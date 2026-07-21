@@ -536,7 +536,23 @@ unsafe fn sum_y_where_both1_neon(lhs: &[u64], rhs: &[u64], y: &[f64], n_samples:
 
 #[inline]
 pub fn sum_y_where_both1(lhs: &[u64], rhs: &[u64], y: &[f64], n_samples: usize) -> f64 {
-    sum_y_where_both1_scalar(lhs, rhs, y, n_samples)
+    #[cfg(target_arch = "aarch64")]
+    {
+        // The current NEON kernel underperforms the scalar path on Apple Silicon
+        // for both sparse and dense supports, so keep AArch64 on scalar for now.
+        sum_y_where_both1_scalar(lhs, rhs, y, n_samples)
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return unsafe { sum_y_where_both1_avx2(lhs, rhs, y, n_samples) };
+        }
+        sum_y_where_both1_scalar(lhs, rhs, y, n_samples)
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        sum_y_where_both1_scalar(lhs, rhs, y, n_samples)
+    }
 }
 
 /// Balanced Accuracy for binary `y` (0/1) vs packed 0/1 bit-vector.

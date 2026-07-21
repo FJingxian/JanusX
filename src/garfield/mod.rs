@@ -6434,6 +6434,17 @@ fn resolve_ml_keep_k(n_region: usize, ml_top_k: usize, ml_top_frac: f64) -> usiz
 }
 
 #[inline]
+fn corr_geneset_ld_prescreen_k(n_region: usize, keep_k: usize) -> usize {
+    if n_region == 0 {
+        return 0;
+    }
+    let keep_k = keep_k.max(1).min(n_region);
+    n_region
+        .min(keep_k.saturating_mul(2).max(keep_k.saturating_add(32)))
+        .max(keep_k)
+}
+
+#[inline]
 fn resolve_ml_top_random_counts(keep_k: usize, top_frac: f64) -> (usize, usize) {
     if keep_k == 0 {
         return (0, 0);
@@ -6645,13 +6656,21 @@ fn select_logic_unit_global_rows(
     if unit.indices.is_empty() {
         return Ok(None);
     }
-    let candidate_global_rows = maybe_prune_geneset_unit_rows_by_ld(
-        unit,
-        unit.indices.as_slice(),
-        unit_kind_lc,
-        logic_bits,
-        train_idx_local,
-    )?;
+    let defer_corr_geneset_ld_prune = matches!(engine, Some(MlEngine::Corr))
+        && unit_kind_lc == "geneset"
+        && unit.spans.len() > 1
+        && unit.indices.len() > 1;
+    let candidate_global_rows = if defer_corr_geneset_ld_prune {
+        unit.indices.clone()
+    } else {
+        maybe_prune_geneset_unit_rows_by_ld(
+            unit,
+            unit.indices.as_slice(),
+            unit_kind_lc,
+            logic_bits,
+            train_idx_local,
+        )?
+    };
     if candidate_global_rows.is_empty() {
         return Ok(None);
     }
@@ -6724,7 +6743,72 @@ fn select_logic_unit_global_rows(
                 feat_sum_xy.as_slice(),
                 y_train,
             );
-            let top_local = topk_indices(&scores, keep_k);
+            let pruned_global_rows = if defer_corr_geneset_ld_prune {
+                if keep_k < candidate_global_rows.len() {
+                    let mut prescreen_k =
+                        corr_geneset_ld_prescreen_k(candidate_global_rows.len(), keep_k);
+                    loop {
+                        let top_local = topk_indices(&scores, prescreen_k);
+                        let prescreen_rows = top_local
+                            .iter()
+                            .map(|&idx| candidate_global_rows[idx])
+                            .collect::<Vec<_>>();
+                        let pruned = maybe_prune_geneset_unit_rows_by_ld(
+                            unit,
+                            prescreen_rows.as_slice(),
+                            unit_kind_lc,
+                            logic_bits,
+                            train_idx_local,
+                        )?;
+                        if pruned.len() >= keep_k || prescreen_k >= candidate_global_rows.len() {
+                            break pruned;
+                        }
+                        let next_k = corr_geneset_ld_prescreen_k(
+                            candidate_global_rows.len(),
+                            prescreen_k.saturating_mul(2),
+                        );
+                        if next_k <= prescreen_k {
+                            break pruned;
+                        }
+                        prescreen_k = next_k;
+                    }
+                } else {
+                    maybe_prune_geneset_unit_rows_by_ld(
+                        unit,
+                        candidate_global_rows.as_slice(),
+                        unit_kind_lc,
+                        logic_bits,
+                        train_idx_local,
+                    )?
+                }
+            } else {
+                candidate_global_rows.clone()
+            };
+            let top_local = if pruned_global_rows.len() <= keep_k {
+                (0..pruned_global_rows.len()).collect::<Vec<_>>()
+            } else {
+                let score_index = candidate_global_rows
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &global_idx)| (global_idx, i))
+                    .collect::<HashMap<usize, usize>>();
+                let pruned_scores = pruned_global_rows
+                    .iter()
+                    .map(|global_idx| {
+                        let score_idx = score_index
+                            .get(global_idx)
+                            .copied()
+                            .ok_or_else(|| {
+                                format!(
+                                    "GARFIELD Corr geneset prescreen lost score index for row {}",
+                                    global_idx
+                                )
+                            })?;
+                        Ok(scores[score_idx])
+                    })
+                    .collect::<Result<Vec<f64>, String>>()?;
+                topk_indices(&pruned_scores, keep_k)
+            };
             GARFIELD_ML_SELECT_NS.fetch_add(
                 t0.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                 Ordering::Relaxed,
@@ -6735,7 +6819,7 @@ fn select_logic_unit_global_rows(
             return Ok(Some(
                 top_local
                     .iter()
-                    .map(|&idx| candidate_global_rows[idx])
+                    .map(|&idx| pruned_global_rows[idx])
                     .collect::<Vec<_>>(),
             ));
         }

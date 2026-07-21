@@ -29,6 +29,8 @@ use std::time::Instant;
 
 const GARFIELD_BEAM_PAR_MIN_TOTAL_CANDS: usize = 1_024;
 const GARFIELD_BEAM_PAR_CHUNK_CANDS: usize = 128;
+const GARFIELD_EXHAUSTIVE_PAR_MIN_TOTAL_CANDS: usize = 64;
+const GARFIELD_EXHAUSTIVE_PAR_CHUNK_CANDS: usize = 32;
 /// Layer-1 singletons: evaluate both positive and negated.
 /// Negated is NOT redundant — `!i & !j` is an AND-family subgroup
 /// identified by pairwise feature selection, and beam search can only
@@ -61,6 +63,24 @@ static GARFIELD_PROFILE_PARENT_BASELINE_NS: AtomicU64 = AtomicU64::new(0);
 #[inline]
 fn elapsed_ns_saturating(start: Instant) -> u64 {
     start.elapsed().as_nanos().min(u64::MAX as u128) as u64
+}
+
+#[inline]
+fn beam_detail_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| parse_env_bool("JX_GARFIELD_BEAM_PROFILE_DETAIL"))
+}
+
+#[inline]
+fn beam_detail_profile_start() -> Option<Instant> {
+    beam_detail_profile_enabled().then(Instant::now)
+}
+
+#[inline]
+fn beam_detail_profile_end(start: Option<Instant>, counter: &AtomicU64) {
+    if let Some(t0) = start {
+        counter.fetch_add(elapsed_ns_saturating(t0), Ordering::Relaxed);
+    }
 }
 
 #[inline]
@@ -1739,9 +1759,9 @@ fn evaluate_child_train_from_parent_virtual(
     let row_n_hit = row_train.n_hit;
     let row_sum_hit = score_sum_hit(row_train);
     let inter_n_hit_pos = and_popcount(parent_bits, row) as usize;
-    let t_sum = Instant::now();
+    let t_sum = beam_detail_profile_start();
     let inter_sum_hit_pos = sum_y_where_both1(parent_bits, row, y_train, n_train);
-    GARFIELD_PROFILE_SUM_Y_BOTH1_NS.fetch_add(elapsed_ns_saturating(t_sum), Ordering::Relaxed);
+    beam_detail_profile_end(t_sum, &GARFIELD_PROFILE_SUM_Y_BOTH1_NS);
     let (inter_n_hit, inter_sum_hit) = if negated {
         (
             parent_n_hit.saturating_sub(inter_n_hit_pos),
@@ -1983,7 +2003,7 @@ fn best_ancestor_raw_baseline_cached(
     ancestor_cache: &mut RuleAncestorBaselineCache,
     disable_parent_delta: bool,
 ) -> Result<f64, String> {
-    let _t = Instant::now();
+    let t_profile = beam_detail_profile_start();
     let key = rule.lexical_key();
     if let Some(score) = ancestor_cache.get(&key) {
         return Ok(*score);
@@ -2032,7 +2052,7 @@ fn best_ancestor_raw_baseline_cached(
     };
     let ret = result?;
     ancestor_cache.insert(key, ret);
-    GARFIELD_PROFILE_PARENT_BASELINE_NS.fetch_add(elapsed_ns_saturating(_t), Ordering::Relaxed);
+    beam_detail_profile_end(t_profile, &GARFIELD_PROFILE_PARENT_BASELINE_NS);
     Ok(ret)
 }
 
@@ -2134,6 +2154,13 @@ fn should_parallel(total_cands: usize, allow_parallel: bool) -> bool {
     allow_parallel
         && rayon::current_num_threads() > 1
         && total_cands >= GARFIELD_BEAM_PAR_MIN_TOTAL_CANDS
+}
+
+#[inline]
+fn should_parallel_exhaustive(total_cands: usize, allow_parallel: bool) -> bool {
+    allow_parallel
+        && rayon::current_num_threads() > 1
+        && total_cands >= GARFIELD_EXHAUSTIVE_PAR_MIN_TOTAL_CANDS
 }
 
 fn validate_search_inputs(
@@ -2869,44 +2896,108 @@ fn build_initial_states_exhaustive(
     params: &BeamSearchParams,
 ) -> Result<Vec<BeamState>, String> {
     check_interrupt_fast()?;
-    let mut all = Vec::<BeamState>::with_capacity(n_rows);
-    for row_idx in 0..n_rows {
-        if (row_idx & 255) == 0 {
-            check_interrupt_fast()?;
+    let total_cands = n_rows.saturating_mul(GARFIELD_INITIAL_SINGLETON_NEGATIONS.len());
+    let all = if should_parallel_exhaustive(total_cands, params.allow_parallel) {
+        let mut work = Vec::<(usize, usize)>::new();
+        let chunk = GARFIELD_EXHAUSTIVE_PAR_CHUNK_CANDS.max(1);
+        let mut start = 0usize;
+        while start < n_rows {
+            let end = (start + chunk).min(n_rows);
+            work.push((start, end));
+            start = end;
         }
-        let row = row_prefix(bits_train, row_words_train, row_idx, needed_words_train);
-        for &negated in GARFIELD_INITIAL_SINGLETON_NEGATIONS.iter() {
-            let literal = BeamLiteral {
-                row_index: row_idx,
-                group_id: group_ids[row_idx],
-                negated,
-            };
-            let rule = BeamRule {
-                first: literal,
-                rest: Vec::new(),
-            };
-            let combined = apply_first_literal(row, needed_words_train, n_train, negated);
-            let single = literal_scores[literal_score_index(row_idx, negated)];
-            let train = single.train;
-            let (train_abs_score, train_score) =
-                train_scores_for_rule(&rule, train, train.raw_score, None, None, params);
-            if !keep_rule_after_support_pruning(&rule, &train, n_train, params) {
-                continue;
-            }
-            if !keep_state_after_min_gain_pruning(rule.len(), train_score, params) {
-                continue;
-            }
-            all.push(BeamState {
-                rule,
-                combined_train: combined,
-                train,
-                train_abs_score,
-                train_score,
-                max_singleton_train_raw: single.train.raw_score,
-                max_singleton_test_raw: single.test.raw_score,
-            });
+        let locals = work
+            .into_par_iter()
+            .map(|(start, end)| -> Result<Vec<BeamState>, String> {
+                let mut local = Vec::<BeamState>::with_capacity(
+                    (end - start).saturating_mul(GARFIELD_INITIAL_SINGLETON_NEGATIONS.len()),
+                );
+                for row_idx in start..end {
+                    if ((row_idx - start) & 255) == 0 {
+                        check_interrupt_fast()?;
+                    }
+                    let row = row_prefix(bits_train, row_words_train, row_idx, needed_words_train);
+                    for &negated in GARFIELD_INITIAL_SINGLETON_NEGATIONS.iter() {
+                        let literal = BeamLiteral {
+                            row_index: row_idx,
+                            group_id: group_ids[row_idx],
+                            negated,
+                        };
+                        let rule = BeamRule {
+                            first: literal,
+                            rest: Vec::new(),
+                        };
+                        let combined = apply_first_literal(row, needed_words_train, n_train, negated);
+                        let single = literal_scores[literal_score_index(row_idx, negated)];
+                        let train = single.train;
+                        let (train_abs_score, train_score) =
+                            train_scores_for_rule(&rule, train, train.raw_score, None, None, params);
+                        if !keep_rule_after_support_pruning(&rule, &train, n_train, params) {
+                            continue;
+                        }
+                        if !keep_state_after_min_gain_pruning(rule.len(), train_score, params) {
+                            continue;
+                        }
+                        local.push(BeamState {
+                            rule,
+                            combined_train: combined,
+                            train,
+                            train_abs_score,
+                            train_score,
+                            max_singleton_train_raw: single.train.raw_score,
+                            max_singleton_test_raw: single.test.raw_score,
+                        });
+                    }
+                }
+                Ok(local)
+            })
+            .collect::<Vec<Result<Vec<BeamState>, String>>>();
+        let mut merged = Vec::<BeamState>::with_capacity(n_rows.saturating_mul(2));
+        for local in locals {
+            merged.extend(local?);
         }
-    }
+        merged
+    } else {
+        let mut seq = Vec::<BeamState>::with_capacity(n_rows);
+        for row_idx in 0..n_rows {
+            if (row_idx & 255) == 0 {
+                check_interrupt_fast()?;
+            }
+            let row = row_prefix(bits_train, row_words_train, row_idx, needed_words_train);
+            for &negated in GARFIELD_INITIAL_SINGLETON_NEGATIONS.iter() {
+                let literal = BeamLiteral {
+                    row_index: row_idx,
+                    group_id: group_ids[row_idx],
+                    negated,
+                };
+                let rule = BeamRule {
+                    first: literal,
+                    rest: Vec::new(),
+                };
+                let combined = apply_first_literal(row, needed_words_train, n_train, negated);
+                let single = literal_scores[literal_score_index(row_idx, negated)];
+                let train = single.train;
+                let (train_abs_score, train_score) =
+                    train_scores_for_rule(&rule, train, train.raw_score, None, None, params);
+                if !keep_rule_after_support_pruning(&rule, &train, n_train, params) {
+                    continue;
+                }
+                if !keep_state_after_min_gain_pruning(rule.len(), train_score, params) {
+                    continue;
+                }
+                seq.push(BeamState {
+                    rule,
+                    combined_train: combined,
+                    train,
+                    train_abs_score,
+                    train_score,
+                    max_singleton_train_raw: single.train.raw_score,
+                    max_singleton_test_raw: single.test.raw_score,
+                });
+            }
+        }
+        seq
+    };
     let out = dedup_states_by_rule_key(all);
     if out.is_empty() {
         return Err(
@@ -3049,10 +3140,9 @@ fn expand_beam_once(
                             if !keep_child_after_parent_gain_pruning(&rule, train_score, params) {
                                 continue;
                             }
-                            let t_clone = Instant::now();
+                            let t_clone = beam_detail_profile_start();
                             let mut combined = node.combined_train.clone();
-                            GARFIELD_PROFILE_CLONE_BITS_NS
-                                .fetch_add(elapsed_ns_saturating(t_clone), Ordering::Relaxed);
+                            beam_detail_profile_end(t_clone, &GARFIELD_PROFILE_CLONE_BITS_NS);
                             apply_literal_inplace(&mut combined, row, op, negated, n_train);
                             let state = BeamState {
                                 rule,
@@ -3255,9 +3345,9 @@ fn dedup_states_by_rule_key(states: Vec<BeamState>) -> Vec<BeamState> {
 fn dedup_states_by_train_bits(states: Vec<BeamState>) -> Vec<BeamState> {
     let mut best = HashMap::<Vec<u64>, BeamState>::with_capacity(states.len());
     for state in states.into_iter() {
-        let t_clone = Instant::now();
+        let t_clone = beam_detail_profile_start();
         let key = state.combined_train.clone();
-        GARFIELD_PROFILE_CLONE_BITS_NS.fetch_add(elapsed_ns_saturating(t_clone), Ordering::Relaxed);
+        beam_detail_profile_end(t_clone, &GARFIELD_PROFILE_CLONE_BITS_NS);
         match best.entry(key) {
             std::collections::hash_map::Entry::Vacant(slot) => {
                 slot.insert(state);
@@ -3288,9 +3378,9 @@ fn dedup_states_by_support_signature(
 
     let mut groups = HashMap::<Vec<u64>, Vec<BeamState>>::with_capacity(states.len());
     for state in states.into_iter() {
-        let t_clone = Instant::now();
+        let t_clone = beam_detail_profile_start();
         let train_bits = state.combined_train.clone();
-        GARFIELD_PROFILE_CLONE_BITS_NS.fetch_add(elapsed_ns_saturating(t_clone), Ordering::Relaxed);
+        beam_detail_profile_end(t_clone, &GARFIELD_PROFILE_CLONE_BITS_NS);
         groups.entry(train_bits).or_default().push(state);
     }
 
@@ -3306,15 +3396,14 @@ fn dedup_states_by_support_signature(
             continue;
         }
         for state in grouped_states.into_iter() {
-            let t_clone = Instant::now();
+            let t_clone = beam_detail_profile_start();
             let test_bits =
                 materialize_rule_bits(&state.rule, bits_test, row_words_test, n_rows, n_test)?;
             let key = BeamSupportSignature {
                 train_bits: train_bits.clone(),
                 test_bits: Some(test_bits),
             };
-            GARFIELD_PROFILE_CLONE_BITS_NS
-                .fetch_add(elapsed_ns_saturating(t_clone), Ordering::Relaxed);
+            beam_detail_profile_end(t_clone, &GARFIELD_PROFILE_CLONE_BITS_NS);
             match best.entry(key) {
                 std::collections::hash_map::Entry::Vacant(slot) => {
                     slot.insert(state);
@@ -3351,116 +3440,266 @@ fn expand_states_exhaustive(
     params: &BeamSearchParams,
 ) -> Result<Vec<BeamState>, String> {
     check_interrupt_fast()?;
-    let mut best = HashMap::<RuleLexKey, BeamState>::new();
-    let base_rule_raws = collect_known_rule_raw_scores(frontier);
-    let mut parent_raw_cache = RuleRawScoreCache::new();
-    let mut ancestor_raw_cache = RuleAncestorBaselineCache::new();
-    for node in frontier.iter() {
-        let cand_start = node.rule.last_row_index() + 1;
-        for cand in cand_start..n_rows {
-            if ((cand - cand_start) & 127) == 0 {
-                check_interrupt_fast()?;
+    let total_expand = frontier
+        .iter()
+        .map(|node| {
+            let cand_start = node.rule.last_row_index() + 1;
+            n_rows
+                .saturating_sub(cand_start)
+                .saturating_mul(2usize.saturating_mul(beam_binary_ops_for_rule(&node.rule).len()))
+        })
+        .sum::<usize>();
+    let base_rule_raws = Arc::new(collect_known_rule_raw_scores(frontier));
+    let out = if should_parallel_exhaustive(total_expand, params.allow_parallel) {
+        let mut work = Vec::<(usize, usize, usize)>::new();
+        let chunk = GARFIELD_EXHAUSTIVE_PAR_CHUNK_CANDS.max(1);
+        for (bi, node) in frontier.iter().enumerate() {
+            let mut start = node.rule.last_row_index() + 1;
+            while start < n_rows {
+                let end = (start + chunk).min(n_rows);
+                work.push((bi, start, end));
+                start = end;
             }
-            let gid = group_ids[cand];
-            if node.rule.uses_group(gid) {
-                continue;
-            }
-            let row = row_prefix(bits_train, row_words_train, cand, needed_words_train);
-            for &op in beam_binary_ops_for_rule(&node.rule).iter() {
-                for &negated in &[false, true] {
-                    let single = literal_scores[literal_score_index(cand, negated)];
-                    let Some(train) = evaluate_child_train_from_parent_virtual(
-                        &node.combined_train,
-                        &node.train,
-                        row,
-                        &single.train,
-                        y_train,
-                        sum_y_train,
-                        n_train,
-                        node.rule.len() + 1,
-                        op,
-                        negated,
-                        params,
-                    ) else {
-                        continue;
-                    };
-                    let literal = BeamLiteral {
-                        row_index: cand,
-                        group_id: gid,
-                        negated,
-                    };
-                    let mut rule = node.rule.clone();
-                    rule.rest.push((op, literal));
-                    let max_singleton_train_raw =
-                        node.max_singleton_train_raw.max(single.train.raw_score);
-                    let max_singleton_test_raw =
-                        node.max_singleton_test_raw.max(single.test.raw_score);
-                    let direct_parent_train_raw = if rule.len() == 2 {
-                        node.train.raw_score.max(single.train.raw_score)
-                    } else {
-                        best_ancestor_raw_baseline_cached(
-                            &rule,
-                            y_train,
-                            bits_train,
-                            row_words_train,
-                            n_rows,
-                            n_train,
-                            literal_scores,
-                            true,
-                            Some(&base_rule_raws),
-                            &mut parent_raw_cache,
-                            &mut ancestor_raw_cache,
-                            params.disable_parent_delta,
-                        )?
-                    };
-                    let (train_abs_score, train_score) = train_scores_for_rule(
-                        &rule,
-                        train,
-                        direct_parent_train_raw,
-                        None,
-                        None,
-                        params,
-                    );
-                    if !keep_child_after_parent_abs_improvement_pruning(
-                        node.train_abs_score,
-                        rule.len(),
-                        train_abs_score,
-                        params,
-                    ) {
+        }
+        let worker_maps = work
+            .into_par_iter()
+            .map(|(bi, start, end)| -> Result<HashMap<RuleLexKey, BeamState>, String> {
+                let node = &frontier[bi];
+                let mut local_best = HashMap::<RuleLexKey, BeamState>::new();
+                let mut parent_raw_cache = RuleRawScoreCache::new();
+                let mut ancestor_raw_cache = RuleAncestorBaselineCache::new();
+                for cand in start..end {
+                    if ((cand - start) & 127) == 0 {
+                        check_interrupt_fast()?;
+                    }
+                    let gid = group_ids[cand];
+                    if node.rule.uses_group(gid) {
                         continue;
                     }
-                    if !keep_state_after_min_gain_pruning(rule.len(), train_score, params) {
-                        continue;
+                    let row = row_prefix(bits_train, row_words_train, cand, needed_words_train);
+                    for &op in beam_binary_ops_for_rule(&node.rule).iter() {
+                        for &negated in &[false, true] {
+                            let single = literal_scores[literal_score_index(cand, negated)];
+                            let Some(train) = evaluate_child_train_from_parent_virtual(
+                                &node.combined_train,
+                                &node.train,
+                                row,
+                                &single.train,
+                                y_train,
+                                sum_y_train,
+                                n_train,
+                                node.rule.len() + 1,
+                                op,
+                                negated,
+                                params,
+                            ) else {
+                                continue;
+                            };
+                            let literal = BeamLiteral {
+                                row_index: cand,
+                                group_id: gid,
+                                negated,
+                            };
+                            let mut rule = node.rule.clone();
+                            rule.rest.push((op, literal));
+                            let max_singleton_train_raw =
+                                node.max_singleton_train_raw.max(single.train.raw_score);
+                            let max_singleton_test_raw =
+                                node.max_singleton_test_raw.max(single.test.raw_score);
+                            let direct_parent_train_raw = if rule.len() == 2 {
+                                node.train.raw_score.max(single.train.raw_score)
+                            } else {
+                                best_ancestor_raw_baseline_cached(
+                                    &rule,
+                                    y_train,
+                                    bits_train,
+                                    row_words_train,
+                                    n_rows,
+                                    n_train,
+                                    literal_scores,
+                                    true,
+                                    Some(base_rule_raws.as_ref()),
+                                    &mut parent_raw_cache,
+                                    &mut ancestor_raw_cache,
+                                    params.disable_parent_delta,
+                                )?
+                            };
+                            let (train_abs_score, train_score) = train_scores_for_rule(
+                                &rule,
+                                train,
+                                direct_parent_train_raw,
+                                None,
+                                None,
+                                params,
+                            );
+                            if !keep_child_after_parent_abs_improvement_pruning(
+                                node.train_abs_score,
+                                rule.len(),
+                                train_abs_score,
+                                params,
+                            ) {
+                                continue;
+                            }
+                            if !keep_state_after_min_gain_pruning(rule.len(), train_score, params) {
+                                continue;
+                            }
+                            if !keep_child_after_parent_gain_pruning(&rule, train_score, params) {
+                                continue;
+                            }
+                            let mut combined = node.combined_train.clone();
+                            apply_literal_inplace(&mut combined, row, op, negated, n_train);
+                            let state = BeamState {
+                                rule,
+                                combined_train: combined,
+                                train,
+                                train_abs_score,
+                                train_score,
+                                max_singleton_train_raw,
+                                max_singleton_test_raw,
+                            };
+                            match local_best.entry(state.rule.lexical_key()) {
+                                std::collections::hash_map::Entry::Vacant(slot) => {
+                                    slot.insert(state);
+                                }
+                                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                                    if cmp_state(&state, slot.get()) == std::cmp::Ordering::Less {
+                                        slot.insert(state);
+                                    }
+                                }
+                            }
+                        }
                     }
-                    if !keep_child_after_parent_gain_pruning(&rule, train_score, params) {
-                        continue;
+                }
+                Ok(local_best)
+            })
+            .collect::<Vec<Result<HashMap<RuleLexKey, BeamState>, String>>>();
+        let mut best = HashMap::<RuleLexKey, BeamState>::new();
+        for wm in worker_maps {
+            for (key, state) in wm? {
+                match best.entry(key) {
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(state);
                     }
-                    let mut combined = node.combined_train.clone();
-                    apply_literal_inplace(&mut combined, row, op, negated, n_train);
-                    let state = BeamState {
-                        rule,
-                        combined_train: combined,
-                        train,
-                        train_abs_score,
-                        train_score,
-                        max_singleton_train_raw,
-                        max_singleton_test_raw,
-                    };
-                    match best.entry(state.rule.lexical_key()) {
-                        std::collections::hash_map::Entry::Vacant(slot) => {
+                    std::collections::hash_map::Entry::Occupied(mut slot) => {
+                        if cmp_state(&state, slot.get()) == std::cmp::Ordering::Less {
                             slot.insert(state);
                         }
-                        std::collections::hash_map::Entry::Occupied(mut slot) => {
-                            if cmp_state(&state, slot.get()) == std::cmp::Ordering::Less {
+                    }
+                }
+            }
+        }
+        best.into_values().collect::<Vec<_>>()
+    } else {
+        let mut best = HashMap::<RuleLexKey, BeamState>::new();
+        let mut parent_raw_cache = RuleRawScoreCache::new();
+        let mut ancestor_raw_cache = RuleAncestorBaselineCache::new();
+        for node in frontier.iter() {
+            let cand_start = node.rule.last_row_index() + 1;
+            for cand in cand_start..n_rows {
+                if ((cand - cand_start) & 127) == 0 {
+                    check_interrupt_fast()?;
+                }
+                let gid = group_ids[cand];
+                if node.rule.uses_group(gid) {
+                    continue;
+                }
+                let row = row_prefix(bits_train, row_words_train, cand, needed_words_train);
+                for &op in beam_binary_ops_for_rule(&node.rule).iter() {
+                    for &negated in &[false, true] {
+                        let single = literal_scores[literal_score_index(cand, negated)];
+                        let Some(train) = evaluate_child_train_from_parent_virtual(
+                            &node.combined_train,
+                            &node.train,
+                            row,
+                            &single.train,
+                            y_train,
+                            sum_y_train,
+                            n_train,
+                            node.rule.len() + 1,
+                            op,
+                            negated,
+                            params,
+                        ) else {
+                            continue;
+                        };
+                        let literal = BeamLiteral {
+                            row_index: cand,
+                            group_id: gid,
+                            negated,
+                        };
+                        let mut rule = node.rule.clone();
+                        rule.rest.push((op, literal));
+                        let max_singleton_train_raw =
+                            node.max_singleton_train_raw.max(single.train.raw_score);
+                        let max_singleton_test_raw =
+                            node.max_singleton_test_raw.max(single.test.raw_score);
+                        let direct_parent_train_raw = if rule.len() == 2 {
+                            node.train.raw_score.max(single.train.raw_score)
+                        } else {
+                            best_ancestor_raw_baseline_cached(
+                                &rule,
+                                y_train,
+                                bits_train,
+                                row_words_train,
+                                n_rows,
+                                n_train,
+                                literal_scores,
+                                true,
+                                Some(base_rule_raws.as_ref()),
+                                &mut parent_raw_cache,
+                                &mut ancestor_raw_cache,
+                                params.disable_parent_delta,
+                            )?
+                        };
+                        let (train_abs_score, train_score) = train_scores_for_rule(
+                            &rule,
+                            train,
+                            direct_parent_train_raw,
+                            None,
+                            None,
+                            params,
+                        );
+                        if !keep_child_after_parent_abs_improvement_pruning(
+                            node.train_abs_score,
+                            rule.len(),
+                            train_abs_score,
+                            params,
+                        ) {
+                            continue;
+                        }
+                        if !keep_state_after_min_gain_pruning(rule.len(), train_score, params) {
+                            continue;
+                        }
+                        if !keep_child_after_parent_gain_pruning(&rule, train_score, params) {
+                            continue;
+                        }
+                        let mut combined = node.combined_train.clone();
+                        apply_literal_inplace(&mut combined, row, op, negated, n_train);
+                        let state = BeamState {
+                            rule,
+                            combined_train: combined,
+                            train,
+                            train_abs_score,
+                            train_score,
+                            max_singleton_train_raw,
+                            max_singleton_test_raw,
+                        };
+                        match best.entry(state.rule.lexical_key()) {
+                            std::collections::hash_map::Entry::Vacant(slot) => {
                                 slot.insert(state);
+                            }
+                            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                                if cmp_state(&state, slot.get()) == std::cmp::Ordering::Less {
+                                    slot.insert(state);
+                                }
                             }
                         }
                     }
                 }
             }
         }
-    }
-    let out = best.into_values().collect::<Vec<_>>();
+        best.into_values().collect::<Vec<_>>()
+    };
     let width = out.len().max(1);
     Ok(filter_beam_candidates(out, width, params))
 }
@@ -4576,10 +4815,10 @@ fn evaluate_child_train_from_parent_virtual_fuzzy(
     let (inter_n_ge1, inter_n_ge2, inter_sum_ge1, inter_sum_ge2) = if negated {
         let drop_n_ge1 = and_popcount(parent_ge1, row_ge2) as usize;
         let drop_n_ge2 = and_popcount(parent_ge2, row_ge1) as usize;
-        let t_sum = Instant::now();
+        let t_sum = beam_detail_profile_start();
         let drop_sum_ge1 = sum_y_where_both1(parent_ge1, row_ge2, y_train, n_train);
         let drop_sum_ge2 = sum_y_where_both1(parent_ge2, row_ge1, y_train, n_train);
-        GARFIELD_PROFILE_SUM_Y_BOTH1_NS.fetch_add(elapsed_ns_saturating(t_sum), Ordering::Relaxed);
+        beam_detail_profile_end(t_sum, &GARFIELD_PROFILE_SUM_Y_BOTH1_NS);
         (
             parent.train.n_hit.saturating_sub(drop_n_ge1),
             parent.train_n_ge2.saturating_sub(drop_n_ge2),
@@ -4589,10 +4828,10 @@ fn evaluate_child_train_from_parent_virtual_fuzzy(
     } else {
         let inter_n_ge1 = and_popcount(parent_ge1, row_ge1) as usize;
         let inter_n_ge2 = and_popcount(parent_ge2, row_ge2) as usize;
-        let t_sum = Instant::now();
+        let t_sum = beam_detail_profile_start();
         let inter_sum_ge1 = sum_y_where_both1(parent_ge1, row_ge1, y_train, n_train);
         let inter_sum_ge2 = sum_y_where_both1(parent_ge2, row_ge2, y_train, n_train);
-        GARFIELD_PROFILE_SUM_Y_BOTH1_NS.fetch_add(elapsed_ns_saturating(t_sum), Ordering::Relaxed);
+        beam_detail_profile_end(t_sum, &GARFIELD_PROFILE_SUM_Y_BOTH1_NS);
         (inter_n_ge1, inter_n_ge2, inter_sum_ge1, inter_sum_ge2)
     };
     let (child_n_ge1, child_n_ge2, child_sum_ge1, child_sum_ge2) = match op {
@@ -4981,7 +5220,7 @@ fn best_ancestor_raw_baseline_fuzzy_cached(
     ancestor_cache: &mut RuleAncestorBaselineCache,
     disable_parent_delta: bool,
 ) -> Result<f64, String> {
-    let _t = Instant::now();
+    let t_profile = beam_detail_profile_start();
     let key = rule.lexical_key();
     if let Some(score) = ancestor_cache.get(&key) {
         return Ok(*score);
@@ -5034,7 +5273,7 @@ fn best_ancestor_raw_baseline_fuzzy_cached(
     };
     let ret = result?;
     ancestor_cache.insert(key, ret);
-    GARFIELD_PROFILE_PARENT_BASELINE_NS.fetch_add(elapsed_ns_saturating(_t), Ordering::Relaxed);
+    beam_detail_profile_end(t_profile, &GARFIELD_PROFILE_PARENT_BASELINE_NS);
     Ok(ret)
 }
 
@@ -5444,11 +5683,10 @@ fn expand_fuzzy_beam_once(
                     if !keep_child_after_parent_gain_pruning(&rule, train_score, params) {
                         continue;
                     }
-                    let t_clone = Instant::now();
+                    let t_clone = beam_detail_profile_start();
                     let mut child_ge1 = node.combined_train_ge1.clone();
                     let mut child_ge2 = node.combined_train_ge2.clone();
-                    GARFIELD_PROFILE_CLONE_BITS_NS
-                        .fetch_add(elapsed_ns_saturating(t_clone), Ordering::Relaxed);
+                    beam_detail_profile_end(t_clone, &GARFIELD_PROFILE_CLONE_BITS_NS);
                     apply_literal_inplace_dual(
                         child_ge1.as_mut_slice(),
                         child_ge2.as_mut_slice(),
@@ -5590,11 +5828,10 @@ fn expand_fuzzy_states_exhaustive(
                     if !keep_child_after_parent_gain_pruning(&rule, train_score, params) {
                         continue;
                     }
-                    let t_clone = Instant::now();
+                    let t_clone = beam_detail_profile_start();
                     let mut child_ge1 = node.combined_train_ge1.clone();
                     let mut child_ge2 = node.combined_train_ge2.clone();
-                    GARFIELD_PROFILE_CLONE_BITS_NS
-                        .fetch_add(elapsed_ns_saturating(t_clone), Ordering::Relaxed);
+                    beam_detail_profile_end(t_clone, &GARFIELD_PROFILE_CLONE_BITS_NS);
                     apply_literal_inplace_dual(
                         child_ge1.as_mut_slice(),
                         child_ge2.as_mut_slice(),
@@ -5803,13 +6040,12 @@ pub fn beam_search_train_test_continuous_fuzzy(
         let mut out = Vec::<BeamRuleCandidate>::with_capacity(retained.len());
         for state in retained.into_iter() {
             let (test_ge1_bits, test_ge2_bits) = if shared_inputs {
-                let t_clone = Instant::now();
+                let t_clone = beam_detail_profile_start();
                 let bits = (
                     state.combined_train_ge1.clone(),
                     state.combined_train_ge2.clone(),
                 );
-                GARFIELD_PROFILE_CLONE_BITS_NS
-                    .fetch_add(elapsed_ns_saturating(t_clone), Ordering::Relaxed);
+                beam_detail_profile_end(t_clone, &GARFIELD_PROFILE_CLONE_BITS_NS);
                 bits
             } else {
                 materialize_rule_bits_dual(

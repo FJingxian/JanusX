@@ -2735,20 +2735,7 @@ fn format_delta_metric_value(value: f64) -> String {
             "-inf".to_string()
         };
     }
-    if value == 0.0 {
-        return "0".to_string();
-    }
-    let abs = value.abs();
-    if abs < 1e-4 || abs >= 1e4 {
-        let raw = format!("{value:.4e}");
-        if let Some((mant, exp)) = raw.split_once('e') {
-            let mant_trimmed = mant.trim_end_matches('0').trim_end_matches('.');
-            return format!("{}e{}", mant_trimmed, exp);
-        }
-        return raw;
-    }
-    let raw = format!("{value:.6}");
-    raw.trim_end_matches('0').trim_end_matches('.').to_string()
+    format!("{value:.4}")
 }
 
 #[inline]
@@ -8355,13 +8342,13 @@ fn write_logic_rules_tsv(path: &str, records: &[GarfieldLogicRuleRecord]) -> Res
     ordered.sort_by(|a, b| cmp_logic_rule_records_output(a, b));
     writeln!(
         w,
-        "unit_kind\tunit_index\tunit_name\tregion_size\tml_feature_count\tMLrank\tsnp_name\texpr\tscore\tdelta_score"
+        "unit_kind\tunit_index\tunit_name\tregion_size\tml_feature_count\tMLrank\tsnp_name\tscore\tdelta_score"
     )
     .map_err(|e| e.to_string())?;
     for rec in ordered.into_iter() {
         writeln!(
             w,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}",
             rec.unit_kind,
             rec.unit_index,
             rec.unit_name,
@@ -8369,7 +8356,6 @@ fn write_logic_rules_tsv(path: &str, records: &[GarfieldLogicRuleRecord]) -> Res
             rec.ml_feature_count,
             rec.ml_rank,
             rec.snp_name,
-            rec.expr,
             rec.score,
             rec.delta_score,
         )

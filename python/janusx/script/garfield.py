@@ -619,6 +619,14 @@ def _garfield_format_fixed4(value: object) -> str:
     return f"{v:.4f}"
 
 
+def _garfield_normalize_sci_text(text: str) -> str:
+    mantissa, exp = text.split("e", 1)
+    mantissa = mantissa.rstrip("0").rstrip(".")
+    if mantissa in {"", "-0", "+0"}:
+        mantissa = "0"
+    return f"{mantissa}e{int(exp)}"
+
+
 def _garfield_format_sci4(value: object, *, blank_if_nan: bool = False) -> str:
     try:
         v = float(value)
@@ -626,7 +634,7 @@ def _garfield_format_sci4(value: object, *, blank_if_nan: bool = False) -> str:
         return "" if blank_if_nan else "NA"
     if not np.isfinite(v):
         return "" if blank_if_nan else "NA"
-    return f"{v:.4e}"
+    return _garfield_normalize_sci_text(f"{v:.4e}")
 
 
 def _garfield_format_pos_int(value: object) -> str:
@@ -653,11 +661,11 @@ def _format_garfield_fvlmm_output_df_for_tsv(df: pd.DataFrame) -> pd.DataFrame:
         "chisq",
         "pwald",
         "padj",
-        "row_role",
     ]
     if df.shape[0] == 0:
         return pd.DataFrame(columns=ordered)
     out = df.copy()
+    out = out.drop(columns=["row_role"], errors="ignore")
     if "chrom" in out.columns:
         out["chrom"] = out["chrom"].astype(str)
     if "pos" in out.columns:
@@ -1575,20 +1583,112 @@ def _read_geneset_lines(path: str) -> list[list[str]]:
     return genesets
 
 
-def _infer_scan_mode_from_genefile(path: str) -> str:
-    genesets = _read_geneset_lines(path)
-    if len(genesets) == 0:
-        raise ValueError(f"Gene file is empty: {path}")
-    return "geneset" if any(len(genes) > 1 for genes in genesets) else "gene"
+def _coerce_genefile_paths(paths: str | list[str] | tuple[str, ...]) -> list[str]:
+    if isinstance(paths, str):
+        out = [paths]
+    else:
+        out = [str(x) for x in paths]
+    return [str(x).strip() for x in out if str(x).strip() != ""]
+
+
+def _infer_scan_mode_from_genefile(paths: str | list[str] | tuple[str, ...]) -> str:
+    scan_mode = "gene"
+    path_list = _coerce_genefile_paths(paths)
+    if len(path_list) == 0:
+        raise ValueError("Gene file list is empty.")
+    for path in path_list:
+        genesets = _read_geneset_lines(path)
+        if len(genesets) == 0:
+            raise ValueError(f"Gene file is empty: {path}")
+        if any(len(genes) > 1 for genes in genesets):
+            scan_mode = "geneset"
+    return scan_mode
+
+
+def _resolve_scan_cli_positive_int(parser: argparse.ArgumentParser, raw: str, flag_desc: str) -> int:
+    try:
+        value = int(str(raw).strip())
+    except Exception:
+        parser.error(f"{flag_desc} must be an integer, got: {raw}")
+    if value <= 0:
+        parser.error(f"{flag_desc} must be > 0")
+    return value
+
+
+def _resolve_window_scan_args(
+    parser: argparse.ArgumentParser,
+    raw_args: list[str] | None,
+    *,
+    default_extension: int,
+) -> tuple[int, int]:
+    values = [] if raw_args is None else [str(x).strip() for x in raw_args if str(x).strip() != ""]
+    if len(values) > 2:
+        parser.error("-w/--window accepts at most [ext] [step]")
+    extension = (
+        int(default_extension)
+        if len(values) <= 0
+        else _resolve_scan_cli_positive_int(parser, values[0], "-w/--window ext")
+    )
+    step = (
+        max(1, int(extension) // 2)
+        if len(values) <= 1
+        else _resolve_scan_cli_positive_int(parser, values[1], "-w/--window step")
+    )
+    return int(extension), int(step)
+
+
+def _resolve_genefile_scan_args(
+    parser: argparse.ArgumentParser,
+    raw_specs: list[list[str]] | None,
+    *,
+    default_extension: int,
+) -> tuple[list[str], int, int]:
+    specs = [] if raw_specs is None else raw_specs
+    if len(specs) == 0:
+        parser.error("-g/--genefile requires at least one file")
+    files: list[str] = []
+    explicit_extensions: list[int] = []
+    explicit_steps: list[int] = []
+    for spec in specs:
+        values = [str(x).strip() for x in spec if str(x).strip() != ""]
+        if len(values) <= 0 or len(values) > 3:
+            parser.error("-g/--genefile accepts FILE [ext] [step]")
+        files.append(values[0])
+        if len(values) >= 2:
+            explicit_extensions.append(
+                _resolve_scan_cli_positive_int(parser, values[1], "-g/--genefile ext")
+            )
+        if len(values) >= 3:
+            explicit_steps.append(
+                _resolve_scan_cli_positive_int(parser, values[2], "-g/--genefile step")
+            )
+    if len(set(explicit_extensions)) > 1:
+        parser.error("All -g/--genefile occurrences must use the same ext when specified.")
+    if len(set(explicit_steps)) > 1:
+        parser.error("All -g/--genefile occurrences must use the same step when specified.")
+    extension = int(explicit_extensions[0]) if len(explicit_extensions) > 0 else int(default_extension)
+    step = int(explicit_steps[0]) if len(explicit_steps) > 0 else max(1, int(extension) // 2)
+    return files, extension, step
+
+
+def _format_genefile_display(paths: list[str]) -> Optional[str]:
+    if len(paths) <= 0:
+        return None
+    return "; ".join(str(x) for x in paths)
 
 
 def _build_interval_groups(
-    genefile: str,
+    genefile: str | list[str] | tuple[str, ...],
     gff3: str,
     extension: int,
     scan_mode: str,
 ) -> tuple[list[str], list[list[tuple[str, int, int]]]]:
-    genesets = _read_geneset_lines(genefile)
+    all_genesets: list[list[str]] = []
+    for path in _coerce_genefile_paths(genefile):
+        all_genesets.extend(_read_geneset_lines(path))
+    genesets = all_genesets
+    if len(genesets) == 0:
+        raise ValueError("Gene file list is empty.")
     dfgff3 = readanno(gff3, "ID").iloc[:, :4].set_index(3)
     dfgff3 = dfgff3.loc[~dfgff3.index.duplicated()]
 
@@ -2056,26 +2156,31 @@ def main() -> None:
         help_profile="plink_prefix_short",
     )
     add_common_pheno_arg(required_group, required=False, help_text="Phenotype file.")
-
-    optional_group = parser.add_argument_group("Optional Arguments")
-    optional_group.add_argument(
-        "-Window",
-        "--Window",
-        action="store_true",
-        dest="mode_window",
-        help="Window scan mode.",
+    scan_mode_group = required_group.add_mutually_exclusive_group(required=True)
+    scan_mode_group.add_argument(
+        "-w",
+        "--window",
+        dest="window_args",
+        nargs="*",
+        default=None,
+        metavar="ARG",
+        help="Window scan mode. Optionally pass EXT [STEP].",
     )
-    optional_group.add_argument(
+    scan_mode_group.add_argument(
         "-g",
         "--genefile",
-        type=str,
+        dest="genefile_args",
+        nargs="+",
+        action="append",
         default=None,
+        metavar="ARG",
         help=(
-            "Gene or gene-set file. If provided together with -gff/--gff3, GARFIELD "
-            "auto-switches out of window mode: single-gene lines are treated as Gene units, "
-            "multi-gene lines as GeneSet units."
+            "Gene or gene-set scan file. Use -g FILE [EXT] [STEP]; repeat -g for multiple files. "
+            "Requires -gff/--gff3."
         ),
     )
+
+    optional_group = parser.add_argument_group("Optional Arguments")
     optional_group.add_argument("-gff", "--gff3", type=str, default=None, help="GFF3 annotation.")
     optional_group.add_argument(
         "--scan-mode",
@@ -2085,8 +2190,6 @@ def main() -> None:
         help=argparse.SUPPRESS,
     )
     add_common_trait_selector_args(optional_group, dest="ncol")
-    optional_group.add_argument("-ext", "--extension", type=int, default=100_000, help="Window extension in bp.")
-    optional_group.add_argument("-step", "--step", dest="step", type=int, default=None, help="Window step size (default: extension/2).")
     add_common_variant_filter_args(
         optional_group,
         help_profile="pureline",
@@ -2112,7 +2215,7 @@ def main() -> None:
         "-dev",
         "--dev",
         action="store_true",
-        help="Deprecated compatibility flag. Under pure-line GARFIELD it aliases BIN encoding.",
+        help=argparse.SUPPRESS,
     )
     add_common_grm_file_arg(
         optional_group,
@@ -2182,6 +2285,17 @@ def main() -> None:
     optional_group.add_argument("--prior-not", type=float, default=None, help=argparse.SUPPRESS)
     optional_group.add_argument("-layer", "--layer", type=int, default=None, help="Maximum beam-search rule depth (default: 4).")
     optional_group.add_argument(
+        "-gain",
+        "--gain-layer",
+        dest="gain_layer",
+        type=int,
+        default=2,
+        help=(
+            "Start ranking beam candidates by interaction gain from this layer onward "
+            "(default: 2; layer 1 always uses raw score)."
+        ),
+    )
+    optional_group.add_argument(
         "-topk",
         "--topk",
         dest="rule_topk",
@@ -2224,7 +2338,7 @@ def main() -> None:
         "--simbench",
         type=str,
         default=None,
-        help="Optional simulation benchmark TSV (<prefix>.fixed.effects.tsv). Matching simulation combinations will be appended to GARFIELD rules output using the same residualized-phenotype statistics.",
+        help=argparse.SUPPRESS,
     )
 
     args, extras = parser.parse_known_args()
@@ -2240,12 +2354,20 @@ def main() -> None:
     if len(extras) > 0:
         parser.error("unrecognized arguments: " + " ".join(extras))
 
-    if int(args.extension) <= 0:
-        parser.error("-ext/--extension must be > 0")
-    if args.step is None:
-        args.step = max(1, int(args.extension) // 2)
-    elif int(args.step) <= 0:
-        parser.error("-step/--step must be > 0")
+    default_extension = 100_000
+    if args.window_args is not None:
+        args.extension, args.step = _resolve_window_scan_args(
+            parser,
+            args.window_args,
+            default_extension=default_extension,
+        )
+        args.genefiles = []
+    else:
+        args.genefiles, args.extension, args.step = _resolve_genefile_scan_args(
+            parser,
+            args.genefile_args,
+            default_extension=default_extension,
+        )
     if not (0.0 <= float(args.maf) <= 0.5):
         parser.error("-maf/--maf must be in [0, 0.5]")
     if args.lmaf is not None and not (0.0 <= float(args.lmaf) <= 0.5):
@@ -2261,14 +2383,11 @@ def main() -> None:
     ):
         parser.error("-k/--grm now expects a GRM path.")
 
-    if args.mode_window and args.genefile is not None:
-        parser.error("-Window cannot be combined with -g/--genefile.")
-
-    if args.genefile is not None:
+    if len(args.genefiles) > 0:
         if not args.gff3:
             parser.error("-g/--genefile requires -gff/--gff3.")
         try:
-            args.scan_mode = _infer_scan_mode_from_genefile(args.genefile)
+            args.scan_mode = _infer_scan_mode_from_genefile(args.genefiles)
         except ValueError as e:
             parser.error(str(e))
     else:
@@ -2286,6 +2405,8 @@ def main() -> None:
     )
     if int(args.layer) <= 0:
         parser.error("-layer must be > 0")
+    if int(args.gain_layer) < 2:
+        parser.error("-gain/--gain-layer must be >= 2")
     if int(args.rule_topk) <= 0:
         parser.error("-topk/--topk must be > 0")
     args.exhaustive_depth_runtime = 2 if int(args.layer) >= 2 else 1
@@ -2318,9 +2439,9 @@ def main() -> None:
     if args.feature_source == "mbin":
         args.feature_source = "bin"
 
-    args.rank_score = "gain_from_layer:2"
-    args.rank_schedule_source = "fixed-combination-gain"
-    args.gain_start_layer_runtime = 2
+    args.rank_score = f"gain_from_layer:{int(args.gain_layer)}"
+    args.rank_schedule_source = "cli-gain-layer"
+    args.gain_start_layer_runtime = int(args.gain_layer)
 
     try:
         args.ncol = parse_trait_selector_specs(args.ncol, label="-n/--n")
@@ -2335,8 +2456,6 @@ def main() -> None:
         args.thread = int(detected_threads)
 
     gfile, prefix = determine_genotype_source(args)
-    input_kind = "bfile"
-
     args.out = os.path.normpath(args.out if args.out is not None else ".")
     outprefix = os.path.join(args.out, prefix)
     os.makedirs(args.out, mode=0o755, exist_ok=True)
@@ -2351,13 +2470,6 @@ def main() -> None:
             "Current BIN beam search preserves 0/1/2 dosage with fuzzy min/max/not logic; "
             "only true missing calls are imputed during decoding."
         )
-    if int(args.fold) < 2:
-        logger.warning(
-            "GARFIELD is running with fold < 2, so rule discovery and pseudo-GWAS follow-up "
-            "reuse the same samples. This can substantially inflate pseudo-GWAS statistics; "
-            "use --fold >= 2 to enable a holdout split."
-        )
-
     ml_skipped = args.engine in ml_skip_tokens
     engine_runtime = "none" if ml_skipped else str(args.engine)
     rank_score_runtime = str(args.rank_score)
@@ -2367,15 +2479,16 @@ def main() -> None:
     )
     rank_schedule_runtime = _describe_rank_schedule(rank_score_runtime)
 
-    gff3_effective = args.gff3 if args.genefile else None
+    genefile_display = _format_genefile_display(args.genefiles)
+    gff3_effective = args.gff3 if len(args.genefiles) > 0 else None
 
     checks: list[bool] = []
     checks.append(ensure_plink_prefix_exists(logger, gfile, "Genotype PLINK prefix"))
     checks.append(ensure_file_exists(logger, args.pheno, "Phenotype file"))
     if args.grm:
         checks.append(ensure_file_exists(logger, args.grm, "GARFIELD GRM"))
-    if args.genefile:
-        checks.append(ensure_file_exists(logger, args.genefile, "Gene file"))
+    for genefile_path in args.genefiles:
+        checks.append(ensure_file_exists(logger, genefile_path, "Gene file"))
     if gff3_effective:
         checks.append(ensure_file_exists(logger, gff3_effective, "GFF3 file"))
     if args.simbench:
@@ -2389,22 +2502,11 @@ def main() -> None:
 
     general_rows = [
         ("Genotype input", gfile),
-        ("Input kind", input_kind),
-        ("Execution route", "direct Rust BED pipeline"),
-        (
-            "Prepare reuse",
-            (
-                "global site_keep once + trait-local load"
-                if bool(args.global_stats)
-                else "trait-specific site_keep + trait-local load"
-            ),
-        ),
-        ("Encoding", feature_source),
         ("Residualization GRM", args.grm if args.grm else "auto from genotype"),
         ("Covariates", None if not args.cov_inputs else ",".join(str(x) for x in args.cov_inputs)),
         ("Phenotype", args.pheno),
         ("Scan mode", args.scan_mode),
-        ("Gene file", args.genefile),
+        ("Gene files", genefile_display),
         ("GFF3", gff3_effective if gff3_effective else ("ignored" if args.gff3 else None)),
         ("Input MAF", float(args.maf)),
         (
@@ -2422,16 +2524,12 @@ def main() -> None:
         ("Bimrange", None if not args.bimrange else ",".join(str(x) for x in args.bimrange)),
         ("Split", "none (full data)"),
         ("Engine", "none (skip ML)" if ml_skipped else args.engine),
-        ("Permutation", True),
         ("Pseudo GWAS", "FvLMM follow-up"),
         ("Structured pruning", not bool(args.no_clean)),
-        ("NOT control", "null penalty only"),
         ("Width", int(args.width)),
-        ("Rules/unit", int(args.top_rules_runtime)),
         ("Layer", int(args.layer)),
         ("Pair seed depth", int(args.exhaustive_depth_runtime)),
         ("Rule ranking", rank_schedule_runtime),
-        ("Sim bench", args.simbench),
         ("Seed", int(args.seed)),
     ]
 
@@ -2566,10 +2664,12 @@ def main() -> None:
             global_stats=True,
         )
     if args.scan_mode in {"gene", "geneset"}:
-        if not args.genefile or not args.gff3:
-            raise ValueError(f"scan-mode={args.scan_mode} requires both --genefile and --gff3.")
+        if len(args.genefiles) <= 0 or not args.gff3:
+            raise ValueError(
+                f"scan-mode={args.scan_mode} requires one or more -g/--genefile and -gff/--gff3."
+            )
         group_labels, group_intervals = _build_interval_groups(
-            args.genefile,
+            args.genefiles,
             args.gff3,
             int(args.extension),
             args.scan_mode,
@@ -2925,6 +3025,8 @@ def main() -> None:
             "bimrange": (list(args.bimrange) if args.bimrange else None),
             "ranking_dataset": "full",
             "feature_source": feature_source,
+            "gene_files": list(args.genefiles),
+            "gff3": gff3_effective,
             "grm_path": args.grm,
             "grm_id_path": resolved_grm_id,
             "maf": float(args.maf),
@@ -3058,10 +3160,12 @@ def main() -> None:
                 "log_file": log_path,
                 "output_prefix": outprefix,
                 "genotype_input": gfile,
-                "input_kind": input_kind,
+                "input_kind": "bfile",
                 "execution_route": "direct Rust BED pipeline",
                 "encoding": feature_source,
                 "phenotype_file": args.pheno,
+                "gene_files": list(args.genefiles),
+                "gff3": gff3_effective,
                 "grm_path": args.grm,
                 "grm_id_path": resolved_grm_id,
                 "scan_mode": args.scan_mode,

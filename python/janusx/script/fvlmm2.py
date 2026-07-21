@@ -510,6 +510,14 @@ def _format_fixed4(value: object) -> str:
     return f"{v:.4f}"
 
 
+def _normalize_sci_text(text: str) -> str:
+    mantissa, exp = text.split("e", 1)
+    mantissa = mantissa.rstrip("0").rstrip(".")
+    if mantissa in {"", "-0", "+0"}:
+        mantissa = "0"
+    return f"{mantissa}e{int(exp)}"
+
+
 def _format_sci4(value: object) -> str:
     try:
         v = float(value)
@@ -517,7 +525,7 @@ def _format_sci4(value: object) -> str:
         return "NA"
     if not np.isfinite(v):
         return "NA"
-    return f"{v:.4e}"
+    return _normalize_sci_text(f"{v:.4e}")
 
 
 def _format_pos_int(value: object) -> str:

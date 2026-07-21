@@ -892,13 +892,8 @@ def _collect_garfield_fvlmm2_specs(
                 "garfield_ml_rank": str(row.get("MLrank", row.get("ml_rank", ""))).strip(),
                 "garfield_rule_snp_name": snp_name,
                 "garfield_rule_expr": expr,
-                "garfield_rule_beta": str(row.get("beta", "")).strip(),
-                "garfield_rule_se": str(row.get("se", "")).strip(),
-                "garfield_rule_chisq": str(row.get("chisq", "")).strip(),
-                "garfield_rule_pwald": str(row.get("pwald", "")).strip(),
                 "garfield_rule_score": str(row.get("score", "")).strip(),
                 "garfield_rule_delta_score": str(row.get("delta_score", "")).strip(),
-                "garfield_rule_delta_pwald": str(row.get("delta_pwald", "")).strip(),
             }
         )
 
@@ -1303,7 +1298,7 @@ def _run_garfield_pseudo_fvlmm(
     )
     tsv_df = _format_garfield_fvlmm_output_df_for_tsv(full_df)
 
-    out_base = f"{pseudo_prefix}.{trait_label}.fvlmm"
+    out_base = f"{pseudo_prefix}.fvlmm"
     tsv_path = f"{out_base}.tsv"
     figure_path = f"{out_base}.svg"
     tsv_df.to_csv(tsv_path, sep="\t", index=False)
@@ -1398,7 +1393,7 @@ def _run_garfield_pseudo_fvlmm2(
         rules_tsv=str(rules_tsv),
         name_map=source_name_map,
     )
-    out_base = f"{pseudo_prefix}.{trait_label}.fvlmm2"
+    out_base = f"{pseudo_prefix}.fvlmm2"
     tsv_path = f"{out_base}.tsv"
     skipped_tsv_path = f"{out_base}.skip"
     figure_path = f"{out_base}.svg"
@@ -1637,6 +1632,90 @@ def _build_interval_groups(
         raise ValueError(f"unsupported scan_mode: {scan_mode}")
 
     return labels, groups
+
+
+def _normalize_scan_chrom(chrom: object) -> str:
+    text = str(chrom).strip()
+    if len(text) > 2 and (text.endswith("_1") or text.endswith("_2")):
+        return text[:-2]
+    if len(text) > 1 and (text.endswith("-") or text.endswith("+")):
+        return text[:-1]
+    return text
+
+
+def _count_window_scan_units_from_bim(
+    prefix: str,
+    *,
+    extension: int,
+    step: int,
+    site_keep: Optional[np.ndarray] = None,
+) -> int:
+    bim_path = f"{prefix}.bim"
+    if not os.path.exists(bim_path):
+        return 0
+
+    groups: dict[str, list[int]] = {}
+    chrom_order: list[str] = []
+    keep_mask = None if site_keep is None else np.asarray(site_keep, dtype=np.bool_).reshape(-1)
+
+    with open(bim_path, "r", encoding="utf-8") as f:
+        for row_idx, line in enumerate(f):
+            if keep_mask is not None:
+                if row_idx >= int(keep_mask.shape[0]) or not bool(keep_mask[row_idx]):
+                    continue
+            tok = line.rstrip("\n").split()
+            if len(tok) < 4:
+                continue
+            chrom = _normalize_scan_chrom(tok[0])
+            try:
+                pos = int(tok[3])
+            except Exception:
+                continue
+            if chrom not in groups:
+                groups[chrom] = []
+                chrom_order.append(chrom)
+            groups[chrom].append(pos)
+
+    total_windows = 0
+    ext = max(1, int(extension))
+    step_bp = max(1, int(step))
+    for chrom in chrom_order:
+        positions = groups.get(chrom, [])
+        if len(positions) == 0:
+            continue
+        positions.sort()
+        min_bp = int(positions[0])
+        max_bp = int(positions[-1])
+        l = 0
+        r = 0
+        center = int(min_bp)
+        prev_sig = None
+        n = len(positions)
+
+        while True:
+            left_bp = max(center - ext, min_bp)
+            right_bp = min(center + ext, max_bp)
+            while l < n and int(positions[l]) < left_bp:
+                l += 1
+            if r < l:
+                r = l
+            while r < n and int(positions[r]) <= right_bp:
+                r += 1
+            if r > l:
+                sig = (l, r - 1, r - l)
+                if prev_sig != sig:
+                    total_windows += 1
+                    prev_sig = sig
+            if center >= max_bp:
+                break
+            center += step_bp
+            if center > np.iinfo(np.int32).max:
+                break
+
+        if prev_sig is None:
+            total_windows += 1
+
+    return int(total_windows)
 
 
 def _scan_mode_to_logic_unit_kind(scan_mode: str) -> str:
@@ -2087,7 +2166,7 @@ def main() -> None:
         "--no-clean",
         action="store_true",
         dest="no_clean",
-        help="Disable structured beam pruning and fall back to the legacy unfiltered fixed-width search.",
+        help=argparse.SUPPRESS,
     )
     optional_group.add_argument(
         "-global",
@@ -2451,19 +2530,6 @@ def main() -> None:
     if len(sample_pool) == 0:
         raise ValueError("No overlapping samples across genotype/phenotype/GRM/cov.")
 
-    grm_n: int | str = "NA" if aligned_grm is None else int(aligned_grm.shape[0])
-    cov_n: int | str = "NA" if cov_ids is None else int(len(cov_ids))
-    split_line = "-"*60
-    _emit_plain_info_line(
-        logger,
-        (
-            f"geno={len(geno_ids)}, pheno={len(pheno_ids_all)}, "
-            f"grm={grm_n}, q=NA, cov={cov_n} -> {len(sample_pool)}"
-            f"\n{split_line}"
-        ),
-        use_spinner=use_spinner,
-    )
-
     cov_index = (
         None
         if cov_ids is None
@@ -2477,6 +2543,13 @@ def main() -> None:
 
     group_labels: list[str] = []
     group_intervals: list[list[tuple[str, int, int]]] = []
+    scan_unit_total: Optional[int] = None
+    if args.scan_mode == "window":
+        scan_unit_total = _count_window_scan_units_from_bim(
+            str(gfile),
+            extension=int(args.extension),
+            step=int(args.step),
+        )
     global_site_keep: Optional[np.ndarray] = None
     if bool(args.global_stats):
         global_site_keep = _prepare_site_keep(
@@ -2503,7 +2576,27 @@ def main() -> None:
         )
         if len(group_intervals) == 0:
             raise ValueError(f"No valid groups built for scan-mode={args.scan_mode}.")
-        logger.info(f"Prepared {len(group_intervals)} interval groups for {args.scan_mode} scan.")
+        scan_unit_total = len(group_intervals)
+
+    grm_n: int | str = "NA" if aligned_grm is None else int(aligned_grm.shape[0])
+    cov_n: int | str = "NA" if cov_ids is None else int(len(cov_ids))
+    split_line = "-" * 60
+    preface_lines = [
+        (
+            f"geno={len(geno_ids)}, pheno={len(pheno_ids_all)}, "
+            f"grm={grm_n}, q=NA, cov={cov_n} -> {len(sample_pool)}"
+        )
+    ]
+    if scan_unit_total is not None and int(scan_unit_total) > 0:
+        preface_lines.append(
+            f"Prepared {int(scan_unit_total)} scan unit(s) for {args.scan_mode} scan."
+        )
+    preface_lines.append(split_line)
+    _emit_plain_info_line(
+        logger,
+        "\n".join(preface_lines),
+        use_spinner=use_spinner,
+    )
 
     used_trait_labels: dict[str, int] = {}
     saved = 0
@@ -2664,13 +2757,29 @@ def main() -> None:
         posterior_tsv_path = f"{trait_logic_prefix}.posterior.tsv"
         posterior_json_path = result.get("posterior_json")
         run_config_path = f"{trait_outprefix}.garfield.run_config.json"
+        skipped_units = result.get("skipped_units") or []
         skipped_messages = result.get("skipped_messages") or []
-        if len(skipped_messages) > 0:
+        if len(skipped_units) > 0:
+            logger.warning(
+                f"GARFIELD skipped {len(skipped_units)} unit(s) for trait '{trait_name}' because no valid initial literals remained."
+            )
+            logger.info("Skipped scan units (unit_name -> max_singleton_dosage_maf):")
+            for item in skipped_units:
+                if not isinstance(item, dict):
+                    continue
+                unit_name = str(item.get("unit_name", "NA"))
+                max_lmaf = item.get("max_singleton_dosage_maf")
+                try:
+                    maf_txt = f"{float(max_lmaf):.4f}"
+                except Exception:
+                    maf_txt = "NA"
+                logger.info(f"  {unit_name} -> {maf_txt}")
+        elif len(skipped_messages) > 0:
             logger.warning(
                 f"GARFIELD skipped {len(skipped_messages)} unit(s) for trait '{trait_name}'."
             )
             for msg in skipped_messages:
-                logger.warning(str(msg))
+                logger.info(str(msg))
         n_rules = int(result.get("n_rules", 0))
         if n_rules <= 0:
             _remove_file_if_exists(pseudo_path)

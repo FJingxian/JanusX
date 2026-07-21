@@ -152,6 +152,16 @@ pub fn feature_scores_abs_corr_stage1(
     sum_xy: &[f64],
     y: &[f64],
 ) -> Vec<f64> {
+    feature_scores_abs_corr_stage1_with_parallel(sum_x, sum_x2, sum_xy, y, true)
+}
+
+pub fn feature_scores_abs_corr_stage1_with_parallel(
+    sum_x: &[f64],
+    sum_x2: &[f64],
+    sum_xy: &[f64],
+    y: &[f64],
+    allow_parallel: bool,
+) -> Vec<f64> {
     if y.is_empty() {
         return vec![0.0; sum_x.len()];
     }
@@ -164,7 +174,7 @@ pub fn feature_scores_abs_corr_stage1(
     if !vary.is_finite() || vary <= 0.0 {
         return vec![0.0; n_features];
     }
-    if should_parallel_row_scores(n_features, y.len()) {
+    if allow_parallel && should_parallel_row_scores(n_features, y.len()) {
         (0..n_features)
             .into_par_iter()
             .map(|i| {

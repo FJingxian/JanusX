@@ -2,7 +2,8 @@
 // Shared beam-search kernels used by GARFIELD.
 
 use super::permutation::{
-    bucket_from_rule, structure_prior_penalty, RuleNullBucket, RuleNullPenaltyLookup,
+    bucket_from_rule_with_complexity, structure_prior_penalty, RuleNullBucket,
+    RuleNullPenaltyLookup,
     RuleStructurePrior,
 };
 use super::score::{
@@ -269,6 +270,7 @@ pub struct BeamSearchParams {
     pub null_penalties: Option<Arc<RuleNullPenaltyLookup>>,
     pub structure_prior: Option<Arc<RuleStructurePrior>>,
     pub disable_parent_delta: bool,
+    pub null_complexity_bin: u8,
     pub group_constraint: BeamGroupConstraintMode,
     pub allow_parallel: bool,
 }
@@ -290,6 +292,7 @@ impl Default for BeamSearchParams {
             null_penalties: None,
             structure_prior: None,
             disable_parent_delta: false,
+            null_complexity_bin: 0,
             group_constraint: BeamGroupConstraintMode::AlwaysExclude,
             allow_parallel: true,
         }
@@ -1453,7 +1456,8 @@ fn train_scores_for_rule(
     _parent_raw_score: Option<f64>,
     params: &BeamSearchParams,
 ) -> (f64, f64) {
-    let bucket = bucket_from_rule(rule, train_raw.dosage_maf);
+    let bucket =
+        bucket_from_rule_with_complexity(rule, train_raw.dosage_maf, params.null_complexity_bin);
     let abs_score = rank_rule_score_components_base(
         rule.len(),
         rule.not_count(),
@@ -1649,7 +1653,7 @@ fn cmp_state(a: &BeamState, b: &BeamState) -> std::cmp::Ordering {
 }
 
 #[inline]
-fn cmp_candidate(a: &BeamRuleCandidate, b: &BeamRuleCandidate) -> std::cmp::Ordering {
+pub(crate) fn cmp_candidate(a: &BeamRuleCandidate, b: &BeamRuleCandidate) -> std::cmp::Ordering {
     let sa = score_key(a.test_score);
     let sb = score_key(b.test_score);
     match sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal) {
@@ -1699,7 +1703,8 @@ fn canonicalize_singleton_output_candidate(
     let train = single.train;
     let test = single.test;
     let (_, train_score) = train_scores_for_rule(&rule, train, train.raw_score, None, None, params);
-    let bucket = bucket_from_rule(&rule, test.dosage_maf);
+    let bucket =
+        bucket_from_rule_with_complexity(&rule, test.dosage_maf, params.null_complexity_bin);
     let test_score = rank_rule_score_components_with_bucket(
         bucket,
         rule.len(),
@@ -3717,7 +3722,11 @@ fn final_test_score_for_state(
     literal_scores: &[LiteralSingletonScore],
     params: &BeamSearchParams,
 ) -> Result<f64, String> {
-    let child_bucket = bucket_from_rule(&state.rule, test.dosage_maf);
+    let child_bucket = bucket_from_rule_with_complexity(
+        &state.rule,
+        test.dosage_maf,
+        params.null_complexity_bin,
+    );
     let direct_parent_test_raw = best_ancestor_raw_baseline(
         &state.rule,
         y_test,
@@ -3826,7 +3835,8 @@ fn final_rule_score_for_eval(
     params: &BeamSearchParams,
     is_train: bool,
 ) -> Result<f64, String> {
-    let bucket = bucket_from_rule(rule, raw.dosage_maf);
+    let bucket =
+        bucket_from_rule_with_complexity(rule, raw.dosage_maf, params.null_complexity_bin);
     let abs_score = rule_abs_score_for_eval(
         rule,
         raw,
@@ -3858,7 +3868,8 @@ fn final_rule_score_for_eval_cached(
     base_cache: Option<&RuleRawScoreCache>,
     local_cache: &mut RuleRawScoreCache,
 ) -> Result<f64, String> {
-    let bucket = bucket_from_rule(rule, raw.dosage_maf);
+    let bucket =
+        bucket_from_rule_with_complexity(rule, raw.dosage_maf, params.null_complexity_bin);
     let abs_score = rule_abs_score_for_eval_cached(
         rule,
         raw,
@@ -6073,7 +6084,11 @@ pub fn beam_search_train_test_continuous_fuzzy(
                     true,
                     params.disable_parent_delta,
                 )?;
-                let bucket = bucket_from_rule(&state.rule, state.train.dosage_maf);
+                let bucket = bucket_from_rule_with_complexity(
+                    &state.rule,
+                    state.train.dosage_maf,
+                    params.null_complexity_bin,
+                );
                 rank_rule_score_components_with_bucket(
                     bucket,
                     state.rule.len(),
@@ -6128,7 +6143,8 @@ fn final_test_score_for_rule_fuzzy(
     literal_scores: &[LiteralSingletonScore],
     params: &BeamSearchParams,
 ) -> Result<f64, String> {
-    let child_bucket = bucket_from_rule(rule, test.dosage_maf);
+    let child_bucket =
+        bucket_from_rule_with_complexity(rule, test.dosage_maf, params.null_complexity_bin);
     let direct_parent_test_raw = best_ancestor_raw_baseline_fuzzy(
         rule,
         y_test,
@@ -6980,7 +6996,7 @@ mod tests {
             n_miss: 6,
         };
         let mut cal = super::super::permutation::RuleNullCalibrator::new();
-        let bucket = bucket_from_rule(&rule, train.dosage_maf);
+        let bucket = super::super::permutation::bucket_from_rule(&rule, train.dosage_maf);
         cal.insert(bucket, 0.0, 0.0);
         let lookup = cal.finalize();
         let (_, gain_score) = train_scores_for_rule(
@@ -7316,7 +7332,7 @@ mod tests {
             n_miss: 10,
         };
         let mut cal = super::super::permutation::RuleNullCalibrator::new();
-        let bucket = bucket_from_rule(&rule, train.dosage_maf);
+        let bucket = super::super::permutation::bucket_from_rule(&rule, train.dosage_maf);
         cal.insert(bucket, 0.0, 0.0);
         let lookup = cal.finalize();
         let parent_raw_score = 0.72;

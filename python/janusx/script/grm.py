@@ -1308,8 +1308,10 @@ def build_grm_streaming_from_meta(
     threads: int,
     logger,
 ) -> tuple[np.ndarray, int]:
-    if int(method) != 1:
-        raise RuntimeError("GRM meta-stream ndarray route currently supports method=1 only.")
+    if int(method) not in (1, 2):
+        raise RuntimeError(
+            "GRM meta-stream ndarray route currently supports methods 1 and 2 only."
+        )
     if _grm_bed_f64_from_meta is None:
         raise RuntimeError(
             "Rust GRM meta kernel is unavailable. Rebuild JanusX extension to export "
@@ -1365,7 +1367,7 @@ def build_grm_streaming_from_meta(
             row_flip,
             row_maf,
             sample_indices=None,
-            method=1,
+            method=int(method),
             block_cols=max(1, int(block_rows)),
             threads=max(1, int(threads)),
             progress_callback=_progress_cb,
@@ -1400,8 +1402,10 @@ def build_grm_streaming_from_meta_to_npy(
     threads: int,
     logger,
 ) -> int:
-    if int(method) != 1:
-        raise RuntimeError("GRM meta-stream NPY route currently supports method=1 only.")
+    if int(method) not in (1, 2):
+        raise RuntimeError(
+            "GRM meta-stream NPY route currently supports methods 1 and 2 only."
+        )
     if _gblup_grm_from_meta_to_npy is None:
         raise RuntimeError(
             "Rust GRM meta->NPY kernel is unavailable. Rebuild JanusX extension to export "
@@ -1458,7 +1462,7 @@ def build_grm_streaming_from_meta_to_npy(
             row_flip,
             row_maf,
             sample_indices=None,
-            method=1,
+            method=int(method),
             block_rows=max(1, int(block_rows)),
             threads=max(1, int(threads)),
             progress_callback=_progress_cb,
@@ -2528,7 +2532,9 @@ def main(log: bool = True):
         grm = None
         grm_path = None
         dense_saved_direct = False
-        prefer_meta_stream = bool(int(args.method) == 1 and (not bool(args.stage_timing)))
+        prefer_meta_stream = bool(
+            int(args.method) in (1, 2) and (not bool(args.stage_timing))
+        )
 
         if prefer_meta_stream:
             try:

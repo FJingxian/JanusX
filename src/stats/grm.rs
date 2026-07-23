@@ -1,4 +1,3 @@
-use memmap2::Mmap;
 use numpy::ndarray::{Array1, Array2};
 use numpy::PyArray1;
 use numpy::PyUntypedArrayMethods;
@@ -486,7 +485,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn grm_packed_f64_core_impl<P>(
+pub(crate) fn grm_packed_f64_core_impl<P>(
     packed_flat: &[u8],
     n_samples: usize,
     row_flip_vec: &[bool],
@@ -3692,75 +3691,22 @@ pub fn grm_bed_f64_from_meta<'py>(
                 Ok(())
             };
 
-            if method == 1 || method == 3 {
-                let stream_mode = if method == 3 {
-                    crate::gblup::StreamKernelMode::Dominance
-                } else {
-                    crate::gblup::StreamKernelMode::Additive
-                };
-                let (grm, _row_sum, _varsum) = crate::gblup::build_grm_from_meta_stream(
-                    &bed_prefix,
-                    row_idx.as_slice(),
-                    row_flip_vec.as_slice(),
-                    row_maf_vec.as_slice(),
-                    sample_idx.as_slice(),
-                    stream_mode,
-                    block_cols,
-                    threads,
-                    mmap_window_mb,
-                    progress_every,
-                    Some(progress),
-                )?;
-                return Ok(grm);
-            }
-
-            let bed_path = format!("{bed_prefix}.bed");
-            let bed_file =
-                File::open(&bed_path).map_err(|e| format!("failed to open {bed_path}: {e}"))?;
-            let mmap = unsafe { Mmap::map(&bed_file) }
-                .map_err(|e| format!("failed to mmap {bed_path}: {e}"))?;
-            if mmap.len() < 3 {
-                return Err("BED too small".to_string());
-            }
-            if mmap[0] != 0x6C || mmap[1] != 0x1B || mmap[2] != 0x01 {
-                return Err("Only SNP-major BED supported".to_string());
-            }
-            let bytes_per_snp = n_samples_full.div_ceil(4);
-            let data_len = mmap.len() - 3;
-            if bytes_per_snp == 0 || data_len % bytes_per_snp != 0 {
-                return Err(format!(
-                    "invalid BED payload length: data_len={data_len}, bytes_per_snp={bytes_per_snp}"
-                ));
-            }
-            let n_snps_total = data_len / bytes_per_snp;
-            if let Some(&bad) = row_idx.iter().find(|&&sid| sid >= n_snps_total) {
-                return Err(format!(
-                    "row index out of range: {bad} for n_snps={n_snps_total}"
-                ));
-            }
-            let packed_src = &mmap[3..];
-            let rows_identity = row_idx.len() == n_snps_total
-                && row_idx.iter().enumerate().all(|(i, &idx)| i == idx);
-            let packed_keep: Cow<[u8]> = if rows_identity {
-                Cow::Borrowed(packed_src)
-            } else {
-                let mut out = Vec::<u8>::with_capacity(row_idx.len() * bytes_per_snp);
-                for &src in row_idx.iter() {
-                    let start = src * bytes_per_snp;
-                    let end = start + bytes_per_snp;
-                    out.extend_from_slice(&packed_src[start..end]);
-                }
-                Cow::Owned(out)
+            let stream_mode = match method {
+                1 => crate::gblup::StreamKernelMode::Additive,
+                2 => crate::gblup::StreamKernelMode::StandardizedAdditive,
+                3 => crate::gblup::StreamKernelMode::Dominance,
+                _ => unreachable!(),
             };
-            let (grm, _row_sum, _varsum) = grm_packed_f64_core_impl(
-                packed_keep.as_ref(),
-                n_samples_full,
+            let (grm, _row_sum, _varsum) = crate::gblup::build_grm_from_meta_stream(
+                &bed_prefix,
+                row_idx.as_slice(),
                 row_flip_vec.as_slice(),
                 row_maf_vec.as_slice(),
                 sample_idx.as_slice(),
-                method,
+                stream_mode,
                 block_cols,
                 threads,
+                mmap_window_mb,
                 progress_every,
                 Some(progress),
             )?;

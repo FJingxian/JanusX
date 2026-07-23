@@ -47,10 +47,11 @@ use std::time::Instant;
 use crate::bedmath::{
     adaptive_grm_block_rows, decode_mean_imputed_additive_packed_block_rows_f32,
     decode_plink_bed_hardcall, decode_row_centered_full_lut, decode_row_centered_full_lut_f64,
-    decode_subset_row_from_full_scratch, is_identity_indices, packed_byte_lut,
+    decode_subset_row_from_full_scratch, is_identity_indices, packed_byte_lut, SubsetDecodePlan,
 };
 use crate::blas::OpenBlasThreadGuard;
 use crate::brent::brent_minimize;
+use crate::decode::decode_standardized_additive_block_from_maf_f32;
 use crate::eigh::{
     load_square_matrix_subset_row_major_f64, square_matrix_subset_cross_dot_f64,
     symmetric_eigh_f64_row_major,
@@ -68,6 +69,7 @@ use crate::stats_common::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StreamKernelMode {
     Additive,
+    StandardizedAdditive,
     Dominance,
 }
 
@@ -234,7 +236,7 @@ fn grm_scale_and_symmetrize_inplace_f64(grm: &mut [f64], n: usize, inv_scale: f6
 }
 
 #[allow(clippy::too_many_arguments)]
-fn decode_centered_meta_block_f32(
+fn decode_meta_block_f32(
     packed_flat: &[u8],
     packed_row_indices: &[usize],
     bytes_per_snp: usize,
@@ -243,6 +245,7 @@ fn decode_centered_meta_block_f32(
     row_maf: &[f32],
     sample_idx: &[usize],
     full_sample_fast: bool,
+    subset_plan: Option<&SubsetDecodePlan>,
     mode: StreamKernelMode,
     out_block: &mut [f32],
     out_varsum: &mut [f64],
@@ -254,26 +257,58 @@ fn decode_centered_meta_block_f32(
         return Ok(());
     }
     if row_maf.len() != rows || packed_row_indices.len() != rows {
-        return Err("decode_centered_meta_block_f32: row metadata length mismatch".to_string());
+        return Err("decode_meta_block_f32: row metadata length mismatch".to_string());
     }
     if sample_idx.is_empty() {
-        return Err("decode_centered_meta_block_f32: sample_idx must not be empty".to_string());
+        return Err("decode_meta_block_f32: sample_idx must not be empty".to_string());
     }
     let n_out = sample_idx.len();
     if out_block.len() < rows.saturating_mul(n_out) {
-        return Err("decode_centered_meta_block_f32: out_block too small".to_string());
+        return Err("decode_meta_block_f32: out_block too small".to_string());
     }
     if out_varsum.len() < rows {
-        return Err("decode_centered_meta_block_f32: out_varsum too small".to_string());
+        return Err("decode_meta_block_f32: out_varsum too small".to_string());
     }
     if out_rowsum.len() < rows {
-        return Err("decode_centered_meta_block_f32: out_rowsum too small".to_string());
+        return Err("decode_meta_block_f32: out_rowsum too small".to_string());
     }
 
-    let code4_lut = &packed_byte_lut().code4;
     let block = &mut out_block[..rows * n_out];
     let varsum = &mut out_varsum[..rows];
     let rowsum = &mut out_rowsum[..rows];
+
+    if mode == StreamKernelMode::StandardizedAdditive {
+        let mut scratch_row_indices = vec![0usize; rows];
+        let mut scratch_mean = vec![0.0_f32; rows];
+        let mut scratch_scale = vec![0.0_f32; rows];
+        decode_standardized_additive_block_from_maf_f32(
+            packed_flat,
+            bytes_per_snp,
+            n_samples,
+            row_flip,
+            row_maf,
+            sample_idx,
+            full_sample_fast,
+            subset_plan,
+            Some(packed_row_indices),
+            0usize,
+            rows,
+            1e-12_f32,
+            scratch_row_indices.as_mut_slice(),
+            scratch_mean.as_mut_slice(),
+            scratch_scale.as_mut_slice(),
+            block,
+            pool,
+        )?;
+        for local_row in 0..rows {
+            let p = row_maf[local_row].clamp(0.0_f32, 1.0_f32) as f64;
+            varsum[local_row] = 0.0_f64;
+            rowsum[local_row] = 2.0_f64 * p * (n_out as f64);
+        }
+        return Ok(());
+    }
+
+    let code4_lut = &packed_byte_lut().code4;
 
     let mut decode_run = || {
         if full_sample_fast {
@@ -303,6 +338,7 @@ fn decode_centered_meta_block_f32(
                             let value_lut = [0.0_f32, mean_g as f32, 1.0_f32, 0.0_f32];
                             (mean_g, var, value_lut)
                         }
+                        StreamKernelMode::StandardizedAdditive => unreachable!(),
                     };
                     decode_row_centered_full_lut(row, n_samples, code4_lut, &value_lut, dst);
                     let mean_g_f32 = mean_g as f32;
@@ -349,6 +385,7 @@ fn decode_centered_meta_block_f32(
                                 full_row.as_mut_slice(),
                                 dst,
                             ),
+                            StreamKernelMode::StandardizedAdditive => unreachable!(),
                         };
                         *row_varsum_dst = var_centered;
                         *row_sum_dst = row_sum;
@@ -400,6 +437,13 @@ where
     let pool_owned = get_cached_pool(threads).map_err(|e| e.to_string())?;
     let pool_ref = pool_owned.as_ref();
     let full_sample_fast = is_identity_indices(train_idx, n_samples);
+    let subset_plan = if full_sample_fast {
+        None
+    } else {
+        Some(SubsetDecodePlan::from_sample_idx_with_n_samples(
+            train_idx, n_samples,
+        ))
+    };
     let row_step = adaptive_grm_block_rows(
         block_rows.max(1),
         eff_m.max(1),
@@ -443,7 +487,7 @@ where
             let cur_rows = row_end - row_start;
             let packed_slice = matrix
                 .prepare_source_rows(&row_source_indices[row_start..row_end], &mut rel_indices)?;
-            decode_centered_meta_block_f32(
+            decode_meta_block_f32(
                 packed_slice,
                 rel_indices.as_slice(),
                 bytes_per_snp,
@@ -452,6 +496,7 @@ where
                 &row_maf[row_start..row_end],
                 train_idx,
                 full_sample_fast,
+                subset_plan.as_ref(),
                 mode,
                 &mut block[..cur_rows * n_train],
                 &mut block_varsum[..cur_rows],
@@ -517,7 +562,7 @@ where
                     &row_source_indices[row_start..row_end],
                     &mut rel_indices,
                 )?;
-                decode_centered_meta_block_f32(
+                decode_meta_block_f32(
                     packed_slice,
                     rel_indices.as_slice(),
                     bytes_per_snp,
@@ -526,6 +571,7 @@ where
                     &row_maf[row_start..row_end],
                     train_idx,
                     full_sample_fast,
+                    subset_plan.as_ref(),
                     mode,
                     &mut buf.data[..cur_rows * n_train],
                     &mut buf.varsum[..cur_rows],
@@ -594,11 +640,16 @@ where
         }
     }
 
-    if !(varsum_acc.is_finite() && varsum_acc > 0.0) {
-        return Err("build_grm_from_meta_stream: invalid centered GRM denominator".to_string());
-    }
-    grm_scale_and_symmetrize_inplace_f64(&mut grm, n_train, 1.0_f64 / varsum_acc);
-    Ok((grm, row_sum_all, varsum_acc))
+    let scale = if mode == StreamKernelMode::StandardizedAdditive {
+        eff_m as f64
+    } else {
+        if !(varsum_acc.is_finite() && varsum_acc > 0.0) {
+            return Err("build_grm_from_meta_stream: invalid centered GRM denominator".to_string());
+        }
+        varsum_acc
+    };
+    grm_scale_and_symmetrize_inplace_f64(&mut grm, n_train, 1.0_f64 / scale);
+    Ok((grm, row_sum_all, scale))
 }
 
 fn write_npy_f32_matrix_from_f64(
@@ -694,9 +745,9 @@ pub fn gblup_grm_from_meta_to_npy<'py>(
     progress_every: usize,
     mmap_window_mb: Option<usize>,
 ) -> PyResult<(usize, usize)> {
-    if method != 1 && method != 3 {
+    if method != 1 && method != 2 && method != 3 {
         return Err(PyRuntimeError::new_err(format!(
-            "unsupported method={method}; expected 1 (centered additive) or 3 (centered dominance)"
+            "unsupported method={method}; expected 1 (centered additive), 2 (standardized additive), or 3 (centered dominance)"
         )));
     }
 
@@ -777,10 +828,11 @@ pub fn gblup_grm_from_meta_to_npy<'py>(
                 Ok(())
             };
 
-            let stream_mode = if method == 3 {
-                StreamKernelMode::Dominance
-            } else {
-                StreamKernelMode::Additive
+            let stream_mode = match method {
+                1 => StreamKernelMode::Additive,
+                2 => StreamKernelMode::StandardizedAdditive,
+                3 => StreamKernelMode::Dominance,
+                _ => unreachable!(),
             };
             let (grm, _row_sum, _varsum) = build_grm_from_meta_stream(
                 &bed_prefix,
@@ -912,6 +964,13 @@ fn compute_effect_beta_from_meta_stream(
     let pool_owned = get_cached_pool(threads).map_err(|e| e.to_string())?;
     let pool_ref = pool_owned.as_ref();
     let full_sample_fast = is_identity_indices(sample_idx, n_samples);
+    let subset_plan = if full_sample_fast {
+        None
+    } else {
+        Some(SubsetDecodePlan::from_sample_idx_with_n_samples(
+            sample_idx, n_samples,
+        ))
+    };
     let row_step = adaptive_grm_block_rows(
         block_rows.max(1),
         eff_m.max(1),
@@ -934,7 +993,7 @@ fn compute_effect_beta_from_meta_stream(
         let cur_rows = row_end - row_start;
         let packed_slice = matrix
             .prepare_source_rows(&row_source_indices[row_start..row_end], &mut rel_indices)?;
-        decode_centered_meta_block_f32(
+        decode_meta_block_f32(
             packed_slice,
             rel_indices.as_slice(),
             bytes_per_snp,
@@ -943,6 +1002,7 @@ fn compute_effect_beta_from_meta_stream(
             &row_maf[row_start..row_end],
             sample_idx,
             full_sample_fast,
+            subset_plan.as_ref(),
             mode,
             &mut block[..cur_rows * n_out],
             &mut block_varsum[..cur_rows],

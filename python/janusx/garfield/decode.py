@@ -7,6 +7,17 @@ import pandas as pd
 _PSEUDO_COMPONENT_SPLIT_RE = re.compile(r"[|&]")
 
 
+def _strip_component_target_suffix(token: str) -> str:
+    part = str(token).strip()
+    if part.startswith("!"):
+        part = part[1:].strip()
+    if part.endswith(")") and "(" in part:
+        base, suffix = part.rsplit("(", 1)
+        if suffix[:-1].strip() != "" and base.strip() != "":
+            part = base.strip()
+    return part
+
+
 def _normalize_assoc_key_value(value: object) -> str:
     txt = str(value).strip()
     if txt == "":
@@ -23,13 +34,12 @@ def _split_pseudo_components(snp_name: str) -> list[tuple[str, str, str]]:
         part = raw_part.strip()
         if not part:
             continue
-        if part.startswith("!"):
-            part = part[1:].strip()
+        coord_part = _strip_component_target_suffix(part)
         if not part:
             continue
-        if "_" not in part:
+        if "_" not in coord_part:
             raise ValueError(f"Invalid pseudo SNP component without chrom_pos form: {snp_name}")
-        chrom, pos = part.rsplit("_", 1)
+        chrom, pos = coord_part.rsplit("_", 1)
         chrom = chrom.strip()
         pos_norm = _normalize_assoc_key_value(pos)
         if chrom == "" or pos_norm == "":

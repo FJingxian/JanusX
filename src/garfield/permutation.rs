@@ -1,3 +1,4 @@
+use crate::linalg::student_t_p_two_sided;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
@@ -27,7 +28,11 @@ const NULL_EXACT_MIN_SAMPLES: usize = 10;
 // the same per-repeat truncation rule.
 const DEFAULT_RULE_NULL_TOPK_ALL: usize = 2;
 const DEFAULT_RULE_NULL_BUCKET_MAX_RULE_LEN: usize = 5;
-const DEFAULT_RULE_NULL_COMPLEXITY_BIN_COUNT: usize = 4;
+const DEFAULT_RULE_NULL_BASE_COMPLEXITY_BIN_COUNT: usize = 4;
+const DEFAULT_RULE_NULL_UNIT_GROUP_BIN_COUNT: usize = 3;
+const DEFAULT_RULE_NULL_CONTEXT_BIN_COUNT: usize =
+    DEFAULT_RULE_NULL_BASE_COMPLEXITY_BIN_COUNT * DEFAULT_RULE_NULL_UNIT_GROUP_BIN_COUNT;
+const DEFAULT_RULE_NULL_LEN_BUCKET_COUNT: usize = 3;
 
 // ---------------------------------------------------------------------------
 // Bucket types
@@ -48,9 +53,26 @@ struct RuleNullScores {
     test: Vec<f64>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RuleNullGlobalStats {
+    pub mean: f64,
+    pub sample_std: f64,
+    pub n: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RuleNullDistributionSummary {
+    pub quantile: f64,
+    pub penalty: f64,
+    pub mean: f64,
+    pub variance: f64,
+    pub n: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct RuleNullCalibrator {
     by_bucket: Vec<RuleNullScores>,
+    by_group_len: Vec<RuleNullScores>,
     by_len: Vec<RuleNullScores>,
     max_rule_len: usize,
     global: RuleNullScores,
@@ -60,11 +82,20 @@ pub struct RuleNullCalibrator {
 pub struct RuleNullPenaltyLookup {
     bucket_train: Vec<Option<f64>>,
     bucket_test: Vec<Option<f64>>,
+    group_len_train: Vec<Option<f64>>,
+    group_len_test: Vec<Option<f64>>,
+    group_len_train_stats: Vec<Option<RuleNullGlobalStats>>,
+    group_len_test_stats: Vec<Option<RuleNullGlobalStats>>,
     len_train: Vec<Option<f64>>,
     len_test: Vec<Option<f64>>,
+    len_train_stats: Vec<Option<RuleNullGlobalStats>>,
+    len_test_stats: Vec<Option<RuleNullGlobalStats>>,
     max_rule_len: usize,
+    quantile: f64,
     global_train: Option<f64>,
     global_test: Option<f64>,
+    global_train_stats: Option<RuleNullGlobalStats>,
+    global_test_stats: Option<RuleNullGlobalStats>,
 }
 
 impl Default for RuleNullPenaltyLookup {
@@ -101,13 +132,23 @@ impl RuleNullBucket {
     }
 
     #[inline]
-    fn complexity_index(self) -> usize {
-        usize::from(self.complexity_bin).min(DEFAULT_RULE_NULL_COMPLEXITY_BIN_COUNT - 1)
+    fn context_index(self) -> usize {
+        usize::from(self.complexity_bin).min(DEFAULT_RULE_NULL_CONTEXT_BIN_COUNT - 1)
+    }
+
+    #[inline]
+    pub fn unit_group_bin(self) -> u8 {
+        (self.context_index() / DEFAULT_RULE_NULL_BASE_COMPLEXITY_BIN_COUNT) as u8
+    }
+
+    #[inline]
+    pub fn base_complexity_bin(self) -> u8 {
+        (self.context_index() % DEFAULT_RULE_NULL_BASE_COMPLEXITY_BIN_COUNT) as u8
     }
 
     #[inline]
     fn bucket_index(self, max_rule_len: usize) -> usize {
-        self.complexity_index()
+        self.context_index()
             .saturating_mul(max_rule_len.max(1))
             .saturating_add(self.len_index().min(max_rule_len.saturating_sub(1)))
     }
@@ -125,6 +166,15 @@ pub fn null_topk_per_repeat_for_bucket(_bucket: RuleNullBucket) -> usize {
 #[inline]
 fn null_quantile_for_bucket() -> f64 {
     DEFAULT_RULE_NULL_QUANTILE
+}
+
+#[inline]
+fn sanitize_rule_null_quantile(quantile: f64) -> f64 {
+    if quantile.is_finite() {
+        quantile.clamp(0.0, 1.0)
+    } else {
+        DEFAULT_RULE_NULL_QUANTILE
+    }
 }
 
 #[allow(dead_code)]
@@ -145,7 +195,24 @@ pub fn rule_null_bucket_count_maf_len() -> usize {
 pub fn rule_null_bucket_count(max_rule_len: usize) -> usize {
     max_rule_len
         .max(1)
-        .saturating_mul(DEFAULT_RULE_NULL_COMPLEXITY_BIN_COUNT)
+        .saturating_mul(DEFAULT_RULE_NULL_CONTEXT_BIN_COUNT)
+}
+
+#[inline]
+pub(crate) fn rule_null_len_bucket_count(max_rule_len: usize) -> usize {
+    max_rule_len.max(1).min(DEFAULT_RULE_NULL_LEN_BUCKET_COUNT)
+}
+
+#[inline]
+pub(crate) fn rule_null_len_bucket_index(rule_len: usize, max_rule_len: usize) -> usize {
+    let count = rule_null_len_bucket_count(max_rule_len);
+    if count <= 1 {
+        0
+    } else if count == 2 {
+        rule_len.saturating_sub(1).min(1)
+    } else {
+        rule_len.saturating_sub(1).min(2)
+    }
 }
 
 #[inline]
@@ -158,12 +225,56 @@ pub fn rule_null_complexity_bin(n_features: usize) -> u8 {
     }
 }
 
+#[inline]
+pub fn rule_null_unit_group_bin(unit_group_count: usize) -> u8 {
+    match unit_group_count {
+        0..=1 => 0,
+        2 => 1,
+        _ => 2,
+    }
+}
+
+#[inline]
+pub fn rule_null_context_bin(base_complexity_bin: u8, unit_group_bin: u8) -> u8 {
+    let base =
+        usize::from(base_complexity_bin).min(DEFAULT_RULE_NULL_BASE_COMPLEXITY_BIN_COUNT - 1);
+    let group = usize::from(unit_group_bin).min(DEFAULT_RULE_NULL_UNIT_GROUP_BIN_COUNT - 1);
+    (group * DEFAULT_RULE_NULL_BASE_COMPLEXITY_BIN_COUNT + base) as u8
+}
+
+#[inline]
+pub(crate) fn rule_null_unit_group_bin_count() -> usize {
+    DEFAULT_RULE_NULL_UNIT_GROUP_BIN_COUNT
+}
+
+#[inline]
+pub(crate) fn rule_null_group_len_bucket_count(max_rule_len: usize) -> usize {
+    rule_null_len_bucket_count(max_rule_len).saturating_mul(DEFAULT_RULE_NULL_UNIT_GROUP_BIN_COUNT)
+}
+
+#[inline]
+pub(crate) fn rule_null_group_len_bucket_index(
+    unit_group_bin: u8,
+    rule_len: usize,
+    max_rule_len: usize,
+) -> usize {
+    let len_count = rule_null_len_bucket_count(max_rule_len);
+    usize::from(unit_group_bin)
+        .min(DEFAULT_RULE_NULL_UNIT_GROUP_BIN_COUNT - 1)
+        .saturating_mul(len_count)
+        .saturating_add(rule_null_len_bucket_index(rule_len, max_rule_len))
+}
+
 impl RuleNullCalibrator {
     pub fn with_max_rule_len(max_rule_len: usize) -> Self {
         let bucket_count = rule_null_bucket_count(max_rule_len);
         Self {
             by_bucket: vec![RuleNullScores::default(); bucket_count],
-            by_len: vec![RuleNullScores::default(); max_rule_len.max(1)],
+            by_group_len: vec![
+                RuleNullScores::default();
+                rule_null_group_len_bucket_count(max_rule_len)
+            ],
+            by_len: vec![RuleNullScores::default(); rule_null_len_bucket_count(max_rule_len)],
             max_rule_len: max_rule_len.max(1),
             global: RuleNullScores::default(),
         }
@@ -186,10 +297,23 @@ impl RuleNullCalibrator {
 
     /// Push a train-only null score without touching the test side.
     pub fn insert_train(&mut self, bucket: RuleNullBucket, score: f64) {
-        if let Some(slot) = self.by_bucket.get_mut(bucket.bucket_index(self.max_rule_len)) {
+        if let Some(slot) = self
+            .by_bucket
+            .get_mut(bucket.bucket_index(self.max_rule_len))
+        {
             slot.train.push(score);
         }
-        if let Some(slot) = self.by_len.get_mut(bucket.len_index().min(self.max_rule_len - 1)) {
+        if let Some(slot) = self.by_group_len.get_mut(rule_null_group_len_bucket_index(
+            bucket.unit_group_bin(),
+            bucket.rule_len,
+            self.max_rule_len,
+        )) {
+            slot.train.push(score);
+        }
+        if let Some(slot) = self.by_len.get_mut(rule_null_len_bucket_index(
+            bucket.rule_len,
+            self.max_rule_len,
+        )) {
             slot.train.push(score);
         }
         self.global.train.push(score);
@@ -197,31 +321,57 @@ impl RuleNullCalibrator {
 
     /// Push a test-only null score without touching the train side.
     pub fn insert_test(&mut self, bucket: RuleNullBucket, score: f64) {
-        if let Some(slot) = self.by_bucket.get_mut(bucket.bucket_index(self.max_rule_len)) {
+        if let Some(slot) = self
+            .by_bucket
+            .get_mut(bucket.bucket_index(self.max_rule_len))
+        {
             slot.test.push(score);
         }
-        if let Some(slot) = self.by_len.get_mut(bucket.len_index().min(self.max_rule_len - 1)) {
+        if let Some(slot) = self.by_group_len.get_mut(rule_null_group_len_bucket_index(
+            bucket.unit_group_bin(),
+            bucket.rule_len,
+            self.max_rule_len,
+        )) {
+            slot.test.push(score);
+        }
+        if let Some(slot) = self.by_len.get_mut(rule_null_len_bucket_index(
+            bucket.rule_len,
+            self.max_rule_len,
+        )) {
             slot.test.push(score);
         }
         self.global.test.push(score);
     }
 
-    pub fn finalize(&self) -> RuleNullPenaltyLookup {
+    pub fn finalize_with_quantile(&self, quantile: f64) -> RuleNullPenaltyLookup {
+        let q = sanitize_rule_null_quantile(quantile);
         let mut out = RuleNullPenaltyLookup::with_max_rule_len(self.max_rule_len);
+        out.quantile = q;
         for (idx, scores) in self.by_bucket.iter().enumerate() {
-            let q = null_quantile_for_bucket();
             out.bucket_train[idx] = sample_min_safe(scores.train.as_slice(), q);
             out.bucket_test[idx] = sample_min_safe(scores.test.as_slice(), q);
         }
+        for (idx, scores) in self.by_group_len.iter().enumerate() {
+            out.group_len_train[idx] = sample_min_safe(scores.train.as_slice(), q);
+            out.group_len_test[idx] = sample_min_safe(scores.test.as_slice(), q);
+            out.group_len_train_stats[idx] = summarize_scores(scores.train.as_slice());
+            out.group_len_test_stats[idx] = summarize_scores(scores.test.as_slice());
+        }
         for (idx, scores) in self.by_len.iter().enumerate() {
-            let q = null_quantile_for_bucket();
             out.len_train[idx] = sample_min_safe(scores.train.as_slice(), q);
             out.len_test[idx] = sample_min_safe(scores.test.as_slice(), q);
+            out.len_train_stats[idx] = summarize_scores(scores.train.as_slice());
+            out.len_test_stats[idx] = summarize_scores(scores.test.as_slice());
         }
-        out.global_train =
-            sample_min_safe(self.global.train.as_slice(), DEFAULT_RULE_NULL_QUANTILE);
-        out.global_test = sample_min_safe(self.global.test.as_slice(), DEFAULT_RULE_NULL_QUANTILE);
+        out.global_train = sample_min_safe(self.global.train.as_slice(), q);
+        out.global_test = sample_min_safe(self.global.test.as_slice(), q);
+        out.global_train_stats = summarize_scores(self.global.train.as_slice());
+        out.global_test_stats = summarize_scores(self.global.test.as_slice());
         out
+    }
+
+    pub fn finalize(&self) -> RuleNullPenaltyLookup {
+        self.finalize_with_quantile(DEFAULT_RULE_NULL_QUANTILE)
     }
 }
 
@@ -231,6 +381,74 @@ fn sample_min_safe(scores: &[f64], q: f64) -> Option<f64> {
         return None;
     }
     quantile_nearest_rank(scores, q)
+}
+
+#[inline]
+fn summarize_scores(scores: &[f64]) -> Option<RuleNullGlobalStats> {
+    let mut n = 0usize;
+    let mut mean = 0.0_f64;
+    let mut m2 = 0.0_f64;
+    for value in scores.iter().copied().filter(|x| x.is_finite()) {
+        n += 1;
+        let delta = value - mean;
+        mean += delta / (n as f64);
+        let delta2 = value - mean;
+        m2 += delta * delta2;
+    }
+    if n == 0 {
+        return None;
+    }
+    let sample_std = if n >= 2 {
+        (m2 / ((n - 1) as f64)).sqrt()
+    } else {
+        0.0
+    };
+    Some(RuleNullGlobalStats {
+        mean,
+        sample_std,
+        n,
+    })
+}
+
+#[inline]
+fn one_sided_t_pvalue_greater(
+    observed_score: f64,
+    null_mean: f64,
+    null_sample_std: f64,
+    n: usize,
+) -> Option<f64> {
+    if !(observed_score.is_finite() && null_mean.is_finite() && null_sample_std.is_finite()) {
+        return None;
+    }
+    if n == 0 {
+        return None;
+    }
+    if n < 2 || !(null_sample_std > 0.0) {
+        return Some(if observed_score > null_mean {
+            f64::MIN_POSITIVE
+        } else {
+            1.0
+        });
+    }
+    let se = null_sample_std / (n as f64).sqrt();
+    if !(se > 0.0 && se.is_finite()) {
+        return Some(if observed_score > null_mean {
+            f64::MIN_POSITIVE
+        } else {
+            1.0
+        });
+    }
+    let t = (observed_score - null_mean) / se;
+    let two_sided = student_t_p_two_sided(t, (n - 1) as i32);
+    if !two_sided.is_finite() {
+        return None;
+    }
+    let p: f64 = if t >= 0.0 {
+        0.5 * two_sided
+    } else {
+        1.0 - 0.5 * two_sided
+    };
+    Some(p.clamp(f64::MIN_POSITIVE, 1.0))
 }
 
 impl Default for RuleNullCalibrator {
@@ -245,11 +463,20 @@ impl RuleNullPenaltyLookup {
         Self {
             bucket_train: vec![None; bucket_count],
             bucket_test: vec![None; bucket_count],
-            len_train: vec![None; max_rule_len.max(1)],
-            len_test: vec![None; max_rule_len.max(1)],
+            group_len_train: vec![None; rule_null_group_len_bucket_count(max_rule_len)],
+            group_len_test: vec![None; rule_null_group_len_bucket_count(max_rule_len)],
+            group_len_train_stats: vec![None; rule_null_group_len_bucket_count(max_rule_len)],
+            group_len_test_stats: vec![None; rule_null_group_len_bucket_count(max_rule_len)],
+            len_train: vec![None; rule_null_len_bucket_count(max_rule_len)],
+            len_test: vec![None; rule_null_len_bucket_count(max_rule_len)],
+            len_train_stats: vec![None; rule_null_len_bucket_count(max_rule_len)],
+            len_test_stats: vec![None; rule_null_len_bucket_count(max_rule_len)],
             max_rule_len: max_rule_len.max(1),
+            quantile: DEFAULT_RULE_NULL_QUANTILE,
             global_train: None,
             global_test: None,
+            global_train_stats: None,
+            global_test_stats: None,
         }
     }
 
@@ -257,7 +484,47 @@ impl RuleNullPenaltyLookup {
         Self::with_max_rule_len(DEFAULT_RULE_NULL_BUCKET_MAX_RULE_LEN)
     }
 
-    fn penalty_with_fallback(&self, _bucket: RuleNullBucket, is_train: bool) -> Option<f64> {
+    pub fn quantile(&self) -> f64 {
+        self.quantile
+    }
+
+    fn penalty_with_fallback(&self, bucket: RuleNullBucket, is_train: bool) -> Option<f64> {
+        let exact = if is_train {
+            self.bucket_train
+                .get(bucket.bucket_index(self.max_rule_len))
+                .copied()
+                .flatten()
+        } else {
+            self.bucket_test
+                .get(bucket.bucket_index(self.max_rule_len))
+                .copied()
+                .flatten()
+        };
+        if exact.is_some() {
+            return exact;
+        }
+        let group_len_idx = rule_null_group_len_bucket_index(
+            bucket.unit_group_bin(),
+            bucket.rule_len,
+            self.max_rule_len,
+        );
+        let by_group_len = if is_train {
+            self.group_len_train.get(group_len_idx).copied().flatten()
+        } else {
+            self.group_len_test.get(group_len_idx).copied().flatten()
+        };
+        if by_group_len.is_some() {
+            return by_group_len;
+        }
+        let len_idx = rule_null_len_bucket_index(bucket.rule_len, self.max_rule_len);
+        let by_len = if is_train {
+            self.len_train.get(len_idx).copied().flatten()
+        } else {
+            self.len_test.get(len_idx).copied().flatten()
+        };
+        if by_len.is_some() {
+            return by_len;
+        }
         if is_train {
             self.global_train
         } else {
@@ -269,10 +536,69 @@ impl RuleNullPenaltyLookup {
         let saw_signal = prev.global_train.is_some()
             || self.global_train.is_some()
             || prev.global_test.is_some()
-            || self.global_test.is_some();
+            || self.global_test.is_some()
+            || prev.bucket_train.iter().any(|x| x.is_some())
+            || self.bucket_train.iter().any(|x| x.is_some())
+            || prev.bucket_test.iter().any(|x| x.is_some())
+            || self.bucket_test.iter().any(|x| x.is_some())
+            || prev.group_len_train.iter().any(|x| x.is_some())
+            || self.group_len_train.iter().any(|x| x.is_some())
+            || prev.group_len_test.iter().any(|x| x.is_some())
+            || self.group_len_test.iter().any(|x| x.is_some())
+            || prev.len_train.iter().any(|x| x.is_some())
+            || self.len_train.iter().any(|x| x.is_some())
+            || prev.len_test.iter().any(|x| x.is_some())
+            || self.len_test.iter().any(|x| x.is_some());
+        let bucket_train_converged = self
+            .bucket_train
+            .iter()
+            .zip(prev.bucket_train.iter())
+            .all(|(curr, old)| penalty_value_converged(*old, *curr));
+        let bucket_test_converged = self
+            .bucket_test
+            .iter()
+            .zip(prev.bucket_test.iter())
+            .all(|(curr, old)| penalty_value_converged(*old, *curr));
+        let group_len_train_converged = self
+            .group_len_train
+            .iter()
+            .zip(prev.group_len_train.iter())
+            .all(|(curr, old)| penalty_value_converged(*old, *curr));
+        let group_len_test_converged = self
+            .group_len_test
+            .iter()
+            .zip(prev.group_len_test.iter())
+            .all(|(curr, old)| penalty_value_converged(*old, *curr));
+        let len_train_converged = self
+            .len_train
+            .iter()
+            .zip(prev.len_train.iter())
+            .all(|(curr, old)| penalty_value_converged(*old, *curr));
+        let len_test_converged = self
+            .len_test
+            .iter()
+            .zip(prev.len_test.iter())
+            .all(|(curr, old)| penalty_value_converged(*old, *curr));
         saw_signal
+            && bucket_train_converged
+            && bucket_test_converged
+            && group_len_train_converged
+            && group_len_test_converged
+            && len_train_converged
+            && len_test_converged
             && penalty_value_converged(prev.global_train, self.global_train)
             && penalty_value_converged(prev.global_test, self.global_test)
+    }
+
+    pub fn has_signal(&self) -> bool {
+        self.bucket_train.iter().any(|x| x.is_some())
+            || self.bucket_test.iter().any(|x| x.is_some())
+            || self.group_len_train.iter().any(|x| x.is_some())
+            || self.group_len_test.iter().any(|x| x.is_some())
+            || self.global_train.is_some()
+            || self.global_test.is_some()
+            || self.len_train.iter().any(|x| x.is_some())
+            || self.len_test.iter().any(|x| x.is_some())
     }
 
     pub fn train_penalty(&self, bucket: RuleNullBucket) -> Option<f64> {
@@ -281,19 +607,134 @@ impl RuleNullPenaltyLookup {
     pub fn test_penalty(&self, bucket: RuleNullBucket) -> Option<f64> {
         self.penalty_with_fallback(bucket, false)
     }
+
+    pub fn train_score_pvalue_greater(&self, observed_score: f64) -> Option<f64> {
+        self.score_pvalue_greater(observed_score, true)
+    }
+
+    pub fn test_score_pvalue_greater(&self, observed_score: f64) -> Option<f64> {
+        self.score_pvalue_greater(observed_score, false)
+    }
+
+    pub fn summary(&self, is_train: bool) -> Option<RuleNullDistributionSummary> {
+        let stats = if is_train {
+            self.global_train_stats
+        } else {
+            self.global_test_stats
+        }?;
+        let penalty = if is_train {
+            self.global_train
+        } else {
+            self.global_test
+        }?;
+        Some(RuleNullDistributionSummary {
+            quantile: self.quantile,
+            penalty,
+            mean: stats.mean,
+            variance: stats.sample_std * stats.sample_std,
+            n: stats.n,
+        })
+    }
+
+    pub fn len_bucket_count(&self) -> usize {
+        self.len_train.len().max(self.len_test.len())
+    }
+
+    pub fn unit_group_bin_count(&self) -> usize {
+        DEFAULT_RULE_NULL_UNIT_GROUP_BIN_COUNT
+    }
+
+    pub fn len_bucket_summary_by_index(
+        &self,
+        idx: usize,
+        is_train: bool,
+    ) -> Option<RuleNullDistributionSummary> {
+        let (penalty, stats) = if is_train {
+            (
+                self.len_train.get(idx).copied().flatten(),
+                self.len_train_stats.get(idx).copied().flatten(),
+            )
+        } else {
+            (
+                self.len_test.get(idx).copied().flatten(),
+                self.len_test_stats.get(idx).copied().flatten(),
+            )
+        };
+        let penalty = penalty?;
+        let stats = stats?;
+        Some(RuleNullDistributionSummary {
+            quantile: self.quantile,
+            penalty,
+            mean: stats.mean,
+            variance: stats.sample_std * stats.sample_std,
+            n: stats.n,
+        })
+    }
+
+    pub fn group_len_bucket_summary_by_index(
+        &self,
+        unit_group_bin: u8,
+        len_idx: usize,
+        is_train: bool,
+    ) -> Option<RuleNullDistributionSummary> {
+        let idx = rule_null_group_len_bucket_index(
+            unit_group_bin,
+            len_idx.saturating_add(1),
+            self.max_rule_len,
+        );
+        let (penalty, stats) = if is_train {
+            (
+                self.group_len_train.get(idx).copied().flatten(),
+                self.group_len_train_stats.get(idx).copied().flatten(),
+            )
+        } else {
+            (
+                self.group_len_test.get(idx).copied().flatten(),
+                self.group_len_test_stats.get(idx).copied().flatten(),
+            )
+        };
+        let penalty = penalty?;
+        let stats = stats?;
+        Some(RuleNullDistributionSummary {
+            quantile: self.quantile,
+            penalty,
+            mean: stats.mean,
+            variance: stats.sample_std * stats.sample_std,
+            n: stats.n,
+        })
+    }
+
+    fn score_pvalue_greater(&self, observed_score: f64, is_train: bool) -> Option<f64> {
+        let stats = if is_train {
+            self.global_train_stats
+        } else {
+            self.global_test_stats
+        }?;
+        let penalty = if is_train {
+            self.global_train.unwrap_or(0.0)
+        } else {
+            self.global_test.unwrap_or(0.0)
+        };
+        one_sided_t_pvalue_greater(
+            observed_score,
+            stats.mean - penalty,
+            stats.sample_std,
+            stats.n,
+        )
+    }
 }
 
 pub fn bucket_from_rule(rule: &BeamRule, _maf: f64) -> RuleNullBucket {
     RuleNullBucket {
         rule_len: rule.len().max(1),
-        complexity_bin: 0,
+        complexity_bin: rule_null_context_bin(0, 0),
     }
 }
 
 pub fn bucket_from_expr(_expr: &str, rule_len: usize, _maf: f64) -> RuleNullBucket {
     RuleNullBucket {
         rule_len: rule_len.max(1),
-        complexity_bin: 0,
+        complexity_bin: rule_null_context_bin(0, 0),
     }
 }
 
@@ -304,7 +745,7 @@ pub fn bucket_from_rule_with_complexity(
 ) -> RuleNullBucket {
     RuleNullBucket {
         rule_len: rule.len().max(1),
-        complexity_bin: complexity_bin.min((DEFAULT_RULE_NULL_COMPLEXITY_BIN_COUNT - 1) as u8),
+        complexity_bin: complexity_bin.min((DEFAULT_RULE_NULL_CONTEXT_BIN_COUNT - 1) as u8),
     }
 }
 
@@ -657,17 +1098,82 @@ mod tests {
     }
 
     #[test]
-    fn test_penalty_uses_global_q99_across_lengths() {
+    fn test_penalty_uses_length_buckets_with_len3plus_collapsed() {
         let mut cal = RuleNullCalibrator::new();
+        let len1 = b(1);
         let len2 = b(2);
         let len3 = b(3);
-        for v in 1..=40 {
-            cal.insert(len2, v as f64, v as f64);
-            cal.insert(len3, (v * 2) as f64, (v * 2) as f64);
+        let len4 = b(4);
+        for v in 1..=20 {
+            cal.insert(len1, v as f64, v as f64);
+            cal.insert(len2, (100 + v) as f64, (100 + v) as f64);
+            cal.insert(len3, (200 + v) as f64, (200 + v) as f64);
+            cal.insert(len4, (300 + v) as f64, (300 + v) as f64);
         }
         let lookup = cal.finalize();
-        assert_eq!(lookup.train_penalty(len2).unwrap(), 80.0);
-        assert_eq!(lookup.train_penalty(len3).unwrap(), 80.0);
+        assert_eq!(lookup.train_penalty(len1).unwrap(), 20.0);
+        assert_eq!(lookup.train_penalty(len2).unwrap(), 120.0);
+        assert_eq!(lookup.train_penalty(len3).unwrap(), 320.0);
+        assert_eq!(lookup.train_penalty(len4).unwrap(), 320.0);
+    }
+
+    #[test]
+    fn test_finalize_with_custom_quantile_changes_penalty() {
+        let mut cal = RuleNullCalibrator::new();
+        let bk = b(2);
+        for v in 1..=20 {
+            cal.insert(bk, v as f64, v as f64);
+        }
+        let q50 = cal.finalize_with_quantile(0.5);
+        let q99 = cal.finalize_with_quantile(0.99);
+        assert_eq!(q50.quantile(), 0.5);
+        assert_eq!(q50.train_penalty(bk).unwrap(), 10.0);
+        assert_eq!(q99.train_penalty(bk).unwrap(), 20.0);
+    }
+
+    #[test]
+    fn test_test_score_pvalue_greater_is_monotonic() {
+        let mut cal = RuleNullCalibrator::new();
+        let bk = b(1);
+        for v in 1..=20 {
+            cal.insert(bk, v as f64, v as f64);
+        }
+        let lookup = cal.finalize_with_quantile(0.5);
+        let p_low = lookup.test_score_pvalue_greater(8.0).unwrap();
+        let p_mid = lookup.test_score_pvalue_greater(12.0).unwrap();
+        let p_high = lookup.test_score_pvalue_greater(16.0).unwrap();
+        assert!(p_low >= p_mid);
+        assert!(p_mid >= p_high);
+    }
+
+    #[test]
+    fn test_summary_returns_penalty_mean_variance_and_n() {
+        let mut cal = RuleNullCalibrator::new();
+        let bk = b(2);
+        for v in 1..=20 {
+            cal.insert(bk, v as f64, v as f64);
+        }
+        let summary = cal.finalize_with_quantile(0.5).summary(true).unwrap();
+        assert_eq!(summary.quantile, 0.5);
+        assert_eq!(summary.penalty, 10.0);
+        assert!((summary.mean - 10.5).abs() < 1e-12);
+        assert!((summary.variance - 35.0).abs() < 1e-12);
+        assert_eq!(summary.n, 20);
+    }
+
+    #[test]
+    fn test_len_bucket_summary_returns_penalty_mean_and_n() {
+        let mut cal = RuleNullCalibrator::new();
+        let len3 = b(3);
+        let len4 = b(4);
+        for v in 1..=20 {
+            cal.insert(len3, (200 + v) as f64, (200 + v) as f64);
+            cal.insert(len4, (300 + v) as f64, (300 + v) as f64);
+        }
+        let summary = cal.finalize().len_bucket_summary_by_index(2, true).unwrap();
+        assert_eq!(summary.penalty, 320.0);
+        assert!((summary.mean - 260.5).abs() < 1e-12);
+        assert_eq!(summary.n, 40);
     }
 
     #[test]
@@ -710,7 +1216,35 @@ mod tests {
 
     #[test]
     fn test_rule_null_bucket_count() {
-        assert_eq!(rule_null_bucket_count(5), 5);
+        assert_eq!(
+            rule_null_bucket_count(5),
+            5 * DEFAULT_RULE_NULL_CONTEXT_BIN_COUNT
+        );
+    }
+
+    #[test]
+    fn test_group_len_penalty_stays_stratified_by_unit_group_bin() {
+        let mut cal = RuleNullCalibrator::new();
+        let w1_len2 = RuleNullBucket {
+            rule_len: 2,
+            complexity_bin: rule_null_context_bin(0, 0),
+        };
+        let w2_len2 = RuleNullBucket {
+            rule_len: 2,
+            complexity_bin: rule_null_context_bin(0, 1),
+        };
+        for v in 1..=20 {
+            cal.insert(w1_len2, v as f64, v as f64);
+            cal.insert(w2_len2, (100 + v) as f64, (100 + v) as f64);
+        }
+        let lookup = cal.finalize();
+        assert_eq!(lookup.train_penalty(w1_len2).unwrap(), 20.0);
+        assert_eq!(lookup.train_penalty(w2_len2).unwrap(), 120.0);
+        let w2_summary = lookup
+            .group_len_bucket_summary_by_index(1, 1, true)
+            .unwrap();
+        assert_eq!(w2_summary.penalty, 120.0);
+        assert_eq!(w2_summary.n, 20);
     }
 
     #[test]

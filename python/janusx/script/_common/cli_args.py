@@ -364,8 +364,8 @@ def _resolve_grm_file_help(profile: str) -> str:
             "uses this matrix on the aligned sample set instead of rebuilding GRM from BED."
         ),
         "background_kernel": (
-            "Optional precomputed GRM/kernel (.npy or text). If set, background effects are "
-            "drawn from this kernel instead of marker-wise genotype effects."
+            "Optional precomputed GRM/kernel (.npy or text). If set, background breeding values "
+            "are drawn directly from this sample-space covariance instead of rebuilding it from genotype."
         ),
     }
     if key not in table:

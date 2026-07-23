@@ -8,6 +8,7 @@ Python is kept as the orchestration / CLI layer and optional plotting hook.
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import socket
 import time
@@ -16,7 +17,9 @@ from typing import Any, Callable, Literal, Optional
 
 import numpy as np
 
-from janusx.gfreader import inspect_genotype_file
+from janusx.assoc.workflow import load_or_build_grm_with_cache
+from janusx.assoc.workflow_cache import _gwas_cache_prefix_with_params
+from janusx.gfreader import inspect_genotype_file, prepare_cli_input_cache
 from janusx.janusx import g2p_simulate
 
 from ._common.cli_args import (
@@ -39,7 +42,8 @@ from ._common.pathcheck import (
     ensure_plink_prefix_exists,
     format_path_for_display,
 )
-from ._common.progress import CliStatus, ProgressAdapter, format_elapsed, log_success
+from ._common.progress import CliStatus, ProgressAdapter, format_elapsed, log_success, stdout_is_tty
+from ._common.threads import detect_effective_threads
 
 
 def _parse_bimrange(text: str) -> tuple[str, int, int]:
@@ -59,40 +63,15 @@ def _parse_bimrange(text: str) -> tuple[str, int, int]:
     return chrom, start, end
 
 
-def _parse_logic_gate_size(text: str) -> tuple[int, int, int]:
-    raw = str(text).strip()
-    if raw == "":
-        raise ValueError("Empty logic-gate size spec.")
-    if "," in raw:
-        left, right = raw.split(",", 1)
-        k = int(left)
-        pair = int(right)
-    else:
-        k = int(raw)
-        pair = 1
-    if k <= 0:
-        raise ValueError("Logic-gate site count must be > 0.")
-    if pair <= 0:
-        raise ValueError("Logic-gate count must be > 0.")
-    return k, k, pair
-
-
-def _resolve_distribution(
-    args: argparse.Namespace,
-) -> tuple[str, float, float, float]:
-    if args.gamma_shape is not None:
-        shape = float(args.gamma_shape)
-        return "gamma", shape, 1.0, 1.0
-    return "normal", 1.0, 1.0, 1.0
-
-
 def _resolve_logic_config(
     args: argparse.Namespace,
 ) -> tuple[Optional[str], Optional[int], int, int, Optional[int]]:
     if args.logic_gate is not None:
-        k_min, k_max, gate_count = _parse_logic_gate_size(str(args.logic_gate[0]))
-        logic_mode = str(args.logic_gate[1]).strip().lower()
-        return logic_mode, gate_count, k_min, k_max, None
+        gate_size = int(args.causal)
+        if gate_size <= 0:
+            raise ValueError("`--causal` must be > 0 when `--logic-gate` is enabled.")
+        logic_mode = str(args.logic_gate).strip().lower()
+        return logic_mode, 1, gate_size, gate_size, None
     return None, None, 2, 2, None
 
 
@@ -118,6 +97,102 @@ def _estimate_simulation_scan_passes(
     )
     needs_causal_scan = effective_term_count > 0 and causal_pve_target > 0.0
     return 1 + int(needs_causal_scan)
+
+
+def _align_square_matrix_to_ids(
+    matrix: np.ndarray,
+    source_ids: Optional[list[str] | np.ndarray],
+    target_ids: list[str] | np.ndarray,
+    *,
+    label: str,
+) -> np.ndarray:
+    target = [str(x) for x in target_ids]
+    arr = np.asarray(matrix, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[0] != arr.shape[1]:
+        raise ValueError(f"{label} must be square, got shape={arr.shape}")
+    if source_ids is None:
+        if arr.shape[0] != len(target):
+            raise ValueError(
+                f"{label} shape {arr.shape} does not match target sample count {len(target)}."
+            )
+        return np.asarray(arr, dtype=np.float64, order="C")
+
+    source = [str(x) for x in source_ids]
+    if len(source) != arr.shape[0]:
+        raise ValueError(
+            f"{label} ID count mismatch: matrix n={arr.shape[0]} but ids={len(source)}."
+        )
+    if source == target:
+        return np.asarray(arr, dtype=np.float64, order="C")
+
+    index = {sid: i for i, sid in enumerate(source)}
+    missing = [sid for sid in target if sid not in index]
+    if missing:
+        preview = ", ".join(missing[:5])
+        extra = "" if len(missing) <= 5 else f" ... (+{len(missing) - 5} more)"
+        raise ValueError(f"{label} is missing target sample IDs: {preview}{extra}")
+    order = np.asarray([index[sid] for sid in target], dtype=np.intp)
+    return np.asarray(arr[np.ix_(order, order)], dtype=np.float64, order="C")
+
+
+def _load_or_build_background_grm_auto(
+    *,
+    gfile: str,
+    sample_ids: np.ndarray,
+    n_sites: int,
+    maf: float,
+    geno: float,
+    het: float,
+    out_dir: str | None,
+    logger: logging.Logger | None,
+    prefer_plink_source: bool,
+    threads: int,
+) -> tuple[np.ndarray, Optional[str], str]:
+    logger_use = logger if logger is not None else logging.getLogger(__name__)
+    grm_input = str(gfile)
+    if not bool(prefer_plink_source):
+        delim = "," if str(grm_input).lower().endswith(".csv") else None
+        grm_input = str(
+            prepare_cli_input_cache(
+                str(grm_input),
+                snps_only=False,
+                delimiter=delim,
+                prefer_plink_for_txt=True,
+                threads=int(max(1, int(threads))),
+            )
+        )
+    cache_prefix = _gwas_cache_prefix_with_params(
+        str(gfile),
+        maf=float(maf),
+        geno=float(geno),
+        snps_only=False,
+        cache_dir=(None if out_dir is None else str(out_dir)),
+        logger=logger_use,
+    )
+    grm_all, _eff_m, grm_ids, grm_cache_path = load_or_build_grm_with_cache(
+        genofile=str(grm_input),
+        cache_prefix=cache_prefix,
+        mgrm="1",
+        maf_threshold=float(maf),
+        max_missing_rate=float(geno),
+        het_threshold=float(het),
+        chunk_size=65536,
+        memory_mb=1024.0,
+        threads=int(max(1, int(threads))),
+        logger=logger_use,
+        use_spinner=bool(stdout_is_tty()),
+        ids_preloaded=np.asarray(sample_ids, dtype=str),
+        n_snps_preloaded=int(n_sites),
+        snps_only=False,
+        allow_packed_full_load=True,
+    )
+    aligned = _align_square_matrix_to_ids(
+        np.asarray(grm_all, dtype=np.float64),
+        grm_ids,
+        sample_ids,
+        label="Simulation background GRM",
+    )
+    return aligned, grm_cache_path, grm_input
 
 
 def _run_rust_simulation(
@@ -156,9 +231,10 @@ def _run_rust_simulation(
     progress_total_hint: Optional[int] = None,
     progress_every: int = 10_000,
 ) -> dict[str, Any]:
-    # Keep passing `residual_var` for API compatibility. Rust now derives the
-    # effective residual variance as `1 - bg_pve - causal_pve` under the
-    # final-variance PVE definition and ignores this input for variance scaling.
+    # Keep passing `residual_var` for API compatibility. Rust derives the
+    # residual variance target as `1 - bg_pve - causal_pve` under the
+    # final-variance PVE definition and samples background / residual terms on
+    # the expectation scale from that target.
     fixed_path = f"{outprefix}.fixed.effects.tsv" if (outprefix and write_effect_tables) else None
     random_path = (
         f"{outprefix}.random.effects.tsv" if (outprefix and write_effect_tables) else None
@@ -230,8 +306,34 @@ def simulate_phenotype_from_genofile(
     and_max_iter: int = 100,
     logic_effect_model: Literal["gate", "centered_interaction"] = "gate",
 ) -> tuple[np.ndarray, list[tuple[str, int, int]]]:
-    logic_mode = "and" if str(mode).lower() == "garfield" else None
+    logic_mode = "a" if str(mode).lower() == "garfield" else None
     gate_count = 1 if logic_mode is not None else None
+    grm = None
+    if float(pve) > 0.0:
+        sample_ids, n_sites = inspect_genotype_file(
+            gfile,
+            snps_only=False,
+            maf=float(maf),
+            missing_rate=float(missing_rate),
+            het=1.0 if het is None else float(het),
+        )
+        sample_ids = np.asarray(sample_ids, dtype=str)
+        prefer_plink_source = bool(
+            str(gfile).lower().endswith(".bed")
+            or os.path.exists(f"{gfile}.bed")
+        )
+        grm, _grm_cache_path, _grm_input = _load_or_build_background_grm_auto(
+            gfile=str(gfile),
+            sample_ids=sample_ids,
+            n_sites=int(n_sites),
+            maf=float(maf),
+            geno=float(missing_rate),
+            het=1.0 if het is None else float(het),
+            out_dir=None,
+            logger=None,
+            prefer_plink_source=prefer_plink_source,
+            threads=int(detect_effective_threads()),
+        )
     res = _run_rust_simulation(
         gfile=gfile,
         seed=int(seed),
@@ -261,7 +363,7 @@ def simulate_phenotype_from_genofile(
         outprefix=None,
         trait_name=None,
         write_effect_tables=False,
-        grm=None,
+        grm=grm,
         snps_only=False,
     )
     y = np.asarray(res["phenotype"], dtype=np.float64).reshape(-1, 1)
@@ -337,13 +439,15 @@ def _histogram_edges(values: np.ndarray) -> np.ndarray:
 
 
 def _background_effect_label(background_source: str) -> str:
-    if str(background_source).strip().lower() == "grm":
+    low = str(background_source).strip().lower()
+    if "grm" in low or "kernel" in low or "sample" in low:
         return "breeding values"
     return "background effects"
 
 
 def _background_effect_axis_label(background_source: str) -> str:
-    if str(background_source).strip().lower() == "grm":
+    low = str(background_source).strip().lower()
+    if "grm" in low or "kernel" in low or "sample" in low:
         return "Breeding value"
     return "Effect"
 
@@ -354,11 +458,12 @@ def _plot_random_effect_distribution(
     out_pdf: str,
     trait_name: str,
     background_dist: str,
-    background_source: str = "marker",
+    background_source: str = "sample_kernel",
     progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> None:
     phase_total = 5
-    is_grm = str(background_source).strip().lower() == "grm"
+    source_low = str(background_source).strip().lower()
+    is_sample_space = ("grm" in source_low) or ("kernel" in source_low) or ("sample" in source_low)
 
     def _report(phase: str, step: int) -> None:
         if progress_callback is not None:
@@ -399,7 +504,7 @@ def _plot_random_effect_distribution(
     curve_ys = None
     curve_color = "#C44E52"
     curve_label = None
-    if is_grm:
+    if is_sample_space:
         _report("fit-normal-curve", 2)
         sigma = float(np.std(effects))
         if effects.size >= 2 and sigma > 1e-12:
@@ -444,8 +549,8 @@ def _plot_random_effect_distribution(
         0.98,
         0.97,
         (
-            f"normal (grm), entries={effects.size:,}"
-            if str(background_source).strip().lower() == "grm"
+            f"gaussian sample-space, entries={effects.size:,}"
+            if is_sample_space
             else f"{background_dist}, entries={effects.size:,}"
         ),
         transform=ax_hist.transAxes,
@@ -472,7 +577,7 @@ def build_parser() -> argparse.ArgumentParser:
             [
                 "jx sim -bfile geno_prefix -o out -prefix demo",
                 "jx sim -vcf geno.vcf.gz -causal 3 -cs-pve 0.15 -o out",
-                "jx sim -bfile geno_prefix -logic-gate 3,2 and -bg-pve 0.4 -o out",
+                "jx sim -bfile geno_prefix -logic-gate a -causal 3 -bg-pve 0.4 -o out",
                 "jx sim -bfile geno_prefix -k panel.grm.npy -o out -prefix demo",
             ]
         ),
@@ -484,7 +589,6 @@ def build_parser() -> argparse.ArgumentParser:
     filter_group = parser.add_argument_group("Genotype filtering")
     pve_group = parser.add_argument_group("Variance / PVE model")
     causal_group = parser.add_argument_group("Causal terms")
-    bg_group = parser.add_argument_group("Background effect distribution")
 
     geno_group = required_group.add_mutually_exclusive_group(required=True)
     add_common_genotype_source_args(geno_group, include_file=True, help_profile="default")
@@ -496,13 +600,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         dest="grm",
         help_profile="background_kernel",
-    )
-    optional_group.add_argument(
-        "-kid",
-        "--grm-id",
-        type=str,
-        default=None,
-        help="Optional GRM sample ID file. Default auto-detect: <grm>.id.",
     )
     optional_group.add_argument("--seed", type=int, default=None, help="Random seed. If omitted, use current time.")
 
@@ -527,29 +624,22 @@ def build_parser() -> argparse.ArgumentParser:
     pve_group.add_argument(
         "-bg-pve",
         "--bg-pve",
-        "-pve",
-        "--pve",
-        "--polygenic-pve",
         dest="bg_pve",
         type=float,
         default=0.5,
         help=(
-            "Background/polygenic variance contribution Var(Mg) in the final phenotype. "
+            "Background/polygenic variance contribution Var(u_bg) in the final phenotype. "
             "Together with --cs-pve, this determines effective residual variance as "
             "1 - bg_pve - cs_pve. Default: %(default)s."
         ),
     )
-    pve_group.add_argument(
-        "-ve",
-        "--ve",
-        type=float,
-        default=1.0,
-        help=(
-            "Deprecated compatibility input. Ignored for variance scaling under the "
-            "final-variance PVE definition; effective VE is 1 - bg_pve - cs_pve."
-        ),
+    causal_group.add_argument(
+        "-causal",
+        "--causal",
+        type=int,
+        default=1,
+        help="Number of causal SNP terms to sample; with --logic-gate, also sets gate size.",
     )
-    causal_group.add_argument("-causal", "--causal", type=int, default=1, help="Number of causal SNP terms to sample.")
     causal_group.add_argument(
         "-cs-pve",
         "--cs-pve",
@@ -563,12 +653,13 @@ def build_parser() -> argparse.ArgumentParser:
     causal_group.add_argument(
         "-logic-gate",
         "--logic-gate",
-        nargs=2,
-        metavar=("SIZE", "MODE"),
+        type=str,
+        metavar="MODE",
+        choices=["a", "na", "an", "nan", "r"],
         default=None,
         help=(
-            "Logic-gate causal terms. SIZE is k or k,count; MODE is and|or|and_or. "
-            "Example: -logic-gate 3,2 and."
+            "Logic-gate causal terms. MODE is one of a|na|an|nan|r, and gate size is "
+            "controlled by --causal. Example: -logic-gate a -causal 3."
         ),
     )
     causal_group.add_argument(
@@ -595,31 +686,6 @@ def build_parser() -> argparse.ArgumentParser:
     #     action="store_true",
     #     help="Use normal background effects g₀ᵢ ~ N(0,1). This is the default.",
     # )
-    bg_group.add_argument(
-        "-gamma",
-        "--gamma",
-        dest="gamma_shape",
-        type=float,
-        metavar="SHAPE",
-        default=None,
-        help=(
-            "Use signed-gamma background effects with random sign. "
-            "SHAPE must be in (0, 1]; SHAPE=1 is Laplace-like. "
-            "The Gamma scale θ is fixed to 1. "
-            "If omitted, normal background effects g₀ᵢ ~ N(0,1) are used."
-        ),
-    )
-    
-    # bg_group.add_argument(
-    #     "-laplace",
-    #     "--laplace",
-    #     dest="laplace_scale",
-    #     nargs=1,
-    #     metavar=("SCALE",),
-    #     default=None,
-    #     help="Use Laplace background effects with the given scale.",
-    # )
-
     return parser
 
 
@@ -631,28 +697,20 @@ def main(argv: Optional[list[str]] = None) -> int:
     outstem = str(args.prefix).strip() if args.prefix is not None else prefix
     outprefix = os.path.join(args.out, outstem)
     os.makedirs(args.out, exist_ok=True, mode=0o755)
-    configure_genotype_cache_from_out(args.out)
+    cache_dir = configure_genotype_cache_from_out(args.out)
 
     log_path = f"{outprefix}.sim.log"
     logger = setup_logging(log_path)
 
     seed = int(args.seed) if args.seed is not None else int(time.time()) & 0x7FFFFFFF
     bimranges = [_parse_bimrange(x) for x in list(args.bimrange or [])]
-    bg_dist, gamma_shape, gamma_scale, laplace_scale = _resolve_distribution(args)
-    requested_bg_dist = bg_dist
-    grm_forced_normal = bool(args.grm and bg_dist != "normal")
-    if args.grm:
-        bg_dist = "normal"
-        gamma_shape = 1.0
-        gamma_scale = 1.0
-        laplace_scale = 1.0
-    if bg_dist == "gamma":
-        if not (0.0 < float(gamma_shape) <= 1.0):
-            logger.error("--gamma SHAPE must be in (0, 1].")
-            raise SystemExit(1)
-    logic_mode, logic_gate_count, logic_k_min, logic_k_max, logic_window_bp = (
-        _resolve_logic_config(args)
-    )
+    try:
+        logic_mode, logic_gate_count, logic_k_min, logic_k_max, logic_window_bp = (
+            _resolve_logic_config(args)
+        )
+    except ValueError as exc:
+        logger.error("%s", exc)
+        raise SystemExit(2) from exc
     cs_pve = float(args.cs_pve) if args.cs_pve is not None else None
     logic_ld_max = 1.0
     logic_het_max = 1.0
@@ -675,18 +733,29 @@ def main(argv: Optional[list[str]] = None) -> int:
                     ("Missing threshold", args.geno),
                     ("Het threshold", "None" if args.het is None else args.het),
                     ("Background PVE", args.bg_pve),
-                    ("Residual input (deprecated)", args.ve),
                     ("Background GRM", args.grm),
+                    (
+                        "Background path",
+                        (
+                            "external GRM"
+                            if args.grm
+                            else (
+                                "auto cached GRM"
+                                if float(args.bg_pve) > 0.0
+                                else "none (bg_pve=0)"
+                            )
+                        ),
+                    ),
                     ("Causal count", args.causal),
                     ("Causal PVE", cs_pve),
-                    ("Logic gate", "None" if logic_mode is None else f"{logic_mode} ({logic_k_min},{logic_k_max})"),
+                    ("Logic gate", "None" if logic_mode is None else logic_mode),
+                    ("Logic gate size", logic_k_min if logic_mode is not None else "None"),
                     ("Logic gate count", logic_gate_count),
                     ("Logic window bp", logic_window_bp),
                     ("Logic effect model", logic_effect_model if logic_mode is not None else "None"),
-                    ("Background dist", bg_dist),
+                    ("Background dist", "gaussian sample-space"),
+                    ("Sampling scale", "expectation-scale"),
                     ("SNPs only", False),
-                    ("Gamma shape", gamma_shape if bg_dist == "gamma" else "None"),
-                    # ("Laplace scale", laplace_scale if bg_dist == "laplace" else "None"),
                     ("BIM ranges", len(bimranges)),
                     ("Seed", seed),
                 ],
@@ -705,13 +774,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         checks.append(ensure_file_exists(logger, gfile, "Genotype file"))
     if args.grm:
         checks.append(ensure_file_exists(logger, args.grm, "Background GRM"))
-    if args.grm_id:
-        checks.append(ensure_file_exists(logger, args.grm_id, "Background GRM ID file"))
     if not ensure_all_true(checks):
         raise SystemExit(1)
 
     if not (0.0 <= float(args.bg_pve) <= 1.0):
-        logger.error("--bg-pve/--pve must be in [0, 1].")
+        logger.error("--bg-pve must be in [0, 1].")
         raise SystemExit(1)
     if args.het is not None and not (0.0 <= float(args.het) <= 1.0):
         logger.error("--het must be in [0, 1].")
@@ -740,6 +807,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         task.complete("Inspecting genotype input ...Finished")
     sample_ids = np.asarray(sample_ids, dtype=str)
+    detected_threads = int(detect_effective_threads())
 
     aligned_grm = None
     if args.grm:
@@ -747,7 +815,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             aligned_grm, resolved_grm_id = load_and_align_grm(
                 str(args.grm),
                 sample_ids.tolist(),
-                grm_id_path=args.grm_id,
+                grm_id_path=None,
                 label="Background GRM",
             )
             task.complete("Loading background GRM ...Finished")
@@ -760,12 +828,25 @@ def main(argv: Optional[list[str]] = None) -> int:
                 else " (sample order assumed to match genotype input)"
             ),
         )
-        if grm_forced_normal:
-            logger.warning(
-                "Background distribution '%s' is ignored when --grm is provided; JanusX switches to Gaussian sample-level breeding values from the GRM.",
-                requested_bg_dist,
-            )
-
+    elif float(args.bg_pve) > 0.0:
+        aligned_grm, grm_cache_path, grm_input = _load_or_build_background_grm_auto(
+            gfile=str(gfile),
+            sample_ids=sample_ids,
+            n_sites=int(n_sites),
+            maf=float(args.maf),
+            geno=float(args.geno),
+            het=1.0 if args.het is None else float(args.het),
+            out_dir=str(cache_dir or args.out),
+            logger=logger,
+            prefer_plink_source=bool(args.bfile),
+            threads=int(detected_threads),
+        )
+        logger.info(
+            "Background GRM mode: using auto cached cGRM from %s (source=%s, threads=%d).",
+            format_path_for_display(str(grm_cache_path or "[memory]")),
+            format_path_for_display(str(grm_input)),
+            int(detected_threads),
+        )
     scan_passes = _estimate_simulation_scan_passes(
         causal_count=int(args.causal),
         cs_pve=cs_pve,
@@ -782,18 +863,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         force_animate=True,
     )
     progress_state = {"last_done": 0, "stage": "background"}
-    stage_label = {
-        "background": "background",
-        "causal_additive": "causal-additive",
-        "causal_logic": "causal-logic",
-        "finalize": "finalize",
-    }
-    stage_pass = {
-        "background": 1,
-        "causal_additive": min(2, max(1, scan_passes)),
-        "causal_logic": min(2, max(1, scan_passes)),
-        "finalize": max(1, scan_passes),
-    }
 
     def _simulation_progress(stage: str, done: int, total: int) -> None:
         stage_key = str(stage)
@@ -802,34 +871,34 @@ def main(argv: Optional[list[str]] = None) -> int:
         if stage_key != progress_state["stage"]:
             progress_state["stage"] = stage_key
         if total_now > 0:
+            if int(getattr(sim_pbar, "total", 0)) != total_now:
+                sim_pbar.set_total(total_now)
             done_now = max(0, min(done_now, total_now))
         delta = done_now - int(progress_state["last_done"])
         if delta > 0:
             sim_pbar.update(delta)
             progress_state["last_done"] = done_now
-        if progress_total_hint > 0 and stage_key == "background":
-            stage_done_now = min(done_now, progress_total_hint)
-            stage_total_now = progress_total_hint
-        elif progress_total_hint > 0 and stage_key in ("causal_additive", "causal_logic"):
-            stage_done_now = max(0, done_now - progress_total_hint)
-            stage_total_now = progress_total_hint
+        first_pass_total = (
+            min(progress_total_hint, total_now) if (progress_total_hint > 0 and total_now > 0) else 0
+        )
+        if stage_key == "background":
+            stage_total_now = first_pass_total if first_pass_total > 0 else total_now
+            stage_done_now = min(done_now, stage_total_now) if stage_total_now > 0 else done_now
+        elif stage_key in ("causal_additive", "causal_logic"):
+            stage_done_now = max(0, done_now - first_pass_total)
+            stage_total_now = max(0, total_now - first_pass_total)
         elif stage_key == "finalize":
             stage_done_now = 1
             stage_total_now = 1
         else:
             stage_done_now = done_now
             stage_total_now = total_now
-        pass_idx = int(stage_pass.get(stage_key, max(1, scan_passes)))
         if stage_total_now > 0:
             sim_pbar.set_postfix(
-                # stage=stage_label.get(stage_key, stage_key),
-                # pass_=f"{pass_idx}/{max(1, scan_passes)}",
                 sites=f"{stage_done_now:,}/{stage_total_now:,}",
             )
         else:
             sim_pbar.set_postfix(
-                # stage=stage_label.get(stage_key, stage_key),
-                # pass_=f"{pass_idx}/{max(1, scan_passes)}",
                 sites=f"{stage_done_now:,}",
             )
 
@@ -842,7 +911,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             missing_rate=float(args.geno),
             het_threshold=None if args.het is None else float(args.het),
             bg_pve=float(args.bg_pve),
-            residual_var=float(args.ve),
+            residual_var=1.0,
             causal=int(args.causal),
             cs_pve=cs_pve,
             bimranges=bimranges,
@@ -857,10 +926,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             logic_max_iter=int(logic_max_iter),
             logic_window_bp=logic_window_bp,
             logic_effect_model=logic_effect_model,
-            background_dist=bg_dist,
-            gamma_shape=float(gamma_shape),
-            gamma_scale=float(gamma_scale),
-            laplace_scale=float(laplace_scale),
+            background_dist="normal",
+            gamma_shape=1.0,
+            gamma_scale=1.0,
+            laplace_scale=1.0,
             outprefix=outprefix,
             trait_name=None,
             write_effect_tables=True,
@@ -878,7 +947,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     random_effects_tsv = f"{outprefix}.random.effects.tsv"
     random_effects_pdf = f"{outprefix}.random.effects.pdf"
     try:
-        vis_source = str(res.get("background_source", "marker"))
+        vis_source = str(res.get("background_source", "none"))
         vis_label = (
             "GRM breeding values"
             if vis_source.strip().lower() == "grm"
@@ -918,8 +987,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 effects_tsv=random_effects_tsv,
                 out_pdf=random_effects_pdf,
                 trait_name=str(res.get("trait_name", "PHENO")),
-                background_dist=str(bg_dist),
-                background_source=str(res.get("background_source", "marker")),
+                background_dist="normal",
+                background_source=str(res.get("background_source", "none")),
                 progress_callback=_visualization_progress,
             )
             vis_success = True
@@ -936,6 +1005,40 @@ def main(argv: Optional[list[str]] = None) -> int:
         res.get("causal_pve"),
         res.get("ve"),
     )
+    realized_summary = res.get("realized_summary")
+    if isinstance(realized_summary, dict):
+        logger.info(
+            "mean(y)=%.6g, var(y)=%.6g.",
+            float(realized_summary.get("mean_y", 0.0)),
+            float(realized_summary.get("var_y", 0.0)),
+        )
+        logger.info(
+            "mean(c)=%.6g, mean(u)=%.6g, mean(e)=%.6g.",
+            float(realized_summary.get("mean_causal", 0.0)),
+            float(realized_summary.get("mean_background", 0.0)),
+            float(realized_summary.get("mean_residual", 0.0)),
+        )
+        logger.info(
+            "var(c)=%.6g, var(u)=%.6g, var(e)=%.6g.",
+            float(realized_summary.get("var_causal", 0.0)),
+            float(realized_summary.get("var_background", 0.0)),
+            float(realized_summary.get("var_residual", 0.0)),
+        )
+        logger.info(
+            "cov(c,u)=%.6g, cov(c,e)=%.6g, cov(u,e)=%.6g.",
+            float(realized_summary.get("cov_causal_background", 0.0)),
+            float(realized_summary.get("cov_causal_residual", 0.0)),
+            float(realized_summary.get("cov_background_residual", 0.0)),
+        )
+        logger.info(
+            "cs=%.6g, bg=%.6g, res=%.6g, sum=%.6g.",
+            float(realized_summary.get("pve_causal", 0.0)),
+            float(realized_summary.get("pve_background", 0.0)),
+            float(realized_summary.get("pve_residual", 0.0)),
+            float(realized_summary.get("pve_causal", 0.0))
+            + float(realized_summary.get("pve_background", 0.0))
+            + float(realized_summary.get("pve_residual", 0.0)),
+        )
     if len(sample_ids) != int(np.asarray(res["phenotype"]).reshape(-1).shape[0]):
         logger.warning("Sample count from inspection differs from Rust phenotype length.")
 

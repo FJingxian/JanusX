@@ -11,12 +11,13 @@ use pyo3::types::PyDict;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
-use rand_distr::{Distribution, Exp, Gamma, StandardNormal};
+use rand_distr::{Distribution, StandardNormal};
 use rayon::prelude::*;
 
-use crate::eigh::symmetric_eigh_f64_row_major;
 use crate::gfcore as core;
 use crate::gfcore::{BedSnpIter, HmpSnpIter, TxtSnpIter, VcfSnpIter};
+use crate::gfreader::prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window;
+use crate::linalg::cholesky_inplace;
 
 #[derive(Clone, Debug)]
 struct SimSiteRecord {
@@ -35,9 +36,11 @@ enum BackgroundDist {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum LogicOp {
-    And,
-    Or,
+enum LogicGateMode {
+    A,
+    Na,
+    An,
+    Nan,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,13 +52,13 @@ enum LogicEffectModel {
 #[derive(Clone, Debug)]
 struct LogicPoolSpec {
     pool_indices: Vec<usize>,
-    op: LogicOp,
+    mode: LogicGateMode,
 }
 
 #[derive(Clone, Debug)]
 struct CausalTerm {
     members: Vec<usize>,
-    op: Option<LogicOp>,
+    mode: Option<LogicGateMode>,
     values: Vec<f64>,
     effect: f64,
     label: String,
@@ -63,6 +66,8 @@ struct CausalTerm {
 
 const SAMPLE_PAR_THRESHOLD: usize = 10_000;
 const SAMPLE_PAR_CHUNK: usize = 4096;
+const DEFAULT_CAUSAL_SERIES_ALPHA: f64 = 0.9;
+const BED_SIM_FAST_WINDOW_MB: usize = 64;
 
 struct G2pSimConfig {
     path_or_prefix: String,
@@ -73,10 +78,6 @@ struct G2pSimConfig {
     seed: u64,
     residual_var: f64,
     bg_pve: f64,
-    background_dist: BackgroundDist,
-    gamma_shape: f64,
-    gamma_scale: f64,
-    laplace_scale: f64,
     causal_count: usize,
     causal_pve: Option<f64>,
     bim_ranges: Vec<(String, i32, i32)>,
@@ -118,6 +119,31 @@ struct G2pSimResult {
     residual_var: f64,
     logic_effect_model: String,
     background_source: String,
+    realized_summary: RealizedSummary,
+}
+
+struct RealizedSummary {
+    mean_y: f64,
+    var_y: f64,
+    mean_causal: f64,
+    mean_background: f64,
+    mean_residual: f64,
+    var_causal: f64,
+    var_background: f64,
+    var_residual: f64,
+    cov_causal_background: f64,
+    cov_causal_residual: f64,
+    cov_background_residual: f64,
+    pve_causal: f64,
+    pve_background: f64,
+    pve_residual: f64,
+}
+
+struct PreparedBedFastPath {
+    prefix: String,
+    sample_ids: Vec<String>,
+    sites: Vec<SimSiteRecord>,
+    row_source_indices: Vec<usize>,
 }
 
 enum SourceReader {
@@ -189,14 +215,27 @@ fn variance_f64(x: &[f64]) -> f64 {
 }
 
 #[inline]
-fn center_inplace(x: &mut [f64]) {
+fn variance_scale_factor(raw_var: f64, target_var: f64) -> f64 {
+    if target_var > 0.0 && raw_var > 1e-12 {
+        (target_var / raw_var).sqrt()
+    } else {
+        0.0
+    }
+}
+
+#[inline]
+fn covariance_f64(x: &[f64], y: &[f64]) -> f64 {
+    debug_assert_eq!(x.len(), y.len());
     if x.is_empty() {
-        return;
+        return 0.0;
     }
-    let mu = mean_f64(x);
-    for v in x.iter_mut() {
-        *v -= mu;
+    let mx = mean_f64(x);
+    let my = mean_f64(y);
+    let mut acc = 0.0_f64;
+    for (&vx, &vy) in x.iter().zip(y.iter()) {
+        acc += (vx - mx) * (vy - my);
     }
+    acc / x.len() as f64
 }
 
 #[inline]
@@ -230,37 +269,6 @@ fn axpy_inplace(dst: &mut [f64], src: &[f64], alpha: f64) {
         for (d, &s) in dst.iter_mut().zip(src.iter()) {
             *d += alpha * s;
         }
-    }
-}
-
-#[inline]
-fn add_scaled_centered_row(dst: &mut [f64], row: &[f32], alpha: f64) {
-    debug_assert_eq!(dst.len(), row.len());
-    if alpha == 0.0 || row.is_empty() {
-        return;
-    }
-    let mu = row.iter().map(|&v| v as f64).sum::<f64>() / row.len() as f64;
-    if dst.len() >= SAMPLE_PAR_THRESHOLD {
-        dst.par_chunks_mut(SAMPLE_PAR_CHUNK)
-            .zip(row.par_chunks(SAMPLE_PAR_CHUNK))
-            .for_each(|(dst_chunk, row_chunk)| {
-                for (d, &v) in dst_chunk.iter_mut().zip(row_chunk.iter()) {
-                    *d += (v as f64 - mu) * alpha;
-                }
-            });
-    } else {
-        for (d, &v) in dst.iter_mut().zip(row.iter()) {
-            *d += (v as f64 - mu) * alpha;
-        }
-    }
-}
-
-#[inline]
-fn background_dist_name(dist: BackgroundDist) -> &'static str {
-    match dist {
-        BackgroundDist::Normal => "normal",
-        BackgroundDist::Gamma => "gamma",
-        BackgroundDist::Laplace => "laplace",
     }
 }
 
@@ -303,34 +311,137 @@ fn validate_grm_matrix(grm: &[f64], n: usize) -> Result<(), String> {
     Ok(())
 }
 
-fn sample_background_effects_from_grm(
+fn spd_cholesky_with_jitter(matrix: &[f64], dim: usize, label: &str) -> Result<Vec<f64>, String> {
+    if matrix.len() != dim.saturating_mul(dim) {
+        return Err(format!(
+            "{label} shape mismatch: got {}, expected {}",
+            matrix.len(),
+            dim.saturating_mul(dim)
+        ));
+    }
+    let mut chol = matrix.to_vec();
+    if cholesky_inplace(&mut chol, dim).is_some() {
+        return Ok(chol);
+    }
+    let diag_scale = (0..dim)
+        .map(|i| matrix[i * dim + i].abs())
+        .fold(1.0_f64, f64::max);
+    for rel in [1e-12_f64, 1e-10_f64, 1e-8_f64, 1e-6_f64, 1e-4_f64] {
+        let jitter = diag_scale * rel;
+        chol.copy_from_slice(matrix);
+        for i in 0..dim {
+            chol[i * dim + i] += jitter;
+        }
+        if cholesky_inplace(&mut chol, dim).is_some() {
+            return Ok(chol);
+        }
+    }
+    Err(format!("{label} is not SPD even after diagonal jitter"))
+}
+
+fn lower_triangular_matvec(l: &[f64], dim: usize, rhs: &[f64]) -> Vec<f64> {
+    debug_assert_eq!(l.len(), dim.saturating_mul(dim));
+    debug_assert_eq!(rhs.len(), dim);
+    let mut out = vec![0.0_f64; dim];
+    for i in 0..dim {
+        let mut acc = 0.0_f64;
+        for j in 0..=i {
+            acc += l[i * dim + j] * rhs[j];
+        }
+        out[i] = acc;
+    }
+    out
+}
+
+fn diag_trace_f64(matrix: &[f64], dim: usize) -> f64 {
+    (0..dim).map(|i| matrix[i * dim + i]).sum::<f64>()
+}
+
+fn build_causal_series_effects(count: usize, alpha: f64, rng: &mut StdRng) -> Vec<f64> {
+    let mut effects = Vec::with_capacity(count);
+    let mut current = alpha;
+    for _ in 0..count {
+        effects.push(current);
+        current *= alpha;
+    }
+    effects.shuffle(rng);
+    effects
+}
+
+fn sample_gaussian_noise_with_variance(n: usize, variance: f64, rng: &mut StdRng) -> Vec<f64> {
+    let mut out = vec![0.0_f64; n];
+    if variance <= 0.0 || n == 0 {
+        return out;
+    }
+    let sd = variance.sqrt();
+    for v in out.iter_mut() {
+        *v = StandardNormal.sample(rng);
+        *v *= sd;
+    }
+    out
+}
+
+fn sample_background_effects_from_grm_trace_scaled(
     grm: &[f64],
     n: usize,
+    target_var: f64,
     rng: &mut StdRng,
 ) -> Result<Vec<f64>, String> {
     validate_grm_matrix(grm, n)?;
-    let (evals, evecs, _backend) = symmetric_eigh_f64_row_major(grm, n)?;
-    if evals.len() != n || evecs.len() != n.saturating_mul(n) {
-        return Err("GRM eigen-decomposition output shape mismatch.".to_string());
+    if target_var <= 0.0 || n == 0 {
+        return Ok(vec![0.0_f64; n]);
     }
+    let trace = diag_trace_f64(grm, n);
+    if !trace.is_finite() || trace <= 0.0 {
+        return Err("GRM trace must be finite and > 0 for trace-scaled sampling.".to_string());
+    }
+    let chol = spd_cholesky_with_jitter(grm, n, "GRM")?;
     let mut z = vec![0.0_f64; n];
     for zi in z.iter_mut() {
         *zi = StandardNormal.sample(rng);
     }
-    let mut rot = vec![0.0_f64; n];
-    for i in 0..n {
-        rot[i] = evals[i].max(0.0).sqrt() * z[i];
+    let mut out = lower_triangular_matvec(&chol, n, &z);
+    let scale = ((n as f64) * target_var / trace).sqrt();
+    for v in out.iter_mut() {
+        *v *= scale;
     }
-    let mut out = vec![0.0_f64; n];
-    for i in 0..n {
-        let mut acc = 0.0_f64;
-        for k in 0..n {
-            acc += evecs[i * n + k] * rot[k];
-        }
-        out[i] = acc;
-    }
-    center_inplace(out.as_mut_slice());
     Ok(out)
+}
+
+fn realized_share(component_var: f64, total_var: f64) -> f64 {
+    if total_var > 1e-12 {
+        component_var / total_var
+    } else {
+        0.0
+    }
+}
+
+fn build_realized_summary(
+    y: &[f64],
+    causal: &[f64],
+    background: &[f64],
+    residual: &[f64],
+) -> RealizedSummary {
+    let var_y = variance_f64(y);
+    let var_causal = variance_f64(causal);
+    let var_background = variance_f64(background);
+    let var_residual = variance_f64(residual);
+    RealizedSummary {
+        mean_y: mean_f64(y),
+        var_y,
+        mean_causal: mean_f64(causal),
+        mean_background: mean_f64(background),
+        mean_residual: mean_f64(residual),
+        var_causal,
+        var_background,
+        var_residual,
+        cov_causal_background: covariance_f64(causal, background),
+        cov_causal_residual: covariance_f64(causal, residual),
+        cov_background_residual: covariance_f64(background, residual),
+        pve_causal: realized_share(var_causal, var_y),
+        pve_background: realized_share(var_background, var_y),
+        pve_residual: realized_share(var_residual, var_y),
+    }
 }
 
 fn collapse_to_logic_bin01(row: &[f32], het_max: f64) -> Option<Vec<u8>> {
@@ -411,39 +522,87 @@ fn binary_r2(a: &[u8], b: &[u8]) -> f64 {
     }
 }
 
-fn logic_gate_indicator(rows: &[Vec<u8>], op: LogicOp) -> Vec<u8> {
+#[inline]
+fn logic_mode_code(mode: LogicGateMode) -> &'static str {
+    match mode {
+        LogicGateMode::A => "a",
+        LogicGateMode::Na => "na",
+        LogicGateMode::An => "an",
+        LogicGateMode::Nan => "nan",
+    }
+}
+
+#[inline]
+fn logic_member_negated(mode: LogicGateMode, idx: usize) -> bool {
+    match mode {
+        LogicGateMode::A | LogicGateMode::Na => false,
+        LogicGateMode::An => idx > 0,
+        LogicGateMode::Nan => true,
+    }
+}
+
+#[inline]
+fn logic_output_negated(mode: LogicGateMode) -> bool {
+    matches!(mode, LogicGateMode::Na)
+}
+
+fn logic_gate_literal_rows(rows: &[Vec<u8>], mode: LogicGateMode) -> Result<Vec<Vec<u8>>, String> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let n = rows[0].len();
+    let mut out = Vec::with_capacity(rows.len());
+    for (row_idx, row) in rows.iter().enumerate() {
+        if row.len() != n {
+            return Err("logic gate member rows have inconsistent sample lengths".to_string());
+        }
+        let negated = logic_member_negated(mode, row_idx);
+        let literal = row
+            .iter()
+            .map(|&v| {
+                let bit = if v == 0 { 0u8 } else { 1u8 };
+                if negated {
+                    1u8 - bit
+                } else {
+                    bit
+                }
+            })
+            .collect::<Vec<_>>();
+        out.push(literal);
+    }
+    Ok(out)
+}
+
+fn logic_gate_indicator_from_literals(rows: &[Vec<u8>], output_negated: bool) -> Vec<u8> {
     if rows.is_empty() {
         return Vec::new();
     }
     let n = rows[0].len();
     let mut raw = vec![0u8; n];
-    match op {
-        LogicOp::And => {
-            for i in 0..n {
-                let mut ok = true;
-                for row in rows.iter() {
-                    if row[i] == 0 {
-                        ok = false;
-                        break;
-                    }
-                }
-                raw[i] = if ok { 1u8 } else { 0u8 };
+    for i in 0..n {
+        let mut ok = true;
+        for row in rows.iter() {
+            if row[i] == 0 {
+                ok = false;
+                break;
             }
         }
-        LogicOp::Or => {
-            for i in 0..n {
-                let mut ok = false;
-                for row in rows.iter() {
-                    if row[i] != 0 {
-                        ok = true;
-                        break;
-                    }
-                }
-                raw[i] = if ok { 1u8 } else { 0u8 };
-            }
+        raw[i] = if ok { 1u8 } else { 0u8 };
+    }
+    if output_negated {
+        for v in raw.iter_mut() {
+            *v = 1u8 - *v;
         }
     }
     raw
+}
+
+fn logic_gate_indicator(rows: &[Vec<u8>], mode: LogicGateMode) -> Result<Vec<u8>, String> {
+    let literal_rows = logic_gate_literal_rows(rows, mode)?;
+    Ok(logic_gate_indicator_from_literals(
+        literal_rows.as_slice(),
+        logic_output_negated(mode),
+    ))
 }
 
 fn logic_gate_centered_values(indicator: &[u8]) -> Vec<f64> {
@@ -556,24 +715,31 @@ fn residualize_logic_indicator_against_main_effects(
     Ok(resid)
 }
 
-fn term_label(sites: &[SimSiteRecord], members: &[usize], op: Option<LogicOp>) -> String {
-    let joiner = match op {
-        Some(LogicOp::And) => "&",
-        Some(LogicOp::Or) => "|",
-        None => "",
-    };
+fn term_label(sites: &[SimSiteRecord], members: &[usize], mode: Option<LogicGateMode>) -> String {
     let mut parts: Vec<String> = Vec::with_capacity(members.len());
-    for &idx in members.iter() {
+    for (member_idx, &idx) in members.iter().enumerate() {
         let s = &sites[idx];
-        parts.push(format!(
-            "{}_{}[{}>{}]",
-            s.chrom, s.pos, s.ref_allele, s.alt_allele
-        ));
+        let base = format!("{}_{}[{}>{}]", s.chrom, s.pos, s.ref_allele, s.alt_allele);
+        parts.push(
+            if mode
+                .map(|gate_mode| logic_member_negated(gate_mode, member_idx))
+                .unwrap_or(false)
+            {
+                format!("!{base}")
+            } else {
+                base
+            },
+        );
     }
-    if joiner.is_empty() {
-        parts.join("")
+    if let Some(gate_mode) = mode {
+        let expr = parts.join("&");
+        if logic_output_negated(gate_mode) {
+            format!("!({expr})")
+        } else {
+            expr
+        }
     } else {
-        parts.join(joiner)
+        parts.join("")
     }
 }
 
@@ -676,6 +842,210 @@ where
         kept = kept.saturating_add(1);
     }
     Ok(sample_ids)
+}
+
+#[inline]
+fn is_plink_bed_prefix_available(path_or_prefix: &str) -> Option<String> {
+    let prefix = normalize_plink_prefix_local(path_or_prefix.trim());
+    if prefix.is_empty() {
+        return None;
+    }
+    if Path::new(&(prefix.clone() + ".bed")).exists()
+        && Path::new(&(prefix.clone() + ".bim")).exists()
+        && Path::new(&(prefix.clone() + ".fam")).exists()
+    {
+        Some(prefix)
+    } else {
+        None
+    }
+}
+
+fn build_kept_bed_sites(
+    prefix: &str,
+    site_keep: &[bool],
+    kept_alt_freq: &[f32],
+) -> Result<Vec<SimSiteRecord>, String> {
+    let sites_all = core::read_bim(prefix)?;
+    if sites_all.len() != site_keep.len() {
+        return Err(format!(
+            "BED/BIM keep-mask mismatch: keep_mask={}, bim_rows={}",
+            site_keep.len(),
+            sites_all.len()
+        ));
+    }
+    let mut kept_idx = 0usize;
+    let mut out = Vec::with_capacity(kept_alt_freq.len());
+    for (src_idx, site) in sites_all.into_iter().enumerate() {
+        if !site_keep[src_idx] {
+            continue;
+        }
+        let alt_freq = kept_alt_freq
+            .get(kept_idx)
+            .copied()
+            .ok_or_else(|| format!("kept alt-frequency missing for kept site index {kept_idx}"))?;
+        let flip = alt_freq > 0.5_f32;
+        let (ref_allele, alt_allele) = if flip {
+            (site.alt_allele, site.ref_allele)
+        } else {
+            (site.ref_allele, site.alt_allele)
+        };
+        out.push(SimSiteRecord {
+            chrom: site.chrom.clone(),
+            chrom_norm: normalize_chrom(&site.chrom),
+            pos: site.pos,
+            ref_allele,
+            alt_allele,
+        });
+        kept_idx = kept_idx.saturating_add(1);
+    }
+    if kept_idx != kept_alt_freq.len() {
+        return Err(format!(
+            "kept alt-frequency count mismatch after BIM filter: used={}, expected={}",
+            kept_idx,
+            kept_alt_freq.len()
+        ));
+    }
+    Ok(out)
+}
+
+fn try_prepare_bed_fast_path(
+    path_or_prefix: &str,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: Option<f32>,
+    snps_only: bool,
+    allow_fast_path: bool,
+) -> Result<Option<PreparedBedFastPath>, String> {
+    if !allow_fast_path {
+        return Ok(None);
+    }
+    let Some(prefix) = is_plink_bed_prefix_available(path_or_prefix) else {
+        return Ok(None);
+    };
+    let sample_ids = core::read_fam(&prefix)?;
+    if sample_ids.is_empty() {
+        return Err("no samples found in PLINK input after BED fast-path prep".to_string());
+    }
+    let prepared = prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window(
+        &prefix,
+        maf_threshold,
+        max_missing_rate,
+        het_threshold.unwrap_or(1.0_f32),
+        snps_only,
+        None,
+        true,
+        Some(BED_SIM_FAST_WINDOW_MB),
+        rayon::current_num_threads().max(1),
+    )?;
+    if prepared.n_samples != sample_ids.len() {
+        return Err(format!(
+            "BED fast-path sample count mismatch: fam={}, prepared={}",
+            sample_ids.len(),
+            prepared.n_samples
+        ));
+    }
+    let sites = build_kept_bed_sites(
+        &prefix,
+        prepared.site_keep.as_slice(),
+        prepared.maf.as_slice(),
+    )?;
+    Ok(Some(PreparedBedFastPath {
+        prefix,
+        sample_ids,
+        sites,
+        row_source_indices: prepared.row_source_indices,
+    }))
+}
+
+fn orient_and_impute_minor_coded_row_inplace(
+    row: &mut [f32],
+    raw_alt_sum: f64,
+    non_missing: usize,
+) -> Result<(), String> {
+    if non_missing == 0 {
+        return Err(
+            "cannot orient/impute a genotype row with zero non-missing samples".to_string(),
+        );
+    }
+    let flip = raw_alt_sum > non_missing as f64;
+    if flip {
+        for v in row.iter_mut() {
+            if *v >= 0.0 {
+                *v = 2.0_f32 - *v;
+            }
+        }
+    }
+    let oriented_alt_sum = if flip {
+        2.0_f64 * non_missing as f64 - raw_alt_sum
+    } else {
+        raw_alt_sum
+    };
+    let imputed = (oriented_alt_sum / non_missing as f64) as f32;
+    for v in row.iter_mut() {
+        if *v < 0.0 {
+            *v = imputed;
+        }
+    }
+    Ok(())
+}
+
+fn decode_bed_rows_by_kept_index(
+    prefix: &str,
+    row_source_indices: &[usize],
+    kept_indices: &[usize],
+    progress_callback: Option<&Py<PyAny>>,
+    progress_stage: &str,
+    progress_done_offset: usize,
+    progress_total: usize,
+    progress_every: usize,
+) -> Result<HashMap<usize, Vec<f32>>, String> {
+    if kept_indices.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut kept_unique = kept_indices.to_vec();
+    kept_unique.sort_unstable();
+    kept_unique.dedup();
+    let mut bed_iter = BedSnpIter::new_for_grm_window(prefix, BED_SIM_FAST_WINDOW_MB)?;
+    let mut row_buf = vec![-9.0_f32; bed_iter.n_samples()];
+    let mut out = HashMap::with_capacity(kept_unique.len());
+    let mut last_notified = progress_done_offset;
+    for (seen, kept_idx) in kept_unique.into_iter().enumerate() {
+        let src_row = *row_source_indices.get(kept_idx).ok_or_else(|| {
+            format!("kept BED row index out of range during causal decode: {kept_idx}")
+        })?;
+        bed_iter.ensure_window_for_snp(src_row)?;
+        let (raw_alt_sum, non_missing) = bed_iter
+            .decode_snp_raw_into_with_stats_at(src_row, row_buf.as_mut_slice())
+            .ok_or_else(|| format!("failed to decode BED source row {src_row}"))?;
+        let mut row = row_buf.clone();
+        orient_and_impute_minor_coded_row_inplace(row.as_mut_slice(), raw_alt_sum, non_missing)?;
+        out.insert(kept_idx, row);
+        if progress_total > 0 {
+            let done_now = progress_done_offset.saturating_add(seen.saturating_add(1));
+            g2p_progress_notify(
+                progress_callback,
+                progress_stage,
+                done_now,
+                progress_total,
+                progress_every,
+                &mut last_notified,
+                false,
+            )?;
+        }
+    }
+    if progress_total > 0 {
+        let done_now = progress_done_offset.saturating_add(out.len());
+        g2p_progress_notify(
+            progress_callback,
+            progress_stage,
+            done_now,
+            progress_total,
+            progress_every,
+            &mut last_notified,
+            true,
+        )?;
+    }
+    Ok(out)
 }
 
 fn site_in_range(site: &SimSiteRecord, range: &(String, i32, i32)) -> bool {
@@ -787,17 +1157,18 @@ fn reservoir_sample(mut pool: Vec<usize>, cap: usize, rng: &mut StdRng) -> Vec<u
     pool
 }
 
-fn logic_op_from_mode(mode: &str, rng: &mut StdRng) -> Result<LogicOp, String> {
+fn logic_mode_from_str(mode: &str, rng: &mut StdRng) -> Result<LogicGateMode, String> {
     match mode.trim().to_ascii_lowercase().as_str() {
-        "and" => Ok(LogicOp::And),
-        "or" => Ok(LogicOp::Or),
-        "and_or" => {
-            if rng.random::<bool>() {
-                Ok(LogicOp::And)
-            } else {
-                Ok(LogicOp::Or)
-            }
-        }
+        "a" | "and" => Ok(LogicGateMode::A),
+        "na" => Ok(LogicGateMode::Na),
+        "an" => Ok(LogicGateMode::An),
+        "nan" => Ok(LogicGateMode::Nan),
+        "r" => Ok(match rng.random_range(0..4) {
+            0 => LogicGateMode::A,
+            1 => LogicGateMode::Na,
+            2 => LogicGateMode::An,
+            _ => LogicGateMode::Nan,
+        }),
         other => Err(format!("unsupported logic mode: {other}")),
     }
 }
@@ -829,7 +1200,7 @@ fn build_logic_pool_specs(
         }
         out.push(LogicPoolSpec {
             pool_indices: reservoir_sample(pool, 1024, rng),
-            op: logic_op_from_mode(logic_mode, rng)?,
+            mode: logic_mode_from_str(logic_mode, rng)?,
         });
     }
     let target = logic_gate_count
@@ -867,41 +1238,10 @@ fn build_logic_pool_specs(
         }
         out.push(LogicPoolSpec {
             pool_indices: pool,
-            op: logic_op_from_mode(logic_mode, rng)?,
+            mode: logic_mode_from_str(logic_mode, rng)?,
         });
     }
     Ok(out)
-}
-
-fn draw_background_effect(
-    dist: BackgroundDist,
-    gamma: Option<&Gamma<f64>>,
-    laplace: Option<&Exp<f64>>,
-    rng: &mut StdRng,
-) -> f64 {
-    match dist {
-        BackgroundDist::Normal => StandardNormal.sample(rng),
-        BackgroundDist::Gamma => {
-            let mag = gamma
-                .expect("gamma distribution must be initialized")
-                .sample(rng);
-            if rng.random::<bool>() {
-                mag
-            } else {
-                -mag
-            }
-        }
-        BackgroundDist::Laplace => {
-            let mag = laplace
-                .expect("laplace exponential distribution must be initialized")
-                .sample(rng);
-            if rng.random::<bool>() {
-                mag
-            } else {
-                -mag
-            }
-        }
-    }
 }
 
 fn select_logic_terms(
@@ -1007,7 +1347,11 @@ fn select_logic_terms(
                         .ok_or_else(|| "missing logic row".to_string())
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let gate_indicator = logic_gate_indicator(&gate_rows, spec.op);
+            let literal_rows = logic_gate_literal_rows(&gate_rows, spec.mode)?;
+            let gate_indicator = logic_gate_indicator_from_literals(
+                literal_rows.as_slice(),
+                logic_output_negated(spec.mode),
+            );
             let raw_af = gate_indicator.iter().filter(|&&v| v != 0).count() as f64
                 / gate_indicator.len() as f64;
             let gate_values = match logic_effect_model {
@@ -1015,7 +1359,7 @@ fn select_logic_terms(
                 LogicEffectModel::CenteredInteraction => {
                     residualize_logic_indicator_against_main_effects(
                         &gate_indicator,
-                        gate_rows.as_slice(),
+                        literal_rows.as_slice(),
                     )?
                 }
             };
@@ -1031,13 +1375,13 @@ fn select_logic_terms(
                 best = Some((members.clone(), gate_values.clone(), raw_af));
             }
             if raw_af >= logic_af_min && raw_af <= logic_af_max {
-                let label = term_label(sites, &members, Some(spec.op));
+                let label = term_label(sites, &members, Some(spec.mode));
                 for idx in members.iter() {
                     used_global.insert(*idx);
                 }
                 out.push(CausalTerm {
                     members,
-                    op: Some(spec.op),
+                    mode: Some(spec.mode),
                     values: gate_values,
                     effect: 0.0,
                     label,
@@ -1048,13 +1392,13 @@ fn select_logic_terms(
 
         if out.len() != ti + 1 {
             if let Some((members, gate, _af)) = best {
-                let label = term_label(sites, &members, Some(spec.op));
+                let label = term_label(sites, &members, Some(spec.mode));
                 for idx in members.iter() {
                     used_global.insert(*idx);
                 }
                 out.push(CausalTerm {
                     members,
-                    op: Some(spec.op),
+                    mode: Some(spec.mode),
                     values: gate,
                     effect: 0.0,
                     label,
@@ -1088,7 +1432,7 @@ fn build_additive_terms(
         }
         out.push(CausalTerm {
             members: vec![idx],
-            op: None,
+            mode: None,
             values,
             effect: 0.0,
             label: term_label(sites, &[idx], None),
@@ -1147,36 +1491,11 @@ fn write_pheno_files(
     Ok(())
 }
 
-fn write_site_background_effects(
-    path: &str,
-    sites: &[SimSiteRecord],
-    effects: &[f64],
-) -> Result<(), String> {
-    if sites.len() != effects.len() {
-        return Err(format!(
-            "random effect metadata length mismatch: sites={}, effects={}",
-            sites.len(),
-            effects.len()
-        ));
-    }
-    let mut w = BufWriter::new(File::create(path).map_err(|e| e.to_string())?);
-    writeln!(w, "chrom\tpos\tref\talt\teffect").map_err(|e| e.to_string())?;
-    for (site, &eff) in sites.iter().zip(effects.iter()) {
-        writeln!(
-            w,
-            "{}\t{}\t{}\t{}\t{eff:.10}",
-            site.chrom, site.pos, site.ref_allele, site.alt_allele
-        )
-        .map_err(|e| e.to_string())?;
-    }
-    w.flush().map_err(|e| e.to_string())?;
-    Ok(())
-}
-
 fn write_sample_background_effects(
     path: &str,
     sample_ids: &[String],
     effects: &[f64],
+    source: &str,
 ) -> Result<(), String> {
     if sample_ids.len() != effects.len() {
         return Err(format!(
@@ -1188,7 +1507,8 @@ fn write_sample_background_effects(
     let mut w = BufWriter::new(File::create(path).map_err(|e| e.to_string())?);
     writeln!(w, "sample_index\tsample_id\tsource\trole\teffect").map_err(|e| e.to_string())?;
     for (i, (sid, &eff)) in sample_ids.iter().zip(effects.iter()).enumerate() {
-        writeln!(w, "{}\t{}\tgrm\tbackground\t{eff:.10}", i + 1, sid).map_err(|e| e.to_string())?;
+        writeln!(w, "{}\t{}\t{}\tbackground\t{eff:.10}", i + 1, sid, source)
+            .map_err(|e| e.to_string())?;
     }
     w.flush().map_err(|e| e.to_string())?;
     Ok(())
@@ -1202,16 +1522,12 @@ fn write_fixed_effects(
     let mut w = BufWriter::new(File::create(path).map_err(|e| e.to_string())?);
     writeln!(w, "term_id\tkind\tlogic\tsites\tlabel\teffect").map_err(|e| e.to_string())?;
     for (i, term) in terms.iter().enumerate() {
-        let kind = if term.op.is_some() {
+        let kind = if term.mode.is_some() {
             "logic_gate"
         } else {
             "additive"
         };
-        let logic = match term.op {
-            Some(LogicOp::And) => "and",
-            Some(LogicOp::Or) => "or",
-            None => "single",
-        };
+        let logic = term.mode.map(logic_mode_code).unwrap_or("single");
         let site_text = term
             .members
             .iter()
@@ -1333,26 +1649,6 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
         return Err("logic_af_min must be <= logic_af_max.".to_string());
     }
 
-    let gamma_dist = if matches!(config.background_dist, BackgroundDist::Gamma) {
-        Some(
-            Gamma::new(config.gamma_shape, config.gamma_scale)
-                .map_err(|e| format!("invalid gamma params: {e}"))?,
-        )
-    } else {
-        None
-    };
-    let laplace_exp = if matches!(config.background_dist, BackgroundDist::Laplace) {
-        if !(config.laplace_scale > 0.0) || !config.laplace_scale.is_finite() {
-            return Err("laplace_scale must be finite and > 0.".to_string());
-        }
-        Some(
-            Exp::new(1.0 / config.laplace_scale)
-                .map_err(|e| format!("invalid laplace scale: {e}"))?,
-        )
-    } else {
-        None
-    };
-
     let logic_requested = config
         .logic_mode
         .as_ref()
@@ -1385,6 +1681,12 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
         );
     }
     let residual_var_eff = residual_var_eff.max(0.0);
+    if config.bg_pve > 0.0 && config.grm.is_none() {
+        return Err(
+            "background sample-space simulation requires a GRM; provide --grm or use a caller that auto-builds cached cGRM."
+                .to_string(),
+        );
+    }
     let needs_causal_scan = effective_term_count > 0 && causal_pve_target > 0.0;
     let scan_passes = 1usize + if needs_causal_scan { 1 } else { 0 };
     let progress_site_total = config.progress_total_hint.unwrap_or(0);
@@ -1393,70 +1695,83 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
 
     let mut rng = StdRng::seed_from_u64(config.seed);
     let mut sites: Vec<SimSiteRecord> = Vec::new();
-    let mut bg_raw_effects: Vec<f64> = Vec::new();
-    let mut bg_score: Vec<f64> = Vec::new();
-    let use_grm_background = config.grm.is_some();
     let mut bg_progress_seen = 0usize;
     let mut bg_last_notified = 0usize;
-
-    let sample_ids = iterate_filtered_rows(
+    let mut fast_bed_path: Option<PreparedBedFastPath> = None;
+    let mut runtime_progress_total = progress_overall_total;
+    let sample_ids = if let Some(prepared) = try_prepare_bed_fast_path(
         &config.path_or_prefix,
-        config.delimiter.as_deref(),
         config.maf_threshold,
         config.max_missing_rate,
         config.het_threshold,
         config.snps_only,
-        |_, row, site| {
-            bg_progress_seen = bg_progress_seen.saturating_add(1);
-            if progress_overall_total > 0 {
-                g2p_progress_notify(
-                    config.progress_callback.as_ref(),
-                    "background",
-                    bg_progress_seen,
-                    progress_overall_total,
-                    progress_every,
-                    &mut bg_last_notified,
-                    false,
-                )?;
-            }
-            if !use_grm_background && bg_score.is_empty() {
-                bg_score.resize(row.len(), 0.0);
-            }
-            if !use_grm_background {
-                let draw = if config.bg_pve > 0.0 {
-                    draw_background_effect(
-                        config.background_dist,
-                        gamma_dist.as_ref(),
-                        laplace_exp.as_ref(),
-                        &mut rng,
-                    )
-                } else {
-                    0.0
-                };
-                add_scaled_centered_row(&mut bg_score, row, draw);
-                bg_raw_effects.push(draw);
-            }
-            sites.push(SimSiteRecord {
-                chrom: site.chrom.clone(),
-                chrom_norm: normalize_chrom(&site.chrom),
-                pos: site.pos,
-                ref_allele: site.ref_allele.clone(),
-                alt_allele: site.alt_allele.clone(),
-            });
-            Ok(())
-        },
-    )?;
-    if progress_overall_total > 0 {
-        g2p_progress_notify(
-            config.progress_callback.as_ref(),
-            "background",
-            progress_site_total,
-            progress_overall_total,
-            progress_every,
-            &mut bg_last_notified,
-            true,
+        true,
+    )? {
+        sites = prepared.sites;
+        let sample_ids = prepared.sample_ids;
+        fast_bed_path = Some(PreparedBedFastPath {
+            prefix: prepared.prefix,
+            sample_ids: Vec::new(),
+            sites: Vec::new(),
+            row_source_indices: prepared.row_source_indices,
+        });
+        runtime_progress_total = progress_site_total;
+        if progress_site_total > 0 {
+            g2p_progress_notify(
+                config.progress_callback.as_ref(),
+                "background",
+                progress_site_total,
+                runtime_progress_total,
+                progress_every,
+                &mut bg_last_notified,
+                true,
+            )?;
+        }
+        sample_ids
+    } else {
+        let sample_ids = iterate_filtered_rows(
+            &config.path_or_prefix,
+            config.delimiter.as_deref(),
+            config.maf_threshold,
+            config.max_missing_rate,
+            config.het_threshold,
+            config.snps_only,
+            |_, _, site| {
+                bg_progress_seen = bg_progress_seen.saturating_add(1);
+                if progress_overall_total > 0 {
+                    g2p_progress_notify(
+                        config.progress_callback.as_ref(),
+                        "background",
+                        bg_progress_seen,
+                        progress_overall_total,
+                        progress_every,
+                        &mut bg_last_notified,
+                        false,
+                    )?;
+                }
+                sites.push(SimSiteRecord {
+                    chrom: site.chrom.clone(),
+                    chrom_norm: normalize_chrom(&site.chrom),
+                    pos: site.pos,
+                    ref_allele: site.ref_allele.clone(),
+                    alt_allele: site.alt_allele.clone(),
+                });
+                Ok(())
+            },
         )?;
-    }
+        if progress_overall_total > 0 {
+            g2p_progress_notify(
+                config.progress_callback.as_ref(),
+                "background",
+                progress_site_total,
+                progress_overall_total,
+                progress_every,
+                &mut bg_last_notified,
+                true,
+            )?;
+        }
+        sample_ids
+    };
 
     if sample_ids.is_empty() {
         return Err("no samples found in genotype input after inspection".to_string());
@@ -1466,16 +1781,10 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
     }
 
     let n = sample_ids.len();
-    let mut y = vec![0.0_f64; n];
-    if residual_var_eff > 0.0 {
-        let sd = residual_var_eff.sqrt();
-        for yi in y.iter_mut() {
-            let z: f64 = StandardNormal.sample(&mut rng);
-            *yi = z * sd;
-        }
-    }
+    let residual_effects = sample_gaussian_noise_with_variance(n, residual_var_eff, &mut rng);
+    let mut y = residual_effects.clone();
     let bg_var_target = config.bg_pve;
-    let (bg_effects_scaled, background_source) = if let Some(grm_vec) = config.grm.as_ref() {
+    let (bg_effects, background_source) = if let Some(grm_vec) = config.grm.as_ref() {
         let grm_n = config
             .grm_n
             .ok_or_else(|| "internal error: grm_n missing for provided GRM".to_string())?;
@@ -1485,43 +1794,100 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
                 grm_n, n
             ));
         }
-        let mut raw = if bg_var_target > 0.0 {
-            sample_background_effects_from_grm(grm_vec.as_slice(), n, &mut rng)?
+        let raw = if bg_var_target > 0.0 {
+            sample_background_effects_from_grm_trace_scaled(
+                grm_vec.as_slice(),
+                n,
+                bg_var_target,
+                &mut rng,
+            )?
         } else {
             vec![0.0_f64; n]
         };
-        let raw_var = variance_f64(&raw);
-        let bg_scale = if bg_var_target > 0.0 && raw_var > 1e-12 {
-            (bg_var_target / raw_var).sqrt()
-        } else {
-            0.0
-        };
-        for v in raw.iter_mut() {
-            *v *= bg_scale;
-        }
         axpy_inplace(&mut y, raw.as_slice(), 1.0);
         (raw, "grm".to_string())
     } else {
-        let bg_score_var = variance_f64(&bg_score);
-        let bg_scale = if bg_var_target > 0.0 && bg_score_var > 1e-12 {
-            (bg_var_target / bg_score_var).sqrt()
-        } else {
-            0.0
-        };
-        axpy_inplace(&mut y, &bg_score, bg_scale);
-        (
-            bg_raw_effects.iter().map(|&v| v * bg_scale).collect(),
-            background_dist_name(config.background_dist).to_string(),
-        )
+        let raw = vec![0.0_f64; n];
+        axpy_inplace(&mut y, raw.as_slice(), 1.0);
+        (raw, "none".to_string())
     };
+    let mut causal_component = vec![0.0_f64; n];
 
     let mut causal_terms: Vec<CausalTerm> = Vec::new();
     if needs_causal_scan {
-        let mut causal_progress_seen = 0usize;
-        let mut causal_last_notified = 0usize;
         let causal_offset = progress_site_total;
-        if logic_requested {
-            let logic_mode_str = config.logic_mode.as_deref().unwrap_or("and");
+        if let Some(bed_fast) = fast_bed_path.as_ref() {
+            if logic_requested {
+                let logic_mode_str = config.logic_mode.as_deref().unwrap_or("a");
+                let mut pool_rng = StdRng::seed_from_u64(config.seed ^ 0xB28F_6A91_C547_31D1u64);
+                let pool_specs = build_logic_pool_specs(
+                    &sites,
+                    &config.bim_ranges,
+                    config.causal_count,
+                    config.logic_gate_count,
+                    logic_mode_str,
+                    config.logic_k_min,
+                    config.logic_window_bp,
+                    &mut pool_rng,
+                )?;
+                let mut need_rows: HashSet<usize> = HashSet::with_capacity(1024);
+                for spec in pool_specs.iter() {
+                    for &idx in spec.pool_indices.iter() {
+                        need_rows.insert(idx);
+                    }
+                }
+                let need_kept_indices = need_rows.into_iter().collect::<Vec<_>>();
+                runtime_progress_total = causal_offset.saturating_add(need_kept_indices.len());
+                let row_map = decode_bed_rows_by_kept_index(
+                    &bed_fast.prefix,
+                    bed_fast.row_source_indices.as_slice(),
+                    need_kept_indices.as_slice(),
+                    config.progress_callback.as_ref(),
+                    "causal_logic",
+                    causal_offset,
+                    runtime_progress_total,
+                    progress_every,
+                )?;
+                let mut logic_rng = StdRng::seed_from_u64(config.seed ^ 0x9F4B_72E0_1A33_4F0Cu64);
+                causal_terms = select_logic_terms(
+                    &pool_specs,
+                    &row_map,
+                    &sites,
+                    config.logic_k_min,
+                    config.logic_k_max,
+                    config.logic_ld_max,
+                    config.logic_het_max,
+                    config.logic_af_min,
+                    config.logic_af_max,
+                    config.logic_max_iter,
+                    config.logic_effect_model,
+                    &mut logic_rng,
+                )?;
+            } else {
+                let mut sel_rng = StdRng::seed_from_u64(config.seed ^ 0xA54D_3F9E_6721_8CB7u64);
+                let selected = select_additive_indices(
+                    &sites,
+                    config.causal_count,
+                    &config.bim_ranges,
+                    &mut sel_rng,
+                )?;
+                runtime_progress_total = causal_offset.saturating_add(selected.len());
+                let row_map = decode_bed_rows_by_kept_index(
+                    &bed_fast.prefix,
+                    bed_fast.row_source_indices.as_slice(),
+                    selected.as_slice(),
+                    config.progress_callback.as_ref(),
+                    "causal_additive",
+                    causal_offset,
+                    runtime_progress_total,
+                    progress_every,
+                )?;
+                causal_terms = build_additive_terms(&selected, &row_map, &sites)?;
+            }
+        } else if logic_requested {
+            let mut causal_progress_seen = 0usize;
+            let mut causal_last_notified = 0usize;
+            let logic_mode_str = config.logic_mode.as_deref().unwrap_or("a");
             let mut pool_rng = StdRng::seed_from_u64(config.seed ^ 0xB28F_6A91_C547_31D1u64);
             let pool_specs = build_logic_pool_specs(
                 &sites,
@@ -1593,6 +1959,8 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
                 &mut logic_rng,
             )?;
         } else {
+            let mut causal_progress_seen = 0usize;
+            let mut causal_last_notified = 0usize;
             let mut sel_rng = StdRng::seed_from_u64(config.seed ^ 0xA54D_3F9E_6721_8CB7u64);
             let selected = select_additive_indices(
                 &sites,
@@ -1644,25 +2012,25 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
     }
 
     if !causal_terms.is_empty() && causal_pve_target > 0.0 {
-        let mut gamma0: Vec<f64> = Vec::with_capacity(causal_terms.len());
-        for _ in 0..causal_terms.len() {
-            gamma0.push(rng.random_range(-1.0_f64..1.0_f64));
-        }
+        let gamma0 =
+            build_causal_series_effects(causal_terms.len(), DEFAULT_CAUSAL_SERIES_ALPHA, &mut rng);
         let mut causal_score = vec![0.0_f64; n];
         for (coef, term) in gamma0.iter().zip(causal_terms.iter()) {
             axpy_inplace(&mut causal_score, &term.values, *coef);
         }
-        let var_causal_raw = variance_f64(&causal_score);
-        if causal_pve_target > 0.0 && var_causal_raw > 1e-12 {
-            let scale = (causal_pve_target / var_causal_raw).sqrt();
+        let scale = variance_scale_factor(variance_f64(&causal_score), causal_pve_target);
+        if scale > 0.0 {
             for (coef, term) in gamma0.iter().zip(causal_terms.iter_mut()) {
                 term.effect = scale * *coef;
             }
             for term in causal_terms.iter() {
+                axpy_inplace(&mut causal_component, &term.values, term.effect);
                 axpy_inplace(&mut y, &term.values, term.effect);
             }
         }
     }
+    let realized_summary =
+        build_realized_summary(&y, &causal_component, &bg_effects, &residual_effects);
 
     let logic_suffix = if logic_requested
         && matches!(
@@ -1694,11 +2062,12 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
         )?;
     }
     if let Some(path) = config.random_effects_path.as_ref() {
-        if use_grm_background {
-            write_sample_background_effects(path, &sample_ids, &bg_effects_scaled)?;
-        } else {
-            write_site_background_effects(path, &sites, &bg_effects_scaled)?;
-        }
+        write_sample_background_effects(
+            path,
+            &sample_ids,
+            &bg_effects,
+            background_source.as_str(),
+        )?;
     }
     if let Some(path) = config.fixed_effects_path.as_ref() {
         write_fixed_effects(path, &causal_terms, &sites)?;
@@ -1706,13 +2075,13 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
     if let Some(path) = config.causal_sites_path.as_ref() {
         write_causal_sites(path, &causal_terms, &sites)?;
     }
-    if progress_overall_total > 0 {
-        let mut final_last_notified = progress_overall_total;
+    if runtime_progress_total > 0 {
+        let mut final_last_notified = runtime_progress_total;
         g2p_progress_notify(
             config.progress_callback.as_ref(),
             "finalize",
-            progress_overall_total,
-            progress_overall_total,
+            runtime_progress_total,
+            runtime_progress_total,
             progress_every,
             &mut final_last_notified,
             true,
@@ -1738,16 +2107,15 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
         .iter()
         .enumerate()
         .map(|(i, term)| {
-            let kind = if term.op.is_some() {
+            let kind = if term.mode.is_some() {
                 "logic_gate".to_string()
             } else {
                 "additive".to_string()
             };
-            let logic = match term.op {
-                Some(LogicOp::And) => "and".to_string(),
-                Some(LogicOp::Or) => "or".to_string(),
-                None => "single".to_string(),
-            };
+            let logic = term
+                .mode
+                .map(|mode| logic_mode_code(mode).to_string())
+                .unwrap_or_else(|| "single".to_string());
             let site_text = term
                 .members
                 .iter()
@@ -1771,13 +2139,14 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
         trait_name,
         causal_sites,
         fixed_rows,
-        n_background_sites: if use_grm_background { 0 } else { sites.len() },
+        n_background_sites: 0,
         n_causal_terms: causal_terms.len(),
         bg_pve: config.bg_pve,
         causal_pve: causal_pve_target,
         residual_var: residual_var_eff,
         logic_effect_model: logic_effect_model_name(config.logic_effect_model).to_string(),
         background_source,
+        realized_summary,
     })
 }
 
@@ -1907,10 +2276,11 @@ pub fn g2p_simulate_py<'py>(
     }
 
     let _ = chunk_size;
-    let bg_dist =
+    let _bg_dist =
         parse_background_dist(background_dist).map_err(|e| PyValueError::new_err(e.to_string()))?;
     let logic_effect_model = parse_logic_effect_model(logic_effect_model)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let _ = (gamma_shape, gamma_scale, laplace_scale);
     let (grm_vec, grm_n) = if let Some(arr) = grm {
         let mat = arr.as_array();
         if mat.ndim() != 2 || mat.shape()[0] != mat.shape()[1] {
@@ -1936,10 +2306,6 @@ pub fn g2p_simulate_py<'py>(
         seed,
         residual_var,
         bg_pve,
-        background_dist: bg_dist,
-        gamma_shape,
-        gamma_scale,
-        laplace_scale,
         causal_count,
         causal_pve,
         bim_ranges: bim_ranges.unwrap_or_default(),
@@ -1984,6 +2350,7 @@ pub fn g2p_simulate_py<'py>(
         residual_var,
         logic_effect_model,
         background_source,
+        realized_summary,
     } = sim;
 
     #[allow(deprecated)]
@@ -2002,6 +2369,28 @@ pub fn g2p_simulate_py<'py>(
     out.set_item("residual_var", residual_var)?;
     out.set_item("logic_effect_model", logic_effect_model)?;
     out.set_item("background_source", background_source)?;
+    let realized = PyDict::new(py);
+    realized.set_item("mean_y", realized_summary.mean_y)?;
+    realized.set_item("var_y", realized_summary.var_y)?;
+    realized.set_item("mean_causal", realized_summary.mean_causal)?;
+    realized.set_item("mean_background", realized_summary.mean_background)?;
+    realized.set_item("mean_residual", realized_summary.mean_residual)?;
+    realized.set_item("var_causal", realized_summary.var_causal)?;
+    realized.set_item("var_background", realized_summary.var_background)?;
+    realized.set_item("var_residual", realized_summary.var_residual)?;
+    realized.set_item(
+        "cov_causal_background",
+        realized_summary.cov_causal_background,
+    )?;
+    realized.set_item("cov_causal_residual", realized_summary.cov_causal_residual)?;
+    realized.set_item(
+        "cov_background_residual",
+        realized_summary.cov_background_residual,
+    )?;
+    realized.set_item("pve_causal", realized_summary.pve_causal)?;
+    realized.set_item("pve_background", realized_summary.pve_background)?;
+    realized.set_item("pve_residual", realized_summary.pve_residual)?;
+    out.set_item("realized_summary", realized)?;
     Ok(out)
 }
 
@@ -2026,24 +2415,111 @@ mod tests {
     fn test_centered_interaction_is_orthogonal_to_main_effects() {
         let a = vec![0u8, 0, 1, 1, 0, 1];
         let b = vec![0u8, 1, 0, 1, 1, 1];
-        let gate = logic_gate_indicator(&[a.clone(), b.clone()], LogicOp::And);
-        let z = residualize_logic_indicator_against_main_effects(&gate, &[a.clone(), b.clone()])
+        let literal_rows = logic_gate_literal_rows(&[a.clone(), b.clone()], LogicGateMode::A)
+            .expect("logic literal rows");
+        let gate = logic_gate_indicator_from_literals(&literal_rows, false);
+        let z = residualize_logic_indicator_against_main_effects(&gate, &literal_rows)
             .expect("centered interaction residualization");
         let sum_z = z.iter().sum::<f64>();
         let dot_a = z
             .iter()
-            .zip(a.iter())
+            .zip(literal_rows[0].iter())
             .map(|(zi, &xi)| zi * xi as f64)
             .sum::<f64>();
         let dot_b = z
             .iter()
-            .zip(b.iter())
+            .zip(literal_rows[1].iter())
             .map(|(zi, &xi)| zi * xi as f64)
             .sum::<f64>();
         assert!(sum_z.abs() < 1e-8);
         assert!(dot_a.abs() < 1e-8);
         assert!(dot_b.abs() < 1e-8);
         assert!(variance_f64(&z) > 1e-12);
+    }
+
+    #[test]
+    fn logic_gate_modes_match_expected_patterns() {
+        let a = vec![0u8, 0, 1, 1];
+        let b = vec![0u8, 1, 0, 1];
+        assert_eq!(
+            logic_gate_indicator(&[a.clone(), b.clone()], LogicGateMode::A).unwrap(),
+            vec![0u8, 0, 0, 1]
+        );
+        assert_eq!(
+            logic_gate_indicator(&[a.clone(), b.clone()], LogicGateMode::Na).unwrap(),
+            vec![1u8, 1, 1, 0]
+        );
+        assert_eq!(
+            logic_gate_indicator(&[a.clone(), b.clone()], LogicGateMode::An).unwrap(),
+            vec![0u8, 0, 1, 0]
+        );
+        assert_eq!(
+            logic_gate_indicator(&[a, b], LogicGateMode::Nan).unwrap(),
+            vec![1u8, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn gaussian_noise_is_sampled_at_requested_scale() {
+        let mut rng = StdRng::seed_from_u64(11);
+        let eps = sample_gaussian_noise_with_variance(4096, 0.35, &mut rng);
+        assert!((variance_f64(&eps) - 0.35).abs() < 0.03);
+    }
+
+    #[test]
+    fn trace_scaled_identity_grm_matches_direct_gaussian_sampling() {
+        let n = 4usize;
+        let grm = vec![
+            1.0_f64, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+        ];
+        let mut rng_bg = StdRng::seed_from_u64(23);
+        let observed =
+            sample_background_effects_from_grm_trace_scaled(&grm, n, 0.25, &mut rng_bg).unwrap();
+        let mut rng_direct = StdRng::seed_from_u64(23);
+        let expected = sample_gaussian_noise_with_variance(n, 0.25, &mut rng_direct);
+        for (obs, exp) in observed.iter().zip(expected.iter()) {
+            assert!((obs - exp).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn realized_summary_reports_component_moments_and_covariances() {
+        let causal = vec![1.0_f64, -1.0, 0.0];
+        let background = vec![0.0_f64, 1.0, -1.0];
+        let residual = vec![1.0_f64, 1.0, 1.0];
+        let y = vec![2.0_f64, 1.0, 0.0];
+        let summary = build_realized_summary(&y, &causal, &background, &residual);
+        assert!((summary.mean_y - 1.0).abs() < 1e-12);
+        assert!((summary.var_y - (2.0 / 3.0)).abs() < 1e-12);
+        assert!(summary.mean_causal.abs() < 1e-12);
+        assert!(summary.mean_background.abs() < 1e-12);
+        assert!((summary.mean_residual - 1.0).abs() < 1e-12);
+        assert!((summary.var_causal - (2.0 / 3.0)).abs() < 1e-12);
+        assert!((summary.var_background - (2.0 / 3.0)).abs() < 1e-12);
+        assert!(summary.var_residual.abs() < 1e-12);
+        assert!((summary.cov_causal_background + (1.0 / 3.0)).abs() < 1e-12);
+        assert!(summary.cov_causal_residual.abs() < 1e-12);
+        assert!(summary.cov_background_residual.abs() < 1e-12);
+        assert!((summary.pve_causal - 1.0).abs() < 1e-12);
+        assert!((summary.pve_background - 1.0).abs() < 1e-12);
+        assert!(summary.pve_residual.abs() < 1e-12);
+    }
+
+    #[test]
+    fn causal_series_effects_match_geometric_magnitudes() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut observed = build_causal_series_effects(4, DEFAULT_CAUSAL_SERIES_ALPHA, &mut rng);
+        observed.sort_by(|a, b| a.total_cmp(b));
+        let mut expected = vec![
+            DEFAULT_CAUSAL_SERIES_ALPHA,
+            DEFAULT_CAUSAL_SERIES_ALPHA.powi(2),
+            DEFAULT_CAUSAL_SERIES_ALPHA.powi(3),
+            DEFAULT_CAUSAL_SERIES_ALPHA.powi(4),
+        ];
+        expected.sort_by(|a, b| a.total_cmp(b));
+        for (obs, exp) in observed.iter().zip(expected.iter()) {
+            assert!((obs - exp).abs() < 1e-12);
+        }
     }
 
     #[test]

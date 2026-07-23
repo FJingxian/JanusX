@@ -172,6 +172,32 @@ fn project_back_from_eigenvectors(
     Ok(out)
 }
 
+fn standardize_residualized_y(values: &mut [f64]) -> Result<(), String> {
+    let n = values.len();
+    if n < 2 {
+        return Err(
+            "garfield residualization requires at least 2 samples to standardize Py.".to_string(),
+        );
+    }
+    let mean = values.iter().copied().sum::<f64>() / (n as f64);
+    let mut ss = 0.0_f64;
+    for value in values.iter() {
+        let centered = *value - mean;
+        ss += centered * centered;
+    }
+    let variance = ss / ((n - 1) as f64);
+    if !(variance.is_finite() && variance > 0.0) {
+        return Err(
+            "garfield residualization produced zero-variance Py; cannot standardize.".to_string(),
+        );
+    }
+    let sample_std = variance.sqrt();
+    for value in values.iter_mut() {
+        *value = (*value - mean) / sample_std;
+    }
+    Ok(())
+}
+
 fn exact_lmm_null_fit_from_rotated(
     s: &[f64],
     x_rot: &[f64],
@@ -406,6 +432,8 @@ pub(crate) fn garfield_residualize_exact_from_grm_rust(
         })?;
     let resid = project_back_from_eigenvectors(&u_vec, &fit.resid_rot, n, threads)?;
     let py_vec = project_back_from_eigenvectors(&u_vec, &fit.py_rot, n, threads)?;
+    let mut residualized_y = py_vec.clone();
+    standardize_residualized_y(&mut residualized_y)?;
     let mean_s = s_vec.iter().copied().sum::<f64>() / (n as f64);
     let var_g = fit.sigma_g2 * mean_s.max(0.0);
     let denom = var_g + fit.sigma_e2;
@@ -418,7 +446,7 @@ pub(crate) fn garfield_residualize_exact_from_grm_rust(
     Ok(GarfieldResidualResult {
         beta: fit.beta,
         py: py_vec.clone(),
-        residualized_y: py_vec,
+        residualized_y,
         resid,
         lbd: fit.lbd,
         ml: fit.ml,
@@ -693,4 +721,40 @@ pub fn garfield_residualize_bed_py<'py>(
         require_lapack,
         Some(eff_m),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::standardize_residualized_y;
+
+    fn sample_mean(values: &[f64]) -> f64 {
+        values.iter().copied().sum::<f64>() / (values.len() as f64)
+    }
+
+    fn sample_std(values: &[f64]) -> f64 {
+        let mean = sample_mean(values);
+        let ss = values
+            .iter()
+            .map(|value| {
+                let centered = *value - mean;
+                centered * centered
+            })
+            .sum::<f64>();
+        (ss / ((values.len() - 1) as f64)).sqrt()
+    }
+
+    #[test]
+    fn standardize_residualized_y_sets_unit_sample_std() {
+        let mut values = vec![2.0, 4.0, 6.0, 8.0];
+        standardize_residualized_y(&mut values).unwrap();
+        assert!(sample_mean(&values).abs() < 1e-12);
+        assert!((sample_std(&values) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn standardize_residualized_y_rejects_zero_variance() {
+        let mut values = vec![3.0, 3.0, 3.0];
+        let err = standardize_residualized_y(&mut values).unwrap_err();
+        assert!(err.contains("zero-variance Py"));
+    }
 }

@@ -78,13 +78,13 @@ from janusx.assoc.workflow_ui import _run_fastplot_from_tsv_with_status
 from janusx.pyBLUP.assoc import FvLMM
 from janusx.script.fvlmm2 import (
     InteractionSpec as _Fvlmm2InteractionSpec,
+    _bh_adjust as _fvlmm2_bh_adjust,
     _decode_rows as _fvlmm2_decode_rows,
     _attach_combo_joint_fdr as _fvlmm2_attach_combo_joint_fdr,
     _format_fvlmm2_output_df_for_tsv as _fvlmm2_format_output_df_for_tsv,
     _load_active_sites as _fvlmm2_load_active_sites,
     _require_rust_backend as _fvlmm2_require_rust_backend,
     _run_trait_scan as _fvlmm2_run_trait_scan,
-    _split_literal_token as _fvlmm2_split_literal_token,
 )
 
 
@@ -543,6 +543,69 @@ _GARFIELD_FOLLOWUP_PAIR_RE = re.compile(
 )
 
 
+def _garfield_parse_literal_token(token: str) -> tuple[str, bool, str | None]:
+    text = str(token).strip()
+    if text == "":
+        raise ValueError("Literal token is empty.")
+    negated = False
+    while text.startswith("!"):
+        negated = not negated
+        text = text[1:].strip()
+    if text == "":
+        raise ValueError("Literal token has no SNP name after '!'.")
+    target_allele: str | None = None
+    if text.endswith(")") and "(" in text:
+        base, suffix = text.rsplit("(", 1)
+        allele_txt = suffix[:-1].strip()
+        base = base.strip()
+        if allele_txt != "" and base != "":
+            text = base
+            target_allele = allele_txt
+    return text, bool(negated), target_allele
+
+
+def _garfield_site_coord_name(site: object) -> str:
+    return f"{str(getattr(site, 'chrom'))}_{int(getattr(site, 'pos'))}"
+
+
+def _garfield_literal_target_name(site: object, negated: bool) -> str:
+    target = str(getattr(site, "allele0" if bool(negated) else "allele1"))
+    return f"{_garfield_site_coord_name(site)}({target})"
+
+
+def _garfield_resolve_literal_token(
+    token: str,
+    *,
+    name_map: dict[str, list[int]],
+    source_sites: list[object],
+) -> tuple[str, bool, int]:
+    snp_name, explicit_neg, target_allele = _garfield_parse_literal_token(token)
+    row = _resolve_garfield_followup_snp_token(snp_name, name_map)
+    site = source_sites[int(row)]
+    if target_allele is None:
+        negated = bool(explicit_neg)
+    else:
+        allele0 = str(getattr(site, "allele0"))
+        allele1 = str(getattr(site, "allele1"))
+        if target_allele == allele1 and target_allele != allele0:
+            negated = False
+        elif target_allele == allele0 and target_allele != allele1:
+            negated = True
+        elif target_allele == allele0 == allele1:
+            negated = bool(explicit_neg)
+        else:
+            raise ValueError(
+                f"Literal token '{token}' targets allele '{target_allele}', "
+                f"but active site '{snp_name}' has alleles ({allele0}, {allele1})."
+            )
+        if explicit_neg and (not negated):
+            raise ValueError(
+                f"Literal token '{token}' mixes '!' with target allele '{target_allele}' "
+                "in an inconsistent direction."
+            )
+    return snp_name, bool(negated), int(row)
+
+
 def _garfield_followup_key(chrom: object, pos: object, snp: object) -> tuple[str, int, str]:
     return (str(chrom).strip(), int(pos), str(snp).strip())
 
@@ -580,31 +643,15 @@ def _attach_garfield_logic_padj(
 
     if role_col not in out.columns:
         out[role_col] = out[snp_col].map(_garfield_followup_row_role)
-    role = out[role_col].astype(str).str.strip().str.lower()
-    combo_mask = role.eq("combo")
-    if not bool(combo_mask.any()):
-        return out
-
-    combo_df = out.loc[combo_mask, [snp_col, p_col]].copy()
-    combo_df[p_col] = pd.to_numeric(combo_df[p_col], errors="coerce")
-    combo_df[snp_col] = combo_df[snp_col].astype(str)
-    combo_unique = (
-        combo_df.drop_duplicates(subset=[snp_col], keep="first")
-        .dropna(subset=[p_col])
-        .sort_values(by=[p_col, snp_col], kind="mergesort")
-        .reset_index(drop=True)
+    pvals = pd.to_numeric(out[p_col], errors="coerce")
+    m_eff = (
+        int(n_tests)
+        if n_tests is not None and int(n_tests) > 0
+        else int(pvals.notna().sum())
     )
-    if combo_unique.shape[0] == 0:
-        return out
-
-    m_eff = int(n_tests) if n_tests is not None and int(n_tests) > 0 else int(combo_unique.shape[0])
-    ranks = np.arange(1, combo_unique.shape[0] + 1, dtype=np.float64)
-    pvals = np.asarray(combo_unique[p_col], dtype=np.float64)
-    padj = np.clip((float(m_eff) / ranks) * pvals, 0.0, 1.0)
-    combo_unique[out_col] = padj
-    padj_map = dict(zip(combo_unique[snp_col].tolist(), combo_unique[out_col].tolist()))
-    out.loc[combo_mask, out_col] = (
-        out.loc[combo_mask, snp_col].astype(str).map(padj_map).to_numpy(dtype=np.float64, copy=False)
+    out[out_col] = _fvlmm2_bh_adjust(
+        pvals.to_numpy(dtype=np.float64, copy=False),
+        n_tests=m_eff,
     )
     return out
 
@@ -634,6 +681,20 @@ def _garfield_format_sci4(value: object, *, blank_if_nan: bool = False) -> str:
         return "" if blank_if_nan else "NA"
     if not np.isfinite(v):
         return "" if blank_if_nan else "NA"
+    return _garfield_normalize_sci_text(f"{v:.4e}")
+
+
+def _garfield_format_metric4(value: object) -> str:
+    try:
+        v = float(value)
+    except Exception:
+        return "NA"
+    if not np.isfinite(v):
+        return "NA"
+    if v == 0.0:
+        return "0"
+    if 1e-4 <= abs(v) < 1e4:
+        return f"{v:.4f}"
     return _garfield_normalize_sci_text(f"{v:.4e}")
 
 
@@ -683,6 +744,30 @@ def _format_garfield_fvlmm_output_df_for_tsv(df: pd.DataFrame) -> pd.DataFrame:
     return out.loc[:, ordered_present]
 
 
+def _sort_garfield_fvlmm_rows_for_tsv(df: pd.DataFrame) -> pd.DataFrame:
+    if df.shape[0] == 0:
+        return df.copy()
+    out = df.copy()
+    sort_cols: list[str] = []
+    if "pwald" in out.columns:
+        out["__sort_pwald"] = pd.to_numeric(out["pwald"], errors="coerce")
+        sort_cols.append("__sort_pwald")
+    if "padj" in out.columns:
+        out["__sort_padj"] = pd.to_numeric(out["padj"], errors="coerce")
+        sort_cols.append("__sort_padj")
+    if "chrom" in out.columns:
+        sort_cols.append("chrom")
+    if "pos" in out.columns:
+        out["__sort_pos"] = pd.to_numeric(out["pos"], errors="coerce")
+        sort_cols.append("__sort_pos")
+    if "snp" in out.columns:
+        sort_cols.append("snp")
+    if len(sort_cols) == 0:
+        return out
+    out = out.sort_values(by=sort_cols, kind="mergesort", na_position="last").reset_index(drop=True)
+    return out.drop(columns=["__sort_pwald", "__sort_padj", "__sort_pos"], errors="ignore")
+
+
 def _garfield_invocation_command() -> str:
     tokens = [str(x) for x in sys.argv[1:]]
     prog_raw = str(sys.argv[0]).strip() if len(sys.argv) > 0 else ""
@@ -712,6 +797,43 @@ def _emit_garfield_command_to_log(logger: logging.Logger) -> None:
         for handler in logger.handlers:
             if isinstance(handler, logging.FileHandler):
                 handler.handle(record)
+
+
+def _emit_garfield_file_only_line(logger: logging.Logger, message: str) -> None:
+    _emit_garfield_file_only_record(logger, logging.INFO, message)
+
+
+def _emit_garfield_file_only_warning(logger: logging.Logger, message: str) -> None:
+    _emit_garfield_file_only_record(logger, logging.WARNING, message)
+
+
+def _emit_garfield_file_only_record(
+    logger: logging.Logger, level: int, message: str
+) -> None:
+    record = logger.makeRecord(
+        logger.name,
+        int(level),
+        __file__,
+        0,
+        str(message),
+        args=(),
+        exc_info=None,
+    )
+    handled = False
+    for handler in logger.handlers:
+        if isinstance(handler, logging.FileHandler):
+            handler.handle(record)
+            handled = True
+    if (not handled) and logger.propagate:
+        parent = logger.parent
+        while parent is not None:
+            for handler in parent.handlers:
+                if isinstance(handler, logging.FileHandler):
+                    handler.handle(record)
+                    handled = True
+            if handled:
+                break
+            parent = parent.parent
 
 
 def _resolve_garfield_followup_snp_token(
@@ -786,6 +908,7 @@ def _collect_garfield_fvlmm2_specs(
     *,
     rules_tsv: str,
     name_map: dict[str, list[int]],
+    source_sites: list[object],
 ) -> tuple[list[_Fvlmm2InteractionSpec], pd.DataFrame, list[dict[str, str]]]:
     rules = pd.read_csv(
         str(rules_tsv),
@@ -841,8 +964,21 @@ def _collect_garfield_fvlmm2_specs(
         op = str(match.group(2)).strip()
         token2 = str(match.group(3)).strip()
         try:
-            snp1, neg1 = _fvlmm2_split_literal_token(token1)
-            snp2, neg2 = _fvlmm2_split_literal_token(token2)
+            snp1, neg1, row1 = _garfield_resolve_literal_token(
+                token1,
+                name_map=name_map,
+                source_sites=source_sites,
+            )
+            snp2, neg2, row2 = _garfield_resolve_literal_token(
+                token2,
+                name_map=name_map,
+                source_sites=source_sites,
+            )
+            site1 = source_sites[int(row1)]
+            site2 = source_sites[int(row2)]
+            literal1 = _garfield_literal_target_name(site1, neg1)
+            literal2 = _garfield_literal_target_name(site2, neg2)
+            combo = f"{literal1}{op}{literal2}"
         except Exception as ex:
             skipped.append(
                 {
@@ -853,7 +989,6 @@ def _collect_garfield_fvlmm2_specs(
                 }
             )
             continue
-        combo = f"{'!' if neg1 else ''}{snp1}{op}{'!' if neg2 else ''}{snp2}"
         if op == "*" and (neg1 or neg2):
             skipped.append(
                 {
@@ -861,19 +996,6 @@ def _collect_garfield_fvlmm2_specs(
                     "expr": expr,
                     "snp_name": snp_name,
                     "reason": "negated_literals_not_supported_for_multiplicative_interaction",
-                }
-            )
-            continue
-        try:
-            row1 = _resolve_garfield_followup_snp_token(snp1, name_map)
-            row2 = _resolve_garfield_followup_snp_token(snp2, name_map)
-        except Exception as ex:
-            skipped.append(
-                {
-                    "line": str(row_no),
-                    "expr": expr,
-                    "snp_name": snp_name,
-                    "reason": str(ex),
                 }
             )
             continue
@@ -1195,7 +1317,7 @@ def _run_garfield_pseudo_fvlmm(
     logic_maf_threshold: float,
     max_missing_rate: float,
     het_threshold: float,
-    total_windows: int | None,
+    fdr_n_tests: int | None,
     threads: int,
     logger,
     use_spinner: bool,
@@ -1302,9 +1424,11 @@ def _run_garfield_pseudo_fvlmm(
         snp_col="snp",
         role_col="row_role",
         out_col="padj",
-        n_tests=total_windows,
+        n_tests=fdr_n_tests,
     )
-    tsv_df = _format_garfield_fvlmm_output_df_for_tsv(full_df)
+    tsv_df = _format_garfield_fvlmm_output_df_for_tsv(
+        _sort_garfield_fvlmm_rows_for_tsv(full_df)
+    )
 
     out_base = f"{pseudo_prefix}.fvlmm"
     tsv_path = f"{out_base}.tsv"
@@ -1349,9 +1473,9 @@ def _run_garfield_pseudo_fvlmm(
             "n_rows_tested": int(full_df.shape[0]),
             "n_combo_tested": int(combo_unique.shape[0]),
             "fdr_n_tests": (
-                int(total_windows)
-                if total_windows is not None and int(total_windows) > 0
-                else int(combo_unique.shape[0])
+                int(fdr_n_tests)
+                if fdr_n_tests is not None and int(fdr_n_tests) > 0
+                else int(full_df.shape[0])
             ),
             "best_combo": best_combo,
             "best_combo_p": best_combo_p,
@@ -1400,6 +1524,7 @@ def _run_garfield_pseudo_fvlmm2(
     specs, rule_meta_df, skipped = _collect_garfield_fvlmm2_specs(
         rules_tsv=str(rules_tsv),
         name_map=source_name_map,
+        source_sites=source_sites,
     )
     out_base = f"{pseudo_prefix}.fvlmm2"
     tsv_path = f"{out_base}.tsv"
@@ -1734,6 +1859,23 @@ def _build_interval_groups(
     return labels, groups
 
 
+def _build_all_gene_interval_groups(
+    gff3: str,
+    extension: int,
+) -> list[list[tuple[str, int, int]]]:
+    dfgff3 = readanno(gff3, "ID").iloc[:, :4].set_index(3)
+    dfgff3 = dfgff3.loc[~dfgff3.index.duplicated()]
+    groups: list[list[tuple[str, int, int]]] = []
+    for gene_id, row in dfgff3.iterrows():
+        chrom = str(row[0])
+        start = int(row[1]) - int(extension)
+        end = int(row[2]) + int(extension)
+        if not gene_id:
+            continue
+        groups.append([(chrom, start, end)])
+    return groups
+
+
 def _normalize_scan_chrom(chrom: object) -> str:
     text = str(chrom).strip()
     if len(text) > 2 and (text.endswith("_1") or text.endswith("_2")):
@@ -1842,6 +1984,33 @@ def _describe_rank_schedule(rank_score_runtime: str) -> str:
     return mode
 
 
+def _parse_rule_null_quantile_spec(spec: object) -> tuple[float, bool, Optional[str]]:
+    if spec is None:
+        return 0.99, False, None
+    text = str(spec).strip().lower()
+    if text == "":
+        raise ValueError(
+            "-pm/--permutation requires a value like q99, q50, or a float in (0, 1)."
+        )
+    if text.startswith("q"):
+        digits = text[1:]
+        if digits == "" or not digits.isdigit():
+            raise ValueError(
+                "-pm/--permutation must look like q99, q50, or a float in (0, 1)."
+            )
+        quantile = int(digits) / float(10 ** len(digits))
+    else:
+        try:
+            quantile = float(text)
+        except Exception as exc:
+            raise ValueError(
+                "-pm/--permutation must look like q99, q50, or a float in (0, 1)."
+            ) from exc
+    if not np.isfinite(quantile) or not (0.0 < float(quantile) < 1.0):
+        raise ValueError("-pm/--permutation quantile must be in (0, 1).")
+    return float(quantile), True, text
+
+
 def _dedupe_saved_paths(paths: list[object]) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
@@ -1902,6 +2071,81 @@ def _emit_garfield_summary_to_log(logger, summary_rows: list[dict[str, object]])
     logger.info("  ".join(headers[idx].ljust(widths[idx]) for idx in range(len(headers))))
     for row in rows:
         logger.info("  ".join(row[idx].ljust(widths[idx]) for idx in range(len(row))))
+
+
+def _format_rule_null_quantile_label(quantile: object) -> str:
+    try:
+        q = float(quantile)
+    except Exception:
+        return "q99"
+    if not np.isfinite(q):
+        return "q99"
+    pct = q * 100.0
+    if abs(pct - round(pct)) <= 1e-9:
+        pct_text = str(int(round(pct)))
+    else:
+        pct_text = f"{pct:.4f}".rstrip("0").rstrip(".")
+    return f"q{pct_text}"
+
+
+def _emit_garfield_bg_noise_summary_to_log(
+    logger,
+    *,
+    trait_name: str,
+    bg_noise_summary: object,
+    use_spinner: bool,
+) -> None:
+    if not isinstance(bg_noise_summary, dict):
+        return
+    buckets = bg_noise_summary.get("buckets")
+    if not isinstance(buckets, list) or len(buckets) == 0:
+        return
+    dataset = str(bg_noise_summary.get("dataset", "")).strip() or "full"
+    first_output = None
+    for bucket in buckets:
+        if isinstance(bucket, dict) and isinstance(bucket.get("output"), dict):
+            first_output = bucket.get("output")
+            break
+    quantile_value = (
+        float(first_output.get("quantile", float("nan")))
+        if isinstance(first_output, dict)
+        else float("nan")
+    )
+    quantile_label = _format_rule_null_quantile_label(quantile_value)
+    _emit_garfield_file_only_line(
+        logger,
+        (
+            f"GARFIELD bg-noise summary for '{trait_name}': "
+            f"dataset={dataset}, quantile={quantile_label} ({float(quantile_value):.4f})"
+        ),
+    )
+    for bucket in buckets:
+        if not isinstance(bucket, dict):
+            continue
+        label = str(bucket.get("label", "")).strip() or "layer?"
+        search = bucket.get("search") if isinstance(bucket.get("search"), dict) else {}
+        output = bucket.get("output") if isinstance(bucket.get("output"), dict) else {}
+        if search:
+            _emit_garfield_file_only_line(
+                logger,
+                (
+                    f"  {label} search null: "
+                    f"penalty={_garfield_format_metric4(search.get('penalty'))}, "
+                    f"mean={_garfield_format_metric4(search.get('mean'))}, "
+                    f"var={_garfield_format_metric4(search.get('variance'))}, "
+                    f"n={int(search.get('n', 0) or 0)}"
+                ),
+            )
+        _emit_garfield_file_only_line(
+            logger,
+            (
+                f"  {label} output null: "
+                f"penalty={_garfield_format_metric4(output.get('penalty'))}, "
+                f"mean={_garfield_format_metric4(output.get('mean'))}, "
+                f"var={_garfield_format_metric4(output.get('variance'))}, "
+                f"n={int(output.get('n', 0) or 0)}"
+            ),
+        )
 
 
 def _load_json_if_exists(path: Optional[str]):
@@ -2247,12 +2491,17 @@ def main() -> None:
         help="Unified width controlling both ML top-k and beam width (default: 100).",
     )
     optional_group.add_argument(
-        "-permutation",
+        "-pm",
         "--permutation",
-        action="store_true",
-        dest="permutation",
-        default=True,
-        help=argparse.SUPPRESS,
+        dest="rule_permutation_quantile",
+        type=str,
+        default=None,
+        help=(
+            "Experimental: set the GARFIELD null-penalty quantile, e.g. q99 or q50. "
+            "When specified, GARFIELD also appends permutation-based one-sided p-value "
+            "and FDR columns to rules.tsv. Default keeps the current q99 threshold "
+            "and does not compute permutation p-values."
+        ),
     )
     optional_group.add_argument(
         "--fold",
@@ -2353,6 +2602,14 @@ def main() -> None:
         parser.error("the following arguments are required: -p/--pheno")
     if len(extras) > 0:
         parser.error("unrecognized arguments: " + " ".join(extras))
+    try:
+        (
+            args.rule_null_quantile_runtime,
+            args.rule_null_report_pvalue_runtime,
+            args.rule_null_quantile_spec_runtime,
+        ) = _parse_rule_null_quantile_spec(args.rule_permutation_quantile)
+    except ValueError as e:
+        parser.error(str(e))
 
     default_extension = 100_000
     if args.window_args is not None:
@@ -2641,6 +2898,7 @@ def main() -> None:
 
     group_labels: list[str] = []
     group_intervals: list[list[tuple[str, int, int]]] = []
+    null_group_intervals: Optional[list[list[tuple[str, int, int]]]] = None
     scan_unit_total: Optional[int] = None
     if args.scan_mode == "window":
         scan_unit_total = _count_window_scan_units_from_bim(
@@ -2676,6 +2934,11 @@ def main() -> None:
         )
         if len(group_intervals) == 0:
             raise ValueError(f"No valid groups built for scan-mode={args.scan_mode}.")
+        if args.scan_mode == "geneset":
+            null_group_intervals = _build_all_gene_interval_groups(
+                args.gff3,
+                int(args.extension),
+            )
         scan_unit_total = len(group_intervals)
 
     grm_n: int | str = "NA" if aligned_grm is None else int(aligned_grm.shape[0])
@@ -2775,6 +3038,7 @@ def main() -> None:
         logic_unit_kind = _scan_mode_to_logic_unit_kind(args.scan_mode)
         rust_groups = group_intervals if args.scan_mode != "window" else None
         rust_group_names = group_labels if args.scan_mode != "window" else None
+        rust_null_groups = null_group_intervals if args.scan_mode == "geneset" else None
         trait_logic_prefix = f"{trait_outprefix}.garfield"
         # Rust handles full-data residualization before ML candidate search
         # and beam search are executed.
@@ -2790,6 +3054,7 @@ def main() -> None:
                 site_keep=site_keep_trait,
                 unit_kind=logic_unit_kind,
                 groups=rust_groups,
+                null_groups=rust_null_groups,
                 group_names=rust_group_names,
                 extension=int(args.extension),
                 step=int(args.step),
@@ -2801,6 +3066,8 @@ def main() -> None:
                 ml_top_frac=0.0,
                 permutation_repeats=20,
                 permutation_scoring="auto",
+                rule_null_quantile=float(args.rule_null_quantile_runtime),
+                rule_null_report_pvalue=bool(args.rule_null_report_pvalue_runtime),
                 n_estimators=100,
                 max_depth=int(args.layer) + 1,
                 min_samples_leaf=1,
@@ -2852,6 +3119,12 @@ def main() -> None:
                     stage_name,
                     rust_memory_debug.get(stage_name),
                 )
+        _emit_garfield_bg_noise_summary_to_log(
+            logger,
+            trait_name=trait_name,
+            bg_noise_summary=result.get("bg_noise_summary"),
+            use_spinner=use_spinner,
+        )
 
         pseudo_path = f"{trait_logic_prefix}.pseudo"
         posterior_tsv_path = f"{trait_logic_prefix}.posterior.tsv"
@@ -2860,10 +3133,14 @@ def main() -> None:
         skipped_units = result.get("skipped_units") or []
         skipped_messages = result.get("skipped_messages") or []
         if len(skipped_units) > 0:
-            logger.warning(
+            _emit_garfield_file_only_warning(
+                logger,
                 f"GARFIELD skipped {len(skipped_units)} unit(s) for trait '{trait_name}' because no valid initial literals remained."
             )
-            logger.info("Skipped scan units (unit_name -> max_singleton_dosage_maf):")
+            _emit_garfield_file_only_line(
+                logger,
+                "Skipped scan units (unit_name -> max_singleton_dosage_maf):",
+            )
             for item in skipped_units:
                 if not isinstance(item, dict):
                     continue
@@ -2873,13 +3150,14 @@ def main() -> None:
                     maf_txt = f"{float(max_lmaf):.4f}"
                 except Exception:
                     maf_txt = "NA"
-                logger.info(f"  {unit_name} -> {maf_txt}")
+                _emit_garfield_file_only_line(logger, f"  {unit_name} -> {maf_txt}")
         elif len(skipped_messages) > 0:
-            logger.warning(
+            _emit_garfield_file_only_warning(
+                logger,
                 f"GARFIELD skipped {len(skipped_messages)} unit(s) for trait '{trait_name}'."
             )
             for msg in skipped_messages:
-                logger.info(str(msg))
+                _emit_garfield_file_only_line(logger, str(msg))
         n_rules = int(result.get("n_rules", 0))
         if n_rules <= 0:
             _remove_file_if_exists(pseudo_path)
@@ -2928,6 +3206,18 @@ def main() -> None:
                 logger.info(
                     f"Running pseudo FvLMM follow-up for '{trait_name}' on {int(n_rules)} GARFIELD rule(s)."
                 )
+                units_for_fdr = (
+                    int(result.get("units_scanned", 0))
+                    if int(result.get("units_scanned", 0)) > 0
+                    else int(result.get("units_total", 0))
+                    if int(result.get("units_total", 0)) > 0
+                    else 0
+                )
+                fdr_n_tests = (
+                    units_for_fdr * max(1, int(args.top_rules_runtime))
+                    if units_for_fdr > 0
+                    else None
+                )
                 return _run_garfield_pseudo_fvlmm(
                     pseudo_prefix=str(pseudo_prefix),
                     trait_label=suffix,
@@ -2938,13 +3228,7 @@ def main() -> None:
                     logic_maf_threshold=float(logic_maf_threshold),
                     max_missing_rate=float(args.geno),
                     het_threshold=float(args.het),
-                    total_windows=(
-                        int(result.get("units_scanned", 0))
-                        if int(result.get("units_scanned", 0)) > 0
-                        else int(result.get("units_total", 0))
-                        if int(result.get("units_total", 0)) > 0
-                        else None
-                    ),
+                    fdr_n_tests=fdr_n_tests,
                     threads=int(args.thread),
                     logger=logger,
                     use_spinner=use_spinner,
@@ -2991,6 +3275,10 @@ def main() -> None:
             "engine_runtime": engine_runtime,
             "ml_skipped": ml_skipped,
             "permutation": True,
+            "rule_null_quantile": float(args.rule_null_quantile_runtime),
+            "rule_null_report_pvalue": bool(args.rule_null_report_pvalue_runtime),
+            "rule_null_quantile_spec": args.rule_null_quantile_spec_runtime,
+            "bg_noise_summary": result.get("bg_noise_summary"),
             "rule_permutation_active": bool(result.get("rule_permutation_active", False)),
             "null_chunk_bp": int(result.get("null_chunk_bp", 0)),
             "null_chunk_min_snps": int(result.get("null_chunk_min_snps", 0)),
@@ -3173,6 +3461,9 @@ def main() -> None:
                 "rank_schedule_runtime": rank_schedule_runtime,
                 "rank_schedule_source": rank_schedule_source,
                 "permutation": True,
+                "rule_null_quantile": float(args.rule_null_quantile_runtime),
+                "rule_null_report_pvalue": bool(args.rule_null_report_pvalue_runtime),
+                "rule_null_quantile_spec": args.rule_null_quantile_spec_runtime,
                 "null_chunk_bp": int(args.extension) * 2,
                 "null_chunk_target": 150,
                 "null_chunk_min_snps": 50,

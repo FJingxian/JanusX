@@ -3,8 +3,7 @@
 
 use super::permutation::{
     bucket_from_rule_with_complexity, structure_prior_penalty, RuleNullBucket,
-    RuleNullPenaltyLookup,
-    RuleStructurePrior,
+    RuleNullPenaltyLookup, RuleStructurePrior,
 };
 use super::score::{
     dosage_maf_from_dual_counts, dual_packed_summary, score_cont_centered_gain_dual_from_summary,
@@ -3722,11 +3721,8 @@ fn final_test_score_for_state(
     literal_scores: &[LiteralSingletonScore],
     params: &BeamSearchParams,
 ) -> Result<f64, String> {
-    let child_bucket = bucket_from_rule_with_complexity(
-        &state.rule,
-        test.dosage_maf,
-        params.null_complexity_bin,
-    );
+    let child_bucket =
+        bucket_from_rule_with_complexity(&state.rule, test.dosage_maf, params.null_complexity_bin);
     let direct_parent_test_raw = best_ancestor_raw_baseline(
         &state.rule,
         y_test,
@@ -3835,8 +3831,7 @@ fn final_rule_score_for_eval(
     params: &BeamSearchParams,
     is_train: bool,
 ) -> Result<f64, String> {
-    let bucket =
-        bucket_from_rule_with_complexity(rule, raw.dosage_maf, params.null_complexity_bin);
+    let bucket = bucket_from_rule_with_complexity(rule, raw.dosage_maf, params.null_complexity_bin);
     let abs_score = rule_abs_score_for_eval(
         rule,
         raw,
@@ -3868,8 +3863,7 @@ fn final_rule_score_for_eval_cached(
     base_cache: Option<&RuleRawScoreCache>,
     local_cache: &mut RuleRawScoreCache,
 ) -> Result<f64, String> {
-    let bucket =
-        bucket_from_rule_with_complexity(rule, raw.dosage_maf, params.null_complexity_bin);
+    let bucket = bucket_from_rule_with_complexity(rule, raw.dosage_maf, params.null_complexity_bin);
     let abs_score = rule_abs_score_for_eval_cached(
         rule,
         raw,
@@ -4557,6 +4551,9 @@ fn beam_search_train_test_continuous_impl(
                 &params,
             );
             if !keep_rule_after_dosage_maf_pruning(&cand.test, &params) {
+                continue;
+            }
+            if !keep_child_after_parent_gain_pruning(&cand.rule, cand.test_score, &params) {
                 continue;
             }
             let key = cand.rule.lexical_key();
@@ -6110,6 +6107,9 @@ pub fn beam_search_train_test_continuous_fuzzy(
                 literal_scores.as_slice(),
                 &params,
             );
+            if !keep_child_after_parent_gain_pruning(&cand.rule, cand.test_score, &params) {
+                continue;
+            }
             match best_by_rule.entry(cand.rule.lexical_key()) {
                 std::collections::hash_map::Entry::Vacant(slot) => {
                     slot.insert(cand);
@@ -6709,6 +6709,61 @@ mod tests {
                 && cand.rule.rest[0].0 == BeamBinaryOp::And
                 && cand.rule.rest[0].1.row_index == 1
         }));
+    }
+
+    #[test]
+    fn test_search_null_filters_high_order_candidates_from_final_hits() {
+        init_python_for_tests();
+        let rows = vec![
+            vec![1, 1, 1, 1, 0, 0, 0, 0],
+            vec![1, 1, 0, 0, 1, 1, 0, 0],
+            vec![0, 0, 0, 0, 1, 1, 1, 1],
+        ];
+        let y = vec![4.0, 4.2, -1.0, -1.2, -1.1, -1.0, -1.2, -1.1];
+        let (bits, row_words) = pack_rows(&rows, y.len());
+        let group_ids = vec![0usize, 1, 2];
+        let pair_rule = BeamRule {
+            first: BeamLiteral {
+                row_index: 0,
+                group_id: 0,
+                negated: false,
+            },
+            rest: vec![(
+                BeamBinaryOp::And,
+                BeamLiteral {
+                    row_index: 1,
+                    group_id: 1,
+                    negated: false,
+                },
+            )],
+        };
+        let pair_bucket = super::super::permutation::bucket_from_rule(&pair_rule, 0.25);
+        let mut cal = super::super::permutation::RuleNullCalibrator::new();
+        for _ in 0..10 {
+            cal.insert(pair_bucket, 1000.0, 1000.0);
+        }
+        let out = beam_search_train_test_continuous(
+            &y,
+            &bits,
+            row_words,
+            rows.len(),
+            y.len(),
+            &y,
+            &bits,
+            row_words,
+            y.len(),
+            &group_ids,
+            BeamSearchParams {
+                max_pick: 2,
+                beam_width: 8,
+                rank_mode: BeamRankMode::InteractionGain,
+                null_penalties: Some(Arc::new(cal.finalize())),
+                ..BeamSearchParams::default()
+            },
+        )
+        .unwrap();
+        assert!(out.iter().all(|cand| cand.rule.len() == 1));
+        assert!(out.iter().any(|cand| cand.rule.first.row_index == 0));
     }
 
     #[test]

@@ -3555,6 +3555,9 @@ enum SimBenchLogic {
     Single,
     And,
     Or,
+    Na,
+    An,
+    Nan,
 }
 
 #[derive(Clone, Debug)]
@@ -3571,11 +3574,32 @@ struct SimBenchTerm {
 fn parse_simbench_logic(raw: &str) -> Result<SimBenchLogic, String> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "" | "single" => Ok(SimBenchLogic::Single),
-        "and" => Ok(SimBenchLogic::And),
+        "and" | "a" => Ok(SimBenchLogic::And),
         "or" => Ok(SimBenchLogic::Or),
+        "na" => Ok(SimBenchLogic::Na),
+        "an" => Ok(SimBenchLogic::An),
+        "nan" => Ok(SimBenchLogic::Nan),
         other => Err(format!(
-            "simbench logic must be one of: single, and, or; got {other}"
+            "simbench logic must be one of: single, and, or, a, na, an, nan; got {other}"
         )),
+    }
+}
+
+#[inline]
+fn simbench_logic_member_negated(logic: SimBenchLogic, idx: usize) -> bool {
+    match logic {
+        SimBenchLogic::Single | SimBenchLogic::And | SimBenchLogic::Or => false,
+        SimBenchLogic::Na | SimBenchLogic::Nan => true,
+        SimBenchLogic::An => idx > 0,
+    }
+}
+
+#[inline]
+fn simbench_logic_join_op(logic: SimBenchLogic) -> Option<BeamBinaryOp> {
+    match logic {
+        SimBenchLogic::Single => None,
+        SimBenchLogic::And | SimBenchLogic::An | SimBenchLogic::Nan => Some(BeamBinaryOp::And),
+        SimBenchLogic::Or | SimBenchLogic::Na => Some(BeamBinaryOp::Or),
     }
 }
 
@@ -3744,17 +3768,17 @@ fn simbench_rule_from_site_count(logic: SimBenchLogic, n_sites: usize) -> Result
     let first = BeamLiteral {
         row_index: 0,
         group_id: 0,
-        negated: false,
+        negated: simbench_logic_member_negated(logic, 0),
     };
     let mut rest = Vec::<(BeamBinaryOp, BeamLiteral)>::with_capacity(n_sites.saturating_sub(1));
-    if let Some(op) = simbench_logic_to_beam_op(logic) {
+    if let Some(op) = simbench_logic_join_op(logic) {
         for row_index in 1..n_sites {
             rest.push((
                 op,
                 BeamLiteral {
                     row_index,
                     group_id: row_index,
-                    negated: false,
+                    negated: simbench_logic_member_negated(logic, row_index),
                 },
             ));
         }
@@ -3763,10 +3787,10 @@ fn simbench_rule_from_site_count(logic: SimBenchLogic, n_sites: usize) -> Result
 }
 
 fn simbench_logic_symbol(logic: SimBenchLogic) -> &'static str {
-    match logic {
-        SimBenchLogic::Single => "",
-        SimBenchLogic::And => " & ",
-        SimBenchLogic::Or => " | ",
+    match simbench_logic_join_op(logic) {
+        None => "",
+        Some(BeamBinaryOp::And) => " & ",
+        Some(BeamBinaryOp::Or) => " | ",
     }
 }
 
@@ -3781,7 +3805,8 @@ fn simbench_rule_name<S: GarfieldChromPosSite>(
     } else {
         sites
             .iter()
-            .map(site_base_label)
+            .enumerate()
+            .map(|(idx, site)| literal_name(site, simbench_logic_member_negated(logic, idx)))
             .collect::<Vec<_>>()
             .join(simbench_logic_symbol(logic))
     }
@@ -3801,17 +3826,21 @@ fn simbench_rule_bim_name<S: GarfieldDisplaySite>(
     } else {
         sites
             .iter()
-            .map(|site| literal_name(site, false))
+            .enumerate()
+            .map(|(idx, site)| literal_name(site, simbench_logic_member_negated(logic, idx)))
             .collect::<Vec<_>>()
             .join(simbench_logic_symbol_compact(logic))
     }
 }
 
-fn simbench_rule_bim_alleles<S: GarfieldDisplaySite>(sites: &[S]) -> (String, String) {
+fn simbench_rule_bim_alleles<S: GarfieldDisplaySite>(
+    logic: SimBenchLogic,
+    sites: &[S],
+) -> (String, String) {
     let mut allele0 = Vec::<String>::with_capacity(sites.len());
     let mut allele1 = Vec::<String>::with_capacity(sites.len());
-    for site in sites.iter() {
-        let (a0, a1) = literal_bim_alleles(site, false);
+    for (idx, site) in sites.iter().enumerate() {
+        let (a0, a1) = literal_bim_alleles(site, simbench_logic_member_negated(logic, idx));
         allele0.push(a0);
         allele1.push(a1);
     }
@@ -3826,18 +3855,21 @@ fn simbench_rule_expr<S: GarfieldDisplaySite>(
     let Some(first) = it.next() else {
         return Err("simbench term has no sites".to_string());
     };
-    let mut out = literal_expr(first, false);
-    let op_txt = match logic {
-        SimBenchLogic::Single => "",
-        SimBenchLogic::And => "AND",
-        SimBenchLogic::Or => "OR",
+    let mut out = literal_expr(first, simbench_logic_member_negated(logic, 0));
+    let op_txt = match simbench_logic_join_op(logic) {
+        None => "",
+        Some(BeamBinaryOp::And) => "AND",
+        Some(BeamBinaryOp::Or) => "OR",
     };
-    if logic != SimBenchLogic::Single {
-        for site in it {
+    if !matches!(logic, SimBenchLogic::Single) {
+        for (idx, site) in it.enumerate() {
             out.push(' ');
             out.push_str(op_txt);
             out.push(' ');
-            out.push_str(&literal_expr(site, false));
+            out.push_str(&literal_expr(
+                site,
+                simbench_logic_member_negated(logic, idx + 1),
+            ));
         }
     }
     Ok(out)
@@ -4146,14 +4178,12 @@ fn format_simbench_ml_rank(logic: SimBenchLogic, ranks: &[Option<usize>]) -> Str
     if ranks.is_empty() {
         return ".".to_string();
     }
-    let joiner = match logic {
-        SimBenchLogic::Single => "",
-        SimBenchLogic::And => " & ",
-        SimBenchLogic::Or => " | ",
-    };
+    let joiner = simbench_logic_symbol(logic);
     ranks
         .iter()
-        .map(|rank| match rank {
+        .enumerate()
+        .map(|(idx, rank)| match rank {
+            Some(v) if simbench_logic_member_negated(logic, idx) => format!("!{v}"),
             Some(v) => v.to_string(),
             None => ".".to_string(),
         })
@@ -4452,7 +4482,8 @@ fn evaluate_simbench_terms(
             .ok_or_else(|| format!("simbench term {} has no sites", term.term_id))?;
         let (ml_rank, ml_feature_count) =
             resolve_simbench_ml_rank(term.logic, logic_row_candidates.as_slice(), ml_contexts);
-        let (bim_allele0, bim_allele1) = simbench_rule_bim_alleles(bench_sites.as_slice());
+        let (bim_allele0, bim_allele1) =
+            simbench_rule_bim_alleles(term.logic, bench_sites.as_slice());
         out.push(GarfieldLogicRuleRecord {
             unit_name: simbench_rule_name(term.logic, bench_sites.as_slice(), &term.label),
             unit_kind: "simbench".to_string(),
@@ -4464,7 +4495,9 @@ fn evaluate_simbench_terms(
             display_ops: simbench_logic_to_beam_op(term.logic)
                 .map(|op| vec![op; bench_sites.len().saturating_sub(1)])
                 .unwrap_or_default(),
-            display_negated: vec![false; bench_sites.len()],
+            display_negated: (0..bench_sites.len())
+                .map(|idx| simbench_logic_member_negated(term.logic, idx))
+                .collect(),
             snp_name: simbench_rule_name(term.logic, bench_sites.as_slice(), &term.label),
             expr: sim_expr_txt,
             chrom_field: first_site.chrom.clone(),
@@ -4785,20 +4818,16 @@ fn literal_target_name<S: GarfieldChromPosSite + GarfieldDisplaySite>(
 
 #[inline]
 fn simbench_logic_symbol_compact(logic: SimBenchLogic) -> &'static str {
-    match logic {
-        SimBenchLogic::Single => "",
-        SimBenchLogic::And => "&",
-        SimBenchLogic::Or => "|",
+    match simbench_logic_join_op(logic) {
+        None => "",
+        Some(BeamBinaryOp::And) => "&",
+        Some(BeamBinaryOp::Or) => "|",
     }
 }
 
 #[inline]
 fn simbench_logic_to_beam_op(logic: SimBenchLogic) -> Option<BeamBinaryOp> {
-    match logic {
-        SimBenchLogic::Single => None,
-        SimBenchLogic::And => Some(BeamBinaryOp::And),
-        SimBenchLogic::Or => Some(BeamBinaryOp::Or),
-    }
+    simbench_logic_join_op(logic)
 }
 
 #[inline]
@@ -13367,6 +13396,66 @@ mod tests {
         );
         assert_eq!(rank_txt, "2 & 1");
         assert_eq!(ml_feature_count, 4);
+    }
+
+    #[test]
+    fn test_parse_simbench_logic_accepts_new_shortcodes() {
+        assert_eq!(parse_simbench_logic("a").unwrap(), SimBenchLogic::And);
+        assert_eq!(parse_simbench_logic("na").unwrap(), SimBenchLogic::Na);
+        assert_eq!(parse_simbench_logic("an").unwrap(), SimBenchLogic::An);
+        assert_eq!(parse_simbench_logic("nan").unwrap(), SimBenchLogic::Nan);
+    }
+
+    #[test]
+    fn test_parse_simbench_terms_accepts_new_logic_shortcodes() {
+        let dir = make_temp_dir("simbench_logic_shortcodes");
+        let path = dir.join("simbench.tsv");
+        fs::write(
+            &path,
+            concat!(
+                "term_id\tkind\tlogic\tsites\tlabel\teffect\n",
+                "1\tlogic_gate\ta\t1:10;1:20\tgate_a\t0.1\n",
+                "2\tlogic_gate\tna\t2:30;2:40\tgate_na\t0.2\n",
+                "3\tlogic_gate\tan\t3:50;3:60\tgate_an\t0.3\n",
+                "4\tlogic_gate\tnan\t4:70;4:80\tgate_nan\t0.4\n",
+            ),
+        )
+        .unwrap();
+        let terms = parse_simbench_terms(path.to_str().unwrap()).unwrap();
+        assert_eq!(terms.len(), 4);
+        assert_eq!(terms[0].logic, SimBenchLogic::And);
+        assert_eq!(terms[1].logic, SimBenchLogic::Na);
+        assert_eq!(terms[2].logic, SimBenchLogic::An);
+        assert_eq!(terms[3].logic, SimBenchLogic::Nan);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn test_simbench_rule_from_site_count_preserves_negation_semantics() {
+        let na_rule = simbench_rule_from_site_count(SimBenchLogic::Na, 2).unwrap();
+        assert!(na_rule.first.negated);
+        assert_eq!(na_rule.rest.len(), 1);
+        assert_eq!(na_rule.rest[0].0, BeamBinaryOp::Or);
+        assert!(na_rule.rest[0].1.negated);
+
+        let an_rule = simbench_rule_from_site_count(SimBenchLogic::An, 2).unwrap();
+        assert!(!an_rule.first.negated);
+        assert_eq!(an_rule.rest.len(), 1);
+        assert_eq!(an_rule.rest[0].0, BeamBinaryOp::And);
+        assert!(an_rule.rest[0].1.negated);
+    }
+
+    #[test]
+    fn test_format_simbench_ml_rank_marks_negated_members() {
+        let ranks = vec![Some(2usize), Some(5usize), None];
+        assert_eq!(
+            format_simbench_ml_rank(SimBenchLogic::Na, &ranks),
+            "!2 | !5 | ."
+        );
+        assert_eq!(
+            format_simbench_ml_rank(SimBenchLogic::An, &ranks),
+            "2 & !5 & ."
+        );
     }
 
     #[test]

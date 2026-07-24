@@ -3374,8 +3374,9 @@ mod tests {
             1.0_f64, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
         ];
         let mut rng_bg = StdRng::seed_from_u64(23);
-        let observed =
+        let (observed, factorization) =
             sample_background_effects_from_grm_trace_scaled(&grm, n, 0.25, &mut rng_bg).unwrap();
+        assert_eq!(factorization, "cholesky");
         let mut rng_direct = StdRng::seed_from_u64(23);
         let expected = sample_gaussian_noise_with_variance(n, 0.25, &mut rng_direct);
         for (obs, exp) in observed.iter().zip(expected.iter()) {

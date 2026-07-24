@@ -14,6 +14,7 @@ use rand::{Rng, SeedableRng};
 use rand_distr::{Distribution, StandardNormal};
 use rayon::prelude::*;
 
+use crate::eigh::symmetric_eigh_f64_row_major;
 use crate::gfcore as core;
 use crate::gfcore::{BedSnpIter, HmpSnpIter, TxtSnpIter, VcfSnpIter};
 use crate::gfreader::prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window;
@@ -339,6 +340,12 @@ fn spd_cholesky_with_jitter(matrix: &[f64], dim: usize, label: &str) -> Result<V
     Err(format!("{label} is not SPD even after diagonal jitter"))
 }
 
+#[derive(Clone, Debug)]
+enum SamplingFactor {
+    CholeskyLower(Vec<f64>),
+    DenseSquareRoot(Vec<f64>),
+}
+
 fn lower_triangular_matvec(l: &[f64], dim: usize, rhs: &[f64]) -> Vec<f64> {
     debug_assert_eq!(l.len(), dim.saturating_mul(dim));
     debug_assert_eq!(rhs.len(), dim);
@@ -353,8 +360,90 @@ fn lower_triangular_matvec(l: &[f64], dim: usize, rhs: &[f64]) -> Vec<f64> {
     out
 }
 
+fn dense_row_major_matvec(a: &[f64], dim: usize, rhs: &[f64]) -> Vec<f64> {
+    debug_assert_eq!(a.len(), dim.saturating_mul(dim));
+    debug_assert_eq!(rhs.len(), dim);
+    let mut out = vec![0.0_f64; dim];
+    for i in 0..dim {
+        let row = &a[i * dim..(i + 1) * dim];
+        let mut acc = 0.0_f64;
+        for (v, z) in row.iter().zip(rhs.iter()) {
+            acc += *v * *z;
+        }
+        out[i] = acc;
+    }
+    out
+}
+
+fn sample_factor_matvec(factor: &SamplingFactor, dim: usize, rhs: &[f64]) -> Vec<f64> {
+    match factor {
+        SamplingFactor::CholeskyLower(l) => lower_triangular_matvec(l, dim, rhs),
+        SamplingFactor::DenseSquareRoot(l) => dense_row_major_matvec(l, dim, rhs),
+    }
+}
+
 fn diag_trace_f64(matrix: &[f64], dim: usize) -> f64 {
     (0..dim).map(|i| matrix[i * dim + i]).sum::<f64>()
+}
+
+fn eigh_psd_square_root_with_clipped_negatives(
+    matrix: &[f64],
+    dim: usize,
+    label: &str,
+) -> Result<(Vec<f64>, f64), String> {
+    let (evals, evecs, _backend) = symmetric_eigh_f64_row_major(matrix, dim)
+        .map_err(|e| format!("{label} eigh fallback failed: {e}"))?;
+    if evals.len() != dim || evecs.len() != dim.saturating_mul(dim) {
+        return Err(format!(
+            "{label} eigh fallback shape mismatch: evals={}, evecs={}, dim={dim}",
+            evals.len(),
+            evecs.len(),
+        ));
+    }
+
+    let mut root = vec![0.0_f64; dim * dim];
+    let mut trace_psd = 0.0_f64;
+    for k in 0..dim {
+        let lambda = evals[k];
+        if !lambda.is_finite() {
+            return Err(format!(
+                "{label} eigh fallback produced non-finite eigenvalue at index {k}: {lambda}"
+            ));
+        }
+        let lambda_clip = lambda.max(0.0_f64);
+        trace_psd += lambda_clip;
+        if lambda_clip <= 0.0_f64 {
+            continue;
+        }
+        let scale = lambda_clip.sqrt();
+        for i in 0..dim {
+            root[i * dim + k] = evecs[i * dim + k] * scale;
+        }
+    }
+    if !trace_psd.is_finite() || trace_psd <= 0.0_f64 {
+        return Err(format!(
+            "{label} eigh fallback produced non-positive PSD trace after clipping: {trace_psd}"
+        ));
+    }
+    Ok((root, trace_psd))
+}
+
+fn build_sampling_factor_with_fallback(
+    matrix: &[f64],
+    dim: usize,
+    label: &str,
+) -> Result<(SamplingFactor, f64), String> {
+    let trace = diag_trace_f64(matrix, dim);
+    if let Ok(chol) = spd_cholesky_with_jitter(matrix, dim, label) {
+        if !trace.is_finite() || trace <= 0.0_f64 {
+            return Err(format!(
+                "{label} trace must be finite and > 0 for trace-scaled sampling."
+            ));
+        }
+        return Ok((SamplingFactor::CholeskyLower(chol), trace));
+    }
+    let (root, trace_psd) = eigh_psd_square_root_with_clipped_negatives(matrix, dim, label)?;
+    Ok((SamplingFactor::DenseSquareRoot(root), trace_psd))
 }
 
 fn build_causal_series_effects(count: usize, alpha: f64, rng: &mut StdRng) -> Vec<f64> {
@@ -391,17 +480,13 @@ fn sample_background_effects_from_grm_trace_scaled(
     if target_var <= 0.0 || n == 0 {
         return Ok(vec![0.0_f64; n]);
     }
-    let trace = diag_trace_f64(grm, n);
-    if !trace.is_finite() || trace <= 0.0 {
-        return Err("GRM trace must be finite and > 0 for trace-scaled sampling.".to_string());
-    }
-    let chol = spd_cholesky_with_jitter(grm, n, "GRM")?;
+    let (factor, trace_for_scale) = build_sampling_factor_with_fallback(grm, n, "GRM")?;
     let mut z = vec![0.0_f64; n];
     for zi in z.iter_mut() {
         *zi = StandardNormal.sample(rng);
     }
-    let mut out = lower_triangular_matvec(&chol, n, &z);
-    let scale = ((n as f64) * target_var / trace).sqrt();
+    let mut out = sample_factor_matvec(&factor, n, &z);
+    let scale = ((n as f64) * target_var / trace_for_scale).sqrt();
     for v in out.iter_mut() {
         *v *= scale;
     }
@@ -2478,6 +2563,34 @@ mod tests {
         let mut rng_direct = StdRng::seed_from_u64(23);
         let expected = sample_gaussian_noise_with_variance(n, 0.25, &mut rng_direct);
         for (obs, exp) in observed.iter().zip(expected.iter()) {
+            assert!((obs - exp).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn indefinite_grm_falls_back_to_eigh_and_clips_negative_eigenvalues() {
+        let grm = vec![1.0_f64, 2.0_f64, 2.0_f64, 1.0_f64];
+        let (factor, trace_psd) = build_sampling_factor_with_fallback(&grm, 2, "GRM").unwrap();
+        assert!((trace_psd - 3.0_f64).abs() < 1e-12);
+        let root = match factor {
+            SamplingFactor::DenseSquareRoot(root) => root,
+            SamplingFactor::CholeskyLower(_) => {
+                panic!("indefinite GRM should fall back to eigh clipping")
+            }
+        };
+
+        let mut recon = vec![0.0_f64; 4];
+        for i in 0..2 {
+            for j in 0..2 {
+                let mut acc = 0.0_f64;
+                for k in 0..2 {
+                    acc += root[i * 2 + k] * root[j * 2 + k];
+                }
+                recon[i * 2 + j] = acc;
+            }
+        }
+        let expected = vec![1.5_f64, 1.5_f64, 1.5_f64, 1.5_f64];
+        for (obs, exp) in recon.iter().zip(expected.iter()) {
             assert!((obs - exp).abs() < 1e-12);
         }
     }

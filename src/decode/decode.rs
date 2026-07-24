@@ -628,7 +628,7 @@ pub(crate) fn decode_prepared_additive_block_packed_f32(
     )
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_centered_additive_block_from_maf_f32(
     packed_flat: &[u8],

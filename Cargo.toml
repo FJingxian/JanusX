@@ -5,7 +5,6 @@ edition = "2021"
 rust-version = "1.74"
 description = "A suite of genotyping tools for genome-wide association study and genomic selection"
 license = "AGPL-3.0-or-later"
-license-file = "LICENSE"
 readme = "README.md"
 documentation = "https://github.com/FJingxian/JanusX/blob/main/doc/JanusXcore.md"
 homepage = "https://github.com/FJingxian/JanusX"
@@ -21,7 +20,10 @@ default = ["blas-openblas"]
 # - macOS default uses Accelerate.
 # - enable `blas-openblas` to link OpenBLAS and prefer it at runtime.
 blas-openblas = []
-python-extension = ["pyo3/extension-module"]
+# Compatibility flag retained for build frontends which still pass
+# `--features python-extension`; extension-module behavior is now driven by
+# `PYO3_BUILD_EXTENSION_MODULE` (set automatically by modern maturin).
+python-extension = []
 # Optional AVX-512 bitwise kernels (nightly-only intrinsics on many stable toolchains).
 # Keep off by default so release wheels build on stable Rust.
 simd-avx512 = []
@@ -52,6 +54,7 @@ statrs = "0.18.0"
 [build-dependencies]
 cc = "1.2"
 pkg-config = "0.3"
+pyo3-build-config = { version = "0.27.2", features = ["resolve-config"] }
 
 [profile.dev]
 debug = 1

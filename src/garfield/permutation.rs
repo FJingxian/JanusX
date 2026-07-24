@@ -142,11 +142,6 @@ impl RuleNullBucket {
     }
 
     #[inline]
-    pub fn base_complexity_bin(self) -> u8 {
-        (self.context_index() % DEFAULT_RULE_NULL_BASE_COMPLEXITY_BIN_COUNT) as u8
-    }
-
-    #[inline]
     fn bucket_index(self, max_rule_len: usize) -> usize {
         self.context_index()
             .saturating_mul(max_rule_len.max(1))
@@ -161,11 +156,6 @@ impl RuleNullBucket {
 #[inline]
 pub fn null_topk_per_repeat_for_bucket(_bucket: RuleNullBucket) -> usize {
     DEFAULT_RULE_NULL_TOPK_ALL
-}
-
-#[inline]
-fn null_quantile_for_bucket() -> f64 {
-    DEFAULT_RULE_NULL_QUANTILE
 }
 
 #[inline]
@@ -370,6 +360,7 @@ impl RuleNullCalibrator {
         out
     }
 
+    #[cfg(test)]
     pub fn finalize(&self) -> RuleNullPenaltyLookup {
         self.finalize_with_quantile(DEFAULT_RULE_NULL_QUANTILE)
     }
@@ -484,6 +475,7 @@ impl RuleNullPenaltyLookup {
         Self::with_max_rule_len(DEFAULT_RULE_NULL_BUCKET_MAX_RULE_LEN)
     }
 
+    #[cfg(test)]
     pub fn quantile(&self) -> f64 {
         self.quantile
     }
@@ -608,6 +600,8 @@ impl RuleNullPenaltyLookup {
         self.penalty_with_fallback(bucket, false)
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn train_score_pvalue_greater(&self, observed_score: f64) -> Option<f64> {
         self.score_pvalue_greater(observed_score, true)
     }
@@ -616,6 +610,7 @@ impl RuleNullPenaltyLookup {
         self.score_pvalue_greater(observed_score, false)
     }
 
+    #[cfg(test)]
     pub fn summary(&self, is_train: bool) -> Option<RuleNullDistributionSummary> {
         let stats = if is_train {
             self.global_train_stats
@@ -724,6 +719,7 @@ impl RuleNullPenaltyLookup {
     }
 }
 
+#[cfg(test)]
 pub fn bucket_from_rule(rule: &BeamRule, _maf: f64) -> RuleNullBucket {
     RuleNullBucket {
         rule_len: rule.len().max(1),
@@ -731,6 +727,7 @@ pub fn bucket_from_rule(rule: &BeamRule, _maf: f64) -> RuleNullBucket {
     }
 }
 
+#[cfg(test)]
 pub fn bucket_from_expr(_expr: &str, rule_len: usize, _maf: f64) -> RuleNullBucket {
     RuleNullBucket {
         rule_len: rule_len.max(1),

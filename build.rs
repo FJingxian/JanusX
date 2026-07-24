@@ -1413,6 +1413,17 @@ fn configure_openblas_from_dir(lib_dir_s: &str, source_label: &str) -> bool {
 }
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=PYO3_BUILD_EXTENSION_MODULE");
+    let build_extension_module = env_value("PYO3_BUILD_EXTENSION_MODULE")
+        .as_deref()
+        .and_then(parse_boolish)
+        .unwrap_or(false);
+    if build_extension_module {
+        pyo3_build_config::add_extension_module_link_args();
+    } else {
+        pyo3_build_config::add_python_framework_link_args();
+    }
+
     compile_kmc_wrapper();
     emit_bed_decode_simd_defaults();
     compile_fasttree_executable();

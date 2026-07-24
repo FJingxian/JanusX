@@ -50,7 +50,7 @@ python-install-mirror = "https://registry.npmmirror.com/-/binary/python-build-st
 
 [build-system]
 requires = [
-    "maturin>=1.7,<2",
+    "maturin>=1.9.4,<2",
     "numpy>=1.23",
 ]
 build-backend = "build_backend"

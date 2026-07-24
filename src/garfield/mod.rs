@@ -2803,6 +2803,7 @@ struct GarfieldPermutationNullScores {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GarfieldRuleDisplayPolarity {
     Original,
+    #[allow(dead_code)]
     Complement,
 }
 
@@ -3759,92 +3760,6 @@ fn simbench_rule_from_site_count(logic: SimBenchLogic, n_sites: usize) -> Result
         }
     }
     Ok(BeamRule { first, rest })
-}
-
-fn simbench_rule_without_literal(rule: &BeamRule, remove_idx: usize) -> Option<BeamRule> {
-    if rule.len() <= 1 || remove_idx >= rule.len() {
-        return None;
-    }
-    if remove_idx == 0 {
-        let (_, first) = *rule.rest.first()?;
-        return Some(BeamRule {
-            first,
-            rest: rule.rest.iter().skip(1).copied().collect(),
-        });
-    }
-    let mut out = BeamRule {
-        first: rule.first,
-        rest: Vec::with_capacity(rule.rest.len().saturating_sub(1)),
-    };
-    for (rest_idx, &(op, lit)) in rule.rest.iter().enumerate() {
-        if rest_idx + 1 == remove_idx {
-            continue;
-        }
-        out.rest.push((op, lit));
-    }
-    Some(out)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn simbench_best_ancestor_raw_baseline_dual(
-    rule: &BeamRule,
-    y: &[f64],
-    ge1_flat: &[u64],
-    ge2_flat: &[u64],
-    row_words: usize,
-    n_rows: usize,
-    n_samples: usize,
-    lambda_len: f64,
-    lambda_not: f64,
-    disable_parent_delta: bool,
-) -> Result<f64, String> {
-    if disable_parent_delta || rule.len() <= 1 {
-        return Ok(0.0);
-    }
-    if rule.len() == 2 {
-        let mut best = f64::NEG_INFINITY;
-        for lit in std::iter::once(rule.first).chain(rule.rest.iter().map(|(_, lit)| *lit)) {
-            let singleton = singleton_rule_from_literal(lit);
-            let sc = evaluate_rule_continuous_dual(
-                &singleton, y, ge1_flat, ge2_flat, row_words, n_rows, n_samples, lambda_len,
-                lambda_not,
-            )?;
-            best = best.max(sc.raw_score);
-        }
-        return Ok(if best.is_finite() { best } else { 0.0 });
-    }
-    let mut best = f64::NEG_INFINITY;
-    for remove_idx in 0..rule.len() {
-        let Some(parent_rule) = simbench_rule_without_literal(rule, remove_idx) else {
-            continue;
-        };
-        let parent_raw = evaluate_rule_continuous_dual(
-            &parent_rule,
-            y,
-            ge1_flat,
-            ge2_flat,
-            row_words,
-            n_rows,
-            n_samples,
-            lambda_len,
-            lambda_not,
-        )?
-        .raw_score;
-        let parent_ancestor = simbench_best_ancestor_raw_baseline_dual(
-            &parent_rule,
-            y,
-            ge1_flat,
-            ge2_flat,
-            row_words,
-            n_rows,
-            n_samples,
-            lambda_len,
-            lambda_not,
-            disable_parent_delta,
-        )?;
-        best = best.max(parent_raw.max(parent_ancestor));
-    }
-    Ok(if best.is_finite() { best } else { 0.0 })
 }
 
 fn simbench_logic_symbol(logic: SimBenchLogic) -> &'static str {
@@ -6479,34 +6394,6 @@ fn binary_row_var_from_support(support: usize, n_samples: usize) -> f64 {
     }
     let p = (support as f64) / (n_samples as f64);
     p * (1.0 - p)
-}
-
-#[inline]
-fn binary_pair_r2_from_bit_rows(
-    row_i: &[u64],
-    support_i: usize,
-    row_j: &[u64],
-    support_j: usize,
-    n_samples: usize,
-) -> f64 {
-    if n_samples == 0 {
-        return 0.0;
-    }
-    let ss_i = (n_samples as f64) * binary_row_var_from_support(support_i, n_samples);
-    let ss_j = (n_samples as f64) * binary_row_var_from_support(support_j, n_samples);
-    if !(ss_i > 0.0 && ss_j > 0.0) {
-        return 0.0;
-    }
-    let both_one = and_popcount(row_i, row_j) as f64;
-    let p_i = (support_i as f64) / (n_samples as f64);
-    let p_j = (support_j as f64) / (n_samples as f64);
-    let cov = both_one - (n_samples as f64) * p_i * p_j;
-    let denom = (ss_i * ss_j).sqrt();
-    if !(denom > 0.0) || !cov.is_finite() {
-        return 0.0;
-    }
-    let corr = cov / denom;
-    (corr * corr).clamp(0.0, 1.0)
 }
 
 #[inline]

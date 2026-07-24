@@ -27,6 +27,7 @@ struct SimSiteRecord {
     pos: i32,
     ref_allele: String,
     alt_allele: String,
+    maf: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +58,19 @@ struct LogicPoolSpec {
 }
 
 #[derive(Clone, Debug)]
+struct LogicSampledSpec {
+    pool_indices: Vec<usize>,
+    mode: LogicGateMode,
+    size: usize,
+}
+
+#[derive(Clone, Debug)]
+enum MixedPlannedTerm {
+    Additive(usize),
+    Logic(LogicSampledSpec),
+}
+
+#[derive(Clone, Debug)]
 struct CausalTerm {
     members: Vec<usize>,
     mode: Option<LogicGateMode>,
@@ -74,6 +88,7 @@ struct G2pSimConfig {
     path_or_prefix: String,
     delimiter: Option<String>,
     maf_threshold: f32,
+    causal_maf_min: f32,
     max_missing_rate: f32,
     het_threshold: Option<f32>,
     seed: u64,
@@ -82,7 +97,9 @@ struct G2pSimConfig {
     causal_count: usize,
     causal_pve: Option<f64>,
     bim_ranges: Vec<(String, i32, i32)>,
+    bim_range_groups: Vec<Vec<(String, i32, i32)>>,
     logic_mode: Option<String>,
+    logic_size_weights: Option<Vec<f64>>,
     logic_gate_count: Option<usize>,
     logic_k_min: usize,
     logic_k_max: usize,
@@ -386,6 +403,32 @@ fn diag_trace_f64(matrix: &[f64], dim: usize) -> f64 {
     (0..dim).map(|i| matrix[i * dim + i]).sum::<f64>()
 }
 
+#[inline]
+fn processed_row_minor_allele_frequency(row: &[f32]) -> f32 {
+    if row.is_empty() {
+        return 0.0_f32;
+    }
+    let mut n_obs = 0usize;
+    let mut sum = 0.0_f64;
+    for &v in row.iter() {
+        if v.is_finite() && v >= 0.0_f32 {
+            n_obs += 1;
+            sum += v as f64;
+        }
+    }
+    if n_obs == 0 {
+        return 0.0_f32;
+    }
+    let af = (0.5_f64 * (sum / n_obs as f64)).clamp(0.0_f64, 1.0_f64);
+    af.min(1.0_f64 - af) as f32
+}
+
+#[inline]
+fn site_passes_causal_maf(site: &SimSiteRecord, causal_maf_min: f32) -> bool {
+    let thr = causal_maf_min.max(0.0_f32);
+    site.maf.is_finite() && site.maf + 1e-8_f32 >= thr
+}
+
 fn eigh_psd_square_root_with_clipped_negatives(
     matrix: &[f64],
     dim: usize,
@@ -682,6 +725,7 @@ fn logic_gate_indicator_from_literals(rows: &[Vec<u8>], output_negated: bool) ->
     raw
 }
 
+#[cfg(test)]
 fn logic_gate_indicator(rows: &[Vec<u8>], mode: LogicGateMode) -> Result<Vec<u8>, String> {
     let literal_rows = logic_gate_literal_rows(rows, mode)?;
     Ok(logic_gate_indicator_from_literals(
@@ -980,6 +1024,7 @@ fn build_kept_bed_sites(
             pos: site.pos,
             ref_allele,
             alt_allele,
+            maf: alt_freq.min(1.0_f32 - alt_freq).max(0.0_f32),
         });
         kept_idx = kept_idx.saturating_add(1);
     }
@@ -1160,6 +1205,54 @@ fn build_range_pools(
     Ok(out)
 }
 
+fn build_range_group_pools(
+    sites: &[SimSiteRecord],
+    range_groups: &[Vec<(String, i32, i32)>],
+) -> Result<Vec<Vec<usize>>, String> {
+    let mut out = Vec::with_capacity(range_groups.len());
+    for (gi, group) in range_groups.iter().enumerate() {
+        if group.is_empty() {
+            return Err(format!("causal_group[{gi}] must contain at least one range"));
+        }
+        let mut idx: Vec<usize> = Vec::new();
+        let mut seen: HashSet<usize> = HashSet::new();
+        for rg in group.iter() {
+            for (i, site) in sites.iter().enumerate() {
+                if site_in_range(site, rg) && seen.insert(i) {
+                    idx.push(i);
+                }
+            }
+        }
+        if idx.is_empty() {
+            let ranges_txt = group
+                .iter()
+                .map(|rg| format!("{}:{}-{}", rg.0, rg.1, rg.2))
+                .collect::<Vec<String>>()
+                .join(";");
+            return Err(format!(
+                "causal_group[{gi}] has no eligible sites after QC: {ranges_txt}"
+            ));
+        }
+        out.push(idx);
+    }
+    Ok(out)
+}
+
+fn build_constraint_pools(
+    sites: &[SimSiteRecord],
+    ranges: &[(String, i32, i32)],
+    range_groups: &[Vec<(String, i32, i32)>],
+) -> Result<Vec<Vec<usize>>, String> {
+    if !ranges.is_empty() && !range_groups.is_empty() {
+        return Err("bim_ranges and bim_range_groups cannot both be set".to_string());
+    }
+    if !range_groups.is_empty() {
+        build_range_group_pools(sites, range_groups)
+    } else {
+        build_range_pools(sites, ranges)
+    }
+}
+
 fn sample_without_replacement(
     pool: &[usize],
     k: usize,
@@ -1180,43 +1273,61 @@ fn sample_without_replacement(
 fn select_additive_indices(
     sites: &[SimSiteRecord],
     causal_count: usize,
-    ranges: &[(String, i32, i32)],
+    constraint_pools: &[Vec<usize>],
+    causal_maf_min: f32,
     rng: &mut StdRng,
 ) -> Result<Vec<usize>, String> {
     if sites.is_empty() {
         return Err("no eligible sites remain after QC".to_string());
     }
-    if causal_count == 0 && ranges.is_empty() {
+    if causal_count == 0 && constraint_pools.is_empty() {
         return Ok(Vec::new());
+    }
+    if causal_count < constraint_pools.len() {
+        return Err(format!(
+            "causal_count must be >= number of causal constraint groups: causal_count={}, groups={}",
+            causal_count,
+            constraint_pools.len()
+        ));
     }
     let mut selected: Vec<usize> = Vec::new();
     let mut used: HashSet<usize> = HashSet::new();
-    let pools = build_range_pools(sites, ranges)?;
-    for pool in pools.iter() {
+    for (ri, pool) in constraint_pools.iter().enumerate() {
         let avail: Vec<usize> = pool
             .iter()
             .copied()
-            .filter(|idx| !used.contains(idx))
+            .filter(|idx| {
+                !used.contains(idx) && site_passes_causal_maf(&sites[*idx], causal_maf_min)
+            })
             .collect();
         if avail.is_empty() {
-            return Err(
-                "explicit bimrange pools overlap completely; no unique causal site can be drawn"
-                    .to_string(),
-            );
+            return Err(format!(
+                "causal constraint group[{ri}] has no causal-site candidates after lmaf filtering: lmaf={:.4}",
+                causal_maf_min
+            ));
         }
         let pick = avail[rng.random_range(0..avail.len())];
         used.insert(pick);
         selected.push(pick);
     }
-    let target = causal_count.max(selected.len());
-    if target > sites.len() {
+    let target = causal_count;
+    let eligible_all: Vec<usize> = sites
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, site)| site_passes_causal_maf(site, causal_maf_min).then_some(idx))
+        .collect();
+    if target > eligible_all.len() {
         return Err(format!(
-            "requested causal sites exceed eligible site count: target={target}, eligible={}",
-            sites.len()
+            "requested causal sites exceed lmaf-filtered eligible site count: target={target}, eligible={}, lmaf={:.4}",
+            eligible_all.len(),
+            causal_maf_min,
         ));
     }
     if selected.len() < target {
-        let mut rest: Vec<usize> = (0..sites.len()).filter(|idx| !used.contains(idx)).collect();
+        let mut rest: Vec<usize> = eligible_all
+            .into_iter()
+            .filter(|idx| !used.contains(idx))
+            .collect();
         rest.shuffle(rng);
         for idx in rest.into_iter().take(target - selected.len()) {
             used.insert(idx);
@@ -1258,13 +1369,212 @@ fn logic_mode_from_str(mode: &str, rng: &mut StdRng) -> Result<LogicGateMode, St
     }
 }
 
+fn validate_logic_size_weights(weights: &[f64]) -> Result<(), String> {
+    if weights.is_empty() {
+        return Err("logic_size_weights must not be empty".to_string());
+    }
+    let mut any_positive = false;
+    for (i, &w) in weights.iter().enumerate() {
+        if !w.is_finite() || w < 0.0 {
+            return Err(format!(
+                "logic_size_weights[{}] must be finite and >= 0, got {}",
+                i, w
+            ));
+        }
+        if w > 0.0 {
+            any_positive = true;
+        }
+    }
+    if !any_positive {
+        return Err("logic_size_weights must contain at least one positive entry".to_string());
+    }
+    Ok(())
+}
+
+fn sample_term_size_with_limit(
+    weights: &[f64],
+    max_size: usize,
+    rng: &mut StdRng,
+) -> Result<usize, String> {
+    let mut filtered: Vec<(usize, f64)> = Vec::new();
+    let mut sum = 0.0_f64;
+    for (i, &w) in weights.iter().enumerate() {
+        let size = i + 1;
+        if size > max_size || w <= 0.0 {
+            continue;
+        }
+        filtered.push((size, w));
+        sum += w;
+    }
+    if filtered.is_empty() || !(sum.is_finite() && sum > 0.0) {
+        return Err(format!(
+            "logic_size_weights has no positive mass for term sizes <= {max_size}"
+        ));
+    }
+    let mut draw = rng.random::<f64>() * sum;
+    for (size, w) in filtered.into_iter() {
+        if draw <= w {
+            return Ok(size);
+        }
+        draw -= w;
+    }
+    Ok(max_size.min(weights.len()).max(1))
+}
+
+fn choose_unique_site_from_pool(
+    pool: &[usize],
+    used: &HashSet<usize>,
+    ctx: &str,
+    rng: &mut StdRng,
+) -> Result<usize, String> {
+    let avail: Vec<usize> = pool.iter().copied().filter(|idx| !used.contains(idx)).collect();
+    if avail.is_empty() {
+        return Err(format!("{ctx}: no unused candidate sites remain"));
+    }
+    Ok(avail[rng.random_range(0..avail.len())])
+}
+
+fn build_mixed_logic_term_plan(
+    sites: &[SimSiteRecord],
+    constraint_pools: &[Vec<usize>],
+    causal_count: usize,
+    logic_mode: &str,
+    logic_size_weights: &[f64],
+    causal_maf_min: f32,
+    logic_window_bp: Option<i32>,
+    rng: &mut StdRng,
+) -> Result<Vec<MixedPlannedTerm>, String> {
+    validate_logic_size_weights(logic_size_weights)?;
+    if sites.is_empty() {
+        return Err("no eligible sites remain after QC".to_string());
+    }
+    if causal_count < constraint_pools.len() {
+        return Err(format!(
+            "causal_count must be >= number of causal constraint groups: causal_count={}, groups={}",
+            causal_count,
+            constraint_pools.len()
+        ));
+    }
+
+    let eligible_all: Vec<usize> = sites
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, site)| site_passes_causal_maf(site, causal_maf_min).then_some(idx))
+        .collect();
+    if eligible_all.is_empty() {
+        return Err(format!(
+            "no causal-site candidates remain after lmaf filtering: lmaf={:.4}",
+            causal_maf_min
+        ));
+    }
+
+    let mut range_pools: Vec<Vec<usize>> = Vec::with_capacity(constraint_pools.len());
+    for (ri, pool) in constraint_pools.iter().enumerate() {
+        let filtered: Vec<usize> = pool
+            .iter()
+            .copied()
+            .into_iter()
+            .filter(|idx| site_passes_causal_maf(&sites[*idx], causal_maf_min))
+            .collect();
+        if filtered.is_empty() {
+            return Err(format!(
+                "causal constraint group[{ri}] has no causal-site candidates after lmaf filtering: lmaf={:.4}",
+                causal_maf_min
+            ));
+        }
+        range_pools.push(filtered);
+    }
+
+    let total_terms = causal_count;
+    if total_terms == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut plan: Vec<MixedPlannedTerm> = Vec::with_capacity(total_terms);
+    let mut used_additive: HashSet<usize> = HashSet::new();
+
+    for (ri, pool) in range_pools.iter().enumerate() {
+        let size = sample_term_size_with_limit(logic_size_weights, pool.len(), rng)?;
+        if size == 1 {
+            let pick = choose_unique_site_from_pool(
+                pool.as_slice(),
+                &used_additive,
+                &format!("bimrange[{ri}]"),
+                rng,
+            )?;
+            used_additive.insert(pick);
+            plan.push(MixedPlannedTerm::Additive(pick));
+        } else {
+            plan.push(MixedPlannedTerm::Logic(LogicSampledSpec {
+                pool_indices: reservoir_sample(pool.clone(), 1024, rng),
+                mode: logic_mode_from_str(logic_mode, rng)?,
+                size,
+            }));
+        }
+    }
+
+    for ti in range_pools.len()..total_terms {
+        let size = sample_term_size_with_limit(logic_size_weights, eligible_all.len(), rng)?;
+        if size == 1 {
+            let pick = choose_unique_site_from_pool(
+                eligible_all.as_slice(),
+                &used_additive,
+                &format!("causal_term[{ti}]"),
+                rng,
+            )?;
+            used_additive.insert(pick);
+            plan.push(MixedPlannedTerm::Additive(pick));
+            continue;
+        }
+
+        let pool = if let Some(window_bp) = logic_window_bp {
+            let mut tries = 0usize;
+            let mut found: Option<Vec<usize>> = None;
+            while tries < 128 {
+                tries += 1;
+                let anchor_idx = eligible_all[rng.random_range(0..eligible_all.len())];
+                let anchor = &sites[anchor_idx];
+                let lo = anchor.pos.saturating_sub(window_bp);
+                let hi = anchor.pos.saturating_add(window_bp);
+                let mut cand = Vec::new();
+                for &idx in eligible_all.iter() {
+                    let site = &sites[idx];
+                    if site.chrom_norm == anchor.chrom_norm && site.pos >= lo && site.pos <= hi {
+                        cand.push(idx);
+                    }
+                }
+                if cand.len() >= size {
+                    found = Some(reservoir_sample(cand, 1024, rng));
+                    break;
+                }
+            }
+            found.unwrap_or_else(|| reservoir_sample(eligible_all.clone(), 1024, rng))
+        } else {
+            reservoir_sample(eligible_all.clone(), 1024, rng)
+        };
+        if pool.len() < size {
+            return Err(format!(
+                "unable to build a logic-gate candidate pool for term {ti} with requested size {size}"
+            ));
+        }
+        plan.push(MixedPlannedTerm::Logic(LogicSampledSpec {
+            pool_indices: pool,
+            mode: logic_mode_from_str(logic_mode, rng)?,
+            size,
+        }));
+    }
+
+    Ok(plan)
+}
+
 fn build_logic_pool_specs(
     sites: &[SimSiteRecord],
-    ranges: &[(String, i32, i32)],
+    constraint_pools: &[Vec<usize>],
     causal_count: usize,
     logic_gate_count: Option<usize>,
     logic_mode: &str,
     logic_k_min: usize,
+    causal_maf_min: f32,
     logic_window_bp: Option<i32>,
     rng: &mut StdRng,
 ) -> Result<Vec<LogicPoolSpec>, String> {
@@ -1275,12 +1585,18 @@ fn build_logic_pool_specs(
         return Err("logic_k_min must be > 0".to_string());
     }
     let mut out: Vec<LogicPoolSpec> = Vec::new();
-    let range_pools = build_range_pools(sites, ranges)?;
-    for pool in range_pools.into_iter() {
+    for (ri, pool) in constraint_pools.iter().enumerate() {
+        let pool: Vec<usize> = pool
+            .iter()
+            .copied()
+            .into_iter()
+            .filter(|idx| site_passes_causal_maf(&sites[*idx], causal_maf_min))
+            .collect();
         if pool.len() < logic_k_min {
             return Err(format!(
-                "an explicit bimrange does not contain enough sites for logic gate size: required >= {logic_k_min}, got {}",
-                pool.len()
+                "causal constraint group[{ri}] does not contain enough lmaf-filtered sites for logic gate size: required >= {logic_k_min}, got {}, lmaf={:.4}",
+                pool.len(),
+                causal_maf_min,
             ));
         }
         out.push(LogicPoolSpec {
@@ -1288,9 +1604,27 @@ fn build_logic_pool_specs(
             mode: logic_mode_from_str(logic_mode, rng)?,
         });
     }
-    let target = logic_gate_count
-        .unwrap_or(causal_count.max(1))
-        .max(out.len());
+    let eligible_all: Vec<usize> = sites
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, site)| site_passes_causal_maf(site, causal_maf_min).then_some(idx))
+        .collect();
+    if eligible_all.len() < logic_k_min {
+        return Err(format!(
+            "unable to build a logic-gate candidate pool with at least {logic_k_min} lmaf-filtered sites: eligible={}, lmaf={:.4}",
+            eligible_all.len(),
+            causal_maf_min,
+        ));
+    }
+    let requested_target = logic_gate_count.unwrap_or(causal_count.max(1));
+    if requested_target < out.len() {
+        return Err(format!(
+            "requested logic term count must be >= number of causal constraint groups: requested_terms={}, groups={}",
+            requested_target,
+            out.len()
+        ));
+    }
+    let target = requested_target;
     while out.len() < target {
         let pool = if let Some(window_bp) = logic_window_bp {
             let mut tries = 0usize;
@@ -1303,7 +1637,11 @@ fn build_logic_pool_specs(
                 let hi = anchor.pos.saturating_add(window_bp);
                 let mut cand = Vec::new();
                 for (i, site) in sites.iter().enumerate() {
-                    if site.chrom_norm == anchor.chrom_norm && site.pos >= lo && site.pos <= hi {
+                    if site.chrom_norm == anchor.chrom_norm
+                        && site.pos >= lo
+                        && site.pos <= hi
+                        && site_passes_causal_maf(site, causal_maf_min)
+                    {
                         cand.push(i);
                     }
                 }
@@ -1312,13 +1650,13 @@ fn build_logic_pool_specs(
                     break;
                 }
             }
-            found.unwrap_or_else(|| reservoir_sample((0..sites.len()).collect(), 1024, rng))
+            found.unwrap_or_else(|| reservoir_sample(eligible_all.clone(), 1024, rng))
         } else {
-            reservoir_sample((0..sites.len()).collect(), 1024, rng)
+            reservoir_sample(eligible_all.clone(), 1024, rng)
         };
         if pool.len() < logic_k_min {
             return Err(format!(
-                "unable to build a logic-gate candidate pool with at least {logic_k_min} sites"
+                "unable to build a logic-gate candidate pool with at least {logic_k_min} lmaf-filtered sites"
             ));
         }
         out.push(LogicPoolSpec {
@@ -1337,6 +1675,7 @@ fn select_logic_terms(
     logic_k_max: usize,
     logic_ld_max: f64,
     logic_het_max: f64,
+    causal_maf_min: f32,
     logic_af_min: f64,
     logic_af_max: f64,
     logic_max_iter: usize,
@@ -1439,6 +1778,7 @@ fn select_logic_terms(
             );
             let raw_af = gate_indicator.iter().filter(|&&v| v != 0).count() as f64
                 / gate_indicator.len() as f64;
+            let gate_maf = raw_af.min(1.0_f64 - raw_af);
             let gate_values = match logic_effect_model {
                 LogicEffectModel::Gate => logic_gate_centered_values(&gate_indicator),
                 LogicEffectModel::CenteredInteraction => {
@@ -1452,14 +1792,18 @@ fn select_logic_terms(
             if var <= 1e-12 {
                 continue;
             }
-            if best
-                .as_ref()
-                .map(|(_, _, af)| (raw_af - af_center).abs() < (*af - af_center).abs())
-                .unwrap_or(true)
+            if gate_maf + 1e-12_f64 >= causal_maf_min as f64
+                && best
+                    .as_ref()
+                    .map(|(_, _, af)| (raw_af - af_center).abs() < (*af - af_center).abs())
+                    .unwrap_or(true)
             {
                 best = Some((members.clone(), gate_values.clone(), raw_af));
             }
-            if raw_af >= logic_af_min && raw_af <= logic_af_max {
+            if raw_af >= logic_af_min
+                && raw_af <= logic_af_max
+                && gate_maf + 1e-12_f64 >= causal_maf_min as f64
+            {
                 let label = term_label(sites, &members, Some(spec.mode));
                 for idx in members.iter() {
                     used_global.insert(*idx);
@@ -1490,12 +1834,194 @@ fn select_logic_terms(
                 });
             } else {
                 return Err(format!(
-                    "unable to build a valid logic gate for pool {ti}; try relaxing gate size / LD / AF / heterozygosity constraints"
+                    "unable to build a valid logic gate for pool {ti}; try relaxing gate size / LD / AF / heterozygosity constraints (gate_size={}..{}, lmaf={:.4})",
+                    logic_k_min,
+                    logic_k_max,
+                    causal_maf_min,
                 ));
             }
         }
     }
     Ok(out)
+}
+
+fn select_logic_terms_sampled_specs(
+    specs: &[LogicSampledSpec],
+    row_map: &HashMap<usize, Vec<f32>>,
+    sites: &[SimSiteRecord],
+    logic_ld_max: f64,
+    logic_het_max: f64,
+    causal_maf_min: f32,
+    logic_af_min: f64,
+    logic_af_max: f64,
+    logic_max_iter: usize,
+    logic_effect_model: LogicEffectModel,
+    initial_used: &HashSet<usize>,
+    rng: &mut StdRng,
+) -> Result<Vec<CausalTerm>, String> {
+    let af_center = 0.5 * (logic_af_min + logic_af_max);
+    let mut used_global = initial_used.clone();
+    let mut out = Vec::with_capacity(specs.len());
+
+    for (ti, spec) in specs.iter().enumerate() {
+        let mut bin_map: HashMap<usize, Vec<u8>> = HashMap::new();
+        for &idx in spec.pool_indices.iter() {
+            if let Some(row) = row_map.get(&idx) {
+                if let Some(bin) = collapse_to_logic_bin01(row, logic_het_max) {
+                    bin_map.insert(idx, bin);
+                }
+            }
+        }
+        if bin_map.len() < spec.size {
+            return Err(format!(
+                "logic-gate candidate pool {ti} has too few usable sites after heterozygosity filtering: need >= {}, got {}",
+                spec.size,
+                bin_map.len()
+            ));
+        }
+
+        let mut best: Option<(Vec<usize>, Vec<f64>, f64)> = None;
+        for _ in 0..logic_max_iter.max(1) {
+            let pool: Vec<usize> = spec
+                .pool_indices
+                .iter()
+                .copied()
+                .filter(|idx| bin_map.contains_key(idx) && !used_global.contains(idx))
+                .collect();
+            if pool.len() < spec.size {
+                break;
+            }
+            let members = sample_without_replacement(&pool, spec.size, rng)?;
+            let mut ld_ok = true;
+            if logic_ld_max < 0.999_999 {
+                for a in 0..members.len() {
+                    for b in (a + 1)..members.len() {
+                        let r2 = binary_r2(
+                            bin_map
+                                .get(&members[a])
+                                .ok_or_else(|| "missing logic row".to_string())?,
+                            bin_map
+                                .get(&members[b])
+                                .ok_or_else(|| "missing logic row".to_string())?,
+                        );
+                        if r2 > logic_ld_max + 1e-12 {
+                            ld_ok = false;
+                            break;
+                        }
+                    }
+                    if !ld_ok {
+                        break;
+                    }
+                }
+            }
+            if !ld_ok {
+                continue;
+            }
+
+            let gate_rows: Vec<Vec<u8>> = members
+                .iter()
+                .map(|idx| {
+                    bin_map
+                        .get(idx)
+                        .cloned()
+                        .ok_or_else(|| "missing logic row".to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let literal_rows = logic_gate_literal_rows(&gate_rows, spec.mode)?;
+            let gate_indicator = logic_gate_indicator_from_literals(
+                literal_rows.as_slice(),
+                logic_output_negated(spec.mode),
+            );
+            let raw_af = gate_indicator.iter().filter(|&&v| v != 0).count() as f64
+                / gate_indicator.len() as f64;
+            let gate_maf = raw_af.min(1.0_f64 - raw_af);
+            let gate_values = match logic_effect_model {
+                LogicEffectModel::Gate => logic_gate_centered_values(&gate_indicator),
+                LogicEffectModel::CenteredInteraction => {
+                    residualize_logic_indicator_against_main_effects(
+                        &gate_indicator,
+                        literal_rows.as_slice(),
+                    )?
+                }
+            };
+            let var = variance_f64(&gate_values);
+            if var <= 1e-12 {
+                continue;
+            }
+            if gate_maf + 1e-12_f64 >= causal_maf_min as f64
+                && best
+                    .as_ref()
+                    .map(|(_, _, af)| (raw_af - af_center).abs() < (*af - af_center).abs())
+                    .unwrap_or(true)
+            {
+                best = Some((members.clone(), gate_values.clone(), raw_af));
+            }
+            if raw_af >= logic_af_min
+                && raw_af <= logic_af_max
+                && gate_maf + 1e-12_f64 >= causal_maf_min as f64
+            {
+                let label = term_label(sites, &members, Some(spec.mode));
+                for idx in members.iter() {
+                    used_global.insert(*idx);
+                }
+                out.push(CausalTerm {
+                    members,
+                    mode: Some(spec.mode),
+                    values: gate_values,
+                    effect: 0.0,
+                    label,
+                });
+                break;
+            }
+        }
+
+        if out.len() != ti + 1 {
+            if let Some((members, gate, _af)) = best {
+                let label = term_label(sites, &members, Some(spec.mode));
+                for idx in members.iter() {
+                    used_global.insert(*idx);
+                }
+                out.push(CausalTerm {
+                    members,
+                    mode: Some(spec.mode),
+                    values: gate,
+                    effect: 0.0,
+                    label,
+                });
+            } else {
+                return Err(format!(
+                    "unable to build a valid logic gate for term {ti}; try relaxing LD / AF / heterozygosity constraints (gate_size={}, lmaf={:.4})",
+                    spec.size,
+                    causal_maf_min,
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn build_additive_term(
+    idx: usize,
+    row_map: &HashMap<usize, Vec<f32>>,
+    sites: &[SimSiteRecord],
+) -> Result<CausalTerm, String> {
+    let row = row_map
+        .get(&idx)
+        .ok_or_else(|| format!("selected causal site row missing for index {idx}"))?;
+    let values = centered_row_to_owned_f64(row);
+    if variance_f64(&values) <= 1e-12 {
+        return Err(format!(
+            "selected causal site has zero variance after centering: {}:{}",
+            sites[idx].chrom, sites[idx].pos
+        ));
+    }
+    Ok(CausalTerm {
+        members: vec![idx],
+        mode: None,
+        values,
+        effect: 0.0,
+        label: term_label(sites, &[idx], None),
+    })
 }
 
 fn build_additive_terms(
@@ -1505,23 +2031,62 @@ fn build_additive_terms(
 ) -> Result<Vec<CausalTerm>, String> {
     let mut out = Vec::with_capacity(selected_indices.len());
     for &idx in selected_indices.iter() {
-        let row = row_map
-            .get(&idx)
-            .ok_or_else(|| format!("selected causal site row missing for index {idx}"))?;
-        let values = centered_row_to_owned_f64(row);
-        if variance_f64(&values) <= 1e-12 {
-            return Err(format!(
-                "selected causal site has zero variance after centering: {}:{}",
-                sites[idx].chrom, sites[idx].pos
-            ));
+        out.push(build_additive_term(idx, row_map, sites)?);
+    }
+    Ok(out)
+}
+
+fn materialize_mixed_terms_from_plan(
+    plan: &[MixedPlannedTerm],
+    row_map: &HashMap<usize, Vec<f32>>,
+    sites: &[SimSiteRecord],
+    logic_ld_max: f64,
+    logic_het_max: f64,
+    causal_maf_min: f32,
+    logic_af_min: f64,
+    logic_af_max: f64,
+    logic_max_iter: usize,
+    logic_effect_model: LogicEffectModel,
+    rng: &mut StdRng,
+) -> Result<Vec<CausalTerm>, String> {
+    let mut additive_used: HashSet<usize> = HashSet::new();
+    let mut logic_specs: Vec<LogicSampledSpec> = Vec::new();
+    for item in plan.iter() {
+        match item {
+            MixedPlannedTerm::Additive(idx) => {
+                additive_used.insert(*idx);
+            }
+            MixedPlannedTerm::Logic(spec) => logic_specs.push(spec.clone()),
         }
-        out.push(CausalTerm {
-            members: vec![idx],
-            mode: None,
-            values,
-            effect: 0.0,
-            label: term_label(sites, &[idx], None),
-        });
+    }
+    let mut logic_terms_iter = select_logic_terms_sampled_specs(
+        logic_specs.as_slice(),
+        row_map,
+        sites,
+        logic_ld_max,
+        logic_het_max,
+        causal_maf_min,
+        logic_af_min,
+        logic_af_max,
+        logic_max_iter,
+        logic_effect_model,
+        &additive_used,
+        rng,
+    )?
+    .into_iter();
+    let mut out: Vec<CausalTerm> = Vec::with_capacity(plan.len());
+    for item in plan.iter() {
+        match item {
+            MixedPlannedTerm::Additive(idx) => out.push(build_additive_term(*idx, row_map, sites)?),
+            MixedPlannedTerm::Logic(_) => out.push(
+                logic_terms_iter
+                    .next()
+                    .ok_or_else(|| "internal error: mixed logic term materialization underflow".to_string())?,
+            ),
+        }
+    }
+    if logic_terms_iter.next().is_some() {
+        return Err("internal error: mixed logic term materialization overflow".to_string());
     }
     Ok(out)
 }
@@ -1716,6 +2281,9 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
     if config.logic_k_max < config.logic_k_min {
         return Err("logic_k_max must be >= logic_k_min.".to_string());
     }
+    if !(0.0..=0.5).contains(&config.causal_maf_min) {
+        return Err("causal_maf_min must be within [0, 0.5].".to_string());
+    }
     if !(0.0..=1.0).contains(&config.logic_ld_max) {
         return Err("logic_ld_max must be within [0, 1].".to_string());
     }
@@ -1739,14 +2307,43 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
         .as_ref()
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false);
-    let base_term_count = if logic_requested {
+    if config.logic_size_weights.is_some() && !logic_requested {
+        return Err("logic_size_weights requires logic_mode to be set.".to_string());
+    }
+    let mixed_logic_requested = logic_requested
+        && config
+            .logic_size_weights
+            .as_ref()
+            .map(|w| !w.is_empty())
+            .unwrap_or(false);
+    if let Some(weights) = config.logic_size_weights.as_ref() {
+        validate_logic_size_weights(weights)?;
+    }
+    if !config.bim_ranges.is_empty() && !config.bim_range_groups.is_empty() {
+        return Err("bim_ranges and bim_range_groups cannot both be set.".to_string());
+    }
+    let constraint_group_count = if !config.bim_range_groups.is_empty() {
+        config.bim_range_groups.len()
+    } else {
+        config.bim_ranges.len()
+    };
+    let base_term_count = if mixed_logic_requested {
+        config.causal_count
+    } else if logic_requested {
         config
             .logic_gate_count
             .unwrap_or(config.causal_count.max(1))
     } else {
         config.causal_count
     };
-    let effective_term_count = base_term_count.max(config.bim_ranges.len());
+    if base_term_count < constraint_group_count {
+        return Err(format!(
+            "requested causal term count must be >= number of causal constraint groups: requested_terms={}, groups={}",
+            base_term_count,
+            constraint_group_count
+        ));
+    }
+    let effective_term_count = base_term_count;
     let causal_pve_target = config.causal_pve.unwrap_or_else(|| {
         if effective_term_count == 0 {
             0.0
@@ -1821,7 +2418,7 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
             config.max_missing_rate,
             config.het_threshold,
             config.snps_only,
-            |_, _, site| {
+            |_, row, site| {
                 bg_progress_seen = bg_progress_seen.saturating_add(1);
                 if progress_overall_total > 0 {
                     g2p_progress_notify(
@@ -1840,6 +2437,7 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
                     pos: site.pos,
                     ref_allele: site.ref_allele.clone(),
                     alt_allele: site.alt_allele.clone(),
+                    maf: processed_row_minor_allele_frequency(row),
                 });
                 Ok(())
             },
@@ -1900,18 +2498,88 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
 
     let mut causal_terms: Vec<CausalTerm> = Vec::new();
     if needs_causal_scan {
+        let constraint_pools = build_constraint_pools(
+            &sites,
+            &config.bim_ranges,
+            &config.bim_range_groups,
+        )?;
         let causal_offset = progress_site_total;
         if let Some(bed_fast) = fast_bed_path.as_ref() {
-            if logic_requested {
+            if mixed_logic_requested {
+                let logic_mode_str = config.logic_mode.as_deref().unwrap_or("a");
+                let logic_size_weights = config
+                    .logic_size_weights
+                    .as_ref()
+                    .ok_or_else(|| "internal error: mixed logic weights missing".to_string())?;
+                let mut plan_rng = StdRng::seed_from_u64(config.seed ^ 0xB28F_6A91_C547_31D1u64);
+                let mixed_plan = build_mixed_logic_term_plan(
+                    &sites,
+                    constraint_pools.as_slice(),
+                    config.causal_count,
+                    logic_mode_str,
+                    logic_size_weights.as_slice(),
+                    config.causal_maf_min,
+                    config.logic_window_bp,
+                    &mut plan_rng,
+                )?;
+                let mut need_rows: HashSet<usize> = HashSet::with_capacity(1024);
+                for item in mixed_plan.iter() {
+                    match item {
+                        MixedPlannedTerm::Additive(idx) => {
+                            need_rows.insert(*idx);
+                        }
+                        MixedPlannedTerm::Logic(spec) => {
+                            for &idx in spec.pool_indices.iter() {
+                                need_rows.insert(idx);
+                            }
+                        }
+                    }
+                }
+                let need_kept_indices = need_rows.into_iter().collect::<Vec<_>>();
+                runtime_progress_total = causal_offset.saturating_add(need_kept_indices.len());
+                let progress_stage = if mixed_plan
+                    .iter()
+                    .all(|item| matches!(item, MixedPlannedTerm::Additive(_)))
+                {
+                    "causal_additive"
+                } else {
+                    "causal_logic"
+                };
+                let row_map = decode_bed_rows_by_kept_index(
+                    &bed_fast.prefix,
+                    bed_fast.row_source_indices.as_slice(),
+                    need_kept_indices.as_slice(),
+                    config.progress_callback.as_ref(),
+                    progress_stage,
+                    causal_offset,
+                    runtime_progress_total,
+                    progress_every,
+                )?;
+                let mut logic_rng = StdRng::seed_from_u64(config.seed ^ 0x9F4B_72E0_1A33_4F0Cu64);
+                causal_terms = materialize_mixed_terms_from_plan(
+                    mixed_plan.as_slice(),
+                    &row_map,
+                    &sites,
+                    config.logic_ld_max,
+                    config.logic_het_max,
+                    config.causal_maf_min,
+                    config.logic_af_min,
+                    config.logic_af_max,
+                    config.logic_max_iter,
+                    config.logic_effect_model,
+                    &mut logic_rng,
+                )?;
+            } else if logic_requested {
                 let logic_mode_str = config.logic_mode.as_deref().unwrap_or("a");
                 let mut pool_rng = StdRng::seed_from_u64(config.seed ^ 0xB28F_6A91_C547_31D1u64);
                 let pool_specs = build_logic_pool_specs(
                     &sites,
-                    &config.bim_ranges,
+                    constraint_pools.as_slice(),
                     config.causal_count,
                     config.logic_gate_count,
                     logic_mode_str,
                     config.logic_k_min,
+                    config.causal_maf_min,
                     config.logic_window_bp,
                     &mut pool_rng,
                 )?;
@@ -1942,6 +2610,7 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
                     config.logic_k_max,
                     config.logic_ld_max,
                     config.logic_het_max,
+                    config.causal_maf_min,
                     config.logic_af_min,
                     config.logic_af_max,
                     config.logic_max_iter,
@@ -1953,7 +2622,8 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
                 let selected = select_additive_indices(
                     &sites,
                     config.causal_count,
-                    &config.bim_ranges,
+                    constraint_pools.as_slice(),
+                    config.causal_maf_min,
                     &mut sel_rng,
                 )?;
                 runtime_progress_total = causal_offset.saturating_add(selected.len());
@@ -1969,6 +2639,98 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
                 )?;
                 causal_terms = build_additive_terms(&selected, &row_map, &sites)?;
             }
+        } else if mixed_logic_requested {
+            let mut causal_progress_seen = 0usize;
+            let mut causal_last_notified = 0usize;
+            let logic_mode_str = config.logic_mode.as_deref().unwrap_or("a");
+            let logic_size_weights = config
+                .logic_size_weights
+                .as_ref()
+                .ok_or_else(|| "internal error: mixed logic weights missing".to_string())?;
+            let mut plan_rng = StdRng::seed_from_u64(config.seed ^ 0xB28F_6A91_C547_31D1u64);
+            let mixed_plan = build_mixed_logic_term_plan(
+                &sites,
+                constraint_pools.as_slice(),
+                config.causal_count,
+                logic_mode_str,
+                logic_size_weights.as_slice(),
+                config.causal_maf_min,
+                config.logic_window_bp,
+                &mut plan_rng,
+            )?;
+            let mut need_rows: HashSet<usize> = HashSet::with_capacity(1024);
+            for item in mixed_plan.iter() {
+                match item {
+                    MixedPlannedTerm::Additive(idx) => {
+                        need_rows.insert(*idx);
+                    }
+                    MixedPlannedTerm::Logic(spec) => {
+                        for &idx in spec.pool_indices.iter() {
+                            need_rows.insert(idx);
+                        }
+                    }
+                }
+            }
+            let progress_stage = if mixed_plan
+                .iter()
+                .all(|item| matches!(item, MixedPlannedTerm::Additive(_)))
+            {
+                "causal_additive"
+            } else {
+                "causal_logic"
+            };
+            let mut row_map: HashMap<usize, Vec<f32>> = HashMap::with_capacity(need_rows.len());
+            iterate_filtered_rows(
+                &config.path_or_prefix,
+                config.delimiter.as_deref(),
+                config.maf_threshold,
+                config.max_missing_rate,
+                config.het_threshold,
+                config.snps_only,
+                |kept_idx, row, _site| {
+                    causal_progress_seen = causal_progress_seen.saturating_add(1);
+                    if progress_overall_total > 0 {
+                        g2p_progress_notify(
+                            config.progress_callback.as_ref(),
+                            progress_stage,
+                            causal_offset.saturating_add(causal_progress_seen),
+                            progress_overall_total,
+                            progress_every,
+                            &mut causal_last_notified,
+                            false,
+                        )?;
+                    }
+                    if need_rows.contains(&kept_idx) {
+                        row_map.insert(kept_idx, row.to_vec());
+                    }
+                    Ok(())
+                },
+            )?;
+            if progress_overall_total > 0 {
+                g2p_progress_notify(
+                    config.progress_callback.as_ref(),
+                    progress_stage,
+                    causal_offset.saturating_add(progress_site_total),
+                    progress_overall_total,
+                    progress_every,
+                    &mut causal_last_notified,
+                    true,
+                )?;
+            }
+            let mut logic_rng = StdRng::seed_from_u64(config.seed ^ 0x9F4B_72E0_1A33_4F0Cu64);
+            causal_terms = materialize_mixed_terms_from_plan(
+                mixed_plan.as_slice(),
+                &row_map,
+                &sites,
+                config.logic_ld_max,
+                config.logic_het_max,
+                config.causal_maf_min,
+                config.logic_af_min,
+                config.logic_af_max,
+                config.logic_max_iter,
+                config.logic_effect_model,
+                &mut logic_rng,
+            )?;
         } else if logic_requested {
             let mut causal_progress_seen = 0usize;
             let mut causal_last_notified = 0usize;
@@ -1976,11 +2738,12 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
             let mut pool_rng = StdRng::seed_from_u64(config.seed ^ 0xB28F_6A91_C547_31D1u64);
             let pool_specs = build_logic_pool_specs(
                 &sites,
-                &config.bim_ranges,
+                constraint_pools.as_slice(),
                 config.causal_count,
                 config.logic_gate_count,
                 logic_mode_str,
                 config.logic_k_min,
+                config.causal_maf_min,
                 config.logic_window_bp,
                 &mut pool_rng,
             )?;
@@ -2037,6 +2800,7 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
                 config.logic_k_max,
                 config.logic_ld_max,
                 config.logic_het_max,
+                config.causal_maf_min,
                 config.logic_af_min,
                 config.logic_af_max,
                 config.logic_max_iter,
@@ -2050,7 +2814,8 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
             let selected = select_additive_indices(
                 &sites,
                 config.causal_count,
-                &config.bim_ranges,
+                constraint_pools.as_slice(),
+                config.causal_maf_min,
                 &mut sel_rng,
             )?;
             let selected_set: HashSet<usize> = selected.iter().copied().collect();
@@ -2240,6 +3005,7 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
     path_or_prefix,
     chunk_size=100_000,
     maf_threshold=0.02_f32,
+    causal_maf_min=0.02_f32,
     max_missing_rate=0.05_f32,
     het_threshold=None,
     seed=1_u64,
@@ -2252,7 +3018,9 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
     causal_count=1_usize,
     causal_pve=None,
     bim_ranges=None,
+    bim_range_groups=None,
     logic_mode=None,
+    logic_size_weights=None,
     logic_gate_count=None,
     logic_k_min=2_usize,
     logic_k_max=2_usize,
@@ -2281,6 +3049,7 @@ pub fn g2p_simulate_py<'py>(
     path_or_prefix: String,
     chunk_size: usize,
     maf_threshold: f32,
+    causal_maf_min: f32,
     max_missing_rate: f32,
     het_threshold: Option<f32>,
     seed: u64,
@@ -2293,7 +3062,9 @@ pub fn g2p_simulate_py<'py>(
     causal_count: usize,
     causal_pve: Option<f64>,
     bim_ranges: Option<Vec<(String, i32, i32)>>,
+    bim_range_groups: Option<Vec<Vec<(String, i32, i32)>>>,
     logic_mode: Option<String>,
+    logic_size_weights: Option<Vec<f64>>,
     logic_gate_count: Option<usize>,
     logic_k_min: usize,
     logic_k_max: usize,
@@ -2335,6 +3106,11 @@ pub fn g2p_simulate_py<'py>(
             ));
         }
     }
+    if !(0.0..=0.5).contains(&causal_maf_min) {
+        return Err(PyValueError::new_err(
+            "causal_maf_min must be within [0, 0.5].",
+        ));
+    }
     if logic_k_min == 0 {
         return Err(PyValueError::new_err("logic_k_min must be > 0."));
     }
@@ -2358,6 +3134,10 @@ pub fn g2p_simulate_py<'py>(
         return Err(PyValueError::new_err(
             "logic_af_min must be <= logic_af_max.",
         ));
+    }
+    if let Some(weights) = logic_size_weights.as_ref() {
+        validate_logic_size_weights(weights)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
     }
 
     let _ = chunk_size;
@@ -2386,6 +3166,7 @@ pub fn g2p_simulate_py<'py>(
         path_or_prefix,
         delimiter,
         maf_threshold,
+        causal_maf_min,
         max_missing_rate,
         het_threshold,
         seed,
@@ -2394,7 +3175,9 @@ pub fn g2p_simulate_py<'py>(
         causal_count,
         causal_pve,
         bim_ranges: bim_ranges.unwrap_or_default(),
+        bim_range_groups: bim_range_groups.unwrap_or_default(),
         logic_mode,
+        logic_size_weights,
         logic_gate_count,
         logic_k_min,
         logic_k_max,

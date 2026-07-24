@@ -35,32 +35,27 @@ JanusX (Joint Association and Novel Utility for Selection) is a GWAS and genomic
 
 ## Installation
 
-### Quick installation: Python with uv (Recommend)
+### Quick installation: Python with uv (recommend)
 
 * Linux | MacOS
-```bash
+```Bash
 curl -fsSL https://raw.githubusercontent.com/FJingxian/JanusX/main/scripts/install.sh | sh
-# Dev version
-# curl -fsSL https://raw.githubusercontent.com/FJingxian/JanusX/main/scripts/install.sh | DEV=1 sh
 ```
 
 * Windows
-```powershell
-Set-ExecutionPolicy RemoteSigned -scope CurrentUser
-irm https://raw.githubusercontent.com/FJingxian/JanusX/main/scripts/install.ps1 | iex
+```PowerShell
+powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/FJingxian/JanusX/main/scripts/install.ps1 | iex"
 ```
 
 ### Option A: Python package install
 
-```bash
+```Bash
 pip install janusx
 ```
 
 ### Option B: Conda / Bioconda
 
-Recommended Bioconda channel order:
-
-```bash
+```Bash
 conda create -n janusx \
   --channel conda-forge \
   --channel bioconda \
@@ -73,7 +68,7 @@ conda create -n janusx \
 
 ### 1) GWAS
 
-```bash
+```Bash
 # Estimate variance for every snp, similar with GEMMA. (Exact, recommand)
 jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -lmm -o test
 # Estimate variance for every snp, similar with GEMMA. (Exact, wald and LR test, recommand)
@@ -94,7 +89,7 @@ jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -farmcpu 
 
 ### 2) Post-GWAS
 
-```bash
+```Bash
 jx postgwas -i test/mouse_hs1940.test0.lmm.tsv -manh -qq -thr 1e-6 -o testpost
 jx postgwas -i test/mouse_hs1940.test0.lmm.tsv a.tsv -manh-merge -qq-merge -fontsize 11 -fontstyle arial -o testpost
 jx postgwas -i a.tsv b.tsv c.tsv -manh-merge -qq-merge -scatter-size 4 10 -alpha 0.2 0.5 -ylim 2 10 -o testpost
@@ -106,7 +101,7 @@ jx postgwas -i a.tsv b.tsv c.tsv -manh-merge -qq-merge -scatter-size 4 10 -alpha
 
 ### 3) Genomic selection
 
-```bash
+```Bash
 # BLUP method, prepared for biobank cohorts
 # n≤15,000 GBLUP
 # n>15,000 & m≤15,000 rrBLUP
@@ -142,7 +137,7 @@ Fold Method     Pearsonr Spearmanr R2     time(s)  Best
 
 ### 4) Get module help
 
-```bash
+```Bash
 jx -h
 jx <module> -h
 ```

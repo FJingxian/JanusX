@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
 set -euxo pipefail
 
-# Conda-build automatically sets CPU_COUNT, use it for Cargo
-export CARGO_BUILD_JOBS=${CPU_COUNT:-1}
-
 # OpenBLAS paths provided by the conda environment
 export JANUSX_REQUIRE_OPENBLAS=1
 export OPENBLAS_LIB_DIR="${PREFIX}/lib"

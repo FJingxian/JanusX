@@ -7,7 +7,6 @@ Files synced:
   - pyproject.toml
   - Cargo.toml
   - bioconda-recipes/recipes/janusx/meta.yaml
-  - bioconda-recipes/recipes/janusx-localcheck/meta.yaml
 
 Usage:
   python scripts/sync_version_from_tag.py v1.2.3
@@ -16,9 +15,11 @@ Usage:
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
+import urllib.request
 from datetime import date
 from pathlib import Path
 
@@ -106,6 +107,24 @@ def _replace_recipe_version(path: Path, new_version: str) -> None:
     path.write_text(updated, encoding="utf-8")
 
 
+def _replace_recipe_sha256(path: Path, sha256: str) -> None:
+    text = path.read_text(encoding="utf-8").lstrip("\ufeff")
+    pattern = r"(?m)^(\s*sha256:\s*)[0-9a-fA-F]{32,}\s*$"
+    updated, n = re.subn(pattern, rf"\g<1>{sha256}", text, count=1)
+    if n != 1:
+        raise ValueError(f"Cannot find sha256 line in {path}")
+    path.write_text(updated, encoding="utf-8")
+
+
+def _fetch_pypi_sdist_sha256(name: str, version: str) -> str:
+    url = f"https://files.pythonhosted.org/packages/source/{name[0]}/{name}/{name}-{version}.tar.gz"
+    with urllib.request.urlopen(url, timeout=120) as resp:
+        data = resp.read()
+    import hashlib
+
+    return hashlib.sha256(data).hexdigest()
+
+
 def _git_head_date() -> str:
     try:
         out = subprocess.check_output(
@@ -133,15 +152,24 @@ def main(argv: list[str] | None = None) -> int:
     _replace_section_version(CARGO, "package", rust_version)
     _replace_build_date_fallback(JANUSX_CLI, build_date)
     _replace_recipe_version(BIOCONDA_META, version)
-    _replace_recipe_version(BIOCONDA_LOCALCHECK_META, version)
+    if BIOCONDA_LOCALCHECK_META.exists():
+        _replace_recipe_version(BIOCONDA_LOCALCHECK_META, version)
+    if (os.environ.get("SYNC_PYPI_SOURCE_SHA256") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        _replace_recipe_sha256(BIOCONDA_META, _fetch_pypi_sdist_sha256("janusx", version))
     print(
         "Synchronized version/build date:\n"
         f"  py_version = {version}\n"
         f"  rs_version = {rust_version}\n"
         f"  build_date = {build_date}\n"
-        f"  bioconda   = {BIOCONDA_META.relative_to(ROOT)}\n"
-        f"  localcheck = {BIOCONDA_LOCALCHECK_META.relative_to(ROOT)}"
+        f"  bioconda   = {BIOCONDA_META.relative_to(ROOT)}"
     )
+    if BIOCONDA_LOCALCHECK_META.exists():
+        print(f"  localcheck = {BIOCONDA_LOCALCHECK_META.relative_to(ROOT)}")
     return 0
 
 

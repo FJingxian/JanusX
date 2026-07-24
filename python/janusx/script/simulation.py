@@ -379,47 +379,64 @@ def _format_unit_intervals(intervals: list[tuple[str, int, int]]) -> str:
     return ";".join(f"{chrom}:{start}:{end}" for chrom, start, end in intervals)
 
 
-def _write_causal_unit_files(
+def _write_causal_units_txt(
     *,
     outprefix: str,
     units: list[dict[str, Any]],
-    fixed_rows: list[tuple[int, str, str, str, str, float]],
-) -> tuple[str, str]:
+) -> str:
     units_path = f"{outprefix}.causal.units.txt"
-    truth_path = f"{outprefix}.causal.unit_truth.tsv"
     with open(units_path, "w", encoding="utf-8") as fh:
         for unit in units:
             fh.write("\t".join(str(g) for g in unit["genes"]) + "\n")
-    if len(fixed_rows) != len(units):
+    return units_path
+
+
+def _write_fixed_effects_table(
+    *,
+    outprefix: str,
+    fixed_rows: list[tuple[int, str, str, str, str, float]],
+    units: Optional[list[dict[str, Any]]] = None,
+) -> str:
+    fixed_path = f"{outprefix}.fixed.effects.tsv"
+    unit_rows = [] if units is None else list(units)
+    if len(unit_rows) not in {0, len(fixed_rows)}:
         raise ValueError(
             "Causal unit count does not match simulated causal term count: "
-            f"units={len(units)}, terms={len(fixed_rows)}."
+            f"units={len(unit_rows)}, terms={len(fixed_rows)}."
         )
-    with open(truth_path, "w", encoding="utf-8") as fh:
-        fh.write(
-            "term_id\tunit_index\tunit_kind\tunit_name\tgenes\tintervals\tterm_kind\tlogic\tsites\tlabel\teffect\n"
-        )
-        for unit, row in zip(units, fixed_rows):
-            term_id, term_kind, logic, site_text, label, effect = row
+    with open(fixed_path, "w", encoding="utf-8") as fh:
+        fh.write("unit_kind\tunit_name\tkind\tsites\teffect\n")
+        for row_idx, row in enumerate(fixed_rows):
+            term_id, _term_kind, logic, site_text, label, effect = row
+            if row_idx < len(unit_rows):
+                unit = unit_rows[row_idx]
+                unit_kind = str(unit["unit_kind"])
+                unit_name = str(unit["unit_name"])
+            else:
+                unit_kind = "term"
+                unit_name = str(label).strip() if str(label).strip() != "" else str(site_text)
+            kind = "s" if str(logic).strip().lower() in {"", "single"} else str(logic).strip().lower()
             fh.write(
                 "\t".join(
                     [
-                        str(term_id),
-                        str(unit["unit_index"]),
-                        str(unit["unit_kind"]),
-                        str(unit["unit_name"]),
-                        str("|".join(str(g) for g in unit["genes"])),
-                        _format_unit_intervals(list(unit["intervals"])),
-                        str(term_kind),
-                        str(logic),
+                        unit_kind,
+                        unit_name,
+                        kind,
                         str(site_text),
-                        str(label),
                         f"{float(effect):.10f}",
                     ]
                 )
                 + "\n"
             )
-    return units_path, truth_path
+    return fixed_path
+
+
+def _remove_optional_file(path: str) -> None:
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
 
 
 _LOGIC_GATE_MODES = {"a", "na", "an", "nan", "r"}
@@ -658,6 +675,11 @@ def _run_rust_simulation(
     random_path = (
         f"{outprefix}.random.effects.tsv" if (outprefix and write_effect_tables) else None
     )
+    grm_cache_key = None
+    if grm is not None:
+        grm_arr = np.asarray(grm)
+        grm_ptr = int(grm_arr.__array_interface__.get("data", (0, False))[0])
+        grm_cache_key = None if grm_ptr == 0 else int(grm_ptr)
     return dict(
         g2p_simulate(
             gfile,
@@ -707,6 +729,7 @@ def _run_rust_simulation(
             trait_name=trait_name,
             na_rate=0.1,
             grm=grm,
+            grm_cache_key=grm_cache_key,
             progress_callback=progress_callback,
             progress_total_hint=(
                 None if progress_total_hint is None else int(max(0, progress_total_hint))
@@ -1722,30 +1745,32 @@ def main(argv: Optional[list[str]] = None) -> int:
             + float(realized_summary.get("pve_background", 0.0))
             + float(realized_summary.get("pve_residual", 0.0)),
         )
+    fixed_rows = [
+        (
+            int(term_id),
+            str(term_kind),
+            str(logic),
+            str(site_text),
+            str(label),
+            float(effect),
+        )
+        for term_id, term_kind, logic, site_text, label, effect in list(res.get("fixed_rows", []))
+    ]
+    _write_fixed_effects_table(
+        outprefix=outprefix,
+        fixed_rows=fixed_rows,
+        units=(selected_causal_units if len(selected_causal_units) > 0 else None),
+    )
+    truth_path = f"{outprefix}.causal.unit_truth.tsv"
+    _remove_optional_file(truth_path)
     if len(selected_causal_units) > 0:
-        fixed_rows = [
-            (
-                int(term_id),
-                str(term_kind),
-                str(logic),
-                str(site_text),
-                str(label),
-                float(effect),
-            )
-            for term_id, term_kind, logic, site_text, label, effect in list(res.get("fixed_rows", []))
-        ]
-        units_path, truth_path = _write_causal_unit_files(
+        units_path = _write_causal_units_txt(
             outprefix=outprefix,
             units=selected_causal_units,
-            fixed_rows=fixed_rows,
         )
         logger.info(
             "Causal units: %s",
             format_path_for_display(str(units_path)),
-        )
-        logger.info(
-            "Causal truth: %s",
-            format_path_for_display(str(truth_path)),
         )
     if len(sample_ids) != int(np.asarray(res["phenotype"]).reshape(-1).shape[0]):
         logger.warning("Sample count from inspection differs from Rust phenotype length.")

@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
 use numpy::ndarray::Array1;
 use numpy::{PyArray1, PyReadonlyArray2};
@@ -117,6 +118,7 @@ struct G2pSimConfig {
     causal_sites_path: Option<String>,
     grm: Option<Vec<f64>>,
     grm_n: Option<usize>,
+    grm_cache_key: Option<u64>,
     trait_name: Option<String>,
     na_rate: f64,
     progress_callback: Option<Py<PyAny>>,
@@ -364,6 +366,34 @@ enum SamplingFactor {
     DenseSquareRoot(Vec<f64>),
 }
 
+#[derive(Clone, Debug)]
+struct GrmFactorCacheEntry {
+    key: u64,
+    dim: usize,
+    factor: SamplingFactor,
+    trace_for_scale: f64,
+    method: String,
+}
+
+static GRM_FACTOR_CACHE: OnceLock<Mutex<Option<GrmFactorCacheEntry>>> = OnceLock::new();
+
+fn grm_factor_cache() -> &'static Mutex<Option<GrmFactorCacheEntry>> {
+    GRM_FACTOR_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn grm_factor_cache_hit(cache_key: Option<u64>, dim: usize) -> bool {
+    let Some(key) = cache_key.filter(|k| *k != 0) else {
+        return false;
+    };
+    let Ok(guard) = grm_factor_cache().lock() else {
+        return false;
+    };
+    guard
+        .as_ref()
+        .map(|entry| entry.key == key && entry.dim == dim)
+        .unwrap_or(false)
+}
+
 fn lower_triangular_matvec(l: &[f64], dim: usize, rhs: &[f64]) -> Vec<f64> {
     debug_assert_eq!(l.len(), dim.saturating_mul(dim));
     debug_assert_eq!(rhs.len(), dim);
@@ -508,6 +538,37 @@ fn build_causal_series_effects(count: usize, alpha: f64, rng: &mut StdRng) -> Ve
     effects
 }
 
+fn assign_causal_series_effects(
+    terms: &mut [CausalTerm],
+    target_var: f64,
+    rng: &mut StdRng,
+) -> Vec<f64> {
+    if terms.is_empty() || target_var <= 0.0 {
+        for term in terms.iter_mut() {
+            term.effect = 0.0;
+        }
+        return Vec::new();
+    }
+    let n = terms[0].values.len();
+    let gamma0 = build_causal_series_effects(terms.len(), DEFAULT_CAUSAL_SERIES_ALPHA, rng);
+    let mut causal_score = vec![0.0_f64; n];
+    for (coef, term) in gamma0.iter().zip(terms.iter()) {
+        axpy_inplace(&mut causal_score, &term.values, *coef);
+    }
+    let scale = variance_scale_factor(variance_f64(&causal_score), target_var);
+    if scale <= 0.0 {
+        for term in terms.iter_mut() {
+            term.effect = 0.0;
+        }
+        return vec![0.0_f64; terms.len()];
+    }
+    let assigned: Vec<f64> = gamma0.iter().map(|coef| scale * *coef).collect();
+    for (effect, term) in assigned.iter().zip(terms.iter_mut()) {
+        term.effect = *effect;
+    }
+    assigned
+}
+
 fn sample_gaussian_noise_with_variance(n: usize, variance: f64, rng: &mut StdRng) -> Vec<f64> {
     let mut out = vec![0.0_f64; n];
     if variance <= 0.0 || n == 0 {
@@ -525,13 +586,38 @@ fn sample_background_effects_from_grm_trace_scaled(
     grm: &[f64],
     n: usize,
     target_var: f64,
+    grm_cache_key: Option<u64>,
     rng: &mut StdRng,
-) -> Result<(Vec<f64>, String), String> {
-    validate_grm_matrix(grm, n)?;
+) -> Result<(Vec<f64>, String, bool), String> {
     if target_var <= 0.0 || n == 0 {
-        return Ok((vec![0.0_f64; n], "none".to_string()));
+        return Ok((vec![0.0_f64; n], "none".to_string(), false));
     }
-    let (factor, trace_for_scale) = build_sampling_factor_with_fallback(grm, n, "GRM")?;
+    let cached = grm_cache_key.filter(|k| *k != 0).and_then(|key| {
+        grm_factor_cache()
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned())
+            .filter(|entry| entry.key == key && entry.dim == n)
+    });
+    let (factor, trace_for_scale, method, cache_hit) = if let Some(entry) = cached {
+        (entry.factor, entry.trace_for_scale, entry.method, true)
+    } else {
+        validate_grm_matrix(grm, n)?;
+        let (factor, trace_for_scale) = build_sampling_factor_with_fallback(grm, n, "GRM")?;
+        let method = sampling_factor_method_name(&factor).to_string();
+        if let Some(key) = grm_cache_key.filter(|k| *k != 0) {
+            if let Ok(mut guard) = grm_factor_cache().lock() {
+                *guard = Some(GrmFactorCacheEntry {
+                    key,
+                    dim: n,
+                    factor: factor.clone(),
+                    trace_for_scale,
+                    method: method.clone(),
+                });
+            }
+        }
+        (factor, trace_for_scale, method, false)
+    };
     let mut z = vec![0.0_f64; n];
     for zi in z.iter_mut() {
         *zi = StandardNormal.sample(rng);
@@ -541,7 +627,7 @@ fn sample_background_effects_from_grm_trace_scaled(
     for v in out.iter_mut() {
         *v *= scale;
     }
-    Ok((out, sampling_factor_method_name(&factor).to_string()))
+    Ok((out, method, cache_hit))
 }
 
 fn realized_share(component_var: f64, total_var: f64) -> f64 {
@@ -1220,7 +1306,9 @@ fn build_range_group_pools(
     let mut out = Vec::with_capacity(range_groups.len());
     for (gi, group) in range_groups.iter().enumerate() {
         if group.is_empty() {
-            return Err(format!("causal_group[{gi}] must contain at least one range"));
+            return Err(format!(
+                "causal_group[{gi}] must contain at least one range"
+            ));
         }
         let mut idx: Vec<usize> = Vec::new();
         let mut seen: HashSet<usize> = HashSet::new();
@@ -1435,7 +1523,11 @@ fn choose_unique_site_from_pool(
     ctx: &str,
     rng: &mut StdRng,
 ) -> Result<usize, String> {
-    let avail: Vec<usize> = pool.iter().copied().filter(|idx| !used.contains(idx)).collect();
+    let avail: Vec<usize> = pool
+        .iter()
+        .copied()
+        .filter(|idx| !used.contains(idx))
+        .collect();
     if avail.is_empty() {
         return Err(format!("{ctx}: no unused candidate sites remain"));
     }
@@ -2086,11 +2178,9 @@ fn materialize_mixed_terms_from_plan(
     for item in plan.iter() {
         match item {
             MixedPlannedTerm::Additive(idx) => out.push(build_additive_term(*idx, row_map, sites)?),
-            MixedPlannedTerm::Logic(_) => out.push(
-                logic_terms_iter
-                    .next()
-                    .ok_or_else(|| "internal error: mixed logic term materialization underflow".to_string())?,
-            ),
+            MixedPlannedTerm::Logic(_) => out.push(logic_terms_iter.next().ok_or_else(|| {
+                "internal error: mixed logic term materialization underflow".to_string()
+            })?),
         }
     }
     if logic_terms_iter.next().is_some() {
@@ -2178,29 +2268,24 @@ fn write_fixed_effects(
     sites: &[SimSiteRecord],
 ) -> Result<(), String> {
     let mut w = BufWriter::new(File::create(path).map_err(|e| e.to_string())?);
-    writeln!(w, "term_id\tkind\tlogic\tsites\tlabel\teffect").map_err(|e| e.to_string())?;
-    for (i, term) in terms.iter().enumerate() {
-        let kind = if term.mode.is_some() {
-            "logic_gate"
-        } else {
-            "additive"
-        };
-        let logic = term.mode.map(logic_mode_code).unwrap_or("single");
+    writeln!(w, "unit_kind\tunit_name\tkind\tsites\teffect").map_err(|e| e.to_string())?;
+    for term in terms.iter() {
+        let kind = term.mode.map(logic_mode_code).unwrap_or("s");
         let site_text = term
             .members
             .iter()
             .map(|&idx| format!("{}:{}", sites[idx].chrom, sites[idx].pos))
             .collect::<Vec<String>>()
             .join(";");
+        let unit_name = if term.label.trim().is_empty() {
+            site_text.as_str()
+        } else {
+            term.label.as_str()
+        };
         writeln!(
             w,
-            "{}\t{}\t{}\t{}\t{}\t{:.10}",
-            i + 1,
-            kind,
-            logic,
-            site_text,
-            term.label,
-            term.effect,
+            "term\t{}\t{}\t{}\t{:.10}",
+            unit_name, kind, site_text, term.effect
         )
         .map_err(|e| e.to_string())?;
     }
@@ -2475,64 +2560,68 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
     let residual_effects = sample_gaussian_noise_with_variance(n, residual_var_eff, &mut rng);
     let mut y = residual_effects.clone();
     let bg_var_target = config.bg_pve;
-    let (bg_effects, background_source, background_factorization) = if let Some(grm_vec) = config.grm.as_ref() {
-        let grm_n = config
-            .grm_n
-            .ok_or_else(|| "internal error: grm_n missing for provided GRM".to_string())?;
-        if grm_n != n {
-            return Err(format!(
-                "GRM size mismatch: got n={}, expected {} genotype samples",
-                grm_n, n
-            ));
-        }
-        let (raw, factorization) = if bg_var_target > 0.0 {
-            let mut grm_factor_last_notified = 0usize;
-            g2p_progress_notify(
-                config.progress_callback.as_ref(),
-                "grm_factor",
-                0,
-                1,
-                1,
-                &mut grm_factor_last_notified,
-                true,
-            )?;
-            sample_background_effects_from_grm_trace_scaled(
-                grm_vec.as_slice(),
-                n,
-                bg_var_target,
-                &mut rng,
-            )?
+    let (bg_effects, background_source, background_factorization) =
+        if let Some(grm_vec) = config.grm.as_ref() {
+            let grm_n = config
+                .grm_n
+                .ok_or_else(|| "internal error: grm_n missing for provided GRM".to_string())?;
+            if grm_n != n {
+                return Err(format!(
+                    "GRM size mismatch: got n={}, expected {} genotype samples",
+                    grm_n, n
+                ));
+            }
+            let (raw, factorization, cache_hit) = if bg_var_target > 0.0 {
+                let cache_hit = grm_factor_cache_hit(config.grm_cache_key, n);
+                if !cache_hit {
+                    let mut grm_factor_last_notified = 0usize;
+                    g2p_progress_notify(
+                        config.progress_callback.as_ref(),
+                        "grm_factor",
+                        0,
+                        1,
+                        1,
+                        &mut grm_factor_last_notified,
+                        true,
+                    )?;
+                }
+                let (raw, factorization, sample_cache_hit) =
+                    sample_background_effects_from_grm_trace_scaled(
+                        grm_vec.as_slice(),
+                        n,
+                        bg_var_target,
+                        config.grm_cache_key,
+                        &mut rng,
+                    )?;
+                (raw, factorization, cache_hit || sample_cache_hit)
+            } else {
+                (vec![0.0_f64; n], "none".to_string(), false)
+            };
+            if bg_var_target > 0.0 && !cache_hit {
+                let mut grm_factor_last_notified = 0usize;
+                g2p_progress_notify(
+                    config.progress_callback.as_ref(),
+                    "grm_factor",
+                    1,
+                    1,
+                    1,
+                    &mut grm_factor_last_notified,
+                    true,
+                )?;
+            }
+            axpy_inplace(&mut y, raw.as_slice(), 1.0);
+            (raw, "grm".to_string(), factorization)
         } else {
-            (vec![0.0_f64; n], "none".to_string())
+            let raw = vec![0.0_f64; n];
+            axpy_inplace(&mut y, raw.as_slice(), 1.0);
+            (raw, "none".to_string(), "none".to_string())
         };
-        if bg_var_target > 0.0 {
-            let mut grm_factor_last_notified = 0usize;
-            g2p_progress_notify(
-                config.progress_callback.as_ref(),
-                "grm_factor",
-                1,
-                1,
-                1,
-                &mut grm_factor_last_notified,
-                true,
-            )?;
-        }
-        axpy_inplace(&mut y, raw.as_slice(), 1.0);
-        (raw, "grm".to_string(), factorization)
-    } else {
-        let raw = vec![0.0_f64; n];
-        axpy_inplace(&mut y, raw.as_slice(), 1.0);
-        (raw, "none".to_string(), "none".to_string())
-    };
     let mut causal_component = vec![0.0_f64; n];
 
     let mut causal_terms: Vec<CausalTerm> = Vec::new();
     if needs_causal_scan {
-        let constraint_pools = build_constraint_pools(
-            &sites,
-            &config.bim_ranges,
-            &config.bim_range_groups,
-        )?;
+        let constraint_pools =
+            build_constraint_pools(&sites, &config.bim_ranges, &config.bim_range_groups)?;
         let causal_offset = progress_site_total;
         if let Some(bed_fast) = fast_bed_path.as_ref() {
             if mixed_logic_requested {
@@ -2892,18 +2981,9 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
     }
 
     if !causal_terms.is_empty() && causal_pve_target > 0.0 {
-        let gamma0 =
-            build_causal_series_effects(causal_terms.len(), DEFAULT_CAUSAL_SERIES_ALPHA, &mut rng);
-        let mut causal_score = vec![0.0_f64; n];
-        for (coef, term) in gamma0.iter().zip(causal_terms.iter()) {
-            axpy_inplace(&mut causal_score, &term.values, *coef);
-        }
-        let scale = variance_scale_factor(variance_f64(&causal_score), causal_pve_target);
-        if scale > 0.0 {
-            for (coef, term) in gamma0.iter().zip(causal_terms.iter_mut()) {
-                term.effect = scale * *coef;
-            }
-            for term in causal_terms.iter() {
+        assign_causal_series_effects(&mut causal_terms, causal_pve_target, &mut rng);
+        for term in causal_terms.iter() {
+            if term.effect != 0.0 {
                 axpy_inplace(&mut causal_component, &term.values, term.effect);
                 axpy_inplace(&mut y, &term.values, term.effect);
             }
@@ -3069,6 +3149,7 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
     random_effects_path=None,
     causal_sites_path=None,
     grm=None,
+    grm_cache_key=None,
     trait_name=None,
     na_rate=0.1_f64,
     progress_callback=None,
@@ -3113,6 +3194,7 @@ pub fn g2p_simulate_py<'py>(
     random_effects_path: Option<String>,
     causal_sites_path: Option<String>,
     grm: Option<PyReadonlyArray2<'py, f64>>,
+    grm_cache_key: Option<u64>,
     trait_name: Option<String>,
     na_rate: f64,
     progress_callback: Option<Py<PyAny>>,
@@ -3167,8 +3249,7 @@ pub fn g2p_simulate_py<'py>(
         ));
     }
     if let Some(weights) = logic_size_weights.as_ref() {
-        validate_logic_size_weights(weights)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        validate_logic_size_weights(weights).map_err(|e| PyValueError::new_err(e.to_string()))?;
     }
 
     let _ = chunk_size;
@@ -3226,6 +3307,7 @@ pub fn g2p_simulate_py<'py>(
         causal_sites_path,
         grm: grm_vec,
         grm_n,
+        grm_cache_key,
         trait_name,
         na_rate,
         progress_callback,
@@ -3374,14 +3456,49 @@ mod tests {
             1.0_f64, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
         ];
         let mut rng_bg = StdRng::seed_from_u64(23);
-        let (observed, factorization) =
-            sample_background_effects_from_grm_trace_scaled(&grm, n, 0.25, &mut rng_bg).unwrap();
+        let (observed, factorization, cache_hit) =
+            sample_background_effects_from_grm_trace_scaled(&grm, n, 0.25, None, &mut rng_bg)
+                .unwrap();
         assert_eq!(factorization, "cholesky");
+        assert!(!cache_hit);
         let mut rng_direct = StdRng::seed_from_u64(23);
         let expected = sample_gaussian_noise_with_variance(n, 0.25, &mut rng_direct);
         for (obs, exp) in observed.iter().zip(expected.iter()) {
             assert!((obs - exp).abs() < 1e-12);
         }
+    }
+
+    #[test]
+    fn grm_factor_cache_reuses_prepared_factor_for_same_cache_key() {
+        let n = 3usize;
+        let grm = vec![1.0_f64, 0.1, 0.0, 0.1, 1.0, 0.2, 0.0, 0.2, 1.0];
+        let cache_key = Some(0xABCDEF_u64);
+        let mut rng_first = StdRng::seed_from_u64(31);
+        let (_first, factorization_first, cache_hit_first) =
+            sample_background_effects_from_grm_trace_scaled(
+                &grm,
+                n,
+                0.4,
+                cache_key,
+                &mut rng_first,
+            )
+            .unwrap();
+        assert_eq!(factorization_first, "cholesky");
+        assert!(!cache_hit_first);
+        assert!(grm_factor_cache_hit(cache_key, n));
+
+        let mut rng_second = StdRng::seed_from_u64(32);
+        let (_second, factorization_second, cache_hit_second) =
+            sample_background_effects_from_grm_trace_scaled(
+                &grm,
+                n,
+                0.4,
+                cache_key,
+                &mut rng_second,
+            )
+            .unwrap();
+        assert_eq!(factorization_second, "cholesky");
+        assert!(cache_hit_second);
     }
 
     #[test]
@@ -3449,6 +3566,50 @@ mod tests {
         expected.sort_by(|a, b| a.total_cmp(b));
         for (obs, exp) in observed.iter().zip(expected.iter()) {
             assert!((obs - exp).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn causal_series_assignment_applies_to_mixed_single_and_logic_terms() {
+        let mut rng = StdRng::seed_from_u64(19);
+        let mut terms = vec![
+            CausalTerm {
+                members: vec![0],
+                mode: None,
+                values: vec![1.0, -1.0, 0.0, 0.0],
+                effect: 0.0,
+                label: "s1".to_string(),
+            },
+            CausalTerm {
+                members: vec![1, 2],
+                mode: Some(LogicGateMode::A),
+                values: vec![0.0, 0.0, 1.0, -1.0],
+                effect: 0.0,
+                label: "g1".to_string(),
+            },
+            CausalTerm {
+                members: vec![3],
+                mode: None,
+                values: vec![1.0, 1.0, -1.0, -1.0],
+                effect: 0.0,
+                label: "s2".to_string(),
+            },
+        ];
+        let assigned = assign_causal_series_effects(&mut terms, 0.2, &mut rng);
+        assert_eq!(assigned.len(), terms.len());
+        assert!(terms.iter().any(|term| term.mode.is_some()));
+        let mut observed: Vec<f64> = terms.iter().map(|term| term.effect.abs()).collect();
+        observed.sort_by(|a, b| a.total_cmp(b));
+        let mut expected = vec![
+            DEFAULT_CAUSAL_SERIES_ALPHA,
+            DEFAULT_CAUSAL_SERIES_ALPHA.powi(2),
+            DEFAULT_CAUSAL_SERIES_ALPHA.powi(3),
+        ];
+        expected.sort_by(|a, b| a.total_cmp(b));
+        let scale = observed[0] / expected[0];
+        assert!(scale.is_finite() && scale > 0.0);
+        for (obs, exp) in observed.iter().zip(expected.iter()) {
+            assert!((obs - scale * exp).abs() < 1e-12);
         }
     }
 

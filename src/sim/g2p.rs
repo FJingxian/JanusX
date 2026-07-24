@@ -137,6 +137,7 @@ struct G2pSimResult {
     residual_var: f64,
     logic_effect_model: String,
     background_source: String,
+    background_factorization: String,
     realized_summary: RealizedSummary,
 }
 
@@ -489,6 +490,13 @@ fn build_sampling_factor_with_fallback(
     Ok((SamplingFactor::DenseSquareRoot(root), trace_psd))
 }
 
+fn sampling_factor_method_name(factor: &SamplingFactor) -> &'static str {
+    match factor {
+        SamplingFactor::CholeskyLower(_) => "cholesky",
+        SamplingFactor::DenseSquareRoot(_) => "eigh-clipped",
+    }
+}
+
 fn build_causal_series_effects(count: usize, alpha: f64, rng: &mut StdRng) -> Vec<f64> {
     let mut effects = Vec::with_capacity(count);
     let mut current = alpha;
@@ -518,10 +526,10 @@ fn sample_background_effects_from_grm_trace_scaled(
     n: usize,
     target_var: f64,
     rng: &mut StdRng,
-) -> Result<Vec<f64>, String> {
+) -> Result<(Vec<f64>, String), String> {
     validate_grm_matrix(grm, n)?;
     if target_var <= 0.0 || n == 0 {
-        return Ok(vec![0.0_f64; n]);
+        return Ok((vec![0.0_f64; n], "none".to_string()));
     }
     let (factor, trace_for_scale) = build_sampling_factor_with_fallback(grm, n, "GRM")?;
     let mut z = vec![0.0_f64; n];
@@ -533,7 +541,7 @@ fn sample_background_effects_from_grm_trace_scaled(
     for v in out.iter_mut() {
         *v *= scale;
     }
-    Ok(out)
+    Ok((out, sampling_factor_method_name(&factor).to_string()))
 }
 
 fn realized_share(component_var: f64, total_var: f64) -> f64 {
@@ -2467,7 +2475,7 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
     let residual_effects = sample_gaussian_noise_with_variance(n, residual_var_eff, &mut rng);
     let mut y = residual_effects.clone();
     let bg_var_target = config.bg_pve;
-    let (bg_effects, background_source) = if let Some(grm_vec) = config.grm.as_ref() {
+    let (bg_effects, background_source, background_factorization) = if let Some(grm_vec) = config.grm.as_ref() {
         let grm_n = config
             .grm_n
             .ok_or_else(|| "internal error: grm_n missing for provided GRM".to_string())?;
@@ -2477,7 +2485,17 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
                 grm_n, n
             ));
         }
-        let raw = if bg_var_target > 0.0 {
+        let (raw, factorization) = if bg_var_target > 0.0 {
+            let mut grm_factor_last_notified = 0usize;
+            g2p_progress_notify(
+                config.progress_callback.as_ref(),
+                "grm_factor",
+                0,
+                1,
+                1,
+                &mut grm_factor_last_notified,
+                true,
+            )?;
             sample_background_effects_from_grm_trace_scaled(
                 grm_vec.as_slice(),
                 n,
@@ -2485,14 +2503,26 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
                 &mut rng,
             )?
         } else {
-            vec![0.0_f64; n]
+            (vec![0.0_f64; n], "none".to_string())
         };
+        if bg_var_target > 0.0 {
+            let mut grm_factor_last_notified = 0usize;
+            g2p_progress_notify(
+                config.progress_callback.as_ref(),
+                "grm_factor",
+                1,
+                1,
+                1,
+                &mut grm_factor_last_notified,
+                true,
+            )?;
+        }
         axpy_inplace(&mut y, raw.as_slice(), 1.0);
-        (raw, "grm".to_string())
+        (raw, "grm".to_string(), factorization)
     } else {
         let raw = vec![0.0_f64; n];
         axpy_inplace(&mut y, raw.as_slice(), 1.0);
-        (raw, "none".to_string())
+        (raw, "none".to_string(), "none".to_string())
     };
     let mut causal_component = vec![0.0_f64; n];
 
@@ -2996,6 +3026,7 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
         residual_var: residual_var_eff,
         logic_effect_model: logic_effect_model_name(config.logic_effect_model).to_string(),
         background_source,
+        background_factorization,
         realized_summary,
     })
 }
@@ -3218,6 +3249,7 @@ pub fn g2p_simulate_py<'py>(
         residual_var,
         logic_effect_model,
         background_source,
+        background_factorization,
         realized_summary,
     } = sim;
 
@@ -3237,6 +3269,7 @@ pub fn g2p_simulate_py<'py>(
     out.set_item("residual_var", residual_var)?;
     out.set_item("logic_effect_model", logic_effect_model)?;
     out.set_item("background_source", background_source)?;
+    out.set_item("background_factorization", background_factorization)?;
     let realized = PyDict::new(py);
     realized.set_item("mean_y", realized_summary.mean_y)?;
     realized.set_item("var_y", realized_summary.var_y)?;

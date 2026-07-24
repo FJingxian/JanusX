@@ -11,6 +11,7 @@ import argparse
 import bisect
 import logging
 import os
+import re
 import socket
 import time
 from datetime import datetime
@@ -209,11 +210,71 @@ def _filter_gene_catalog_by_active_sites(
     return out
 
 
+def _count_active_sites_in_interval(
+    chrom: str,
+    start: int,
+    end: int,
+    *,
+    active_positions: dict[str, list[int]],
+) -> int:
+    pos_vec = active_positions.get(_normalize_bim_chrom(chrom), [])
+    if len(pos_vec) == 0:
+        return 0
+    lo = bisect.bisect_left(pos_vec, int(start))
+    hi = bisect.bisect_right(pos_vec, int(end))
+    return max(0, int(hi - lo))
+
+
+def _count_active_sites_in_intervals(
+    intervals: list[tuple[str, int, int]],
+    *,
+    active_positions: dict[str, list[int]],
+) -> int:
+    merged: dict[str, list[tuple[int, int]]] = {}
+    for chrom, start, end in intervals:
+        chrom_norm = _normalize_bim_chrom(chrom)
+        merged.setdefault(chrom_norm, []).append((int(start), int(end)))
+    total = 0
+    for chrom_norm, spans in merged.items():
+        spans_sorted = sorted(spans, key=lambda x: (int(x[0]), int(x[1])))
+        collapsed: list[tuple[int, int]] = []
+        for start, end in spans_sorted:
+            if len(collapsed) == 0 or int(start) > int(collapsed[-1][1]):
+                collapsed.append((int(start), int(end)))
+            else:
+                collapsed[-1] = (collapsed[-1][0], max(int(collapsed[-1][1]), int(end)))
+        pos_vec = active_positions.get(chrom_norm, [])
+        if len(pos_vec) == 0:
+            continue
+        for start, end in collapsed:
+            lo = bisect.bisect_left(pos_vec, int(start))
+            hi = bisect.bisect_right(pos_vec, int(end))
+            total += max(0, int(hi - lo))
+    return int(total)
+
+
+def _gff_logic_unit_min_active_sites(
+    logic_mode: Optional[str],
+    logic_size_weights: Optional[list[float]],
+    logic_k_min: int,
+) -> int:
+    if logic_mode is None or str(logic_mode).strip() == "":
+        return 1
+    weights = [] if logic_size_weights is None else [float(x) for x in logic_size_weights]
+    size1_positive = len(weights) >= 1 and float(weights[0]) > 0.0
+    if size1_positive:
+        return 1
+    return max(1, int(logic_k_min))
+
+
 def _sample_causal_gene_units(
     gene_catalog: list[tuple[str, tuple[str, int, int]]],
     *,
     causal_count: int,
     seed: int,
+    active_positions: Optional[dict[str, list[int]]] = None,
+    min_unit_active_sites: int = 1,
+    blocked_unit_names: Optional[set[str]] = None,
 ) -> list[dict[str, Any]]:
     if int(causal_count) <= 0:
         return []
@@ -222,33 +283,96 @@ def _sample_causal_gene_units(
             "Not enough genes in GFF3 to sample the requested number of causal units "
             f"without replacement: genes={len(gene_catalog)}, causal={int(causal_count)}."
         )
-    remaining = list(gene_catalog)
     rng = np.random.default_rng(int(seed) ^ 0x5EED_91A7)
+    blocked = set() if blocked_unit_names is None else {str(x) for x in blocked_unit_names}
+    used_genes: set[str] = set()
     units: list[dict[str, Any]] = []
+    draw_budget = max(512, int(causal_count) * 64)
+    stalled_draws = 0
     while len(units) < int(causal_count):
+        remaining = [item for item in gene_catalog if str(item[0]) not in used_genes]
         units_left = int(causal_count) - len(units)
         genes_left = len(remaining)
+        if genes_left < units_left:
+            raise ValueError(
+                "Not enough unused genes remain to finish GFF causal-unit sampling after "
+                f"filtering / redraw: remaining_genes={genes_left}, units_left={units_left}, "
+                f"blocked_units={len(blocked)}."
+            )
+        accepted = False
         feasible_sizes = [1]
         if genes_left - 2 >= (units_left - 1):
             feasible_sizes.append(2)
-        unit_size = int(feasible_sizes[int(rng.integers(0, len(feasible_sizes)))])
-        pick_idx = np.sort(rng.choice(len(remaining), size=unit_size, replace=False)).tolist()
-        chosen = [remaining[i] for i in pick_idx]
-        for i in reversed(pick_idx):
-            remaining.pop(int(i))
-        chosen = sorted(chosen, key=lambda x: x[0])
-        genes = [gene for gene, _iv in chosen]
-        intervals = [iv for _gene, iv in chosen]
-        units.append(
-            {
-                "unit_index": len(units) + 1,
-                "unit_kind": "geneset" if len(genes) > 1 else "gene",
-                "genes": genes,
-                "unit_name": "|".join(genes),
-                "intervals": intervals,
-            }
+        inner_budget = max(64, len(remaining) * 8)
+        while inner_budget > 0:
+            inner_budget -= 1
+            stalled_draws += 1
+            unit_size = int(feasible_sizes[int(rng.integers(0, len(feasible_sizes)))])
+            pick_idx = np.sort(rng.choice(len(remaining), size=unit_size, replace=False)).tolist()
+            chosen = sorted((remaining[i] for i in pick_idx), key=lambda x: x[0])
+            genes = [str(gene) for gene, _iv in chosen]
+            intervals = [iv for _gene, iv in chosen]
+            unit_name = "|".join(genes)
+            if unit_name in blocked:
+                continue
+            if int(min_unit_active_sites) > 1:
+                if active_positions is None:
+                    raise ValueError(
+                        "Internal error: active_positions is required when min_unit_active_sites > 1."
+                    )
+                if (
+                    _count_active_sites_in_intervals(
+                        intervals,
+                        active_positions=active_positions,
+                    )
+                    < int(min_unit_active_sites)
+                ):
+                    continue
+            used_genes.update(genes)
+            units.append(
+                {
+                    "unit_index": len(units) + 1,
+                    "unit_kind": "geneset" if len(genes) > 1 else "gene",
+                    "genes": genes,
+                    "unit_name": unit_name,
+                    "intervals": intervals,
+                }
+            )
+            accepted = True
+            stalled_draws = 0
+            break
+        if accepted:
+            continue
+        if stalled_draws >= draw_budget:
+            raise ValueError(
+                "Unable to sample enough valid GFF causal units after redraw filtering: "
+                f"requested={int(causal_count)}, built={len(units)}, "
+                f"blocked_units={len(blocked)}, min_unit_active_sites={int(min_unit_active_sites)}."
+            )
+        raise ValueError(
+            "Unable to sample a valid GFF causal unit from remaining genes under the current "
+            f"constraints: remaining_genes={genes_left}, min_unit_active_sites={int(min_unit_active_sites)}, "
+            f"blocked_units={len(blocked)}."
         )
     return units
+
+
+def _extract_failed_gff_logic_unit_index(message: str) -> Optional[int]:
+    text = str(message)
+    patterns = (
+        r"unable to build a valid logic gate for term (\d+)",
+        r"unable to build a valid logic gate for pool (\d+)",
+        r"causal_group\[(\d+)\] has no eligible sites after QC",
+        r"causal constraint group\[(\d+)\]",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match is not None:
+            try:
+                return int(match.group(1))
+            except Exception:
+                return None
+    return None
 
 
 def _format_unit_intervals(intervals: list[tuple[str, int, int]]) -> str:
@@ -766,6 +890,83 @@ def _background_effect_axis_label(background_source: str) -> str:
     return "Effect"
 
 
+_SIM_SECTION_RULE = "-" * 72
+
+
+def _simulation_section(logger: logging.Logger, title: str) -> None:
+    logger.info("")
+    logger.info(_SIM_SECTION_RULE)
+    logger.info("[ %s ]", str(title).strip())
+
+
+def _simulation_stage_view(
+    stage: str,
+    done: int,
+    total: int,
+    *,
+    progress_total_hint: int,
+    logic_mode: Optional[str],
+) -> tuple[str, int, int, dict[str, str]]:
+    stage_key = str(stage).strip().lower()
+    total_now = max(0, int(total))
+    done_now = max(0, int(done))
+    first_pass_total = (
+        min(int(progress_total_hint), total_now)
+        if (int(progress_total_hint) > 0 and total_now > 0)
+        else total_now
+    )
+    if stage_key == "background":
+        stage_total = first_pass_total
+        stage_done = min(done_now, stage_total) if stage_total > 0 else done_now
+        return (
+            "Loading eligible genotype variants",
+            int(stage_done),
+            int(stage_total),
+            {"sites": f"{int(stage_done):,}/{int(stage_total):,}"} if stage_total > 0 else {},
+        )
+    if stage_key == "grm_factor":
+        stage_total = max(1, total_now)
+        stage_done = min(done_now, stage_total)
+        return (
+            "Preparing GRM sampling factor",
+            int(stage_done),
+            int(stage_total),
+            {"step": f"{int(stage_done):,}/{int(stage_total):,}"},
+        )
+    if stage_key in {"causal_additive", "causal_logic"}:
+        stage_total = max(0, total_now - first_pass_total)
+        stage_done = max(0, done_now - first_pass_total)
+        stage_done = min(stage_done, stage_total) if stage_total > 0 else stage_done
+        desc = (
+            "Sampling causal sites"
+            if stage_key == "causal_additive" and (logic_mode is None or str(logic_mode).strip() == "")
+            else "Sampling causal terms"
+        )
+        return (
+            desc,
+            int(stage_done),
+            int(stage_total),
+            {"sites": f"{int(stage_done):,}/{int(stage_total):,}"} if stage_total > 0 else {},
+        )
+    if stage_key == "finalize":
+        stage_total = 1
+        stage_done = 1 if done_now > 0 else 0
+        return (
+            "Finalizing phenotype outputs",
+            int(stage_done),
+            int(stage_total),
+            {"step": f"{int(stage_done):,}/{int(stage_total):,}"},
+        )
+    stage_total = max(1, total_now)
+    stage_done = min(done_now, stage_total)
+    return (
+        "Simulation",
+        int(stage_done),
+        int(stage_total),
+        {"step": f"{int(stage_done):,}/{int(stage_total):,}"},
+    )
+
+
 def _plot_random_effect_distribution(
     *,
     effects_tsv: str,
@@ -1176,9 +1377,12 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     selected_causal_units: list[dict[str, Any]] = []
     bimrange_groups: Optional[list[list[tuple[str, int, int]]]] = None
+    filtered_gene_catalog: list[tuple[str, tuple[str, int, int]]] = []
+    active_pos_index: dict[str, list[int]] | None = None
+    gff_logic_min_unit_sites = 1
 
     t_start = time.time()
-    logger.info(f"Simulating phenotype from genotype: {gfile}")
+    _simulation_section(logger, "Genotype")
     with CliStatus("Inspecting genotype input...", enabled=True) as task:
         sample_ids, n_sites = inspect_genotype_file(
             gfile,
@@ -1191,53 +1395,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     sample_ids = np.asarray(sample_ids, dtype=str)
     detected_threads = int(detect_effective_threads())
 
-    if gff3_path is not None:
-        if not os.path.exists(f"{gfile}.bim"):
-            logger.error(
-                "GFF-constrained simulation currently requires PLINK BIM metadata; expected %s.bim.",
-                gfile,
-            )
-            raise SystemExit(1)
-        try:
-            gene_catalog = _load_gene_catalog_from_gff(str(gff3_path), int(gff_extension or 0))
-            with CliStatus("Computing active-site mask for causal GFF units...", enabled=True) as task:
-                site_keep = _prepare_simulation_site_keep(
-                    bed_prefix=str(gfile),
-                    n_samples=int(sample_ids.shape[0]),
-                    maf_threshold=float(args.maf),
-                    max_missing_rate=float(args.geno),
-                    het_threshold=1.0 if args.het is None else float(args.het),
-                    threads=int(detected_threads),
-                )
-                active_pos_index = _build_active_bim_position_index(
-                    bed_prefix=str(gfile),
-                    site_keep=site_keep,
-                )
-                filtered_gene_catalog = _filter_gene_catalog_by_active_sites(
-                    gene_catalog,
-                    active_positions=active_pos_index,
-                )
-                task.complete(
-                    "Computing active-site mask for causal GFF units ...Finished "
-                    f"(genes={len(filtered_gene_catalog)}/{len(gene_catalog)})"
-                )
-            selected_causal_units = _sample_causal_gene_units(
-                filtered_gene_catalog,
-                causal_count=int(args.causal),
-                seed=seed,
-            )
-        except ValueError as exc:
-            logger.error("%s", exc)
-            raise SystemExit(1) from exc
-        bimrange_groups = [list(unit["intervals"]) for unit in selected_causal_units]
-        logger.info(
-            "Sampled %d causal gene/gene-set units from %s after QC prefilter (ext=%d).",
-            len(selected_causal_units),
-            format_path_for_display(str(gff3_path)),
-            int(gff_extension or 0),
-        )
-
     aligned_grm = None
+    _simulation_section(logger, "Background GRM")
     if args.grm:
         with CliStatus("Loading background GRM...", enabled=True) as task:
             aligned_grm, resolved_grm_id = load_and_align_grm(
@@ -1248,7 +1407,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
             task.complete("Loading background GRM ...Finished")
         logger.info(
-            "Background GRM mode: using %s%s",
+            "Using external GRM: %s%s",
             format_path_for_display(str(args.grm)),
             (
                 f" (ID: {format_path_for_display(str(resolved_grm_id))})"
@@ -1270,10 +1429,64 @@ def main(argv: Optional[list[str]] = None) -> int:
             threads=int(detected_threads),
         )
         logger.info(
-            "Background GRM mode: using auto cached cGRM from %s (source=%s, threads=%d).",
+            "Using cached cGRM: %s (source=%s, threads=%d).",
             format_path_for_display(str(grm_cache_path or "[memory]")),
             format_path_for_display(str(grm_input)),
             int(detected_threads),
+        )
+
+    if gff3_path is not None:
+        _simulation_section(logger, "Causal Units")
+        if not os.path.exists(f"{gfile}.bim"):
+            logger.error(
+                "GFF-constrained simulation currently requires PLINK BIM metadata; expected %s.bim.",
+                gfile,
+            )
+            raise SystemExit(1)
+        try:
+            gene_catalog = _load_gene_catalog_from_gff(str(gff3_path), int(gff_extension or 0))
+            with CliStatus("Preparing causal GFF unit candidates...", enabled=True) as task:
+                site_keep = _prepare_simulation_site_keep(
+                    bed_prefix=str(gfile),
+                    n_samples=int(sample_ids.shape[0]),
+                    maf_threshold=float(args.maf),
+                    max_missing_rate=float(args.geno),
+                    het_threshold=1.0 if args.het is None else float(args.het),
+                    threads=int(detected_threads),
+                )
+                active_pos_index = _build_active_bim_position_index(
+                    bed_prefix=str(gfile),
+                    site_keep=site_keep,
+                )
+                filtered_gene_catalog = _filter_gene_catalog_by_active_sites(
+                    gene_catalog,
+                    active_positions=active_pos_index,
+                )
+                task.complete(
+                    "Preparing causal GFF unit candidates ...Finished "
+                    f"(genes={len(filtered_gene_catalog)}/{len(gene_catalog)})"
+                )
+            gff_logic_min_unit_sites = _gff_logic_unit_min_active_sites(
+                logic_mode,
+                logic_size_weights,
+                int(logic_k_min),
+            )
+            selected_causal_units = _sample_causal_gene_units(
+                filtered_gene_catalog,
+                causal_count=int(args.causal),
+                seed=seed,
+                active_positions=active_pos_index,
+                min_unit_active_sites=int(gff_logic_min_unit_sites),
+            )
+        except ValueError as exc:
+            logger.error("%s", exc)
+            raise SystemExit(1) from exc
+        bimrange_groups = [list(unit["intervals"]) for unit in selected_causal_units]
+        logger.info(
+            "Selected %d causal gene/gene-set units from %s (ext=%d).",
+            len(selected_causal_units),
+            format_path_for_display(str(gff3_path)),
+            int(gff_extension or 0),
         )
     scan_passes = _estimate_simulation_scan_passes(
         causal_count=int(args.causal),
@@ -1284,101 +1497,141 @@ def main(argv: Optional[list[str]] = None) -> int:
         logic_gate_count=logic_gate_count,
     )
     progress_total_hint = int(max(0, n_sites))
-    progress_total = int(max(1, progress_total_hint * max(1, scan_passes)))
-    sim_pbar = ProgressAdapter(
-        total=progress_total,
-        desc="Simulation work",
-        emit_done=False,
-        force_animate=True,
+    blocked_gff_unit_names: set[str] = set()
+    max_gff_logic_redraw_attempts = max(8, int(args.causal) * 4)
+    redraw_attempt = 0
+    _simulation_section(logger, "Phenotype Simulation")
+    logger.info(
+        "Stage order: eligible variants -> GRM factorization -> %s -> finalize.",
+        "causal terms" if logic_mode is not None else "causal sites",
     )
-    progress_state = {"last_done": 0, "stage": "background"}
-
-    def _simulation_progress(stage: str, done: int, total: int) -> None:
-        stage_key = str(stage)
-        total_now = int(total)
-        done_now = int(done)
-        if stage_key != progress_state["stage"]:
-            progress_state["stage"] = stage_key
-        if total_now > 0:
-            if int(getattr(sim_pbar, "total", 0)) != total_now:
-                sim_pbar.set_total(total_now)
-            done_now = max(0, min(done_now, total_now))
-        delta = done_now - int(progress_state["last_done"])
-        if delta > 0:
-            sim_pbar.update(delta)
-            progress_state["last_done"] = done_now
-        first_pass_total = (
-            min(progress_total_hint, total_now) if (progress_total_hint > 0 and total_now > 0) else 0
+    while True:
+        if len(selected_causal_units) > 0:
+            bimrange_groups = [list(unit["intervals"]) for unit in selected_causal_units]
+        sim_pbar = ProgressAdapter(
+            total=max(1, progress_total_hint if progress_total_hint > 0 else scan_passes),
+            desc="Preparing phenotype simulation",
+            emit_done=False,
+            force_animate=True,
         )
-        if stage_key == "background":
-            stage_total_now = first_pass_total if first_pass_total > 0 else total_now
-            stage_done_now = min(done_now, stage_total_now) if stage_total_now > 0 else done_now
-        elif stage_key in ("causal_additive", "causal_logic"):
-            stage_done_now = max(0, done_now - first_pass_total)
-            stage_total_now = max(0, total_now - first_pass_total)
-        elif stage_key == "finalize":
-            stage_done_now = 1
-            stage_total_now = 1
-        else:
-            stage_done_now = done_now
-            stage_total_now = total_now
-        if stage_total_now > 0:
-            sim_pbar.set_postfix(
-                sites=f"{stage_done_now:,}/{stage_total_now:,}",
-            )
-        else:
-            sim_pbar.set_postfix(
-                sites=f"{stage_done_now:,}",
-            )
+        progress_state = {
+            "raw_stage": None,
+            "desc": "Preparing phenotype simulation",
+            "last_done": 0,
+            "stage_total": max(1, progress_total_hint if progress_total_hint > 0 else scan_passes),
+        }
 
-    sim_start = time.monotonic()
-    try:
-        res = _run_rust_simulation(
-            gfile=gfile,
-            seed=seed,
-            maf=float(args.maf),
-            causal_maf_min=float(causal_maf_min),
-            missing_rate=float(args.geno),
-            het_threshold=None if args.het is None else float(args.het),
-            bg_pve=float(args.bg_pve),
-            residual_var=1.0,
-            causal=int(args.causal),
-            cs_pve=cs_pve,
-            bimranges=bimranges,
-            bimrange_groups=bimrange_groups,
-            logic_mode=logic_mode,
-            logic_size_weights=logic_size_weights,
-            logic_gate_count=logic_gate_count,
-            logic_k_min=int(logic_k_min),
-            logic_k_max=int(logic_k_max),
-            logic_ld_max=float(logic_ld_max),
-            logic_het_max=float(logic_het_max),
-            logic_af_min=float(logic_af_min),
-            logic_af_max=float(logic_af_max),
-            logic_max_iter=int(logic_max_iter),
-            logic_window_bp=logic_window_bp,
-            logic_effect_model=logic_effect_model,
-            background_dist="normal",
-            gamma_shape=1.0,
-            gamma_scale=1.0,
-            laplace_scale=1.0,
-            outprefix=outprefix,
-            trait_name=None,
-            write_effect_tables=True,
-            grm=aligned_grm,
-            snps_only=False,
-            progress_callback=_simulation_progress,
-            progress_total_hint=progress_total_hint,
-            progress_every=max(1, min(10_000, progress_total_hint // 200 if progress_total_hint > 0 else 10_000)),
-        )
-    finally:
-        sim_pbar.finish()
-        sim_pbar.close()
-    sim_elapsed = max(0.0, time.monotonic() - sim_start)
+        def _simulation_progress(stage: str, done: int, total: int) -> None:
+            desc, stage_done, stage_total, postfix = _simulation_stage_view(
+                stage,
+                int(done),
+                int(total),
+                progress_total_hint=int(progress_total_hint),
+                logic_mode=logic_mode,
+            )
+            stage_total_norm = max(1, int(stage_total))
+            if str(stage) != progress_state["raw_stage"]:
+                progress_state["raw_stage"] = str(stage)
+                progress_state["desc"] = str(desc)
+                progress_state["last_done"] = 0
+                progress_state["stage_total"] = stage_total_norm
+                sim_pbar.set_desc(str(desc))
+                sim_pbar.set_total(stage_total_norm)
+            elif int(progress_state["stage_total"]) != stage_total_norm:
+                progress_state["stage_total"] = stage_total_norm
+                sim_pbar.set_total(stage_total_norm)
+            delta = int(stage_done) - int(progress_state["last_done"])
+            if delta > 0:
+                sim_pbar.update(delta)
+                progress_state["last_done"] = int(stage_done)
+            sim_pbar.set_postfix(**postfix)
+
+        sim_start = time.monotonic()
+        try:
+            res = _run_rust_simulation(
+                gfile=gfile,
+                seed=seed,
+                maf=float(args.maf),
+                causal_maf_min=float(causal_maf_min),
+                missing_rate=float(args.geno),
+                het_threshold=None if args.het is None else float(args.het),
+                bg_pve=float(args.bg_pve),
+                residual_var=1.0,
+                causal=int(args.causal),
+                cs_pve=cs_pve,
+                bimranges=bimranges,
+                bimrange_groups=bimrange_groups,
+                logic_mode=logic_mode,
+                logic_size_weights=logic_size_weights,
+                logic_gate_count=logic_gate_count,
+                logic_k_min=int(logic_k_min),
+                logic_k_max=int(logic_k_max),
+                logic_ld_max=float(logic_ld_max),
+                logic_het_max=float(logic_het_max),
+                logic_af_min=float(logic_af_min),
+                logic_af_max=float(logic_af_max),
+                logic_max_iter=int(logic_max_iter),
+                logic_window_bp=logic_window_bp,
+                logic_effect_model=logic_effect_model,
+                background_dist="normal",
+                gamma_shape=1.0,
+                gamma_scale=1.0,
+                laplace_scale=1.0,
+                outprefix=outprefix,
+                trait_name=None,
+                write_effect_tables=True,
+                grm=aligned_grm,
+                snps_only=False,
+                progress_callback=_simulation_progress,
+                progress_total_hint=progress_total_hint,
+                progress_every=max(1, min(10_000, progress_total_hint // 200 if progress_total_hint > 0 else 10_000)),
+            )
+            sim_elapsed = max(0.0, time.monotonic() - sim_start)
+            break
+        except RuntimeError as exc:
+            failed_unit_idx = _extract_failed_gff_logic_unit_index(str(exc))
+            can_redraw_gff_unit = (
+                gff3_path is not None
+                and logic_mode is not None
+                and active_pos_index is not None
+                and len(filtered_gene_catalog) > 0
+                and len(selected_causal_units) == int(args.causal)
+                and failed_unit_idx is not None
+                and 0 <= int(failed_unit_idx) < len(selected_causal_units)
+                and redraw_attempt < int(max_gff_logic_redraw_attempts)
+            )
+            if not can_redraw_gff_unit:
+                raise
+            failed_unit = selected_causal_units[int(failed_unit_idx)]
+            blocked_gff_unit_names.add(str(failed_unit["unit_name"]))
+            redraw_attempt += 1
+            selected_causal_units = _sample_causal_gene_units(
+                filtered_gene_catalog,
+                causal_count=int(args.causal),
+                seed=seed + int(redraw_attempt) * 1009,
+                active_positions=active_pos_index,
+                min_unit_active_sites=int(gff_logic_min_unit_sites),
+                blocked_unit_names=blocked_gff_unit_names,
+            )
+            continue
+        finally:
+            sim_pbar.finish()
+            sim_pbar.close()
+
     log_success(logger, f"Simulation ...Finished [{format_elapsed(sim_elapsed)}]")
+    if len(blocked_gff_unit_names) > 0:
+        preview = ", ".join(str(x) for x in list(blocked_gff_unit_names)[:3])
+        extra = "" if len(blocked_gff_unit_names) <= 3 else f" ... (+{len(blocked_gff_unit_names) - 3} more)"
+        logger.info(
+            "Causal-unit redraws: skipped %d incompatible GFF unit signatures%s%s.",
+            len(blocked_gff_unit_names),
+            f" [{preview}]" if preview != "" else "",
+            extra,
+        )
     random_effects_tsv = f"{outprefix}.random.effects.tsv"
     random_effects_pdf = f"{outprefix}.random.effects.pdf"
     try:
+        _simulation_section(logger, "Visualization")
         vis_source = str(res.get("background_source", "none"))
         vis_label = (
             "GRM breeding values"
@@ -1431,18 +1684,43 @@ def main(argv: Optional[list[str]] = None) -> int:
     except Exception as exc:
         logger.warning("Random effect distribution PDF was skipped: %s", exc)
 
+    realized_summary = res.get("realized_summary")
+    _simulation_section(logger, "Summary")
     logger.info(
-        "Final-variance PVE runtime: bg_pve=%s, causal_pve=%s, ve=%s.",
+        "Targets: bg_pve=%s, causal_pve=%s, residual=%s.",
         res.get("bg_pve"),
         res.get("causal_pve"),
         res.get("ve"),
     )
-    realized_summary = res.get("realized_summary")
+    background_factorization = str(res.get("background_factorization", "none")).strip().lower()
+    if background_factorization not in {"", "none"}:
+        logger.info("GRM factorization: %s.", background_factorization)
     if isinstance(realized_summary, dict):
         logger.info(
-            "mean(y)=%.6g, var(y)=%.6g.",
+            "Phenotype: mean(y)=%.6g, var(y)=%.6g.",
             float(realized_summary.get("mean_y", 0.0)),
             float(realized_summary.get("var_y", 0.0)),
+        )
+        logger.info(
+            "Components (mean): c=%.6g, u=%.6g, e=%.6g.",
+            float(realized_summary.get("mean_causal", 0.0)),
+            float(realized_summary.get("mean_background", 0.0)),
+            float(realized_summary.get("mean_residual", 0.0)),
+        )
+        logger.info(
+            "Components (var):  c=%.6g, u=%.6g, e=%.6g.",
+            float(realized_summary.get("var_causal", 0.0)),
+            float(realized_summary.get("var_background", 0.0)),
+            float(realized_summary.get("var_residual", 0.0)),
+        )
+        logger.info(
+            "Components (share): cs=%.6g, bg=%.6g, res=%.6g, sum=%.6g.",
+            float(realized_summary.get("pve_causal", 0.0)),
+            float(realized_summary.get("pve_background", 0.0)),
+            float(realized_summary.get("pve_residual", 0.0)),
+            float(realized_summary.get("pve_causal", 0.0))
+            + float(realized_summary.get("pve_background", 0.0))
+            + float(realized_summary.get("pve_residual", 0.0)),
         )
     if len(selected_causal_units) > 0:
         fixed_rows = [
@@ -1462,44 +1740,17 @@ def main(argv: Optional[list[str]] = None) -> int:
             fixed_rows=fixed_rows,
         )
         logger.info(
-            "Saved causal unit file: %s",
+            "Causal units: %s",
             format_path_for_display(str(units_path)),
         )
         logger.info(
-            "Saved causal truth file: %s",
+            "Causal truth: %s",
             format_path_for_display(str(truth_path)),
-        )
-        logger.info(
-            "mean(c)=%.6g, mean(u)=%.6g, mean(e)=%.6g.",
-            float(realized_summary.get("mean_causal", 0.0)),
-            float(realized_summary.get("mean_background", 0.0)),
-            float(realized_summary.get("mean_residual", 0.0)),
-        )
-        logger.info(
-            "var(c)=%.6g, var(u)=%.6g, var(e)=%.6g.",
-            float(realized_summary.get("var_causal", 0.0)),
-            float(realized_summary.get("var_background", 0.0)),
-            float(realized_summary.get("var_residual", 0.0)),
-        )
-        logger.info(
-            "cov(c,u)=%.6g, cov(c,e)=%.6g, cov(u,e)=%.6g.",
-            float(realized_summary.get("cov_causal_background", 0.0)),
-            float(realized_summary.get("cov_causal_residual", 0.0)),
-            float(realized_summary.get("cov_background_residual", 0.0)),
-        )
-        logger.info(
-            "cs=%.6g, bg=%.6g, res=%.6g, sum=%.6g.",
-            float(realized_summary.get("pve_causal", 0.0)),
-            float(realized_summary.get("pve_background", 0.0)),
-            float(realized_summary.get("pve_residual", 0.0)),
-            float(realized_summary.get("pve_causal", 0.0))
-            + float(realized_summary.get("pve_background", 0.0))
-            + float(realized_summary.get("pve_residual", 0.0)),
         )
     if len(sample_ids) != int(np.asarray(res["phenotype"]).reshape(-1).shape[0]):
         logger.warning("Sample count from inspection differs from Rust phenotype length.")
 
-    logger.info("Outputs:")
+    _simulation_section(logger, "Outputs")
     logger.info(f"  {format_path_for_display(f'{outprefix}.pheno')}")
     logger.info(f"  {format_path_for_display(f'{outprefix}.pheno.txt')}")
     logger.info(f"  {format_path_for_display(f'{outprefix}.pheno.NA.txt')}")

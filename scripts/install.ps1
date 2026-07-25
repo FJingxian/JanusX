@@ -20,7 +20,7 @@ uv venv $EnvPath --python $PythonVersion
 Write-Host "[4/4] Installing janusx..."
 uv pip install --python "$EnvPath\Scripts\python.exe" $Package
 
-$EnvPath\Scripts\jx -v
+"$EnvPath\Scripts\jx -v"
 Write-Host ""
 Write-Host "Done."
 Write-Host "Run with:"

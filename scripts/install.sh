@@ -5,13 +5,13 @@ PYTHON_VERSION="3.13"
 ENV_PATH="${HOME}/venv_janusx"
 PACKAGE="janusx"
 
+export PATH="$HOME/.local/bin:$PATH"
 if command -v uv >/dev/null 2>&1; then
   echo "[1/4] uv already installed: $(uv --version)"
 else
   echo "[1/4] Installing uv..."
   curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1
 fi
-export PATH="$HOME/.local/bin:$PATH"
 
 echo "[2/4] Installing Python via uv..."
 uv python install $PYTHON_VERSION >/dev/null 2>&1

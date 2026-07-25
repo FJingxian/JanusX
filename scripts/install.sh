@@ -37,4 +37,4 @@ $ENV_PATH/bin/jx -v
 echo ""
 echo "Done."
 echo "Script:"
-echo "$ENV_PATH/bin/jx"
+echo "$ENV_PATH/bin/jx -h"

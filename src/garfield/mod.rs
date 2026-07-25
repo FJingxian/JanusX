@@ -55,6 +55,7 @@ use crate::ml::pairwise_and::{
     feature_scores_pairwise_and_packed_dual_with_stage1, reset_pairwise_profile,
     snapshot_pairwise_profile,
 };
+use crate::eigh::load_square_matrix_f64_from_file;
 use crate::ml::univariate::{
     feature_scores_abs_corr_stage1, feature_scores_abs_corr_stage1_with_parallel,
 };
@@ -519,6 +520,7 @@ enum GarfieldInputKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 enum GarfieldBinMode {
     Bin,
     Mbin,
@@ -641,8 +643,10 @@ fn parse_bin_mode(mode: &str) -> Result<GarfieldBinMode, String> {
     let t = mode.trim().to_ascii_lowercase();
     match t.as_str() {
         "bin" | "bin02" => Ok(GarfieldBinMode::Bin),
-        "mbin" => Ok(GarfieldBinMode::Mbin),
-        _ => Err("mode must be one of: bin, mbin".to_string()),
+        // MBIN is retained only as a compatibility alias. The active GARFIELD
+        // path is BIN with fuzzy 0/1/2 dosage logic.
+        "mbin" => Ok(GarfieldBinMode::Bin),
+        _ => Err("mode must be one of: bin, mbin(alias->bin)".to_string()),
     }
 }
 
@@ -2735,8 +2739,10 @@ fn materialize_prepared_bit_matrices(
 #[derive(Clone, Debug)]
 struct GarfieldUnitMlContext {
     unit_index: usize,
+    unit_name: String,
     selected_global_rows: Vec<usize>,
     ranked_global_rows: Vec<usize>,
+    null_unit_group_bin: u8,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -2762,6 +2768,7 @@ struct GarfieldLogicRuleRecord {
     bim_snp_name: String,
     bim_allele0: String,
     bim_allele1: String,
+    allele1_maf: f64,
     pos: i32,
     score: f64,
     delta_score: String,
@@ -2771,6 +2778,7 @@ struct GarfieldLogicRuleRecord {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 struct GarfieldUnitRuleCompareRecord {
     unit_name: String,
     unit_kind: String,
@@ -2825,6 +2833,12 @@ struct GarfieldRenderedRule {
 struct GarfieldUnitEvaluationOutput {
     records: Vec<GarfieldLogicRuleRecord>,
     compare_record: Option<GarfieldUnitRuleCompareRecord>,
+}
+
+#[derive(Clone, Debug)]
+struct GarfieldBeamDebugProbe {
+    unit_name: String,
+    out_tsv: String,
 }
 
 #[derive(Clone, Debug)]
@@ -3048,13 +3062,8 @@ fn format_delta_metric_value(value: f64) -> String {
 }
 
 #[inline]
-fn literal_metric_token(value: f64, negated: bool) -> String {
-    let text = format_delta_metric_value(value);
-    if negated {
-        format!("!{text}")
-    } else {
-        text
-    }
+fn literal_metric_token(value: f64) -> String {
+    format_delta_metric_value(value)
 }
 
 #[inline]
@@ -3233,7 +3242,7 @@ fn rule_bim_alleles_with_polarity<S: GarfieldDisplaySite>(
         allele0.push(a0);
         allele1.push(a1);
     }
-    Ok((allele0.join(","), allele1.join(",")))
+    Ok((allele0.join(""), allele1.join("")))
 }
 
 fn rule_ml_rank_name_with_polarity(
@@ -3310,7 +3319,7 @@ fn build_rule_delta_score_annotation(
         );
         let single_score =
             final_output_score_with_bucket(bucket, test_sc.raw_score, output_null_penalties, false);
-        score_txt.push_str(&literal_metric_token(single_score, display_lit.negated));
+        score_txt.push_str(&literal_metric_token(single_score));
         Ok(())
     };
 
@@ -3502,6 +3511,64 @@ fn build_unit_rule_compare_record(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn maybe_write_beam_debug_probe_tsv(
+    probe: Option<&GarfieldBeamDebugProbe>,
+    unit: &GarfieldLogicUnit,
+    prepared: &GarfieldUnitPrepared,
+    beam_hits: &[BeamRuleCandidate],
+    local_sites: &[GarfieldLogicSite],
+    selected_bits_full: &[u64],
+    selected_bits_full_hi: Option<&[u64]>,
+    logic_bits: &GarfieldLogicBits,
+    output_null_penalties: Option<&RuleNullPenaltyLookup>,
+    null_complexity_bin: u8,
+) -> Result<(), String> {
+    let Some(probe) = probe else {
+        return Ok(());
+    };
+    if probe.unit_name != unit.label {
+        return Ok(());
+    }
+    let mut w = BufWriter::new(File::create(&probe.out_tsv).map_err(|e| e.to_string())?);
+    writeln!(
+        w,
+        "gain_rank\trule_len\tml_rank\tsnp_name\tgain_score\toutput_score\traw_score\tallele1_maf\texpr"
+    )
+    .map_err(|e| e.to_string())?;
+    for (rank_idx, cand) in beam_hits.iter().enumerate() {
+        let rendered = render_candidate_rule_for_output(
+            cand,
+            local_sites,
+            selected_bits_full,
+            selected_bits_full_hi,
+            logic_bits,
+            prepared.selected_global_rows.len(),
+        )?;
+        let output_score = final_output_score_for_candidate(
+            cand,
+            output_null_penalties,
+            false,
+            null_complexity_bin,
+        );
+        writeln!(
+            w,
+            "{}\t{}\t{}\t{}\t{:.10}\t{:.10}\t{:.10}\t{:.10}\t{}",
+            rank_idx + 1,
+            cand.rule.len(),
+            rule_ml_rank_name_with_polarity(&cand.rule, rendered.polarity),
+            rendered.snp_name,
+            cand.test_score,
+            output_score,
+            cand.test.raw_score,
+            cand.test.dosage_maf,
+            rendered.expr
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    w.flush().map_err(|e| e.to_string())
+}
+
 #[inline]
 fn is_no_valid_initial_literals_error(err: &str) -> bool {
     err.contains("no valid initial literals")
@@ -3568,19 +3635,20 @@ struct SimBenchTerm {
     logic_text: String,
     sites_text: String,
     sites: Vec<(String, i32)>,
+    unit_name: String,
     label: String,
 }
 
 fn parse_simbench_logic(raw: &str) -> Result<SimBenchLogic, String> {
     match raw.trim().to_ascii_lowercase().as_str() {
-        "" | "single" => Ok(SimBenchLogic::Single),
+        "" | "single" | "s" | "additive" => Ok(SimBenchLogic::Single),
         "and" | "a" => Ok(SimBenchLogic::And),
         "or" => Ok(SimBenchLogic::Or),
         "na" => Ok(SimBenchLogic::Na),
         "an" => Ok(SimBenchLogic::An),
         "nan" => Ok(SimBenchLogic::Nan),
         other => Err(format!(
-            "simbench logic must be one of: single, and, or, a, na, an, nan; got {other}"
+            "simbench logic must be one of: single, s, additive, and, or, a, na, an, nan; got {other}"
         )),
     }
 }
@@ -3626,6 +3694,26 @@ fn parse_simbench_sites(raw: &str) -> Result<Vec<(String, i32)>, String> {
     Ok(out)
 }
 
+fn parse_simbench_label_alleles(label: &str) -> Vec<(String, String)> {
+    let mut out = Vec::<(String, String)>::new();
+    let mut rest = label;
+    while let Some(lb) = rest.find('[') {
+        let after_lb = &rest[lb + 1..];
+        let Some(rb_rel) = after_lb.find(']') else {
+            break;
+        };
+        let inside = &after_lb[..rb_rel];
+        if let Some((a0, a1)) = inside.split_once('>') {
+            out.push((
+                a0.trim().to_ascii_uppercase(),
+                a1.trim().to_ascii_uppercase(),
+            ));
+        }
+        rest = &after_lb[rb_rel + 1..];
+    }
+    out
+}
+
 fn parse_simbench_terms(path: &str) -> Result<Vec<SimBenchTerm>, String> {
     let file = File::open(path).map_err(|e| format!("open simbench file {path}: {e}"))?;
     let mut rdr = BufReader::new(file);
@@ -3645,26 +3733,24 @@ fn parse_simbench_terms(path: &str) -> Result<Vec<SimBenchTerm>, String> {
     for (i, col) in cols.iter().enumerate() {
         col_idx.insert(col.to_ascii_lowercase(), i);
     }
-    let term_idx = col_idx
-        .get("term_id")
-        .copied()
-        .ok_or_else(|| format!("simbench file {path} is missing required column: term_id"))?;
+    let term_idx = col_idx.get("term_id").copied();
     let kind_idx = col_idx
         .get("kind")
+        .or_else(|| col_idx.get("term_kind"))
         .copied()
         .ok_or_else(|| format!("simbench file {path} is missing required column: kind"))?;
-    let logic_idx = col_idx
-        .get("logic")
-        .copied()
-        .ok_or_else(|| format!("simbench file {path} is missing required column: logic"))?;
+    let logic_idx = col_idx.get("logic").copied();
     let sites_idx = col_idx
         .get("sites")
         .copied()
         .ok_or_else(|| format!("simbench file {path} is missing required column: sites"))?;
-    let label_idx = col_idx
-        .get("label")
-        .copied()
-        .ok_or_else(|| format!("simbench file {path} is missing required column: label"))?;
+    let label_idx = col_idx.get("label").copied();
+    let unit_name_idx = col_idx.get("unit_name").copied();
+    if label_idx.is_none() && unit_name_idx.is_none() {
+        return Err(format!(
+            "simbench file {path} is missing required column: label (or unit_name)"
+        ));
+    }
 
     let mut out = Vec::<SimBenchTerm>::new();
     for (line_no0, line_res) in rdr.lines().enumerate() {
@@ -3681,17 +3767,24 @@ fn parse_simbench_terms(path: &str) -> Result<Vec<SimBenchTerm>, String> {
                 ""
             }
         };
-        let term_id = get_field(term_idx)
-            .parse::<usize>()
+        let term_id = term_idx
+            .map(get_field)
+            .and_then(|txt| txt.parse::<usize>().ok())
             .unwrap_or(out.len() + 1);
         let kind = get_field(kind_idx).to_string();
-        let logic_text = get_field(logic_idx).to_string();
+        let logic_text = logic_idx.map(get_field).unwrap_or("").to_string();
+        let logic_source = if logic_text.trim().is_empty() {
+            kind.as_str()
+        } else {
+            logic_text.as_str()
+        };
         let logic =
-            parse_simbench_logic(&logic_text).map_err(|e| format!("{path}:{line_no}: {e}"))?;
+            parse_simbench_logic(logic_source).map_err(|e| format!("{path}:{line_no}: {e}"))?;
         let sites_text = get_field(sites_idx).to_string();
         let sites =
             parse_simbench_sites(&sites_text).map_err(|e| format!("{path}:{line_no}: {e}"))?;
-        let label = get_field(label_idx).to_string();
+        let unit_name = unit_name_idx.map(get_field).unwrap_or("").to_string();
+        let label = label_idx.map(get_field).unwrap_or("").to_string();
         out.push(SimBenchTerm {
             term_id,
             kind,
@@ -3699,64 +3792,15 @@ fn parse_simbench_terms(path: &str) -> Result<Vec<SimBenchTerm>, String> {
             logic_text,
             sites_text,
             sites,
+            unit_name,
             label,
         });
     }
     Ok(out)
 }
 
-fn normalize_simbench_raw_row(row: &mut [f32], site: &mut SiteInfo) -> Result<(), String> {
-    if row.is_empty() {
-        return Err("empty genotype row".to_string());
-    }
-    let keep = process_snp_row(
-        row,
-        &mut site.ref_allele,
-        &mut site.alt_allele,
-        0.0,
-        1.0,
-        false,
-        false,
-        1.0,
-    );
-    if !keep {
-        return Err("failed to normalize genotype row".to_string());
-    }
-    Ok(())
-}
-
-fn pack_simbench_raw_row_dual_words(row: &[f32]) -> Result<(Vec<u64>, Vec<u64>), String> {
-    if row.is_empty() {
-        return Err("empty genotype row".to_string());
-    }
-    let row_words = words_for_samples(row.len());
-    let mut ge1 = vec![0u64; row_words];
-    let mut ge2 = vec![0u64; row_words];
-    for (i, &v) in row.iter().enumerate() {
-        if !v.is_finite() {
-            return Err(format!("non-finite genotype value at sample index {i}"));
-        }
-        let r = v.round();
-        let g = if r <= 0.0 {
-            0u8
-        } else if r >= 2.0 {
-            2u8
-        } else {
-            1u8
-        };
-        if g >= 1 {
-            ge1[i >> 6] |= 1u64 << (i & 63);
-        }
-        if g >= 2 {
-            ge2[i >> 6] |= 1u64 << (i & 63);
-        }
-    }
-    apply_tail_mask(&mut ge1, tail_mask(row.len()));
-    apply_tail_mask(&mut ge2, tail_mask(row.len()));
-    Ok((ge1, ge2))
-}
-
-fn simbench_rule_from_site_count(logic: SimBenchLogic, n_sites: usize) -> Result<BeamRule, String> {
+fn simbench_rule_from_negations(logic: SimBenchLogic, negated: &[bool]) -> Result<BeamRule, String> {
+    let n_sites = negated.len();
     if n_sites == 0 {
         return Err("simbench term has no sites".to_string());
     }
@@ -3768,7 +3812,7 @@ fn simbench_rule_from_site_count(logic: SimBenchLogic, n_sites: usize) -> Result
     let first = BeamLiteral {
         row_index: 0,
         group_id: 0,
-        negated: simbench_logic_member_negated(logic, 0),
+        negated: negated[0],
     };
     let mut rest = Vec::<(BeamBinaryOp, BeamLiteral)>::with_capacity(n_sites.saturating_sub(1));
     if let Some(op) = simbench_logic_join_op(logic) {
@@ -3778,7 +3822,7 @@ fn simbench_rule_from_site_count(logic: SimBenchLogic, n_sites: usize) -> Result
                 BeamLiteral {
                     row_index,
                     group_id: row_index,
-                    negated: simbench_logic_member_negated(logic, row_index),
+                    negated: negated[row_index],
                 },
             ));
         }
@@ -3786,93 +3830,120 @@ fn simbench_rule_from_site_count(logic: SimBenchLogic, n_sites: usize) -> Result
     Ok(BeamRule { first, rest })
 }
 
-fn simbench_logic_symbol(logic: SimBenchLogic) -> &'static str {
-    match simbench_logic_join_op(logic) {
-        None => "",
-        Some(BeamBinaryOp::And) => " & ",
-        Some(BeamBinaryOp::Or) => " | ",
-    }
+fn simbench_effective_negations<S: GarfieldDisplaySite>(
+    term: &SimBenchTerm,
+    sites: &[S],
+) -> Vec<bool> {
+    let label_alleles = parse_simbench_label_alleles(&term.label);
+    (0..sites.len())
+        .map(|idx| {
+            let base_negated = simbench_logic_member_negated(term.logic, idx);
+            let Some((label_ref, label_alt)) = label_alleles.get(idx) else {
+                return base_negated;
+            };
+            let site_ref = clean_logic_allele_label(sites[idx].garfield_ref_allele())
+                .to_ascii_uppercase();
+            let site_alt = clean_logic_allele_label(sites[idx].garfield_alt_allele())
+                .to_ascii_uppercase();
+            let swapped = *label_ref == site_alt && *label_alt == site_ref;
+            if swapped {
+                !base_negated
+            } else {
+                base_negated
+            }
+        })
+        .collect()
 }
 
-fn simbench_rule_name<S: GarfieldChromPosSite>(
-    logic: SimBenchLogic,
+fn simbench_rule_name<S: GarfieldChromPosSite + GarfieldDisplaySite>(
+    negated: &[bool],
     sites: &[S],
-    label: &str,
 ) -> String {
-    let trimmed = label.trim();
-    if !trimmed.is_empty() {
-        trimmed.to_string()
-    } else {
-        sites
-            .iter()
-            .enumerate()
-            .map(|(idx, site)| literal_name(site, simbench_logic_member_negated(logic, idx)))
-            .collect::<Vec<_>>()
-            .join(simbench_logic_symbol(logic))
-    }
+    sites
+        .iter()
+        .enumerate()
+        .map(|(idx, site)| literal_target_name(site, negated.get(idx).copied().unwrap_or(false)))
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
-fn simbench_rule_bim_name<S: GarfieldDisplaySite>(
-    logic: SimBenchLogic,
+fn simbench_rule_bim_name<S: GarfieldChromPosSite + GarfieldDisplaySite>(
+    negated: &[bool],
     sites: &[S],
-    label: &str,
 ) -> String {
-    let trimmed = label.trim();
-    if !trimmed.is_empty() {
-        trimmed
-            .chars()
-            .filter(|c| !c.is_ascii_whitespace())
-            .collect()
-    } else {
-        sites
-            .iter()
-            .enumerate()
-            .map(|(idx, site)| literal_name(site, simbench_logic_member_negated(logic, idx)))
-            .collect::<Vec<_>>()
-            .join(simbench_logic_symbol_compact(logic))
-    }
+    simbench_rule_name(negated, sites)
 }
 
 fn simbench_rule_bim_alleles<S: GarfieldDisplaySite>(
-    logic: SimBenchLogic,
+    negated: &[bool],
     sites: &[S],
 ) -> (String, String) {
     let mut allele0 = Vec::<String>::with_capacity(sites.len());
     let mut allele1 = Vec::<String>::with_capacity(sites.len());
     for (idx, site) in sites.iter().enumerate() {
-        let (a0, a1) = literal_bim_alleles(site, simbench_logic_member_negated(logic, idx));
+        let (a0, a1) =
+            literal_bim_alleles(site, negated.get(idx).copied().unwrap_or(false));
         allele0.push(a0);
         allele1.push(a1);
     }
-    (allele0.join(","), allele1.join(","))
+    (allele0.join(""), allele1.join(""))
 }
 
 fn simbench_rule_expr<S: GarfieldDisplaySite>(
-    logic: SimBenchLogic,
+    negated: &[bool],
     sites: &[S],
 ) -> Result<String, String> {
     let mut it = sites.iter();
     let Some(first) = it.next() else {
         return Err("simbench term has no sites".to_string());
     };
-    let mut out = literal_expr(first, simbench_logic_member_negated(logic, 0));
-    let op_txt = match simbench_logic_join_op(logic) {
-        None => "",
-        Some(BeamBinaryOp::And) => "AND",
-        Some(BeamBinaryOp::Or) => "OR",
-    };
-    if !matches!(logic, SimBenchLogic::Single) {
+    let mut out = literal_expr(first, negated.first().copied().unwrap_or(false));
+    if sites.len() > 1 {
         for (idx, site) in it.enumerate() {
             out.push(' ');
-            out.push_str(op_txt);
+            out.push_str("AND");
             out.push(' ');
-            out.push_str(&literal_expr(
-                site,
-                simbench_logic_member_negated(logic, idx + 1),
-            ));
+            out.push_str(&literal_expr(site, negated.get(idx + 1).copied().unwrap_or(false)));
         }
     }
     Ok(out)
+}
+
+#[inline]
+fn simbench_term_unit_name<S: GarfieldChromPosSite>(term: &SimBenchTerm, sites: &[S]) -> String {
+    let trimmed = term.unit_name.trim();
+    if !trimmed.is_empty() {
+        trimmed.to_string()
+    } else {
+        let trimmed_label = term.label.trim();
+        if !trimmed_label.is_empty() {
+            trimmed_label.to_string()
+        } else {
+            sites
+                .iter()
+                .map(site_base_label)
+                .collect::<Vec<_>>()
+                .join("&")
+        }
+    }
+}
+
+#[inline]
+fn simbench_term_rule_name<S: GarfieldChromPosSite + GarfieldDisplaySite>(
+    _term: &SimBenchTerm,
+    negated: &[bool],
+    sites: &[S],
+) -> String {
+    simbench_rule_name(negated, sites)
+}
+
+#[inline]
+fn simbench_term_bim_name<S: GarfieldChromPosSite + GarfieldDisplaySite>(
+    _term: &SimBenchTerm,
+    negated: &[bool],
+    sites: &[S],
+) -> String {
+    simbench_rule_bim_name(negated, sites)
 }
 
 #[inline]
@@ -4059,6 +4130,21 @@ fn beam_params_for_prepared(
     }
 }
 
+#[inline]
+fn beam_params_for_simbench_context(
+    selected_row_count: usize,
+    null_unit_group_bin: u8,
+    beam_params: BeamSearchParams,
+) -> BeamSearchParams {
+    BeamSearchParams {
+        null_complexity_bin: rule_null_context_bin(
+            rule_null_complexity_bin(selected_row_count),
+            null_unit_group_bin,
+        ),
+        ..beam_params
+    }
+}
+
 fn unit_contains_any_simbench_site(unit: &GarfieldLogicUnit, terms: &[SimBenchTerm]) -> bool {
     unit.spans.iter().any(|span| {
         terms.iter().any(|term| {
@@ -4083,7 +4169,9 @@ fn build_simbench_ml_contexts(
     tree_cfg: ExtraTreesConfig,
     logic_bits: &GarfieldLogicBits,
     train_idx_local: &[usize],
+    test_idx_local: &[usize],
     y_train: &[f64],
+    beam_params: BeamSearchParams,
     allow_parallel: bool,
 ) -> Result<Vec<GarfieldUnitMlContext>, String> {
     if terms.is_empty() || scan_unit_indices.is_empty() {
@@ -4098,6 +4186,25 @@ fn build_simbench_ml_contexts(
         if unit.indices.is_empty() {
             continue;
         }
+        let Some(prepared) = prepare_logic_unit_continuous(
+            unit,
+            unit_kind_lc,
+            response,
+            engine,
+            importance,
+            perm_cfg,
+            ml_top_k,
+            ml_top_frac,
+            tree_cfg,
+            logic_bits,
+            train_idx_local,
+            test_idx_local,
+            y_train,
+            beam_params.clone(),
+        )?
+        else {
+            continue;
+        };
         let dense_train = dense_dosage_rows_from_full_bits(
             logic_bits.bits_flat.as_slice(),
             logic_bits.bits_hi_flat.as_deref(),
@@ -4117,7 +4224,7 @@ fn build_simbench_ml_contexts(
             logic_bits.sites.as_slice(),
             unit_kind_lc,
         );
-        let (selected_global_rows, ranked_global_rows) = if let Some(engine_one) = engine {
+        let (_selected_global_rows, ranked_global_rows) = if let Some(engine_one) = engine {
             let keep_k = resolve_ml_keep_k(n_region, ml_top_k, ml_top_frac);
             let top_local = select_ml_top_local_indices(
                 dense_train.as_slice(),
@@ -4167,23 +4274,25 @@ fn build_simbench_ml_contexts(
         };
         out.push(GarfieldUnitMlContext {
             unit_index: ui,
-            selected_global_rows,
+            unit_name: unit.label.clone(),
+            selected_global_rows: prepared.selected_global_rows,
             ranked_global_rows,
+            null_unit_group_bin: prepared.null_unit_group_bin,
         });
     }
     Ok(out)
 }
 
-fn format_simbench_ml_rank(logic: SimBenchLogic, ranks: &[Option<usize>]) -> String {
+fn format_simbench_ml_rank(negated: &[bool], ranks: &[Option<usize>]) -> String {
     if ranks.is_empty() {
         return ".".to_string();
     }
-    let joiner = simbench_logic_symbol(logic);
+    let joiner = "&";
     ranks
         .iter()
         .enumerate()
         .map(|(idx, rank)| match rank {
-            Some(v) if simbench_logic_member_negated(logic, idx) => format!("!{v}"),
+            Some(v) if negated.get(idx).copied().unwrap_or(false) => format!("!{v}"),
             Some(v) => v.to_string(),
             None => ".".to_string(),
         })
@@ -4191,8 +4300,110 @@ fn format_simbench_ml_rank(logic: SimBenchLogic, ranks: &[Option<usize>]) -> Str
         .join(joiner)
 }
 
+fn match_simbench_ml_context<'a>(
+    term: &SimBenchTerm,
+    site_row_candidates: &[Vec<usize>],
+    contexts: &'a [GarfieldUnitMlContext],
+) -> Option<&'a GarfieldUnitMlContext> {
+    let unit_name = term.unit_name.trim();
+    if !unit_name.is_empty() {
+        if let Some(ctx) = contexts.iter().find(|ctx| ctx.unit_name == unit_name) {
+            return Some(ctx);
+        }
+    }
+    let mut best = None::<(usize, usize, usize, &'a GarfieldUnitMlContext)>;
+    for ctx in contexts.iter() {
+        let selected_hits = site_row_candidates
+            .iter()
+            .filter(|cands| cands.iter().any(|idx| ctx.selected_global_rows.contains(idx)))
+            .count();
+        let ranked_hits = site_row_candidates
+            .iter()
+            .filter(|cands| cands.iter().any(|idx| ctx.ranked_global_rows.contains(idx)))
+            .count();
+        if selected_hits == 0 && ranked_hits == 0 {
+            continue;
+        }
+        let candidate = (
+            selected_hits,
+            ranked_hits,
+            usize::MAX - ctx.selected_global_rows.len(),
+            ctx,
+        );
+        if best
+            .as_ref()
+            .map(|prev| candidate.0 > prev.0 || (candidate.0 == prev.0 && (candidate.1, candidate.2) > (prev.1, prev.2)))
+            .unwrap_or(true)
+        {
+            best = Some(candidate);
+        }
+    }
+    best.map(|(_, _, _, ctx)| ctx)
+}
+
+fn build_simbench_delta_score_annotation<S: GarfieldDisplaySite>(
+    negated: &[bool],
+    child_score: f64,
+    sites: &[S],
+    y_test: &[f64],
+    bits_test: &[u64],
+    bits_test_hi: Option<&[u64]>,
+    row_words_test: usize,
+    n_rows: usize,
+    n_test: usize,
+    params: &BeamSearchParams,
+    output_null_penalties: Option<&RuleNullPenaltyLookup>,
+) -> Result<String, String> {
+    let mut out = String::new();
+    for idx in 0..sites.len() {
+        if idx > 0 {
+            out.push('&');
+        }
+        let singleton = singleton_rule_from_literal(BeamLiteral {
+            row_index: idx,
+            group_id: idx,
+            negated: negated.get(idx).copied().unwrap_or(false),
+        });
+        let test_sc = if let Some(bits_test_hi_use) = bits_test_hi {
+            evaluate_rule_continuous_dual(
+                &singleton,
+                y_test,
+                bits_test,
+                bits_test_hi_use,
+                row_words_test,
+                n_rows,
+                n_test,
+                params.lambda_len,
+                params.lambda_not,
+            )?
+        } else {
+            evaluate_rule_continuous(
+                &singleton,
+                y_test,
+                bits_test,
+                row_words_test,
+                n_rows,
+                n_test,
+                params.lambda_len,
+                params.lambda_not,
+            )?
+        };
+        let bucket = bucket_from_rule_with_complexity(
+            &singleton,
+            test_sc.dosage_maf,
+            params.null_complexity_bin,
+        );
+        let single_score =
+            final_output_score_with_bucket(bucket, test_sc.raw_score, output_null_penalties, false);
+        out.push_str(&literal_metric_token(single_score));
+    }
+    out.push_str("->");
+    out.push_str(&format_delta_metric_value(child_score));
+    Ok(out)
+}
+
 fn resolve_simbench_ml_rank(
-    logic: SimBenchLogic,
+    negated: &[bool],
     site_row_candidates: &[Vec<usize>],
     contexts: &[GarfieldUnitMlContext],
 ) -> (String, usize) {
@@ -4226,7 +4437,7 @@ fn resolve_simbench_ml_rank(
                 .copied()
                 .max()
                 .unwrap_or(usize::MAX);
-            let ml_rank = format_simbench_ml_rank(logic, selected_ranks.as_slice());
+            let ml_rank = format_simbench_ml_rank(negated, selected_ranks.as_slice());
             let candidate = (
                 usize::MAX - selected_matched,
                 max_rank,
@@ -4270,7 +4481,7 @@ fn resolve_simbench_ml_rank(
             .copied()
             .max()
             .unwrap_or(usize::MAX);
-        let ml_rank = format_simbench_ml_rank(logic, ranked_ranks.as_slice());
+        let ml_rank = format_simbench_ml_rank(negated, ranked_ranks.as_slice());
         let candidate = (
             usize::MAX - ranked_matched,
             max_rank,
@@ -4292,18 +4503,14 @@ fn resolve_simbench_ml_rank(
     } else if let Some((_, _, _, _, ml_rank, ml_feature_count)) = best_ranked {
         (ml_rank, ml_feature_count)
     } else {
-        (
-            format_simbench_ml_rank(logic, &vec![None; site_row_candidates.len()]),
-            0,
-        )
+        (format_simbench_ml_rank(negated, &vec![None; site_row_candidates.len()]), 0)
     }
 }
 
 fn evaluate_simbench_terms(
-    prefix: &str,
     terms: &[SimBenchTerm],
+    logic_bits: &GarfieldLogicBits,
     logic_site_lookup: &HashMap<(String, i32), Vec<usize>>,
-    selected_sample_indices: &[usize],
     train_idx_local: &[usize],
     assoc_sample_indices: &[usize],
     y_train: &[f64],
@@ -4315,147 +4522,170 @@ fn evaluate_simbench_terms(
     if terms.is_empty() {
         return Ok(Vec::new());
     }
-    let bed = BedSnpIter::new_with_fill(prefix, 0.0, 1.0, false, false, 1.0)?;
-    let mut site_lookup = HashMap::<(String, i32), usize>::with_capacity(bed.sites.len());
-    for (idx, site) in bed.sites.iter().enumerate() {
-        site_lookup
-            .entry((normalize_chrom(&site.chrom), site.pos))
-            .or_insert(idx);
-    }
-
-    let n_selected = selected_sample_indices.len();
-    let row_words_full = words_for_samples(n_selected);
     let mut out = Vec::<GarfieldLogicRuleRecord>::with_capacity(terms.len());
     for term in terms.iter() {
-        let mut member_ge1_full = Vec::<u64>::with_capacity(term.sites.len() * row_words_full);
-        let mut member_ge2_full = Vec::<u64>::with_capacity(term.sites.len() * row_words_full);
-        let mut bench_sites = Vec::<SiteInfo>::with_capacity(term.sites.len());
-        let mut selected_row_indices = Vec::<usize>::with_capacity(term.sites.len());
         let mut logic_row_candidates = Vec::<Vec<usize>>::with_capacity(term.sites.len());
         for (chrom, pos) in term.sites.iter() {
             let key = (normalize_chrom(chrom), *pos);
-            let src_idx = *site_lookup.get(&key).ok_or_else(|| {
+            let row_candidates = logic_site_lookup.get(&key).cloned().ok_or_else(|| {
                 format!(
-                    "simbench term {} site not found in BED/BIM: {}:{}",
+                    "simbench term {} site not found in logic feature rows: {}:{}",
                     term.term_id, chrom, pos
                 )
             })?;
-            let (mut row, mut site) = bed
-                .get_snp_row_selected_raw(src_idx, selected_sample_indices)
-                .ok_or_else(|| {
-                    format!(
-                        "simbench term {} failed to decode site {}:{} from BED",
-                        term.term_id, chrom, pos
-                    )
-                })?;
-            normalize_simbench_raw_row(&mut row, &mut site).map_err(|e| {
-                format!(
-                    "simbench term {} failed to normalize site {}:{} from BED: {e}",
-                    term.term_id, chrom, pos
-                )
-            })?;
-            let (row_ge1, row_ge2) =
-                pack_simbench_raw_row_dual_words(row.as_slice()).map_err(|e| {
-                    format!(
-                        "simbench term {} failed to pack site {}:{} into dual bits: {e}",
-                        term.term_id, chrom, pos
-                    )
-                })?;
-            member_ge1_full.extend(row_ge1);
-            member_ge2_full.extend(row_ge2);
-            let row_candidates = logic_site_lookup.get(&key).cloned().unwrap_or_default();
-            bench_sites.push(site);
-            selected_row_indices.push(src_idx);
             logic_row_candidates.push(row_candidates);
         }
-        let rule = simbench_rule_from_site_count(term.logic, bench_sites.len()).map_err(|e| {
+        let matched_ctx = match_simbench_ml_context(term, logic_row_candidates.as_slice(), ml_contexts);
+        let selected_row_indices = logic_row_candidates
+            .iter()
+            .map(|cands| {
+                if let Some(ctx) = matched_ctx {
+                    if let Some(&idx) = cands
+                        .iter()
+                        .find(|idx| ctx.selected_global_rows.contains(idx))
+                    {
+                        return Ok(idx);
+                    }
+                    if let Some(&idx) = cands.iter().find(|idx| ctx.ranked_global_rows.contains(idx))
+                    {
+                        return Ok(idx);
+                    }
+                }
+                cands.first().copied().ok_or_else(|| {
+                    format!("simbench term {} has an empty candidate row set", term.term_id)
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let bench_sites = selected_row_indices
+            .iter()
+            .map(|&idx| {
+                logic_bits
+                    .sites
+                    .get(idx)
+                    .cloned()
+                    .ok_or_else(|| format!("simbench term {} logic row out of range: {}", term.term_id, idx))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let effective_negated = simbench_effective_negations(term, bench_sites.as_slice());
+        let rule = simbench_rule_from_negations(term.logic, effective_negated.as_slice()).map_err(|e| {
             format!(
                 "simbench term {} ('{}' {} {}) failed to build rule: {e}",
                 term.term_id, term.kind, term.logic_text, term.sites_text
             )
         })?;
         let n_rule_rows = bench_sites.len();
-        let (train_ge1, row_words_train) = packed_rows_subset_from_full_bits_range(
-            member_ge1_full.as_slice(),
-            row_words_full,
-            0,
-            n_rule_rows,
+        let (train_ge1, row_words_train) = packed_rows_subset_from_full_bits(
+            logic_bits.bits_flat.as_slice(),
+            logic_bits.row_words,
+            selected_row_indices.as_slice(),
             train_idx_local,
-            n_rule_rows,
-            n_selected,
+            logic_bits.sites.len(),
+            logic_bits.n_samples,
         )?;
-        let (train_ge2, row_words_train_hi) = packed_rows_subset_from_full_bits_range(
-            member_ge2_full.as_slice(),
-            row_words_full,
-            0,
-            n_rule_rows,
-            train_idx_local,
-            n_rule_rows,
-            n_selected,
-        )?;
-        if row_words_train != row_words_train_hi {
-            return Err("simbench train dual row-word mismatch".to_string());
-        }
-        let (assoc_ge1, row_words_assoc) = packed_rows_subset_from_full_bits_range(
-            member_ge1_full.as_slice(),
-            row_words_full,
-            0,
-            n_rule_rows,
+        let train_ge2 = if let Some(bits_hi_flat) = logic_bits.bits_hi_flat.as_ref() {
+            let (bits_hi, row_words_train_hi) = packed_rows_subset_from_full_bits(
+                bits_hi_flat.as_slice(),
+                logic_bits.row_words,
+                selected_row_indices.as_slice(),
+                train_idx_local,
+                logic_bits.sites.len(),
+                logic_bits.n_samples,
+            )?;
+            if row_words_train != row_words_train_hi {
+                return Err("simbench train dual row-word mismatch".to_string());
+            }
+            Some(bits_hi)
+        } else {
+            None
+        };
+        let (assoc_ge1, row_words_assoc) = packed_rows_subset_from_full_bits(
+            logic_bits.bits_flat.as_slice(),
+            logic_bits.row_words,
+            selected_row_indices.as_slice(),
             assoc_sample_indices,
-            n_rule_rows,
-            n_selected,
+            logic_bits.sites.len(),
+            logic_bits.n_samples,
         )?;
-        let (assoc_ge2, row_words_assoc_hi) = packed_rows_subset_from_full_bits_range(
-            member_ge2_full.as_slice(),
-            row_words_full,
-            0,
-            n_rule_rows,
-            assoc_sample_indices,
-            n_rule_rows,
-            n_selected,
-        )?;
-        if row_words_assoc != row_words_assoc_hi {
-            return Err("simbench assoc dual row-word mismatch".to_string());
+        let assoc_ge2 = if let Some(bits_hi_flat) = logic_bits.bits_hi_flat.as_ref() {
+            let (bits_hi, row_words_assoc_hi) = packed_rows_subset_from_full_bits(
+                bits_hi_flat.as_slice(),
+                logic_bits.row_words,
+                selected_row_indices.as_slice(),
+                assoc_sample_indices,
+                logic_bits.sites.len(),
+                logic_bits.n_samples,
+            )?;
+            if row_words_assoc != row_words_assoc_hi {
+                return Err("simbench assoc dual row-word mismatch".to_string());
+            }
+            Some(bits_hi)
+        } else {
+            None
+        };
+        let context_beam_params = matched_ctx
+            .map(|ctx| {
+                beam_params_for_simbench_context(
+                    ctx.selected_global_rows.len(),
+                    ctx.null_unit_group_bin,
+                    beam_params.clone(),
+                )
+            })
+            .unwrap_or_else(|| beam_params.clone());
+        let _train_sc = if let Some(train_ge2_use) = train_ge2.as_ref() {
+            evaluate_rule_continuous_dual(
+                &rule,
+                y_train,
+                train_ge1.as_slice(),
+                train_ge2_use.as_slice(),
+                row_words_train,
+                n_rule_rows,
+                train_idx_local.len(),
+                context_beam_params.lambda_len,
+                context_beam_params.lambda_not,
+            )
+        } else {
+            evaluate_rule_continuous(
+                &rule,
+                y_train,
+                train_ge1.as_slice(),
+                row_words_train,
+                n_rule_rows,
+                train_idx_local.len(),
+                context_beam_params.lambda_len,
+                context_beam_params.lambda_not,
+            )
         }
-        let _train_sc = evaluate_rule_continuous_dual(
-            &rule,
-            y_train,
-            train_ge1.as_slice(),
-            train_ge2.as_slice(),
-            row_words_train,
-            n_rule_rows,
-            train_idx_local.len(),
-            beam_params.lambda_len,
-            beam_params.lambda_not,
-        )
-        .map_err(|e| {
-            format!(
-                "simbench term {} failed to score train rule: {e}",
-                term.term_id
+        .map_err(|e| format!("simbench term {} failed to score train rule: {e}", term.term_id))?;
+        let assoc_sc = if let Some(assoc_ge2_use) = assoc_ge2.as_ref() {
+            evaluate_rule_continuous_dual(
+                &rule,
+                y_assoc,
+                assoc_ge1.as_slice(),
+                assoc_ge2_use.as_slice(),
+                row_words_assoc,
+                n_rule_rows,
+                assoc_sample_indices.len(),
+                context_beam_params.lambda_len,
+                context_beam_params.lambda_not,
             )
-        })?;
-        let assoc_sc = evaluate_rule_continuous_dual(
-            &rule,
-            y_assoc,
-            assoc_ge1.as_slice(),
-            assoc_ge2.as_slice(),
-            row_words_assoc,
-            n_rule_rows,
-            assoc_sample_indices.len(),
-            beam_params.lambda_len,
-            beam_params.lambda_not,
-        )
-        .map_err(|e| {
-            format!(
-                "simbench term {} failed to score assoc rule: {e}",
-                term.term_id
+        } else {
+            evaluate_rule_continuous(
+                &rule,
+                y_assoc,
+                assoc_ge1.as_slice(),
+                row_words_assoc,
+                n_rule_rows,
+                assoc_sample_indices.len(),
+                context_beam_params.lambda_len,
+                context_beam_params.lambda_not,
             )
-        })?;
-        let sim_expr_txt = simbench_rule_expr(term.logic, bench_sites.as_slice())?;
+        }
+        .map_err(|e| format!("simbench term {} failed to score assoc rule: {e}", term.term_id))?;
+        let sim_expr_txt = simbench_rule_expr(effective_negated.as_slice(), bench_sites.as_slice())?;
         let test_bucket = bucket_from_rule_with_complexity(
             &rule,
             assoc_sc.dosage_maf,
-            beam_params.null_complexity_bin,
+            context_beam_params.null_complexity_bin,
         );
         let test_score = final_output_score_with_bucket(
             test_bucket,
@@ -4463,60 +4693,93 @@ fn evaluate_simbench_terms(
             output_null_penalties.as_deref(),
             false,
         );
-        let (full_ge1, full_ge2) = materialize_rule_bits_dual(
-            &rule,
-            member_ge1_full.as_slice(),
-            member_ge2_full.as_slice(),
-            row_words_full,
-            n_rule_rows,
-            n_selected,
-        )
-        .map_err(|e| {
-            format!(
-                "simbench term {} failed to materialize full support bits: {e}",
-                term.term_id
+        let support_bits = if let Some(bits_hi_flat) = logic_bits.bits_hi_flat.as_ref() {
+            let (full_ge1, full_ge2) = materialize_rule_bits_dual(
+                &rule,
+                logic_bits.bits_flat.as_slice(),
+                bits_hi_flat.as_slice(),
+                logic_bits.row_words,
+                n_rule_rows,
+                logic_bits.n_samples,
             )
-        })?;
+            .map_err(|e| {
+                format!(
+                    "simbench term {} failed to materialize full support bits: {e}",
+                    term.term_id
+                )
+            })?;
+            GarfieldRuleSupportBits::Dual {
+                ge1: full_ge1.into_boxed_slice(),
+                ge2: full_ge2.into_boxed_slice(),
+            }
+        } else {
+            let full_bits = materialize_rule_bits(
+                &rule,
+                logic_bits.bits_flat.as_slice(),
+                logic_bits.row_words,
+                n_rule_rows,
+                logic_bits.n_samples,
+            )
+            .map_err(|e| {
+                format!(
+                    "simbench term {} failed to materialize full support bits: {e}",
+                    term.term_id
+                )
+            })?;
+            GarfieldRuleSupportBits::Binary(full_bits.into_boxed_slice())
+        };
         let first_site = bench_sites
             .first()
             .ok_or_else(|| format!("simbench term {} has no sites", term.term_id))?;
         let (ml_rank, ml_feature_count) =
-            resolve_simbench_ml_rank(term.logic, logic_row_candidates.as_slice(), ml_contexts);
+            resolve_simbench_ml_rank(effective_negated.as_slice(), logic_row_candidates.as_slice(), ml_contexts);
         let (bim_allele0, bim_allele1) =
-            simbench_rule_bim_alleles(term.logic, bench_sites.as_slice());
+            simbench_rule_bim_alleles(effective_negated.as_slice(), bench_sites.as_slice());
+        let unit_name = simbench_term_unit_name(term, bench_sites.as_slice());
+        let snp_name = simbench_term_rule_name(term, effective_negated.as_slice(), bench_sites.as_slice());
+        let bim_snp_name = simbench_term_bim_name(term, effective_negated.as_slice(), bench_sites.as_slice());
+        let delta_score = build_simbench_delta_score_annotation(
+            effective_negated.as_slice(),
+            test_score,
+            bench_sites.as_slice(),
+            y_assoc,
+            assoc_ge1.as_slice(),
+            assoc_ge2.as_deref(),
+            row_words_assoc,
+            n_rule_rows,
+            assoc_sample_indices.len(),
+            &context_beam_params,
+            output_null_penalties.as_deref(),
+        )
+        .map_err(|e| {
+            format!(
+                "simbench term {} failed to build delta-score annotation: {e}",
+                term.term_id
+            )
+        })?;
         out.push(GarfieldLogicRuleRecord {
-            unit_name: simbench_rule_name(term.logic, bench_sites.as_slice(), &term.label),
+            unit_name,
             unit_kind: "simbench".to_string(),
             unit_index: term.term_id,
             region_size: bench_sites.len(),
             ml_feature_count,
             ml_rank,
             selected_row_indices,
-            display_ops: simbench_logic_to_beam_op(term.logic)
-                .map(|op| vec![op; bench_sites.len().saturating_sub(1)])
-                .unwrap_or_default(),
-            display_negated: (0..bench_sites.len())
-                .map(|idx| simbench_logic_member_negated(term.logic, idx))
-                .collect(),
-            snp_name: simbench_rule_name(term.logic, bench_sites.as_slice(), &term.label),
+            display_ops: vec![BeamBinaryOp::And; bench_sites.len().saturating_sub(1)],
+            display_negated: effective_negated,
+            snp_name,
             expr: sim_expr_txt,
-            chrom_field: first_site.chrom.clone(),
-            bim_snp_name: simbench_rule_bim_name(term.logic, bench_sites.as_slice(), &term.label),
+            chrom_field: first_site.chrom.as_ref().to_string(),
+            bim_snp_name,
             bim_allele0,
             bim_allele1,
+            allele1_maf: assoc_sc.dosage_maf,
             pos: first_site.pos,
             score: test_score,
-            delta_score: format!(
-                "{}->{}",
-                format_delta_metric_value(test_score),
-                format_delta_metric_value(test_score)
-            ),
+            delta_score,
             perm_pvalue: None,
             perm_fdr: None,
-            support_bits: Some(GarfieldRuleSupportBits::Dual {
-                ge1: full_ge1.into_boxed_slice(),
-                ge2: full_ge2.into_boxed_slice(),
-            }),
+            support_bits: Some(support_bits),
         });
     }
     Ok(out)
@@ -4790,15 +5053,6 @@ fn literal_expr<S: GarfieldDisplaySite>(site: &S, negated: bool) -> String {
     }
 }
 
-fn literal_name<S: GarfieldChromPosSite>(site: &S, negated: bool) -> String {
-    let base = site_base_label(site);
-    if negated {
-        format!("!{base}")
-    } else {
-        base
-    }
-}
-
 #[inline]
 fn literal_target_allele<S: GarfieldDisplaySite>(site: &S, negated: bool) -> String {
     literal_bim_alleles(site, negated).1
@@ -4809,25 +5063,7 @@ fn literal_target_name<S: GarfieldChromPosSite + GarfieldDisplaySite>(
     site: &S,
     negated: bool,
 ) -> String {
-    format!(
-        "{}({})",
-        site_coord_label(site),
-        literal_target_allele(site, negated)
-    )
-}
-
-#[inline]
-fn simbench_logic_symbol_compact(logic: SimBenchLogic) -> &'static str {
-    match simbench_logic_join_op(logic) {
-        None => "",
-        Some(BeamBinaryOp::And) => "&",
-        Some(BeamBinaryOp::Or) => "|",
-    }
-}
-
-#[inline]
-fn simbench_logic_to_beam_op(logic: SimBenchLogic) -> Option<BeamBinaryOp> {
-    simbench_logic_join_op(logic)
+    format!("{}[{}]", site_coord_label(site), literal_target_allele(site, negated))
 }
 
 #[inline]
@@ -8078,6 +8314,7 @@ fn evaluate_logic_unit_prepared_continuous(
     top_rules_per_unit: usize,
     unit_kind_lc: &str,
     literal_scores: Option<&[LiteralSingletonScore]>,
+    debug_probe: Option<&GarfieldBeamDebugProbe>,
 ) -> Result<GarfieldUnitEvaluationOutput, String> {
     let beam_params_search = beam_params_for_prepared(prepared, beam_params.clone());
     let beam_hits = if prepared_bits.has_fuzzy_bin() {
@@ -8162,6 +8399,18 @@ fn evaluate_logic_unit_prepared_continuous(
         logic_bits,
         unit_kind_lc,
     )?;
+    maybe_write_beam_debug_probe_tsv(
+        debug_probe,
+        unit,
+        prepared,
+        beam_hits.as_slice(),
+        local_sites.as_slice(),
+        selected_bits_full,
+        selected_bits_full_hi,
+        logic_bits,
+        output_null_penalties.as_deref(),
+        null_complexity_bin,
+    )?;
     let keep_rules = if top_rules_per_unit == 0 {
         ranked_hits.len()
     } else {
@@ -8216,6 +8465,7 @@ fn evaluate_logic_unit_prepared_continuous(
             bim_snp_name: rendered.bim_snp_name,
             bim_allele0: rendered.bim_allele0,
             bim_allele1: rendered.bim_allele1,
+            allele1_maf: cand.test.dosage_maf,
             pos: rendered.pos,
             score: *output_score,
             delta_score,
@@ -8321,6 +8571,7 @@ fn evaluate_logic_unit_continuous(
         top_rules_per_unit,
         unit_kind_lc,
         None,
+        None,
     )?
     .records)
 }
@@ -8351,6 +8602,7 @@ fn process_scan_unit_continuous(
     scanned_units: usize,
     skipped_units: &Arc<Mutex<Vec<GarfieldSkippedUnitInfo>>>,
     mem_tracker: Option<&GarfieldStageMemoryTracker>,
+    debug_probe: Option<&GarfieldBeamDebugProbe>,
 ) -> Result<GarfieldUnitEvaluationOutput, String> {
     check_ctrlc()?;
     let unit = &units[ui];
@@ -8405,6 +8657,7 @@ fn process_scan_unit_continuous(
             top_rules_per_unit,
             unit_kind_lc,
             literal_scores.as_ref().map(|v| v.as_slice()),
+            debug_probe,
         ) {
             Ok(v) => v,
             Err(err) if is_no_valid_initial_literals_error(&err) => {
@@ -9107,13 +9360,13 @@ fn write_logic_rules_tsv(path: &str, records: &[GarfieldLogicRuleRecord]) -> Res
     if has_perm_sig {
         writeln!(
             w,
-            "unit_name\tregion_size\tml_feature_count\tMLrank\tsnp_name\tscore\tdelta_score\tperm_pvalue\tperm_fdr"
+            "unit_name\tregion_size\tml_feature_count\tMLrank\tsnp_name\tallele1_maf\tscore\tdelta_score\tperm_pvalue\tperm_fdr"
         )
         .map_err(|e| e.to_string())?;
     } else {
         writeln!(
             w,
-            "unit_name\tregion_size\tml_feature_count\tMLrank\tsnp_name\tscore\tdelta_score"
+            "unit_name\tregion_size\tml_feature_count\tMLrank\tsnp_name\tallele1_maf\tscore\tdelta_score"
         )
         .map_err(|e| e.to_string())?;
     }
@@ -9121,12 +9374,13 @@ fn write_logic_rules_tsv(path: &str, records: &[GarfieldLogicRuleRecord]) -> Res
         if has_perm_sig {
             writeln!(
                 w,
-                "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{}\t{}\t{}",
                 rec.unit_name,
                 rec.region_size,
                 rec.ml_feature_count,
                 rec.ml_rank,
                 rec.snp_name,
+                rec.allele1_maf,
                 rec.score,
                 rec.delta_score,
                 format_optional_sci4(rec.perm_pvalue),
@@ -9136,12 +9390,13 @@ fn write_logic_rules_tsv(path: &str, records: &[GarfieldLogicRuleRecord]) -> Res
         } else {
             writeln!(
                 w,
-                "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}",
+                "{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{}",
                 rec.unit_name,
                 rec.region_size,
                 rec.ml_feature_count,
                 rec.ml_rank,
                 rec.snp_name,
+                rec.allele1_maf,
                 rec.score,
                 rec.delta_score,
             )
@@ -9151,6 +9406,7 @@ fn write_logic_rules_tsv(path: &str, records: &[GarfieldLogicRuleRecord]) -> Res
     w.flush().map_err(|e| e.to_string())
 }
 
+#[allow(dead_code)]
 fn write_logic_rule_compare_tsv(
     path: &str,
     records: &[GarfieldUnitRuleCompareRecord],
@@ -9359,6 +9615,7 @@ fn garfield_logic_search_bed_owned(
     no_clean: bool,
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
+    debug_probe: Option<GarfieldBeamDebugProbe>,
 ) -> Result<GarfieldLogicPipelineResult, String> {
     let total_wall_t0 = Instant::now();
     let rss_debug_enabled = garfield_rss_debug_enabled();
@@ -10611,6 +10868,7 @@ fn garfield_logic_search_bed_owned(
                         scanned_units,
                         &skipped_units_parallel,
                         Some(&scan_mem_tracker),
+                        debug_probe.as_ref(),
                     )
                 })
                 .collect::<Vec<Result<GarfieldUnitEvaluationOutput, String>>>()
@@ -10645,6 +10903,7 @@ fn garfield_logic_search_bed_owned(
                 scanned_units,
                 &skipped_units,
                 Some(&scan_mem_tracker),
+                debug_probe.as_ref(),
             );
             out.push(chunk_out);
         }
@@ -10703,14 +10962,15 @@ fn garfield_logic_search_bed_owned(
             tree_cfg,
             &logic_bits,
             train_idx_local.as_slice(),
+            test_idx_local.as_slice(),
             train_fit.residualized_y.as_slice(),
+            scan_beam_params.clone(),
             unit_parallel_threads <= 1,
         )?;
         let simbench_records = evaluate_simbench_terms(
-            &prefix,
             simbench_terms.as_slice(),
+            &logic_bits,
             &logic_site_lookup,
-            selected_sample_indices.as_slice(),
             train_idx_local.as_slice(),
             assoc_sample_indices,
             train_fit.residualized_y.as_slice(),
@@ -10747,8 +11007,9 @@ fn garfield_logic_search_bed_owned(
     let structure_prior_for_output = rule_structure_prior.clone();
     let mut pseudo_prefix_out = None;
     let mut rules_tsv_out = None;
-    let mut rules_compare_tsv_out = None;
+    let rules_compare_tsv_out = None;
     let mut posterior_json_out = None;
+    drop(compare_records);
     if let Some(prefix_out) = out_prefix.as_ref() {
         write_logic_pseudo_plink(
             prefix_out,
@@ -10759,7 +11020,7 @@ fn garfield_logic_search_bed_owned(
         let rules_tsv = format!("{prefix_out}.rules.tsv");
         write_logic_rules_tsv(&rules_tsv, records.as_slice())?;
         let rules_compare_tsv = format!("{prefix_out}.rules.compare.tsv");
-        write_logic_rule_compare_tsv(&rules_compare_tsv, compare_records.as_slice())?;
+        let _ = std::fs::remove_file(&rules_compare_tsv);
         if let Some(prior) = structure_prior_for_output.as_deref() {
             let posterior_json = format!("{prefix_out}.posterior.json");
             write_rule_structure_prior_json(&posterior_json, prior)?;
@@ -10767,7 +11028,6 @@ fn garfield_logic_search_bed_owned(
         }
         pseudo_prefix_out = Some(prefix_out.clone());
         rules_tsv_out = Some(rules_tsv);
-        rules_compare_tsv_out = Some(rules_compare_tsv);
     }
 
     Ok(GarfieldLogicPipelineResult {
@@ -10851,6 +11111,166 @@ fn garfield_logic_search_bed_owned(
         train_fit,
         test_fit,
     })
+}
+
+fn read_single_trait_pheno_aligned(pheno_path: &str, ordered_iids: &[String]) -> Result<Vec<f64>, String> {
+    let file = File::open(pheno_path).map_err(|e| format!("open phenotype failed: {e}"))?;
+    let mut lines = BufReader::new(file).lines();
+    let header = lines
+        .next()
+        .ok_or_else(|| "phenotype file is empty".to_string())?
+        .map_err(|e| format!("read phenotype header failed: {e}"))?;
+    let cols = header.split_whitespace().collect::<Vec<_>>();
+    if cols.len() < 2 {
+        return Err("phenotype file must contain at least IID and one trait column".to_string());
+    }
+    let iid_idx = cols
+        .iter()
+        .position(|c| c.eq_ignore_ascii_case("IID"))
+        .unwrap_or(0usize);
+    let trait_idx = (0..cols.len())
+        .find(|&idx| idx != iid_idx)
+        .ok_or_else(|| "phenotype file has no trait column".to_string())?;
+    let mut by_iid = HashMap::<String, f64>::with_capacity(ordered_iids.len());
+    for (line_no, line_res) in lines.enumerate() {
+        let line = line_res.map_err(|e| format!("read phenotype line failed: {e}"))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let fields = trimmed.split_whitespace().collect::<Vec<_>>();
+        let need = iid_idx.max(trait_idx);
+        if fields.len() <= need {
+            return Err(format!(
+                "{pheno_path}:{}: expected at least {} columns, got {}",
+                line_no + 2,
+                need + 1,
+                fields.len()
+            ));
+        }
+        let iid = fields[iid_idx].to_string();
+        let value = fields[trait_idx].parse::<f64>().map_err(|e| {
+            format!(
+                "{pheno_path}:{}: invalid phenotype value '{}': {e}",
+                line_no + 2,
+                fields[trait_idx]
+            )
+        })?;
+        if !value.is_finite() {
+            return Err(format!(
+                "{pheno_path}:{}: phenotype value for IID '{}' is not finite",
+                line_no + 2,
+                iid
+            ));
+        }
+        by_iid.insert(iid, value);
+    }
+    ordered_iids
+        .iter()
+        .map(|iid| {
+            by_iid
+                .get(iid)
+                .copied()
+                .ok_or_else(|| format!("phenotype missing IID '{iid}' from FAM order"))
+        })
+        .collect()
+}
+
+pub fn garfield_debug_probe_single_group_from_files(
+    prefix: String,
+    pheno_path: String,
+    grm_path: String,
+    unit_name: String,
+    chrom: String,
+    bp_start: i32,
+    bp_end: i32,
+    out_tsv: String,
+    logic_maf_threshold: f32,
+    threads: usize,
+) -> Result<String, String> {
+    let prefix_norm = normalize_plink_prefix(&prefix);
+    let fam_iids = read_fam(prefix_norm.as_str())?;
+    let y = read_single_trait_pheno_aligned(&pheno_path, fam_iids.as_slice())?;
+    let (grm_vec, grm_n) = load_square_matrix_f64_from_file(&grm_path, 0.0)?;
+    if grm_n != fam_iids.len() {
+        return Err(format!(
+            "GRM dimension mismatch: grm_n={}, fam_n={}",
+            grm_n,
+            fam_iids.len()
+        ));
+    }
+    let probe = GarfieldBeamDebugProbe {
+        unit_name: unit_name.clone(),
+        out_tsv: out_tsv.clone(),
+    };
+    let _ = garfield_logic_search_bed_owned(
+        prefix_norm,
+        y,
+        Some(grm_vec),
+        None,
+        0usize,
+        None,
+        None,
+        None,
+        "geneset".to_string(),
+        Some(vec![vec![(chrom, bp_start, bp_end)]]),
+        None,
+        Some(vec![unit_name]),
+        0usize,
+        None,
+        None,
+        "bin".to_string(),
+        "corr".to_string(),
+        "imp".to_string(),
+        100usize,
+        0.0,
+        20usize,
+        "auto".to_string(),
+        0.99,
+        false,
+        ExtraTreesConfig {
+            n_estimators: 100,
+            max_depth: 5,
+            min_samples_leaf: 1,
+            min_samples_split: 2,
+            bootstrap: true,
+            feature_subsample: 0.0,
+            seed: 42,
+            allow_parallel: true,
+        },
+        0usize,
+        42u64,
+        4usize,
+        2usize,
+        100usize,
+        "gain_from_layer:2".to_string(),
+        logic_maf_threshold,
+        logic_maf_threshold,
+        0.05,
+        1.0,
+        false,
+        65_536usize,
+        threads,
+        -5.0,
+        5.0,
+        50usize,
+        1e-3,
+        true,
+        15_000usize,
+        false,
+        None,
+        None,
+        100usize,
+        0usize,
+        0.0,
+        true,
+        None,
+        false,
+        None,
+        0usize,
+        Some(probe),
+    )?;
+    Ok(out_tsv)
 }
 
 #[pyfunction(name = "garfield_logic_search_bed")]
@@ -11080,12 +11500,13 @@ pub fn garfield_logic_search_bed_py<'py>(
                 top_rules_per_unit,
                 max_output_rules,
                 max_output_ratio,
-                rule_permutation,
-                prior_len,
-                no_clean,
-                progress_callback,
-                progress_every,
-            )
+            rule_permutation,
+            prior_len,
+            no_clean,
+            progress_callback,
+            progress_every,
+            None,
+        )
         })
         .map_err(map_err_string_to_py)?;
 
@@ -12756,8 +13177,8 @@ mod tests {
         let (a0, a1) = rule_bim_alleles_with_polarity(&rule, sites.as_slice(), polarity).unwrap();
 
         assert_eq!(expr, "NOT BIN(1_100) AND NOT BIN(1_200)");
-        assert_eq!(snp_name, "1_100(A)&1_200(A)");
-        assert_eq!(bim_name, "1_100(A)&1_200(A)");
+        assert_eq!(snp_name, "!1_100[A>G]&!1_200[A>G]");
+        assert_eq!(bim_name, "!1_100[A>G]&!1_200[A>G]");
         assert_eq!(ml_rank, "!1&!2");
         assert_eq!(a0, "G,G");
         assert_eq!(a1, "A,A");
@@ -12788,8 +13209,8 @@ mod tests {
         let ml_rank = rule_ml_rank_name_with_polarity(&rule, polarity);
 
         assert_eq!(expr, "BIN(1_100) OR BIN(1_200)");
-        assert_eq!(snp_name, "1_100(G)|1_200(G)");
-        assert_eq!(bim_name, "1_100(G)|1_200(G)");
+        assert_eq!(snp_name, "1_100[A>G]|1_200[A>G]");
+        assert_eq!(bim_name, "1_100[A>G]|1_200[A>G]");
         assert_eq!(ml_rank, "1|2");
     }
 
@@ -12825,8 +13246,8 @@ mod tests {
             rule_bim_name_with_polarity(&rule, logic_sites.as_slice(), polarity).unwrap();
 
         assert_eq!(expr, "BIN(rsA) AND BIN(rsB)");
-        assert_eq!(snp_name, "1_100(G)&1_200(G)");
-        assert_eq!(bim_name, "1_100(G)&1_200(G)");
+        assert_eq!(snp_name, "1_100[A>G]&1_200[A>G]");
+        assert_eq!(bim_name, "1_100[A>G]&1_200[A>G]");
     }
 
     #[test]
@@ -12859,7 +13280,7 @@ mod tests {
             rule_snp_name_with_polarity(&rule, logic_sites.as_slice(), polarity).unwrap();
 
         assert_eq!(expr, "BIN(1_100) AND BIN(1_200)");
-        assert_eq!(snp_name, "1_100(G)&1_200(G)");
+        assert_eq!(snp_name, "1_100[A>G]&1_200[A>G]");
     }
 
     #[test]
@@ -12974,7 +13395,7 @@ mod tests {
             bim_allele1: "G,T".to_string(),
             pos: 100,
             score: 10.0,
-            delta_score: "0.1&!0.2->10".to_string(),
+            delta_score: "0.1&0.2->10".to_string(),
             perm_pvalue: None,
             perm_fdr: None,
             support_bits: None,
@@ -13368,8 +13789,10 @@ mod tests {
     fn test_resolve_simbench_ml_rank_preserves_site_order_and_missing_marks() {
         let contexts = vec![GarfieldUnitMlContext {
             unit_index: 7,
+            unit_name: "u7".to_string(),
             selected_global_rows: vec![100, 300, 200],
             ranked_global_rows: vec![100, 300, 200],
+            null_unit_group_bin: 0,
         }];
         let site_row_candidates = vec![vec![300, 301], vec![999], vec![200, 201]];
         let (rank_txt, ml_feature_count) = resolve_simbench_ml_rank(
@@ -13377,7 +13800,7 @@ mod tests {
             site_row_candidates.as_slice(),
             contexts.as_slice(),
         );
-        assert_eq!(rank_txt, "2 & . & 3");
+        assert_eq!(rank_txt, "2&.&3");
         assert_eq!(ml_feature_count, 3);
     }
 
@@ -13385,8 +13808,10 @@ mod tests {
     fn test_resolve_simbench_ml_rank_falls_back_to_full_ranking_when_not_selected() {
         let contexts = vec![GarfieldUnitMlContext {
             unit_index: 9,
+            unit_name: "u9".to_string(),
             selected_global_rows: vec![100, 200],
             ranked_global_rows: vec![400, 300, 200, 100],
+            null_unit_group_bin: 0,
         }];
         let site_row_candidates = vec![vec![300], vec![400]];
         let (rank_txt, ml_feature_count) = resolve_simbench_ml_rank(
@@ -13394,7 +13819,7 @@ mod tests {
             site_row_candidates.as_slice(),
             contexts.as_slice(),
         );
-        assert_eq!(rank_txt, "2 & 1");
+        assert_eq!(rank_txt, "2&1");
         assert_eq!(ml_feature_count, 4);
     }
 
@@ -13413,16 +13838,19 @@ mod tests {
         fs::write(
             &path,
             concat!(
-                "term_id\tkind\tlogic\tsites\tlabel\teffect\n",
-                "1\tlogic_gate\ta\t1:10;1:20\tgate_a\t0.1\n",
-                "2\tlogic_gate\tna\t2:30;2:40\tgate_na\t0.2\n",
-                "3\tlogic_gate\tan\t3:50;3:60\tgate_an\t0.3\n",
-                "4\tlogic_gate\tnan\t4:70;4:80\tgate_nan\t0.4\n",
+                "unit_kind\tunit_name\tkind\tsites\teffect\n",
+                "gene\tgeneA\ta\t1:10;1:20\t0.1\n",
+                "gene\tgeneB\tna\t2:30;2:40\t0.2\n",
+                "gene\tgeneC\tan\t3:50;3:60\t0.3\n",
+                "gene\tgeneD\tnan\t4:70;4:80\t0.4\n",
             ),
         )
         .unwrap();
         let terms = parse_simbench_terms(path.to_str().unwrap()).unwrap();
         assert_eq!(terms.len(), 4);
+        assert_eq!(terms[0].term_id, 1);
+        assert_eq!(terms[0].unit_name, "geneA");
+        assert_eq!(terms[0].label, "");
         assert_eq!(terms[0].logic, SimBenchLogic::And);
         assert_eq!(terms[1].logic, SimBenchLogic::Na);
         assert_eq!(terms[2].logic, SimBenchLogic::An);
@@ -13450,11 +13878,11 @@ mod tests {
         let ranks = vec![Some(2usize), Some(5usize), None];
         assert_eq!(
             format_simbench_ml_rank(SimBenchLogic::Na, &ranks),
-            "!2 | !5 | ."
+            "2&5&."
         );
         assert_eq!(
             format_simbench_ml_rank(SimBenchLogic::An, &ranks),
-            "2 & !5 & ."
+            "2&!5&."
         );
     }
 

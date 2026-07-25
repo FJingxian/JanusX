@@ -978,7 +978,7 @@ fn load_square_matrix_from_text_f64(
     Ok((out, n))
 }
 
-fn load_square_matrix_f64_from_file(
+pub(crate) fn load_square_matrix_f64_from_file(
     path: &str,
     diag_shift: f64,
 ) -> Result<(Vec<f64>, usize), String> {

@@ -34,7 +34,7 @@ mod fvlmm;
 #[path = "stats/fvlmm2.rs"]
 mod fvlmm2;
 #[path = "garfield/mod.rs"]
-pub(crate) mod garfield;
+pub mod garfield;
 #[path = "stats/gblup.rs"]
 pub(crate) mod gblup;
 #[path = "stats/glm.rs"]

@@ -3972,11 +3972,11 @@ fn shorter_subrule_surrogate_limits(
 #[allow(clippy::too_many_arguments)]
 fn collapse_surrogate_candidate(
     state: &BeamState,
-    y_train: &[f64],
-    bits_train: &[u64],
-    row_words_train: usize,
+    _y_train: &[f64],
+    _bits_train: &[u64],
+    _row_words_train: usize,
     n_rows: usize,
-    n_train: usize,
+    _n_train: usize,
     y_test: &[f64],
     bits_test: &[u64],
     row_words_test: usize,
@@ -3984,16 +3984,16 @@ fn collapse_surrogate_candidate(
     literal_scores: &[LiteralSingletonScore],
     params: &BeamSearchParams,
 ) -> Result<BeamRuleCandidate, String> {
-    let mut current_rule = state.rule.clone();
-    let mut current_train = state.train;
-    let mut current_train_score = state.train_score;
+    let current_rule = state.rule.clone();
+    let current_train = state.train;
+    let current_train_score = state.train_score;
     let cache_capacity = current_rule.len().saturating_mul(16).max(16);
     let mut train_raw_cache = RuleRawScoreCache::with_capacity(cache_capacity);
     let mut test_raw_cache = RuleRawScoreCache::with_capacity(cache_capacity);
-    let mut train_bits_cache = RuleBitsCache::with_capacity(cache_capacity);
+    let _train_bits_cache = RuleBitsCache::with_capacity(cache_capacity);
     let mut test_bits_cache = RuleBitsCache::with_capacity(cache_capacity);
     cache_rule_raw_score(&mut train_raw_cache, &current_rule, current_train.raw_score);
-    let mut current_test = evaluate_rule_continuous_cached(
+    let current_test = evaluate_rule_continuous_cached(
         &current_rule,
         y_test,
         bits_test,
@@ -4004,7 +4004,7 @@ fn collapse_surrogate_candidate(
         params.lambda_not,
         &mut test_bits_cache,
     )?;
-    let mut current_test_score = final_rule_score_for_eval_cached(
+    let current_test_score = final_rule_score_for_eval_cached(
         &current_rule,
         &current_test,
         y_test,
@@ -4019,6 +4019,10 @@ fn collapse_surrogate_candidate(
         &mut test_raw_cache,
     )?;
 
+    /*
+    Surrogate collapse is intentionally disabled for both the legacy binary
+    search path and its dedicated tests. Keep the old implementation here for
+    possible future recovery.
     if surrogate_collapse_enabled(params) && current_rule.len() > 1 {
         loop {
             let Some(parent_rule) = rule_parent(&current_rule) else {
@@ -4363,6 +4367,7 @@ fn collapse_surrogate_candidate(
             }
         }
     }
+    */
 
     Ok(BeamRuleCandidate {
         rule: current_rule,
@@ -8023,6 +8028,7 @@ mod tests {
         }));
     }
 
+    /*
     #[test]
     #[ignore]
     fn test_surrogate_or_rule_collapses_back_to_singleton() {
@@ -8608,4 +8614,5 @@ mod tests {
         .unwrap();
         assert_eq!(collapsed.rule.len(), 3);
     }
+    */
 }

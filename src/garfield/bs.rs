@@ -1835,10 +1835,7 @@ fn keep_child_after_parent_gain_pruning(
     child_rank_score: f64,
     params: &BeamSearchParams,
 ) -> bool {
-    if !gain_threshold_applies(child_rule.len(), params) {
-        return true;
-    }
-    score_strictly_improves(child_rank_score, 0.0)
+    keep_state_after_min_gain_pruning(child_rule.len(), child_rank_score, params)
 }
 
 /// A child rule must improve on its parent by at least `min_parent_abs_gain`
@@ -1869,8 +1866,15 @@ fn keep_state_after_min_gain_pruning(
     train_score: f64,
     params: &BeamSearchParams,
 ) -> bool {
-    let _ = (rule_len, train_score, params);
-    true
+    if !gain_threshold_applies(rule_len, params) {
+        return true;
+    }
+    let min_gain = if params.min_gain.is_finite() {
+        params.min_gain.max(0.0)
+    } else {
+        0.0
+    };
+    score_strictly_improves(train_score, min_gain)
 }
 
 #[inline]
@@ -5652,20 +5656,8 @@ fn expand_fuzzy_beam_once(
                         None,
                         params,
                     );
-                    if !keep_child_after_parent_abs_improvement_pruning(
-                        node.train_abs_score,
-                        rule.len(),
-                        train_abs_score,
-                        params,
-                    ) {
-                        continue;
-                    }
-                    if !keep_state_after_min_gain_pruning(rule.len(), train_score, params) {
-                        continue;
-                    }
-                    if !keep_child_after_parent_gain_pruning(&rule, train_score, params) {
-                        continue;
-                    }
+                    // Exhaustive seed depths enumerate all QC-valid children and leave
+                    // gain-based culling to later beam-only layers / final output reranking.
                     let t_clone = beam_detail_profile_start();
                     let mut child_ge1 = node.combined_train_ge1.clone();
                     let mut child_ge2 = node.combined_train_ge2.clone();
@@ -6107,7 +6099,9 @@ pub fn beam_search_train_test_continuous_fuzzy(
                 literal_scores.as_slice(),
                 &params,
             );
-            if !keep_child_after_parent_gain_pruning(&cand.rule, cand.test_score, &params) {
+            if cand.rule.len() > exhaustive_depth
+                && !keep_child_after_parent_gain_pruning(&cand.rule, cand.test_score, &params)
+            {
                 continue;
             }
             match best_by_rule.entry(cand.rule.lexical_key()) {
@@ -6491,6 +6485,50 @@ mod tests {
         assert_eq!(hits[0].rule.first.row_index, 0);
         assert!(!hits[0].rule.first.negated);
         assert!(hits[0].train.raw_score > 0.0);
+    }
+
+    #[test]
+    fn test_fuzzy_exhaustive_depth_keeps_negative_gain_pair_for_final_rerank() {
+        init_python_for_tests();
+        let rows = vec![
+            vec![1u8, 1, 1, 1, 0, 0, 0, 0],
+            vec![1u8, 1, 0, 0, 1, 1, 0, 0],
+        ];
+        let y = vec![3.0, 3.0, 3.0, 3.0, -1.0, -1.0, -1.0, -1.0];
+        let (ge1, ge2, row_words) = pack_dual_rows(&rows, y.len());
+        let out = beam_search_train_test_continuous_fuzzy(
+            &y,
+            &ge1,
+            &ge2,
+            row_words,
+            rows.len(),
+            y.len(),
+            &y,
+            &ge1,
+            &ge2,
+            row_words,
+            y.len(),
+            &[0usize, 1usize],
+            BeamSearchParams {
+                max_pick: 2,
+                beam_width: 8,
+                exhaustive_depth: 2,
+                rank_mode: BeamRankMode::InteractionGain,
+                allow_parallel: false,
+                ..BeamSearchParams::default()
+            },
+        )
+        .unwrap();
+        assert!(out.iter().any(|cand| {
+            cand.rule.len() == 2
+                && !cand.rule.first.negated
+                && cand.rule.first.row_index == 0
+                && cand.rule.rest.len() == 1
+                && cand.rule.rest[0].0 == BeamBinaryOp::And
+                && !cand.rule.rest[0].1.negated
+                && cand.rule.rest[0].1.row_index == 1
+                && cand.test_score <= 0.0
+        }));
     }
 
     #[test]
@@ -7832,6 +7870,48 @@ mod tests {
         assert!(keep_child_after_parent_abs_improvement_pruning(
             0.5, 2, 0.52, &params
         ));
+    }
+
+    #[test]
+    fn test_min_gain_pruning_uses_gain_minus_null_penalty_scale() {
+        let mut params = BeamSearchParams {
+            exhaustive_depth: 2,
+            min_gain: 1e-6,
+            ..BeamSearchParams::default()
+        };
+        assert!(keep_state_after_min_gain_pruning(1, -10.0, &params));
+        assert!(!keep_state_after_min_gain_pruning(2, 1e-7, &params));
+        assert!(!keep_state_after_min_gain_pruning(2, 1e-6, &params));
+        assert!(keep_state_after_min_gain_pruning(2, 1e-4, &params));
+
+        let pair_rule = BeamRule {
+            first: BeamLiteral {
+                row_index: 1,
+                group_id: 1,
+                negated: false,
+            },
+            rest: vec![(
+                BeamBinaryOp::And,
+                BeamLiteral {
+                    row_index: 2,
+                    group_id: 2,
+                    negated: false,
+                },
+            )],
+        };
+        assert!(!keep_child_after_parent_gain_pruning(
+            &pair_rule, 1e-7, &params
+        ));
+        assert!(!keep_child_after_parent_gain_pruning(
+            &pair_rule, 1e-6, &params
+        ));
+        assert!(keep_child_after_parent_gain_pruning(
+            &pair_rule, 1e-4, &params
+        ));
+
+        params.min_gain = 0.0;
+        assert!(!keep_state_after_min_gain_pruning(2, 0.0, &params));
+        assert!(keep_state_after_min_gain_pruning(2, 1e-7, &params));
     }
 
     #[test]

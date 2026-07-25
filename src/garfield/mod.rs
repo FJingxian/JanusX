@@ -111,7 +111,7 @@ pub use score_gpu::{
 const GARFIELD_CONSTRAINED_BEAM_PAR_MIN_TOTAL_CANDS: usize = 1_024;
 const GARFIELD_CONSTRAINED_BEAM_PAR_CHUNK_CANDS: usize = 256;
 const GARFIELD_NULL_ML_TOP_FRAC: f64 = 0.80;
-const GARFIELD_SCAN_PAIR_PARENT_ABS_GAIN_MIN: f64 = 1e-6;
+const GARFIELD_SCAN_MIN_GAIN_EPS: f64 = 1e-6;
 const GARFIELD_SCAN_SURROGATE_TEST_GAIN_MAX: f64 = 0.02;
 const GARFIELD_SCAN_SURROGATE_HAMMING_FRAC_MAX: f64 = 0.02;
 const GARFIELD_DISABLE_STRUCTURE_PRIOR: bool = true;
@@ -10508,12 +10508,12 @@ fn garfield_logic_search_bed_owned(
         null_penalties: rule_search_null_lookup.clone(),
         structure_prior: rule_structure_prior.clone(),
         disable_parent_delta: soft_structure_mode,
-        min_gain: 0.0,
-        min_parent_abs_gain: if no_clean {
+        min_gain: if no_clean {
             0.0
         } else {
-            GARFIELD_SCAN_PAIR_PARENT_ABS_GAIN_MIN
+            GARFIELD_SCAN_MIN_GAIN_EPS
         },
+        min_parent_abs_gain: 0.0,
         surrogate_test_gain_max: if no_clean {
             0.0
         } else {

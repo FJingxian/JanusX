@@ -36,6 +36,7 @@ use crate::breader::{
     load_bin01_packed_payload_owned, load_bin01_selected_rows_as_u64_words,
 };
 use crate::bstats::{apply_tail_mask, tail_mask, words_for_samples};
+use crate::eigh::load_square_matrix_f64_from_file;
 use crate::gblup::{build_grm_from_meta_stream, StreamKernelMode};
 use crate::gfcore::{
     process_snp_row, read_fam, BedSnpIter, HmpSnpIter, SiteInfo, TxtSnpIter, VcfSnpIter,
@@ -55,7 +56,6 @@ use crate::ml::pairwise_and::{
     feature_scores_pairwise_and_packed_dual_with_stage1, reset_pairwise_profile,
     snapshot_pairwise_profile,
 };
-use crate::eigh::load_square_matrix_f64_from_file;
 use crate::ml::univariate::{
     feature_scores_abs_corr_stage1, feature_scores_abs_corr_stage1_with_parallel,
 };
@@ -3799,7 +3799,10 @@ fn parse_simbench_terms(path: &str) -> Result<Vec<SimBenchTerm>, String> {
     Ok(out)
 }
 
-fn simbench_rule_from_negations(logic: SimBenchLogic, negated: &[bool]) -> Result<BeamRule, String> {
+fn simbench_rule_from_negations(
+    logic: SimBenchLogic,
+    negated: &[bool],
+) -> Result<BeamRule, String> {
     let n_sites = negated.len();
     if n_sites == 0 {
         return Err("simbench term has no sites".to_string());
@@ -3841,10 +3844,10 @@ fn simbench_effective_negations<S: GarfieldDisplaySite>(
             let Some((label_ref, label_alt)) = label_alleles.get(idx) else {
                 return base_negated;
             };
-            let site_ref = clean_logic_allele_label(sites[idx].garfield_ref_allele())
-                .to_ascii_uppercase();
-            let site_alt = clean_logic_allele_label(sites[idx].garfield_alt_allele())
-                .to_ascii_uppercase();
+            let site_ref =
+                clean_logic_allele_label(sites[idx].garfield_ref_allele()).to_ascii_uppercase();
+            let site_alt =
+                clean_logic_allele_label(sites[idx].garfield_alt_allele()).to_ascii_uppercase();
             let swapped = *label_ref == site_alt && *label_alt == site_ref;
             if swapped {
                 !base_negated
@@ -3881,8 +3884,7 @@ fn simbench_rule_bim_alleles<S: GarfieldDisplaySite>(
     let mut allele0 = Vec::<String>::with_capacity(sites.len());
     let mut allele1 = Vec::<String>::with_capacity(sites.len());
     for (idx, site) in sites.iter().enumerate() {
-        let (a0, a1) =
-            literal_bim_alleles(site, negated.get(idx).copied().unwrap_or(false));
+        let (a0, a1) = literal_bim_alleles(site, negated.get(idx).copied().unwrap_or(false));
         allele0.push(a0);
         allele1.push(a1);
     }
@@ -3903,7 +3905,10 @@ fn simbench_rule_expr<S: GarfieldDisplaySite>(
             out.push(' ');
             out.push_str("AND");
             out.push(' ');
-            out.push_str(&literal_expr(site, negated.get(idx + 1).copied().unwrap_or(false)));
+            out.push_str(&literal_expr(
+                site,
+                negated.get(idx + 1).copied().unwrap_or(false),
+            ));
         }
     }
     Ok(out)
@@ -4315,7 +4320,11 @@ fn match_simbench_ml_context<'a>(
     for ctx in contexts.iter() {
         let selected_hits = site_row_candidates
             .iter()
-            .filter(|cands| cands.iter().any(|idx| ctx.selected_global_rows.contains(idx)))
+            .filter(|cands| {
+                cands
+                    .iter()
+                    .any(|idx| ctx.selected_global_rows.contains(idx))
+            })
             .count();
         let ranked_hits = site_row_candidates
             .iter()
@@ -4332,7 +4341,10 @@ fn match_simbench_ml_context<'a>(
         );
         if best
             .as_ref()
-            .map(|prev| candidate.0 > prev.0 || (candidate.0 == prev.0 && (candidate.1, candidate.2) > (prev.1, prev.2)))
+            .map(|prev| {
+                candidate.0 > prev.0
+                    || (candidate.0 == prev.0 && (candidate.1, candidate.2) > (prev.1, prev.2))
+            })
             .unwrap_or(true)
         {
             best = Some(candidate);
@@ -4503,7 +4515,10 @@ fn resolve_simbench_ml_rank(
     } else if let Some((_, _, _, _, ml_rank, ml_feature_count)) = best_ranked {
         (ml_rank, ml_feature_count)
     } else {
-        (format_simbench_ml_rank(negated, &vec![None; site_row_candidates.len()]), 0)
+        (
+            format_simbench_ml_rank(negated, &vec![None; site_row_candidates.len()]),
+            0,
+        )
     }
 }
 
@@ -4535,7 +4550,8 @@ fn evaluate_simbench_terms(
             })?;
             logic_row_candidates.push(row_candidates);
         }
-        let matched_ctx = match_simbench_ml_context(term, logic_row_candidates.as_slice(), ml_contexts);
+        let matched_ctx =
+            match_simbench_ml_context(term, logic_row_candidates.as_slice(), ml_contexts);
         let selected_row_indices = logic_row_candidates
             .iter()
             .map(|cands| {
@@ -4546,33 +4562,41 @@ fn evaluate_simbench_terms(
                     {
                         return Ok(idx);
                     }
-                    if let Some(&idx) = cands.iter().find(|idx| ctx.ranked_global_rows.contains(idx))
+                    if let Some(&idx) = cands
+                        .iter()
+                        .find(|idx| ctx.ranked_global_rows.contains(idx))
                     {
                         return Ok(idx);
                     }
                 }
                 cands.first().copied().ok_or_else(|| {
-                    format!("simbench term {} has an empty candidate row set", term.term_id)
+                    format!(
+                        "simbench term {} has an empty candidate row set",
+                        term.term_id
+                    )
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
         let bench_sites = selected_row_indices
             .iter()
             .map(|&idx| {
-                logic_bits
-                    .sites
-                    .get(idx)
-                    .cloned()
-                    .ok_or_else(|| format!("simbench term {} logic row out of range: {}", term.term_id, idx))
+                logic_bits.sites.get(idx).cloned().ok_or_else(|| {
+                    format!(
+                        "simbench term {} logic row out of range: {}",
+                        term.term_id, idx
+                    )
+                })
             })
             .collect::<Result<Vec<_>, String>>()?;
         let effective_negated = simbench_effective_negations(term, bench_sites.as_slice());
-        let rule = simbench_rule_from_negations(term.logic, effective_negated.as_slice()).map_err(|e| {
-            format!(
-                "simbench term {} ('{}' {} {}) failed to build rule: {e}",
-                term.term_id, term.kind, term.logic_text, term.sites_text
-            )
-        })?;
+        let rule = simbench_rule_from_negations(term.logic, effective_negated.as_slice()).map_err(
+            |e| {
+                format!(
+                    "simbench term {} ('{}' {} {}) failed to build rule: {e}",
+                    term.term_id, term.kind, term.logic_text, term.sites_text
+                )
+            },
+        )?;
         let n_rule_rows = bench_sites.len();
         let (train_ge1, row_words_train) = packed_rows_subset_from_full_bits(
             logic_bits.bits_flat.as_slice(),
@@ -4655,7 +4679,12 @@ fn evaluate_simbench_terms(
                 context_beam_params.lambda_not,
             )
         }
-        .map_err(|e| format!("simbench term {} failed to score train rule: {e}", term.term_id))?;
+        .map_err(|e| {
+            format!(
+                "simbench term {} failed to score train rule: {e}",
+                term.term_id
+            )
+        })?;
         let assoc_sc = if let Some(assoc_ge2_use) = assoc_ge2.as_ref() {
             evaluate_rule_continuous_dual(
                 &rule,
@@ -4680,8 +4709,14 @@ fn evaluate_simbench_terms(
                 context_beam_params.lambda_not,
             )
         }
-        .map_err(|e| format!("simbench term {} failed to score assoc rule: {e}", term.term_id))?;
-        let sim_expr_txt = simbench_rule_expr(effective_negated.as_slice(), bench_sites.as_slice())?;
+        .map_err(|e| {
+            format!(
+                "simbench term {} failed to score assoc rule: {e}",
+                term.term_id
+            )
+        })?;
+        let sim_expr_txt =
+            simbench_rule_expr(effective_negated.as_slice(), bench_sites.as_slice())?;
         let test_bucket = bucket_from_rule_with_complexity(
             &rule,
             assoc_sc.dosage_maf,
@@ -4731,13 +4766,18 @@ fn evaluate_simbench_terms(
         let first_site = bench_sites
             .first()
             .ok_or_else(|| format!("simbench term {} has no sites", term.term_id))?;
-        let (ml_rank, ml_feature_count) =
-            resolve_simbench_ml_rank(effective_negated.as_slice(), logic_row_candidates.as_slice(), ml_contexts);
+        let (ml_rank, ml_feature_count) = resolve_simbench_ml_rank(
+            effective_negated.as_slice(),
+            logic_row_candidates.as_slice(),
+            ml_contexts,
+        );
         let (bim_allele0, bim_allele1) =
             simbench_rule_bim_alleles(effective_negated.as_slice(), bench_sites.as_slice());
         let unit_name = simbench_term_unit_name(term, bench_sites.as_slice());
-        let snp_name = simbench_term_rule_name(term, effective_negated.as_slice(), bench_sites.as_slice());
-        let bim_snp_name = simbench_term_bim_name(term, effective_negated.as_slice(), bench_sites.as_slice());
+        let snp_name =
+            simbench_term_rule_name(term, effective_negated.as_slice(), bench_sites.as_slice());
+        let bim_snp_name =
+            simbench_term_bim_name(term, effective_negated.as_slice(), bench_sites.as_slice());
         let delta_score = build_simbench_delta_score_annotation(
             effective_negated.as_slice(),
             test_score,
@@ -4844,8 +4884,9 @@ fn cmp_logic_rule_records_same_support(
 fn logic_rule_output_kind_rank(unit_kind: &str) -> u8 {
     match unit_kind {
         "window" => 0,
-        "gene" => 1,
-        "geneset" => 2,
+        "wholegenome" => 1,
+        "gene" => 2,
+        "geneset" => 3,
         "simbench" => 255,
         _ => 200,
     }
@@ -5055,7 +5096,11 @@ fn literal_target_name<S: GarfieldChromPosSite + GarfieldDisplaySite>(
     site: &S,
     negated: bool,
 ) -> String {
-    format!("{}[{}]", site_coord_label(site), literal_target_allele(site, negated))
+    format!(
+        "{}[{}]",
+        site_coord_label(site),
+        literal_target_allele(site, negated)
+    )
 }
 
 #[inline]
@@ -5394,6 +5439,44 @@ fn build_logic_units<S: GarfieldChromPosSite>(
     extension: usize,
     step: Option<usize>,
 ) -> Result<Vec<GarfieldLogicUnit>, String> {
+    fn build_whole_genome_unit<S: GarfieldChromPosSite>(
+        sites: &[S],
+    ) -> Result<Vec<GarfieldLogicUnit>, String> {
+        if sites.is_empty() {
+            return Err("cannot build whole-genome GARFIELD unit from zero sites".to_string());
+        }
+        let mut spans = Vec::<GarfieldUnitSpan>::new();
+        let mut current_chrom = normalize_chrom(sites[0].garfield_chrom());
+        let mut current_start = sites[0].garfield_pos();
+        let mut current_end = sites[0].garfield_pos();
+        for site in sites.iter().skip(1) {
+            let chrom = normalize_chrom(site.garfield_chrom());
+            let pos = site.garfield_pos();
+            if chrom == current_chrom {
+                current_end = pos;
+            } else {
+                spans.push(GarfieldUnitSpan {
+                    chrom: current_chrom,
+                    bp_start: current_start,
+                    bp_end: current_end,
+                });
+                current_chrom = chrom;
+                current_start = pos;
+                current_end = pos;
+            }
+        }
+        spans.push(GarfieldUnitSpan {
+            chrom: current_chrom,
+            bp_start: current_start,
+            bp_end: current_end,
+        });
+        Ok(vec![GarfieldLogicUnit {
+            label: "whole_genome".to_string(),
+            indices: (0..sites.len()).collect(),
+            spans,
+        }])
+    }
+
     let kind = unit_kind.trim().to_ascii_lowercase();
     match kind.as_str() {
         "" | "window" => {
@@ -5421,6 +5504,7 @@ fn build_logic_units<S: GarfieldChromPosSite>(
                 })
                 .collect())
         }
+        "wholegenome" => build_whole_genome_unit(sites),
         "gene" | "geneset" | "group" => {
             let g = groups.ok_or_else(|| {
                 "groups must be provided for unit_kind in {gene, geneset, group}".to_string()
@@ -5428,7 +5512,7 @@ fn build_logic_units<S: GarfieldChromPosSite>(
             Ok(build_logic_units_from_groups(sites, g, group_names))
         }
         other => Err(format!(
-            "unit_kind must be one of: window, gene, geneset, group; got {other}"
+            "unit_kind must be one of: window, wholegenome, gene, geneset, group; got {other}"
         )),
     }
 }
@@ -9605,6 +9689,7 @@ fn garfield_logic_search_bed_owned(
     rule_permutation: bool,
     prior_len: Option<Vec<f64>>,
     no_clean: bool,
+    whole_genome_dev_mode: bool,
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
     debug_probe: Option<GarfieldBeamDebugProbe>,
@@ -9889,6 +9974,7 @@ fn garfield_logic_search_bed_owned(
     };
 
     let mode = parse_bin_mode(&bin_mode)?;
+    let unit_kind_lc = unit_kind.trim().to_ascii_lowercase();
     let logic_row_mul = match mode {
         GarfieldBinMode::Bin => 1usize,
         GarfieldBinMode::Mbin => 3usize,
@@ -9908,18 +9994,18 @@ fn garfield_logic_search_bed_owned(
     } else {
         0
     };
-    let (null_chunks, mut null_chunk_valid_total) =
-        if rule_permutation && unit_kind.trim().to_ascii_lowercase() != "geneset" {
-            sample_null_chunks_stratified(
-                filtered_sites.as_slice(),
-                extension.max(1),
-                DEFAULT_RULE_NULL_PHYSICAL_CHUNKS,
-                DEFAULT_RULE_NULL_MIN_SNPS_PER_CHUNK,
-                seed,
-            )?
-        } else {
-            (Vec::new(), 0usize)
-        };
+    let (null_chunks, mut null_chunk_valid_total) = if rule_permutation && unit_kind_lc != "geneset"
+    {
+        sample_null_chunks_stratified(
+            filtered_sites.as_slice(),
+            extension.max(1),
+            DEFAULT_RULE_NULL_PHYSICAL_CHUNKS,
+            DEFAULT_RULE_NULL_MIN_SNPS_PER_CHUNK,
+            seed,
+        )?
+    } else {
+        (Vec::new(), 0usize)
+    };
     let global_bits_mem_tracker = GarfieldStageMemoryTracker::new(rss_debug_enabled);
     let global_bits_mem_start = global_bits_mem_tracker.start_stage();
     let logic_bits = convert_bed_prefix_to_logic_bits(
@@ -9953,6 +10039,9 @@ fn garfield_logic_search_bed_owned(
         .map(parse_scan_bimranges)
         .transpose()?
         .unwrap_or_default();
+    if unit_kind_lc == "wholegenome" && !scan_bimranges.is_empty() {
+        return Err("--bimrange is not supported under unit_kind 'wholegenome'".to_string());
+    }
 
     let response = ResponseKind::Continuous;
     let engine = parse_optional_ml_engine(&ml_method)?;
@@ -9977,7 +10066,11 @@ fn garfield_logic_search_bed_owned(
         maf_threshold: logic_maf_threshold.clamp(0.0, 0.5) as f64,
         lambda_len: 0.0,
         lambda_not: 0.0,
-        exhaustive_depth: exhaustive_depth.max(1),
+        exhaustive_depth: if whole_genome_dev_mode {
+            1
+        } else {
+            exhaustive_depth.max(1)
+        },
         rank_mode,
         null_penalties: None,
         structure_prior: None,
@@ -9985,8 +10078,8 @@ fn garfield_logic_search_bed_owned(
         null_complexity_bin: 0,
         group_constraint: BeamGroupConstraintMode::AlwaysExclude,
         allow_parallel: true,
+        whole_genome_dev_mode,
     };
-    let unit_kind_lc = unit_kind.trim().to_ascii_lowercase();
     let total_units = units.len();
     let scan_unit_indices = if scan_bimranges.is_empty() {
         (0..total_units).collect::<Vec<_>>()
@@ -11101,7 +11194,10 @@ fn garfield_logic_search_bed_owned(
     })
 }
 
-fn read_single_trait_pheno_aligned(pheno_path: &str, ordered_iids: &[String]) -> Result<Vec<f64>, String> {
+fn read_single_trait_pheno_aligned(
+    pheno_path: &str,
+    ordered_iids: &[String],
+) -> Result<Vec<f64>, String> {
     let file = File::open(pheno_path).map_err(|e| format!("open phenotype failed: {e}"))?;
     let mut lines = BufReader::new(file).lines();
     let header = lines
@@ -11254,6 +11350,7 @@ pub fn garfield_debug_probe_single_group_from_files(
         true,
         None,
         false,
+        false,
         None,
         0usize,
         Some(probe),
@@ -11320,6 +11417,7 @@ pub fn garfield_debug_probe_single_group_from_files(
     rule_permutation=true,
     prior_len=None,
     no_clean=false,
+    whole_genome_dev_mode=false,
     progress_callback=None,
     progress_every=0
 ))]
@@ -11382,6 +11480,7 @@ pub fn garfield_logic_search_bed_py<'py>(
     rule_permutation: bool,
     prior_len: Option<Vec<f64>>,
     no_clean: bool,
+    whole_genome_dev_mode: bool,
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
 ) -> PyResult<Bound<'py, PyDict>> {
@@ -11488,13 +11587,14 @@ pub fn garfield_logic_search_bed_py<'py>(
                 top_rules_per_unit,
                 max_output_rules,
                 max_output_ratio,
-            rule_permutation,
-            prior_len,
-            no_clean,
-            progress_callback,
-            progress_every,
-            None,
-        )
+                rule_permutation,
+                prior_len,
+                no_clean,
+                whole_genome_dev_mode,
+                progress_callback,
+                progress_every,
+                None,
+            )
         })
         .map_err(map_err_string_to_py)?;
 
@@ -12752,6 +12852,7 @@ mod tests {
                 bim_snp_name: format!("snp{i}"),
                 bim_allele0: "A".to_string(),
                 bim_allele1: "T".to_string(),
+                allele1_maf: 0.0,
                 pos: i as i32,
                 score: 20.0 - i as f64,
                 delta_score: format!("{}->{}", 20.0 - i as f64, 20.0 - i as f64),
@@ -12785,6 +12886,7 @@ mod tests {
             bim_snp_name: "snp1".to_string(),
             bim_allele0: "A".to_string(),
             bim_allele1: "T".to_string(),
+            allele1_maf: 0.0,
             pos: 1,
             score: 10.0,
             delta_score: "10->10".to_string(),
@@ -12797,7 +12899,7 @@ mod tests {
         let first_line = header.lines().next().unwrap();
         assert_eq!(
             first_line,
-            "unit_name\tregion_size\tml_feature_count\tMLrank\tsnp_name\tscore\tdelta_score"
+            "unit_name\tregion_size\tml_feature_count\tMLrank\tsnp_name\tallele1_maf\tscore\tdelta_score"
         );
     }
 
@@ -12822,6 +12924,7 @@ mod tests {
             bim_snp_name: "snp1".to_string(),
             bim_allele0: "A".to_string(),
             bim_allele1: "T".to_string(),
+            allele1_maf: 0.0,
             pos: 1,
             score: 10.0,
             delta_score: "10->10".to_string(),
@@ -12834,11 +12937,11 @@ mod tests {
         let mut lines = content.lines();
         assert_eq!(
             lines.next().unwrap(),
-            "unit_name\tregion_size\tml_feature_count\tMLrank\tsnp_name\tscore\tdelta_score\tperm_pvalue\tperm_fdr"
+            "unit_name\tregion_size\tml_feature_count\tMLrank\tsnp_name\tallele1_maf\tscore\tdelta_score\tperm_pvalue\tperm_fdr"
         );
         assert_eq!(
             lines.next().unwrap(),
-            "u1\t8\t4\t.\tsnp1\t10.0000\t10->10\t1.2e-4\t2.5e-4"
+            "u1\t8\t4\t.\tsnp1\t0.0000\t10.0000\t10->10\t1.2e-4\t2.5e-4"
         );
     }
 
@@ -13035,6 +13138,7 @@ mod tests {
                 bim_snp_name: "snp1".to_string(),
                 bim_allele0: "A".to_string(),
                 bim_allele1: "T".to_string(),
+                allele1_maf: 0.0,
                 pos: 1,
                 score: 10.0,
                 delta_score: "10->10".to_string(),
@@ -13058,6 +13162,7 @@ mod tests {
                 bim_snp_name: "snp2".to_string(),
                 bim_allele0: "A".to_string(),
                 bim_allele1: "T".to_string(),
+                allele1_maf: 0.0,
                 pos: 2,
                 score: 9.0,
                 delta_score: "9->9".to_string(),
@@ -13081,6 +13186,7 @@ mod tests {
                 bim_snp_name: "snp3".to_string(),
                 bim_allele0: "A".to_string(),
                 bim_allele1: "T".to_string(),
+                allele1_maf: 0.0,
                 pos: 3,
                 score: 9.0,
                 delta_score: "9->9".to_string(),
@@ -13104,6 +13210,7 @@ mod tests {
                 bim_snp_name: "snp4".to_string(),
                 bim_allele0: "A".to_string(),
                 bim_allele1: "T".to_string(),
+                allele1_maf: 0.0,
                 pos: 4,
                 score: 8.0,
                 delta_score: "8->8".to_string(),
@@ -13291,6 +13398,7 @@ mod tests {
                 bim_snp_name: "1_100(A)&1_200(A)".to_string(),
                 bim_allele0: "G,G".to_string(),
                 bim_allele1: "A,A".to_string(),
+                allele1_maf: 0.0,
                 pos: 100,
                 score: 5.0,
                 delta_score: "0.1&0.2->5.0".to_string(),
@@ -13316,6 +13424,7 @@ mod tests {
                 bim_snp_name: "1_100(G)|1_200(G)".to_string(),
                 bim_allele0: "A,A".to_string(),
                 bim_allele1: "G,G".to_string(),
+                allele1_maf: 0.0,
                 pos: 100,
                 score: 5.0,
                 delta_score: "0.1|0.2->5.0".to_string(),
@@ -13381,6 +13490,7 @@ mod tests {
             bim_snp_name: "1_100(G)&1_200(A)".to_string(),
             bim_allele0: "A,C".to_string(),
             bim_allele1: "G,T".to_string(),
+            allele1_maf: 0.0,
             pos: 100,
             score: 10.0,
             delta_score: "0.1&0.2->10".to_string(),
@@ -13438,6 +13548,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, vec![0x47u8]);
+    }
+
+    fn normalize_test_simbench_raw_row(row: &mut [f32], site: &mut SiteInfo) -> Result<(), String> {
+        let ref_upper = site.ref_allele.trim().to_ascii_uppercase();
+        let alt_upper = site.alt_allele.trim().to_ascii_uppercase();
+        if ref_upper > alt_upper {
+            for v in row.iter_mut() {
+                if let Some(g) = normalize_genotype3(*v) {
+                    *v = f32::from(2u8.saturating_sub(g));
+                }
+            }
+            site.ref_allele = alt_upper;
+            site.alt_allele = ref_upper;
+        } else {
+            site.ref_allele = ref_upper;
+            site.alt_allele = alt_upper;
+        }
+        Ok(())
+    }
+
+    fn pack_test_simbench_raw_row_dual_words(row: &[f32]) -> Result<(Vec<u64>, Vec<u64>), String> {
+        let row_words = words_for_samples(row.len());
+        let mut ge1 = vec![0u64; row_words];
+        let mut ge2 = vec![0u64; row_words];
+        for (i, &v) in row.iter().enumerate() {
+            let Some(g) = normalize_genotype3(v) else {
+                continue;
+            };
+            if g >= 1 {
+                ge1[i >> 6] |= 1u64 << (i & 63);
+            }
+            if g >= 2 {
+                ge2[i >> 6] |= 1u64 << (i & 63);
+            }
+        }
+        Ok((ge1, ge2))
     }
 
     fn test_site(chrom: &str, pos: i32) -> SiteInfo {
@@ -13784,7 +13930,7 @@ mod tests {
         }];
         let site_row_candidates = vec![vec![300, 301], vec![999], vec![200, 201]];
         let (rank_txt, ml_feature_count) = resolve_simbench_ml_rank(
-            SimBenchLogic::And,
+            &[false, false, false],
             site_row_candidates.as_slice(),
             contexts.as_slice(),
         );
@@ -13803,7 +13949,7 @@ mod tests {
         }];
         let site_row_candidates = vec![vec![300], vec![400]];
         let (rank_txt, ml_feature_count) = resolve_simbench_ml_rank(
-            SimBenchLogic::And,
+            &[false, false],
             site_row_candidates.as_slice(),
             contexts.as_slice(),
         );
@@ -13847,14 +13993,14 @@ mod tests {
     }
 
     #[test]
-    fn test_simbench_rule_from_site_count_preserves_negation_semantics() {
-        let na_rule = simbench_rule_from_site_count(SimBenchLogic::Na, 2).unwrap();
+    fn test_simbench_rule_from_negations_preserves_negation_semantics() {
+        let na_rule = simbench_rule_from_negations(SimBenchLogic::Na, &[true, true]).unwrap();
         assert!(na_rule.first.negated);
         assert_eq!(na_rule.rest.len(), 1);
         assert_eq!(na_rule.rest[0].0, BeamBinaryOp::Or);
         assert!(na_rule.rest[0].1.negated);
 
-        let an_rule = simbench_rule_from_site_count(SimBenchLogic::An, 2).unwrap();
+        let an_rule = simbench_rule_from_negations(SimBenchLogic::An, &[false, true]).unwrap();
         assert!(!an_rule.first.negated);
         assert_eq!(an_rule.rest.len(), 1);
         assert_eq!(an_rule.rest[0].0, BeamBinaryOp::And);
@@ -13865,11 +14011,11 @@ mod tests {
     fn test_format_simbench_ml_rank_marks_negated_members() {
         let ranks = vec![Some(2usize), Some(5usize), None];
         assert_eq!(
-            format_simbench_ml_rank(SimBenchLogic::Na, &ranks),
-            "2&5&."
+            format_simbench_ml_rank(&[true, true, false], &ranks),
+            "!2&!5&."
         );
         assert_eq!(
-            format_simbench_ml_rank(SimBenchLogic::An, &ranks),
+            format_simbench_ml_rank(&[false, true, false], &ranks),
             "2&!5&."
         );
     }
@@ -13893,11 +14039,11 @@ mod tests {
             alt_allele: "C".to_string(),
         };
 
-        normalize_simbench_raw_row(&mut row_a, &mut site_a).unwrap();
-        normalize_simbench_raw_row(&mut row_b, &mut site_b).unwrap();
+        normalize_test_simbench_raw_row(&mut row_a, &mut site_a).unwrap();
+        normalize_test_simbench_raw_row(&mut row_b, &mut site_b).unwrap();
 
-        let (ge1_a, ge2_a) = pack_simbench_raw_row_dual_words(&row_a).unwrap();
-        let (ge1_b, ge2_b) = pack_simbench_raw_row_dual_words(&row_b).unwrap();
+        let (ge1_a, ge2_a) = pack_test_simbench_raw_row_dual_words(&row_a).unwrap();
+        let (ge1_b, ge2_b) = pack_test_simbench_raw_row_dual_words(&row_b).unwrap();
         assert_eq!(site_a.ref_allele, site_b.ref_allele);
         assert_eq!(site_a.alt_allele, site_b.alt_allele);
         assert_eq!(ge1_a, ge1_b);
@@ -13950,8 +14096,8 @@ mod tests {
             ref_allele: "T".to_string(),
             alt_allele: "C".to_string(),
         };
-        normalize_simbench_raw_row(&mut row, &mut site).unwrap();
-        let (exp_ge1, exp_ge2) = pack_simbench_raw_row_dual_words(&row).unwrap();
+        normalize_test_simbench_raw_row(&mut row, &mut site).unwrap();
+        let (exp_ge1, exp_ge2) = pack_test_simbench_raw_row_dual_words(&row).unwrap();
 
         assert_eq!(
             unpack_dual_bits(dst_ge1.as_slice(), dst_ge2.as_slice(), raw_row.len()),

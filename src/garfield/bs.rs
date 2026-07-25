@@ -36,6 +36,7 @@ const GARFIELD_EXHAUSTIVE_PAR_CHUNK_CANDS: usize = 32;
 /// identified by pairwise feature selection, and beam search can only
 /// reach it if negated singletons enter the beam at layer 1.
 const GARFIELD_INITIAL_SINGLETON_NEGATIONS: [bool; 2] = [false, true];
+const GARFIELD_INITIAL_SINGLETON_NEGATIONS_POS_ONLY: [bool; 1] = [false];
 const GARFIELD_AND_NOT_SHORTER_SUBRULE_GAIN_MAX: f64 = 0.08;
 const GARFIELD_AND_NOT_SHORTER_SUBRULE_HAMMING_FRAC_MAX: f64 = 0.05;
 const GARFIELD_LITERAL_BATCH_MAX_ROWS_DEFAULT: usize = 16_384;
@@ -272,6 +273,7 @@ pub struct BeamSearchParams {
     pub null_complexity_bin: u8,
     pub group_constraint: BeamGroupConstraintMode,
     pub allow_parallel: bool,
+    pub whole_genome_dev_mode: bool,
 }
 
 impl Default for BeamSearchParams {
@@ -294,7 +296,17 @@ impl Default for BeamSearchParams {
             null_complexity_bin: 0,
             group_constraint: BeamGroupConstraintMode::AlwaysExclude,
             allow_parallel: true,
+            whole_genome_dev_mode: false,
         }
+    }
+}
+
+#[inline]
+fn initial_singleton_negations(params: &BeamSearchParams) -> &'static [bool] {
+    if params.whole_genome_dev_mode {
+        &GARFIELD_INITIAL_SINGLETON_NEGATIONS_POS_ONLY
+    } else {
+        &GARFIELD_INITIAL_SINGLETON_NEGATIONS
     }
 }
 
@@ -2779,7 +2791,7 @@ fn build_initial_beam(
                     // Layer 1 seeds both positive and negated singletons so that
                     // AND-only expansion can still recover former OR hypotheses
                     // via complement forms such as !i & !j.
-                    for &negated in GARFIELD_INITIAL_SINGLETON_NEGATIONS.iter() {
+                    for &negated in initial_singleton_negations(params).iter() {
                         let literal = BeamLiteral {
                             row_index: row_idx,
                             group_id: group_ids[row_idx],
@@ -2839,7 +2851,7 @@ fn build_initial_beam(
                 check_interrupt_fast()?;
             }
             let row = row_prefix(bits_train, row_words_train, row_idx, needed_words_train);
-            for &negated in GARFIELD_INITIAL_SINGLETON_NEGATIONS.iter() {
+            for &negated in initial_singleton_negations(params).iter() {
                 let literal = BeamLiteral {
                     row_index: row_idx,
                     group_id: group_ids[row_idx],
@@ -2895,7 +2907,7 @@ fn build_initial_states_exhaustive(
     params: &BeamSearchParams,
 ) -> Result<Vec<BeamState>, String> {
     check_interrupt_fast()?;
-    let total_cands = n_rows.saturating_mul(GARFIELD_INITIAL_SINGLETON_NEGATIONS.len());
+    let total_cands = n_rows.saturating_mul(initial_singleton_negations(params).len());
     let all = if should_parallel_exhaustive(total_cands, params.allow_parallel) {
         let mut work = Vec::<(usize, usize)>::new();
         let chunk = GARFIELD_EXHAUSTIVE_PAR_CHUNK_CANDS.max(1);
@@ -2909,14 +2921,14 @@ fn build_initial_states_exhaustive(
             .into_par_iter()
             .map(|(start, end)| -> Result<Vec<BeamState>, String> {
                 let mut local = Vec::<BeamState>::with_capacity(
-                    (end - start).saturating_mul(GARFIELD_INITIAL_SINGLETON_NEGATIONS.len()),
+                    (end - start).saturating_mul(initial_singleton_negations(params).len()),
                 );
                 for row_idx in start..end {
                     if ((row_idx - start) & 255) == 0 {
                         check_interrupt_fast()?;
                     }
                     let row = row_prefix(bits_train, row_words_train, row_idx, needed_words_train);
-                    for &negated in GARFIELD_INITIAL_SINGLETON_NEGATIONS.iter() {
+                    for &negated in initial_singleton_negations(params).iter() {
                         let literal = BeamLiteral {
                             row_index: row_idx,
                             group_id: group_ids[row_idx],
@@ -2967,7 +2979,7 @@ fn build_initial_states_exhaustive(
                 check_interrupt_fast()?;
             }
             let row = row_prefix(bits_train, row_words_train, row_idx, needed_words_train);
-            for &negated in GARFIELD_INITIAL_SINGLETON_NEGATIONS.iter() {
+            for &negated in initial_singleton_negations(params).iter() {
                 let literal = BeamLiteral {
                     row_index: row_idx,
                     group_id: group_ids[row_idx],
@@ -3005,6 +3017,181 @@ fn build_initial_states_exhaustive(
         );
     }
     Ok(out)
+}
+
+fn whole_genome_layer2_parent_variants(
+    node: &BeamState,
+    bits_train: &[u64],
+    row_words_train: usize,
+    needed_words_train: usize,
+    n_train: usize,
+    literal_scores: &[LiteralSingletonScore],
+    params: &BeamSearchParams,
+) -> Vec<BeamState> {
+    let mut out = Vec::<BeamState>::with_capacity(2);
+    out.push(node.clone());
+    if node.rule.len() != 1 || node.rule.first.negated {
+        return out;
+    }
+    let row_idx = node.rule.first.row_index;
+    let row = row_prefix(bits_train, row_words_train, row_idx, needed_words_train);
+    let literal = BeamLiteral {
+        negated: true,
+        ..node.rule.first
+    };
+    let rule = BeamRule {
+        first: literal,
+        rest: Vec::new(),
+    };
+    let combined = apply_first_literal(row, needed_words_train, n_train, true);
+    let single = literal_scores[literal_score_index(row_idx, true)];
+    let train = single.train;
+    let (train_abs_score, train_score) =
+        train_scores_for_rule(&rule, train, train.raw_score, None, None, params);
+    if keep_rule_after_dosage_maf_pruning(&train, params)
+        && keep_state_after_min_gain_pruning(rule.len(), train_score, params)
+    {
+        out.push(BeamState {
+            rule,
+            combined_train: combined,
+            train,
+            train_abs_score,
+            train_score,
+            max_singleton_train_raw: single.train.raw_score,
+            max_singleton_test_raw: single.test.raw_score,
+        });
+    }
+    out
+}
+
+fn expand_beam_once_whole_genome_layer2(
+    beam: &[BeamState],
+    y_train: &[f64],
+    sum_y_train: f64,
+    bits_train: &[u64],
+    row_words_train: usize,
+    n_rows: usize,
+    needed_words_train: usize,
+    n_train: usize,
+    group_ids: &[usize],
+    literal_scores: &[LiteralSingletonScore],
+    params: &BeamSearchParams,
+) -> Result<Vec<BeamState>, String> {
+    check_interrupt_fast()?;
+    let next_cap = params.beam_width.min(n_rows.saturating_mul(4).max(1));
+    let mut best = HashMap::<RuleLexKey, BeamState>::with_capacity(next_cap.saturating_mul(2));
+    for node in beam.iter() {
+        let parent_variants = whole_genome_layer2_parent_variants(
+            node,
+            bits_train,
+            row_words_train,
+            needed_words_train,
+            n_train,
+            literal_scores,
+            params,
+        );
+        for parent in parent_variants.iter() {
+            for cand in 0..n_rows {
+                if (cand & 127) == 0 {
+                    check_interrupt_fast()?;
+                }
+                if cand == parent.rule.first.row_index {
+                    continue;
+                }
+                let gid = group_ids[cand];
+                if candidate_group_is_excluded(&parent.rule, gid, params) {
+                    continue;
+                }
+                let row = row_prefix(bits_train, row_words_train, cand, needed_words_train);
+                for &op in beam_binary_ops_for_rule(&parent.rule).iter() {
+                    for &negated in &[false, true] {
+                        let literal = BeamLiteral {
+                            row_index: cand,
+                            group_id: gid,
+                            negated,
+                        };
+                        let single = literal_scores[literal_score_index(cand, negated)];
+                        let Some(train) = evaluate_child_train_from_parent_virtual(
+                            &parent.combined_train,
+                            &parent.train,
+                            row,
+                            &single.train,
+                            y_train,
+                            sum_y_train,
+                            n_train,
+                            parent.rule.len() + 1,
+                            op,
+                            negated,
+                            params,
+                        ) else {
+                            continue;
+                        };
+                        let rule = if let Some(rule) =
+                            canonical_commutative_child_rule(&parent.rule, op, literal)
+                        {
+                            rule
+                        } else {
+                            let mut rule = parent.rule.clone();
+                            rule.rest.push((op, literal));
+                            rule
+                        };
+                        let max_singleton_train_raw =
+                            parent.max_singleton_train_raw.max(single.train.raw_score);
+                        let max_singleton_test_raw =
+                            parent.max_singleton_test_raw.max(single.test.raw_score);
+                        let direct_parent_train_raw =
+                            parent.train.raw_score.max(single.train.raw_score);
+                        let (train_abs_score, train_score) = train_scores_for_rule(
+                            &rule,
+                            train,
+                            direct_parent_train_raw,
+                            None,
+                            None,
+                            params,
+                        );
+                        if !keep_child_after_parent_abs_improvement_pruning(
+                            parent.train_abs_score,
+                            rule.len(),
+                            train_abs_score,
+                            params,
+                        ) {
+                            continue;
+                        }
+                        if !keep_state_after_min_gain_pruning(rule.len(), train_score, params) {
+                            continue;
+                        }
+                        if !keep_child_after_parent_gain_pruning(&rule, train_score, params) {
+                            continue;
+                        }
+                        let mut combined = parent.combined_train.clone();
+                        apply_literal_inplace(&mut combined, row, op, negated, n_train);
+                        let state = BeamState {
+                            rule,
+                            combined_train: combined,
+                            train,
+                            train_abs_score,
+                            train_score,
+                            max_singleton_train_raw,
+                            max_singleton_test_raw,
+                        };
+                        match best.entry(state.rule.lexical_key()) {
+                            std::collections::hash_map::Entry::Vacant(slot) => {
+                                slot.insert(state);
+                            }
+                            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                                if cmp_state(&state, slot.get()) == std::cmp::Ordering::Less {
+                                    slot.insert(state);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut out = best.into_values().collect::<Vec<_>>();
+    out.sort_by(cmp_state);
+    Ok(filter_beam_candidates(out, next_cap, params))
 }
 
 fn expand_beam_once(
@@ -4496,7 +4683,30 @@ fn beam_search_train_test_continuous_impl(
             beam
         };
 
-        for _depth in (exhaustive_depth + 1)..=max_depth {
+        let mut depth_start = exhaustive_depth + 1;
+        if params.whole_genome_dev_mode && exhaustive_depth == 1 && max_depth >= 2 {
+            check_ctrlc()?;
+            let next = expand_beam_once_whole_genome_layer2(
+                &beam,
+                y_train,
+                sum_y_train,
+                bits_train,
+                row_words_train,
+                n_rows,
+                needed_words_train,
+                n_train,
+                group_ids,
+                literal_scores,
+                &params,
+            )?;
+            if !next.is_empty() {
+                kept_all.extend(next.iter().cloned());
+                beam = next;
+            }
+            depth_start = 3;
+        }
+
+        for _depth in depth_start..=max_depth {
             check_ctrlc()?;
             let next = expand_beam_once(
                 &beam,
@@ -5419,7 +5629,7 @@ fn build_initial_fuzzy_beam(
         let row_ge1 = row_prefix(ge1_train, row_words_train, row_idx, needed_words_train);
         let row_ge2 = row_prefix(ge2_train, row_words_train, row_idx, needed_words_train);
         let summary = literal_summaries[row_idx];
-        for &negated in GARFIELD_INITIAL_SINGLETON_NEGATIONS.iter() {
+        for &negated in initial_singleton_negations(params).iter() {
             let (_, train_n_ge2, train_sum_ge1, train_sum_ge2) =
                 literal_dual_summary_with_negation(sum_y_train, n_train, summary, negated);
             let literal = BeamLiteral {
@@ -5502,7 +5712,7 @@ fn build_initial_fuzzy_states_exhaustive(
         let row_ge1 = row_prefix(ge1_train, row_words_train, row_idx, needed_words_train);
         let row_ge2 = row_prefix(ge2_train, row_words_train, row_idx, needed_words_train);
         let summary = literal_summaries[row_idx];
-        for &negated in GARFIELD_INITIAL_SINGLETON_NEGATIONS.iter() {
+        for &negated in initial_singleton_negations(params).iter() {
             let (_, train_n_ge2, train_sum_ge1, train_sum_ge2) =
                 literal_dual_summary_with_negation(sum_y_train, n_train, summary, negated);
             let literal = BeamLiteral {
@@ -5549,6 +5759,215 @@ fn build_initial_fuzzy_states_exhaustive(
         ));
     }
     Ok(out)
+}
+
+fn whole_genome_layer2_parent_variants_fuzzy(
+    node: &FuzzyBeamState,
+    sum_y_train: f64,
+    ge1_train: &[u64],
+    ge2_train: &[u64],
+    row_words_train: usize,
+    needed_words_train: usize,
+    n_train: usize,
+    literal_scores: &[LiteralSingletonScore],
+    literal_summaries: &[DualLiteralSummary],
+    params: &BeamSearchParams,
+) -> Vec<FuzzyBeamState> {
+    let mut out = Vec::<FuzzyBeamState>::with_capacity(2);
+    out.push(node.clone());
+    if node.rule.len() != 1 || node.rule.first.negated {
+        return out;
+    }
+    let row_idx = node.rule.first.row_index;
+    let row_ge1 = row_prefix(ge1_train, row_words_train, row_idx, needed_words_train);
+    let row_ge2 = row_prefix(ge2_train, row_words_train, row_idx, needed_words_train);
+    let (_, train_n_ge2, train_sum_ge1, train_sum_ge2) =
+        literal_dual_summary_with_negation(sum_y_train, n_train, literal_summaries[row_idx], true);
+    let literal = BeamLiteral {
+        negated: true,
+        ..node.rule.first
+    };
+    let rule = BeamRule {
+        first: literal,
+        rest: Vec::new(),
+    };
+    let (combined_ge1, combined_ge2) = apply_first_literal_dual(row_ge1, row_ge2, n_train, true);
+    let single = literal_scores[literal_score_index(row_idx, true)];
+    let train = single.train;
+    let (train_abs_score, train_score) =
+        train_scores_for_rule(&rule, train, train.raw_score, None, None, params);
+    if keep_rule_after_dosage_maf_pruning(&train, params)
+        && keep_state_after_min_gain_pruning(rule.len(), train_score, params)
+    {
+        out.push(FuzzyBeamState {
+            rule,
+            combined_train_ge1: combined_ge1,
+            combined_train_ge2: combined_ge2,
+            train,
+            train_n_ge2,
+            train_sum_ge1,
+            train_sum_ge2,
+            train_abs_score,
+            train_score,
+            max_singleton_train_raw: single.train.raw_score,
+            max_singleton_test_raw: single.test.raw_score,
+        });
+    }
+    out
+}
+
+fn expand_fuzzy_beam_once_whole_genome_layer2(
+    beam: &[FuzzyBeamState],
+    y_train: &[f64],
+    sum_y_train: f64,
+    ge1_train: &[u64],
+    ge2_train: &[u64],
+    row_words_train: usize,
+    n_rows: usize,
+    needed_words_train: usize,
+    n_train: usize,
+    group_ids: &[usize],
+    literal_scores: &[LiteralSingletonScore],
+    literal_summaries: &[DualLiteralSummary],
+    params: &BeamSearchParams,
+) -> Result<Vec<FuzzyBeamState>, String> {
+    check_interrupt_fast()?;
+    let next_cap = params.beam_width.min(n_rows.saturating_mul(4).max(1));
+    let mut best = HashMap::<RuleLexKey, FuzzyBeamState>::with_capacity(next_cap.saturating_mul(2));
+    for node in beam.iter() {
+        let parent_variants = whole_genome_layer2_parent_variants_fuzzy(
+            node,
+            sum_y_train,
+            ge1_train,
+            ge2_train,
+            row_words_train,
+            needed_words_train,
+            n_train,
+            literal_scores,
+            literal_summaries,
+            params,
+        );
+        for parent in parent_variants.iter() {
+            for cand in 0..n_rows {
+                if (cand & 127) == 0 {
+                    check_interrupt_fast()?;
+                }
+                if cand == parent.rule.first.row_index {
+                    continue;
+                }
+                let gid = group_ids[cand];
+                if candidate_group_is_excluded(&parent.rule, gid, params) {
+                    continue;
+                }
+                let row_ge1 = row_prefix(ge1_train, row_words_train, cand, needed_words_train);
+                let row_ge2 = row_prefix(ge2_train, row_words_train, cand, needed_words_train);
+                let row_summary = literal_summaries[cand];
+                for &op in beam_binary_ops_for_rule(&parent.rule).iter() {
+                    for &negated in &[false, true] {
+                        let Some((train, train_n_ge2, train_sum_ge1, train_sum_ge2)) =
+                            evaluate_child_train_from_parent_virtual_fuzzy(
+                                parent.combined_train_ge1.as_slice(),
+                                parent.combined_train_ge2.as_slice(),
+                                parent,
+                                row_ge1,
+                                row_ge2,
+                                row_summary,
+                                y_train,
+                                sum_y_train,
+                                n_train,
+                                parent.rule.len() + 1,
+                                op,
+                                negated,
+                                params,
+                            )
+                        else {
+                            continue;
+                        };
+                        let literal = BeamLiteral {
+                            row_index: cand,
+                            group_id: gid,
+                            negated,
+                        };
+                        let rule = if let Some(rule) =
+                            canonical_commutative_child_rule(&parent.rule, op, literal)
+                        {
+                            rule
+                        } else {
+                            let mut rule = parent.rule.clone();
+                            rule.rest.push((op, literal));
+                            rule
+                        };
+                        let single = literal_scores[literal_score_index(cand, negated)];
+                        let max_singleton_train_raw =
+                            parent.max_singleton_train_raw.max(single.train.raw_score);
+                        let max_singleton_test_raw =
+                            parent.max_singleton_test_raw.max(single.test.raw_score);
+                        let direct_parent_train_raw =
+                            parent.train.raw_score.max(single.train.raw_score);
+                        let (train_abs_score, train_score) = train_scores_for_rule(
+                            &rule,
+                            train,
+                            direct_parent_train_raw,
+                            None,
+                            None,
+                            params,
+                        );
+                        if !keep_child_after_parent_abs_improvement_pruning(
+                            parent.train_abs_score,
+                            rule.len(),
+                            train_abs_score,
+                            params,
+                        ) {
+                            continue;
+                        }
+                        if !keep_state_after_min_gain_pruning(rule.len(), train_score, params) {
+                            continue;
+                        }
+                        if !keep_child_after_parent_gain_pruning(&rule, train_score, params) {
+                            continue;
+                        }
+                        let mut child_ge1 = parent.combined_train_ge1.clone();
+                        let mut child_ge2 = parent.combined_train_ge2.clone();
+                        apply_literal_inplace_dual(
+                            child_ge1.as_mut_slice(),
+                            child_ge2.as_mut_slice(),
+                            row_ge1,
+                            row_ge2,
+                            op,
+                            negated,
+                            n_train,
+                        );
+                        let state = FuzzyBeamState {
+                            rule,
+                            combined_train_ge1: child_ge1,
+                            combined_train_ge2: child_ge2,
+                            train,
+                            train_n_ge2,
+                            train_sum_ge1,
+                            train_sum_ge2,
+                            train_abs_score,
+                            train_score,
+                            max_singleton_train_raw,
+                            max_singleton_test_raw,
+                        };
+                        match best.entry(state.rule.lexical_key()) {
+                            std::collections::hash_map::Entry::Vacant(slot) => {
+                                slot.insert(state);
+                            }
+                            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                                if cmp_fuzzy_state(&state, slot.get()) == std::cmp::Ordering::Less {
+                                    slot.insert(state);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut out = best.into_values().collect::<Vec<_>>();
+    out.sort_by(cmp_fuzzy_state);
+    Ok(filter_fuzzy_beam_candidates(out, next_cap, params))
 }
 
 fn expand_fuzzy_beam_once(
@@ -5975,7 +6394,30 @@ pub fn beam_search_train_test_continuous_fuzzy(
             kept_all.extend(beam.iter().cloned());
             beam
         };
-        for _depth in (exhaustive_depth + 1)..=max_depth {
+        let mut depth_start = exhaustive_depth + 1;
+        if params.whole_genome_dev_mode && exhaustive_depth == 1 && max_depth >= 2 {
+            let next = expand_fuzzy_beam_once_whole_genome_layer2(
+                beam.as_slice(),
+                y_train,
+                sum_y_train,
+                ge1_train,
+                ge2_train,
+                row_words_train,
+                n_rows,
+                needed_words_train,
+                n_train,
+                group_ids,
+                literal_scores.as_slice(),
+                literal_summaries.as_slice(),
+                &params,
+            )?;
+            if !next.is_empty() {
+                kept_all.extend(next.iter().cloned());
+                beam = next;
+            }
+            depth_start = 3;
+        }
+        for _depth in depth_start..=max_depth {
             let next = expand_fuzzy_beam_once(
                 beam.as_slice(),
                 y_train,
@@ -7561,6 +8003,88 @@ mod tests {
         let has_pos = out.iter().any(|c| !c.rule.first.negated);
         let has_neg = out.iter().any(|c| c.rule.first.negated);
         assert!(has_pos || has_neg, "expected at least some singletons");
+    }
+
+    #[test]
+    fn test_whole_genome_layer1_keeps_positive_singletons_only() {
+        init_python_for_tests();
+        let rows = vec![vec![1, 1, 0, 0, 1, 0, 1, 0], vec![0, 1, 0, 1, 0, 1, 0, 1]];
+        let y = vec![2.0, 2.1, -1.0, -1.1, 1.9, -0.9, 2.2, -1.2];
+        let (bits, row_words) = pack_rows(&rows, y.len());
+        let group_ids = vec![0usize, 1usize];
+        let out = beam_search_train_test_continuous(
+            &y,
+            &bits,
+            row_words,
+            rows.len(),
+            y.len(),
+            &y,
+            &bits,
+            row_words,
+            y.len(),
+            &group_ids,
+            BeamSearchParams {
+                max_pick: 1,
+                beam_width: 8,
+                whole_genome_dev_mode: true,
+                rank_mode: BeamRankMode::Raw,
+                ..BeamSearchParams::default()
+            },
+        )
+        .unwrap();
+        assert!(!out.is_empty());
+        assert!(out
+            .iter()
+            .all(|cand| cand.rule.rest.is_empty() && !cand.rule.first.negated));
+    }
+
+    #[test]
+    fn test_whole_genome_layer2_can_pair_with_smaller_index() {
+        init_python_for_tests();
+        let rows = vec![vec![1, 1, 0, 0], vec![1, 0, 1, 0], vec![1, 1, 1, 0]];
+        let y = vec![2.0, 1.0, -1.0, -2.0];
+        let (bits, row_words) = pack_rows(&rows, y.len());
+        let literal_scores = literal_scores_for_test(&y, &bits, row_words, rows.len());
+        let group_ids = vec![0usize, 1usize, 2usize];
+        let parent = beam_state_from_rule_for_test(
+            BeamRule {
+                first: BeamLiteral {
+                    row_index: 2,
+                    group_id: 2,
+                    negated: false,
+                },
+                rest: Vec::new(),
+            },
+            &y,
+            &bits,
+            row_words,
+            rows.len(),
+            literal_scores.as_slice(),
+        );
+        let next = expand_beam_once_whole_genome_layer2(
+            &[parent],
+            &y,
+            y.iter().copied().sum::<f64>(),
+            &bits,
+            row_words,
+            rows.len(),
+            words_for_samples(y.len()),
+            y.len(),
+            &group_ids,
+            literal_scores.as_slice(),
+            &BeamSearchParams {
+                rank_mode: BeamRankMode::Raw,
+                beam_width: 16,
+                allow_parallel: false,
+                whole_genome_dev_mode: true,
+                ..BeamSearchParams::default()
+            },
+        )
+        .unwrap();
+        let expected = vec![(0usize, false, 0u8), (2usize, false, 1u8)];
+        assert!(next
+            .iter()
+            .any(|state| state.rule.lexical_key() == expected));
     }
 
     #[test]

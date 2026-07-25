@@ -1964,6 +1964,8 @@ def _scan_mode_to_logic_unit_kind(scan_mode: str) -> str:
     mode = str(scan_mode).strip().lower()
     if mode == "window":
         return "window"
+    if mode == "wholegenome":
+        return "wholegenome"
     if mode == "gene":
         return "gene"
     if mode in {"genepair", "geneset"}:
@@ -2423,13 +2425,21 @@ def main() -> None:
             "Requires -gff/--gff3."
         ),
     )
+    scan_mode_group.add_argument(
+        "-wg",
+        "--whole-genome",
+        dest="whole_genome",
+        action="store_true",
+        default=False,
+        help=argparse.SUPPRESS,
+    )
 
     optional_group = parser.add_argument_group("Optional Arguments")
     optional_group.add_argument("-gff", "--gff3", type=str, default=None, help="GFF3 annotation.")
     optional_group.add_argument(
         "--scan-mode",
         type=str,
-        choices=["window", "gene", "genepair", "geneset"],
+        choices=["window", "gene", "genepair", "geneset", "wholegenome"],
         default=None,
         help=argparse.SUPPRESS,
     )
@@ -2608,7 +2618,11 @@ def main() -> None:
         parser.error(str(e))
 
     default_extension = 100_000
-    if args.window_args is not None:
+    if bool(args.whole_genome):
+        args.genefiles = []
+        args.extension = int(default_extension)
+        args.step = max(1, int(default_extension) // 2)
+    elif args.window_args is not None:
         args.extension, args.step = _resolve_window_scan_args(
             parser,
             args.window_args,
@@ -2636,7 +2650,9 @@ def main() -> None:
     ):
         parser.error("-k/--grm now expects a GRM path.")
 
-    if len(args.genefiles) > 0:
+    if bool(args.whole_genome):
+        args.scan_mode = "wholegenome"
+    elif len(args.genefiles) > 0:
         if not args.gff3:
             parser.error("-g/--genefile requires -gff/--gff3.")
         try:
@@ -2664,7 +2680,11 @@ def main() -> None:
         parser.error("-topk/--topk must be > 0")
     if int(args.fold) >= 2:
         parser.error("--fold train/test splitting is disabled; GARFIELD now only supports the full-sample path")
-    args.exhaustive_depth_runtime = 2 if int(args.layer) >= 2 else 1
+    args.exhaustive_depth_runtime = (
+        1
+        if str(args.scan_mode).lower() == "wholegenome"
+        else 2 if int(args.layer) >= 2 else 1
+    )
     if args.prior_not is not None:
         try:
             if not np.isfinite(float(args.prior_not)):
@@ -2676,6 +2696,8 @@ def main() -> None:
         args.engine = str(args.engine).upper()
         if args.engine == "AUTO":
             args.engine = "CORR"
+    if str(args.scan_mode).lower() == "wholegenome":
+        args.engine = "NONE"
 
     ml_skip_tokens = {"NONE", "SKIP", "DIRECT"}
     args.ml_top_k_runtime = int(args.width) if args.engine not in ml_skip_tokens else 0
@@ -2904,6 +2926,8 @@ def main() -> None:
             extension=int(args.extension),
             step=int(args.step),
         )
+    elif args.scan_mode == "wholegenome":
+        scan_unit_total = 1
     global_site_keep: Optional[np.ndarray] = None
     if bool(args.global_stats):
         global_site_keep = _prepare_site_keep(
@@ -3029,13 +3053,14 @@ def main() -> None:
             trait_cov = np.asarray(cov_all[cov_take, :], dtype=np.float64, order="C")
         scan_desc = {
             "window": "Scan Windows",
+            "wholegenome": "Scan Whole Genome",
             "gene": "Scan Genes",
             "genepair": "Scan Gene Pairs",
             "geneset": "Scan Gene Sets",
         }.get(str(args.scan_mode), f"Rust GARFIELD search for '{trait_name}'")
         logic_unit_kind = _scan_mode_to_logic_unit_kind(args.scan_mode)
-        rust_groups = group_intervals if args.scan_mode != "window" else None
-        rust_group_names = group_labels if args.scan_mode != "window" else None
+        rust_groups = group_intervals if args.scan_mode not in {"window", "wholegenome"} else None
+        rust_group_names = group_labels if args.scan_mode not in {"window", "wholegenome"} else None
         rust_null_groups = null_group_intervals if args.scan_mode == "geneset" else None
         trait_logic_prefix = f"{trait_outprefix}.garfield"
         # Rust handles full-data residualization before ML candidate search
@@ -3100,6 +3125,7 @@ def main() -> None:
                 rule_permutation=True,
                 prior_len=None,
                 no_clean=bool(args.no_clean),
+                whole_genome_dev_mode=bool(str(args.scan_mode).lower() == "wholegenome"),
                 progress_callback=progress_cb,
                 progress_every=0,
             ),

@@ -15,7 +15,7 @@ Write-Host "[2/4] Installing Python via uv..."
 uv python install $PythonVersion
 
 Write-Host "[3/4] Creating venv..."
-uv venv $EnvPath --python $PythonVersion
+uv venv $EnvPath --python $PythonVersion --clear
 
 Write-Host "[4/4] Installing janusx..."
 uv pip install --python "$EnvPath\Scripts\python.exe" $Package

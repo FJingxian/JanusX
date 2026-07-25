@@ -4964,14 +4964,6 @@ fn effective_threads_local(threads: usize) -> usize {
     }
 }
 
-#[inline]
-fn mask_to_indices(mask: &[bool], choose_value: bool) -> Vec<usize> {
-    mask.iter()
-        .enumerate()
-        .filter_map(|(i, &v)| if v == choose_value { Some(i) } else { None })
-        .collect()
-}
-
 fn subset_vec_f64(values: &[f64], indices: &[usize]) -> Result<Vec<f64>, String> {
     let mut out = Vec::<f64>::with_capacity(indices.len());
     for &idx in indices.iter() {
@@ -9700,19 +9692,15 @@ fn garfield_logic_search_bed_owned(
         }
     }
 
-    let split_applied = fold >= 2;
-    let (train_idx_local, test_idx_local) = if split_applied {
-        let test_mask = stratified_test_mask(&y, fold, seed)?;
-        let train_idx_local = mask_to_indices(&test_mask, false);
-        let test_idx_local = mask_to_indices(&test_mask, true);
-        if train_idx_local.is_empty() || test_idx_local.is_empty() {
-            return Err("train/test split produced an empty partition".to_string());
-        }
-        (train_idx_local, test_idx_local)
-    } else {
-        let full = (0..n_selected).collect::<Vec<_>>();
-        (full.clone(), full)
-    };
+    if fold >= 2 {
+        return Err(
+            "GARFIELD train/test splitting is disabled; only the full-sample path is supported."
+                .to_string(),
+        );
+    }
+    let split_applied = false;
+    let full = (0..n_selected).collect::<Vec<_>>();
+    let (train_idx_local, test_idx_local) = (full.clone(), full);
     let train_idx = train_idx_local
         .iter()
         .map(|&i| selected_sample_indices[i])

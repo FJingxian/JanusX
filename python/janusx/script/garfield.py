@@ -2507,11 +2507,7 @@ def main() -> None:
         "--fold",
         type=int,
         default=0,
-        help=(
-            "Holdout split used to separate GARFIELD rule discovery from pseudo-GWAS evaluation. "
-            "Use values >=2 to enable a 1/fold test split; 0 or 1 keeps the legacy full-data mode "
-            "and may substantially inflate pseudo-GWAS statistics."
-        ),
+        help=argparse.SUPPRESS,
     )
     optional_group.add_argument(
         "-no-clean",
@@ -2666,6 +2662,8 @@ def main() -> None:
         parser.error("-gain/--gain-layer must be >= 2")
     if int(args.rule_topk) <= 0:
         parser.error("-topk/--topk must be > 0")
+    if int(args.fold) >= 2:
+        parser.error("--fold train/test splitting is disabled; GARFIELD now only supports the full-sample path")
     args.exhaustive_depth_runtime = 2 if int(args.layer) >= 2 else 1
     if args.prior_not is not None:
         try:
@@ -3074,7 +3072,7 @@ def main() -> None:
                 min_samples_split=2,
                 bootstrap=True,
                 feature_subsample=0.0,
-                fold=max(0, int(args.fold)),
+                fold=0,
                 seed=trait_seed,
                 max_pick=int(args.layer),
                 exhaustive_depth=int(args.exhaustive_depth_runtime),

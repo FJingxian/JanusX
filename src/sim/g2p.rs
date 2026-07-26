@@ -783,7 +783,8 @@ fn logic_mode_code(mode: LogicGateMode) -> &'static str {
 #[inline]
 fn logic_member_negated(mode: LogicGateMode, idx: usize) -> bool {
     match mode {
-        LogicGateMode::A | LogicGateMode::Na => false,
+        LogicGateMode::A => false,
+        LogicGateMode::Na => idx == 0,
         LogicGateMode::An => idx > 0,
         LogicGateMode::Nan => true,
     }
@@ -791,7 +792,8 @@ fn logic_member_negated(mode: LogicGateMode, idx: usize) -> bool {
 
 #[inline]
 fn logic_output_negated(mode: LogicGateMode) -> bool {
-    matches!(mode, LogicGateMode::Na)
+    let _ = mode;
+    false
 }
 
 fn logic_gate_literal_rows(rows: &[Vec<u8>], mode: LogicGateMode) -> Result<Vec<Vec<u8>>, String> {
@@ -3477,7 +3479,7 @@ mod tests {
         );
         assert_eq!(
             logic_gate_indicator(&[a.clone(), b.clone()], LogicGateMode::Na).unwrap(),
-            vec![1u8, 1, 1, 0]
+            vec![0u8, 1, 0, 0]
         );
         assert_eq!(
             logic_gate_indicator(&[a.clone(), b.clone()], LogicGateMode::An).unwrap(),

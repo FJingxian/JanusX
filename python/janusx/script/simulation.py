@@ -471,7 +471,7 @@ def _write_fixed_effects_table(
             f"units={len(unit_rows)}, terms={len(fixed_rows)}."
         )
     with open(fixed_path, "w", encoding="utf-8") as fh:
-        fh.write("unit_kind\tunit_name\tkind\tsites\teffect\n")
+        fh.write("unit_kind\tunit_name\tkind\tsites\tlabel\teffect\n")
         for row_idx, row in enumerate(fixed_rows):
             term_id, _term_kind, logic, site_text, label, effect = row
             if row_idx < len(unit_rows):
@@ -482,6 +482,7 @@ def _write_fixed_effects_table(
                 unit_kind = "term"
                 unit_name = str(label).strip() if str(label).strip() != "" else str(site_text)
             kind = "s" if str(logic).strip().lower() in {"", "single"} else str(logic).strip().lower()
+            label_text = str(label).strip() if str(label).strip() != "" else str(site_text)
             fh.write(
                 "\t".join(
                     [
@@ -489,6 +490,7 @@ def _write_fixed_effects_table(
                         unit_name,
                         kind,
                         str(site_text),
+                        label_text,
                         f"{float(effect):.10f}",
                     ]
                 )
@@ -1501,14 +1503,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
             task.complete("Loading background GRM ...Finished")
         logger.info(
-            "Using external GRM: %s%s",
+            "Using external GRM: %s",
             format_path_for_display(str(args.grm)),
-            (
-                f" (ID: {format_path_for_display(str(resolved_grm_id))})"
-                if resolved_grm_id is not None
-                else " (sample order assumed to match genotype input)"
-            ),
         )
+        if resolved_grm_id is not None:
+            logger.info("  GRM ID: %s", format_path_for_display(str(resolved_grm_id)))
+        else:
+            logger.info("  Sample alignment: assumed to match genotype input.")
     elif float(args.bg_pve) > 0.0:
         aligned_grm, grm_cache_path, grm_input = _load_or_build_background_grm_auto(
             gfile=str(gfile),
@@ -1578,9 +1579,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             raise SystemExit(1) from exc
         bimrange_groups = [list(unit["intervals"]) for unit in selected_causal_units]
         logger.info(
-            "Selected %d causal GFF units from %s (ext=%d, mode=%s).",
+            "Selected %d causal GFF units from %s.",
             len(selected_causal_units),
             format_path_for_display(str(gff3_path)),
+        )
+        logger.info(
+            "  ext=%d, mode=%s",
             int(gff_extension or 0),
             str(gff_mode_label or "g1/g2"),
         )

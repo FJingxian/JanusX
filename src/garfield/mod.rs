@@ -3729,7 +3729,8 @@ fn parse_simbench_logic(raw: &str) -> Result<SimBenchLogic, String> {
 fn simbench_logic_member_negated(logic: SimBenchLogic, idx: usize) -> bool {
     match logic {
         SimBenchLogic::Single | SimBenchLogic::And | SimBenchLogic::Or => false,
-        SimBenchLogic::Na | SimBenchLogic::Nan => true,
+        SimBenchLogic::Na => idx == 0,
+        SimBenchLogic::Nan => true,
         SimBenchLogic::An => idx > 0,
     }
 }
@@ -3738,8 +3739,10 @@ fn simbench_logic_member_negated(logic: SimBenchLogic, idx: usize) -> bool {
 fn simbench_logic_join_op(logic: SimBenchLogic) -> Option<BeamBinaryOp> {
     match logic {
         SimBenchLogic::Single => None,
-        SimBenchLogic::And | SimBenchLogic::An | SimBenchLogic::Nan => Some(BeamBinaryOp::And),
-        SimBenchLogic::Or | SimBenchLogic::Na => Some(BeamBinaryOp::Or),
+        SimBenchLogic::And | SimBenchLogic::Na | SimBenchLogic::An | SimBenchLogic::Nan => {
+            Some(BeamBinaryOp::And)
+        }
+        SimBenchLogic::Or => Some(BeamBinaryOp::Or),
     }
 }
 
@@ -3766,8 +3769,14 @@ fn parse_simbench_sites(raw: &str) -> Result<Vec<(String, i32)>, String> {
     Ok(out)
 }
 
-fn parse_simbench_label_alleles(label: &str) -> Vec<(String, String)> {
-    let mut out = Vec::<(String, String)>::new();
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SimBenchLabelAlleleSpec {
+    RefAlt(String, String),
+    Target(String),
+}
+
+fn parse_simbench_label_alleles(label: &str) -> Vec<SimBenchLabelAlleleSpec> {
+    let mut out = Vec::<SimBenchLabelAlleleSpec>::new();
     let mut rest = label;
     while let Some(lb) = rest.find('[') {
         let after_lb = &rest[lb + 1..];
@@ -3776,10 +3785,15 @@ fn parse_simbench_label_alleles(label: &str) -> Vec<(String, String)> {
         };
         let inside = &after_lb[..rb_rel];
         if let Some((a0, a1)) = inside.split_once('>') {
-            out.push((
+            out.push(SimBenchLabelAlleleSpec::RefAlt(
                 a0.trim().to_ascii_uppercase(),
                 a1.trim().to_ascii_uppercase(),
             ));
+        } else {
+            let allele = inside.trim().to_ascii_uppercase();
+            if !allele.is_empty() {
+                out.push(SimBenchLabelAlleleSpec::Target(allele));
+            }
         }
         rest = &after_lb[rb_rel + 1..];
     }
@@ -3856,7 +3870,16 @@ fn parse_simbench_terms(path: &str) -> Result<Vec<SimBenchTerm>, String> {
         let sites =
             parse_simbench_sites(&sites_text).map_err(|e| format!("{path}:{line_no}: {e}"))?;
         let unit_name = unit_name_idx.map(get_field).unwrap_or("").to_string();
-        let label = label_idx.map(get_field).unwrap_or("").to_string();
+        let label = if let Some(idx) = label_idx {
+            get_field(idx).to_string()
+        } else {
+            let unit_trimmed = unit_name.trim();
+            if unit_trimmed.contains('[') && unit_trimmed.contains(']') {
+                unit_trimmed.to_string()
+            } else {
+                String::new()
+            }
+        };
         out.push(SimBenchTerm {
             term_id,
             kind,
@@ -3913,18 +3936,31 @@ fn simbench_effective_negations<S: GarfieldDisplaySite>(
     (0..sites.len())
         .map(|idx| {
             let base_negated = simbench_logic_member_negated(term.logic, idx);
-            let Some((label_ref, label_alt)) = label_alleles.get(idx) else {
+            let Some(label_spec) = label_alleles.get(idx) else {
                 return base_negated;
             };
             let site_ref =
                 clean_logic_allele_label(sites[idx].garfield_ref_allele()).to_ascii_uppercase();
             let site_alt =
                 clean_logic_allele_label(sites[idx].garfield_alt_allele()).to_ascii_uppercase();
-            let swapped = *label_ref == site_alt && *label_alt == site_ref;
-            if swapped {
-                !base_negated
-            } else {
-                base_negated
+            match label_spec {
+                SimBenchLabelAlleleSpec::RefAlt(label_ref, label_alt) => {
+                    let swapped = *label_ref == site_alt && *label_alt == site_ref;
+                    if swapped {
+                        !base_negated
+                    } else {
+                        base_negated
+                    }
+                }
+                SimBenchLabelAlleleSpec::Target(target) => {
+                    if *target == site_alt {
+                        base_negated
+                    } else if *target == site_ref {
+                        !base_negated
+                    } else {
+                        base_negated
+                    }
+                }
             }
         })
         .collect()
@@ -14122,17 +14158,29 @@ mod tests {
 
     #[test]
     fn test_simbench_rule_from_negations_preserves_negation_semantics() {
-        let na_rule = simbench_rule_from_negations(SimBenchLogic::Na, &[true, true]).unwrap();
+        let na_rule = simbench_rule_from_negations(SimBenchLogic::Na, &[true, false]).unwrap();
         assert!(na_rule.first.negated);
         assert_eq!(na_rule.rest.len(), 1);
-        assert_eq!(na_rule.rest[0].0, BeamBinaryOp::Or);
-        assert!(na_rule.rest[0].1.negated);
+        assert_eq!(na_rule.rest[0].0, BeamBinaryOp::And);
+        assert!(!na_rule.rest[0].1.negated);
 
         let an_rule = simbench_rule_from_negations(SimBenchLogic::An, &[false, true]).unwrap();
         assert!(!an_rule.first.negated);
         assert_eq!(an_rule.rest.len(), 1);
         assert_eq!(an_rule.rest[0].0, BeamBinaryOp::And);
         assert!(an_rule.rest[0].1.negated);
+    }
+
+    #[test]
+    fn test_parse_simbench_label_alleles_accepts_target_only_format() {
+        let parsed = parse_simbench_label_alleles("8_1[G]&8_2[T]");
+        assert_eq!(
+            parsed,
+            vec![
+                SimBenchLabelAlleleSpec::Target("G".to_string()),
+                SimBenchLabelAlleleSpec::Target("T".to_string()),
+            ]
+        );
     }
 
     #[test]

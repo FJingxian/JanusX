@@ -2121,6 +2121,26 @@ def _emit_garfield_bg_noise_summary_to_log(
             f"dataset={dataset}, quantile={quantile_label} ({float(quantile_value):.4f})"
         ),
     )
+    tsv_rows: list[str] = [
+        "\t".join(
+            [
+                "trait",
+                "dataset",
+                "bucket",
+                "kind",
+                "quantile",
+                "penalty",
+                "mean",
+                "variance",
+                "n",
+                "min",
+                "q25",
+                "median",
+                "q75",
+                "max",
+            ]
+        )
+    ]
     for bucket in buckets:
         if not isinstance(bucket, dict):
             continue
@@ -2135,8 +2155,33 @@ def _emit_garfield_bg_noise_summary_to_log(
                     f"penalty={_garfield_format_metric4(search.get('penalty'))}, "
                     f"mean={_garfield_format_metric4(search.get('mean'))}, "
                     f"var={_garfield_format_metric4(search.get('variance'))}, "
-                    f"n={int(search.get('n', 0) or 0)}"
+                    f"n={int(search.get('n', 0) or 0)}, "
+                    f"min={_garfield_format_metric4(search.get('min'))}, "
+                    f"q25={_garfield_format_metric4(search.get('q25'))}, "
+                    f"median={_garfield_format_metric4(search.get('median'))}, "
+                    f"q75={_garfield_format_metric4(search.get('q75'))}, "
+                    f"max={_garfield_format_metric4(search.get('max'))}"
                 ),
+            )
+            tsv_rows.append(
+                "\t".join(
+                    [
+                        str(trait_name),
+                        dataset,
+                        label,
+                        "search",
+                        _garfield_format_metric4(search.get("quantile")),
+                        _garfield_format_metric4(search.get("penalty")),
+                        _garfield_format_metric4(search.get("mean")),
+                        _garfield_format_metric4(search.get("variance")),
+                        str(int(search.get("n", 0) or 0)),
+                        _garfield_format_metric4(search.get("min")),
+                        _garfield_format_metric4(search.get("q25")),
+                        _garfield_format_metric4(search.get("median")),
+                        _garfield_format_metric4(search.get("q75")),
+                        _garfield_format_metric4(search.get("max")),
+                    ]
+                )
             )
         _emit_garfield_file_only_line(
             logger,
@@ -2145,9 +2190,40 @@ def _emit_garfield_bg_noise_summary_to_log(
                 f"penalty={_garfield_format_metric4(output.get('penalty'))}, "
                 f"mean={_garfield_format_metric4(output.get('mean'))}, "
                 f"var={_garfield_format_metric4(output.get('variance'))}, "
-                f"n={int(output.get('n', 0) or 0)}"
+                f"n={int(output.get('n', 0) or 0)}, "
+                f"min={_garfield_format_metric4(output.get('min'))}, "
+                f"q25={_garfield_format_metric4(output.get('q25'))}, "
+                f"median={_garfield_format_metric4(output.get('median'))}, "
+                f"q75={_garfield_format_metric4(output.get('q75'))}, "
+                f"max={_garfield_format_metric4(output.get('max'))}"
             ),
         )
+        tsv_rows.append(
+            "\t".join(
+                [
+                    str(trait_name),
+                    dataset,
+                    label,
+                    "output",
+                    _garfield_format_metric4(output.get("quantile")),
+                    _garfield_format_metric4(output.get("penalty")),
+                    _garfield_format_metric4(output.get("mean")),
+                    _garfield_format_metric4(output.get("variance")),
+                    str(int(output.get("n", 0) or 0)),
+                    _garfield_format_metric4(output.get("min")),
+                    _garfield_format_metric4(output.get("q25")),
+                    _garfield_format_metric4(output.get("median")),
+                    _garfield_format_metric4(output.get("q75")),
+                    _garfield_format_metric4(output.get("max")),
+                ]
+            )
+        )
+    _emit_garfield_file_only_line(
+        logger,
+        "GARFIELD bg-noise table (TSV; copy/paste into Excel):",
+    )
+    for row in tsv_rows:
+        _emit_garfield_file_only_line(logger, row)
 
 
 def _load_json_if_exists(path: Optional[str]):

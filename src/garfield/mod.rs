@@ -3063,6 +3063,11 @@ fn rule_null_distribution_summary_to_pydict<'py>(
     out.set_item("mean", summary.mean)?;
     out.set_item("variance", summary.variance)?;
     out.set_item("n", summary.n)?;
+    out.set_item("min", summary.min)?;
+    out.set_item("q25", summary.q25)?;
+    out.set_item("median", summary.median)?;
+    out.set_item("q75", summary.q75)?;
+    out.set_item("max", summary.max)?;
     Ok(out)
 }
 

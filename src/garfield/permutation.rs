@@ -58,6 +58,11 @@ pub struct RuleNullGlobalStats {
     pub mean: f64,
     pub sample_std: f64,
     pub n: usize,
+    pub min: f64,
+    pub q25: f64,
+    pub median: f64,
+    pub q75: f64,
+    pub max: f64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -67,6 +72,11 @@ pub struct RuleNullDistributionSummary {
     pub mean: f64,
     pub variance: f64,
     pub n: usize,
+    pub min: f64,
+    pub q25: f64,
+    pub median: f64,
+    pub q75: f64,
+    pub max: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -376,28 +386,44 @@ fn sample_min_safe(scores: &[f64], q: f64) -> Option<f64> {
 
 #[inline]
 fn summarize_scores(scores: &[f64]) -> Option<RuleNullGlobalStats> {
+    let mut finite = scores
+        .iter()
+        .copied()
+        .filter(|x| x.is_finite())
+        .collect::<Vec<_>>();
+    if finite.is_empty() {
+        return None;
+    }
+    finite.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
     let mut n = 0usize;
     let mut mean = 0.0_f64;
     let mut m2 = 0.0_f64;
-    for value in scores.iter().copied().filter(|x| x.is_finite()) {
+    for value in finite.iter().copied() {
         n += 1;
         let delta = value - mean;
         mean += delta / (n as f64);
         let delta2 = value - mean;
         m2 += delta * delta2;
     }
-    if n == 0 {
-        return None;
-    }
     let sample_std = if n >= 2 {
         (m2 / ((n - 1) as f64)).sqrt()
     } else {
         0.0
     };
+    let min = *finite.first().unwrap_or(&f64::NAN);
+    let max = *finite.last().unwrap_or(&f64::NAN);
+    let q25 = quantile_nearest_rank_sorted(finite.as_slice(), 0.25).unwrap_or(min);
+    let median = quantile_nearest_rank_sorted(finite.as_slice(), 0.50).unwrap_or(min);
+    let q75 = quantile_nearest_rank_sorted(finite.as_slice(), 0.75).unwrap_or(max);
     Some(RuleNullGlobalStats {
         mean,
         sample_std,
         n,
+        min,
+        q25,
+        median,
+        q75,
+        max,
     })
 }
 
@@ -628,6 +654,11 @@ impl RuleNullPenaltyLookup {
             mean: stats.mean,
             variance: stats.sample_std * stats.sample_std,
             n: stats.n,
+            min: stats.min,
+            q25: stats.q25,
+            median: stats.median,
+            q75: stats.q75,
+            max: stats.max,
         })
     }
 
@@ -663,6 +694,11 @@ impl RuleNullPenaltyLookup {
             mean: stats.mean,
             variance: stats.sample_std * stats.sample_std,
             n: stats.n,
+            min: stats.min,
+            q25: stats.q25,
+            median: stats.median,
+            q75: stats.q75,
+            max: stats.max,
         })
     }
 
@@ -696,6 +732,11 @@ impl RuleNullPenaltyLookup {
             mean: stats.mean,
             variance: stats.sample_std * stats.sample_std,
             n: stats.n,
+            min: stats.min,
+            q25: stats.q25,
+            median: stats.median,
+            q75: stats.q75,
+            max: stats.max,
         })
     }
 
@@ -954,6 +995,16 @@ pub fn structure_prior_penalty(
     prior.map(|p| p.penalty(rule_len, n_not)).unwrap_or(0.0)
 }
 
+fn quantile_nearest_rank_sorted(values: &[f64], quantile: f64) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let qq = quantile.clamp(0.0, 1.0);
+    let idx = ((values.len() as f64) * qq).ceil() as usize;
+    let idx = idx.saturating_sub(1).min(values.len() - 1);
+    Some(values[idx])
+}
+
 fn quantile_nearest_rank(values: &[f64], quantile: f64) -> Option<f64> {
     let mut v = values
         .iter()
@@ -964,10 +1015,7 @@ fn quantile_nearest_rank(values: &[f64], quantile: f64) -> Option<f64> {
         return None;
     }
     v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-    let qq = quantile.clamp(0.0, 1.0);
-    let idx = ((v.len() as f64) * qq).ceil() as usize;
-    let idx = idx.saturating_sub(1).min(v.len() - 1);
-    Some(v[idx])
+    quantile_nearest_rank_sorted(v.as_slice(), quantile)
 }
 
 #[inline]
@@ -1156,6 +1204,11 @@ mod tests {
         assert!((summary.mean - 10.5).abs() < 1e-12);
         assert!((summary.variance - 35.0).abs() < 1e-12);
         assert_eq!(summary.n, 20);
+        assert_eq!(summary.min, 1.0);
+        assert_eq!(summary.q25, 5.0);
+        assert_eq!(summary.median, 10.0);
+        assert_eq!(summary.q75, 15.0);
+        assert_eq!(summary.max, 20.0);
     }
 
     #[test]
@@ -1171,6 +1224,11 @@ mod tests {
         assert_eq!(summary.penalty, 320.0);
         assert!((summary.mean - 260.5).abs() < 1e-12);
         assert_eq!(summary.n, 40);
+        assert_eq!(summary.min, 201.0);
+        assert_eq!(summary.q25, 210.0);
+        assert_eq!(summary.median, 220.0);
+        assert_eq!(summary.q75, 310.0);
+        assert_eq!(summary.max, 320.0);
     }
 
     #[test]

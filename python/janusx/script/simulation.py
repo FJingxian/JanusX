@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+from dataclasses import dataclass
 import logging
 import os
 import re
@@ -53,6 +54,20 @@ from ._common.progress import CliStatus, ProgressAdapter, format_elapsed, log_su
 from ._common.threads import detect_effective_threads
 
 
+@dataclass(frozen=True)
+class CausalSpec:
+    count: int
+    effect_model: Literal["equal", "geometric"]
+
+
+@dataclass(frozen=True)
+class GffSamplingSpec:
+    path: str
+    extension: int
+    unit_sizes: tuple[int, ...]
+    mode_label: str
+
+
 def _parse_bimrange(text: str) -> tuple[str, int, int]:
     raw = str(text).strip()
     parts = raw.split(":")
@@ -80,23 +95,58 @@ def _parse_nonnegative_int(text: str, *, label: str) -> int:
     return value
 
 
+def _resolve_causal_spec(raw_args: Optional[list[str]]) -> CausalSpec:
+    values = [] if raw_args is None else [str(x).strip() for x in raw_args if str(x).strip() != ""]
+    if len(values) == 0:
+        return CausalSpec(count=1, effect_model="equal")
+    if len(values) > 2:
+        raise ValueError("`-causal/--causal` accepts NUMBER [equal|geometric].")
+    count = _parse_nonnegative_int(values[0], label="`-causal/--causal NUMBER`")
+    effect_model = "equal" if len(values) == 1 else str(values[1]).strip().lower()
+    if effect_model not in {"equal", "geometric"}:
+        raise ValueError(
+            "`-causal/--causal` effect model must be one of: equal, geometric."
+        )
+    return CausalSpec(count=int(count), effect_model=effect_model)  # type: ignore[arg-type]
+
+
 def _resolve_gff_sampling_spec(
     raw_args: Optional[list[str]],
     *,
     default_extension: int = 100_000,
-) -> tuple[Optional[str], Optional[int]]:
+) -> Optional[GffSamplingSpec]:
     values = [] if raw_args is None else [str(x).strip() for x in raw_args if str(x).strip() != ""]
     if len(values) == 0:
-        return None, None
-    if len(values) > 2:
-        raise ValueError("`-gff/--gff3` accepts GFF3 [EXT].")
+        return None
+    if len(values) > 3:
+        raise ValueError("`-gff/--gff3` accepts GFFFILE [EXTENSION] [g1|g2|g3].")
     gff3_path = values[0]
-    extension = (
-        int(default_extension)
-        if len(values) == 1
-        else _parse_nonnegative_int(values[1], label="`-gff/--gff3 EXT`")
+    extension = int(default_extension)
+    unit_sizes: tuple[int, ...] = (1, 2)
+    mode_label = "g1/g2"
+    saw_extension = False
+    saw_mode = False
+    for token in values[1:]:
+        token_lc = str(token).strip().lower()
+        if token_lc in {"g1", "g2", "g3"}:
+            if saw_mode:
+                raise ValueError("`-gff/--gff3` accepts at most one of g1/g2/g3.")
+            unit_sizes = (int(token_lc[1:]),)
+            mode_label = token_lc
+            saw_mode = True
+            continue
+        if saw_extension:
+            raise ValueError(
+                "`-gff/--gff3` accepts at most one EXTENSION plus one optional g1/g2/g3 mode."
+            )
+        extension = _parse_nonnegative_int(token, label="`-gff/--gff3 EXTENSION`")
+        saw_extension = True
+    return GffSamplingSpec(
+        path=gff3_path,
+        extension=int(extension),
+        unit_sizes=tuple(sorted(set(int(x) for x in unit_sizes if int(x) > 0))),
+        mode_label=mode_label,
     )
-    return gff3_path, int(extension)
 
 
 def _load_gene_catalog_from_gff(
@@ -272,16 +322,23 @@ def _sample_causal_gene_units(
     *,
     causal_count: int,
     seed: int,
+    unit_sizes: tuple[int, ...] = (1, 2),
     active_positions: Optional[dict[str, list[int]]] = None,
     min_unit_active_sites: int = 1,
     blocked_unit_names: Optional[set[str]] = None,
 ) -> list[dict[str, Any]]:
     if int(causal_count) <= 0:
         return []
-    if len(gene_catalog) < int(causal_count):
+    allowed_sizes = tuple(sorted(set(int(x) for x in unit_sizes if int(x) > 0)))
+    if len(allowed_sizes) == 0:
+        raise ValueError("Internal error: GFF unit_sizes must contain at least one positive size.")
+    min_unit_size = int(min(allowed_sizes))
+    if len(gene_catalog) < int(causal_count) * int(min_unit_size):
         raise ValueError(
-            "Not enough genes in GFF3 to sample the requested number of causal units "
-            f"without replacement: genes={len(gene_catalog)}, causal={int(causal_count)}."
+            "Not enough genes in GFF3 to sample the requested number of causal units without "
+            "replacement: "
+            f"genes={len(gene_catalog)}, causal={int(causal_count)}, "
+            f"min_unit_size={int(min_unit_size)}."
         )
     rng = np.random.default_rng(int(seed) ^ 0x5EED_91A7)
     blocked = set() if blocked_unit_names is None else {str(x) for x in blocked_unit_names}
@@ -293,16 +350,25 @@ def _sample_causal_gene_units(
         remaining = [item for item in gene_catalog if str(item[0]) not in used_genes]
         units_left = int(causal_count) - len(units)
         genes_left = len(remaining)
-        if genes_left < units_left:
+        if genes_left < units_left * int(min_unit_size):
             raise ValueError(
                 "Not enough unused genes remain to finish GFF causal-unit sampling after "
                 f"filtering / redraw: remaining_genes={genes_left}, units_left={units_left}, "
-                f"blocked_units={len(blocked)}."
+                f"blocked_units={len(blocked)}, min_unit_size={int(min_unit_size)}."
             )
         accepted = False
-        feasible_sizes = [1]
-        if genes_left - 2 >= (units_left - 1):
-            feasible_sizes.append(2)
+        feasible_sizes = [
+            int(size)
+            for size in allowed_sizes
+            if int(size) <= genes_left
+            and (genes_left - int(size)) >= (units_left - 1) * int(min_unit_size)
+        ]
+        if len(feasible_sizes) == 0:
+            raise ValueError(
+                "No feasible GFF unit size remains under the current without-replacement "
+                f"constraints: remaining_genes={genes_left}, units_left={units_left}, "
+                f"allowed_sizes={','.join(str(x) for x in allowed_sizes)}."
+            )
         inner_budget = max(64, len(remaining) * 8)
         while inner_budget > 0:
             inner_budget -= 1
@@ -482,9 +548,11 @@ def _weights_from_gate_size_range(k_min: int, k_max: int) -> list[float]:
 
 def _resolve_logic_config(
     args: argparse.Namespace,
+    *,
+    causal_count: int,
 ) -> tuple[Optional[str], Optional[list[float]], int, int, Optional[int]]:
     if args.logic_gate is not None:
-        if int(args.causal) <= 0:
+        if int(causal_count) <= 0:
             raise ValueError("`--causal` must be > 0 when `--logic-gate` is enabled.")
         if len(args.logic_gate) != 2:
             raise ValueError(
@@ -639,6 +707,7 @@ def _run_rust_simulation(
     bg_pve: float,
     residual_var: float,
     causal: int,
+    causal_effect_model: str,
     cs_pve: Optional[float],
     bimranges: list[tuple[str, int, int]],
     bimrange_groups: Optional[list[list[tuple[str, int, int]]]],
@@ -696,6 +765,7 @@ def _run_rust_simulation(
             gamma_scale=float(gamma_scale),
             laplace_scale=float(laplace_scale),
             causal_count=int(max(0, causal)),
+            causal_effect_model=str(causal_effect_model),
             causal_pve=None if cs_pve is None else float(cs_pve),
             bim_ranges=list(bimranges),
             bim_range_groups=(
@@ -758,6 +828,7 @@ def simulate_phenotype_from_genofile(
     and_af_max: float = 0.98,
     and_target_pve: float = 0.2,
     and_max_iter: int = 100,
+    causal_effect_model: Literal["equal", "geometric"] = "equal",
     logic_effect_model: Literal["gate", "centered_interaction"] = "gate",
 ) -> tuple[np.ndarray, list[tuple[str, int, int]]]:
     logic_mode = "a" if str(mode).lower() == "garfield" else None
@@ -802,6 +873,7 @@ def simulate_phenotype_from_genofile(
         bg_pve=float(pve),
         residual_var=float(ve),
         causal=1,
+        causal_effect_model=str(causal_effect_model),
         cs_pve=float(and_target_pve) if logic_mode is not None else None,
         bimranges=[],
         bimrange_groups=None,
@@ -1109,14 +1181,14 @@ def _plot_random_effect_distribution(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = CliArgumentParser(
-        prog="jx sim",
+        prog="jx simulation",
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog(
             [
-                "jx sim -bfile geno_prefix -o out -prefix demo",
-                "jx sim -vcf geno.vcf.gz -causal 3 -cs-pve 0.15 -o out",
-                "jx sim -bfile geno_prefix -logic-gate r 3,1,0.5 -causal 100 -bg-pve 0.4 -o out",
-                "jx sim -bfile geno_prefix -k panel.grm.npy -o out -prefix demo",
+                "jx simulation -bfile geno_prefix -o out -prefix demo",
+                "jx simulation -vcf geno.vcf.gz -causal 3 -cs-pve 0.15 -o out",
+                "jx simulation -bfile geno_prefix -logic-gate r 3,1,0.5 -causal 100 -bg-pve 0.4 -o out",
+                "jx simulation -bfile geno_prefix -k panel.grm.npy -o out -prefix demo",
             ]
         ),
         description="JanusX simulation: phenotype from existing genotype (Rust-first)",
@@ -1174,12 +1246,15 @@ def build_parser() -> argparse.ArgumentParser:
     causal_group.add_argument(
         "-causal",
         "--causal",
-        type=int,
-        default=1,
+        nargs="+",
+        metavar=("NUMBER", "MODEL"),
+        default=["1"],
         help=(
-            "Total number of causal terms. Without --logic-gate these are additive single-site "
-            "terms. With --logic-gate, each term size is sampled from the supplied weight vector; "
-            "size 1 denotes a single-site additive term."
+            "Causal term specification: NUMBER, with an optional equal or geometric effect model. "
+            "NUMBER is the total number "
+            "of causal terms. Without --logic-gate these are additive single-site terms. With "
+            "--logic-gate, each term size is sampled from the supplied weight vector; size 1 "
+            "denotes a single-site additive term. Effect allocation defaults to equal."
         ),
     )
     causal_group.add_argument(
@@ -1218,17 +1293,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     causal_group.add_argument(
-        "--logic-effect-model",
-        type=str,
-        choices=["gate", "centered_interaction"],
-        default="gate",
-        help=(
-            "Logic-term effect model. 'gate' keeps the current mean-centered gate effect; "
-            "'centered_interaction' removes member main effects and builds a weak-marginal "
-            "interaction benchmark."
-        ),
-    )
-    causal_group.add_argument(
         "-bimrange",
         "--bimrange",
         action="append",
@@ -1239,13 +1303,13 @@ def build_parser() -> argparse.ArgumentParser:
         "-gff",
         "--gff3",
         nargs="+",
-        metavar="ARG",
+        metavar=("GFFFILE", "EXTENSION"),
         default=None,
         help=(
-            "Sample causal gene/gene-set units from GFF3. Use `-gff GFF3 [EXT]`. "
-            "When enabled, simulation draws --causal units without replacement; each unit "
-            "contains one gene or a two-gene set, and every causal term is constrained to "
-            "the selected unit window(s)."
+            "Sample causal gene/gene-set units from GFF3. Use `-gff GFFFILE`, optionally "
+            "followed by EXTENSION and an optional g1/g2/g3 mode in either order. Default mode "
+            "mixes g1/g2, matching the current random single-gene / two-gene strategy. "
+            "g1 forces single-gene units; g2 and g3 force exact two-gene or three-gene units."
         ),
     )
     # bg_group.add_argument(
@@ -1273,13 +1337,19 @@ def main(argv: Optional[list[str]] = None) -> int:
     seed = int(args.seed) if args.seed is not None else int(time.time()) & 0x7FFFFFFF
     bimranges = [_parse_bimrange(x) for x in list(args.bimrange or [])]
     try:
+        causal_spec = _resolve_causal_spec(args.causal)
         logic_mode, logic_size_weights, logic_k_min, logic_k_max, logic_window_bp = (
-            _resolve_logic_config(args)
+            _resolve_logic_config(args, causal_count=int(causal_spec.count))
         )
-        gff3_path, gff_extension = _resolve_gff_sampling_spec(args.gff3)
+        gff_spec = _resolve_gff_sampling_spec(args.gff3)
     except ValueError as exc:
         logger.error("%s", exc)
         raise SystemExit(2) from exc
+    causal_count = int(causal_spec.count)
+    causal_effect_model = str(causal_spec.effect_model)
+    gff3_path = None if gff_spec is None else str(gff_spec.path)
+    gff_extension = None if gff_spec is None else int(gff_spec.extension)
+    gff_mode_label = None if gff_spec is None else str(gff_spec.mode_label)
     logic_gate_count = None
     cs_pve = float(args.cs_pve) if args.cs_pve is not None else None
     causal_maf_min = max(
@@ -1291,7 +1361,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     logic_af_min = 0.0
     logic_af_max = 1.0
     logic_max_iter = 256
-    logic_effect_model = str(args.logic_effect_model).strip().lower()
+    logic_effect_model = "gate"
     logic_enabled_sizes = (
         ",".join(str(i + 1) for i, weight in enumerate(logic_size_weights) if weight > 0.0)
         if logic_size_weights is not None
@@ -1321,6 +1391,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                     ("Causal lMAF", causal_maf_min),
                     ("Causal GFF", gff3_path),
                     ("Causal GFF ext", gff_extension),
+                    ("Causal GFF mode", gff_mode_label),
                     (
                         "Background path",
                         (
@@ -1333,13 +1404,13 @@ def main(argv: Optional[list[str]] = None) -> int:
                             )
                         ),
                     ),
-                    ("Causal count", args.causal),
+                    ("Causal count", causal_count),
+                    ("Causal effect model", causal_effect_model),
                     ("Causal PVE", cs_pve),
                     ("Logic gate", "None" if logic_mode is None else logic_mode),
                     ("Logic sizes", logic_enabled_sizes),
                     ("Logic size weights", logic_weight_text),
                     ("Logic window bp", logic_window_bp),
-                    ("Logic effect model", logic_effect_model if logic_mode is not None else "None"),
                     ("Background dist", "gaussian sample-space"),
                     ("Sampling scale", "expectation-scale"),
                     ("SNPs only", False),
@@ -1375,11 +1446,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.lmaf is not None and not (0.0 <= float(args.lmaf) <= 0.5):
         logger.error("--lmaf must be in [0, 0.5].")
         raise SystemExit(1)
-    if int(args.causal) < len(bimranges):
+    if int(causal_count) < len(bimranges):
         logger.error(
             "--causal must be >= number of --bimrange constraints. "
             "Got causal=%d and bimranges=%d.",
-            int(args.causal),
+            int(causal_count),
             len(bimranges),
         )
         raise SystemExit(1)
@@ -1496,8 +1567,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
             selected_causal_units = _sample_causal_gene_units(
                 filtered_gene_catalog,
-                causal_count=int(args.causal),
+                causal_count=int(causal_count),
                 seed=seed,
+                unit_sizes=(1, 2) if gff_spec is None else tuple(gff_spec.unit_sizes),
                 active_positions=active_pos_index,
                 min_unit_active_sites=int(gff_logic_min_unit_sites),
             )
@@ -1506,13 +1578,14 @@ def main(argv: Optional[list[str]] = None) -> int:
             raise SystemExit(1) from exc
         bimrange_groups = [list(unit["intervals"]) for unit in selected_causal_units]
         logger.info(
-            "Selected %d causal gene/gene-set units from %s (ext=%d).",
+            "Selected %d causal GFF units from %s (ext=%d, mode=%s).",
             len(selected_causal_units),
             format_path_for_display(str(gff3_path)),
             int(gff_extension or 0),
+            str(gff_mode_label or "g1/g2"),
         )
     scan_passes = _estimate_simulation_scan_passes(
-        causal_count=int(args.causal),
+        causal_count=int(causal_count),
         cs_pve=cs_pve,
         bimranges=bimranges,
         logic_mode=logic_mode,
@@ -1521,7 +1594,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     progress_total_hint = int(max(0, n_sites))
     blocked_gff_unit_names: set[str] = set()
-    max_gff_logic_redraw_attempts = max(8, int(args.causal) * 4)
+    max_gff_logic_redraw_attempts = max(8, int(causal_count) * 4)
     redraw_attempt = 0
     _simulation_section(logger, "Phenotype Simulation")
     logger.info(
@@ -1580,7 +1653,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 het_threshold=None if args.het is None else float(args.het),
                 bg_pve=float(args.bg_pve),
                 residual_var=1.0,
-                causal=int(args.causal),
+                causal=int(causal_count),
+                causal_effect_model=causal_effect_model,
                 cs_pve=cs_pve,
                 bimranges=bimranges,
                 bimrange_groups=bimrange_groups,
@@ -1618,7 +1692,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 and logic_mode is not None
                 and active_pos_index is not None
                 and len(filtered_gene_catalog) > 0
-                and len(selected_causal_units) == int(args.causal)
+                and len(selected_causal_units) == int(causal_count)
                 and failed_unit_idx is not None
                 and 0 <= int(failed_unit_idx) < len(selected_causal_units)
                 and redraw_attempt < int(max_gff_logic_redraw_attempts)
@@ -1630,8 +1704,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             redraw_attempt += 1
             selected_causal_units = _sample_causal_gene_units(
                 filtered_gene_catalog,
-                causal_count=int(args.causal),
+                causal_count=int(causal_count),
                 seed=seed + int(redraw_attempt) * 1009,
+                unit_sizes=(1, 2) if gff_spec is None else tuple(gff_spec.unit_sizes),
                 active_positions=active_pos_index,
                 min_unit_active_sites=int(gff_logic_min_unit_sites),
                 blocked_unit_names=blocked_gff_unit_names,

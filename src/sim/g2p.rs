@@ -52,6 +52,12 @@ enum LogicEffectModel {
     CenteredInteraction,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CausalEffectModel {
+    Equal,
+    Geometric,
+}
+
 #[derive(Clone, Debug)]
 struct LogicPoolSpec {
     pool_indices: Vec<usize>,
@@ -82,7 +88,7 @@ struct CausalTerm {
 
 const SAMPLE_PAR_THRESHOLD: usize = 10_000;
 const SAMPLE_PAR_CHUNK: usize = 4096;
-const DEFAULT_CAUSAL_SERIES_ALPHA: f64 = 0.9;
+const DEFAULT_CAUSAL_GEOMETRIC_ALPHA: f64 = 0.9;
 const BED_SIM_FAST_WINDOW_MB: usize = 64;
 
 struct G2pSimConfig {
@@ -96,6 +102,7 @@ struct G2pSimConfig {
     residual_var: f64,
     bg_pve: f64,
     causal_count: usize,
+    causal_effect_model: CausalEffectModel,
     causal_pve: Option<f64>,
     bim_ranges: Vec<(String, i32, i32)>,
     bim_range_groups: Vec<Vec<(String, i32, i32)>>,
@@ -137,6 +144,7 @@ struct G2pSimResult {
     bg_pve: f64,
     causal_pve: f64,
     residual_var: f64,
+    causal_effect_model: String,
     logic_effect_model: String,
     background_source: String,
     background_factorization: String,
@@ -298,6 +306,14 @@ fn logic_effect_model_name(model: LogicEffectModel) -> &'static str {
     match model {
         LogicEffectModel::Gate => "gate",
         LogicEffectModel::CenteredInteraction => "centered_interaction",
+    }
+}
+
+#[inline]
+fn causal_effect_model_name(model: CausalEffectModel) -> &'static str {
+    match model {
+        CausalEffectModel::Equal => "equal",
+        CausalEffectModel::Geometric => "geometric",
     }
 }
 
@@ -527,7 +543,7 @@ fn sampling_factor_method_name(factor: &SamplingFactor) -> &'static str {
     }
 }
 
-fn build_causal_series_effects(count: usize, alpha: f64, rng: &mut StdRng) -> Vec<f64> {
+fn build_causal_geometric_effects(count: usize, alpha: f64, rng: &mut StdRng) -> Vec<f64> {
     let mut effects = Vec::with_capacity(count);
     let mut current = alpha;
     for _ in 0..count {
@@ -538,9 +554,14 @@ fn build_causal_series_effects(count: usize, alpha: f64, rng: &mut StdRng) -> Ve
     effects
 }
 
-fn assign_causal_series_effects(
+fn build_causal_equal_effects(count: usize) -> Vec<f64> {
+    vec![1.0_f64; count]
+}
+
+fn assign_causal_effects(
     terms: &mut [CausalTerm],
     target_var: f64,
+    causal_effect_model: CausalEffectModel,
     rng: &mut StdRng,
 ) -> Vec<f64> {
     if terms.is_empty() || target_var <= 0.0 {
@@ -550,7 +571,12 @@ fn assign_causal_series_effects(
         return Vec::new();
     }
     let n = terms[0].values.len();
-    let gamma0 = build_causal_series_effects(terms.len(), DEFAULT_CAUSAL_SERIES_ALPHA, rng);
+    let gamma0 = match causal_effect_model {
+        CausalEffectModel::Equal => build_causal_equal_effects(terms.len()),
+        CausalEffectModel::Geometric => {
+            build_causal_geometric_effects(terms.len(), DEFAULT_CAUSAL_GEOMETRIC_ALPHA, rng)
+        }
+    };
     let mut causal_score = vec![0.0_f64; n];
     for (coef, term) in gamma0.iter().zip(terms.iter()) {
         axpy_inplace(&mut causal_score, &term.values, *coef);
@@ -2323,6 +2349,14 @@ fn parse_background_dist(name: &str) -> Result<BackgroundDist, String> {
     }
 }
 
+fn parse_causal_effect_model(name: &str) -> Result<CausalEffectModel, String> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "" | "equal" | "flat" => Ok(CausalEffectModel::Equal),
+        "geometric" | "series" => Ok(CausalEffectModel::Geometric),
+        other => Err(format!("unsupported causal effect model: {other}")),
+    }
+}
+
 fn parse_logic_effect_model(name: &str) -> Result<LogicEffectModel, String> {
     match name.trim().to_ascii_lowercase().as_str() {
         "" | "gate" | "raw" | "mean_centered_gate" => Ok(LogicEffectModel::Gate),
@@ -2981,7 +3015,12 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
     }
 
     if !causal_terms.is_empty() && causal_pve_target > 0.0 {
-        assign_causal_series_effects(&mut causal_terms, causal_pve_target, &mut rng);
+        assign_causal_effects(
+            &mut causal_terms,
+            causal_pve_target,
+            config.causal_effect_model,
+            &mut rng,
+        );
         for term in causal_terms.iter() {
             if term.effect != 0.0 {
                 axpy_inplace(&mut causal_component, &term.values, term.effect);
@@ -3104,6 +3143,7 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
         bg_pve: config.bg_pve,
         causal_pve: causal_pve_target,
         residual_var: residual_var_eff,
+        causal_effect_model: causal_effect_model_name(config.causal_effect_model).to_string(),
         logic_effect_model: logic_effect_model_name(config.logic_effect_model).to_string(),
         background_source,
         background_factorization,
@@ -3127,6 +3167,7 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
     gamma_scale=1.0_f64,
     laplace_scale=1.0_f64,
     causal_count=1_usize,
+    causal_effect_model="equal",
     causal_pve=None,
     bim_ranges=None,
     bim_range_groups=None,
@@ -3172,6 +3213,7 @@ pub fn g2p_simulate_py<'py>(
     gamma_scale: f64,
     laplace_scale: f64,
     causal_count: usize,
+    causal_effect_model: &str,
     causal_pve: Option<f64>,
     bim_ranges: Option<Vec<(String, i32, i32)>>,
     bim_range_groups: Option<Vec<Vec<(String, i32, i32)>>>,
@@ -3255,6 +3297,8 @@ pub fn g2p_simulate_py<'py>(
     let _ = chunk_size;
     let _bg_dist =
         parse_background_dist(background_dist).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let causal_effect_model = parse_causal_effect_model(causal_effect_model)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
     let logic_effect_model = parse_logic_effect_model(logic_effect_model)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
     let _ = (gamma_shape, gamma_scale, laplace_scale);
@@ -3285,6 +3329,7 @@ pub fn g2p_simulate_py<'py>(
         residual_var,
         bg_pve,
         causal_count,
+        causal_effect_model,
         causal_pve,
         bim_ranges: bim_ranges.unwrap_or_default(),
         bim_range_groups: bim_range_groups.unwrap_or_default(),
@@ -3329,6 +3374,7 @@ pub fn g2p_simulate_py<'py>(
         bg_pve,
         causal_pve,
         residual_var,
+        causal_effect_model,
         logic_effect_model,
         background_source,
         background_factorization,
@@ -3349,6 +3395,7 @@ pub fn g2p_simulate_py<'py>(
     out.set_item("causal_pve", causal_pve)?;
     out.set_item("ve", residual_var)?;
     out.set_item("residual_var", residual_var)?;
+    out.set_item("causal_effect_model", causal_effect_model)?;
     out.set_item("logic_effect_model", logic_effect_model)?;
     out.set_item("background_source", background_source)?;
     out.set_item("background_factorization", background_factorization)?;
@@ -3553,15 +3600,16 @@ mod tests {
     }
 
     #[test]
-    fn causal_series_effects_match_geometric_magnitudes() {
+    fn causal_geometric_effects_match_expected_magnitudes() {
         let mut rng = StdRng::seed_from_u64(7);
-        let mut observed = build_causal_series_effects(4, DEFAULT_CAUSAL_SERIES_ALPHA, &mut rng);
+        let mut observed =
+            build_causal_geometric_effects(4, DEFAULT_CAUSAL_GEOMETRIC_ALPHA, &mut rng);
         observed.sort_by(|a, b| a.total_cmp(b));
         let mut expected = vec![
-            DEFAULT_CAUSAL_SERIES_ALPHA,
-            DEFAULT_CAUSAL_SERIES_ALPHA.powi(2),
-            DEFAULT_CAUSAL_SERIES_ALPHA.powi(3),
-            DEFAULT_CAUSAL_SERIES_ALPHA.powi(4),
+            DEFAULT_CAUSAL_GEOMETRIC_ALPHA,
+            DEFAULT_CAUSAL_GEOMETRIC_ALPHA.powi(2),
+            DEFAULT_CAUSAL_GEOMETRIC_ALPHA.powi(3),
+            DEFAULT_CAUSAL_GEOMETRIC_ALPHA.powi(4),
         ];
         expected.sort_by(|a, b| a.total_cmp(b));
         for (obs, exp) in observed.iter().zip(expected.iter()) {
@@ -3570,7 +3618,43 @@ mod tests {
     }
 
     #[test]
-    fn causal_series_assignment_applies_to_mixed_single_and_logic_terms() {
+    fn causal_equal_assignment_uses_flat_magnitudes() {
+        let mut rng = StdRng::seed_from_u64(29);
+        let mut terms = vec![
+            CausalTerm {
+                members: vec![0],
+                mode: None,
+                values: vec![1.0, -1.0, 0.0, 0.0],
+                effect: 0.0,
+                label: "s1".to_string(),
+            },
+            CausalTerm {
+                members: vec![1],
+                mode: None,
+                values: vec![0.0, 1.0, -1.0, 0.0],
+                effect: 0.0,
+                label: "s2".to_string(),
+            },
+            CausalTerm {
+                members: vec![2],
+                mode: None,
+                values: vec![0.0, 0.0, 1.0, -1.0],
+                effect: 0.0,
+                label: "s3".to_string(),
+            },
+        ];
+        let assigned =
+            assign_causal_effects(&mut terms, 0.2, CausalEffectModel::Equal, &mut rng);
+        assert_eq!(assigned.len(), terms.len());
+        let first = assigned[0].abs();
+        assert!(first.is_finite() && first > 0.0);
+        for effect in assigned.iter() {
+            assert!((effect.abs() - first).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn causal_geometric_assignment_applies_to_mixed_single_and_logic_terms() {
         let mut rng = StdRng::seed_from_u64(19);
         let mut terms = vec![
             CausalTerm {
@@ -3595,15 +3679,16 @@ mod tests {
                 label: "s2".to_string(),
             },
         ];
-        let assigned = assign_causal_series_effects(&mut terms, 0.2, &mut rng);
+        let assigned =
+            assign_causal_effects(&mut terms, 0.2, CausalEffectModel::Geometric, &mut rng);
         assert_eq!(assigned.len(), terms.len());
         assert!(terms.iter().any(|term| term.mode.is_some()));
         let mut observed: Vec<f64> = terms.iter().map(|term| term.effect.abs()).collect();
         observed.sort_by(|a, b| a.total_cmp(b));
         let mut expected = vec![
-            DEFAULT_CAUSAL_SERIES_ALPHA,
-            DEFAULT_CAUSAL_SERIES_ALPHA.powi(2),
-            DEFAULT_CAUSAL_SERIES_ALPHA.powi(3),
+            DEFAULT_CAUSAL_GEOMETRIC_ALPHA,
+            DEFAULT_CAUSAL_GEOMETRIC_ALPHA.powi(2),
+            DEFAULT_CAUSAL_GEOMETRIC_ALPHA.powi(3),
         ];
         expected.sort_by(|a, b| a.total_cmp(b));
         let scale = observed[0] / expected[0];

@@ -2103,24 +2103,6 @@ def _emit_garfield_bg_noise_summary_to_log(
     if not isinstance(buckets, list) or len(buckets) == 0:
         return
     dataset = str(bg_noise_summary.get("dataset", "")).strip() or "full"
-    first_output = None
-    for bucket in buckets:
-        if isinstance(bucket, dict) and isinstance(bucket.get("output"), dict):
-            first_output = bucket.get("output")
-            break
-    quantile_value = (
-        float(first_output.get("quantile", float("nan")))
-        if isinstance(first_output, dict)
-        else float("nan")
-    )
-    quantile_label = _format_rule_null_quantile_label(quantile_value)
-    _emit_garfield_file_only_line(
-        logger,
-        (
-            f"GARFIELD bg-noise summary for '{trait_name}': "
-            f"dataset={dataset}, quantile={quantile_label} ({float(quantile_value):.4f})"
-        ),
-    )
     tsv_rows: list[str] = [
         "\t".join(
             [
@@ -2148,21 +2130,6 @@ def _emit_garfield_bg_noise_summary_to_log(
         search = bucket.get("search") if isinstance(bucket.get("search"), dict) else {}
         output = bucket.get("output") if isinstance(bucket.get("output"), dict) else {}
         if search:
-            _emit_garfield_file_only_line(
-                logger,
-                (
-                    f"  {label} search null: "
-                    f"penalty={_garfield_format_metric4(search.get('penalty'))}, "
-                    f"mean={_garfield_format_metric4(search.get('mean'))}, "
-                    f"var={_garfield_format_metric4(search.get('variance'))}, "
-                    f"n={int(search.get('n', 0) or 0)}, "
-                    f"min={_garfield_format_metric4(search.get('min'))}, "
-                    f"q25={_garfield_format_metric4(search.get('q25'))}, "
-                    f"median={_garfield_format_metric4(search.get('median'))}, "
-                    f"q75={_garfield_format_metric4(search.get('q75'))}, "
-                    f"max={_garfield_format_metric4(search.get('max'))}"
-                ),
-            )
             tsv_rows.append(
                 "\t".join(
                     [
@@ -2183,21 +2150,6 @@ def _emit_garfield_bg_noise_summary_to_log(
                     ]
                 )
             )
-        _emit_garfield_file_only_line(
-            logger,
-            (
-                f"  {label} output null: "
-                f"penalty={_garfield_format_metric4(output.get('penalty'))}, "
-                f"mean={_garfield_format_metric4(output.get('mean'))}, "
-                f"var={_garfield_format_metric4(output.get('variance'))}, "
-                f"n={int(output.get('n', 0) or 0)}, "
-                f"min={_garfield_format_metric4(output.get('min'))}, "
-                f"q25={_garfield_format_metric4(output.get('q25'))}, "
-                f"median={_garfield_format_metric4(output.get('median'))}, "
-                f"q75={_garfield_format_metric4(output.get('q75'))}, "
-                f"max={_garfield_format_metric4(output.get('max'))}"
-            ),
-        )
         tsv_rows.append(
             "\t".join(
                 [
@@ -2220,7 +2172,7 @@ def _emit_garfield_bg_noise_summary_to_log(
         )
     _emit_garfield_file_only_line(
         logger,
-        "GARFIELD bg-noise table (TSV; copy/paste into Excel):",
+        "GARFIELD bg-noise table:",
     )
     for row in tsv_rows:
         _emit_garfield_file_only_line(logger, row)
@@ -2485,8 +2437,8 @@ def main() -> None:
         dest="window_args",
         nargs="*",
         default=None,
-        metavar="ARG",
-        help="Window scan mode. Optionally pass EXT [STEP].",
+        metavar=("EXT", "STEP"),
+        help="Window scan mode. Use `-w`, optionally followed by EXT and STEP.",
     )
     scan_mode_group.add_argument(
         "-g",
@@ -2495,9 +2447,10 @@ def main() -> None:
         nargs="+",
         action="append",
         default=None,
-        metavar="ARG",
+        metavar="FILE",
         help=(
-            "Gene or gene-set scan file. Use -g FILE [EXT] [STEP]; repeat -g for multiple files. "
+            "Gene or gene-set scan file. Use `-g FILE`, optionally followed by EXT and STEP; "
+            "repeat `-g` for multiple files. "
             "Requires -gff/--gff3."
         ),
     )

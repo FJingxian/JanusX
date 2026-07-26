@@ -60,7 +60,8 @@ use crate::ml::univariate::{
     feature_scores_abs_corr_stage1, feature_scores_abs_corr_stage1_with_parallel,
 };
 use crate::stats_common::{
-    arm_interrupt_trap, check_ctrlc, env_truthy, map_err_string_to_py, process_memory_usage,
+    arm_interrupt_trap, check_ctrlc, env_truthy, format_bytes, map_err_string_to_py,
+    process_memory_usage,
 };
 
 use numpy::ndarray::{Array1, Array2};
@@ -367,6 +368,72 @@ fn garfield_geneset_ld_prune_r2() -> f64 {
 #[inline]
 fn garfield_rss_debug_enabled() -> bool {
     env_truthy("JX_GARFIELD_RSS_DEBUG")
+}
+
+#[inline]
+fn garfield_layer_rss_debug_enabled() -> bool {
+    env_truthy("JX_GARFIELD_LAYER_RSS_DEBUG")
+}
+
+#[inline]
+fn garfield_layer_rss_limit_bytes() -> Option<u64> {
+    parse_env_f64("JX_GARFIELD_LAYER_RSS_LIMIT_GB")
+        .filter(|v| *v > 0.0)
+        .map(|gb| (gb * 1024.0_f64 * 1024.0_f64 * 1024.0_f64) as u64)
+}
+
+#[inline]
+fn garfield_whole_genome_unit_debug_enabled() -> bool {
+    env_truthy("JX_GARFIELD_WG_UNIT_DEBUG") || garfield_layer_rss_debug_enabled()
+}
+
+#[inline]
+fn garfield_whole_genome_unit_breakpoint(
+    unit_name: &str,
+    phase: &str,
+    ml_feature_count: usize,
+    elapsed_s: f64,
+) -> Result<(), String> {
+    let debug_enabled = garfield_whole_genome_unit_debug_enabled();
+    let limit_bytes = garfield_layer_rss_limit_bytes();
+    if !debug_enabled && limit_bytes.is_none() {
+        return Ok(());
+    }
+    let Some(sample) = garfield_memory_sample_now() else {
+        return Ok(());
+    };
+    let rss_txt = sample
+        .rss_bytes
+        .map(format_bytes)
+        .unwrap_or_else(|| "NA".to_string());
+    let footprint_txt = sample
+        .footprint_bytes
+        .map(format_bytes)
+        .unwrap_or_else(|| "NA".to_string());
+    if debug_enabled {
+        eprintln!(
+            "[GARFIELD-WG-UNIT] phase={phase} unit={unit_name} ml_features={ml_feature_count} elapsed={elapsed_s:.1}s metric={} current={} rss={} footprint={}",
+            sample.metric,
+            format_bytes(sample.current_bytes),
+            rss_txt,
+            footprint_txt,
+        );
+    }
+    if let Some(limit) = limit_bytes {
+        if sample.current_bytes > limit {
+            return Err(format!(
+                "GARFIELD whole-genome pre-beam memory limit exceeded at phase {phase}: {}={} (rss={}, footprint={}, limit={}, unit={}, ml_features={})",
+                sample.metric,
+                format_bytes(sample.current_bytes),
+                rss_txt,
+                footprint_txt,
+                format_bytes(limit),
+                unit_name,
+                ml_feature_count,
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -8683,6 +8750,16 @@ fn process_scan_unit_continuous(
     check_ctrlc()?;
     let unit = &units[ui];
     let mut out = GarfieldUnitEvaluationOutput::default();
+    let wg_debug = beam_params.whole_genome_dev_mode;
+    let unit_t0 = wg_debug.then(Instant::now);
+    if let Some(t0) = unit_t0 {
+        garfield_whole_genome_unit_breakpoint(
+            unit.label.as_str(),
+            "prepare:start",
+            unit.indices.len(),
+            t0.elapsed().as_secs_f64(),
+        )?;
+    }
     if let Some(prepared) = prepare_logic_unit_continuous(
         unit,
         unit_kind_lc,
@@ -8699,6 +8776,14 @@ fn process_scan_unit_continuous(
         y_train,
         beam_params.clone(),
     )? {
+        if let Some(t0) = unit_t0 {
+            garfield_whole_genome_unit_breakpoint(
+                unit.label.as_str(),
+                "prepare:end",
+                prepared.selected_global_rows.len(),
+                t0.elapsed().as_secs_f64(),
+            )?;
+        }
         let prepared_bits = materialize_prepared_bit_matrices(
             &prepared,
             logic_bits,
@@ -8706,8 +8791,24 @@ fn process_scan_unit_continuous(
             test_idx_local,
             true,
         )?;
+        if let Some(t0) = unit_t0 {
+            garfield_whole_genome_unit_breakpoint(
+                unit.label.as_str(),
+                "materialize:end",
+                prepared.selected_global_rows.len(),
+                t0.elapsed().as_secs_f64(),
+            )?;
+        }
         if let Some(tracker) = mem_tracker {
             tracker.sample_now();
+        }
+        if let Some(t0) = unit_t0 {
+            garfield_whole_genome_unit_breakpoint(
+                unit.label.as_str(),
+                "literal_scores:start",
+                prepared.selected_global_rows.len(),
+                t0.elapsed().as_secs_f64(),
+            )?;
         }
         let literal_scores = if prepared_bits.has_fuzzy_bin() {
             None
@@ -8719,6 +8820,20 @@ fn process_scan_unit_continuous(
                 y_test,
             )?)
         };
+        if let Some(t0) = unit_t0 {
+            garfield_whole_genome_unit_breakpoint(
+                unit.label.as_str(),
+                "literal_scores:end",
+                prepared.selected_global_rows.len(),
+                t0.elapsed().as_secs_f64(),
+            )?;
+            garfield_whole_genome_unit_breakpoint(
+                unit.label.as_str(),
+                "beam:dispatch",
+                prepared.selected_global_rows.len(),
+                t0.elapsed().as_secs_f64(),
+            )?;
+        }
         out = match evaluate_logic_unit_prepared_continuous(
             ui,
             unit,
@@ -8745,6 +8860,14 @@ fn process_scan_unit_continuous(
             }
             Err(err) => return Err(err),
         };
+        if let Some(t0) = unit_t0 {
+            garfield_whole_genome_unit_breakpoint(
+                unit.label.as_str(),
+                "beam:return",
+                prepared.selected_global_rows.len(),
+                t0.elapsed().as_secs_f64(),
+            )?;
+        }
         if let Some(tracker) = mem_tracker {
             tracker.sample_now();
         }

@@ -68,6 +68,10 @@ class GffSamplingSpec:
     mode_label: str
 
 
+DEFAULT_LOGIC_GFF_UNIT_GAP_BP = 50_000_000
+DEFAULT_GFF_LOGIC_REDRAW_ATTEMPTS = 2_000
+
+
 def _parse_bimrange(text: str) -> tuple[str, int, int]:
     raw = str(text).strip()
     parts = raw.split(":")
@@ -260,6 +264,29 @@ def _filter_gene_catalog_by_active_sites(
     return out
 
 
+def _filter_gene_catalog_by_min_active_sites(
+    gene_catalog: list[tuple[str, tuple[str, int, int]]],
+    *,
+    active_positions: dict[str, list[int]],
+    min_active_sites: int,
+) -> list[tuple[str, tuple[str, int, int]]]:
+    if int(min_active_sites) <= 1:
+        return list(gene_catalog)
+    out: list[tuple[str, tuple[str, int, int]]] = []
+    for gene, (chrom, start, end) in gene_catalog:
+        if (
+            _count_active_sites_in_interval(
+                chrom,
+                int(start),
+                int(end),
+                active_positions=active_positions,
+            )
+            >= int(min_active_sites)
+        ):
+            out.append((gene, (chrom, int(start), int(end))))
+    return out
+
+
 def _count_active_sites_in_interval(
     chrom: str,
     start: int,
@@ -317,6 +344,122 @@ def _gff_logic_unit_min_active_sites(
     return max(1, int(logic_k_min))
 
 
+def _merge_unit_intervals_by_chrom(
+    intervals: list[tuple[str, int, int]],
+) -> dict[str, list[tuple[int, int]]]:
+    merged: dict[str, list[tuple[int, int]]] = {}
+    for chrom, start, end in intervals:
+        chrom_norm = _normalize_bim_chrom(chrom)
+        merged.setdefault(chrom_norm, []).append((int(start), int(end)))
+    out: dict[str, list[tuple[int, int]]] = {}
+    for chrom_norm, spans in merged.items():
+        spans_sorted = sorted(spans, key=lambda x: (int(x[0]), int(x[1])))
+        collapsed: list[tuple[int, int]] = []
+        for start, end in spans_sorted:
+            if len(collapsed) == 0 or int(start) > int(collapsed[-1][1]):
+                collapsed.append((int(start), int(end)))
+            else:
+                collapsed[-1] = (collapsed[-1][0], max(int(collapsed[-1][1]), int(end)))
+        out[chrom_norm] = collapsed
+    return out
+
+
+def _unit_is_physically_isolated(
+    intervals: list[tuple[str, int, int]],
+    *,
+    existing_units: list[dict[str, Any]],
+    min_unit_gap_bp: int,
+) -> bool:
+    if int(min_unit_gap_bp) <= 0 or len(existing_units) == 0:
+        return True
+    lhs_by_chrom = _merge_unit_intervals_by_chrom(intervals)
+    for unit in existing_units:
+        rhs_by_chrom = _merge_unit_intervals_by_chrom(list(unit["intervals"]))
+        for chrom_norm, lhs_spans in lhs_by_chrom.items():
+            rhs_spans = rhs_by_chrom.get(chrom_norm, [])
+            if len(rhs_spans) == 0:
+                continue
+            for lhs_start, lhs_end in lhs_spans:
+                for rhs_start, rhs_end in rhs_spans:
+                    separated = (
+                        int(lhs_end) + int(min_unit_gap_bp) < int(rhs_start)
+                        or int(rhs_end) + int(min_unit_gap_bp) < int(lhs_start)
+                    )
+                    if not separated:
+                        return False
+    return True
+
+
+def _draw_single_causal_gene_unit(
+    *,
+    gene_catalog: list[tuple[str, tuple[str, int, int]]],
+    rng: np.random.Generator,
+    used_genes: set[str],
+    feasible_sizes: list[int],
+    active_positions: Optional[dict[str, list[int]]],
+    min_unit_active_sites: int,
+    blocked_unit_names: set[str],
+    existing_units: list[dict[str, Any]],
+    min_unit_gap_bp: int,
+    inner_budget: int,
+    gene_sampling_weights: Optional[dict[str, float]] = None,
+) -> Optional[dict[str, Any]]:
+    remaining = [item for item in gene_catalog if str(item[0]) not in used_genes]
+    if len(remaining) == 0 or len(feasible_sizes) == 0:
+        return None
+    attempts = int(max(1, inner_budget))
+    while attempts > 0:
+        attempts -= 1
+        unit_size = int(feasible_sizes[int(rng.integers(0, len(feasible_sizes)))])
+        weight_map = {} if gene_sampling_weights is None else gene_sampling_weights
+        weight_vec = np.asarray(
+            [max(0.0, float(weight_map.get(str(gene), 1.0))) for gene, _iv in remaining],
+            dtype=float,
+        )
+        positive_count = int(np.count_nonzero(weight_vec > 0.0))
+        if positive_count >= int(unit_size) and float(weight_vec.sum()) > 0.0:
+            prob = weight_vec / float(weight_vec.sum())
+            pick_idx = np.sort(
+                rng.choice(len(remaining), size=unit_size, replace=False, p=prob)
+            ).tolist()
+        else:
+            pick_idx = np.sort(
+                rng.choice(len(remaining), size=unit_size, replace=False)
+            ).tolist()
+        chosen = sorted((remaining[i] for i in pick_idx), key=lambda x: x[0])
+        genes = [str(gene) for gene, _iv in chosen]
+        intervals = [iv for _gene, iv in chosen]
+        unit_name = "|".join(genes)
+        if unit_name in blocked_unit_names:
+            continue
+        if int(min_unit_active_sites) > 1:
+            if active_positions is None:
+                raise ValueError(
+                    "Internal error: active_positions is required when min_unit_active_sites > 1."
+                )
+            if (
+                _count_active_sites_in_intervals(
+                    intervals,
+                    active_positions=active_positions,
+                )
+                < int(min_unit_active_sites)
+            ):
+                continue
+        if not _unit_is_physically_isolated(
+            intervals,
+            existing_units=existing_units,
+            min_unit_gap_bp=int(min_unit_gap_bp),
+        ):
+            continue
+        return {
+            "unit_kind": "geneset" if len(genes) > 1 else "gene",
+            "genes": genes,
+            "unit_name": unit_name,
+            "intervals": intervals,
+        }
+    return None
+
+
 def _sample_causal_gene_units(
     gene_catalog: list[tuple[str, tuple[str, int, int]]],
     *,
@@ -326,6 +469,8 @@ def _sample_causal_gene_units(
     active_positions: Optional[dict[str, list[int]]] = None,
     min_unit_active_sites: int = 1,
     blocked_unit_names: Optional[set[str]] = None,
+    min_unit_gap_bp: int = 0,
+    gene_sampling_weights: Optional[dict[str, float]] = None,
 ) -> list[dict[str, Any]]:
     if int(causal_count) <= 0:
         return []
@@ -370,55 +515,38 @@ def _sample_causal_gene_units(
                 f"allowed_sizes={','.join(str(x) for x in allowed_sizes)}."
             )
         inner_budget = max(64, len(remaining) * 8)
-        while inner_budget > 0:
-            inner_budget -= 1
-            stalled_draws += 1
-            unit_size = int(feasible_sizes[int(rng.integers(0, len(feasible_sizes)))])
-            pick_idx = np.sort(rng.choice(len(remaining), size=unit_size, replace=False)).tolist()
-            chosen = sorted((remaining[i] for i in pick_idx), key=lambda x: x[0])
-            genes = [str(gene) for gene, _iv in chosen]
-            intervals = [iv for _gene, iv in chosen]
-            unit_name = "|".join(genes)
-            if unit_name in blocked:
-                continue
-            if int(min_unit_active_sites) > 1:
-                if active_positions is None:
-                    raise ValueError(
-                        "Internal error: active_positions is required when min_unit_active_sites > 1."
-                    )
-                if (
-                    _count_active_sites_in_intervals(
-                        intervals,
-                        active_positions=active_positions,
-                    )
-                    < int(min_unit_active_sites)
-                ):
-                    continue
-            used_genes.update(genes)
-            units.append(
-                {
-                    "unit_index": len(units) + 1,
-                    "unit_kind": "geneset" if len(genes) > 1 else "gene",
-                    "genes": genes,
-                    "unit_name": unit_name,
-                    "intervals": intervals,
-                }
-            )
+        stalled_draws += 1
+        candidate = _draw_single_causal_gene_unit(
+            gene_catalog=gene_catalog,
+            rng=rng,
+            used_genes=used_genes,
+            feasible_sizes=feasible_sizes,
+            active_positions=active_positions,
+            min_unit_active_sites=int(min_unit_active_sites),
+            blocked_unit_names=blocked,
+            existing_units=units,
+            min_unit_gap_bp=int(min_unit_gap_bp),
+            inner_budget=int(inner_budget),
+            gene_sampling_weights=gene_sampling_weights,
+        )
+        if candidate is not None:
+            used_genes.update(str(g) for g in candidate["genes"])
+            candidate["unit_index"] = len(units) + 1
+            units.append(candidate)
             accepted = True
             stalled_draws = 0
-            break
         if accepted:
             continue
         if stalled_draws >= draw_budget:
             raise ValueError(
                 "Unable to sample enough valid GFF causal units after redraw filtering: "
-                f"requested={int(causal_count)}, built={len(units)}, "
-                f"blocked_units={len(blocked)}, min_unit_active_sites={int(min_unit_active_sites)}."
+                f"requested={int(causal_count)}, built={len(units)}, blocked_units={len(blocked)}, "
+                f"min_unit_active_sites={int(min_unit_active_sites)}, min_unit_gap_bp={int(min_unit_gap_bp)}."
             )
         raise ValueError(
             "Unable to sample a valid GFF causal unit from remaining genes under the current "
             f"constraints: remaining_genes={genes_left}, min_unit_active_sites={int(min_unit_active_sites)}, "
-            f"blocked_units={len(blocked)}."
+            f"min_unit_gap_bp={int(min_unit_gap_bp)}, blocked_units={len(blocked)}."
         )
     return units
 
@@ -426,6 +554,7 @@ def _sample_causal_gene_units(
 def _extract_failed_gff_logic_unit_index(message: str) -> Optional[int]:
     text = str(message)
     patterns = (
+        r"unable to realize a benchmarkable logic gate for term (\d+)",
         r"unable to build a valid logic gate for term (\d+)",
         r"unable to build a valid logic gate for pool (\d+)",
         r"causal_group\[(\d+)\] has no eligible sites after QC",
@@ -722,6 +851,7 @@ def _run_rust_simulation(
     logic_het_max: float,
     logic_af_min: float,
     logic_af_max: float,
+    logic_delta: float,
     logic_max_iter: int,
     logic_window_bp: Optional[int],
     logic_effect_model: str,
@@ -789,6 +919,7 @@ def _run_rust_simulation(
             logic_het_max=float(logic_het_max),
             logic_af_min=float(logic_af_min),
             logic_af_max=float(logic_af_max),
+            logic_delta=float(logic_delta),
             logic_max_iter=int(logic_max_iter),
             logic_window_bp=logic_window_bp,
             logic_effect_model=str(logic_effect_model),
@@ -828,6 +959,7 @@ def simulate_phenotype_from_genofile(
     and_het_max: float = 0.05,
     and_af_min: float = 0.02,
     and_af_max: float = 0.98,
+    logic_delta: float = 1e-6,
     and_target_pve: float = 0.2,
     and_max_iter: int = 100,
     causal_effect_model: Literal["equal", "geometric"] = "equal",
@@ -888,6 +1020,7 @@ def simulate_phenotype_from_genofile(
         logic_het_max=float(and_het_max),
         logic_af_min=float(and_af_min),
         logic_af_max=float(and_af_max),
+        logic_delta=float(logic_delta),
         logic_max_iter=int(and_max_iter),
         logic_window_bp=int(windows) if logic_mode is not None else None,
         logic_effect_model=str(logic_effect_model),
@@ -1295,6 +1428,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     causal_group.add_argument(
+        "-logic-delta",
+        "--logic-delta",
+        type=float,
+        default=1e-6,
+        help=(
+            "Minimum realized score margin required for a simulated logic gate over its best "
+            "parent literal. Gates with realized delta below this threshold are redrawn. "
+            "Default: %(default)g."
+        ),
+    )
+    causal_group.add_argument(
         "-bimrange",
         "--bimrange",
         action="append",
@@ -1362,8 +1506,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     logic_het_max = 1.0
     logic_af_min = 0.0
     logic_af_max = 1.0
+    logic_delta = float(args.logic_delta)
     logic_max_iter = 256
     logic_effect_model = "gate"
+    logic_has_multi_site_terms = logic_mode is not None and logic_size_weights is not None and any(
+        float(weight) > 0.0 for weight in logic_size_weights[1:]
+    )
+    gff_logic_min_unit_gap_bp = (
+        int(DEFAULT_LOGIC_GFF_UNIT_GAP_BP) if logic_has_multi_site_terms else 0
+    )
     logic_enabled_sizes = (
         ",".join(str(i + 1) for i, weight in enumerate(logic_size_weights) if weight > 0.0)
         if logic_size_weights is not None
@@ -1412,6 +1563,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                     ("Logic gate", "None" if logic_mode is None else logic_mode),
                     ("Logic sizes", logic_enabled_sizes),
                     ("Logic size weights", logic_weight_text),
+                    ("Logic realized delta", logic_delta),
+                    ("Logic unit gap bp", gff_logic_min_unit_gap_bp),
                     ("Logic window bp", logic_window_bp),
                     ("Background dist", "gaussian sample-space"),
                     ("Sampling scale", "expectation-scale"),
@@ -1448,6 +1601,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.lmaf is not None and not (0.0 <= float(args.lmaf) <= 0.5):
         logger.error("--lmaf must be in [0, 0.5].")
         raise SystemExit(1)
+    if not np.isfinite(logic_delta) or float(logic_delta) < 0.0:
+        logger.error("--logic-delta must be finite and >= 0.")
+        raise SystemExit(1)
     if int(causal_count) < len(bimranges):
         logger.error(
             "--causal must be >= number of --bimrange constraints. "
@@ -1475,7 +1631,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     bimrange_groups: Optional[list[list[tuple[str, int, int]]]] = None
     filtered_gene_catalog: list[tuple[str, tuple[str, int, int]]] = []
     active_pos_index: dict[str, list[int]] | None = None
+    gene_sampling_weights: dict[str, float] | None = None
     gff_logic_min_unit_sites = 1
+    selected_unit_sizes = (1, 2) if gff_spec is None else tuple(gff_spec.unit_sizes)
 
     t_start = time.time()
     _simulation_section(logger, "Genotype")
@@ -1566,13 +1724,35 @@ def main(argv: Optional[list[str]] = None) -> int:
                 logic_size_weights,
                 int(logic_k_min),
             )
+            if active_pos_index is not None:
+                if tuple(selected_unit_sizes) == (1,) and int(gff_logic_min_unit_sites) > 1:
+                    filtered_gene_catalog = _filter_gene_catalog_by_min_active_sites(
+                        filtered_gene_catalog,
+                        active_positions=active_pos_index,
+                        min_active_sites=int(gff_logic_min_unit_sites),
+                    )
+                gene_sampling_weights = {}
+                for gene, (chrom, start, end) in filtered_gene_catalog:
+                    active_n = _count_active_sites_in_interval(
+                        chrom,
+                        int(start),
+                        int(end),
+                        active_positions=active_pos_index,
+                    )
+                    if tuple(selected_unit_sizes) == (1,) and int(gff_logic_min_unit_sites) > 1:
+                        weight = float(max(1, active_n * max(0, active_n - 1) // 2))
+                    else:
+                        weight = float(max(1, active_n))
+                    gene_sampling_weights[str(gene)] = float(weight)
             selected_causal_units = _sample_causal_gene_units(
                 filtered_gene_catalog,
                 causal_count=int(causal_count),
                 seed=seed,
-                unit_sizes=(1, 2) if gff_spec is None else tuple(gff_spec.unit_sizes),
+                unit_sizes=selected_unit_sizes,
                 active_positions=active_pos_index,
                 min_unit_active_sites=int(gff_logic_min_unit_sites),
+                min_unit_gap_bp=int(gff_logic_min_unit_gap_bp),
+                gene_sampling_weights=gene_sampling_weights,
             )
         except ValueError as exc:
             logger.error("%s", exc)
@@ -1588,6 +1768,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             int(gff_extension or 0),
             str(gff_mode_label or "g1/g2"),
         )
+        if int(gff_logic_min_unit_gap_bp) > 0:
+            logger.info("  isolated_unit_gap_bp=%d", int(gff_logic_min_unit_gap_bp))
     scan_passes = _estimate_simulation_scan_passes(
         causal_count=int(causal_count),
         cs_pve=cs_pve,
@@ -1598,7 +1780,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     progress_total_hint = int(max(0, n_sites))
     blocked_gff_unit_names: set[str] = set()
-    max_gff_logic_redraw_attempts = max(8, int(causal_count) * 4)
+    max_gff_logic_redraw_attempts = int(DEFAULT_GFF_LOGIC_REDRAW_ATTEMPTS)
     redraw_attempt = 0
     _simulation_section(logger, "Phenotype Simulation")
     logger.info(
@@ -1671,6 +1853,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 logic_het_max=float(logic_het_max),
                 logic_af_min=float(logic_af_min),
                 logic_af_max=float(logic_af_max),
+                logic_delta=float(logic_delta),
                 logic_max_iter=int(logic_max_iter),
                 logic_window_bp=logic_window_bp,
                 logic_effect_model=logic_effect_model,
@@ -1691,44 +1874,81 @@ def main(argv: Optional[list[str]] = None) -> int:
             break
         except RuntimeError as exc:
             failed_unit_idx = _extract_failed_gff_logic_unit_index(str(exc))
-            can_redraw_gff_unit = (
+            has_failed_gff_logic_unit = (
                 gff3_path is not None
                 and logic_mode is not None
-                and active_pos_index is not None
                 and len(filtered_gene_catalog) > 0
                 and len(selected_causal_units) == int(causal_count)
                 and failed_unit_idx is not None
                 and 0 <= int(failed_unit_idx) < len(selected_causal_units)
+            )
+            can_redraw_gff_unit = (
+                has_failed_gff_logic_unit
                 and redraw_attempt < int(max_gff_logic_redraw_attempts)
             )
             if not can_redraw_gff_unit:
+                if has_failed_gff_logic_unit:
+                    raise RuntimeError(
+                        f"{exc} [GFF redraw budget exhausted: attempts={redraw_attempt}/{max_gff_logic_redraw_attempts}, "
+                        f"blocked_units={len(blocked_gff_unit_names)}]"
+                    ) from exc
                 raise
             failed_unit = selected_causal_units[int(failed_unit_idx)]
             blocked_gff_unit_names.add(str(failed_unit["unit_name"]))
             redraw_attempt += 1
-            selected_causal_units = _sample_causal_gene_units(
-                filtered_gene_catalog,
-                causal_count=int(causal_count),
-                seed=seed + int(redraw_attempt) * 1009,
-                unit_sizes=(1, 2) if gff_spec is None else tuple(gff_spec.unit_sizes),
+            locked_units = [
+                dict(unit)
+                for unit_idx, unit in enumerate(selected_causal_units)
+                if int(unit_idx) != int(failed_unit_idx)
+            ]
+            locked_genes = {
+                str(gene)
+                for unit in locked_units
+                for gene in list(unit["genes"])
+            }
+            remaining_gene_count = sum(
+                1
+                for gene, _iv in filtered_gene_catalog
+                if str(gene) not in locked_genes
+            )
+            feasible_sizes = [
+                int(size) for size in selected_unit_sizes if int(size) <= int(remaining_gene_count)
+            ]
+            replacement_rng = np.random.default_rng(
+                (int(seed) + int(redraw_attempt) * 1009) ^ 0x5EED_91A7
+            )
+            replacement = _draw_single_causal_gene_unit(
+                gene_catalog=filtered_gene_catalog,
+                rng=replacement_rng,
+                used_genes=locked_genes,
+                feasible_sizes=feasible_sizes,
                 active_positions=active_pos_index,
                 min_unit_active_sites=int(gff_logic_min_unit_sites),
                 blocked_unit_names=blocked_gff_unit_names,
+                existing_units=locked_units,
+                min_unit_gap_bp=int(gff_logic_min_unit_gap_bp),
+                inner_budget=max(128, len(filtered_gene_catalog) * 4),
+                gene_sampling_weights=gene_sampling_weights,
             )
+            if replacement is None:
+                raise RuntimeError(
+                    "unable to replace failed causal GFF unit under the current isolation / QC "
+                    f"constraints: failed_unit={failed_unit['unit_name']}, blocked_units={len(blocked_gff_unit_names)}, "
+                    f"min_unit_gap_bp={int(gff_logic_min_unit_gap_bp)}"
+                ) from exc
+            replacement["unit_index"] = int(failed_unit_idx) + 1
+            selected_causal_units[int(failed_unit_idx)] = replacement
             continue
         finally:
             sim_pbar.finish()
             sim_pbar.close()
 
     log_success(logger, f"Simulation ...Finished [{format_elapsed(sim_elapsed)}]")
-    if len(blocked_gff_unit_names) > 0:
-        preview = ", ".join(str(x) for x in list(blocked_gff_unit_names)[:3])
-        extra = "" if len(blocked_gff_unit_names) <= 3 else f" ... (+{len(blocked_gff_unit_names) - 3} more)"
+    if redraw_attempt > 0:
         logger.info(
-            "Causal-unit redraws: skipped %d incompatible GFF unit signatures%s%s.",
+            "Causal-unit redraws: retried %d times; skipped %d incompatible GFF unit signatures.",
+            int(redraw_attempt),
             len(blocked_gff_unit_names),
-            f" [{preview}]" if preview != "" else "",
-            extra,
         )
     random_effects_tsv = f"{outprefix}.random.effects.tsv"
     random_effects_pdf = f"{outprefix}.random.effects.pdf"

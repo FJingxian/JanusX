@@ -16,6 +16,7 @@ use rand_distr::{Distribution, StandardNormal};
 use rayon::prelude::*;
 
 use crate::eigh::symmetric_eigh_f64_row_major;
+use crate::garfield::score_cont_corr_packed;
 use crate::gfcore as core;
 use crate::gfcore::{BedSnpIter, HmpSnpIter, TxtSnpIter, VcfSnpIter};
 use crate::gfreader::prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window;
@@ -90,6 +91,171 @@ const SAMPLE_PAR_THRESHOLD: usize = 10_000;
 const SAMPLE_PAR_CHUNK: usize = 4096;
 const DEFAULT_CAUSAL_GEOMETRIC_ALPHA: f64 = 0.9;
 const BED_SIM_FAST_WINDOW_MB: usize = 64;
+const MAX_REALIZED_LOGIC_REDRAWS: usize = 64;
+const DEFAULT_REALIZED_LOGIC_DELTA: f64 = 1e-6;
+
+enum LogicTermSampler {
+    None,
+    Pure {
+        pool_specs: Vec<LogicPoolSpec>,
+        row_map: HashMap<usize, Vec<f32>>,
+        rng: StdRng,
+    },
+    Mixed {
+        plan: Vec<MixedPlannedTerm>,
+        row_map: HashMap<usize, Vec<f32>>,
+        rng: StdRng,
+    },
+}
+
+impl LogicTermSampler {
+    fn row_map(&self) -> Option<&HashMap<usize, Vec<f32>>> {
+        match self {
+            Self::None => None,
+            Self::Pure { row_map, .. } | Self::Mixed { row_map, .. } => Some(row_map),
+        }
+    }
+
+    fn locked_members_excluding(
+        current_terms: &[CausalTerm],
+        term_index: usize,
+    ) -> Result<HashSet<usize>, String> {
+        if term_index >= current_terms.len() {
+            return Err(format!(
+                "internal error: logic term index {} out of range for {} causal terms",
+                term_index,
+                current_terms.len(),
+            ));
+        }
+        let mut locked: HashSet<usize> = HashSet::new();
+        for (idx, term) in current_terms.iter().enumerate() {
+            if idx == term_index {
+                continue;
+            }
+            for &member in term.members.iter() {
+                locked.insert(member);
+            }
+        }
+        Ok(locked)
+    }
+
+    fn rematerialize_one(
+        &mut self,
+        term_index: usize,
+        current_terms: &[CausalTerm],
+        sites: &[SimSiteRecord],
+        config: &G2pSimConfig,
+        proxy_delta_min: f64,
+    ) -> Result<CausalTerm, String> {
+        let locked_members = Self::locked_members_excluding(current_terms, term_index)?;
+        match self {
+            Self::None => Err("internal error: no logic-term sampler available for redraw".to_string()),
+            Self::Pure {
+                pool_specs,
+                row_map,
+                rng,
+            } => {
+                let spec = pool_specs.get(term_index).ok_or_else(|| {
+                    format!(
+                        "internal error: logic pool index {} out of range for {} pools",
+                        term_index,
+                        pool_specs.len(),
+                    )
+                })?;
+                let filtered_pool = spec
+                    .pool_indices
+                    .iter()
+                    .copied()
+                    .filter(|idx| !locked_members.contains(idx))
+                    .collect::<Vec<_>>();
+                if filtered_pool.len() < config.logic_k_min {
+                    return Err(format!(
+                        "logic-gate redraw pool {term_index} has too few unlocked sites: need >= {}, got {}",
+                        config.logic_k_min,
+                        filtered_pool.len(),
+                    ));
+                }
+                let mut terms = select_logic_terms(
+                    &[LogicPoolSpec {
+                        pool_indices: filtered_pool,
+                        mode: spec.mode,
+                    }],
+                    row_map,
+                    sites,
+                    config.logic_k_min,
+                    config.logic_k_max,
+                    config.logic_ld_max,
+                    config.logic_het_max,
+                    config.causal_maf_min,
+                    config.logic_af_min,
+                    config.logic_af_max,
+                    config.logic_delta,
+                    proxy_delta_min,
+                    config.logic_max_iter,
+                    config.logic_effect_model,
+                    rng,
+                )?;
+                terms
+                    .pop()
+                    .ok_or_else(|| "internal error: pure logic redraw returned no term".to_string())
+            }
+            Self::Mixed { plan, row_map, rng } => {
+                let item = plan.get(term_index).ok_or_else(|| {
+                    format!(
+                        "internal error: mixed logic term index {} out of range for {} planned terms",
+                        term_index,
+                        plan.len(),
+                    )
+                })?;
+                let spec = match item {
+                    MixedPlannedTerm::Additive(_) => {
+                        return Err(format!(
+                            "internal error: realized logic redraw requested for additive term {term_index}"
+                        ))
+                    }
+                    MixedPlannedTerm::Logic(spec) => spec,
+                };
+                let filtered_pool = spec
+                    .pool_indices
+                    .iter()
+                    .copied()
+                    .filter(|idx| !locked_members.contains(idx))
+                    .collect::<Vec<_>>();
+                if filtered_pool.len() < spec.size {
+                    return Err(format!(
+                        "logic-gate redraw pool {term_index} has too few unlocked sites: need >= {}, got {}",
+                        spec.size,
+                        filtered_pool.len(),
+                    ));
+                }
+                let redraw_spec = LogicSampledSpec {
+                    pool_indices: filtered_pool,
+                    mode: spec.mode,
+                    size: spec.size,
+                };
+                let mut terms = select_logic_terms_sampled_specs(
+                    &[redraw_spec],
+                    row_map,
+                    sites,
+                    config.logic_ld_max,
+                    config.logic_het_max,
+                    config.causal_maf_min,
+                    config.logic_af_min,
+                    config.logic_af_max,
+                    config.logic_delta,
+                    proxy_delta_min,
+                    config.logic_max_iter,
+                    config.logic_effect_model,
+                    &locked_members,
+                    rng,
+                )?;
+                terms
+                    .pop()
+                    .ok_or_else(|| "internal error: mixed logic redraw returned no term".to_string())
+            }
+        }
+    }
+}
 
 struct G2pSimConfig {
     path_or_prefix: String,
@@ -115,6 +281,7 @@ struct G2pSimConfig {
     logic_het_max: f64,
     logic_af_min: f64,
     logic_af_max: f64,
+    logic_delta: f64,
     logic_max_iter: usize,
     logic_window_bp: Option<i32>,
     logic_effect_model: LogicEffectModel,
@@ -692,6 +859,22 @@ fn build_realized_summary(
     }
 }
 
+fn compose_phenotype_with_causal_terms(
+    base_y: &[f64],
+    terms: &[CausalTerm],
+) -> (Vec<f64>, Vec<f64>) {
+    let mut y = base_y.to_vec();
+    let mut causal = vec![0.0_f64; base_y.len()];
+    for term in terms.iter() {
+        if term.effect == 0.0 {
+            continue;
+        }
+        axpy_inplace(&mut causal, &term.values, term.effect);
+        axpy_inplace(&mut y, &term.values, term.effect);
+    }
+    (y, causal)
+}
+
 fn collapse_to_logic_bin01(row: &[f32], het_max: f64) -> Option<Vec<u8>> {
     if row.is_empty() {
         return None;
@@ -860,6 +1043,226 @@ fn logic_gate_centered_values(indicator: &[u8]) -> Vec<f64> {
     let raw = indicator.iter().map(|&v| v as f64).collect::<Vec<_>>();
     let mu = mean_f64(&raw);
     raw.into_iter().map(|v| v - mu).collect()
+}
+
+fn gate_parent_max_r2(gate_indicator: &[u8], literal_rows: &[Vec<u8>]) -> f64 {
+    literal_rows
+        .iter()
+        .map(|row| binary_r2(gate_indicator, row))
+        .fold(0.0_f64, f64::max)
+}
+
+#[inline]
+fn logic_parent_similarity_limit(logic_delta: f64) -> f64 {
+    (1.0_f64 - logic_delta.max(0.0)).clamp(0.0, 1.0)
+}
+
+fn pack_binary01_to_words(bits01: &[u8]) -> Vec<u64> {
+    let words = ((bits01.len() + 63) >> 6).max(1);
+    let mut out = vec![0u64; words];
+    for (i, &v) in bits01.iter().enumerate() {
+        if v != 0 {
+            out[i >> 6] |= 1u64 << (i & 63);
+        }
+    }
+    out
+}
+
+#[derive(Clone, Debug)]
+struct WeakLogicTerm {
+    term_index: usize,
+    label: String,
+    gate_score: f64,
+    max_parent_score: f64,
+}
+
+#[derive(Clone, Debug)]
+struct LogicCandidateEval {
+    gate_values: Vec<f64>,
+    raw_af: f64,
+    gate_maf: f64,
+    parent_gate_max_r2: f64,
+    proxy_margin: f64,
+}
+
+fn evaluate_logic_candidate(
+    members: &[usize],
+    bin_map: &HashMap<usize, Vec<u8>>,
+    mode: LogicGateMode,
+    logic_effect_model: LogicEffectModel,
+) -> Result<Option<LogicCandidateEval>, String> {
+    let gate_rows: Vec<Vec<u8>> = members
+        .iter()
+        .map(|idx| {
+            bin_map
+                .get(idx)
+                .cloned()
+                .ok_or_else(|| "missing logic row".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let literal_rows = logic_gate_literal_rows(&gate_rows, mode)?;
+    let gate_indicator =
+        logic_gate_indicator_from_literals(literal_rows.as_slice(), logic_output_negated(mode));
+    let raw_af =
+        gate_indicator.iter().filter(|&&v| v != 0).count() as f64 / gate_indicator.len() as f64;
+    let gate_maf = raw_af.min(1.0_f64 - raw_af);
+    let gate_values = match logic_effect_model {
+        LogicEffectModel::Gate => logic_gate_centered_values(&gate_indicator),
+        LogicEffectModel::CenteredInteraction => residualize_logic_indicator_against_main_effects(
+            &gate_indicator,
+            literal_rows.as_slice(),
+        )?,
+    };
+    if variance_f64(&gate_values) <= 1e-12 {
+        return Ok(None);
+    }
+    let gate_words = pack_binary01_to_words(gate_indicator.as_slice());
+    let gate_proxy_score =
+        score_cont_corr_packed(gate_values.as_slice(), gate_words.as_slice(), gate_values.len())
+            .abs();
+    let max_parent_proxy_score = literal_rows
+        .iter()
+        .map(|row| {
+            let words = pack_binary01_to_words(row.as_slice());
+            score_cont_corr_packed(gate_values.as_slice(), words.as_slice(), gate_values.len()).abs()
+        })
+        .fold(0.0_f64, f64::max);
+    Ok(Some(LogicCandidateEval {
+        gate_values,
+        raw_af,
+        gate_maf,
+        parent_gate_max_r2: gate_parent_max_r2(gate_indicator.as_slice(), literal_rows.as_slice()),
+        proxy_margin: gate_proxy_score - max_parent_proxy_score,
+    }))
+}
+
+fn logic_candidate_is_better(
+    cand_proxy_margin: f64,
+    cand_parent_gate_max_r2: f64,
+    cand_raw_af: f64,
+    best_proxy_margin: f64,
+    best_parent_gate_max_r2: f64,
+    best_raw_af: f64,
+    af_center: f64,
+) -> bool {
+    let dmargin = cand_proxy_margin - best_proxy_margin;
+    if dmargin > 1e-12 {
+        return true;
+    }
+    if dmargin < -1e-12 {
+        return false;
+    }
+    let dr2 = cand_parent_gate_max_r2 - best_parent_gate_max_r2;
+    if dr2 < -1e-12 {
+        return true;
+    }
+    if dr2 > 1e-12 {
+        return false;
+    }
+    (cand_raw_af - af_center).abs() + 1e-12 < (best_raw_af - af_center).abs()
+}
+
+fn realized_logic_term_scores(
+    term: &CausalTerm,
+    row_map: &HashMap<usize, Vec<f32>>,
+    y: &[f64],
+    logic_het_max: f64,
+) -> Result<Option<(f64, Vec<f64>)>, String> {
+    let Some(mode) = term.mode else {
+        return Ok(None);
+    };
+    if term.members.len() <= 1 {
+        return Ok(None);
+    }
+    let mut gate_rows: Vec<Vec<u8>> = Vec::with_capacity(term.members.len());
+    for &idx in term.members.iter() {
+        let row = row_map.get(&idx).ok_or_else(|| {
+            format!("realized logic validation is missing genotype row for causal site index {idx}")
+        })?;
+        let bin = collapse_to_logic_bin01(row, logic_het_max).ok_or_else(|| {
+            format!(
+                "realized logic validation failed heterozygosity collapse for causal site index {idx}"
+            )
+        })?;
+        gate_rows.push(bin);
+    }
+    let literal_rows = logic_gate_literal_rows(gate_rows.as_slice(), mode)?;
+    let gate_indicator =
+        logic_gate_indicator_from_literals(literal_rows.as_slice(), logic_output_negated(mode));
+    let gate_words = pack_binary01_to_words(gate_indicator.as_slice());
+    let gate_score = score_cont_corr_packed(y, gate_words.as_slice(), y.len()).abs();
+    let parent_scores = literal_rows
+        .iter()
+        .map(|row| {
+            let words = pack_binary01_to_words(row.as_slice());
+            score_cont_corr_packed(y, words.as_slice(), y.len()).abs()
+        })
+        .collect::<Vec<_>>();
+    Ok(Some((gate_score, parent_scores)))
+}
+
+fn logic_term_local_proxy_margin(
+    term: &CausalTerm,
+    row_map: &HashMap<usize, Vec<f32>>,
+    logic_het_max: f64,
+) -> Result<Option<f64>, String> {
+    let Some(mode) = term.mode else {
+        return Ok(None);
+    };
+    if term.members.len() <= 1 {
+        return Ok(None);
+    }
+    let mut gate_rows: Vec<Vec<u8>> = Vec::with_capacity(term.members.len());
+    for &idx in term.members.iter() {
+        let row = row_map.get(&idx).ok_or_else(|| {
+            format!("logic proxy validation is missing genotype row for causal site index {idx}")
+        })?;
+        let bin = collapse_to_logic_bin01(row, logic_het_max).ok_or_else(|| {
+            format!("logic proxy validation failed heterozygosity collapse for causal site index {idx}")
+        })?;
+        gate_rows.push(bin);
+    }
+    let literal_rows = logic_gate_literal_rows(gate_rows.as_slice(), mode)?;
+    let gate_indicator =
+        logic_gate_indicator_from_literals(literal_rows.as_slice(), logic_output_negated(mode));
+    let gate_words = pack_binary01_to_words(gate_indicator.as_slice());
+    let gate_score =
+        score_cont_corr_packed(term.values.as_slice(), gate_words.as_slice(), term.values.len())
+            .abs();
+    let max_parent_score = literal_rows
+        .iter()
+        .map(|row| {
+            let words = pack_binary01_to_words(row.as_slice());
+            score_cont_corr_packed(term.values.as_slice(), words.as_slice(), term.values.len()).abs()
+        })
+        .fold(0.0_f64, f64::max);
+    Ok(Some(gate_score - max_parent_score))
+}
+
+fn first_weak_realized_logic_term(
+    terms: &[CausalTerm],
+    row_map: &HashMap<usize, Vec<f32>>,
+    y: &[f64],
+    logic_het_max: f64,
+    eps: f64,
+) -> Result<Option<WeakLogicTerm>, String> {
+    for (term_index, term) in terms.iter().enumerate() {
+        let Some((gate_score, parent_scores)) =
+            realized_logic_term_scores(term, row_map, y, logic_het_max)?
+        else {
+            continue;
+        };
+        let max_parent_score = parent_scores.into_iter().fold(0.0_f64, f64::max);
+        if gate_score <= max_parent_score + eps {
+            return Ok(Some(WeakLogicTerm {
+                term_index,
+                label: term.label.clone(),
+                gate_score,
+                max_parent_score,
+            }));
+        }
+    }
+    Ok(None)
 }
 
 fn solve_linear_system(mut a: Vec<f64>, mut b: Vec<f64>, n: usize) -> Option<Vec<f64>> {
@@ -1806,6 +2209,8 @@ fn select_logic_terms(
     causal_maf_min: f32,
     logic_af_min: f64,
     logic_af_max: f64,
+    logic_delta: f64,
+    proxy_delta_min: f64,
     logic_max_iter: usize,
     logic_effect_model: LogicEffectModel,
     rng: &mut StdRng,
@@ -1817,6 +2222,7 @@ fn select_logic_terms(
         return Err("logic_k_max must be >= logic_k_min".to_string());
     }
     let af_center = 0.5 * (logic_af_min + logic_af_max);
+    let parent_similarity_limit = logic_parent_similarity_limit(logic_delta);
     let mut used_global: HashSet<usize> = HashSet::new();
     let mut out = Vec::with_capacity(pool_specs.len());
 
@@ -1836,7 +2242,10 @@ fn select_logic_terms(
             ));
         }
 
-        let mut best: Option<(Vec<usize>, Vec<f64>, f64)> = None;
+        let mut best: Option<(Vec<usize>, Vec<f64>, f64, f64)> = None;
+        let mut best_margin = f64::NEG_INFINITY;
+        let mut best_similarity = f64::INFINITY;
+        let exact_pair_search = logic_k_min == 2 && logic_k_max == 2;
         for _ in 0..logic_max_iter.max(1) {
             let prefer_unused: Vec<usize> = spec
                 .pool_indices
@@ -1856,6 +2265,79 @@ fn select_logic_terms(
                 all_avail
             };
             if pool.len() < logic_k_min {
+                break;
+            }
+            if exact_pair_search {
+                for a in 0..pool.len() {
+                    for b in (a + 1)..pool.len() {
+                        let members = vec![pool[a], pool[b]];
+                        let r2 = binary_r2(
+                            bin_map
+                                .get(&members[0])
+                                .ok_or_else(|| "missing logic row".to_string())?,
+                            bin_map
+                                .get(&members[1])
+                                .ok_or_else(|| "missing logic row".to_string())?,
+                        );
+                        if logic_ld_max < 0.999_999 && r2 > logic_ld_max + 1e-12 {
+                            continue;
+                        }
+                        let Some(eval) = evaluate_logic_candidate(
+                            members.as_slice(),
+                            &bin_map,
+                            spec.mode,
+                            logic_effect_model,
+                        )?
+                        else {
+                            continue;
+                        };
+                        if eval.gate_maf + 1e-12_f64 < causal_maf_min as f64 {
+                            continue;
+                        }
+                        if logic_candidate_is_better(
+                            eval.proxy_margin,
+                            eval.parent_gate_max_r2,
+                            eval.raw_af,
+                            best_margin,
+                            best_similarity,
+                            best.as_ref().map(|(_, _, af, _)| *af).unwrap_or(af_center),
+                            af_center,
+                        ) {
+                            best_margin = eval.proxy_margin;
+                            best_similarity = eval.parent_gate_max_r2;
+                            best = Some((
+                                members.clone(),
+                                eval.gate_values.clone(),
+                                eval.raw_af,
+                                eval.proxy_margin,
+                            ));
+                        }
+                        if eval.raw_af >= logic_af_min
+                            && eval.raw_af <= logic_af_max
+                            && eval.parent_gate_max_r2 <= parent_similarity_limit + 1e-12
+                            && eval.proxy_margin > proxy_delta_min + 1e-12
+                        {
+                            let label = term_label(sites, &members, Some(spec.mode));
+                            for idx in members.iter() {
+                                used_global.insert(*idx);
+                            }
+                            out.push(CausalTerm {
+                                members,
+                                mode: Some(spec.mode),
+                                values: eval.gate_values,
+                                effect: 0.0,
+                                label,
+                            });
+                            break;
+                        }
+                    }
+                    if out.len() == ti + 1 {
+                        break;
+                    }
+                }
+                if out.len() == ti + 1 {
+                    break;
+                }
                 break;
             }
             let k_hi = logic_k_max.min(pool.len());
@@ -1890,47 +2372,40 @@ fn select_logic_terms(
             if !ld_ok {
                 continue;
             }
-            let gate_rows: Vec<Vec<u8>> = members
-                .iter()
-                .map(|idx| {
-                    bin_map
-                        .get(idx)
-                        .cloned()
-                        .ok_or_else(|| "missing logic row".to_string())
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let literal_rows = logic_gate_literal_rows(&gate_rows, spec.mode)?;
-            let gate_indicator = logic_gate_indicator_from_literals(
-                literal_rows.as_slice(),
-                logic_output_negated(spec.mode),
-            );
-            let raw_af = gate_indicator.iter().filter(|&&v| v != 0).count() as f64
-                / gate_indicator.len() as f64;
-            let gate_maf = raw_af.min(1.0_f64 - raw_af);
-            let gate_values = match logic_effect_model {
-                LogicEffectModel::Gate => logic_gate_centered_values(&gate_indicator),
-                LogicEffectModel::CenteredInteraction => {
-                    residualize_logic_indicator_against_main_effects(
-                        &gate_indicator,
-                        literal_rows.as_slice(),
-                    )?
-                }
-            };
-            let var = variance_f64(&gate_values);
-            if var <= 1e-12 {
+            let Some(eval) = evaluate_logic_candidate(
+                members.as_slice(),
+                &bin_map,
+                spec.mode,
+                logic_effect_model,
+            )?
+            else {
                 continue;
-            }
-            if gate_maf + 1e-12_f64 >= causal_maf_min as f64
-                && best
-                    .as_ref()
-                    .map(|(_, _, af)| (raw_af - af_center).abs() < (*af - af_center).abs())
-                    .unwrap_or(true)
+            };
+            if eval.gate_maf + 1e-12_f64 >= causal_maf_min as f64
+                && logic_candidate_is_better(
+                    eval.proxy_margin,
+                    eval.parent_gate_max_r2,
+                    eval.raw_af,
+                    best_margin,
+                    best_similarity,
+                    best.as_ref().map(|(_, _, af, _)| *af).unwrap_or(af_center),
+                    af_center,
+                )
             {
-                best = Some((members.clone(), gate_values.clone(), raw_af));
+                best_margin = eval.proxy_margin;
+                best_similarity = eval.parent_gate_max_r2;
+                best = Some((
+                    members.clone(),
+                    eval.gate_values.clone(),
+                    eval.raw_af,
+                    eval.proxy_margin,
+                ));
             }
-            if raw_af >= logic_af_min
-                && raw_af <= logic_af_max
-                && gate_maf + 1e-12_f64 >= causal_maf_min as f64
+            if eval.raw_af >= logic_af_min
+                && eval.raw_af <= logic_af_max
+                && eval.gate_maf + 1e-12_f64 >= causal_maf_min as f64
+                && eval.parent_gate_max_r2 <= parent_similarity_limit + 1e-12
+                && eval.proxy_margin > proxy_delta_min + 1e-12
             {
                 let label = term_label(sites, &members, Some(spec.mode));
                 for idx in members.iter() {
@@ -1939,7 +2414,7 @@ fn select_logic_terms(
                 out.push(CausalTerm {
                     members,
                     mode: Some(spec.mode),
-                    values: gate_values,
+                    values: eval.gate_values,
                     effect: 0.0,
                     label,
                 });
@@ -1948,24 +2423,35 @@ fn select_logic_terms(
         }
 
         if out.len() != ti + 1 {
-            if let Some((members, gate, _af)) = best {
-                let label = term_label(sites, &members, Some(spec.mode));
-                for idx in members.iter() {
-                    used_global.insert(*idx);
+            if proxy_delta_min <= 1e-12 {
+                if let Some((members, gate, _af, _margin)) = best {
+                    let label = term_label(sites, &members, Some(spec.mode));
+                    for idx in members.iter() {
+                        used_global.insert(*idx);
+                    }
+                    out.push(CausalTerm {
+                        members,
+                        mode: Some(spec.mode),
+                        values: gate,
+                        effect: 0.0,
+                        label,
+                    });
+                } else {
+                    return Err(format!(
+                        "unable to build a valid logic gate for pool {ti}; try relaxing gate size / LD / AF / heterozygosity constraints (gate_size={}..{}, lmaf={:.4})",
+                        logic_k_min,
+                        logic_k_max,
+                        causal_maf_min,
+                    ));
                 }
-                out.push(CausalTerm {
-                    members,
-                    mode: Some(spec.mode),
-                    values: gate,
-                    effect: 0.0,
-                    label,
-                });
             } else {
                 return Err(format!(
-                    "unable to build a valid logic gate for pool {ti}; try relaxing gate size / LD / AF / heterozygosity constraints (gate_size={}..{}, lmaf={:.4})",
+                    "unable to build a valid logic gate for pool {ti}; no candidate satisfied the requested proxy-delta / LD / AF / heterozygosity constraints (gate_size={}..{}, lmaf={:.4}, proxy_delta={:.4}, logic_delta={:.4})",
                     logic_k_min,
                     logic_k_max,
                     causal_maf_min,
+                    proxy_delta_min,
+                    logic_delta,
                 ));
             }
         }
@@ -1982,12 +2468,15 @@ fn select_logic_terms_sampled_specs(
     causal_maf_min: f32,
     logic_af_min: f64,
     logic_af_max: f64,
+    logic_delta: f64,
+    proxy_delta_min: f64,
     logic_max_iter: usize,
     logic_effect_model: LogicEffectModel,
     initial_used: &HashSet<usize>,
     rng: &mut StdRng,
 ) -> Result<Vec<CausalTerm>, String> {
     let af_center = 0.5 * (logic_af_min + logic_af_max);
+    let parent_similarity_limit = logic_parent_similarity_limit(logic_delta);
     let mut used_global = initial_used.clone();
     let mut out = Vec::with_capacity(specs.len());
 
@@ -2008,7 +2497,10 @@ fn select_logic_terms_sampled_specs(
             ));
         }
 
-        let mut best: Option<(Vec<usize>, Vec<f64>, f64)> = None;
+        let mut best: Option<(Vec<usize>, Vec<f64>, f64, f64)> = None;
+        let mut best_margin = f64::NEG_INFINITY;
+        let mut best_similarity = f64::INFINITY;
+        let exact_pair_search = spec.size == 2;
         for _ in 0..logic_max_iter.max(1) {
             let pool: Vec<usize> = spec
                 .pool_indices
@@ -2017,6 +2509,79 @@ fn select_logic_terms_sampled_specs(
                 .filter(|idx| bin_map.contains_key(idx) && !used_global.contains(idx))
                 .collect();
             if pool.len() < spec.size {
+                break;
+            }
+            if exact_pair_search {
+                for a in 0..pool.len() {
+                    for b in (a + 1)..pool.len() {
+                        let members = vec![pool[a], pool[b]];
+                        let r2 = binary_r2(
+                            bin_map
+                                .get(&members[0])
+                                .ok_or_else(|| "missing logic row".to_string())?,
+                            bin_map
+                                .get(&members[1])
+                                .ok_or_else(|| "missing logic row".to_string())?,
+                        );
+                        if logic_ld_max < 0.999_999 && r2 > logic_ld_max + 1e-12 {
+                            continue;
+                        }
+                        let Some(eval) = evaluate_logic_candidate(
+                            members.as_slice(),
+                            &bin_map,
+                            spec.mode,
+                            logic_effect_model,
+                        )?
+                        else {
+                            continue;
+                        };
+                        if eval.gate_maf + 1e-12_f64 < causal_maf_min as f64 {
+                            continue;
+                        }
+                        if logic_candidate_is_better(
+                            eval.proxy_margin,
+                            eval.parent_gate_max_r2,
+                            eval.raw_af,
+                            best_margin,
+                            best_similarity,
+                            best.as_ref().map(|(_, _, af, _)| *af).unwrap_or(af_center),
+                            af_center,
+                        ) {
+                            best_margin = eval.proxy_margin;
+                            best_similarity = eval.parent_gate_max_r2;
+                            best = Some((
+                                members.clone(),
+                                eval.gate_values.clone(),
+                                eval.raw_af,
+                                eval.proxy_margin,
+                            ));
+                        }
+                        if eval.raw_af >= logic_af_min
+                            && eval.raw_af <= logic_af_max
+                            && eval.parent_gate_max_r2 <= parent_similarity_limit + 1e-12
+                            && eval.proxy_margin > proxy_delta_min + 1e-12
+                        {
+                            let label = term_label(sites, &members, Some(spec.mode));
+                            for idx in members.iter() {
+                                used_global.insert(*idx);
+                            }
+                            out.push(CausalTerm {
+                                members,
+                                mode: Some(spec.mode),
+                                values: eval.gate_values,
+                                effect: 0.0,
+                                label,
+                            });
+                            break;
+                        }
+                    }
+                    if out.len() == ti + 1 {
+                        break;
+                    }
+                }
+                if out.len() == ti + 1 {
+                    break;
+                }
                 break;
             }
             let members = sample_without_replacement(&pool, spec.size, rng)?;
@@ -2045,48 +2610,40 @@ fn select_logic_terms_sampled_specs(
             if !ld_ok {
                 continue;
             }
-
-            let gate_rows: Vec<Vec<u8>> = members
-                .iter()
-                .map(|idx| {
-                    bin_map
-                        .get(idx)
-                        .cloned()
-                        .ok_or_else(|| "missing logic row".to_string())
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let literal_rows = logic_gate_literal_rows(&gate_rows, spec.mode)?;
-            let gate_indicator = logic_gate_indicator_from_literals(
-                literal_rows.as_slice(),
-                logic_output_negated(spec.mode),
-            );
-            let raw_af = gate_indicator.iter().filter(|&&v| v != 0).count() as f64
-                / gate_indicator.len() as f64;
-            let gate_maf = raw_af.min(1.0_f64 - raw_af);
-            let gate_values = match logic_effect_model {
-                LogicEffectModel::Gate => logic_gate_centered_values(&gate_indicator),
-                LogicEffectModel::CenteredInteraction => {
-                    residualize_logic_indicator_against_main_effects(
-                        &gate_indicator,
-                        literal_rows.as_slice(),
-                    )?
-                }
-            };
-            let var = variance_f64(&gate_values);
-            if var <= 1e-12 {
+            let Some(eval) = evaluate_logic_candidate(
+                members.as_slice(),
+                &bin_map,
+                spec.mode,
+                logic_effect_model,
+            )?
+            else {
                 continue;
-            }
-            if gate_maf + 1e-12_f64 >= causal_maf_min as f64
-                && best
-                    .as_ref()
-                    .map(|(_, _, af)| (raw_af - af_center).abs() < (*af - af_center).abs())
-                    .unwrap_or(true)
+            };
+            if eval.gate_maf + 1e-12_f64 >= causal_maf_min as f64
+                && logic_candidate_is_better(
+                    eval.proxy_margin,
+                    eval.parent_gate_max_r2,
+                    eval.raw_af,
+                    best_margin,
+                    best_similarity,
+                    best.as_ref().map(|(_, _, af, _)| *af).unwrap_or(af_center),
+                    af_center,
+                )
             {
-                best = Some((members.clone(), gate_values.clone(), raw_af));
+                best_margin = eval.proxy_margin;
+                best_similarity = eval.parent_gate_max_r2;
+                best = Some((
+                    members.clone(),
+                    eval.gate_values.clone(),
+                    eval.raw_af,
+                    eval.proxy_margin,
+                ));
             }
-            if raw_af >= logic_af_min
-                && raw_af <= logic_af_max
-                && gate_maf + 1e-12_f64 >= causal_maf_min as f64
+            if eval.raw_af >= logic_af_min
+                && eval.raw_af <= logic_af_max
+                && eval.gate_maf + 1e-12_f64 >= causal_maf_min as f64
+                && eval.parent_gate_max_r2 <= parent_similarity_limit + 1e-12
+                && eval.proxy_margin > proxy_delta_min + 1e-12
             {
                 let label = term_label(sites, &members, Some(spec.mode));
                 for idx in members.iter() {
@@ -2095,7 +2652,7 @@ fn select_logic_terms_sampled_specs(
                 out.push(CausalTerm {
                     members,
                     mode: Some(spec.mode),
-                    values: gate_values,
+                    values: eval.gate_values,
                     effect: 0.0,
                     label,
                 });
@@ -2104,23 +2661,33 @@ fn select_logic_terms_sampled_specs(
         }
 
         if out.len() != ti + 1 {
-            if let Some((members, gate, _af)) = best {
-                let label = term_label(sites, &members, Some(spec.mode));
-                for idx in members.iter() {
-                    used_global.insert(*idx);
+            if proxy_delta_min <= 1e-12 {
+                if let Some((members, gate, _af, _margin)) = best {
+                    let label = term_label(sites, &members, Some(spec.mode));
+                    for idx in members.iter() {
+                        used_global.insert(*idx);
+                    }
+                    out.push(CausalTerm {
+                        members,
+                        mode: Some(spec.mode),
+                        values: gate,
+                        effect: 0.0,
+                        label,
+                    });
+                } else {
+                    return Err(format!(
+                        "unable to build a valid logic gate for term {ti}; try relaxing LD / AF / heterozygosity constraints (gate_size={}, lmaf={:.4})",
+                        spec.size,
+                        causal_maf_min,
+                    ));
                 }
-                out.push(CausalTerm {
-                    members,
-                    mode: Some(spec.mode),
-                    values: gate,
-                    effect: 0.0,
-                    label,
-                });
             } else {
                 return Err(format!(
-                    "unable to build a valid logic gate for term {ti}; try relaxing LD / AF / heterozygosity constraints (gate_size={}, lmaf={:.4})",
+                    "unable to build a valid logic gate for term {ti}; no candidate satisfied the requested proxy-delta / LD / AF / heterozygosity constraints (gate_size={}, lmaf={:.4}, proxy_delta={:.4}, logic_delta={:.4})",
                     spec.size,
                     causal_maf_min,
+                    proxy_delta_min,
+                    logic_delta,
                 ));
             }
         }
@@ -2173,6 +2740,8 @@ fn materialize_mixed_terms_from_plan(
     causal_maf_min: f32,
     logic_af_min: f64,
     logic_af_max: f64,
+    logic_delta: f64,
+    proxy_delta_min: f64,
     logic_max_iter: usize,
     logic_effect_model: LogicEffectModel,
     rng: &mut StdRng,
@@ -2196,6 +2765,8 @@ fn materialize_mixed_terms_from_plan(
         causal_maf_min,
         logic_af_min,
         logic_af_max,
+        logic_delta,
+        proxy_delta_min,
         logic_max_iter,
         logic_effect_model,
         &additive_used,
@@ -2430,6 +3001,9 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
     if config.logic_af_min > config.logic_af_max {
         return Err("logic_af_min must be <= logic_af_max.".to_string());
     }
+    if !config.logic_delta.is_finite() || config.logic_delta < 0.0 {
+        return Err("logic_delta must be finite and >= 0.".to_string());
+    }
 
     let logic_requested = config
         .logic_mode
@@ -2652,7 +3226,9 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
             axpy_inplace(&mut y, raw.as_slice(), 1.0);
             (raw, "none".to_string(), "none".to_string())
         };
+    let base_y = y.clone();
     let mut causal_component = vec![0.0_f64; n];
+    let mut logic_term_sampler = LogicTermSampler::None;
 
     let mut causal_terms: Vec<CausalTerm> = Vec::new();
     if needs_causal_scan {
@@ -2720,10 +3296,22 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
                     config.causal_maf_min,
                     config.logic_af_min,
                     config.logic_af_max,
+                    config.logic_delta,
+                    config.logic_delta,
                     config.logic_max_iter,
                     config.logic_effect_model,
                     &mut logic_rng,
                 )?;
+                if mixed_plan
+                    .iter()
+                    .any(|item| matches!(item, MixedPlannedTerm::Logic(_)))
+                {
+                    logic_term_sampler = LogicTermSampler::Mixed {
+                        plan: mixed_plan,
+                        row_map,
+                        rng: logic_rng,
+                    };
+                }
             } else if logic_requested {
                 let logic_mode_str = config.logic_mode.as_deref().unwrap_or("a");
                 let mut pool_rng = StdRng::seed_from_u64(config.seed ^ 0xB28F_6A91_C547_31D1u64);
@@ -2768,10 +3356,17 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
                     config.causal_maf_min,
                     config.logic_af_min,
                     config.logic_af_max,
+                    config.logic_delta,
+                    config.logic_delta,
                     config.logic_max_iter,
                     config.logic_effect_model,
                     &mut logic_rng,
                 )?;
+                logic_term_sampler = LogicTermSampler::Pure {
+                    pool_specs,
+                    row_map,
+                    rng: logic_rng,
+                };
             } else {
                 let mut sel_rng = StdRng::seed_from_u64(config.seed ^ 0xA54D_3F9E_6721_8CB7u64);
                 let selected = select_additive_indices(
@@ -2882,10 +3477,22 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
                 config.causal_maf_min,
                 config.logic_af_min,
                 config.logic_af_max,
+                config.logic_delta,
+                config.logic_delta,
                 config.logic_max_iter,
                 config.logic_effect_model,
                 &mut logic_rng,
             )?;
+            if mixed_plan
+                .iter()
+                .any(|item| matches!(item, MixedPlannedTerm::Logic(_)))
+            {
+                logic_term_sampler = LogicTermSampler::Mixed {
+                    plan: mixed_plan,
+                    row_map,
+                    rng: logic_rng,
+                };
+            }
         } else if logic_requested {
             let mut causal_progress_seen = 0usize;
             let mut causal_last_notified = 0usize;
@@ -2958,10 +3565,17 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
                 config.causal_maf_min,
                 config.logic_af_min,
                 config.logic_af_max,
+                config.logic_delta,
+                config.logic_delta,
                 config.logic_max_iter,
                 config.logic_effect_model,
                 &mut logic_rng,
             )?;
+            logic_term_sampler = LogicTermSampler::Pure {
+                pool_specs,
+                row_map,
+                rng: logic_rng,
+            };
         } else {
             let mut causal_progress_seen = 0usize;
             let mut causal_last_notified = 0usize;
@@ -3017,17 +3631,72 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
     }
 
     if !causal_terms.is_empty() && causal_pve_target > 0.0 {
-        assign_causal_effects(
-            &mut causal_terms,
-            causal_pve_target,
-            config.causal_effect_model,
-            &mut rng,
-        );
-        for term in causal_terms.iter() {
-            if term.effect != 0.0 {
-                axpy_inplace(&mut causal_component, &term.values, term.effect);
-                axpy_inplace(&mut y, &term.values, term.effect);
+        let mut redraws = 0usize;
+        loop {
+            assign_causal_effects(
+                &mut causal_terms,
+                causal_pve_target,
+                config.causal_effect_model,
+                &mut rng,
+            );
+            let (candidate_y, candidate_causal) =
+                compose_phenotype_with_causal_terms(base_y.as_slice(), &causal_terms);
+            let weak_logic = match logic_term_sampler.row_map() {
+                Some(row_map) => first_weak_realized_logic_term(
+                    &causal_terms,
+                    row_map,
+                    candidate_y.as_slice(),
+                    config.logic_het_max,
+                    config.logic_delta,
+                )?,
+                None => None,
+            };
+            if let Some(weak) = weak_logic {
+                if redraws >= MAX_REALIZED_LOGIC_REDRAWS {
+                    return Err(format!(
+                        "unable to realize a benchmarkable logic gate for term {} after {} redraws: term='{}', gate_score={:.4}, best_parent_score={:.4}",
+                        weak.term_index,
+                        MAX_REALIZED_LOGIC_REDRAWS,
+                        weak.label,
+                        weak.gate_score,
+                        weak.max_parent_score,
+                    ));
+                }
+                let realized_margin = weak.gate_score - weak.max_parent_score;
+                let proxy_delta_min = if let Some(row_map) = logic_term_sampler.row_map() {
+                    let local_proxy_margin = logic_term_local_proxy_margin(
+                        &causal_terms[weak.term_index],
+                        row_map,
+                        config.logic_het_max,
+                    )?
+                    .unwrap_or(0.0);
+                    if local_proxy_margin.is_finite()
+                        && local_proxy_margin > 1e-12
+                        && realized_margin.is_finite()
+                        && realized_margin > 1e-12
+                    {
+                        (config.logic_delta * local_proxy_margin / realized_margin)
+                            .max(config.logic_delta)
+                    } else {
+                        f64::INFINITY
+                    }
+                } else {
+                    config.logic_delta
+                };
+                let replacement = logic_term_sampler.rematerialize_one(
+                    weak.term_index,
+                    &causal_terms,
+                    &sites,
+                    &config,
+                    proxy_delta_min,
+                )?;
+                causal_terms[weak.term_index] = replacement;
+                redraws += 1;
+                continue;
             }
+            y = candidate_y;
+            causal_component = candidate_causal;
+            break;
         }
     }
     let realized_summary =
@@ -3182,6 +3851,7 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
     logic_het_max=1.0_f64,
     logic_af_min=0.0_f64,
     logic_af_max=1.0_f64,
+    logic_delta=DEFAULT_REALIZED_LOGIC_DELTA,
     logic_max_iter=256_usize,
     logic_window_bp=None,
     logic_effect_model="gate",
@@ -3228,6 +3898,7 @@ pub fn g2p_simulate_py<'py>(
     logic_het_max: f64,
     logic_af_min: f64,
     logic_af_max: f64,
+    logic_delta: f64,
     logic_max_iter: usize,
     logic_window_bp: Option<i32>,
     logic_effect_model: &str,
@@ -3292,6 +3963,11 @@ pub fn g2p_simulate_py<'py>(
             "logic_af_min must be <= logic_af_max.",
         ));
     }
+    if !logic_delta.is_finite() || logic_delta < 0.0 {
+        return Err(PyValueError::new_err(
+            "logic_delta must be finite and >= 0.",
+        ));
+    }
     if let Some(weights) = logic_size_weights.as_ref() {
         validate_logic_size_weights(weights).map_err(|e| PyValueError::new_err(e.to_string()))?;
     }
@@ -3344,6 +4020,7 @@ pub fn g2p_simulate_py<'py>(
         logic_het_max,
         logic_af_min,
         logic_af_max,
+        logic_delta,
         logic_max_iter,
         logic_window_bp,
         logic_effect_model,
@@ -3489,6 +4166,55 @@ mod tests {
             logic_gate_indicator(&[a, b], LogicGateMode::Nan).unwrap(),
             vec![1u8, 0, 0, 0]
         );
+    }
+
+    #[test]
+    fn realized_logic_validation_flags_gate_weaker_than_parent_literal() {
+        let mut row_map: HashMap<usize, Vec<f32>> = HashMap::new();
+        row_map.insert(0, vec![0.0, 0.0, 2.0, 2.0]);
+        row_map.insert(1, vec![0.0, 2.0, 0.0, 2.0]);
+        let term = CausalTerm {
+            members: vec![0, 1],
+            mode: Some(LogicGateMode::A),
+            values: vec![0.0, 0.0, 0.0, 0.0],
+            effect: 0.0,
+            label: "1_1[A>G]&1_2[C>T]".to_string(),
+        };
+        let y = vec![-1.0_f64, -1.0, 2.0, 2.0];
+        let weak = first_weak_realized_logic_term(
+            &[term],
+            &row_map,
+            &y,
+            1.0,
+            DEFAULT_REALIZED_LOGIC_DELTA,
+        )
+        .expect("realized logic validation");
+        let weak = weak.expect("weak logic term should be flagged");
+        assert!(weak.max_parent_score > weak.gate_score);
+    }
+
+    #[test]
+    fn realized_logic_validation_keeps_gate_stronger_than_parent_literals() {
+        let mut row_map: HashMap<usize, Vec<f32>> = HashMap::new();
+        row_map.insert(0, vec![0.0, 0.0, 2.0, 2.0]);
+        row_map.insert(1, vec![0.0, 2.0, 0.0, 2.0]);
+        let term = CausalTerm {
+            members: vec![0, 1],
+            mode: Some(LogicGateMode::A),
+            values: vec![0.0, 0.0, 0.0, 0.0],
+            effect: 0.0,
+            label: "1_1[A>G]&1_2[C>T]".to_string(),
+        };
+        let y = vec![-1.0_f64, -1.0, -1.0, 3.0];
+        let weak = first_weak_realized_logic_term(
+            &[term],
+            &row_map,
+            &y,
+            1.0,
+            DEFAULT_REALIZED_LOGIC_DELTA,
+        )
+        .expect("realized logic validation");
+        assert!(weak.is_none());
     }
 
     #[test]
@@ -3645,8 +4371,7 @@ mod tests {
                 label: "s3".to_string(),
             },
         ];
-        let assigned =
-            assign_causal_effects(&mut terms, 0.2, CausalEffectModel::Equal, &mut rng);
+        let assigned = assign_causal_effects(&mut terms, 0.2, CausalEffectModel::Equal, &mut rng);
         assert_eq!(assigned.len(), terms.len());
         let first = assigned[0].abs();
         assert!(first.is_finite() && first > 0.0);

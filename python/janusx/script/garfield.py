@@ -1866,10 +1866,14 @@ def _build_all_gene_interval_groups(
     dfgff3 = readanno(gff3, "ID").iloc[:, :4].set_index(3)
     dfgff3 = dfgff3.loc[~dfgff3.index.duplicated()]
     groups: list[list[tuple[str, int, int]]] = []
+    ext = max(1, int(extension))
     for gene_id, row in dfgff3.iterrows():
         chrom = str(row[0])
-        start = int(row[1]) - int(extension)
-        end = int(row[2]) + int(extension)
+        gene_start = int(row[1])
+        gene_end = int(row[2])
+        center = (gene_start + gene_end) // 2
+        start = center - ext
+        end = center + ext
         if not gene_id:
             continue
         groups.append([(chrom, start, end)])
@@ -1986,31 +1990,49 @@ def _describe_rank_schedule(rank_score_runtime: str) -> str:
     return mode
 
 
-def _parse_rule_null_quantile_spec(spec: object) -> tuple[float, bool, Optional[str]]:
+def _parse_rule_null_penalty_spec(
+    spec: object,
+) -> tuple[str, float, bool, Optional[str]]:
     if spec is None:
-        return 0.99, False, None
+        return "gev", 0.99, False, None
     text = str(spec).strip().lower()
     if text == "":
         raise ValueError(
-            "-pm/--permutation requires a value like q99, q50, or a float in (0, 1)."
+            "-pm/--permutation requires one of: gev, g99, g99.9, q99, q99.9, or a float in (0, 1)."
         )
+    if text in {"gev", "gumbel", "auto"}:
+        return "gev", 0.99, False, text
+    if text.startswith("g"):
+        digits = text[1:]
+        try:
+            pct = float(digits)
+        except Exception as exc:
+            raise ValueError(
+                "-pm/--permutation GEV mode must look like g99 or g99.9."
+            ) from exc
+        quantile = pct / 100.0
+        if not np.isfinite(quantile) or not (0.0 < float(quantile) < 1.0):
+            raise ValueError("-pm/--permutation GEV quantile must be in (0, 1).")
+        return "gev", float(quantile), False, text
     if text.startswith("q"):
         digits = text[1:]
-        if digits == "" or not digits.isdigit():
+        try:
+            pct = float(digits)
+        except Exception as exc:
             raise ValueError(
-                "-pm/--permutation must look like q99, q50, or a float in (0, 1)."
-            )
-        quantile = int(digits) / float(10 ** len(digits))
+                "-pm/--permutation empirical-quantile mode must look like q99 or q99.9."
+            ) from exc
+        quantile = pct / 100.0
     else:
         try:
             quantile = float(text)
         except Exception as exc:
             raise ValueError(
-                "-pm/--permutation must look like q99, q50, or a float in (0, 1)."
+                "-pm/--permutation must look like gev, g99, g99.9, q99, q99.9, or a float in (0, 1)."
             ) from exc
     if not np.isfinite(quantile) or not (0.0 < float(quantile) < 1.0):
         raise ValueError("-pm/--permutation quantile must be in (0, 1).")
-    return float(quantile), True, text
+    return "quantile", float(quantile), False, text
 
 
 def _dedupe_saved_paths(paths: list[object]) -> list[str]:
@@ -2110,6 +2132,7 @@ def _emit_garfield_bg_noise_summary_to_log(
                 "dataset",
                 "bucket",
                 "kind",
+                "method",
                 "quantile",
                 "penalty",
                 "mean",
@@ -2137,6 +2160,7 @@ def _emit_garfield_bg_noise_summary_to_log(
                         dataset,
                         label,
                         "search",
+                        str(search.get("method", "")),
                         _garfield_format_metric4(search.get("quantile")),
                         _garfield_format_metric4(search.get("penalty")),
                         _garfield_format_metric4(search.get("mean")),
@@ -2157,6 +2181,7 @@ def _emit_garfield_bg_noise_summary_to_log(
                     dataset,
                     label,
                     "output",
+                    str(output.get("method", "")),
                     _garfield_format_metric4(output.get("quantile")),
                     _garfield_format_metric4(output.get("penalty")),
                     _garfield_format_metric4(output.get("mean")),
@@ -2536,10 +2561,12 @@ def main() -> None:
         type=str,
         default=None,
         help=(
-            "Experimental: set the GARFIELD null-penalty quantile, e.g. q99 or q50. "
-            "When specified, GARFIELD also appends permutation-based one-sided p-value "
-            "and FDR columns to rules.tsv. Default keeps the current q99 threshold "
-            "and does not compute permutation p-values."
+            "Set the GARFIELD null-penalty method. Default uses `g99` "
+            "(GEV/Gumbel-fit extreme-value threshold at target quantile 0.99). "
+            "You may also pass `gev`, `gumbel`, `g99`, `g99.9`, or an empirical quantile "
+            "such as `q99`, `q99.9`, or `0.99`. "
+            "This option only controls the null-penalty threshold; it does not append "
+            "permutation p-value or FDR columns."
         ),
     )
     optional_group.add_argument(
@@ -2639,10 +2666,11 @@ def main() -> None:
         parser.error("unrecognized arguments: " + " ".join(extras))
     try:
         (
+            args.rule_null_penalty_method_runtime,
             args.rule_null_quantile_runtime,
             args.rule_null_report_pvalue_runtime,
             args.rule_null_quantile_spec_runtime,
-        ) = _parse_rule_null_quantile_spec(args.rule_permutation_quantile)
+        ) = _parse_rule_null_penalty_spec(args.rule_permutation_quantile)
     except ValueError as e:
         parser.error(str(e))
 
@@ -2699,7 +2727,7 @@ def main() -> None:
     args.layer = (
         int(args.layer) if args.layer is not None
         else int(args.layer_compat) if args.layer_compat is not None
-        else 4
+        else 3
     )
     if int(args.layer) <= 0:
         parser.error("-layer must be > 0")
@@ -2985,7 +3013,7 @@ def main() -> None:
         )
         if len(group_intervals) == 0:
             raise ValueError(f"No valid groups built for scan-mode={args.scan_mode}.")
-        if args.scan_mode == "geneset":
+        if args.scan_mode in {"gene", "geneset"}:
             null_group_intervals = _build_all_gene_interval_groups(
                 args.gff3,
                 int(args.extension),
@@ -3090,7 +3118,7 @@ def main() -> None:
         logic_unit_kind = _scan_mode_to_logic_unit_kind(args.scan_mode)
         rust_groups = group_intervals if args.scan_mode not in {"window", "wholegenome"} else None
         rust_group_names = group_labels if args.scan_mode not in {"window", "wholegenome"} else None
-        rust_null_groups = null_group_intervals if args.scan_mode == "geneset" else None
+        rust_null_groups = null_group_intervals if args.scan_mode in {"gene", "geneset"} else None
         trait_logic_prefix = f"{trait_outprefix}.garfield"
         # Rust handles full-data residualization before ML candidate search
         # and beam search are executed.
@@ -3118,6 +3146,7 @@ def main() -> None:
                 ml_top_frac=0.0,
                 permutation_repeats=20,
                 permutation_scoring="auto",
+                rule_null_penalty_method=str(args.rule_null_penalty_method_runtime),
                 rule_null_quantile=float(args.rule_null_quantile_runtime),
                 rule_null_report_pvalue=bool(args.rule_null_report_pvalue_runtime),
                 n_estimators=100,
@@ -3260,17 +3289,15 @@ def main() -> None:
                     f"Running pseudo FvLMM follow-up for '{trait_name}' on {int(n_rules)} GARFIELD rule(s)."
                 )
                 units_for_fdr = (
-                    int(result.get("units_scanned", 0))
-                    if int(result.get("units_scanned", 0)) > 0
-                    else int(result.get("units_total", 0))
+                    int(result.get("units_total", 0))
                     if int(result.get("units_total", 0)) > 0
+                    else int(result.get("units_scanned", 0))
+                    if int(result.get("units_scanned", 0)) > 0
                     else 0
                 )
-                fdr_n_tests = (
-                    units_for_fdr * max(1, int(args.top_rules_runtime))
-                    if units_for_fdr > 0
-                    else None
-                )
+                site_tests_for_fdr = max(0, int(_n_snps))
+                total_tests_for_fdr = site_tests_for_fdr + max(0, units_for_fdr)
+                fdr_n_tests = total_tests_for_fdr if total_tests_for_fdr > 0 else None
                 return _run_garfield_pseudo_fvlmm(
                     pseudo_prefix=str(pseudo_prefix),
                     trait_label=suffix,
@@ -3328,6 +3355,7 @@ def main() -> None:
             "engine_runtime": engine_runtime,
             "ml_skipped": ml_skipped,
             "permutation": True,
+            "rule_null_penalty_method": str(args.rule_null_penalty_method_runtime),
             "rule_null_quantile": float(args.rule_null_quantile_runtime),
             "rule_null_report_pvalue": bool(args.rule_null_report_pvalue_runtime),
             "rule_null_quantile_spec": args.rule_null_quantile_spec_runtime,
@@ -3514,6 +3542,7 @@ def main() -> None:
                 "rank_schedule_runtime": rank_schedule_runtime,
                 "rank_schedule_source": rank_schedule_source,
                 "permutation": True,
+                "rule_null_penalty_method": str(args.rule_null_penalty_method_runtime),
                 "rule_null_quantile": float(args.rule_null_quantile_runtime),
                 "rule_null_report_pvalue": bool(args.rule_null_report_pvalue_runtime),
                 "rule_null_quantile_spec": args.rule_null_quantile_spec_runtime,

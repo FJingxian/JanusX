@@ -5085,7 +5085,13 @@ fn beam_search_train_test_continuous_impl(
                 )?
             };
             if next.is_empty() {
-                garfield_layer_rss_breakpoint(mode_name, depth, "empty", beam.len(), kept_all.len())?;
+                garfield_layer_rss_breakpoint(
+                    mode_name,
+                    depth,
+                    "empty",
+                    beam.len(),
+                    kept_all.len(),
+                )?;
                 break;
             }
             kept_all.extend(next.iter().cloned());
@@ -7070,7 +7076,13 @@ pub fn beam_search_train_test_continuous_fuzzy(
                 )?
             };
             if next.is_empty() {
-                garfield_layer_rss_breakpoint(mode_name, depth, "empty", beam.len(), kept_all.len())?;
+                garfield_layer_rss_breakpoint(
+                    mode_name,
+                    depth,
+                    "empty",
+                    beam.len(),
+                    kept_all.len(),
+                )?;
                 break;
             }
             kept_all.extend(next.iter().cloned());

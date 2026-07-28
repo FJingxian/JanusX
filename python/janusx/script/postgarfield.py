@@ -6,6 +6,7 @@ Examples
 --------
   jx postgarfield -i trait.garfield.fvlmm.tsv -gff genes.gff3.gz
   jx postgarfield -i trait.garfield.fvlmm.tsv -gff genes.gff3.gz -gwasfile trait.gwas.tsv --circle 6 0.4
+  jx postgarfield -i trait.garfield.fvlmm.tsv -bed genes.txt
 """
 
 from __future__ import annotations
@@ -56,6 +57,7 @@ from janusx.script._common.threads import (
 )
 from janusx.script.postgwas import (
     GWASPLOT,
+    _ANNO_DESC_KEY,
     _DEFAULT_CIRCLE_INTERVAL,
     _DEFAULT_CIRCLE_LW,
     _DEFAULT_CIRCLE_SIZE_IN,
@@ -63,7 +65,9 @@ from janusx.script.postgwas import (
     _DEFAULT_SCATTER_SIZE,
     _POSTGWAS_DEFAULT_FONT_SIZE,
     _apply_postgwas_matplotlib_style,
+    _build_postgwas_bed_annotation_context,
     _chrom_sort_key,
+    _format_postgwas_bed_site_desc_many,
     _format_postgwas_gff_site_desc_direct,
     _format_postgwas_gff_site_desc_many_rust,
     _load_postgwas_input_table,
@@ -73,10 +77,13 @@ from janusx.script.postgwas import (
     _parse_palette_spec,
     _parse_scatter_size_spec,
     _parse_ylim_spec,
+    _postgwas_annotation_is_gff,
     _postgwas_build_circle_link_table_from_groups,
     _postgwas_get_gff_query,
     _postgwas_get_gff_rust_index,
+    _resolve_postgwas_annotation_kind,
     _postgwas_resolve_input_pvalue_column,
+    _resolve_postgwas_annotation_file,
     _postgwas_should_rasterize_dense_layers,
     _resolve_postgwas_fontstyle,
     _resolve_postgwas_output_stem,
@@ -87,6 +94,7 @@ from janusx.script.postgwas import (
     _save_figure_and_close,
     _strip_postgwas_input_suffix,
 )
+from janusx.gtools.reader import readanno
 
 _GARFIELD_GROUP_COL = "snp"
 _GARFIELD_CHR_COL = "chrom"
@@ -101,10 +109,11 @@ _GARFIELD_LABEL_ORDER = {
     "FivePrimeUTR": 1,
     "ThreePrimeUTR": 2,
     "Exon": 3,
-    "Intron": 4,
-    "Upstream2kb": 5,
-    "Downstream2kb": 6,
-    "Intergenic": 7,
+    "Gene": 4,
+    "Intron": 5,
+    "Upstream2kb": 6,
+    "Downstream2kb": 7,
+    "Intergenic": 8,
 }
 _GARFIELD_CATEGORY_SPECS = (
     ("all", "all significant interactions"),
@@ -435,7 +444,11 @@ def _postgarfield_extract_combo_rows(df: pd.DataFrame) -> pd.DataFrame:
     return df.loc[group_series.isin(multi_groups) & token_mask].copy()
 
 
-def _postgarfield_build_combo_summary(combo_df: pd.DataFrame) -> pd.DataFrame:
+def _postgarfield_build_combo_summary(
+    combo_df: pd.DataFrame,
+    *,
+    requested_p_col: str,
+) -> pd.DataFrame:
     work = combo_df.copy()
     work[_GARFIELD_GROUP_COL] = work[_GARFIELD_GROUP_COL].astype(str)
     work[_GARFIELD_P_COL] = pd.to_numeric(work[_GARFIELD_P_COL], errors="coerce")
@@ -443,11 +456,19 @@ def _postgarfield_build_combo_summary(combo_df: pd.DataFrame) -> pd.DataFrame:
         work[_GARFIELD_PADJ_COL] = pd.to_numeric(work[_GARFIELD_PADJ_COL], errors="coerce")
     else:
         work[_GARFIELD_PADJ_COL] = np.nan
+    resolved_requested_p = _postgwas_resolve_input_pvalue_column(
+        work.columns,
+        requested_p_col,
+    )
+    work[resolved_requested_p] = pd.to_numeric(work[resolved_requested_p], errors="coerce")
     summary = work.groupby(_GARFIELD_GROUP_COL, sort=False).agg(
         combo_pwald=(_GARFIELD_P_COL, "min"),
         combo_padj=(_GARFIELD_PADJ_COL, "min"),
+        combo_requested_p=(resolved_requested_p, "min"),
         combo_n_loci=(_GARFIELD_POS_COL, "size"),
     )
+    summary.attrs["requested_p_col"] = str(requested_p_col)
+    summary.attrs["resolved_requested_p_col"] = str(resolved_requested_p)
     return summary
 
 
@@ -455,16 +476,22 @@ def _postgarfield_resolve_sig_groups(
     summary_df: pd.DataFrame,
     *,
     thr: Optional[float],
+    requested_p_col: str,
 ) -> tuple[set[str], Optional[float], str]:
     if summary_df.shape[0] == 0:
         return set(), None, "no combo rows"
+    requested_label = str(requested_p_col).strip() or _GARFIELD_P_COL
+    resolved_requested_p = str(
+        summary_df.attrs.get("resolved_requested_p_col", requested_label)
+    ).strip() or requested_label
+    requested_vals = pd.to_numeric(summary_df["combo_requested_p"], errors="coerce")
     pwald = pd.to_numeric(summary_df["combo_pwald"], errors="coerce")
     if thr is not None:
-        sig_mask = pwald <= float(thr)
+        sig_mask = requested_vals <= float(thr)
         return (
             set(summary_df.index[sig_mask].tolist()),
             float(thr),
-            f"combo_pwald<={float(thr):.4g}",
+            f"combo_{resolved_requested_p}<={float(thr):.4g}",
         )
 
     padj = pd.to_numeric(summary_df["combo_padj"], errors="coerce")
@@ -472,7 +499,12 @@ def _postgarfield_resolve_sig_groups(
     sig_groups = set(summary_df.index[sig_mask].tolist())
     if len(sig_groups) == 0:
         return set(), None, f"combo_padj<={float(_GARFIELD_SIG_PADJ_DEFAULT):.4g} (none)"
-    thr_p = float(pd.to_numeric(summary_df.loc[list(sig_groups), "combo_pwald"], errors="coerce").max())
+    if resolved_requested_p == _GARFIELD_PADJ_COL:
+        thr_p = float(_GARFIELD_SIG_PADJ_DEFAULT)
+    else:
+        thr_p = float(
+            pd.to_numeric(summary_df.loc[list(sig_groups), "combo_pwald"], errors="coerce").max()
+        )
     return sig_groups, thr_p, f"combo_padj<={float(_GARFIELD_SIG_PADJ_DEFAULT):.4g}"
 
 
@@ -481,6 +513,7 @@ def _postgarfield_annotate_sig_rows(
     *,
     gff_query,
     gff_rust_index,
+    bed_annotation_ctx: Optional[dict[str, object]],
     summary_df: pd.DataFrame,
     sig_rule: str,
     sig_thr_p: Optional[float],
@@ -523,6 +556,18 @@ def _postgarfield_annotate_sig_rows(
                 out[_GARFIELD_POS_COL].astype(int).tolist(),
             )
         ]
+    elif out.shape[0] > 0 and bed_annotation_ctx is not None:
+        site_index = pd.MultiIndex.from_arrays(
+            [
+                out[_GARFIELD_CHR_COL].astype(str).tolist(),
+                out[_GARFIELD_POS_COL].astype(int).tolist(),
+            ]
+        )
+        desc_values = _format_postgwas_bed_site_desc_many(
+            site_index,
+            annotation_ctx=bed_annotation_ctx,
+            flank_bp=2_000,
+        )
     out["desc"] = [str(x) for x in desc_values]
 
     row_label_sets = [set(_postgarfield_split_desc_labels(x)) for x in out["desc"].tolist()]
@@ -903,6 +948,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         epilog=minimal_help_epilog([
             "jx postgarfield -i trait.garfield.fvlmm.tsv -gff genes.gff3.gz",
             "jx postgarfield -i trait.garfield.fvlmm.tsv -gff genes.gff3.gz -gwasfile trait.gwas.tsv --circle 6 0.4",
+            "jx postgarfield -i trait.garfield.fvlmm.tsv -bed genes.txt",
         ]),
     )
     required_group = parser.add_argument_group("Required Arguments")
@@ -910,9 +956,14 @@ def main(argv: Optional[list[str]] = None) -> None:
         "-i", "--input", dest="garfield", nargs="+", required=True,
         help="GARFIELD interaction result file(s), typically *.fvlmm.tsv.",
     )
-    required_group.add_argument(
-        "-gff", "--gff", dest="gff", required=True,
+    anno_group = required_group.add_mutually_exclusive_group(required=True)
+    anno_group.add_argument(
+        "-gff", "--gff", dest="gff", default=None,
         help="GFF/GFF3 annotation file for interaction endpoint annotation.",
+    )
+    anno_group.add_argument(
+        "-bed", "--bed", dest="bed", default=None,
+        help="BED-like annotation text file for interaction endpoint annotation. Delimiter auto-detects tab/comma/space.",
     )
 
     optional_group = parser.add_argument_group("Optional Arguments")
@@ -1027,6 +1078,12 @@ def main(argv: Optional[list[str]] = None) -> None:
     add_common_thread_arg(optional_group, default_threads=detect_effective_threads())
 
     args = parser.parse_args(argv)
+    args.anno_file = _resolve_postgwas_annotation_file(args)
+    args._postgarfield_annotation_kind = _resolve_postgwas_annotation_kind(
+        gff=getattr(args, "gff", None),
+        bed=getattr(args, "bed", None),
+        anno_file=args.anno_file,
+    )
     args.out = os.path.normpath(args.out if args.out is not None else ".")
     os.makedirs(args.out, mode=0o755, exist_ok=True)
 
@@ -1071,7 +1128,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         ensure_file_exists(logger, str(path), "GARFIELD result file")
         for path in list(args.garfield)
     ]
-    checks.append(ensure_file_exists(logger, str(args.gff), "GFF annotation file"))
+    checks.append(ensure_file_exists(logger, str(args.anno_file), "Annotation file"))
     for bg in bg_files:
         if bg is not None:
             checks.append(ensure_file_exists(logger, str(bg), "GWAS background file"))
@@ -1088,7 +1145,7 @@ def main(argv: Optional[list[str]] = None) -> None:
                 "General",
                 [
                     ("GARFIELD files", ", ".join([os.path.basename(str(x)) for x in list(args.garfield)])),
-                    ("GFF", str(args.gff)),
+                    ("Annotation", str(args.anno_file)),
                     ("GWAS background", "auto(singleton fallback)" if args.gwasfile is None else ", ".join([os.path.basename(str(x)) for x in list(args.gwasfile)])),
                     ("Background Chr|Pos|P", f"{args.chr}|{args.pos}|{args.pvalue}"),
                     ("Threshold", str(args.thr) if args.thr is not None else "auto from combo padj<=0.05"),
@@ -1111,16 +1168,37 @@ def main(argv: Optional[list[str]] = None) -> None:
     _emit_postgarfield_command_to_log(logger, argv)
 
     _apply_postgwas_matplotlib_style(args)
-    gff_rust_index = _postgwas_get_gff_rust_index(
-        str(args.gff),
-        use_shared=True,
+    anno_is_gff = _postgwas_annotation_is_gff(
+        args.anno_file,
+        annotation_kind=getattr(args, "_postgarfield_annotation_kind", None),
     )
-    gff_query = None if gff_rust_index is not None else _postgwas_get_gff_query(
-        str(args.gff),
-        use_shared=True,
+    gff_rust_index = (
+        _postgwas_get_gff_rust_index(str(args.anno_file), use_shared=True)
+        if anno_is_gff
+        else None
     )
-    if gff_rust_index is None and gff_query is None:
-        logger.error(f"Failed to build GFF annotation index: {args.gff}")
+    gff_query = (
+        None
+        if not anno_is_gff
+        else (
+            None
+            if gff_rust_index is not None
+            else _postgwas_get_gff_query(str(args.anno_file), use_shared=True)
+        )
+    )
+    bed_annotation_ctx = (
+        None
+        if anno_is_gff
+        else _build_postgwas_bed_annotation_context(
+            readanno(
+                str(args.anno_file),
+                _ANNO_DESC_KEY,
+                annotation_kind=getattr(args, "_postgarfield_annotation_kind", None),
+            )
+        )
+    )
+    if anno_is_gff and gff_rust_index is None and gff_query is None:
+        logger.error(f"Failed to build GFF annotation index: {args.anno_file}")
         raise SystemExit(1)
 
     saved_paths: list[str] = []
@@ -1140,16 +1218,21 @@ def main(argv: Optional[list[str]] = None) -> None:
             raise SystemExit(1)
 
         combo_df = _postgarfield_extract_combo_rows(garfield_df)
-        summary_df = _postgarfield_build_combo_summary(combo_df)
+        summary_df = _postgarfield_build_combo_summary(
+            combo_df,
+            requested_p_col=str(args.pvalue),
+        )
         sig_groups, sig_thr_p, sig_rule = _postgarfield_resolve_sig_groups(
             summary_df,
             thr=args.thr,
+            requested_p_col=str(args.pvalue),
         )
         sig_rows = combo_df.loc[combo_df[_GARFIELD_GROUP_COL].astype(str).isin(sig_groups)].copy()
         annotated_df = _postgarfield_annotate_sig_rows(
             sig_rows,
             gff_query=gff_query,
             gff_rust_index=gff_rust_index,
+            bed_annotation_ctx=bed_annotation_ctx,
             summary_df=summary_df,
             sig_rule=sig_rule,
             sig_thr_p=sig_thr_p,

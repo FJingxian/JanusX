@@ -2,6 +2,7 @@
 General-purpose readers and range query helpers used across JanusX.
 """
 
+import csv
 from pathlib import Path
 from typing import Iterable, Optional, Union
 import gzip
@@ -286,23 +287,92 @@ def gffreader(gffpath: pathlike, attr: Optional[Iterable[str]] = None) -> pd.Dat
     return gff
 
 
+def _read_bed_like_rows(annofile: pathlike) -> list[list[str]]:
+    """
+    Read BED-like text rows with delimiter auto-detection.
+
+    Supported delimiters:
+      - tab
+      - comma
+      - whitespace
+
+    For whitespace-delimited rows, parsing splits on runs of whitespace.
+    """
+    path_text = str(annofile)
+    opener = gzip.open if path_text.lower().endswith(".gz") else open
+    detected: Optional[str] = None
+    rows: list[list[str]] = []
+    with opener(annofile, "rt", encoding="utf-8", errors="replace") as fh:
+        for raw_line in fh:
+            line = str(raw_line).strip()
+            if line == "" or line.startswith("#"):
+                continue
+            if detected is None:
+                if "\t" in line:
+                    detected = "tab"
+                elif "," in line:
+                    detected = "comma"
+                else:
+                    detected = "space"
+            if detected == "tab":
+                fields = [str(x).strip() for x in raw_line.rstrip("\r\n").split("\t")]
+            elif detected == "comma":
+                parsed = next(csv.reader([raw_line.rstrip("\r\n")]))
+                fields = [str(x).strip() for x in parsed]
+            else:
+                fields = re.split(r"\s+", line)
+            if len(fields) == 0:
+                continue
+            rows.append(fields)
+    return rows
+
+
 def bedreader(annofile: pathlike) -> pd.DataFrame:
     """
-    Read BED annotation and guarantee columns 0..5 exist
+    Read BED-like annotation text and guarantee columns 0..5 exist
     (missing columns are filled with 'NA').
+
+    The file suffix is not used; delimiters are auto-detected from
+    tab/comma/whitespace. Rows whose start/end cannot be parsed as numeric
+    are treated as header/malformed rows and skipped.
     """
-    anno = pd.read_csv(annofile, sep="\t", header=None).fillna("NA")
+    rows = _read_bed_like_rows(annofile)
+    if len(rows) == 0:
+        return pd.DataFrame(columns=range(6))
+    anno = pd.DataFrame(rows).fillna("NA")
     if anno.shape[1] <= 4:
         anno[4] = "NA"
     if anno.shape[1] <= 5:
         anno[5] = "NA"
-    return anno
+    if anno.shape[1] <= 2:
+        return pd.DataFrame(columns=range(6))
+
+    start_num = pd.to_numeric(anno[1], errors="coerce")
+    end_num = pd.to_numeric(anno[2], errors="coerce")
+    valid = start_num.notna() & end_num.notna()
+    if not bool(valid.any()):
+        return pd.DataFrame(columns=range(6))
+
+    anno = anno.loc[valid].copy()
+    start_num = start_num.loc[valid].astype(np.int64)
+    end_num = end_num.loc[valid].astype(np.int64)
+    anno[1] = np.minimum(
+        start_num.to_numpy(dtype=np.int64),
+        end_num.to_numpy(dtype=np.int64),
+    )
+    anno[2] = np.maximum(
+        start_num.to_numpy(dtype=np.int64),
+        end_num.to_numpy(dtype=np.int64),
+    )
+    anno[0] = anno[0].astype(str).str.strip()
+    return anno.reset_index(drop=True)
 
 
 def readanno(
     annofile: str,
     descItem: str = "description",
     gff_data: Optional[pd.DataFrame] = None,
+    annotation_kind: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Read BED/GFF annotation into JanusX unified schema.
@@ -319,13 +389,17 @@ def readanno(
     gff_data : pd.DataFrame or None, default None
         Optional preloaded GFF DataFrame from `gffreader` / `GFFQuery.gff`.
         When provided for GFF/GFF3 input, file parsing is skipped.
+    annotation_kind : {"gff", "bed"} or None, default None
+        Explicit annotation source kind. When "bed", the file is parsed as
+        BED-like text regardless of suffix.
     """
     suffix = str(annofile).replace(".gz", "").split(".")[-1].lower()
+    kind = str(annotation_kind or "").strip().lower()
 
-    if suffix == "bed":
+    if kind == "bed" or suffix == "bed":
         return bedreader(annofile)
 
-    if suffix in {"gff", "gff3"}:
+    if kind == "gff" or suffix in {"gff", "gff3"}:
         if gff_data is None:
             gff = gffreader(annofile)
         else:
@@ -364,7 +438,7 @@ def readanno(
         anno[5] = "NA"
         return anno
 
-    raise ValueError(f"Unsupported annotation suffix: {suffix} (file: {annofile})")
+    return bedreader(annofile)
 
 
 class GFFQuery:

@@ -68,7 +68,6 @@ class GffSamplingSpec:
     mode_label: str
 
 
-DEFAULT_LOGIC_GFF_UNIT_GAP_BP = 50_000_000
 DEFAULT_GFF_LOGIC_REDRAW_ATTEMPTS = 2_000
 
 
@@ -344,52 +343,6 @@ def _gff_logic_unit_min_active_sites(
     return max(1, int(logic_k_min))
 
 
-def _merge_unit_intervals_by_chrom(
-    intervals: list[tuple[str, int, int]],
-) -> dict[str, list[tuple[int, int]]]:
-    merged: dict[str, list[tuple[int, int]]] = {}
-    for chrom, start, end in intervals:
-        chrom_norm = _normalize_bim_chrom(chrom)
-        merged.setdefault(chrom_norm, []).append((int(start), int(end)))
-    out: dict[str, list[tuple[int, int]]] = {}
-    for chrom_norm, spans in merged.items():
-        spans_sorted = sorted(spans, key=lambda x: (int(x[0]), int(x[1])))
-        collapsed: list[tuple[int, int]] = []
-        for start, end in spans_sorted:
-            if len(collapsed) == 0 or int(start) > int(collapsed[-1][1]):
-                collapsed.append((int(start), int(end)))
-            else:
-                collapsed[-1] = (collapsed[-1][0], max(int(collapsed[-1][1]), int(end)))
-        out[chrom_norm] = collapsed
-    return out
-
-
-def _unit_is_physically_isolated(
-    intervals: list[tuple[str, int, int]],
-    *,
-    existing_units: list[dict[str, Any]],
-    min_unit_gap_bp: int,
-) -> bool:
-    if int(min_unit_gap_bp) <= 0 or len(existing_units) == 0:
-        return True
-    lhs_by_chrom = _merge_unit_intervals_by_chrom(intervals)
-    for unit in existing_units:
-        rhs_by_chrom = _merge_unit_intervals_by_chrom(list(unit["intervals"]))
-        for chrom_norm, lhs_spans in lhs_by_chrom.items():
-            rhs_spans = rhs_by_chrom.get(chrom_norm, [])
-            if len(rhs_spans) == 0:
-                continue
-            for lhs_start, lhs_end in lhs_spans:
-                for rhs_start, rhs_end in rhs_spans:
-                    separated = (
-                        int(lhs_end) + int(min_unit_gap_bp) < int(rhs_start)
-                        or int(rhs_end) + int(min_unit_gap_bp) < int(lhs_start)
-                    )
-                    if not separated:
-                        return False
-    return True
-
-
 def _draw_single_causal_gene_unit(
     *,
     gene_catalog: list[tuple[str, tuple[str, int, int]]],
@@ -399,8 +352,6 @@ def _draw_single_causal_gene_unit(
     active_positions: Optional[dict[str, list[int]]],
     min_unit_active_sites: int,
     blocked_unit_names: set[str],
-    existing_units: list[dict[str, Any]],
-    min_unit_gap_bp: int,
     inner_budget: int,
     gene_sampling_weights: Optional[dict[str, float]] = None,
 ) -> Optional[dict[str, Any]]:
@@ -445,12 +396,6 @@ def _draw_single_causal_gene_unit(
                 < int(min_unit_active_sites)
             ):
                 continue
-        if not _unit_is_physically_isolated(
-            intervals,
-            existing_units=existing_units,
-            min_unit_gap_bp=int(min_unit_gap_bp),
-        ):
-            continue
         return {
             "unit_kind": "geneset" if len(genes) > 1 else "gene",
             "genes": genes,
@@ -469,7 +414,6 @@ def _sample_causal_gene_units(
     active_positions: Optional[dict[str, list[int]]] = None,
     min_unit_active_sites: int = 1,
     blocked_unit_names: Optional[set[str]] = None,
-    min_unit_gap_bp: int = 0,
     gene_sampling_weights: Optional[dict[str, float]] = None,
 ) -> list[dict[str, Any]]:
     if int(causal_count) <= 0:
@@ -524,8 +468,6 @@ def _sample_causal_gene_units(
             active_positions=active_positions,
             min_unit_active_sites=int(min_unit_active_sites),
             blocked_unit_names=blocked,
-            existing_units=units,
-            min_unit_gap_bp=int(min_unit_gap_bp),
             inner_budget=int(inner_budget),
             gene_sampling_weights=gene_sampling_weights,
         )
@@ -541,12 +483,12 @@ def _sample_causal_gene_units(
             raise ValueError(
                 "Unable to sample enough valid GFF causal units after redraw filtering: "
                 f"requested={int(causal_count)}, built={len(units)}, blocked_units={len(blocked)}, "
-                f"min_unit_active_sites={int(min_unit_active_sites)}, min_unit_gap_bp={int(min_unit_gap_bp)}."
+                f"min_unit_active_sites={int(min_unit_active_sites)}."
             )
         raise ValueError(
             "Unable to sample a valid GFF causal unit from remaining genes under the current "
             f"constraints: remaining_genes={genes_left}, min_unit_active_sites={int(min_unit_active_sites)}, "
-            f"min_unit_gap_bp={int(min_unit_gap_bp)}, blocked_units={len(blocked)}."
+            f"blocked_units={len(blocked)}."
         )
     return units
 
@@ -681,7 +623,7 @@ def _resolve_logic_config(
     args: argparse.Namespace,
     *,
     causal_count: int,
-) -> tuple[Optional[str], Optional[list[float]], int, int, Optional[int]]:
+) -> tuple[Optional[str], Optional[list[float]], int, int]:
     if args.logic_gate is not None:
         if int(causal_count) <= 0:
             raise ValueError("`--causal` must be > 0 when `--logic-gate` is enabled.")
@@ -698,8 +640,8 @@ def _resolve_logic_config(
         gate_sizes = [i + 1 for i, weight in enumerate(logic_size_weights) if weight > 0.0 and i >= 1]
         logic_k_min = min(gate_sizes) if gate_sizes else 2
         logic_k_max = max(gate_sizes) if gate_sizes else 2
-        return logic_mode, logic_size_weights, logic_k_min, logic_k_max, None
-    return None, None, 2, 2, None
+        return logic_mode, logic_size_weights, logic_k_min, logic_k_max
+    return None, None, 2, 2
 
 
 def _estimate_simulation_scan_passes(
@@ -853,7 +795,6 @@ def _run_rust_simulation(
     logic_af_max: float,
     logic_delta: float,
     logic_max_iter: int,
-    logic_window_bp: Optional[int],
     logic_effect_model: str,
     background_dist: str,
     gamma_shape: float,
@@ -921,7 +862,7 @@ def _run_rust_simulation(
             logic_af_max=float(logic_af_max),
             logic_delta=float(logic_delta),
             logic_max_iter=int(logic_max_iter),
-            logic_window_bp=logic_window_bp,
+            logic_window_bp=None,
             logic_effect_model=str(logic_effect_model),
             delimiter=None,
             snps_only=bool(snps_only),
@@ -964,8 +905,12 @@ def simulate_phenotype_from_genofile(
     and_max_iter: int = 100,
     causal_effect_model: Literal["equal", "geometric"] = "equal",
     logic_effect_model: Literal["gate", "centered_interaction"] = "gate",
+    pure_epistasis_only: bool = False,
 ) -> tuple[np.ndarray, list[tuple[str, int, int]]]:
     logic_mode = "a" if str(mode).lower() == "garfield" else None
+    effective_logic_effect_model: Literal["gate", "centered_interaction"] = (
+        "centered_interaction" if bool(pure_epistasis_only) else str(logic_effect_model)
+    )
     logic_size_weights = (
         _weights_from_gate_size_range(int(and_k_min), int(and_k_max))
         if logic_mode is not None
@@ -1022,8 +967,7 @@ def simulate_phenotype_from_genofile(
         logic_af_max=float(and_af_max),
         logic_delta=float(logic_delta),
         logic_max_iter=int(and_max_iter),
-        logic_window_bp=int(windows) if logic_mode is not None else None,
-        logic_effect_model=str(logic_effect_model),
+        logic_effect_model=str(effective_logic_effect_model),
         background_dist="normal",
         gamma_shape=1.0,
         gamma_scale=1.0,
@@ -1439,6 +1383,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     causal_group.add_argument(
+        "--pure-epistasis-only",
+        action="store_true",
+        help=(
+            "For multi-site logic terms, residualize each gate against intercept + member "
+            "main effects before assigning its effect. This produces a pure interaction "
+            "signal with zero fitted marginal contribution from the gate members."
+        ),
+    )
+    causal_group.add_argument(
         "-bimrange",
         "--bimrange",
         action="append",
@@ -1484,7 +1437,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     bimranges = [_parse_bimrange(x) for x in list(args.bimrange or [])]
     try:
         causal_spec = _resolve_causal_spec(args.causal)
-        logic_mode, logic_size_weights, logic_k_min, logic_k_max, logic_window_bp = (
+        logic_mode, logic_size_weights, logic_k_min, logic_k_max = (
             _resolve_logic_config(args, causal_count=int(causal_spec.count))
         )
         gff_spec = _resolve_gff_sampling_spec(args.gff3)
@@ -1508,12 +1461,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     logic_af_max = 1.0
     logic_delta = float(args.logic_delta)
     logic_max_iter = 256
-    logic_effect_model = "gate"
     logic_has_multi_site_terms = logic_mode is not None and logic_size_weights is not None and any(
         float(weight) > 0.0 for weight in logic_size_weights[1:]
     )
-    gff_logic_min_unit_gap_bp = (
-        int(DEFAULT_LOGIC_GFF_UNIT_GAP_BP) if logic_has_multi_site_terms else 0
+    logic_effect_model = (
+        "centered_interaction" if bool(args.pure_epistasis_only) else "gate"
     )
     logic_enabled_sizes = (
         ",".join(str(i + 1) for i, weight in enumerate(logic_size_weights) if weight > 0.0)
@@ -1564,8 +1516,6 @@ def main(argv: Optional[list[str]] = None) -> int:
                     ("Logic sizes", logic_enabled_sizes),
                     ("Logic size weights", logic_weight_text),
                     ("Logic realized delta", logic_delta),
-                    ("Logic unit gap bp", gff_logic_min_unit_gap_bp),
-                    ("Logic window bp", logic_window_bp),
                     ("Background dist", "gaussian sample-space"),
                     ("Sampling scale", "expectation-scale"),
                     ("SNPs only", False),
@@ -1603,6 +1553,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         raise SystemExit(1)
     if not np.isfinite(logic_delta) or float(logic_delta) < 0.0:
         logger.error("--logic-delta must be finite and >= 0.")
+        raise SystemExit(1)
+    if bool(args.pure_epistasis_only) and logic_mode is None:
+        logger.error("--pure-epistasis-only requires --logic-gate.")
+        raise SystemExit(1)
+    if bool(args.pure_epistasis_only) and not bool(logic_has_multi_site_terms):
+        logger.error(
+            "--pure-epistasis-only requires at least one multi-site logic term "
+            "(that is, a positive --logic-gate weight for size >= 2)."
+        )
         raise SystemExit(1)
     if int(causal_count) < len(bimranges):
         logger.error(
@@ -1751,7 +1710,6 @@ def main(argv: Optional[list[str]] = None) -> int:
                 unit_sizes=selected_unit_sizes,
                 active_positions=active_pos_index,
                 min_unit_active_sites=int(gff_logic_min_unit_sites),
-                min_unit_gap_bp=int(gff_logic_min_unit_gap_bp),
                 gene_sampling_weights=gene_sampling_weights,
             )
         except ValueError as exc:
@@ -1768,8 +1726,6 @@ def main(argv: Optional[list[str]] = None) -> int:
             int(gff_extension or 0),
             str(gff_mode_label or "g1/g2"),
         )
-        if int(gff_logic_min_unit_gap_bp) > 0:
-            logger.info("  isolated_unit_gap_bp=%d", int(gff_logic_min_unit_gap_bp))
     scan_passes = _estimate_simulation_scan_passes(
         causal_count=int(causal_count),
         cs_pve=cs_pve,
@@ -1855,7 +1811,6 @@ def main(argv: Optional[list[str]] = None) -> int:
                 logic_af_max=float(logic_af_max),
                 logic_delta=float(logic_delta),
                 logic_max_iter=int(logic_max_iter),
-                logic_window_bp=logic_window_bp,
                 logic_effect_model=logic_effect_model,
                 background_dist="normal",
                 gamma_shape=1.0,
@@ -1896,14 +1851,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             failed_unit = selected_causal_units[int(failed_unit_idx)]
             blocked_gff_unit_names.add(str(failed_unit["unit_name"]))
             redraw_attempt += 1
-            locked_units = [
-                dict(unit)
-                for unit_idx, unit in enumerate(selected_causal_units)
-                if int(unit_idx) != int(failed_unit_idx)
-            ]
             locked_genes = {
                 str(gene)
-                for unit in locked_units
+                for unit_idx, unit in enumerate(selected_causal_units)
+                if int(unit_idx) != int(failed_unit_idx)
                 for gene in list(unit["genes"])
             }
             remaining_gene_count = sum(
@@ -1925,16 +1876,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                 active_positions=active_pos_index,
                 min_unit_active_sites=int(gff_logic_min_unit_sites),
                 blocked_unit_names=blocked_gff_unit_names,
-                existing_units=locked_units,
-                min_unit_gap_bp=int(gff_logic_min_unit_gap_bp),
                 inner_budget=max(128, len(filtered_gene_catalog) * 4),
                 gene_sampling_weights=gene_sampling_weights,
             )
             if replacement is None:
                 raise RuntimeError(
-                    "unable to replace failed causal GFF unit under the current isolation / QC "
+                    "unable to replace failed causal GFF unit under the current QC "
                     f"constraints: failed_unit={failed_unit['unit_name']}, blocked_units={len(blocked_gff_unit_names)}, "
-                    f"min_unit_gap_bp={int(gff_logic_min_unit_gap_bp)}"
+                    f"min_unit_active_sites={int(gff_logic_min_unit_sites)}"
                 ) from exc
             replacement["unit_index"] = int(failed_unit_idx) + 1
             selected_causal_units[int(failed_unit_idx)] = replacement

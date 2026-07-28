@@ -107,6 +107,8 @@ from ._common.cjk import contains_cjk as _contains_cjk, ensure_cjk_font as _ensu
 from matplotlib import font_manager as mpl_font_manager
 
 _LEAD_SNP_INFO_COLS = ["allele0", "allele1", "af", "maf", "beta", "se"]
+_INTERACTION_PLOT_INFO_COLS = ["snp", "padj", "row_role"]
+_INTERACTION_SIG_PADJ_DEFAULT = 0.05
 _QQ_FIXED_RATIO = 5.0 / 4.0
 _QQ_FAST_MAX_POINTS = 120_000
 _QQ_BAND_MAX_POINTS = 20_000
@@ -3868,7 +3870,8 @@ def _load_postgwas_input_table(
     except Exception:
         header_cols = [chr_col, pos_col, p_col]
     lead_info_cols = [c for c in _LEAD_SNP_INFO_COLS if c in header_cols]
-    read_cols = [chr_col, pos_col, p_col] + lead_info_cols
+    interaction_info_cols = [c for c in _INTERACTION_PLOT_INFO_COLS if c in header_cols]
+    read_cols = [chr_col, pos_col, p_col] + lead_info_cols + interaction_info_cols
     read_cols = list(dict.fromkeys(read_cols))
     if bool(keep_all_columns):
         df_all = pd.read_csv(file, sep="\t")
@@ -4839,6 +4842,140 @@ def _overlay_manhattan_threshold_points(
     )
 
 
+def _postgwas_logic_combo_mask(df: pd.DataFrame) -> np.ndarray:
+    if df is None or df.shape[0] == 0:
+        return np.zeros(0, dtype=bool)
+    combo_mask = np.zeros(df.shape[0], dtype=bool)
+    if "row_role" in df.columns:
+        row_role = df["row_role"].astype(str).str.strip().str.lower()
+        combo_mask |= row_role.eq("combo").to_numpy(dtype=bool, copy=False)
+    if "snp" in df.columns:
+        snp = df["snp"].astype(str)
+        combo_mask |= snp.str.contains(r"[&|*]", regex=True, na=False).to_numpy(
+            dtype=bool,
+            copy=False,
+        )
+    return combo_mask
+
+
+def _overlay_manhattan_interaction_padj_points(
+    ax: plt.Axes,
+    plotmodel: GWASPLOT,
+    *,
+    threshold: float,
+    base_size: float,
+    marker: str,
+    rasterized: bool,
+    alpha_override: Optional[float] = None,
+    min_logp: float = 0.5,
+    max_logp: Optional[float] = None,
+    ignore: Optional[list[object]] = None,
+    padj_cutoff: float = _INTERACTION_SIG_PADJ_DEFAULT,
+) -> bool:
+    df_full = plotmodel.df.iloc[plotmodel.minidx].copy()
+    if (
+        df_full.shape[0] == 0
+        or "padj" not in df_full.columns
+        or ("snp" not in df_full.columns and "row_role" not in df_full.columns)
+    ):
+        return False
+
+    combo_mask_full = _postgwas_logic_combo_mask(df_full)
+    if combo_mask_full.size == 0 or not bool(np.any(combo_mask_full)):
+        return False
+
+    if ignore is None:
+        ignore = []
+    ignore_set = set(ignore)
+
+    pvals = pd.to_numeric(df_full["y"], errors="coerce")
+    keep = pvals.notna() & np.isfinite(pvals) & (pvals > 0.0)
+    if not bool(keep.any()):
+        return True
+    dfp = df_full.loc[keep].copy()
+    dfp["ylog"] = _safe_neglog10_p(dfp["y"])
+    dfp = dfp[dfp["ylog"] >= float(min_logp)]
+    if max_logp is not None:
+        dfp = dfp[dfp["ylog"] <= float(max_logp)]
+    if dfp.shape[0] == 0:
+        return True
+
+    combo_mask = _postgwas_logic_combo_mask(dfp)
+    padj = pd.to_numeric(dfp["padj"], errors="coerce")
+    sig_mask = combo_mask & np.isfinite(padj.to_numpy(dtype=float, copy=False))
+    sig_mask &= padj.to_numpy(dtype=float, copy=False) <= float(padj_cutoff)
+    if len(ignore_set) > 0:
+        sig_mask = sig_mask & (~dfp.index.isin(ignore_set))
+
+    if bool(np.any(sig_mask)):
+        ax.scatter(
+            dfp.loc[sig_mask, "x"],
+            dfp.loc[sig_mask, "ylog"],
+            color="red",
+            marker=str(marker),
+            s=float(base_size) * 1.5,
+            alpha=(
+                float(alpha_override)
+                if alpha_override is not None
+                else 0.85
+            ),
+            rasterized=rasterized,
+            zorder=6,
+            **_marker_scatter_style(str(marker)),
+        )
+
+    if np.isfinite(threshold) and threshold > 0:
+        thr_log = float(-np.log10(threshold))
+        if np.isfinite(thr_log):
+            ax.axhline(
+                y=thr_log,
+                linestyle="dashed",
+                color="grey",
+                linewidth=1.0,
+            )
+    return True
+
+
+def _overlay_postgwas_manhattan_hits(
+    ax: plt.Axes,
+    plotmodel: GWASPLOT,
+    *,
+    threshold: float,
+    base_size: float,
+    marker: str,
+    rasterized: bool,
+    alpha_override: Optional[float] = None,
+    min_logp: float = 0.5,
+    max_logp: Optional[float] = None,
+    ignore: Optional[list[object]] = None,
+) -> None:
+    if _overlay_manhattan_interaction_padj_points(
+        ax,
+        plotmodel,
+        threshold=threshold,
+        base_size=base_size,
+        marker=marker,
+        rasterized=rasterized,
+        alpha_override=alpha_override,
+        min_logp=min_logp,
+        max_logp=max_logp,
+        ignore=ignore,
+    ):
+        return
+    _overlay_manhattan_threshold_points(
+        ax,
+        plotmodel,
+        threshold=threshold,
+        base_size=base_size,
+        marker=marker,
+        rasterized=rasterized,
+        alpha_override=alpha_override,
+        min_logp=min_logp,
+        max_logp=max_logp,
+        ignore=ignore,
+    )
+
+
 def _safe_neglog10_p(values: object) -> np.ndarray:
     """
     Safe -log10 transform for p-values:
@@ -5309,6 +5446,8 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             if args.bimrange_tuples is not None and len(bim_layout) > 1:
                 _apply_segmented_x_to_plotmodel(plotmodel, df, chr_col, pos_col, bim_layout)
             if args.qq_ratio is not None:
+                # Keep QQ tied to the same filtered row universe as Manhattan,
+                # including both singleton and combo rows from GARFIELD FvLMM tables.
                 plotmodel_qq = GWASPLOT(
                     df,
                     chr_col,
@@ -5478,7 +5617,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         alpha=(float(single_alpha) if single_alpha is not None else 0.78),
                         rasterized=rasterized,
                     )
-                    _overlay_manhattan_threshold_points(
+                    _overlay_postgwas_manhattan_hits(
                         ax,
                         plotmodel,
                         threshold=threshold,
@@ -5529,7 +5668,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         ignore=df_hl_idx,
                         rasterized=rasterized,
                     )
-                    _overlay_manhattan_threshold_points(
+                    _overlay_postgwas_manhattan_hits(
                         ax,
                         plotmodel,
                         threshold=threshold,
@@ -5554,7 +5693,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     alpha=(float(single_alpha) if single_alpha is not None else 0.78),
                     rasterized=rasterized,
                 )
-                _overlay_manhattan_threshold_points(
+                _overlay_postgwas_manhattan_hits(
                     ax,
                     plotmodel,
                     threshold=threshold,

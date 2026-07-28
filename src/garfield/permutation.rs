@@ -25,10 +25,8 @@ pub const DEFAULT_RULE_NULL_GEV_FWER_ALPHA: f64 = 0.01;
 const DEFAULT_RULE_NULL_Q99_REL_TOL: f64 = 0.05;
 // Minimum samples per exact bucket before falling back to the global null.
 const NULL_EXACT_MIN_SAMPLES: usize = 10;
-// Top-k per repeat: keep the same number of extreme null scores for every
-// rule length so singleton / pair / higher-order penalties are estimated under
-// the same per-repeat truncation rule.
-const DEFAULT_RULE_NULL_TOPK_ALL: usize = 2;
+// Top-k per repeat: keep a single best null score for every bucket / repeat.
+const DEFAULT_RULE_NULL_TOPK_ALL: usize = 1;
 const DEFAULT_RULE_NULL_BUCKET_MAX_RULE_LEN: usize = 5;
 const DEFAULT_RULE_NULL_UNIT_GROUP_BIN_COUNT: usize = 3;
 const DEFAULT_RULE_NULL_LEN_BUCKET_COUNT: usize = 3;
@@ -1411,10 +1409,10 @@ mod tests {
 
     #[test]
     fn test_topk_values() {
-        assert_eq!(null_topk_per_repeat_for_bucket(b(2)), 2);
-        assert_eq!(null_topk_per_repeat_for_bucket(b(3)), 2);
-        assert_eq!(null_topk_per_repeat_for_bucket(b(4)), 2);
-        assert_eq!(null_topk_per_repeat_for_bucket(b(1)), 2);
+        assert_eq!(null_topk_per_repeat_for_bucket(b(2)), 1);
+        assert_eq!(null_topk_per_repeat_for_bucket(b(3)), 1);
+        assert_eq!(null_topk_per_repeat_for_bucket(b(4)), 1);
+        assert_eq!(null_topk_per_repeat_for_bucket(b(1)), 1);
     }
 
     #[test]

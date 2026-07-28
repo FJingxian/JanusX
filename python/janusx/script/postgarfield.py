@@ -76,6 +76,7 @@ from janusx.script.postgwas import (
     _postgwas_build_circle_link_table_from_groups,
     _postgwas_get_gff_query,
     _postgwas_get_gff_rust_index,
+    _postgwas_resolve_input_pvalue_column,
     _postgwas_should_rasterize_dense_layers,
     _resolve_postgwas_fontstyle,
     _resolve_postgwas_output_stem,
@@ -572,7 +573,11 @@ def _postgarfield_build_category_frames(annotated_df: pd.DataFrame) -> dict[str,
     }
 
 
-def _postgarfield_background_from_garfield(df: pd.DataFrame) -> tuple[pd.DataFrame, list[object]]:
+def _postgarfield_background_from_garfield(
+    df: pd.DataFrame,
+    *,
+    p_col: str,
+) -> tuple[pd.DataFrame, list[object]]:
     work = df.copy()
     if _GARFIELD_ROW_ROLE_COL in work.columns:
         role = work[_GARFIELD_ROW_ROLE_COL].astype(str).str.strip().str.lower()
@@ -581,17 +586,28 @@ def _postgarfield_background_from_garfield(df: pd.DataFrame) -> tuple[pd.DataFra
             work = non_combo
     work[_GARFIELD_CHR_COL] = work[_GARFIELD_CHR_COL].astype(str)
     work[_GARFIELD_POS_COL] = pd.to_numeric(work[_GARFIELD_POS_COL], errors="coerce")
-    work[_GARFIELD_P_COL] = pd.to_numeric(work[_GARFIELD_P_COL], errors="coerce")
-    work = work.dropna(subset=[_GARFIELD_POS_COL, _GARFIELD_P_COL]).copy()
+    resolved_p_col = _postgwas_resolve_input_pvalue_column(
+        work.columns,
+        p_col,
+    )
+    work[resolved_p_col] = pd.to_numeric(work[resolved_p_col], errors="coerce")
+    work = work.dropna(subset=[_GARFIELD_POS_COL, resolved_p_col]).copy()
     if work.shape[0] == 0:
-        return pd.DataFrame(columns=[_GARFIELD_CHR_COL, _GARFIELD_POS_COL, _GARFIELD_P_COL]), []
+        return pd.DataFrame(columns=[_GARFIELD_CHR_COL, _GARFIELD_POS_COL, str(p_col)]), []
     work[_GARFIELD_POS_COL] = work[_GARFIELD_POS_COL].astype(int)
     full_chr_labels = work[_GARFIELD_CHR_COL].drop_duplicates().tolist()
     work = (
-        work.groupby([_GARFIELD_CHR_COL, _GARFIELD_POS_COL], as_index=False)[_GARFIELD_P_COL]
+        work.groupby([_GARFIELD_CHR_COL, _GARFIELD_POS_COL], as_index=False)[resolved_p_col]
         .min()
         .copy()
     )
+    requested_p_col = str(p_col).strip()
+    if (
+        requested_p_col != ""
+        and requested_p_col not in work.columns
+        and resolved_p_col in work.columns
+    ):
+        work[requested_p_col] = work[resolved_p_col]
     return work, full_chr_labels
 
 
@@ -604,7 +620,10 @@ def _postgarfield_load_background_table(
     p_col: str,
 ) -> tuple[pd.DataFrame, list[object], str]:
     if gwasfile is None:
-        bg_df, full_chr_labels = _postgarfield_background_from_garfield(garfield_df)
+        bg_df, full_chr_labels = _postgarfield_background_from_garfield(
+            garfield_df,
+            p_col=p_col,
+        )
         return bg_df, full_chr_labels, "GARFIELD singleton/background"
     bg_df, full_chr_labels = _load_postgwas_input_table(
         str(gwasfile),

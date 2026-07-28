@@ -3869,14 +3869,22 @@ def _load_postgwas_input_table(
         header_cols = pd.read_csv(file, sep="\t", nrows=0).columns.tolist()
     except Exception:
         header_cols = [chr_col, pos_col, p_col]
+    resolved_p_col = _postgwas_resolve_input_pvalue_column(header_cols, p_col)
     lead_info_cols = [c for c in _LEAD_SNP_INFO_COLS if c in header_cols]
     interaction_info_cols = [c for c in _INTERACTION_PLOT_INFO_COLS if c in header_cols]
-    read_cols = [chr_col, pos_col, p_col] + lead_info_cols + interaction_info_cols
+    read_cols = [chr_col, pos_col, resolved_p_col] + lead_info_cols + interaction_info_cols
     read_cols = list(dict.fromkeys(read_cols))
     if bool(keep_all_columns):
         df_all = pd.read_csv(file, sep="\t")
     else:
         df_all = pd.read_csv(file, sep="\t", usecols=read_cols)
+    requested_p_col = str(p_col).strip()
+    if (
+        requested_p_col != ""
+        and requested_p_col not in df_all.columns
+        and resolved_p_col in df_all.columns
+    ):
+        df_all[requested_p_col] = df_all[resolved_p_col]
     full_chr_labels = df_all[chr_col].drop_duplicates().tolist()
     return df_all, full_chr_labels
 
@@ -3893,6 +3901,40 @@ def _postgwas_first_present_column(
         if text != "" and text in colset:
             return text
     return None
+
+
+def _postgwas_resolve_input_pvalue_column(
+    columns: object,
+    requested_p_col: object,
+) -> str:
+    requested = str(requested_p_col).strip()
+    candidates = [
+        requested,
+        "pwald",
+        "padj",
+        "p",
+        "P",
+        "pvalue",
+        "Pvalue",
+        "pval",
+        "Pval",
+        "P_Wald",
+        "P_wald",
+        "p_wald",
+    ]
+    resolved = _postgwas_first_present_column(
+        columns,
+        list(dict.fromkeys([c for c in candidates if str(c).strip() != ""])),
+    )
+    if resolved is not None:
+        return str(resolved)
+    col_list = [str(col) for col in list(columns or [])]
+    shown = ", ".join(col_list[:20])
+    extra = "" if len(col_list) <= 20 else f" ... (+{len(col_list) - 20} more)"
+    raise ValueError(
+        f"P-value column '{requested or 'NA'}' was not found in the input table. "
+        f"Available columns: {shown}{extra}"
+    )
 
 
 def _postgwas_parse_interact_spec(spec_text: object | None) -> dict[str, object]:

@@ -282,9 +282,7 @@ pub fn rule_null_complexity_bin(n_features: usize) -> u8 {
 
 #[inline]
 pub fn rule_null_unit_group_bin(unit_group_count: usize) -> u8 {
-    unit_group_count
-        .saturating_sub(1)
-        .min(usize::from(u8::MAX)) as u8
+    unit_group_count.saturating_sub(1).min(usize::from(u8::MAX)) as u8
 }
 
 #[inline]
@@ -324,9 +322,7 @@ pub(crate) fn rule_null_group_len_bucket_index(
 impl RuleNullCalibrator {
     pub fn with_layout(max_rule_len: usize, unit_group_count_max: usize) -> Self {
         let unit_group_bin_count = rule_null_unit_group_bin_count(unit_group_count_max);
-        let bucket_count = max_rule_len
-            .max(1)
-            .saturating_mul(unit_group_bin_count);
+        let bucket_count = max_rule_len.max(1).saturating_mul(unit_group_bin_count);
         Self {
             by_bucket: vec![RuleNullScores::default(); bucket_count],
             by_group_len: vec![
@@ -415,7 +411,8 @@ impl RuleNullCalibrator {
 
     pub fn finalize_with_method(&self, method: RuleNullPenaltyMethod) -> RuleNullPenaltyLookup {
         let q = method.target_quantile();
-        let mut out = RuleNullPenaltyLookup::with_layout(self.max_rule_len, self.unit_group_bin_count);
+        let mut out =
+            RuleNullPenaltyLookup::with_layout(self.max_rule_len, self.unit_group_bin_count);
         out.method = method;
         out.quantile = q;
         for (idx, scores) in self.by_bucket.iter().enumerate() {
@@ -594,27 +591,37 @@ impl Default for RuleNullCalibrator {
 impl RuleNullPenaltyLookup {
     pub fn with_layout(max_rule_len: usize, unit_group_count_max: usize) -> Self {
         let unit_group_bin_count = rule_null_unit_group_bin_count(unit_group_count_max);
-        let bucket_count = max_rule_len
-            .max(1)
-            .saturating_mul(unit_group_bin_count);
+        let bucket_count = max_rule_len.max(1).saturating_mul(unit_group_bin_count);
         Self {
             bucket_train: vec![None; bucket_count],
             bucket_test: vec![None; bucket_count],
             group_len_train: vec![
                 None;
-                rule_null_group_len_bucket_count(max_rule_len, unit_group_count_max)
+                rule_null_group_len_bucket_count(
+                    max_rule_len,
+                    unit_group_count_max
+                )
             ],
             group_len_test: vec![
                 None;
-                rule_null_group_len_bucket_count(max_rule_len, unit_group_count_max)
+                rule_null_group_len_bucket_count(
+                    max_rule_len,
+                    unit_group_count_max
+                )
             ],
             group_len_train_stats: vec![
                 None;
-                rule_null_group_len_bucket_count(max_rule_len, unit_group_count_max)
+                rule_null_group_len_bucket_count(
+                    max_rule_len,
+                    unit_group_count_max
+                )
             ],
             group_len_test_stats: vec![
                 None;
-                rule_null_group_len_bucket_count(max_rule_len, unit_group_count_max)
+                rule_null_group_len_bucket_count(
+                    max_rule_len,
+                    unit_group_count_max
+                )
             ],
             len_train: vec![None; rule_null_len_bucket_count(max_rule_len)],
             len_test: vec![None; rule_null_len_bucket_count(max_rule_len)],

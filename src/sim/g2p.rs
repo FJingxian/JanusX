@@ -835,15 +835,15 @@ fn build_logic_validation_context(
         v[i * n + i] += residual_var.max(0.0);
     }
     let ones = vec![1.0_f64; n];
-    if let Ok(chol) = spd_cholesky_with_jitter(
-        v.as_slice(),
-        n,
-        "logic validation null covariance",
-    ) {
+    if let Ok(chol) = spd_cholesky_with_jitter(v.as_slice(), n, "logic validation null covariance")
+    {
         let vinv_ones = solve_spd_from_cholesky(chol.as_slice(), n, ones.as_slice())?;
         let ones_vinv_ones = vinv_ones.iter().sum::<f64>();
         if !(ones_vinv_ones.is_finite() && ones_vinv_ones > 0.0) {
-            return Err("logic validation null covariance produced invalid intercept projection".to_string());
+            return Err(
+                "logic validation null covariance produced invalid intercept projection"
+                    .to_string(),
+            );
         }
         return Ok(LogicValidationContext::CholeskyNull {
             dim: n,
@@ -882,7 +882,9 @@ fn build_logic_validation_context(
     }
     let ones_vinv_ones = vinv_ones.iter().sum::<f64>();
     if !(ones_vinv_ones.is_finite() && ones_vinv_ones > 0.0) {
-        return Err("logic validation null covariance produced invalid intercept projection".to_string());
+        return Err(
+            "logic validation null covariance produced invalid intercept projection".to_string(),
+        );
     }
     Ok(LogicValidationContext::EighNull {
         dim: n,
@@ -1960,11 +1962,14 @@ fn residualize_logic_values_against_basis(
     }
     for row in extra_basis_rows.iter() {
         if row.len() != n {
-            return Err("logic gate orthogonalization basis has inconsistent sample lengths".to_string());
+            return Err(
+                "logic gate orthogonalization basis has inconsistent sample lengths".to_string(),
+            );
         }
     }
 
-    let mut basis_rows: Vec<&[f64]> = Vec::with_capacity(member_rows.len() + extra_basis_rows.len());
+    let mut basis_rows: Vec<&[f64]> =
+        Vec::with_capacity(member_rows.len() + extra_basis_rows.len());
     basis_rows.extend(member_rows.iter().map(|row| row.as_slice()));
     basis_rows.extend(extra_basis_rows.iter().copied());
 
@@ -3050,8 +3055,7 @@ fn select_logic_terms(
             if !ld_ok {
                 continue;
             }
-            let mut orth_basis: Vec<&[f64]> =
-                Vec::with_capacity(initial_basis.len() + out.len());
+            let mut orth_basis: Vec<&[f64]> = Vec::with_capacity(initial_basis.len() + out.len());
             orth_basis.extend(initial_basis.iter().copied());
             orth_basis.extend(out.iter().map(|term| term.values.as_slice()));
             let Some(eval) = evaluate_logic_candidate(
@@ -3350,8 +3354,7 @@ fn select_logic_terms_sampled_specs(
             if !ld_ok {
                 continue;
             }
-            let mut orth_basis: Vec<&[f64]> =
-                Vec::with_capacity(initial_basis.len() + out.len());
+            let mut orth_basis: Vec<&[f64]> = Vec::with_capacity(initial_basis.len() + out.len());
             orth_basis.extend(initial_basis.iter().copied());
             orth_basis.extend(out.iter().map(|term| term.values.as_slice()));
             let Some(eval) = evaluate_logic_candidate(
@@ -3982,17 +3985,16 @@ fn g2p_simulate_core(config: G2pSimConfig) -> Result<G2pSimResult, String> {
             (raw, "none".to_string(), "none".to_string())
         };
     let base_y = y.clone();
-    let logic_validation_ctx =
-        if needs_causal_scan && (logic_requested || mixed_logic_requested) {
+    let logic_validation_ctx = if needs_causal_scan && (logic_requested || mixed_logic_requested) {
         Some(build_logic_validation_context(
             config.grm.as_deref(),
             n,
             bg_var_target,
             residual_var_eff,
         )?)
-        } else {
-            None
-        };
+    } else {
+        None
+    };
     let mut causal_component = vec![0.0_f64; n];
     let mut logic_term_sampler = LogicTermSampler::None;
 
@@ -4913,10 +4915,22 @@ mod tests {
             test_sim_site("1", 200, "C", "T"),
         ];
         assert_eq!(term_label(&sites, &[0], None), "1_100[G]");
-        assert_eq!(term_label(&sites, &[0, 1], Some(LogicGateMode::A)), "1_100[G]&1_200[T]");
-        assert_eq!(term_label(&sites, &[0, 1], Some(LogicGateMode::Na)), "1_100[A]&1_200[T]");
-        assert_eq!(term_label(&sites, &[0, 1], Some(LogicGateMode::An)), "1_100[G]&1_200[C]");
-        assert_eq!(term_label(&sites, &[0, 1], Some(LogicGateMode::Nan)), "1_100[A]&1_200[C]");
+        assert_eq!(
+            term_label(&sites, &[0, 1], Some(LogicGateMode::A)),
+            "1_100[G]&1_200[T]"
+        );
+        assert_eq!(
+            term_label(&sites, &[0, 1], Some(LogicGateMode::Na)),
+            "1_100[A]&1_200[T]"
+        );
+        assert_eq!(
+            term_label(&sites, &[0, 1], Some(LogicGateMode::An)),
+            "1_100[G]&1_200[C]"
+        );
+        assert_eq!(
+            term_label(&sites, &[0, 1], Some(LogicGateMode::Nan)),
+            "1_100[A]&1_200[C]"
+        );
     }
 
     #[test]

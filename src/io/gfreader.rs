@@ -4327,8 +4327,7 @@ fn prepare_bed_logic_meta_owned_for_candidate_rows_pure_line(
     if !stats_sample_indices.is_empty() && stats_sample_indices.iter().any(|&idx| idx >= n_samples)
     {
         return Err(
-            "selected sample index out of range for BED pure-line interval preparation"
-                .to_string(),
+            "selected sample index out of range for BED pure-line interval preparation".to_string(),
         );
     }
     let stats_identity = stats_sample_indices.is_empty()

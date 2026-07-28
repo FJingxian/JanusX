@@ -1,4 +1,9 @@
 #![allow(dead_code)]
+//
+// Active GARFIELD continuous search uses the dual-bitplane fuzzy dosage route
+// (`g >= 1`, `g >= 2`) together with dosage-aware centered-gain scoring.
+// Legacy packed-0/1 score helpers are retained below only for backward-
+// compatible parsing/evaluation paths and tests.
 
 use crate::bitwise::{and_popcount, popcount};
 use numpy::{PyArray1, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};

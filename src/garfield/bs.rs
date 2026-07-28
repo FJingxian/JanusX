@@ -1,5 +1,13 @@
 #![allow(dead_code)]
 // Shared beam-search kernels used by GARFIELD.
+//
+// Active GARFIELD continuous search is intentionally restricted to:
+// - fuzzy dosage rules backed by dual bitplanes (`g >= 1`, `g >= 2`)
+// - AND-family beam expansion plus negation at the literal level
+//
+// Legacy packed-0/1 continuous helpers and OR-family compatibility code are
+// retained in this file only for backward-compatible rule parsing/evaluation
+// and tests. They are not part of the active `-bfile/-g/-w/-wg` search path.
 
 use super::permutation::{
     bucket_from_rule_with_complexity, structure_prior_penalty, RuleNullBucket,
@@ -130,7 +138,6 @@ pub enum BeamBinaryOp {
 }
 
 const BEAM_EXPAND_OPS_AND: [BeamBinaryOp; 1] = [BeamBinaryOp::And];
-const BEAM_EXPAND_OPS_OR: [BeamBinaryOp; 1] = [BeamBinaryOp::Or];
 
 #[inline]
 fn beam_binary_op_code(op: BeamBinaryOp) -> u8 {
@@ -141,14 +148,20 @@ fn beam_binary_op_code(op: BeamBinaryOp) -> u8 {
 }
 
 #[inline]
-fn beam_binary_ops_for_rule(rule: &BeamRule) -> &'static [BeamBinaryOp] {
-    match rule.rest.first().map(|(op, _)| *op) {
-        // Search is AND-only from singleton seeds onward. Legacy/manual OR rules
-        // can still be evaluated and extended inside the OR family when needed.
-        Some(BeamBinaryOp::And) => &BEAM_EXPAND_OPS_AND,
-        Some(BeamBinaryOp::Or) => &BEAM_EXPAND_OPS_OR,
-        None => &BEAM_EXPAND_OPS_AND,
-    }
+fn beam_binary_ops_for_rule(_rule: &BeamRule) -> &'static [BeamBinaryOp] {
+    // Active search is AND-only from singleton seeds onward.
+    //
+    // Legacy/manual OR-family rules are still materializable below so old
+    // artifacts can be evaluated/exported, but OR expansion is intentionally
+    // disabled in the live beam path.
+    //
+    // Legacy code path kept here for reference:
+    // match rule.rest.first().map(|(op, _)| *op) {
+    //     Some(BeamBinaryOp::And) => &BEAM_EXPAND_OPS_AND,
+    //     Some(BeamBinaryOp::Or) => &BEAM_EXPAND_OPS_OR,
+    //     None => &BEAM_EXPAND_OPS_AND,
+    // }
+    &BEAM_EXPAND_OPS_AND
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -5260,6 +5273,9 @@ fn apply_literal_inplace_dual(
     negated: bool,
     n_samples: usize,
 ) {
+    // Legacy OR-family materialization is retained only so old serialized or
+    // manually supplied rules can still be decoded consistently. Active beam
+    // expansion no longer emits OR rules.
     match (op, negated) {
         (BeamBinaryOp::And, true) => {
             bitand_not_assign_masked(dst_ge1, row_ge2, n_samples);

@@ -5,11 +5,18 @@ mod sampling;
 mod score;
 mod score_gpu;
 
+// GARFIELD runtime note (2026-07):
+// - Active continuous search uses fuzzy 0/1/2 dosage bits only.
+// - Active beam expansion is AND-only; negation remains supported.
+// - Legacy packed-0/1 continuous beam code and OR-family compatibility helpers
+//   are retained only for backward-compatible parsing/evaluation of old
+//   artifacts and tests, and are intentionally disabled in the main runtime.
+
 use self::bs::{beam_search_and_binary_mcc, beam_search_and_continuous_abs_corr, BeamAndResult};
 use self::bs::{
-    beam_search_train_test_continuous_fuzzy, beam_search_train_test_continuous_with_literal_scores,
-    evaluate_rule_continuous_dual, materialize_rule_bits_dual,
-    precompute_literal_singleton_scores_batched, LiteralScoreBatchRequest, LiteralSingletonScore,
+    beam_search_train_test_continuous_fuzzy, evaluate_rule_continuous_dual,
+    materialize_rule_bits_dual, precompute_literal_singleton_scores_batched,
+    LiteralScoreBatchRequest, LiteralSingletonScore,
 };
 use self::bs::{reset_garfield_beam_profile, snapshot_garfield_beam_profile};
 use self::permutation::{
@@ -2601,18 +2608,27 @@ fn beam_search_train_test_continuous_dispatch(
             params,
         )
     } else {
-        beam_search_train_test_continuous(
-            y_train,
-            prepared_bits.train_bits.as_slice(),
-            prepared_bits.row_words_train,
-            n_rows,
-            y_train.len(),
-            y_test,
-            prepared_bits.test_bits(),
-            prepared_bits.row_words_test,
-            y_test.len(),
-            group_ids,
-            params,
+        // Legacy packed-0/1 continuous beam path intentionally disabled.
+        // Kept in comments so the old routing is still easy to recover if
+        // backward-compatibility work is ever needed again.
+        //
+        // beam_search_train_test_continuous(
+        //     y_train,
+        //     prepared_bits.train_bits.as_slice(),
+        //     prepared_bits.row_words_train,
+        //     n_rows,
+        //     y_train.len(),
+        //     y_test,
+        //     prepared_bits.test_bits(),
+        //     prepared_bits.row_words_test,
+        //     y_test.len(),
+        //     group_ids,
+        //     params,
+        // )
+        let _ = (y_train, n_rows, y_test, group_ids, params);
+        Err(
+            "legacy packed-0/1 GARFIELD continuous path is disabled; active search requires fuzzy 0/1/2 dosage bits"
+                .to_string(),
         )
     }
 }
@@ -5600,7 +5616,14 @@ fn select_logic_group_interval_defs_for_scan(
     group_names: Option<&[String]>,
     scan_bimranges: &[GarfieldScanBimRange],
     unit_kind_lc: &str,
-) -> Result<(Vec<Vec<(String, i32, i32)>>, Vec<String>, Vec<GarfieldLogicUnit>), String> {
+) -> Result<
+    (
+        Vec<Vec<(String, i32, i32)>>,
+        Vec<String>,
+        Vec<GarfieldLogicUnit>,
+    ),
+    String,
+> {
     let span_defs = build_logic_unit_span_defs_from_groups(groups, group_names);
     let mut selected_groups = Vec::<Vec<(String, i32, i32)>>::new();
     let mut selected_names = Vec::<String>::new();
@@ -8527,19 +8550,12 @@ fn collect_rule_structure_posterior_for_repeat(
             beam_params,
         )?
     } else {
-        beam_search_train_test_continuous(
-            boot_y_train.as_slice(),
-            boot_train_bits.as_slice(),
-            boot_row_words_train,
-            prepared.selected_global_rows.len(),
-            boot_y_train.len(),
-            boot_y_test.as_slice(),
-            boot_test_bits.as_slice(),
-            boot_row_words_test,
-            boot_y_test.len(),
-            prepared.local_groups.as_slice(),
-            beam_params,
-        )?
+        // Legacy packed-0/1 null-search path intentionally disabled together
+        // with the corresponding main search path.
+        return Err(
+            "legacy packed-0/1 GARFIELD continuous null path is disabled; active search requires fuzzy 0/1/2 dosage bits"
+                .to_string(),
+        );
     };
 
     if perm_hits.is_empty() {
@@ -8714,7 +8730,7 @@ fn evaluate_logic_unit_prepared_continuous(
     output_null_penalties: Option<Arc<RuleNullPenaltyLookup>>,
     top_rules_per_unit: usize,
     unit_kind_lc: &str,
-    literal_scores: Option<&[LiteralSingletonScore]>,
+    _literal_scores: Option<&[LiteralSingletonScore]>,
     debug_probe: Option<&GarfieldBeamDebugProbe>,
 ) -> Result<GarfieldUnitEvaluationOutput, String> {
     let beam_params_search = beam_params_for_prepared(prepared, beam_params.clone());
@@ -8727,35 +8743,18 @@ fn evaluate_logic_unit_prepared_continuous(
             prepared.local_groups.as_slice(),
             beam_params_search.clone(),
         )?
-    } else if let Some(scores) = literal_scores {
-        beam_search_train_test_continuous_with_literal_scores(
-            y_train,
-            prepared_bits.train_bits.as_slice(),
-            prepared_bits.row_words_train,
-            prepared.selected_global_rows.len(),
-            y_train.len(),
-            y_test,
-            prepared_bits.test_bits(),
-            prepared_bits.row_words_test,
-            test_idx_local.len(),
-            prepared.local_groups.as_slice(),
-            beam_params_search.clone(),
-            scores,
-        )?
     } else {
-        beam_search_train_test_continuous(
-            y_train,
-            prepared_bits.train_bits.as_slice(),
-            prepared_bits.row_words_train,
-            prepared.selected_global_rows.len(),
-            y_train.len(),
-            y_test,
-            prepared_bits.test_bits(),
-            prepared_bits.row_words_test,
-            test_idx_local.len(),
-            prepared.local_groups.as_slice(),
-            beam_params_search.clone(),
-        )?
+        // Legacy packed-0/1 continuous beam paths intentionally disabled:
+        //
+        // if let Some(scores) = literal_scores {
+        //     beam_search_train_test_continuous_with_literal_scores(...)
+        // } else {
+        //     beam_search_train_test_continuous(...)
+        // }
+        return Err(
+            "legacy packed-0/1 GARFIELD continuous path is disabled; active search requires fuzzy 0/1/2 dosage bits"
+                .to_string(),
+        );
     };
     if beam_hits.is_empty() {
         return Ok(GarfieldUnitEvaluationOutput::default());
@@ -8879,12 +8878,15 @@ fn evaluate_logic_unit_prepared_continuous(
     })
 }
 
+#[allow(dead_code)]
 fn precompute_literal_singleton_scores_for_unit(
     prepared: &GarfieldUnitPrepared,
     prepared_bits: &GarfieldUnitBitMatrices,
     y_train: &[f64],
     y_test: &[f64],
 ) -> Result<Vec<LiteralSingletonScore>, String> {
+    // Legacy packed-0/1 singleton precompute helper retained only so the
+    // disabled non-fuzzy route can be resurrected or inspected if needed.
     let requests = [LiteralScoreBatchRequest {
         bits_train: prepared_bits.train_bits.as_slice(),
         row_words_train: prepared_bits.row_words_train,
@@ -9066,16 +9068,9 @@ fn process_scan_unit_continuous(
                 t0.elapsed().as_secs_f64(),
             )?;
         }
-        let literal_scores = if prepared_bits.has_fuzzy_bin() {
-            None
-        } else {
-            Some(precompute_literal_singleton_scores_for_unit(
-                &prepared,
-                &prepared_bits,
-                y_train,
-                y_test,
-            )?)
-        };
+        // Legacy packed-0/1 singleton precompute is intentionally disabled
+        // together with the non-fuzzy continuous beam path.
+        let literal_scores: Option<Vec<LiteralSingletonScore>> = None;
         if let Some(t0) = unit_t0 {
             garfield_whole_genome_unit_breakpoint(
                 unit.label.as_str(),
@@ -9518,6 +9513,7 @@ fn apply_logic_rule_output_limit(
 fn plink2bits_from_logic_g(g: i8) -> u8 {
     match g {
         0 => 0b00,
+        1 => 0b10,
         2 => 0b11,
         _ => 0b01,
     }
@@ -14507,7 +14503,7 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(out, vec![0x74u8]);
+        assert_eq!(out, vec![0xB8u8]);
 
         out.clear();
         write_logic_dual_bits_as_plink_row(
@@ -14519,7 +14515,7 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(out, vec![0x47u8]);
+        assert_eq!(out, vec![0x8Bu8]);
     }
 
     fn normalize_test_simbench_raw_row(row: &mut [f32], site: &mut SiteInfo) -> Result<(), String> {

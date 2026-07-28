@@ -2727,7 +2727,7 @@ def main() -> None:
     args.layer = (
         int(args.layer) if args.layer is not None
         else int(args.layer_compat) if args.layer_compat is not None
-        else 3
+        else 2
     )
     if int(args.layer) <= 0:
         parser.error("-layer must be > 0")

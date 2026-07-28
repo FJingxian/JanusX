@@ -4395,7 +4395,13 @@ fn beam_params_for_prepared(
         prepared.null_unit_group_bin,
     );
     if let Some(required_groups) = prepared.geneset_stage_group_target {
+        let effective_max_pick = if required_groups > 1 {
+            required_groups.max(1)
+        } else {
+            beam_params.max_pick.max(1)
+        };
         BeamSearchParams {
+            max_pick: effective_max_pick,
             null_complexity_bin,
             group_constraint: BeamGroupConstraintMode::ExcludeUntilDistinctGroups(required_groups),
             ..beam_params
@@ -11113,6 +11119,36 @@ fn garfield_logic_search_bed_owned(
     let soft_structure_mode = rule_permutation
         && !GARFIELD_DISABLE_STRUCTURE_PRIOR
         && !representative_prepared.is_empty();
+    let effective_null_max_rule_len = beam_params
+        .max_pick
+        .max(
+            scan_unit_indices
+                .iter()
+                .filter_map(|&ui| units.get(ui))
+                .map(|unit| {
+                    if unit_kind_lc == "geneset" {
+                        unit.spans.len().max(1)
+                    } else {
+                        1usize
+                    }
+                })
+                .max()
+                .unwrap_or(1),
+        )
+        .max(
+            null_geneset_units
+                .iter()
+                .map(|unit| {
+                    if unit_kind_lc == "geneset" {
+                        unit.spans.len().max(1)
+                    } else {
+                        1usize
+                    }
+                })
+                .max()
+                .unwrap_or(1),
+        )
+        .max(1);
     let permutation_task_total = if null_permutation_active {
         null_prepared
             .len()
@@ -11152,9 +11188,9 @@ fn garfield_logic_search_bed_owned(
             ..beam_params.clone()
         };
         let mut search_bucket_scores =
-            RuleNullCalibrator::with_layout(beam_params.max_pick.max(1), max_null_unit_group_count);
+            RuleNullCalibrator::with_layout(effective_null_max_rule_len, max_null_unit_group_count);
         let mut output_bucket_scores =
-            RuleNullCalibrator::with_layout(beam_params.max_pick.max(1), max_null_unit_group_count);
+            RuleNullCalibrator::with_layout(effective_null_max_rule_len, max_null_unit_group_count);
         let min_perm_repeats =
             DEFAULT_RULE_NULL_ADAPTIVE_MIN_REPEATS.min(perm_cfg.n_repeats.max(1));
         let mut stable_rounds = 0usize;
@@ -15299,6 +15335,50 @@ mod tests {
         assert_eq!(
             geneset_stage_group_target("geneset", &unit, &[2usize, 3usize]),
             Some(1usize)
+        );
+    }
+
+    #[test]
+    fn test_beam_params_for_prepared_promotes_multigroup_geneset_depth() {
+        let prepared = GarfieldUnitPrepared {
+            selected_global_rows: vec![0, 1, 2],
+            local_groups: vec![0, 1, 2],
+            geneset_stage_group_target: Some(3),
+            null_unit_group_bin: 0,
+        };
+        let out = beam_params_for_prepared(
+            &prepared,
+            BeamSearchParams {
+                max_pick: 1,
+                ..BeamSearchParams::default()
+            },
+        );
+        assert_eq!(out.max_pick, 3);
+        assert_eq!(
+            out.group_constraint,
+            BeamGroupConstraintMode::ExcludeUntilDistinctGroups(3)
+        );
+    }
+
+    #[test]
+    fn test_beam_params_for_prepared_clamps_multigroup_geneset_depth_to_group_count() {
+        let prepared = GarfieldUnitPrepared {
+            selected_global_rows: vec![0, 1],
+            local_groups: vec![0, 1],
+            geneset_stage_group_target: Some(2),
+            null_unit_group_bin: 0,
+        };
+        let out = beam_params_for_prepared(
+            &prepared,
+            BeamSearchParams {
+                max_pick: 5,
+                ..BeamSearchParams::default()
+            },
+        );
+        assert_eq!(out.max_pick, 2);
+        assert_eq!(
+            out.group_constraint,
+            BeamGroupConstraintMode::ExcludeUntilDistinctGroups(2)
         );
     }
 

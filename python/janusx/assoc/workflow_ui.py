@@ -47,6 +47,9 @@ _FASTPLOT_DPI = 300
 _FASTPLOT_SCATTER_SIZE = 8.0
 _FASTPLOT_HIST_BINS = 15
 _FASTPLOT_SINGLETON_COLOR = "#C7CCD3"
+_FASTPLOT_SIG_COMBO_COLOR = "#D62728"
+_FASTPLOT_COMBO_FDR_THRESHOLD = 0.05
+_FASTPLOT_COMBO_FDR_COLUMNS = ("padj", "pwald_fdr", "p_combo_joint_fdr")
 
 
 def _histogram_kde_count_curve(
@@ -114,6 +117,14 @@ def _fastplot_sanitize_pvalues(values: object) -> np.ndarray:
     return np.clip(arr, np.nextafter(0.0, 1.0), 1.0)
 
 
+def _resolve_fastplot_combo_fdr_column(columns: object) -> str | None:
+    colset = {str(c) for c in columns}
+    for name in _FASTPLOT_COMBO_FDR_COLUMNS:
+        if name in colset:
+            return str(name)
+    return None
+
+
 def _prepare_role_layered_manhattan_df(
     results: pd.DataFrame,
     gwasplot,
@@ -130,6 +141,14 @@ def _prepare_role_layered_manhattan_df(
     results_df["chrom"] = results_df["chrom"].astype(str)
     results_df["pos"] = pd.to_numeric(results_df["pos"], errors="coerce").fillna(0).astype(np.int64)
     results_df["row_role"] = results_df["row_role"].astype(str).str.strip().str.lower()
+    combo_fdr_col = _resolve_fastplot_combo_fdr_column(results_df.columns)
+    results_df["__combo_sig"] = False
+    if combo_fdr_col is not None:
+        combo_fdr = _fastplot_sanitize_pvalues(results_df[combo_fdr_col])
+        results_df["__combo_sig"] = (
+            results_df["row_role"].eq("combo")
+            & (combo_fdr < float(_FASTPLOT_COMBO_FDR_THRESHOLD))
+        )
     chr_map = {str(label): i + 1 for i, label in enumerate(getattr(gwasplot, "chr_labels", []))}
     results_df["__chr_code"] = results_df["chrom"].map(chr_map)
     if results_df["__chr_code"].isna().any():
@@ -144,12 +163,16 @@ def _prepare_role_layered_manhattan_df(
     if keep_idx.size == 0:
         return pd.DataFrame(columns=["x", "y", "z", "row_role"])
     kept_roles = results_sorted.iloc[keep_idx]["row_role"].to_numpy(dtype=object, copy=False)
+    kept_combo_sig = results_sorted.iloc[keep_idx]["__combo_sig"].to_numpy(dtype=bool, copy=False)
     plot_df = gwasplot.df.iloc[keep_idx].copy().reset_index(drop=True)
     plot_df = plot_df.loc[:, ["x", "y", "z"]].copy()
     plot_df["y"] = -np.log10(_fastplot_sanitize_pvalues(plot_df["y"]))
     plot_df["row_role"] = kept_roles
+    plot_df["combo_sig"] = kept_combo_sig
     plot_df = plot_df[np.isfinite(plot_df["x"]) & np.isfinite(plot_df["y"]) & np.isfinite(plot_df["z"])]
-    return plot_df.reset_index(drop=True)
+    plot_df = plot_df.reset_index(drop=True)
+    plot_df.attrs["combo_fdr_col"] = combo_fdr_col
+    return plot_df
 
 
 def _prepare_fastplot_qq_results(results: pd.DataFrame) -> pd.DataFrame:
@@ -200,8 +223,12 @@ def _draw_role_layered_manhattan(
         ax.set_ylabel("-log10(p-value)")
         return True
 
+    combo_fdr_col = str(layered_df.attrs.get("combo_fdr_col") or "").strip()
+    has_combo_fdr = combo_fdr_col != ""
     singleton_mask = plot_df["row_role"] == "singleton"
     combo_mask = plot_df["row_role"] == "combo"
+    combo_sig_mask = combo_mask & plot_df.get("combo_sig", False).astype(bool)
+    combo_bg_mask = combo_mask & ~combo_sig_mask
     combo_palette = list(_bioplotkit_color_set.get(6, []))
     if len(combo_palette) == 0:
         combo_palette = ["#3E4F94", "#3E90BF"]
@@ -212,8 +239,9 @@ def _draw_role_layered_manhattan(
         )
     )
 
-    if bool(np.any(singleton_mask)):
-        single_df = plot_df.loc[singleton_mask, ["x", "y"]]
+    base_mask = singleton_mask | combo_bg_mask if has_combo_fdr else singleton_mask
+    if bool(np.any(base_mask)):
+        single_df = plot_df.loc[base_mask, ["x", "y"]]
         ax.scatter(
             single_df["x"],
             single_df["y"],
@@ -225,7 +253,20 @@ def _draw_role_layered_manhattan(
             zorder=1,
         )
 
-    if bool(np.any(combo_mask)):
+    if has_combo_fdr:
+        if bool(np.any(combo_sig_mask)):
+            combo_sig_df = plot_df.loc[combo_sig_mask, ["x", "y"]]
+            ax.scatter(
+                combo_sig_df["x"],
+                combo_sig_df["y"],
+                color=_FASTPLOT_SIG_COMBO_COLOR,
+                s=max(1.0, float(scatter_size) * 1.2),
+                alpha=0.95,
+                linewidths=0.0,
+                rasterized=True,
+                zorder=4,
+            )
+    elif bool(np.any(combo_mask)):
         combo_df = plot_df.loc[combo_mask, ["x", "y", "z"]]
         for chr_id in gwasplot.chr_ids:
             chr_mask = combo_df["z"] == chr_id
@@ -638,6 +679,7 @@ def fastplot(
     phenosub: np.ndarray,
     xlabel: str = "",
     outpdf: str = "fastplot.pdf",
+    threshold_n_tests: Optional[int] = None,
 ) -> None:
     """
     Generate diagnostic plots for GWAS results: phenotype histogram, Manhattan, and QQ.
@@ -695,7 +737,14 @@ def fastplot(
         axes["A"].set_ylabel("Count")
 
         # B: Manhattan plot
-        threshold = -np.log10(1 / max(1, results.shape[0]))
+        if threshold_n_tests is None:
+            threshold_base_n = int(results.shape[0])
+        else:
+            try:
+                threshold_base_n = int(threshold_n_tests)
+            except Exception:
+                threshold_base_n = int(results.shape[0])
+        threshold = -np.log10(1 / max(1, threshold_base_n))
         if not _draw_role_layered_manhattan(
             results,
             gwasplot,
@@ -760,6 +809,7 @@ def _run_fastplot_with_status(
     *,
     xlabel: str,
     outpdf: str,
+    threshold_n_tests: Optional[int] = None,
     use_spinner: bool = False,
     emit_done_line: bool = False,
 ) -> float:
@@ -768,7 +818,13 @@ def _run_fastplot_with_status(
         with CliStatus("Visualizing ...", enabled=True, use_process=False) as task:
             try:
                 with runtime_thread_stage(blas_threads=1, rayon_threads=1):
-                    fastplot(gwasresult, phenosub, xlabel=str(xlabel), outpdf=str(outpdf))
+                    fastplot(
+                        gwasresult,
+                        phenosub,
+                        xlabel=str(xlabel),
+                        outpdf=str(outpdf),
+                        threshold_n_tests=threshold_n_tests,
+                    )
             except Exception:
                 task.fail("Visualizing ...Failed")
                 raise
@@ -776,7 +832,13 @@ def _run_fastplot_with_status(
                 task.complete("Visualizing ...Finished")
     else:
         with runtime_thread_stage(blas_threads=1, rayon_threads=1):
-            fastplot(gwasresult, phenosub, xlabel=str(xlabel), outpdf=str(outpdf))
+            fastplot(
+                gwasresult,
+                phenosub,
+                xlabel=str(xlabel),
+                outpdf=str(outpdf),
+                threshold_n_tests=threshold_n_tests,
+            )
     return max(time.time() - viz_t0, 0.0)
 
 
@@ -786,6 +848,7 @@ def _run_fastplot_from_tsv_with_status(
     *,
     xlabel: str,
     outpdf: str,
+    threshold_n_tests: Optional[int] = None,
     use_spinner: bool = False,
     emit_done_line: bool = False,
 ) -> float:
@@ -796,6 +859,9 @@ def _run_fastplot_from_tsv_with_status(
         usecols.append("row_role")
     if "snp" in header_df.columns:
         usecols.append("snp")
+    for fdr_col in _FASTPLOT_COMBO_FDR_COLUMNS:
+        if fdr_col in header_df.columns:
+            usecols.append(str(fdr_col))
     dtype_map: dict[str, object] = {"chrom": str, "pos": "int64"}
     if "row_role" in usecols:
         dtype_map["row_role"] = str
@@ -811,8 +877,17 @@ def _run_fastplot_from_tsv_with_status(
                     dtype=dtype_map,
                 )
                 plot_df["pwald"] = pd.to_numeric(plot_df["pwald"], errors="coerce")
+                for fdr_col in _FASTPLOT_COMBO_FDR_COLUMNS:
+                    if fdr_col in plot_df.columns:
+                        plot_df[fdr_col] = pd.to_numeric(plot_df[fdr_col], errors="coerce")
                 with runtime_thread_stage(blas_threads=1, rayon_threads=1):
-                    fastplot(plot_df, phenosub, xlabel=str(xlabel), outpdf=str(outpdf))
+                    fastplot(
+                        plot_df,
+                        phenosub,
+                        xlabel=str(xlabel),
+                        outpdf=str(outpdf),
+                        threshold_n_tests=threshold_n_tests,
+                    )
             except Exception:
                 task.fail("Visualizing ...Failed")
                 raise
@@ -826,8 +901,17 @@ def _run_fastplot_from_tsv_with_status(
             dtype=dtype_map,
         )
         plot_df["pwald"] = pd.to_numeric(plot_df["pwald"], errors="coerce")
+        for fdr_col in _FASTPLOT_COMBO_FDR_COLUMNS:
+            if fdr_col in plot_df.columns:
+                plot_df[fdr_col] = pd.to_numeric(plot_df[fdr_col], errors="coerce")
         with runtime_thread_stage(blas_threads=1, rayon_threads=1):
-            fastplot(plot_df, phenosub, xlabel=str(xlabel), outpdf=str(outpdf))
+            fastplot(
+                plot_df,
+                phenosub,
+                xlabel=str(xlabel),
+                outpdf=str(outpdf),
+                threshold_n_tests=threshold_n_tests,
+            )
     return max(time.time() - viz_t0, 0.0)
 
 

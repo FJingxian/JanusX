@@ -1442,6 +1442,7 @@ def _run_garfield_pseudo_fvlmm(
             y_trait,
             xlabel=str(trait_label),
             outpdf=figure_path,
+            threshold_n_tests=fdr_n_tests,
             use_spinner=bool(use_spinner),
             emit_done_line=False,
         )
@@ -1622,6 +1623,7 @@ def _run_garfield_pseudo_fvlmm2(
             np.asarray(pheno_values, dtype=np.float64),
             xlabel=str(trait_label),
             outpdf=figure_path,
+            threshold_n_tests=fdr_n_tests,
             use_spinner=bool(use_spinner),
             emit_done_line=False,
         )
@@ -2630,7 +2632,23 @@ def main() -> None:
             "Background-noise calibration remains genome-wide."
         ),
     )
-    optional_group.add_argument("-m", "--max-pick", type=int, default=None, dest="layer_compat", help=argparse.SUPPRESS)
+    optional_group.add_argument(
+        "-m",
+        "--meff",
+        type=int,
+        default=None,
+        help=(
+            "Effective SNP count used for GARFIELD Manhattan Bonferroni thresholding "
+            "and FDR test counting. Default uses the input genotype SNP count."
+        ),
+    )
+    optional_group.add_argument(
+        "--max-pick",
+        type=int,
+        default=None,
+        dest="layer_compat",
+        help=argparse.SUPPRESS,
+    )
     optional_group.add_argument(
         "--feature-source",
         type=str,
@@ -2700,6 +2718,13 @@ def main() -> None:
         parser.error("-geno/--geno must be in [0, 1]")
     if not (0.0 <= float(args.het) <= 1.0):
         parser.error("-het/--het must be in [0, 1]")
+    if args.meff is not None:
+        try:
+            args.meff = int(args.meff)
+        except Exception:
+            parser.error("-m/--meff must be an integer")
+        if int(args.meff) <= 0:
+            parser.error("-m/--meff must be > 0")
     if (
         args.grm is not None
         and str(args.grm).strip().isdigit()
@@ -3296,7 +3321,11 @@ def main() -> None:
                     if int(result.get("units_scanned", 0)) > 0
                     else 0
                 )
-                site_tests_for_fdr = max(0, int(_n_snps))
+                site_tests_for_fdr = (
+                    max(0, int(args.meff))
+                    if args.meff is not None
+                    else max(0, int(_n_snps))
+                )
                 total_tests_for_fdr = site_tests_for_fdr + max(0, units_for_fdr)
                 fdr_n_tests = total_tests_for_fdr if total_tests_for_fdr > 0 else None
                 return _run_garfield_pseudo_fvlmm(
@@ -3393,6 +3422,7 @@ def main() -> None:
             "extension": int(args.extension),
             "step": int(args.step),
             "bimrange": (list(args.bimrange) if args.bimrange else None),
+            "meff": (None if args.meff is None else int(args.meff)),
             "ranking_dataset": "full",
             "feature_source": feature_source,
             "gene_files": list(args.genefiles),

@@ -118,9 +118,13 @@ def _prepare_role_layered_manhattan_df(
     results: pd.DataFrame,
     gwasplot,
 ) -> pd.DataFrame | None:
-    if "row_role" not in results.columns:
-        return None
     results_df = results.reset_index(drop=True).copy()
+    if "row_role" not in results_df.columns and "snp" in results_df.columns:
+        snp_text = results_df["snp"].astype(str)
+        inferred_combo = snp_text.str.contains(r"[&|*]", regex=True, na=False)
+        results_df["row_role"] = np.where(inferred_combo, "combo", "singleton")
+    if "row_role" not in results_df.columns:
+        return None
     if results_df.shape[0] == 0:
         return pd.DataFrame(columns=["x", "y", "z", "row_role"])
     results_df["chrom"] = results_df["chrom"].astype(str)
@@ -146,6 +150,30 @@ def _prepare_role_layered_manhattan_df(
     plot_df["row_role"] = kept_roles
     plot_df = plot_df[np.isfinite(plot_df["x"]) & np.isfinite(plot_df["y"]) & np.isfinite(plot_df["z"])]
     return plot_df.reset_index(drop=True)
+
+
+def _prepare_fastplot_qq_results(results: pd.DataFrame) -> pd.DataFrame:
+    if results.shape[0] == 0:
+        return results.copy()
+    qq_df = results.reset_index(drop=True).copy()
+    if "row_role" not in qq_df.columns and "snp" in qq_df.columns:
+        snp_text = qq_df["snp"].astype(str)
+        inferred_combo = snp_text.str.contains(r"[&|*]", regex=True, na=False)
+        qq_df["row_role"] = np.where(inferred_combo, "combo", "singleton")
+    if "snp" not in qq_df.columns or "row_role" not in qq_df.columns:
+        return qq_df
+    row_role = qq_df["row_role"].astype(str).str.strip().str.lower()
+    combo_mask = row_role.eq("combo")
+    if not bool(combo_mask.any()):
+        return qq_df
+    keep_combo = ~qq_df.loc[combo_mask].duplicated(subset=["snp"], keep="first")
+    combo_mask_np = combo_mask.to_numpy(dtype=bool, copy=False)
+    keep_mask = np.array(~combo_mask_np, dtype=bool, copy=True)
+    keep_mask[combo_mask_np] = keep_combo.to_numpy(
+        dtype=bool,
+        copy=False,
+    )
+    return qq_df.loc[keep_mask].reset_index(drop=True)
 
 
 def _draw_role_layered_manhattan(
@@ -627,6 +655,8 @@ def fastplot(
         from janusx.bioplotkit import GWASPLOT, apply_integer_yticks
 
         gwasplot = GWASPLOT(results)
+        qq_results = _prepare_fastplot_qq_results(results)
+        gwasplot_qq = GWASPLOT(qq_results, compression=False)
         scatter_size = _FASTPLOT_SCATTER_SIZE
 
         # A: phenotype distribution
@@ -692,18 +722,20 @@ def fastplot(
 
         # C: QQ plot
         manh_ymin, manh_ymax = axes["B"].get_ylim()
-        gwasplot.qq(
+        gwasplot_qq.qq(
             ax=axes["C"],
             scatter_size=scatter_size,
-            axis_min=float(manh_ymin),
+            axis_min=0.0,
         )
 
         # Align QQ with Manhattan:
-        # - QQ ylim follows Manhattan ylim
-        # - QQ xlim minimum equals Manhattan ylim minimum
+        # - QQ shares the Manhattan upper y bound for visual comparability
+        # - but both QQ axes still start from 0 to avoid artificial upward shifts
         qq_xmin, qq_xmax = axes["C"].get_xlim()
-        axes["C"].set_ylim(manh_ymin, manh_ymax)
-        qq_left = float(manh_ymin)
+        qq_left = 0.0
+        qq_bottom = 0.0
+        if np.isfinite(manh_ymax) and float(manh_ymax) > qq_bottom:
+            axes["C"].set_ylim(qq_bottom, float(manh_ymax))
         if np.isfinite(qq_xmin) and np.isfinite(qq_xmax) and qq_xmax > qq_xmin:
             x_right = max(float(qq_xmax), qq_left + 1e-9)
             x_span = max(1e-9, x_right - qq_left)
@@ -762,9 +794,13 @@ def _run_fastplot_from_tsv_with_status(
     usecols = ["chrom", "pos", "pwald"]
     if "row_role" in header_df.columns:
         usecols.append("row_role")
+    if "snp" in header_df.columns:
+        usecols.append("snp")
     dtype_map: dict[str, object] = {"chrom": str, "pos": "int64"}
     if "row_role" in usecols:
         dtype_map["row_role"] = str
+    if "snp" in usecols:
+        dtype_map["snp"] = str
     if bool(use_spinner):
         with CliStatus("Visualizing ...", enabled=True, use_process=False) as task:
             try:

@@ -3652,7 +3652,7 @@ def _format_postgwas_gff_broaden_direct(
         desc = _clean_anno_token(_postgwas_attr_list_value(attrs, 1))
         if desc == "NA":
             desc = _clean_anno_token(_postgwas_attr_list_value(attrs, 2))
-        out.append(f"{gene_id}:{desc}/NA")
+        out.append(f"{gene_id}:{desc}")
     if len(out) == 0:
         return "NA"
     return ";".join(out)
@@ -3850,7 +3850,7 @@ def _format_postgwas_gene_annotation_from_ids(
             continue
         seen.add(gene_id_text)
         out.append(
-            f"{gene_id_text}:{_clean_anno_token(gene_meta[gene_id_text].get('desc', 'NA'))}/NA"
+            f"{gene_id_text}:{_clean_anno_token(gene_meta[gene_id_text].get('desc', 'NA'))}"
         )
     if len(out) == 0:
         return "NA"

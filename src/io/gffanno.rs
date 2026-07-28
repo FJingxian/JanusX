@@ -997,7 +997,7 @@ fn annotate_many_broaden_on_chrom(
             if !seen.insert(gene.id.as_str()) {
                 continue;
             }
-            parts.push(format!("{}:{}/NA", gene.id, gene.desc));
+            parts.push(format!("{}:{}", gene.id, gene.desc));
         }
         out[out_idx] = if parts.is_empty() {
             BROADEN_EMPTY.to_string()
@@ -1238,7 +1238,7 @@ chr1\tsrc\tCDS\t320\t340\t.\t-\t0\tID=cds:Cdsb;Parent=transcript:TxB\n";
         );
         assert_eq!(
             index.annotate_site_broaden("1", 250, 80),
-            "GeneA:Alpha kinase/NA;GeneB:Beta protein/NA"
+            "GeneA:Alpha kinase;GeneB:Beta protein"
         );
         let _ = fs::remove_file(path);
     }

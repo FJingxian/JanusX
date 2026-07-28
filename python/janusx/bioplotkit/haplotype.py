@@ -461,9 +461,47 @@ def _convert_call_to_allele(value: object, ref: str, alt: str) -> str:
                     return ref
                 if a in {"1", alt}:
                     return alt
-            return "H"
+            a_norm = ref if a in {"0", ref} else alt if a in {"1", alt} else str(a)
+            b_norm = ref if b in {"0", ref} else alt if b in {"1", alt} else str(b)
+            pair = tuple(sorted((str(a_norm), str(b_norm))))
+            if pair == tuple(sorted((str(ref), str(alt)))):
+                return "H"
+            return f"H:{pair[0]}/{pair[1]}"
 
     return s
+
+
+def _is_heterozygote_label(value: object) -> bool:
+    text = str(value).strip()
+    if text == "H":
+        return True
+    if text.startswith("H:"):
+        return True
+    if len(text) >= 2 and text[0] == "H" and text[1:].isdigit():
+        return True
+    return False
+
+
+def _normalize_sitewise_heterozygote_labels(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    for col in out.columns:
+        series = out[col].astype(str)
+        hetero_keys = [
+            key
+            for key in pd.unique(series)
+            if str(key).startswith("H:")
+        ]
+        if not hetero_keys:
+            continue
+        hetero_keys = sorted(str(key) for key in hetero_keys)
+        hetero_map = {
+            key: (f"H{i + 1}" if len(hetero_keys) > 1 else "H")
+            for i, key in enumerate(hetero_keys)
+        }
+        out[col] = series.map(lambda x: hetero_map.get(str(x), x))
+    return out
 
 
 def _genotype_dataframe_to_sample_site(
@@ -521,6 +559,7 @@ def _genotype_dataframe_to_sample_site(
 
     mat = np.asarray(site_calls, dtype=object).T
     out = pd.DataFrame(mat, index=keep_samples, columns=site_keys)
+    out = _normalize_sitewise_heterozygote_labels(out)
     return out
 
 
@@ -556,6 +595,7 @@ def _chunks_to_sample_site(
 
     mat = np.asarray(site_calls, dtype=object).T
     df = pd.DataFrame(mat, index=sample_ids, columns=site_keys)
+    df = _normalize_sitewise_heterozygote_labels(df)
     keep = [s for s in phenotype_samples if s in df.index]
     if not keep:
         raise ValueError("No overlapping samples between phenotype and chunk genotype.")
@@ -712,7 +752,7 @@ def _build_binomial_summary(
         sig = pd.DataFrame(False, index=gidx, columns=gidx, dtype=bool)
         pairwise_pvalues = pd.DataFrame(np.nan, index=gidx, columns=gidx, dtype=float)
         for g in gidx:
-            pairwise_pvalues.loc[g, g] = 0.0
+            pairwise_pvalues.at[g, g] = 0.0
         means = out["mean"].astype(float)
 
         if len(gidx) == 2:
@@ -721,8 +761,8 @@ def _build_binomial_summary(
                 [[int(succ.loc[g1]), int(fail.loc[g1])], [int(succ.loc[g2]), int(fail.loc[g2])]]
             )
             if np.isfinite(p):
-                pairwise_pvalues.loc[g1, g2] = float(p)
-                pairwise_pvalues.loc[g2, g1] = float(p)
+                pairwise_pvalues.at[g1, g2] = float(p)
+                pairwise_pvalues.at[g2, g1] = float(p)
             reject = bool(np.isfinite(p) and float(p) < float(alpha))
             sig.at[g1, g2] = reject
             sig.at[g2, g1] = reject
@@ -744,8 +784,8 @@ def _build_binomial_summary(
             p_adj = _holm_adjust(np.asarray(pvals, dtype=float))
             for (gi, gj), pv in zip(pairs, p_adj):
                 if np.isfinite(pv):
-                    pairwise_pvalues.loc[gi, gj] = float(pv)
-                    pairwise_pvalues.loc[gj, gi] = float(pv)
+                    pairwise_pvalues.at[gi, gj] = float(pv)
+                    pairwise_pvalues.at[gj, gi] = float(pv)
                 if np.isfinite(p_omnibus) and float(p_omnibus) < float(alpha):
                     reject = bool(np.isfinite(pv) and float(pv) < float(alpha))
                     sig.at[gi, gj] = reject
@@ -1101,7 +1141,7 @@ def _infer_adv_alleles(
         picked = None
         for allele in means.index:
             a = str(allele)
-            if a not in na_like and a != "H":
+            if a not in na_like and not _is_heterozygote_label(a):
                 picked = a
                 break
         if picked is None:
@@ -1147,7 +1187,7 @@ def _draw_haplotype_matrix(
 
         col_vals = matrix_labels[:, j]
         non_na = [x for x in pd.unique(col_vals) if str(x) not in na_like]
-        allele_main = [x for x in non_na if str(x) != "H"]
+        allele_main = [x for x in non_na if not _is_heterozygote_label(x)]
         ref_like = str(allele_main[0]) if len(allele_main) >= 1 else None
         alt_like = str(allele_main[1]) if len(allele_main) >= 2 else None
 
@@ -1165,7 +1205,7 @@ def _draw_haplotype_matrix(
             if v in na_like:
                 rgba[i, j, :] = na_gray
                 continue
-            if v == "H":
+            if _is_heterozygote_label(v):
                 rgba[i, j, :] = het_color
                 continue
 
@@ -1355,6 +1395,11 @@ def plot_haplotype(
           - summary_df.attrs['p_omnibus'] for binomial multi-group omnibus chi-square
           - summary_df.attrs['pairwise_pvalues'] as a symmetric DataFrame
           - summary_df.attrs['significance_matrix'] as a symmetric boolean DataFrame
+
+    Notes
+    -----
+    Samples with missing genotype at any requested haplotype site are removed
+    before haplotype grouping (union filter across selected sites).
     """
     legacy_draw_violin = kwargs.pop("draw_violin", None)
     legacy_draw_box = kwargs.pop("draw_box", None)
@@ -1439,12 +1484,31 @@ def plot_haplotype(
         geno_sample_site = _chunks_to_sample_site(genotype, phenotype_samples, None)
     geno_sample_site = _subset_sample_site_by_sites(geno_sample_site, snp_sites)
 
+    site_cols = list(geno_sample_site.columns)
     merged = pd.concat([pheno.rename("_pheno"), geno_sample_site], axis=1, join="inner")
     merged = merged.dropna()
+    na_like = {"NA", "N", ".", "./.", "-", "nan"}
+    missing_site_mask = np.zeros(int(merged.shape[0]), dtype=bool)
+    if site_cols:
+        for col in site_cols:
+            col_vals = merged[col]
+            miss = np.asarray(col_vals.isna().to_numpy(dtype=bool, copy=False), dtype=bool)
+            miss = miss | col_vals.astype(str).str.strip().isin(na_like).to_numpy(dtype=bool, copy=False)
+            missing_site_mask |= miss
+    removed_missing_site_n = int(np.count_nonzero(missing_site_mask))
+    if removed_missing_site_n > 0:
+        warnings.warn(
+            (
+                "Filtered out samples with missing genotype in selected haplotype sites "
+                f"(union filter across sites): n={removed_missing_site_n}"
+            ),
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        merged = merged.loc[~missing_site_mask].copy()
     if merged.empty:
         raise ValueError("No valid samples after merging phenotype and genotype.")
 
-    site_cols = list(geno_sample_site.columns)
     if len(site_cols) == 1:
         merged["_hap_key"] = merged[site_cols[0]]
     else:
@@ -1505,6 +1569,7 @@ def plot_haplotype(
         )
 
     summary.attrs["min_haplotype_n"] = int(min_haplotype_n)
+    summary.attrs["removed_missing_site_samples"] = int(removed_missing_site_n)
     summary.attrs["removed_haplotype_groups"] = int(removed_counts.shape[0])
     summary.attrs["removed_haplotype_samples"] = int(removed_counts.sum())
     summary.attrs["removed_haplotype_detail"] = removed_counts.to_dict()

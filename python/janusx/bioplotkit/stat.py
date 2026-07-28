@@ -90,7 +90,7 @@ def _tukey_test_matrices(
     sig = pd.DataFrame(False, index=groups, columns=groups, dtype=bool)
     pvals = pd.DataFrame(np.nan, index=groups, columns=groups, dtype=float)
     for g in groups:
-        pvals.loc[g, g] = 0.0
+        pvals.at[g, g] = 0.0
 
     tukey = pairwise_tukeyhsd(
         endog=df["value"].values,
@@ -107,10 +107,10 @@ def _tukey_test_matrices(
             p_adj_f = float(p_adj)
         except (TypeError, ValueError):
             p_adj_f = np.nan
-        sig.loc[g1, g2] = bool(reject)
-        sig.loc[g2, g1] = bool(reject)
-        pvals.loc[g1, g2] = p_adj_f
-        pvals.loc[g2, g1] = p_adj_f
+        sig.at[g1, g2] = bool(reject)
+        sig.at[g2, g1] = bool(reject)
+        pvals.at[g1, g2] = p_adj_f
+        pvals.at[g2, g1] = p_adj_f
 
     return sig, pvals
 
@@ -336,13 +336,13 @@ def multiple_comparison_groupby(
         pairwise_pvalues = pd.DataFrame(np.nan, index=out.index, columns=out.index, dtype=float)
         significance_matrix = pd.DataFrame(False, index=out.index, columns=out.index, dtype=bool)
         for g in out.index:
-            pairwise_pvalues.loc[g, g] = 0.0
+            pairwise_pvalues.at[g, g] = 0.0
         if np.isfinite(pvalue):
-            pairwise_pvalues.loc[g1, g2] = float(pvalue)
-            pairwise_pvalues.loc[g2, g1] = float(pvalue)
+            pairwise_pvalues.at[g1, g2] = float(pvalue)
+            pairwise_pvalues.at[g2, g1] = float(pvalue)
             is_sig = bool(float(pvalue) < alpha)
-            significance_matrix.loc[g1, g2] = is_sig
-            significance_matrix.loc[g2, g1] = is_sig
+            significance_matrix.at[g1, g2] = is_sig
+            significance_matrix.at[g2, g1] = is_sig
 
         out["letters"] = [letters.get(g, "") for g in out.index]
         out = out.sort_values("mean", ascending=False)

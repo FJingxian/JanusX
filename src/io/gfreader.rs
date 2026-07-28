@@ -234,6 +234,64 @@ fn normalize_chr_key_local(chrom: &str) -> String {
 }
 
 #[inline]
+fn normalize_interval_bounds_local(start: i32, end: i32) -> (i32, i32) {
+    if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    }
+}
+
+fn merge_interval_groups_local(
+    interval_groups: &[Vec<(String, i32, i32)>],
+) -> HashMap<String, Vec<(i32, i32)>> {
+    let mut by_chrom = HashMap::<String, Vec<(i32, i32)>>::new();
+    for group in interval_groups.iter() {
+        for (chrom, start, end) in group.iter() {
+            let key = normalize_chr_key_local(chrom);
+            let (lo, hi) = normalize_interval_bounds_local(*start, *end);
+            by_chrom.entry(key).or_default().push((lo, hi));
+        }
+    }
+    for intervals in by_chrom.values_mut() {
+        intervals.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        let mut merged = Vec::<(i32, i32)>::with_capacity(intervals.len());
+        for &(start, end) in intervals.iter() {
+            if let Some(last) = merged.last_mut() {
+                if start <= last.1 {
+                    last.1 = last.1.max(end);
+                    continue;
+                }
+            }
+            merged.push((start, end));
+        }
+        *intervals = merged;
+    }
+    by_chrom
+}
+
+#[inline]
+fn merged_interval_contains_pos_local(intervals: &[(i32, i32)], pos: i32) -> bool {
+    if intervals.is_empty() {
+        return false;
+    }
+    let mut lo = 0usize;
+    let mut hi = intervals.len();
+    while lo < hi {
+        let mid = lo + ((hi - lo) / 2);
+        if intervals[mid].0 <= pos {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if lo == 0 {
+        return false;
+    }
+    pos <= intervals[lo - 1].1
+}
+
+#[inline]
 fn env_truthy_local(name: &str) -> bool {
     match std::env::var(name) {
         Ok(raw) => {
@@ -4194,6 +4252,295 @@ pub(crate) struct PreparedBedPackedOwned {
     pub n_samples: usize,
     pub n_snps_total: usize,
     pub bytes_per_snp: usize,
+}
+
+fn collect_bed_interval_candidate_rows_local(
+    prefix: &str,
+    interval_groups: &[Vec<(String, i32, i32)>],
+    n_snps_total: usize,
+) -> Result<(Vec<usize>, Vec<core::SiteInfo>), String> {
+    if interval_groups.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let merged = merge_interval_groups_local(interval_groups);
+    if merged.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let mut bim = core::BimChunkReader::open(prefix)?;
+    let mut row_source_indices = Vec::<usize>::new();
+    let mut sites = Vec::<core::SiteInfo>::new();
+    let chunk_rows = 131_072usize;
+    let mut base = 0usize;
+    while base < n_snps_total {
+        let end = (base + chunk_rows).min(n_snps_total);
+        let chunk_sites = bim.read_range(base, end)?;
+        for (off, site) in chunk_sites.into_iter().enumerate() {
+            let chrom_key = normalize_chr_key_local(site.chrom.as_str());
+            let Some(intervals) = merged.get(&chrom_key) else {
+                continue;
+            };
+            if merged_interval_contains_pos_local(intervals.as_slice(), site.pos) {
+                row_source_indices.push(base + off);
+                sites.push(site);
+            }
+        }
+        base = end;
+    }
+    bim.ensure_exhausted(n_snps_total)?;
+    Ok((row_source_indices, sites))
+}
+
+fn prepare_bed_logic_meta_owned_for_candidate_rows_pure_line(
+    prefix: &str,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
+    stats_sample_indices: Option<&[usize]>,
+    row_source_indices: &[usize],
+    candidate_sites: &[core::SiteInfo],
+) -> Result<PreparedBedLogicMetaOwned, String> {
+    if row_source_indices.len() != candidate_sites.len() {
+        return Err(format!(
+            "candidate row/site length mismatch: rows={}, sites={}",
+            row_source_indices.len(),
+            candidate_sites.len()
+        ));
+    }
+    if row_source_indices.is_empty() {
+        return Err("candidate row_source_indices must not be empty".to_string());
+    }
+
+    let mut bed_prefix = prefix.to_string();
+    let lower = bed_prefix.to_ascii_lowercase();
+    if lower.ends_with(".bed") || lower.ends_with(".bim") || lower.ends_with(".fam") {
+        bed_prefix.truncate(bed_prefix.len() - 4);
+    }
+
+    let samples = core::read_fam(&bed_prefix).map_err(|e| e.to_string())?;
+    let n_samples = samples.len();
+    if n_samples == 0 {
+        return Err("no samples found in PLINK input".to_string());
+    }
+    let stats_sample_indices = stats_sample_indices.unwrap_or(&[]);
+    if !stats_sample_indices.is_empty() && stats_sample_indices.iter().any(|&idx| idx >= n_samples)
+    {
+        return Err(
+            "selected sample index out of range for BED pure-line interval preparation"
+                .to_string(),
+        );
+    }
+    let stats_identity = stats_sample_indices.is_empty()
+        || (stats_sample_indices.len() == n_samples
+            && sample_indices_are_identity(stats_sample_indices));
+    let stats_n_samples = if stats_identity {
+        n_samples
+    } else {
+        stats_sample_indices.len()
+    };
+    if stats_n_samples == 0 {
+        return Err(
+            "selected sample set for BED pure-line interval preparation is empty".to_string(),
+        );
+    }
+    let stats_excluded_sample_indices = if stats_identity {
+        None
+    } else {
+        precompute_excluded_sample_indices(n_samples, stats_sample_indices)
+    };
+
+    let bed_path = format!("{bed_prefix}.bed");
+    let bed_file = File::open(&bed_path).map_err(|e| format!("failed to open {bed_path}: {e}"))?;
+    let mmap =
+        unsafe { Mmap::map(&bed_file) }.map_err(|e| format!("failed to mmap {bed_path}: {e}"))?;
+    if mmap.len() < 3 {
+        return Err("BED too small".to_string());
+    }
+    if mmap[0] != 0x6C || mmap[1] != 0x1B || mmap[2] != 0x01 {
+        return Err("Only SNP-major BED supported".to_string());
+    }
+    let bytes_per_snp = (n_samples + 3) / 4;
+    let data_len = mmap.len() - 3;
+    if bytes_per_snp == 0 || data_len % bytes_per_snp != 0 {
+        return Err(format!(
+            "invalid BED payload length: data_len={data_len}, bytes_per_snp={bytes_per_snp}"
+        ));
+    }
+    let n_snps_total = data_len / bytes_per_snp;
+    if let Some(&bad_idx) = row_source_indices.iter().find(|&&idx| idx >= n_snps_total) {
+        return Err(format!(
+            "row_source_indices contains out-of-range source row {bad_idx} for n_snps={n_snps_total}"
+        ));
+    }
+
+    let packed_src = &mmap[3..];
+    let row_eval = row_source_indices
+        .par_iter()
+        .zip(candidate_sites.par_iter())
+        .map(|(&src_row, site)| {
+            let src_off = src_row * bytes_per_snp;
+            let row = &packed_src[src_off..src_off + bytes_per_snp];
+            let (missing, het, hom_alt) = if stats_identity {
+                count_packed_row_counts(row, n_samples)
+            } else {
+                count_packed_row_counts_selected_with_excluded(
+                    row,
+                    n_samples,
+                    stats_sample_indices,
+                    stats_excluded_sample_indices.as_deref(),
+                )
+            };
+            let (mut status, missing_rate, alt_freq) = pure_line_filter_status_from_counts(
+                stats_n_samples,
+                missing,
+                het,
+                hom_alt,
+                maf_threshold,
+                max_missing_rate,
+                het_threshold,
+            );
+            if snps_only
+                && pure_line_filter_status_reason(status) == PURE_LINE_FILTER_KEEP
+                && (!is_simple_snp_allele(&site.ref_allele)
+                    || !is_simple_snp_allele(&site.alt_allele))
+            {
+                status = pure_line_filter_status_replace_reason(
+                    status,
+                    PURE_LINE_FILTER_FAIL_NON_SIMPLE_SNP,
+                );
+            }
+            (status, missing_rate, alt_freq)
+        })
+        .collect::<Vec<_>>();
+
+    let mut row_flip = Vec::<bool>::with_capacity(row_source_indices.len());
+    let mut kept_rows = Vec::<usize>::with_capacity(row_source_indices.len());
+    let mut kept_missing = Vec::<f32>::with_capacity(row_source_indices.len());
+    let mut kept_maf = Vec::<f32>::with_capacity(row_source_indices.len());
+    let mut kept_sites = Vec::<core::SiteInfo>::with_capacity(row_source_indices.len());
+    let mut fail_missing = 0usize;
+    let mut fail_het = 0usize;
+    let mut fail_no_non_missing = 0usize;
+    let mut fail_maf = 0usize;
+    let mut fail_non_simple_snp = 0usize;
+    let mut het_sites = 0usize;
+    let mut raw_missing_sites = 0usize;
+
+    for (idx, ((status, missing_rate, alt_freq), site)) in
+        row_eval.into_iter().zip(candidate_sites.iter()).enumerate()
+    {
+        let reason = pure_line_filter_status_reason(status);
+        if reason == PURE_LINE_FILTER_KEEP {
+            kept_rows.push(row_source_indices[idx]);
+            kept_missing.push(missing_rate);
+            kept_maf.push(alt_freq);
+            kept_sites.push(site.clone());
+            row_flip.push(false);
+        } else {
+            match reason {
+                PURE_LINE_FILTER_FAIL_MISSING => fail_missing += 1,
+                PURE_LINE_FILTER_FAIL_HET => fail_het += 1,
+                PURE_LINE_FILTER_FAIL_NO_NON_MISSING => fail_no_non_missing += 1,
+                PURE_LINE_FILTER_FAIL_MAF => fail_maf += 1,
+                PURE_LINE_FILTER_FAIL_NON_SIMPLE_SNP => fail_non_simple_snp += 1,
+                _ => {}
+            }
+        }
+        if (status & PURE_LINE_FILTER_FLAG_HAS_HET) != 0 {
+            het_sites += 1;
+        }
+        if (status & PURE_LINE_FILTER_FLAG_HAS_RAW_MISSING) != 0 {
+            raw_missing_sites += 1;
+        }
+    }
+
+    if kept_rows.is_empty() {
+        return Err(format_zero_sites_pure_line_error(
+            stats_n_samples,
+            n_samples,
+            row_source_indices.len(),
+            maf_threshold,
+            max_missing_rate,
+            het_threshold,
+            snps_only,
+            fail_missing,
+            fail_het,
+            fail_no_non_missing,
+            fail_maf,
+            fail_non_simple_snp,
+            het_sites,
+            raw_missing_sites,
+        ));
+    }
+
+    Ok(PreparedBedLogicMetaOwned {
+        site_keep: Vec::new(),
+        row_flip,
+        row_source_indices: kept_rows,
+        missing_rate: kept_missing,
+        maf: kept_maf,
+        sites: kept_sites,
+        n_samples,
+        n_snps_total,
+        bytes_per_snp,
+    })
+}
+
+pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_pure_line_intervals(
+    prefix: &str,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
+    interval_groups: &[Vec<(String, i32, i32)>],
+    stats_sample_indices: Option<&[usize]>,
+) -> Result<PreparedBedLogicMetaOwned, String> {
+    let mut bed_prefix = prefix.to_string();
+    let lower = bed_prefix.to_ascii_lowercase();
+    if lower.ends_with(".bed") || lower.ends_with(".bim") || lower.ends_with(".fam") {
+        bed_prefix.truncate(bed_prefix.len() - 4);
+    }
+
+    let samples = core::read_fam(&bed_prefix).map_err(|e| e.to_string())?;
+    let n_samples = samples.len();
+    if n_samples == 0 {
+        return Err("no samples found in PLINK input".to_string());
+    }
+    let bed_path = format!("{bed_prefix}.bed");
+    let bed_file = File::open(&bed_path).map_err(|e| format!("failed to open {bed_path}: {e}"))?;
+    let mmap =
+        unsafe { Mmap::map(&bed_file) }.map_err(|e| format!("failed to mmap {bed_path}: {e}"))?;
+    if mmap.len() < 3 {
+        return Err("BED too small".to_string());
+    }
+    if mmap[0] != 0x6C || mmap[1] != 0x1B || mmap[2] != 0x01 {
+        return Err("Only SNP-major BED supported".to_string());
+    }
+    let bytes_per_snp = (n_samples + 3) / 4;
+    let data_len = mmap.len() - 3;
+    if bytes_per_snp == 0 || data_len % bytes_per_snp != 0 {
+        return Err(format!(
+            "invalid BED payload length: data_len={data_len}, bytes_per_snp={bytes_per_snp}"
+        ));
+    }
+    let n_snps_total = data_len / bytes_per_snp;
+
+    let (candidate_rows, candidate_sites) =
+        collect_bed_interval_candidate_rows_local(&bed_prefix, interval_groups, n_snps_total)?;
+    if candidate_rows.is_empty() {
+        return Err("no BED sites overlapped the requested active interval groups".to_string());
+    }
+    prepare_bed_logic_meta_owned_for_candidate_rows_pure_line(
+        &bed_prefix,
+        maf_threshold,
+        max_missing_rate,
+        het_threshold,
+        snps_only,
+        stats_sample_indices,
+        candidate_rows.as_slice(),
+        candidate_sites.as_slice(),
+    )
 }
 
 pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_sparse_windowed(

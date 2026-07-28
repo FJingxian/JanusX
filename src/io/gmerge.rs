@@ -1856,7 +1856,7 @@ pub fn merge_genotypes(
     geno=1.0,
     impute=false,
     model="add",
-    het=0.02,
+    het=1.0,
     sample_ids=None,
     sample_indices=None,
     snp_name_template=None
@@ -1889,9 +1889,9 @@ pub fn convert_genotypes(
             "geno must be within [0, 1]",
         ));
     }
-    if !(0.0..=0.5).contains(&het) {
+    if !(0.0..=1.0).contains(&het) {
         return Err(pyo3::exceptions::PyValueError::new_err(
-            "het must be within [0, 0.5]",
+            "het must be within [0, 1.0]",
         ));
     }
     let model_key = model.trim().to_ascii_lowercase();

@@ -46,6 +46,7 @@ _FASTPLOT_FIGSIZE = (16.0, 4.0)
 _FASTPLOT_DPI = 300
 _FASTPLOT_SCATTER_SIZE = 8.0
 _FASTPLOT_HIST_BINS = 15
+_FASTPLOT_MANHATTAN_INTERVAL_RATE = 0.5
 _FASTPLOT_SINGLETON_COLOR = "#C7CCD3"
 _FASTPLOT_SIG_COMBO_COLOR = "#D62728"
 _FASTPLOT_COMBO_FDR_THRESHOLD = 0.05
@@ -123,6 +124,13 @@ def _resolve_fastplot_combo_fdr_column(columns: object) -> str | None:
         if name in colset:
             return str(name)
     return None
+
+
+def _normalize_fastplot_style(style: object) -> str:
+    text = str(style or "").strip().lower()
+    if text == "garfield":
+        return "garfield"
+    return "gwas"
 
 
 def _prepare_role_layered_manhattan_df(
@@ -680,12 +688,14 @@ def fastplot(
     xlabel: str = "",
     outpdf: str = "fastplot.pdf",
     threshold_n_tests: Optional[int] = None,
+    plot_style: str = "gwas",
 ) -> None:
     """
     Generate diagnostic plots for GWAS results: phenotype histogram, Manhattan, and QQ.
     """
     mpl.rcParams["font.size"] = 12
     results = gwasresult
+    plot_style_norm = _normalize_fastplot_style(plot_style)
     if "pos" in results.columns and not pd.api.types.is_integer_dtype(results["pos"]):
         results = results.copy()
         results["pos"] = pd.to_numeric(results["pos"], errors="coerce").fillna(0).astype(np.int64)
@@ -696,9 +706,17 @@ def fastplot(
 
         from janusx.bioplotkit import GWASPLOT, apply_integer_yticks
 
-        gwasplot = GWASPLOT(results)
-        qq_results = _prepare_fastplot_qq_results(results)
-        gwasplot_qq = GWASPLOT(qq_results, compression=False)
+        gwasplot = GWASPLOT(results, interval_rate=_FASTPLOT_MANHATTAN_INTERVAL_RATE)
+        qq_results = (
+            _prepare_fastplot_qq_results(results)
+            if plot_style_norm == "garfield"
+            else results
+        )
+        gwasplot_qq = GWASPLOT(
+            qq_results,
+            interval_rate=_FASTPLOT_MANHATTAN_INTERVAL_RATE,
+            compression=False,
+        )
         scatter_size = _FASTPLOT_SCATTER_SIZE
 
         # A: phenotype distribution
@@ -745,13 +763,16 @@ def fastplot(
             except Exception:
                 threshold_base_n = int(results.shape[0])
         threshold = -np.log10(1 / max(1, threshold_base_n))
-        if not _draw_role_layered_manhattan(
-            results,
-            gwasplot,
-            ax=axes["B"],
-            threshold=threshold,
-            scatter_size=scatter_size,
-        ):
+        drew_manhattan = False
+        if plot_style_norm == "garfield":
+            drew_manhattan = _draw_role_layered_manhattan(
+                results,
+                gwasplot,
+                ax=axes["B"],
+                threshold=threshold,
+                scatter_size=scatter_size,
+            )
+        if not drew_manhattan:
             gwasplot.manhattan(
                 threshold,
                 ax=axes["B"],
@@ -810,6 +831,7 @@ def _run_fastplot_with_status(
     xlabel: str,
     outpdf: str,
     threshold_n_tests: Optional[int] = None,
+    plot_style: str = "gwas",
     use_spinner: bool = False,
     emit_done_line: bool = False,
 ) -> float:
@@ -824,6 +846,7 @@ def _run_fastplot_with_status(
                         xlabel=str(xlabel),
                         outpdf=str(outpdf),
                         threshold_n_tests=threshold_n_tests,
+                        plot_style=str(plot_style),
                     )
             except Exception:
                 task.fail("Visualizing ...Failed")
@@ -838,6 +861,7 @@ def _run_fastplot_with_status(
                 xlabel=str(xlabel),
                 outpdf=str(outpdf),
                 threshold_n_tests=threshold_n_tests,
+                plot_style=str(plot_style),
             )
     return max(time.time() - viz_t0, 0.0)
 
@@ -849,19 +873,22 @@ def _run_fastplot_from_tsv_with_status(
     xlabel: str,
     outpdf: str,
     threshold_n_tests: Optional[int] = None,
+    plot_style: str = "gwas",
     use_spinner: bool = False,
     emit_done_line: bool = False,
 ) -> float:
     viz_t0 = time.time()
+    plot_style_norm = _normalize_fastplot_style(plot_style)
     header_df = pd.read_csv(out_tsv, sep="\t", nrows=0)
     usecols = ["chrom", "pos", "pwald"]
-    if "row_role" in header_df.columns:
-        usecols.append("row_role")
-    if "snp" in header_df.columns:
-        usecols.append("snp")
-    for fdr_col in _FASTPLOT_COMBO_FDR_COLUMNS:
-        if fdr_col in header_df.columns:
-            usecols.append(str(fdr_col))
+    if plot_style_norm == "garfield":
+        if "row_role" in header_df.columns:
+            usecols.append("row_role")
+        if "snp" in header_df.columns:
+            usecols.append("snp")
+        for fdr_col in _FASTPLOT_COMBO_FDR_COLUMNS:
+            if fdr_col in header_df.columns:
+                usecols.append(str(fdr_col))
     dtype_map: dict[str, object] = {"chrom": str, "pos": "int64"}
     if "row_role" in usecols:
         dtype_map["row_role"] = str
@@ -877,9 +904,10 @@ def _run_fastplot_from_tsv_with_status(
                     dtype=dtype_map,
                 )
                 plot_df["pwald"] = pd.to_numeric(plot_df["pwald"], errors="coerce")
-                for fdr_col in _FASTPLOT_COMBO_FDR_COLUMNS:
-                    if fdr_col in plot_df.columns:
-                        plot_df[fdr_col] = pd.to_numeric(plot_df[fdr_col], errors="coerce")
+                if plot_style_norm == "garfield":
+                    for fdr_col in _FASTPLOT_COMBO_FDR_COLUMNS:
+                        if fdr_col in plot_df.columns:
+                            plot_df[fdr_col] = pd.to_numeric(plot_df[fdr_col], errors="coerce")
                 with runtime_thread_stage(blas_threads=1, rayon_threads=1):
                     fastplot(
                         plot_df,
@@ -887,6 +915,7 @@ def _run_fastplot_from_tsv_with_status(
                         xlabel=str(xlabel),
                         outpdf=str(outpdf),
                         threshold_n_tests=threshold_n_tests,
+                        plot_style=plot_style_norm,
                     )
             except Exception:
                 task.fail("Visualizing ...Failed")
@@ -901,9 +930,10 @@ def _run_fastplot_from_tsv_with_status(
             dtype=dtype_map,
         )
         plot_df["pwald"] = pd.to_numeric(plot_df["pwald"], errors="coerce")
-        for fdr_col in _FASTPLOT_COMBO_FDR_COLUMNS:
-            if fdr_col in plot_df.columns:
-                plot_df[fdr_col] = pd.to_numeric(plot_df[fdr_col], errors="coerce")
+        if plot_style_norm == "garfield":
+            for fdr_col in _FASTPLOT_COMBO_FDR_COLUMNS:
+                if fdr_col in plot_df.columns:
+                    plot_df[fdr_col] = pd.to_numeric(plot_df[fdr_col], errors="coerce")
         with runtime_thread_stage(blas_threads=1, rayon_threads=1):
             fastplot(
                 plot_df,
@@ -911,6 +941,7 @@ def _run_fastplot_from_tsv_with_status(
                 xlabel=str(xlabel),
                 outpdf=str(outpdf),
                 threshold_n_tests=threshold_n_tests,
+                plot_style=plot_style_norm,
             )
     return max(time.time() - viz_t0, 0.0)
 

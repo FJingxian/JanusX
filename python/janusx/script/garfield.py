@@ -1443,6 +1443,7 @@ def _run_garfield_pseudo_fvlmm(
             xlabel=str(trait_label),
             outpdf=figure_path,
             threshold_n_tests=fdr_n_tests,
+            plot_style="garfield",
             use_spinner=bool(use_spinner),
             emit_done_line=False,
         )
@@ -1624,6 +1625,7 @@ def _run_garfield_pseudo_fvlmm2(
             xlabel=str(trait_label),
             outpdf=figure_path,
             threshold_n_tests=fdr_n_tests,
+            plot_style="garfield",
             use_spinner=bool(use_spinner),
             emit_done_line=False,
         )

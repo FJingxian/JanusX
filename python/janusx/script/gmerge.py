@@ -32,6 +32,7 @@ from typing import Callable, Iterator, Sequence
 import numpy as np
 import pandas as pd
 
+from ._common.cli_args import add_common_out_arg, add_common_prefix_arg, add_common_thread_arg
 from ._common.config_render import emit_cli_configuration
 from ._common.genoio import (
     GENOTYPE_TEXT_SUFFIXES,
@@ -46,6 +47,7 @@ from ._common.genoio import (
 from ._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.log import setup_logging
+from ._common.outprefix import apply_output_prefix_compat
 from ._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
@@ -624,7 +626,7 @@ def build_parser() -> CliArgumentParser:
             [
                 "jx gmerge -vcf a.vcf.gz b.vcf.gz -fmt vcf",
                 "jx gmerge -hmp a.hmp.gz b.hmp.gz -fmt plink",
-                "jx gmerge -bfile A B -o merged_dir -prefix panel -fmt plink",
+                "jx gmerge -bfile A B -o merged_dir/panel -fmt plink",
                 "jx gmerge -vcf a.vcf.gz -file matrix_prefix -fmt txt",
             ]
         ),
@@ -677,18 +679,8 @@ def build_parser() -> CliArgumentParser:
         default="vcf",
         help="Output genotype format: plink, vcf, txt, npy (default: vcf.gz).",
     )
-    opt.add_argument(
-        "-o",
-        "--out",
-        default=".",
-        help="Output directory for merged results (default: %(default)s).",
-    )
-    opt.add_argument(
-        "-prefix",
-        "--prefix",
-        default=None,
-        help="Prefix for merged output files (default: inferred from first input).",
-    )
+    add_common_out_arg(opt, default=".", help_profile="default")
+    add_common_prefix_arg(opt, default=None, help_profile="first_input")
     opt.add_argument(
         "-sample-prefix",
         "--sample-prefix",
@@ -710,15 +702,20 @@ def build_parser() -> CliArgumentParser:
         default=1.0,
         help="Drop merged sites with missing rate above this threshold (range: 0-1; default: %(default)s).",
     )
-    opt.add_argument(
-        "-thread",
-        "--thread",
-        type=int,
-        default=0,
-        help=(
+    add_common_thread_arg(
+        opt,
+        default_threads=0,
+        help_text=(
             "Threads used while preparing reusable PLINK caches for VCF/HMP inputs "
             "(default: %(default)s)."
         ),
+    )
+    opt.add_argument(
+        "-thread",
+        dest="thread",
+        type=int,
+        default=argparse.SUPPRESS,
+        help=argparse.SUPPRESS,
     )
     return parser
 
@@ -740,14 +737,15 @@ def main(log: bool = True) -> None:
             "At least 2 inputs are required across -vcf/-hmp/-bfile/-file."
         )
 
-    outdir = os.path.normpath(str(args.out or "."))
-    prefix = str(
-        args.prefix or _infer_default_prefix(vcf_inputs, hmp_inputs, bfile_inputs, file_inputs)
+    outdir, outprefix, prefix = apply_output_prefix_compat(
+        args,
+        _infer_default_prefix(vcf_inputs, hmp_inputs, bfile_inputs, file_inputs),
+        fallback_prefix="gmerge",
     )
     os.makedirs(outdir, mode=0o755, exist_ok=True)
     configure_genotype_cache_from_out(outdir)
 
-    log_path = os.path.join(outdir, f"{prefix}.merge.log")
+    log_path = f"{outprefix}.merge.log"
     logger = setup_logging(log_path)
 
     final_format, final_output = _resolve_output(args.format_name, outdir, prefix)
@@ -783,7 +781,7 @@ def main(log: bool = True) -> None:
                     ],
                 ),
             ],
-            footer_rows=[("Output", final_output)],
+            footer_rows=[("Output prefix", outprefix), ("Output", final_output)],
             line_max_chars=60,
         )
 

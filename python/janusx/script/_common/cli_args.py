@@ -300,12 +300,12 @@ def _resolve_thread_help(profile: str) -> str:
 def _resolve_out_help(profile: str) -> str:
     key = str(profile).strip().lower()
     table = {
-        "default": "Output directory for results (default: %(default)s).",
-        "current_dir": "Output directory (default: current directory).",
-        "simple": "Output directory.",
-        "converted_results": "Output directory for converted results (default: %(default)s).",
-        "plot_annotation": "Output directory for plots and annotation (default: current directory).",
-        "pca_results": "Output directory for PCA results (default: current directory).",
+        "default": "Output prefix. Use PREFIX or DIR/PREFIX.",
+        "current_dir": "Output prefix. Use PREFIX or DIR/PREFIX.",
+        "simple": "Output prefix.",
+        "converted_results": "Output prefix for converted results. Use PREFIX or DIR/PREFIX.",
+        "plot_annotation": "Output prefix for plots and annotation. Use PREFIX or DIR/PREFIX.",
+        "pca_results": "Output prefix for PCA results. Use PREFIX or DIR/PREFIX.",
     }
     return str(table.get(key, table["default"]))
 
@@ -511,6 +511,7 @@ def add_common_memory_arg(
     help_profile: str | None = None,
     help_text: str | None = None,
     dest: str = "memory",
+    metavar: str | None = None,
     include_hidden_legacy_single_dash_alias: bool = False,
 ) -> None:
     group.add_argument(
@@ -519,6 +520,7 @@ def add_common_memory_arg(
         type=float,
         default=(None if default is None else float(default)),
         dest=str(dest),
+        metavar=metavar,
         help=(
             str(help_text)
             if help_text is not None
@@ -741,6 +743,7 @@ def add_common_prefix_arg(
     default: str | None = None,
     help_profile: str = "default",
     help_text: str | None = None,
+    hidden: bool = True,
 ) -> None:
     group.add_argument(
         "-prefix",
@@ -748,9 +751,13 @@ def add_common_prefix_arg(
         type=str,
         default=default,
         help=(
-            str(help_text)
-            if help_text is not None
-            else _resolve_prefix_help(help_profile)
+            argparse.SUPPRESS
+            if bool(hidden)
+            else (
+                str(help_text)
+                if help_text is not None
+                else _resolve_prefix_help(help_profile)
+            )
         ),
     )
 

@@ -58,6 +58,7 @@ from janusx.script._common.cli_core import (  # noqa: E402
     minimal_help_epilog,
 )
 from janusx.script._common.cli_args import (  # noqa: E402
+    add_common_thread_arg,
     add_common_genotype_source_args,
     add_common_variant_filter_args,
     parse_trait_selector_specs,
@@ -2393,12 +2394,10 @@ def _build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--cache-input", action="store_true", default=True, help=argparse.SUPPRESS)
         sp.add_argument("--max-snps", type=int, default=None, help="Optional random cap on active SNPs after QC (0 disables).")
         sp.add_argument("--rscript", type=str, default=(shutil.which("Rscript") or "Rscript"), help="Rscript executable. Required for `--builtin wheat` and BGLR compare.")
-        sp.add_argument(
-            "-t",
-            "--thread",
-            type=int,
-            default=0,
-            help=(
+        add_common_thread_arg(
+            sp,
+            default_threads=0,
+            help_text=(
                 "Thread count backdoor. JanusX uses it for packed kernels; compare-mode also pins "
                 "HIBayes/BGLR BLAS/OpenMP threads to the same value. Use -t 1 for fair single-core "
                 "cross-software benchmarks; use -t N for multicore experiments."

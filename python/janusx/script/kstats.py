@@ -8,9 +8,16 @@ from pathlib import Path
 
 from janusx import janusx as jxrs
 
+from ._common.cli_args import (
+    add_common_memory_arg,
+    add_common_out_arg,
+    add_common_prefix_arg,
+    add_common_thread_arg,
+)
 from ._common.config_render import emit_cli_configuration
 from ._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.log import setup_logging
+from ._common.outprefix import apply_output_prefix_compat
 from ._common.pathcheck import format_kmc_db_pair_for_display, format_path_for_display
 from ._common.progress import ProgressAdapter, log_success
 from ._common.threads import detect_effective_threads, format_requested_thread_usage
@@ -148,8 +155,8 @@ def build_parser():
         epilog=minimal_help_epilog(
             [
                 "jx kstats -db sample_A sample_B -pair both -o out",
-                "jx kstats -db sample_A -db sample_B -venn -o out -prefix pairAB",
-                "jx kstats -db './panel/*.jx*' -venn -o out -prefix panel_venn",
+                "jx kstats -db sample_A -db sample_B -venn -o out/pairAB",
+                "jx kstats -db './panel/*.jx*' -venn -o out/panel_venn",
                 "jx kstats -db panel.kmc.tsv -pair intersection -sid A B C -o out -t 8 -mem 8",
                 "jx kstats -kbin test.kmer/kmerge -compare WY25=WY2_11.jx,WY2_21.jx WY35P=YY3P_11.jx,YY5P_11.jx -o out",
             ]
@@ -220,43 +227,24 @@ def build_parser():
         default=None,
         help="Optional sample IDs in the same order as -db. Only used in -db mode.",
     )
-    basic.add_argument(
-        "-o",
-        "--out",
-        type=str,
-        default=".",
-        help="Output directory (default: .).",
+    add_common_out_arg(basic, default=".", help_profile="default")
+    add_common_prefix_arg(basic, default="kstats", help_profile="simple")
+    add_common_thread_arg(
+        basic,
+        default_threads=8,
+        help_text="Number of worker threads for bucket-parallel stages (default: 8).",
     )
-    basic.add_argument(
-        "-prefix",
-        "--prefix",
-        type=str,
-        default="kstats",
-        help="Output file prefix (default: kstats).",
-    )
-    basic.add_argument(
-        "-t",
-        "--thread",
-        type=int,
-        default=8,
-        help="Number of worker threads for bucket-parallel stages (default: 8).",
-    )
-    basic.add_argument(
-        "-mem",
-        "--memory",
-        type=float,
+    add_common_memory_arg(
+        basic,
         default=DEFAULT_MEMORY_GB,
-        help=(
+        dest="memory",
+        metavar="MEMORY",
+        help_text=(
             "Runtime memory budget in GB for bucket and sorted-run stages. "
             "Larger values reduce temp-run fragmentation; this is not a decode-block size "
             "(default: %(default)s)."
         ),
-    )
-    basic.add_argument(
-        "-memory",
-        dest="memory",
-        type=float,
-        help=argparse.SUPPRESS,
+        include_hidden_legacy_single_dash_alias=True,
     )
 
     advanced.add_argument(
@@ -341,12 +329,14 @@ def main() -> int:
     detected_threads = int(detect_effective_threads())
     requested_threads = int(args.thread)
     using_threads = min(requested_threads, detected_threads)
-    out_dir = Path(args.out).expanduser().resolve()
+    out_dir_str, outprefix, output_prefix = apply_output_prefix_compat(
+        args,
+        "kstats",
+        fallback_prefix="kstats",
+    )
+    out_dir = Path(out_dir_str).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    output_prefix = str(args.prefix).strip()
-    if output_prefix == "":
-        parser.error("-prefix/--prefix cannot be empty.")
-    log_path = str(out_dir / f"{output_prefix}.kstats.log")
+    log_path = f"{outprefix}.kstats.log"
     logger = setup_logging(log_path)
 
     if requested_threads > detected_threads:
@@ -414,7 +404,7 @@ def main() -> int:
                     ],
                 ),
             ],
-            footer_rows=[("Output dir", str(out_dir)), ("Prefix", output_prefix)],
+            footer_rows=[("Output prefix", outprefix)],
         )
         logger.info("Resolved KMC DB pairs:")
         for idx, (sample_id, resolved_prefix) in enumerate(
@@ -461,7 +451,7 @@ def main() -> int:
                     ],
                 ),
             ],
-            footer_rows=[("Output dir", str(out_dir)), ("Prefix", output_prefix)],
+            footer_rows=[("Output prefix", outprefix)],
         )
         logger.info(f"Input kmerge prefix: {format_path_for_display(kbin_prefix)}")
         logger.info("Compare groups:")

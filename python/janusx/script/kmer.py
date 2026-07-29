@@ -18,10 +18,11 @@ try:
 except Exception:
     jxrs = None
 
-from ._common.cli_args import add_common_out_arg, add_common_prefix_arg, add_common_thread_arg
+from ._common.cli_args import add_common_memory_arg, add_common_out_arg, add_common_prefix_arg, add_common_thread_arg
 from ._common.config_render import emit_cli_configuration
 from ._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.log import setup_logging
+from ._common.outprefix import apply_output_prefix_compat
 from ._common.pathcheck import format_path_for_display
 from ._common.progress import CliStatus, format_elapsed, log_success, stdout_is_tty
 from ._common.threads import detect_effective_threads, format_requested_thread_usage
@@ -495,9 +496,9 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog(
             [
-                "jx kmer -fa sample.fastq.gz -o out -prefix sample_k19 -k 19 -t 8",
-                "jx kmer -fa read_1.fq.gz read_2.fq.gz -o out -prefix sample_pe -k 31 -ci 1",
-                "Common params: -fa/-t/-o/-prefix/-k/-mem",
+                "jx kmer -fa sample.fastq.gz -o out/sample_k19 -k 19 -t 8",
+                "jx kmer -fa read_1.fq.gz read_2.fq.gz -o out/sample_pe -k 31 -ci 1",
+                "Common params: -fa/-t/-o/-k/-mem",
                 "Count params: -ci/-cx/--counter-max/--tmp-dir",
             ]
         ),
@@ -527,14 +528,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=19,
         help="K-mer length parameter for KMC count workflow (default: 19).",
     )
-    common_group.add_argument(
-        "-mem",
-        "--memory",
+    add_common_memory_arg(
+        common_group,
+        default=8,
         dest="limit_mem_gb",
         metavar="MEMORY",
-        type=float,
-        default=8,
-        help=(
+        help_text=(
             "Runtime memory budget in GB passed to KMC. "
             "This controls the KMC RAM cap, not a decode-block size "
             "(default: %(default)s)."
@@ -663,20 +662,19 @@ def main() -> int:
     _require_rust_backend()
 
     input_files = [str(Path(x).expanduser()) for x in args.fa]
-    out_dir = Path(args.out).expanduser().resolve()
+    auto_prefix = _default_prefix_from_input(input_files)
+    _out_dir_str, outprefix_raw, _out_stem = apply_output_prefix_compat(
+        args,
+        auto_prefix,
+        fallback_prefix="kmer",
+    )
+    output_prefix = _normalize_prefix(outprefix_raw)
+    out_dir = Path(str(Path(output_prefix).parent)).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    if args.prefix is None:
-        prefix = _default_prefix_from_input(input_files)
-    else:
-        prefix = str(args.prefix).strip()
-    if prefix == "":
-        raise ValueError("Output prefix cannot be empty.")
-    output_prefix = _normalize_prefix(str(out_dir / prefix))
     out_parent = Path(output_prefix).parent
     if str(out_parent) not in {"", "."}:
         out_parent.mkdir(parents=True, exist_ok=True)
-    log_path = str(out_dir / f"{prefix}.kmer.log")
+    log_path = f"{output_prefix}.kmer.log"
     logger = setup_logging(log_path)
 
     detected_threads = int(detect_effective_threads())

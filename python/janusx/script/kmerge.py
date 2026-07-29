@@ -8,9 +8,16 @@ from pathlib import Path
 
 from janusx import janusx as jxrs
 
+from ._common.cli_args import (
+    add_common_memory_arg,
+    add_common_out_arg,
+    add_common_prefix_arg,
+    add_common_thread_arg,
+)
 from ._common.config_render import emit_cli_configuration
 from ._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.log import setup_logging
+from ._common.outprefix import apply_output_prefix_compat
 from ._common.pathcheck import format_kmc_db_pair_for_display, format_path_for_display
 from ._common.progress import ProgressAdapter, log_success
 from ._common.threads import detect_effective_threads, format_requested_thread_usage
@@ -147,10 +154,10 @@ def build_parser():
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog(
             [
-                "jx kmerge -db /data/kmc/S001 /data/kmc/S002 -o out -prefix maize_k31",
-                "jx kmerge -db '/data/kmc/*' -o out -prefix maize_k31",
-                "jx kmerge -db samples.kmc.tsv -o out -prefix maize_k31 -t 32 -mem 128",
-                "jx kmerge -db sampleA.kmc_pre sampleB.kmc_pre -o out -prefix panel --resume",
+                "jx kmerge -db /data/kmc/S001 /data/kmc/S002 -o out/maize_k31",
+                "jx kmerge -db '/data/kmc/*' -o out/maize_k31",
+                "jx kmerge -db samples.kmc.tsv -o out/maize_k31 -t 32 -mem 128",
+                "jx kmerge -db sampleA.kmc_pre sampleB.kmc_pre -o out/panel --resume",
             ]
         ),
         description=(
@@ -182,43 +189,24 @@ def build_parser():
         default=None,
         help="Optional sample IDs in the same order as -db.",
     )
-    basic.add_argument(
-        "-o",
-        "--out",
-        type=str,
-        default=".",
-        help="Output directory (default: .).",
+    add_common_out_arg(basic, default=".", help_profile="default")
+    add_common_prefix_arg(basic, default="kmerge", help_profile="simple")
+    add_common_thread_arg(
+        basic,
+        default_threads=8,
+        help_text="Number of worker threads (default: %(default)s).",
     )
-    basic.add_argument(
-        "-prefix",
-        "--prefix",
-        type=str,
-        default="kmerge",
-        help="Output file prefix (default: kmerge).",
-    )
-    basic.add_argument(
-        "-t",
-        "--thread",
-        type=int,
-        default=8,
-        help="Number of worker threads (default: 8).",
-    )
-    basic.add_argument(
-        "-mem",
-        "--memory",
-        type=float,
+    add_common_memory_arg(
+        basic,
         default=DEFAULT_MEMORY_GB,
-        help=(
+        dest="memory",
+        metavar="MEMORY",
+        help_text=(
             "Runtime memory budget in GB for merge and sorted-run stages. "
             "Larger values reduce temp-run fragmentation; this is not a decode-block size "
             "(default: %(default)s)."
         ),
-    )
-    basic.add_argument(
-        "-memory",
-        dest="memory",
-        type=float,
-        help=argparse.SUPPRESS,
+        include_hidden_legacy_single_dash_alias=True,
     )
     basic.add_argument(
         "-freq",
@@ -302,12 +290,14 @@ def main() -> int:
         parser.error("--bucket-bits must be within [1, 20].")
     detected_threads = int(detect_effective_threads())
     threads = int(args.thread)
-    out_dir = str(Path(args.out).expanduser().resolve())
+    out_dir_str, outprefix, output_prefix = apply_output_prefix_compat(
+        args,
+        "kmerge",
+        fallback_prefix="kmerge",
+    )
+    out_dir = str(Path(out_dir_str).expanduser().resolve())
     Path(out_dir).mkdir(parents=True, exist_ok=True)
-    output_prefix = str(args.prefix).strip()
-    if output_prefix == "":
-        parser.error("-prefix/--prefix cannot be empty.")
-    log_path = str(Path(out_dir) / f"{output_prefix}.kmerge.log")
+    log_path = f"{outprefix}.kmerge.log"
     logger = setup_logging(log_path)
 
     try:
@@ -376,7 +366,7 @@ def main() -> int:
                 ],
             ),
         ],
-        footer_rows=[("Output dir", out_dir), ("Prefix", output_prefix)],
+        footer_rows=[("Output prefix", outprefix)],
     )
     logger.info("Resolved KMC DB pairs:")
     for idx, (sample_id, resolved_prefix) in enumerate(

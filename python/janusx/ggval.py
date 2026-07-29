@@ -1329,11 +1329,11 @@ def run_gwas_suite(paths: dict[str, Path], outdir: Path, logdir: Path, *, thread
             "-palette",
             "tab10",
             "-o",
-            str(outdir),
+            str(outdir / SIM_PREFIX_NAME),
         ]
     )
-    require_any_file("postGWAS Manhattan output missing", outdir.glob(f"{SIM_PREFIX_NAME}.test*.manh.pdf"))
-    require_any_file("postGWAS QQ output missing", outdir.glob(f"{SIM_PREFIX_NAME}.test*.qq.pdf"))
+    require_any_file("postGWAS Manhattan output missing", outdir.glob(f"*{SIM_PREFIX_NAME}.test*.manh.pdf"))
+    require_any_file("postGWAS QQ output missing", outdir.glob(f"*{SIM_PREFIX_NAME}.test*.qq.pdf"))
     sep()
 
 
@@ -1378,7 +1378,7 @@ def run_gs_file_suite(
         trait_name=TRAIT_NAME,
     )
     if postgs_enabled:
-        run(["jx", "postgs", "-json", str(gs_summary), "-o", str(outdir)])
+        run(["jx", "postgs", "-json", str(gs_summary), "-o", str(outdir / SIM_TXT_PREFIX_NAME)])
         validate_postgs_outputs(
             outdir,
             prefix_name=SIM_TXT_PREFIX_NAME,
@@ -1589,7 +1589,7 @@ def run_gs_ml_suite(
         )
         validate_binary_jxmodel_artifact(summary_path, method_name=method_name)
         if postgs_enabled:
-            run(["jx", "postgs", "-json", str(summary_path), "-o", str(outdir)])
+            run(["jx", "postgs", "-json", str(summary_path), "-o", str(outdir / method_prefix)])
             validate_postgs_outputs(
                 outdir,
                 prefix_name=method_prefix,

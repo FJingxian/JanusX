@@ -29,11 +29,13 @@ import pandas as pd
 
 from janusx.gfreader import inspect_genotype_file, load_genotype_chunks
 from janusx.gfreader.gfreader import save_genotype_streaming
+from janusx.script._common.cli_args import add_common_out_arg, add_common_thread_arg
 from janusx.script._common.config_render import emit_cli_configuration
 from janusx.script._common.genoio import determine_genotype_source_from_args as determine_genotype_source
 from janusx.script._common.genocache import configure_genotype_cache_from_out
 from janusx.script._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from janusx.script._common.log import setup_logging
+from janusx.script._common.outprefix import apply_output_prefix_compat
 from janusx.script._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
@@ -308,9 +310,7 @@ def _run_garfield_subprocess(
         "-t",
         str(int(thread)),
         "-o",
-        str(out_dir),
-        "-prefix",
-        str(out_prefix),
+        str(Path(out_dir) / str(out_prefix)),
     ]
     if step is not None:
         cmd.extend(["-step", str(int(step))])
@@ -448,8 +448,8 @@ def build_parser() -> argparse.ArgumentParser:
     geno_group.add_argument("-bfile", "--bfile", type=str, help="Input PLINK prefix.")
     geno_group.add_argument("-file", "--file", type=str, help="Input numeric matrix prefix/path.")
 
-    optional_group.add_argument("-o", "--out", type=str, default=".", help="Output directory.")
-    optional_group.add_argument("-prefix", "--prefix", type=str, default=None, help="Output prefix.")
+    add_common_out_arg(optional_group, default=".", help_profile="default")
+    optional_group.add_argument("-prefix", "--prefix", type=str, default=None, help=argparse.SUPPRESS)
     optional_group.add_argument("--seed", type=int, default=2026, help="Base random seed.")
     optional_group.add_argument("--n-runs", type=int, default=1, help="Number of benchmark runs.")
     optional_group.add_argument(
@@ -495,7 +495,11 @@ def build_parser() -> argparse.ArgumentParser:
     optional_group.add_argument("-m", "--max-pick", type=int, default=2, help="GARFIELD max literals.")
     optional_group.add_argument("--top-k-validate", type=int, default=20, help="GARFIELD top-k validation.")
     optional_group.add_argument("--val-frac", type=float, default=0.25, help="GARFIELD validation fraction.")
-    optional_group.add_argument("-t", "--thread", type=int, default=detect_effective_threads(), help="CPU threads.")
+    add_common_thread_arg(
+        optional_group,
+        default_threads=detect_effective_threads(),
+        help_text="CPU threads.",
+    )
     optional_group.add_argument("--top-k-hit", type=int, default=10, help="Hit criterion on top-K rules.")
     optional_group.add_argument(
         "--hit-mode",
@@ -668,12 +672,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     gfile, auto_prefix = determine_genotype_source(args)
-    prefix = _safe_prefix(args.prefix if args.prefix is not None else auto_prefix)
-    out_dir = Path(args.out).expanduser().resolve()
+    out_dir_str, outprefix, prefix = apply_output_prefix_compat(
+        args,
+        _safe_prefix(auto_prefix),
+        argv=argv,
+        fallback_prefix="garfieldbench",
+    )
+    out_dir = Path(out_dir_str).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     configure_genotype_cache_from_out(str(out_dir))
 
-    log_path = str(out_dir / f"{prefix}.garfieldbench.log")
+    log_path = f"{outprefix}.garfieldbench.log"
     logger = setup_logging(log_path)
 
     checks: list[bool] = []
@@ -745,12 +754,12 @@ def main(argv: Optional[list[str]] = None) -> int:
                 ],
             )
         ],
-        footer_rows=[("Output root", str(out_dir / prefix))],
+        footer_rows=[("Output root", outprefix)],
         line_max_chars=60,
     )
 
     t0 = time.time()
-    bench_root = out_dir / prefix
+    bench_root = Path(outprefix)
     bench_root.mkdir(parents=True, exist_ok=True)
 
     records: list[dict[str, Any]] = []

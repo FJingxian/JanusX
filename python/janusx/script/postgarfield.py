@@ -44,6 +44,7 @@ from janusx.script._common.cli_core import (
 )
 from janusx.script._common.config_render import emit_cli_configuration
 from janusx.script._common.log import setup_logging
+from janusx.script._common.outprefix import apply_output_prefix_compat
 from janusx.script._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
@@ -1084,15 +1085,18 @@ def main(argv: Optional[list[str]] = None) -> None:
         bed=getattr(args, "bed", None),
         anno_file=args.anno_file,
     )
-    args.out = os.path.normpath(args.out if args.out is not None else ".")
-    os.makedirs(args.out, mode=0o755, exist_ok=True)
-
-    log_stem = (
-        str(args.prefix).strip()
-        if args.prefix is not None and str(args.prefix).strip() != ""
-        else (_strip_postgwas_input_suffix(args.garfield[0]) if len(args.garfield) == 1 else "postgarfield")
+    auto_prefix = (
+        _strip_postgwas_input_suffix(args.garfield[0])
+        if len(args.garfield) == 1 else "postgarfield"
     )
-    log_path = os.path.join(args.out, f"{log_stem}.postGARFIELD.log")
+    out_dir, outprefix, out_stem = apply_output_prefix_compat(
+        args,
+        auto_prefix,
+        argv=argv,
+        fallback_prefix="postgarfield",
+    )
+    os.makedirs(out_dir, mode=0o755, exist_ok=True)
+    log_path = f"{outprefix}.postGARFIELD.log"
     logger = setup_logging(log_path)
 
     detected_threads = detect_effective_threads()

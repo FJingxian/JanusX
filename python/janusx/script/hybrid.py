@@ -52,6 +52,7 @@ from ._common.genoio import (
 from ._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.log import setup_logging
+from ._common.outprefix import apply_output_prefix_compat
 from ._common.pathcheck import format_output_display, format_path_for_display, safe_expanduser
 from ._common.progress import CliStatus, print_success, print_warning, stdout_is_tty
 
@@ -616,10 +617,14 @@ def _make_hybrid_chunk_iterator(
 
 
 def _resolve_output_target(args) -> tuple[str, str, str]:
-    _, prefix = determine_genotype_source(args)
-    outdir = os.path.normpath(str(args.out or "."))
+    _, auto_prefix = determine_genotype_source(args)
+    _outdir, outprefix, _outstem = apply_output_prefix_compat(
+        args,
+        str(auto_prefix),
+        fallback_prefix="hybrid",
+    )
     fmt = str(args.format).lower()
-    base = os.path.join(outdir, prefix)
+    base = outprefix
     if fmt == "vcf":
         return fmt, base, f"{base}.vcf.gz"
     if fmt == "txt":
@@ -668,7 +673,7 @@ def build_parser() -> CliArgumentParser:
         epilog=minimal_help_epilog(
             [
                 "jx hybrid -vcf parents.vcf.gz -p1 p1.txt -p2 p2.txt -fmt txt",
-                "jx hybrid -bfile geno/QC -p1 tester.txt -p2 female.txt -o outdir -prefix hybrids -fmt vcf",
+                "jx hybrid -bfile geno/QC -p1 tester.txt -p2 female.txt -o outdir/hybrids -fmt vcf",
                 "jx hybrid -file geno_prefix -p1 p1.txt -p2 p2.txt -fmt npy",
             ]
         ),

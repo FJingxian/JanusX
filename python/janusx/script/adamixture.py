@@ -4,7 +4,7 @@ JanusX: FastPop ancestry inference (Rust-kernel backend)
 
 Examples
 --------
-  jx fastpop -bfile data/geno -k 8 -o out -prefix cohort
+  jx fastpop -bfile data/geno -k 8 -o out/cohort
   jx fastpop -vcf data/geno.vcf.gz -k 6 -t 16
 """
 
@@ -47,6 +47,7 @@ from ._common.config_render import emit_cli_configuration
 from ._common.genoio import determine_genotype_source_from_args, strip_default_prefix_suffix
 from ._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.log import setup_logging
+from ._common.outprefix import apply_output_prefix_compat
 from ._common.memory import (
     DEFAULT_DECODE_MEMORY_GB,
     decode_memory_gb_to_mb,
@@ -746,8 +747,8 @@ def _resolve_input(args, logger) -> tuple[str, str, str]:
     if not ensure_all_true(checks):
         raise FileNotFoundError("Input validation failed.")
 
-    prefix = args.prefix or strip_default_prefix_suffix(auto_prefix)
-    return gfile, source_label, prefix
+    auto_prefix = strip_default_prefix_suffix(auto_prefix)
+    return gfile, source_label, auto_prefix
 
 
 def _site_line_from_obj(site: Any) -> str:
@@ -1521,7 +1522,7 @@ def _build_parser() -> CliArgumentParser:
         prog=cli,
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
-            f"{cli} -bfile data/geno -k 8 -o out -prefix cohort",
+            f"{cli} -bfile data/geno -k 8 -o out/cohort",
             f"{cli} -vcf data/geno.vcf.gz -k 1..10 -t 16",
         ]),
     )
@@ -1681,8 +1682,6 @@ def main() -> None:
         thread_capped = True
         resolved_threads = int(detected_threads)
 
-    outdir = os.path.normpath(str(args.out or "."))
-    os.makedirs(outdir, exist_ok=True)
     t0 = time.time()
 
     tmp_logger = logging.getLogger(brand["logger_name"])
@@ -1703,6 +1702,13 @@ def main() -> None:
     except Exception as e:
         print_failure(str(e), force_color=True)
         raise
+    outdir, outprefix, prefix = apply_output_prefix_compat(
+        args,
+        auto_prefix,
+        argv=argv,
+        fallback_prefix=brand["cli"],
+    )
+    os.makedirs(outdir, exist_ok=True)
     tag_samples = _parse_tag_samples(args.tag, logger=tmp_logger)
     args._resolved_memory_mb = _resolve_fastpop_memory_mb(
         genotype_path=genotype_path,
@@ -1720,7 +1726,6 @@ def main() -> None:
         user_set=bool(getattr(args, "_memory_user_set", False)),
     )
 
-    prefix = args.prefix or auto_prefix
     multi_k = len(k_values) > 1
     enable_spinner = bool(stdout_is_tty())
     bed_stream_session = _bed_stream_session_available(source_label)
@@ -1829,11 +1834,11 @@ def main() -> None:
     finally:
         rss_watchdog.stop()
 
-    summary_log = os.path.join(outdir, f"{prefix}.{brand['summary_stem']}.summary.log")
+    summary_log = f"{outprefix}.{brand['summary_stem']}.summary.log"
     logger = setup_logging(summary_log)
     if cv_enabled:
         cv_rows = [r for r in summary_rows if r.get("cverror") is not None]
-        summary_tsv = os.path.join(outdir, f"{prefix}.{brand['summary_stem']}.cverror.summary.tsv")
+        summary_tsv = f"{outprefix}.{brand['summary_stem']}.cverror.summary.tsv"
         _write_cverror_summary_tsv(summary_tsv, cv_rows)
         logger.info("")
         _log_cverror_summary(logger, cv_rows, summary_tsv)
@@ -1844,6 +1849,7 @@ def main() -> None:
     now = datetime.now()
     logger.info("")
     logger.info(f"Summary log: {format_path_for_display(summary_log)}")
+    logger.info(f"Output prefix: {format_path_for_display(outprefix)}")
     logger.info(f"Output dir: {format_path_for_display(outdir)}")
     log_success(logger, f"Finished. Total wall time: {wall:.2f} seconds")
     logger.info(now.strftime("%Y-%m-%d %H:%M:%S"))

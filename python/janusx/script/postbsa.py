@@ -6,7 +6,7 @@ Examples
 --------
   jx postbsa -file bsa.tsv -b1 Bulk1 -b2 Bulk2
 
-  jx postbsa -file bsa.tsv -b1 Bulk1 -b2 Bulk2 -o results -prefix case1
+  jx postbsa -file bsa.tsv -b1 Bulk1 -b2 Bulk2 -o results/case1
 
   jx postbsa -file bsa.tsv -b1 Bulk1 -b2 Bulk2 --window 1 --step 0.25 --fmt pdf
 
@@ -38,6 +38,7 @@ from janusx.gtools.cleaner import chrom_sort_key as _chrom_sort_key
 
 from ._common.cli_args import add_common_out_arg, add_common_prefix_arg, add_common_thread_arg
 from ._common.log import setup_logging
+from ._common.outprefix import apply_output_prefix_compat
 from ._common.config_render import emit_cli_configuration
 from ._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.pathcheck import ensure_all_true, ensure_file_exists, format_path_for_display
@@ -1810,11 +1811,13 @@ def main() -> None:
         input_files = sorted(input_files, key=path_sort_key)
     input_hint = " ".join(file_args)
 
-    args.out = args.out if args.out else "."
-    os.makedirs(args.out, mode=0o755, exist_ok=True)
-
-    if args.prefix is None:
-        args.prefix = default_prefix_for_inputs(input_hint, input_files)
+    auto_prefix = default_prefix_for_inputs(input_hint, input_files)
+    out_dir, outprefix, out_stem = apply_output_prefix_compat(
+        args,
+        auto_prefix,
+        fallback_prefix="postbsa",
+    )
+    os.makedirs(out_dir, mode=0o755, exist_ok=True)
     output_stem = build_output_stem(args.out, args.prefix, args.bulk1, args.bulk2)
 
     log_path = f"{output_stem}.postbsa.log"

@@ -47,6 +47,7 @@ from janusx.script._common.genoio import (
     prepare_packed_ctx_from_plink,
 )
 from janusx.script._common.genocache import configure_genotype_cache_from_out
+from janusx.script._common.outprefix import apply_output_prefix_compat
 from janusx.script._common.grmio import load_and_align_grm
 from janusx.script._common.log import setup_logging
 from janusx.script._common.pathcheck import (
@@ -883,10 +884,6 @@ def main(argv: list[str] | None = None) -> int:
     if int(args.thread) > detected_threads:
         args.thread = detected_threads
 
-    args.out = os.path.normpath(args.out if args.out is not None else ".")
-    os.makedirs(args.out, mode=0o755, exist_ok=True)
-    configure_genotype_cache_from_out(args.out)
-
     raw_gfile, auto_prefix = determine_genotype_source(
         vcf=getattr(args, "vcf", None),
         hmp=getattr(args, "hmp", None),
@@ -895,8 +892,9 @@ def main(argv: list[str] | None = None) -> int:
         prefix=None,
         apply_cache=False,
     )
-    prefix = str(args.prefix) if args.prefix else str(auto_prefix)
-    outprefix = os.path.join(str(args.out), str(prefix))
+    out_dir, outprefix, prefix = apply_output_prefix_compat(args, str(auto_prefix), argv=argv)
+    os.makedirs(out_dir, mode=0o755, exist_ok=True)
+    configure_genotype_cache_from_out(out_dir)
     logger = setup_logging(f"{outprefix}.fvlmm2.log")
     apply_outer_thread_cap(int(args.thread))
 

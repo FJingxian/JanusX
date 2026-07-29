@@ -49,6 +49,7 @@ from ._common.progress import (
 )
 from ._common.progress import build_rich_progress, rich_progress_available
 from ._common.genocache import configure_genotype_cache_from_out
+from ._common.outprefix import apply_output_prefix_compat
 from ._common.config_render import emit_cli_configuration
 from ._common.threads import (
     apply_blas_thread_env,
@@ -9103,19 +9104,19 @@ def main(argv: Optional[list[str]] = None):
         anno_file=args.anno_file,
     )
 
-    args.out = os.path.normpath(args.out if args.out is not None else ".")
-    user_prefix = str(args.prefix).strip() if args.prefix is not None else ""
-    args._postgwas_plot_prefix = user_prefix
-    args.prefix = "JanusX" if user_prefix == "" else user_prefix
-
-    # Create output directory if needed
-    if args.out != "":
-        os.makedirs(args.out, mode=0o755, exist_ok=True)
-        configure_genotype_cache_from_out(args.out)
-    else:
-        args.out = "."
-
-    outprefix_base = os.path.join(args.out, args.prefix)
+    out_dir, outprefix_base, out_stem = apply_output_prefix_compat(
+        args,
+        "JanusX",
+        argv=argv,
+        fallback_prefix="JanusX",
+    )
+    args._postgwas_plot_prefix = (
+        str(out_stem)
+        if bool(getattr(args, "_out_was_explicit", False) or getattr(args, "_prefix_was_explicit", False))
+        else ""
+    )
+    os.makedirs(out_dir, mode=0o755, exist_ok=True)
+    configure_genotype_cache_from_out(out_dir)
     log_path = f"{outprefix_base}.postGWAS.log"
     logger = setup_logging(log_path)
     args._postgwas_log_path = str(log_path)

@@ -8,9 +8,9 @@ Current stage:
 
 Examples
 --------
-  jx tree -vcf cohort.vcf.gz -o out --prefix cohort_tree -nj
-  jx tree -fa aln.fasta -o out --prefix aln_tree -nj
-  jx tree -bfile panel -o out --prefix panel_tree --write-phylip -nj
+  jx tree -vcf cohort.vcf.gz -o out/cohort_tree -nj
+  jx tree -fa aln.fasta -o out/aln_tree -nj
+  jx tree -bfile panel -o out/panel_tree --write-phylip -nj
   jx tree -vcf cohort.vcf.gz -o out -nj bionj
   jx tree -vcf cohort.vcf.gz -o out -nj bionj-dist
   jx tree -fa aln.fasta -o out -ml
@@ -51,6 +51,7 @@ from ._common.cli_args import (
 from ._common.genoio import determine_genotype_source_from_args
 from ._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.log import setup_logging
+from ._common.outprefix import apply_output_prefix_compat
 from ._common.pathcheck import (
     ensure_file_exists,
     ensure_file_input_exists,
@@ -110,19 +111,14 @@ def _default_prefix_from_genofile(path: str) -> str:
 
 
 def _resolve_out_prefix(args, gfile: str) -> str:
-    out_dir = os.path.abspath(str(args.out).strip() or ".")
-    if os.path.exists(out_dir) and not os.path.isdir(out_dir):
-        raise ValueError(f"-o/--out must be an output directory, got file path: {out_dir}")
+    auto_prefix = _normalize_out_prefix(_default_prefix_from_genofile(gfile))
+    out_dir, outprefix, _out_stem = apply_output_prefix_compat(
+        args,
+        auto_prefix,
+        fallback_prefix="tree",
+    )
     os.makedirs(out_dir, mode=0o755, exist_ok=True)
-
-    if args.prefix is not None and str(args.prefix).strip() != "":
-        prefix = os.path.basename(str(args.prefix).strip())
-        prefix = _normalize_out_prefix(prefix)
-    else:
-        prefix = _normalize_out_prefix(_default_prefix_from_genofile(gfile))
-    if prefix == "":
-        prefix = "tree"
-    return os.path.join(out_dir, prefix)
+    return outprefix
 
 
 def _sanitize_phylip_names(names: Iterable[str]) -> list[str]:
@@ -479,11 +475,11 @@ def _add_tree_optional_args(
     add_common_prefix_arg(optional_group, default=None, help_profile="tree_inferred_genotype")
     optional_group.add_argument(
         "--write-phylip", dest="write_phylip", action="store_true",
-        help="Also write relaxed PHYLIP alignment: <out>/<prefix>.phy",
+        help="Also write relaxed PHYLIP alignment: <outprefix>.phy",
     )
     optional_group.add_argument(
         "--profile", dest="profile", action="store_true",
-        help="Report phase timings and save <out>/<prefix>.profile.tsv.",
+        help="Report phase timings and save <outprefix>.profile.tsv.",
     )
     if include_ml_options:
         optional_group.add_argument(
@@ -518,9 +514,9 @@ def build_nj_parser(prog: str) -> CliArgumentParser:
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog(
             [
-                "jx tree -vcf cohort.vcf.gz -o out --prefix cohort_tree -nj",
-                "jx tree -fa aln.fasta -o out --prefix aln_tree -nj",
-                "jx tree -bfile panel -o out --prefix panel_tree --write-phylip -nj",
+                "jx tree -vcf cohort.vcf.gz -o out/cohort_tree -nj",
+                "jx tree -fa aln.fasta -o out/aln_tree -nj",
+                "jx tree -bfile panel -o out/panel_tree --write-phylip -nj",
                 "jx tree -vcf cohort.vcf.gz -o out -nj bionj",
                 "jx tree -vcf cohort.vcf.gz -o out -nj approx",
             ]
@@ -547,14 +543,14 @@ def build_tree_parser() -> CliArgumentParser:
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog(
             [
-                "jx tree -vcf cohort.vcf.gz -o out --prefix cohort_tree -nj",
-                "jx tree -fa aln.fasta -o out --prefix aln_tree -nj",
-                "jx tree -vcf cohort.vcf.gz -o out --prefix cohort_tree -nj bionj",
-                "jx tree -vcf cohort.vcf.gz -o out --prefix cohort_tree -nj bionj-dist",
-                "jx tree -vcf cohort.vcf.gz -o out --prefix cohort_tree -nj approx",
-                "jx tree -fa aln.fasta -o out --prefix aln_tree -ml",
-                "jx tree -vcf cohort.vcf.gz -o out --prefix cohort_tree -ml",
-                "jx tree -bfile panel -o out --prefix panel_tree --profile -nj",
+                "jx tree -vcf cohort.vcf.gz -o out/cohort_tree -nj",
+                "jx tree -fa aln.fasta -o out/aln_tree -nj",
+                "jx tree -vcf cohort.vcf.gz -o out/cohort_tree -nj bionj",
+                "jx tree -vcf cohort.vcf.gz -o out/cohort_tree -nj bionj-dist",
+                "jx tree -vcf cohort.vcf.gz -o out/cohort_tree -nj approx",
+                "jx tree -fa aln.fasta -o out/aln_tree -ml",
+                "jx tree -vcf cohort.vcf.gz -o out/cohort_tree -ml",
+                "jx tree -bfile panel -o out/panel_tree --profile -nj",
             ]
         ),
     )

@@ -49,6 +49,7 @@ from ._common.cli_args import (
 )
 from ._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.log import setup_logging
+from ._common.outprefix import apply_output_prefix_compat
 from ._common.config_render import emit_cli_configuration
 from ._common.grmio import load_grm_matrix, read_id_file, resolve_grm_id_path
 from ._common.pathcheck import ensure_file_exists, format_path_for_display
@@ -1588,10 +1589,13 @@ def main() -> None:
         raise ValueError("Please provide only one of -k/--grm or -spk/--grm-sparse.")
     if args.grm_sparse is not None:
         args.grm_sparse = _splmm_normalize_sparse_grm_path(str(args.grm_sparse))
-    outdir = os.path.normpath(str(args.out or "."))
+    auto_prefix = strip_default_prefix_suffix(os.path.basename(str(args.file)))
+    outdir, outprefix, prefix = apply_output_prefix_compat(
+        args,
+        auto_prefix,
+        fallback_prefix="reml",
+    )
     os.makedirs(outdir, mode=0o755, exist_ok=True)
-    prefix = str(args.prefix or strip_default_prefix_suffix(os.path.basename(str(args.file))))
-    outprefix = os.path.join(outdir, prefix)
     log_path = f"{outprefix}.reml.log"
     logger = setup_logging(log_path)
 

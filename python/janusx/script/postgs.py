@@ -26,6 +26,7 @@ import numpy as np
 import pandas as pd
 
 from janusx.bioplotkit import gsplot
+from janusx.script._common.cli_args import add_common_out_arg, add_common_prefix_arg
 from janusx.script._common.cli_core import (
     CliArgumentParser,
     cli_help_formatter,
@@ -36,6 +37,7 @@ from janusx.script._common.pathcheck import (
     ensure_file_exists,
 )
 from janusx.script._common.log import setup_logging
+from janusx.script._common.outprefix import apply_output_prefix_compat
 from janusx.script._common.threads import runtime_thread_stage
 
 
@@ -1232,14 +1234,8 @@ def main() -> None:
     )
 
     opt = parser.add_argument_group("Optional Arguments")
-    opt.add_argument("-o", "--out", type=str, default=".", help="Output directory.")
-    opt.add_argument(
-        "-prefix",
-        "--prefix",
-        type=str,
-        default=None,
-        help="Output prefix (default: inferred from summary.json).",
-    )
+    add_common_out_arg(opt, default=".", help_profile="default")
+    add_common_prefix_arg(opt, default=None, help_profile="inferred_input")
     opt.add_argument(
         "-fmt",
         "--fmt",
@@ -1328,9 +1324,6 @@ def main() -> None:
     if len(extras) > 0:
         parser.error("unrecognized arguments: " + " ".join(extras))
 
-    args.out = os.path.normpath(str(args.out) if args.out is not None else ".")
-    os.makedirs(args.out, mode=0o755, exist_ok=True)
-
     check_logger: Any = _SilentLogger()
     if args.effect is not None:
         checks = [
@@ -1346,9 +1339,14 @@ def main() -> None:
     with open(args.json, "r", encoding="utf-8") as f:
         summary = json.load(f)
 
-    prefix = str(args.prefix).strip() if args.prefix is not None else _infer_prefix(summary, args.json)
-    outprefix = os.path.join(args.out, prefix)
-    log_path = os.path.join(args.out, f"{prefix}.postgs.log")
+    auto_prefix = _infer_prefix(summary, args.json)
+    out_dir, outprefix, prefix = apply_output_prefix_compat(
+        args,
+        auto_prefix,
+        fallback_prefix="postgs",
+    )
+    os.makedirs(out_dir, mode=0o755, exist_ok=True)
+    log_path = f"{outprefix}.postgs.log"
     logger = setup_logging(log_path)
 
     fmts = _parse_formats(args.fmt)

@@ -20,6 +20,7 @@ from ._common.cli_args import (
 )
 from ._common.config_render import emit_cli_configuration
 from ._common.genoio import determine_genotype_source
+from ._common.outprefix import apply_output_prefix_compat
 from ._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.log import setup_logging
 from ._common.pathcheck import (
@@ -471,9 +472,9 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog(
             [
-                "jx gstats -bfile geno_prefix -freq -o outdir -prefix demo",
-                "jx gstats -vcf cohort.vcf.gz -miss -het -o outdir -prefix cohort",
-                "jx gstats -file geno_prefix -ldsc 100kb -o outdir -prefix panel",
+                "jx gstats -bfile geno_prefix -freq -o outdir/demo",
+                "jx gstats -vcf cohort.vcf.gz -miss -het -o outdir/cohort",
+                "jx gstats -file geno_prefix -ldsc 100kb -o outdir/panel",
                 "jx gstats -bfile geno_prefix -ldsc 100",
             ]
         ),
@@ -552,11 +553,8 @@ def main() -> None:
         prefix=None,
         apply_cache=False,
     )
-    if args.prefix is None:
-        args.prefix = auto_prefix
-
-    os.makedirs(args.out, exist_ok=True)
-    outprefix = os.path.join(str(args.out), str(args.prefix))
+    out_dir, outprefix, out_stem = apply_output_prefix_compat(args, auto_prefix)
+    os.makedirs(out_dir, exist_ok=True)
     log_path = f"{outprefix}.gstats.log"
     logger = setup_logging(log_path)
 

@@ -47,6 +47,7 @@ from janusx.script._common.genoio import (
     prepare_packed_ctx_from_plink,
 )
 from janusx.script._common.genocache import configure_genotype_cache_from_out
+from janusx.script._common.outprefix import apply_output_prefix_compat
 from janusx.script._common.grmio import format_grm_cache_num, load_and_align_grm
 from janusx.script._common.cli_core import CliArgumentParser, cli_help_formatter
 from janusx.script._common.log import setup_logging
@@ -2817,12 +2818,11 @@ def main() -> None:
         args.thread = int(detected_threads)
 
     gfile, prefix = determine_genotype_source(args)
-    args.out = os.path.normpath(args.out if args.out is not None else ".")
-    outprefix = os.path.join(args.out, prefix)
-    os.makedirs(args.out, mode=0o755, exist_ok=True)
-    configure_genotype_cache_from_out(args.out)
+    out_dir, outprefix, out_stem = apply_output_prefix_compat(args, prefix)
+    os.makedirs(out_dir, mode=0o755, exist_ok=True)
+    configure_genotype_cache_from_out(out_dir)
 
-    log_path = os.path.join(args.out, f"{prefix}.garfield.log")
+    log_path = f"{outprefix}.garfield.log"
     logger = setup_logging(log_path)
     apply_outer_thread_cap(int(args.thread))
     if args.feature_source_requested == "mbin":

@@ -13,9 +13,9 @@ Input modes
 
 Outputs
 -------
-- <out>/<prefix>.tree.svg
-- <out>/<prefix>.tree.html (when --hover is enabled)
-- <out>/<prefix>.tree.nwk (when input is GRM and a tree is inferred)
+- <outprefix>.tree.svg
+- <outprefix>.tree.html (when --hover is enabled)
+- <outprefix>.tree.nwk (when input is GRM and a tree is inferred)
 """
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ import pandas as pd
 
 from ._common.cli_args import add_common_out_arg, add_common_prefix_arg
 from ._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
+from ._common.outprefix import apply_output_prefix_compat
 
 
 def _normalize_prefix(path_or_prefix: str) -> str:
@@ -277,8 +278,8 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog(
             [
-                "jx treeplot -nwk result.tree.nwk -o out -prefix fig1 --layout c --showlabels -fmt svg",
-                "jx treeplot -k panel.grm.npy -kid panel.grm.npy.id -o out -prefix panel_tree --method nj -fmt pdf",
+                "jx treeplot -nwk result.tree.nwk -o out/fig1 --layout c --showlabels -fmt svg",
+                "jx treeplot -k panel.grm.npy -kid panel.grm.npy.id -o out/panel_tree --method nj -fmt pdf",
                 "jx treeplot -k panel.grm.txt --meta sample_meta.tsv --layout r --root B73 --scale-bar -fmt svg,html",
             ]
         ),
@@ -469,17 +470,20 @@ def main() -> int:
             seen_fmts.add(tok)
             out_fmts.append(tok)
 
-    out_dir = Path(args.out).expanduser().resolve()
+    auto_prefix = (
+        _default_prefix_from_path(str(args.newick), "treeplot")
+        if args.newick
+        else _default_prefix_from_path(str(args.grm), "treeplot")
+    )
+    out_dir_str, outprefix, _out_stem = apply_output_prefix_compat(
+        args,
+        auto_prefix,
+        fallback_prefix="treeplot",
+    )
+    out_dir = Path(out_dir_str).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.prefix is not None and str(args.prefix).strip() != "":
-        prefix = _normalize_prefix(str(args.prefix))
-    elif args.newick:
-        prefix = _default_prefix_from_path(str(args.newick), "treeplot")
-    else:
-        prefix = _default_prefix_from_path(str(args.grm), "treeplot")
-
-    nwk_path = out_dir / f"{prefix}.tree.nwk"
+    nwk_path = Path(f"{outprefix}.tree.nwk")
 
     tree, inferred_newick, tip_labels, backend_used = _load_tree_from_inputs(args)
 
@@ -588,7 +592,7 @@ def main() -> int:
 
     out_paths: list[Path] = []
     for fmt in out_fmts:
-        p = out_dir / f"{prefix}.tree.{fmt}"
+        p = Path(f"{outprefix}.tree.{fmt}")
         try:
             toytree.save(canvas, str(p))
         except Exception as exc:

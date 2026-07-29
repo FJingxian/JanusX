@@ -57,6 +57,7 @@ from ._common.pathcheck import (
 )
 from ._common.progress import CliStatus, ProgressAdapter, format_elapsed, log_success
 from ._common.genocache import configure_genotype_cache_from_out
+from ._common.outprefix import apply_output_prefix_compat
 from ._common.genoio import (
     build_packed_meta_basic_uncached,
     determine_genotype_source as _determine_genotype_source,
@@ -1874,8 +1875,8 @@ def main(log: bool = True):
         prog="jx grm",
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog([
-            "jx grm -vcf geno.vcf.gz -o outdir -prefix demo",
-            "jx grm -hmp geno.hmp.gz -o outdir -prefix demo",
+            "jx grm -vcf geno.vcf.gz -o outdir/demo",
+            "jx grm -hmp geno.hmp.gz -o outdir/demo",
             "jx grm -bfile geno_prefix -m 1",
             "jx grm -bfile geno_prefix -m 1 --txt",
         ]),
@@ -2006,10 +2007,7 @@ def main(log: bool = True):
             bfile=getattr(args, "bfile", None),
             prefix=None,
         )
-    args.prefix = auto_prefix if args.prefix is None else args.prefix
-
-    args.out = os.path.normpath(args.out if args.out is not None else ".")
-    outprefix = os.path.join(args.out, args.prefix)
+    out_dir, outprefix, out_stem = apply_output_prefix_compat(args, auto_prefix)
 
     if args.part is not None or args.part_group is not None:
         if getattr(args, "dense_grm", None):
@@ -2022,8 +2020,8 @@ def main(log: bool = True):
     # ------------------------------------------------------------------
     # Logging
     # ------------------------------------------------------------------
-    os.makedirs(args.out, 0o755, exist_ok=True)
-    configure_genotype_cache_from_out(args.out)
+    os.makedirs(out_dir, 0o755, exist_ok=True)
+    configure_genotype_cache_from_out(out_dir)
     log_path = f"{outprefix}.grm.log"
     logger = setup_logging(log_path)
     if thread_capped:

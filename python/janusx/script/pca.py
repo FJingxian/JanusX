@@ -88,6 +88,7 @@ from ._common.progress import (
     plain_spinner_frames,
     stdout_is_tty,
 )
+from ._common.outprefix import apply_output_prefix_compat
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.genoio import (
     determine_genotype_source as _determine_genotype_source,
@@ -1273,7 +1274,6 @@ def main(log: bool = True):
             bfile=None,
             prefix=None,
         )
-        args.prefix = auto_prefix if args.prefix is None else args.prefix
     elif args.hmp:
         gfile, auto_prefix = _determine_genotype_source(
             vcf=None,
@@ -1282,7 +1282,6 @@ def main(log: bool = True):
             bfile=None,
             prefix=None,
         )
-        args.prefix = auto_prefix if args.prefix is None else args.prefix
     elif args.file:
         gfile, auto_prefix = _determine_genotype_source(
             vcf=None,
@@ -1291,7 +1290,6 @@ def main(log: bool = True):
             bfile=None,
             prefix=None,
         )
-        args.prefix = auto_prefix if args.prefix is None else args.prefix
     elif args.bfile:
         gfile, auto_prefix = _determine_genotype_source(
             vcf=None,
@@ -1300,25 +1298,23 @@ def main(log: bool = True):
             bfile=args.bfile,
             prefix=None,
         )
-        args.prefix = auto_prefix if args.prefix is None else args.prefix
     elif args.grm:
         gfile = args.grm
-        args.prefix = strip_default_prefix_suffix(os.path.basename(gfile)) if args.prefix is None else args.prefix
+        auto_prefix = strip_default_prefix_suffix(os.path.basename(gfile))
     elif args.qcov:
         gfile = args.qcov
-        args.prefix = strip_default_prefix_suffix(os.path.basename(gfile)) if args.prefix is None else args.prefix
+        auto_prefix = strip_default_prefix_suffix(os.path.basename(gfile))
     else:
         raise ValueError("No valid input found; one of --vcf/--hmp/--bfile/--grm/--cov must be provided.")
 
-    args.out = os.path.normpath(args.out if args.out is not None else ".")
-    outprefix = os.path.join(args.out, args.prefix)
+    out_dir, outprefix, out_stem = apply_output_prefix_compat(args, auto_prefix)
     genotype_input_mode = bool(args.vcf or args.hmp or args.file or args.bfile)
     args.memory = _normalize_memory_gb(args.memory)
     memory_mb = _memory_gb_to_mb(args.memory)
 
     # ------------------------- Logging -------------------------
-    os.makedirs(args.out, 0o755, exist_ok=True)
-    configure_genotype_cache_from_out(args.out)
+    os.makedirs(out_dir, 0o755, exist_ok=True)
+    configure_genotype_cache_from_out(out_dir)
     log_path = f"{outprefix}.pca.log"
     logger = setup_logging(log_path)
     setattr(logger, "_janusx_pca_verbose", bool(getattr(args, "verbose", False)))

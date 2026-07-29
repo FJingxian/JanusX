@@ -75,6 +75,7 @@ from janusx.script._common.cli_args import (  # noqa: E402
     parse_trait_selector_specs,
     resolve_trait_selectors,
 )
+from janusx.script._common.outprefix import apply_output_prefix_compat  # noqa: E402
 from janusx.gfreader import inspect_genotype_file  # noqa: E402
 
 try:
@@ -220,7 +221,6 @@ def _determine_genotype_source_from_args(args: argparse.Namespace) -> tuple[str,
     hmp = getattr(args, "hmp", None)
     file = getattr(args, "file", None)
     bfile = getattr(args, "bfile", None)
-    prefix = getattr(args, "prefix", None)
     if vcf:
         gfile = str(vcf)
         auto_prefix = _strip_default_prefix_suffix(gfile)
@@ -235,8 +235,7 @@ def _determine_genotype_source_from_args(args: argparse.Namespace) -> tuple[str,
         auto_prefix = os.path.basename(gfile.rstrip("/\\"))
     else:
         raise ValueError("No genotype input specified. Use -vcf, -hmp, -file or -bfile.")
-    resolved_prefix = str(prefix) if prefix is not None else auto_prefix
-    return gfile, resolved_prefix
+    return gfile, auto_prefix
 
 
 def _parse_number_list(raw: str, cast=float) -> list[Any]:
@@ -3202,12 +3201,12 @@ def main() -> None:
     if not args.pheno:
         raise ValueError("Missing phenotype input: -p/--pheno is required.")
 
+    gfile, auto_prefix = _determine_genotype_source_from_args(args)
+    apply_output_prefix_compat(args, auto_prefix, fallback_prefix="benchmark")
     out_dir = safe_expanduser(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     bench_dir = out_dir / f"{args.prefix}.farmcpu_bench"
     bench_dir.mkdir(parents=True, exist_ok=True)
-
-    gfile, _auto_prefix = _determine_genotype_source_from_args(args)
     gfile = str(gfile)
     geno_flag, _ = _as_geno_flag_and_value(args, gfile)
 

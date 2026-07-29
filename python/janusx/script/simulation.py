@@ -40,6 +40,7 @@ from ._common.cli_args import (
 from ._common.config_render import emit_cli_configuration
 from ._common.genocache import configure_genotype_cache_from_out
 from ._common.genoio import determine_genotype_source_from_args as determine_genotype_source
+from ._common.outprefix import apply_output_prefix_compat
 from ._common.grmio import load_and_align_grm
 from ._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.log import setup_logging
@@ -1312,10 +1313,10 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog(
             [
-                "jx simulation -bfile geno_prefix -o out -prefix demo",
+                "jx simulation -bfile geno_prefix -o out/demo",
                 "jx simulation -vcf geno.vcf.gz -causal 3 -cs-pve 0.15 -o out",
                 "jx simulation -bfile geno_prefix -logic-gate r 3,1,0.5 -causal 100 -bg-pve 0.4 -o out",
-                "jx simulation -bfile geno_prefix -k panel.grm.npy -o out -prefix demo",
+                "jx simulation -bfile geno_prefix -k panel.grm.npy -o out/demo",
             ]
         ),
         description="JanusX simulation: phenotype from existing genotype (Rust-first)",
@@ -1472,11 +1473,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
 
     gfile, prefix = determine_genotype_source(args)
-    args.out = os.path.normpath(args.out if args.out is not None else ".")
-    outstem = str(args.prefix).strip() if args.prefix is not None else prefix
-    outprefix = os.path.join(args.out, outstem)
-    os.makedirs(args.out, exist_ok=True, mode=0o755)
-    cache_dir = configure_genotype_cache_from_out(args.out)
+    out_dir, outprefix, outstem = apply_output_prefix_compat(args, prefix, argv=argv)
+    os.makedirs(out_dir, exist_ok=True, mode=0o755)
+    cache_dir = configure_genotype_cache_from_out(out_dir)
 
     log_path = f"{outprefix}.sim.log"
     logger = setup_logging(log_path)

@@ -62,6 +62,7 @@ from janusx.janusx import (
     count_vcf_snps,
     count_hmp_snps,
 )
+from ._common.outprefix import apply_output_prefix_compat
 from janusx.gfreader.gfreader import _resolve_input
 
 try:
@@ -2449,7 +2450,7 @@ def build_parser() -> CliArgumentParser:
             [
                 "jx gformat -vcf geno.vcf.gz",
                 "jx gformat -hmp geno.hmp.gz -fmt plink",
-                "jx gformat -bfile geno_prefix -fmt txt -o outdir -prefix panel",
+                "jx gformat -bfile geno_prefix -fmt txt -o outdir/panel",
                 "jx gformat -file geno_prefix -fmt vcf",
                 "jx gformat -bfile geno_prefix --prune 500 50 0.2",
                 "jx gformat -bfile geno_prefix --prune 500kb 10 0.2",
@@ -2632,13 +2633,12 @@ def main() -> None:
     print_prune_kernel_stats = _env_truthy("JX_GFORMAT_PRINT_PRUNE_KERNEL_STATS", "0")
 
     gfile, default_prefix = determine_genotype_source(args)
-    if args.prefix is None:
-        args.prefix = default_prefix
+    out_dir, outprefix, out_stem = apply_output_prefix_compat(args, default_prefix)
     out_fmt, out_prefix, out_path = _resolve_output_target(args)
     output_display = format_output_display(out_fmt, out_prefix, out_path)
 
-    os.makedirs(str(args.out), exist_ok=True, mode=0o755)
-    configure_genotype_cache_from_out(str(args.out))
+    os.makedirs(str(out_dir), exist_ok=True, mode=0o755)
+    configure_genotype_cache_from_out(str(out_dir))
     log_path = f"{out_prefix}.gformat.log"
     logger = setup_logging(log_path)
     if thread_capped:

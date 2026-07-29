@@ -143,6 +143,7 @@ from janusx.script._common.cli_args import (
     resolve_trait_selectors,
 )
 from janusx.script._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
+from janusx.script._common.outprefix import apply_output_prefix_compat
 from janusx.script._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
@@ -18633,7 +18634,7 @@ def parse_args(argv: typing.Optional[list[str]] = None):
     # Model arguments
     # ------------------------------------------------------------------
     model_group = parser.add_argument_group(
-        "Model Arguments (Required: Select at least one or provide a saved model)"
+        "Model Arguments (Required: Select At Least One Model)"
     )
     model_group.add_argument(
         "-GBLUP", "--GBLUP",
@@ -18734,9 +18735,7 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         "-model", "--model",
         type=str,
         default=None,
-        help=(
-            "Load saved .jxmodel file for direct prediction/evaluation instead of refitting."
-        ),
+        help=argparse.SUPPRESS,
     )
     # ------------------------------------------------------------------
     # Optional arguments
@@ -19246,7 +19245,6 @@ def parse_args(argv: typing.Optional[list[str]] = None):
     add_common_out_arg(
         optional_group,
         default=".",
-        help_text="Output directory for results (default: %(default)s).",
     )
     optional_group.add_argument(
         "-prefix", "--prefix",
@@ -19442,23 +19440,15 @@ def parse_args(argv: typing.Optional[list[str]] = None):
 
 def _resolve_gs_pipeline_paths(
     args,
+    *,
+    argv: typing.Optional[list[str]] = None,
 ) -> tuple[str, str, str, str]:
     if args.vcf:
         gfile = str(args.vcf)
-        args.prefix = (
-            os.path.basename(gfile)
-            .replace(".gz", "")
-            .replace(".vcf", "")
-            if args.prefix is None else args.prefix
-        )
+        auto_prefix = os.path.basename(gfile).replace(".gz", "").replace(".vcf", "")
     elif args.hmp:
         gfile = str(args.hmp)
-        args.prefix = (
-            os.path.basename(gfile)
-            .replace(".gz", "")
-            .replace(".hmp", "")
-            if args.prefix is None else args.prefix
-        )
+        auto_prefix = os.path.basename(gfile).replace(".gz", "").replace(".hmp", "")
     elif args.file:
         gfile = str(args.file)
         base = os.path.basename(gfile)
@@ -19466,16 +19456,15 @@ def _resolve_gs_pipeline_paths(
             if base.lower().endswith(ext):
                 base = base[: -len(ext)]
                 break
-        args.prefix = base if args.prefix is None else args.prefix
+        auto_prefix = base
     elif args.bfile:
         gfile = str(args.bfile)
-        args.prefix = os.path.basename(gfile) if args.prefix is None else args.prefix
+        auto_prefix = os.path.basename(gfile)
     else:
         raise ValueError("No genotype input detected. Use -vcf, -hmp, -file or -bfile.")
 
-    args.out = os.path.normpath(args.out if args.out is not None else ".")
-    outprefix = os.path.join(str(args.out), str(args.prefix))
-    gs_model_dir = os.path.join(str(args.out), f"{args.prefix}.gs.model")
+    out_dir, outprefix, out_stem = apply_output_prefix_compat(args, auto_prefix, argv=argv)
+    gs_model_dir = os.path.join(str(out_dir), f"{out_stem}.gs.model")
     log_path = f"{outprefix}.gs.log"
     return gfile, outprefix, gs_model_dir, log_path
 

@@ -82,6 +82,7 @@ from janusx.script._common.cli_args import (  # noqa: E402
     parse_trait_selector_specs,
     resolve_trait_selectors,
 )  # noqa: E402
+from janusx.script._common.outprefix import apply_output_prefix_compat  # noqa: E402
 from janusx.script._common.progress import CliStatus, stdout_is_tty  # noqa: E402
 from janusx.script import sim as sim_mod  # noqa: E402
 from janusx.gfreader import convert_genotypes, inspect_genotype_file, load_genotype_chunks, save_genotype_streaming  # noqa: E402
@@ -218,7 +219,6 @@ def _determine_genotype_source_from_args(args: argparse.Namespace) -> tuple[str,
     hmp = getattr(args, "hmp", None)
     file = getattr(args, "file", None)
     bfile = getattr(args, "bfile", None)
-    prefix = getattr(args, "prefix", None)
     if vcf:
         gfile = str(vcf)
         auto_prefix = _strip_default_prefix_suffix(gfile)
@@ -233,8 +233,7 @@ def _determine_genotype_source_from_args(args: argparse.Namespace) -> tuple[str,
         auto_prefix = os.path.basename(gfile.rstrip("/\\"))
     else:
         raise ValueError("No genotype input specified. Use -vcf, -hmp, -file or -bfile.")
-    resolved_prefix = str(prefix) if prefix is not None else auto_prefix
-    return gfile, resolved_prefix
+    return gfile, auto_prefix
 
 
 def _safe_float(v: Any, default: float = math.nan) -> float:
@@ -3761,6 +3760,8 @@ def main() -> None:
         ok = _print_env_checks(engines, checks)
         raise SystemExit(0 if ok else 1)
 
+    gfile, auto_prefix = _determine_genotype_source_from_args(args)
+    apply_output_prefix_compat(args, auto_prefix, fallback_prefix="gblupbench")
     out_dir = safe_expanduser(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     bench_dir = out_dir / f"{args.prefix}.gblup_bench"

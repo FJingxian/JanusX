@@ -136,7 +136,6 @@ from janusx.script._common.cli_args import (
     add_common_memory_arg,
     add_common_out_arg,
     add_common_pheno_arg,
-    add_common_prefix_arg,
     add_common_thread_arg,
     add_common_trait_selector_args,
     add_common_variant_filter_args,
@@ -18611,23 +18610,31 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         ]),
     )
 
-    # ------------------------------------------------------------------
-    # Required arguments
-    # ------------------------------------------------------------------
-    required_group = parser.add_argument_group("Required Arguments")
-
-    geno_group = required_group.add_mutually_exclusive_group(required=False)
+    genotype_group = parser.add_argument_group("Genotype Arguments (Required: Select exactly one)")
+    geno_group = genotype_group.add_mutually_exclusive_group(required=False)
     add_common_genotype_source_args(geno_group, include_file=True)
+    phenotype_group = parser.add_argument_group("Phenotype Arguments (Required)")
     add_common_pheno_arg(
-        required_group,
+        phenotype_group,
         required=False,
         help_text="Phenotype file (tab/comma/whitespace-delimited, sample IDs in the first column).",
+    )
+    add_common_trait_selector_args(
+        phenotype_group,
+        dest="ncol",
+        help_text=(
+            "Phenotype column(s), accepted as zero-based index (excluding sample ID), "
+            "column name, comma list (e.g. 0,2 or TraitA,TraitB), or numeric range "
+            "(e.g. 0:2). Repeat this flag for multiple traits. (default: all)"
+        ),
     )
 
     # ------------------------------------------------------------------
     # Model arguments
     # ------------------------------------------------------------------
-    model_group = parser.add_argument_group("Model Arguments")
+    model_group = parser.add_argument_group(
+        "Model Arguments (Required: Select at least one or provide a saved model)"
+    )
     model_group.add_argument(
         "-GBLUP", "--GBLUP",
         action="append",
@@ -18654,10 +18661,10 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         default=False,
         help=(
             "Use automatic BLUP dispatch. "
-            f"When n<= {BLUP_SMALL_N}, choose GBLUP; "
-            f"when n> {BLUP_SMALL_N} and m<= {BLUP_SMALL_M}, choose exact rrBLUP(snp spectral REML); "
-            f"when n> {BLUP_SMALL_N} and m> {BLUP_SMALL_M}, choose PCG rrBLUP. "
-            "For benchmarking, set env GS_BLUP=0/1/2 to force GBLUP / exact rrBLUP / PCG rrBLUP."
+            f"When n<={BLUP_SMALL_N}, choose GBLUP; "
+            f"when n>{BLUP_SMALL_N} and m<={BLUP_SMALL_M}, choose exact rrBLUP; "
+            f"when n>{BLUP_SMALL_N} and m>{BLUP_SMALL_M}, choose PCG rrBLUP. "
+            "(Set env GS_BLUP=0/1/2 to force route)."
         ),
     )
     model_group.add_argument(
@@ -18728,30 +18735,21 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         type=str,
         default=None,
         help=(
-            "Load saved .jxmodel file for direct prediction/evaluation. "
-            "When set, selected methods are loaded from model artifact instead of refitting."
+            "Load saved .jxmodel file for direct prediction/evaluation instead of refitting."
         ),
     )
     # ------------------------------------------------------------------
     # Optional arguments
     # ------------------------------------------------------------------
     optional_group = parser.add_argument_group("Optional Arguments")
-    add_common_variant_filter_args(
-        optional_group,
-        include_maf=True,
-        include_geno=True,
-        include_het=True,
-        maf_default=0.02,
-        geno_default=0.05,
-        het_default=1.0,
-    )
-    add_common_trait_selector_args(optional_group, dest="ncol")
     optional_group.add_argument(
         "-cv", "--cv",
         type=int,
         default=None,
-        help="K fold of cross-validation for models. "
-             "(default: %(default)s).",
+        help=(
+            "K-fold of cross-validation for models. "
+            "When provided, models are evaluated via CV (default: %(default)s)."
+        ),
     )
     optional_group.add_argument(
         "-seed", "--seed",
@@ -18760,6 +18758,15 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         help=(
             "Random seed for outer CV fold shuffling and GS model-side stochastic "
             "routines (default: %(default)s)."
+        ),
+    )
+    optional_group.add_argument(
+        "-save-model", "--save-model",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable fitted-model saving (.jxmodel) and marker-effect output. "
+            "Disabled by default to save post-fit time and disk usage."
         ),
     )
     # optional_group.add_argument(
@@ -18849,27 +18856,6 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         choices=("linear", "none", "addmean"),
         default="linear",
         help=argparse.SUPPRESS,
-    )
-    add_common_thread_arg(optional_group, default_threads=detect_effective_threads())
-    add_common_memory_arg(
-        optional_group,
-        default=None,
-        help_text=(
-            "Working memory budget in GB for streamed BED kernels in GS. "
-            "When omitted, GS chooses a route-aware default from loaded sample/marker counts; "
-            "explicit -mem keeps the requested fixed budget."
-        ),
-        dest="memory",
-    )
-    optional_group.add_argument(
-        "-save-model", "--save-model",
-        action="store_true",
-        default=False,
-        help=(
-            "Enable fitted-model saving and marker-effect output when supported by the selected "
-            "method. Disabled by default because effect back-projection, artifact serialization, "
-            "and large TSV export can add noticeable post-fit time and disk usage."
-        ),
     )
     optional_group.add_argument(
         "-limit-predtrain", "--limit-predtrain",
@@ -19197,8 +19183,7 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         "-pcd", "--pcd",
         action="store_true",
         default=False,
-        help="Enable PCA-based dimensionality reduction on genotypes "
-             "(default: %(default)s).",
+        help="Enable PCA-based dimensionality reduction on genotypes before fitting (default: %(default)s).",
     )
     optional_group.add_argument(
         "-ldprune", "--ldprune",
@@ -19207,10 +19192,8 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         metavar=("WINDOW", "STEP", "R2"),
         help=(
             "Apply packed BED LD prune before GS model fitting. "
-            "Usage: --ldprune <window size[kb|bp]> <step size (variant ct)> <r^2 threshold>. "
-            "Set env JX_GS_LDPRUNE_BACKEND=plink to use external PLINK backend "
-            "(same prune strategy as PLINK indep-pairwise). "
-            "Numeric window defaults to kb (e.g. 1=1kb, 0.1=100bp)."
+            "Usage: --ldprune <window> <step(variant_ct)> <r^2 threshold>. "
+            "Numeric window defaults to kb (e.g., 1=1kb, 0.1=100bp)."
         ),
     )
     optional_group.add_argument(
@@ -19220,9 +19203,29 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         metavar=("DIM", "SEED"),
         help=(
             "Enable signed feature hashing before GS. "
-            "Usage: --hash [dim] [seed]. "
+            "Usage: --hash . "
             "Defaults when enabled: dim=2048, seed=520."
         ),
+    )
+    add_common_variant_filter_args(
+        optional_group,
+        include_maf=True,
+        include_geno=True,
+        include_het=True,
+        maf_default=0.02,
+        geno_default=0.05,
+        het_default=1.0,
+    )
+    add_common_thread_arg(optional_group, default_threads=detect_effective_threads())
+    add_common_memory_arg(
+        optional_group,
+        default=None,
+        help_text=(
+            "Working memory budget in GB for streamed BED kernels in GS. "
+            "When omitted, GS chooses a route-aware default from loaded sample/marker counts; "
+            "explicit -mem keeps the requested fixed budget."
+        ),
+        dest="memory",
     )
     # Backward-compatible legacy flags (hidden): --hash-dim / --hash-seed
     optional_group.add_argument("-hash-dim", "--hash-dim", type=int, default=None, help=argparse.SUPPRESS)
@@ -19240,21 +19243,22 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         default=False,
         help=argparse.SUPPRESS,
     )
+    add_common_out_arg(
+        optional_group,
+        default=".",
+        help_text="Output directory for results (default: %(default)s).",
+    )
+    optional_group.add_argument(
+        "-prefix", "--prefix",
+        type=str,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     optional_group.add_argument(
         "-v", "--verbose",
         action="store_true",
         default=False,
-        help="Show advanced backend, runtime, and model diagnostics.",
-    )
-    add_common_out_arg(
-        optional_group,
-        default=".",
-        help_profile="current_dir",
-    )
-    add_common_prefix_arg(
-        optional_group,
-        default=None,
-        help_profile="genotype_basename",
+        help="Show advanced diagnostics and configuration details at the end of the report.",
     )
 
     args, extras = parser.parse_known_args(argv)

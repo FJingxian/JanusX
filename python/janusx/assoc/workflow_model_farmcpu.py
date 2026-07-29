@@ -652,7 +652,13 @@ def run_farmcpu_fullmem(
     genotype IDs and therefore reload phenotype/Q/cov on the full ID space.
     """
     phenofile = args.pheno
-    outfolder = args.out
+    outfolder = str(getattr(args, "out_dir", getattr(args, "out", ".")))
+    outprefix_base = str(getattr(args, "outprefix", "")).strip()
+    outstem = (
+        str(getattr(args, "out_stem", "")).strip()
+        if str(getattr(args, "out_stem", "")).strip() != ""
+        else str(prefix).strip()
+    )
     qdim = args.qcov
     cov = args.cov
     snps_only = bool(getattr(args, "snps_only", False))
@@ -720,8 +726,8 @@ def run_farmcpu_fullmem(
                 het_threshold=float(args.het),
                 snps_only=bool(snps_only),
                 outprefix=(
-                    str(outfolder)
-                    if str(outfolder).strip() != ""
+                    outprefix_base
+                    if outprefix_base != ""
                     else None
                 ),
                 logger=logger,
@@ -1280,9 +1286,15 @@ def run_farmcpu_fullmem(
                 pass
 
         phename_tag = _safe_trait_file_label(phename)
-        out_tsv = os.path.join(outfolder, f"{prefix}.{phename_tag}.farmcpu.tsv")
+        if outprefix_base != "":
+            out_tsv = f"{outprefix_base}.{phename_tag}.farmcpu.tsv"
+            pseudo_tsv_hint = f"{outprefix_base}.{phename_tag}.farmcpu.qtn"
+            out_svg = f"{outprefix_base}.{phename_tag}.farmcpu.svg"
+        else:
+            out_tsv = os.path.join(outfolder, f"{outstem}.{phename_tag}.farmcpu.tsv")
+            pseudo_tsv_hint = os.path.join(outfolder, f"{outstem}.{phename_tag}.farmcpu.qtn")
+            out_svg = os.path.join(outfolder, f"{outstem}.{phename_tag}.farmcpu.svg")
         tmp_tsv = _gwas_result_tmp_path(out_tsv)
-        pseudo_tsv_hint = os.path.join(outfolder, f"{prefix}.{phename_tag}.farmcpu.qtn")
         n_pseudo_qtn = 0
         pseudo_tsv: Union[str, None] = None
         stage1_secs = 0.0
@@ -1687,7 +1699,7 @@ def run_farmcpu_fullmem(
                 out_tsv,
                 p_sub,
                 xlabel=phename,
-                outpdf=os.path.join(outfolder, f"{prefix}.{phename_tag}.farmcpu.svg"),
+                outpdf=out_svg,
                 use_spinner=bool(use_spinner),
                 emit_done_line=False,
             )

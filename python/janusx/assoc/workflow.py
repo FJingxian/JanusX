@@ -97,9 +97,7 @@ from janusx.script._common.cli_args import (
     add_common_genotype_source_args,
     add_common_grm_option_arg,
     add_common_memory_arg,
-    add_common_out_arg,
     add_common_pheno_arg,
-    add_common_prefix_arg,
     add_common_thread_arg,
     add_common_trait_selector_args,
     add_common_variant_filter_args,
@@ -1828,6 +1826,65 @@ def _parse_qcov_dim(qcov_opt: object) -> int:
     if q < 0:
         raise ValueError(f"Invalid -q/--qcov: {q}. Q/PC dimension must be >= 0.")
     return int(q)
+
+
+def _normalize_bimrange_chr(value: object) -> str:
+    text = str(value).strip()
+    if text.lower().startswith("chr"):
+        text = text[3:]
+    return text.upper()
+
+
+def _parse_scan_bimrange(value: object) -> tuple[str, int, int]:
+    text = str(value).strip()
+    match = re.match(r"^([^:]+):([0-9]*\.?[0-9]+)(?:-|:)([0-9]*\.?[0-9]+)$", text)
+    if match is None:
+        raise ValueError(
+            f"Invalid -bimrange/--bimrange format: {value}. "
+            "Use chr:start-end (or chr:start:end)."
+        )
+    chrom = str(match.group(1)).strip()
+    start_raw = str(match.group(2)).strip()
+    end_raw = str(match.group(3)).strip()
+    start_num = float(start_raw)
+    end_num = float(end_raw)
+
+    def _looks_like_bp_integer(token: str) -> bool:
+        tok = str(token).strip()
+        if "." in tok:
+            return False
+        tok = tok.lstrip("0")
+        if tok == "":
+            tok = "0"
+        return len(tok) > 6
+
+    use_bp_input = _looks_like_bp_integer(start_raw) or _looks_like_bp_integer(end_raw)
+    if use_bp_input:
+        start_bp = int(round(start_num))
+        end_bp = int(round(end_num))
+        if start_bp < 0 or end_bp < 0:
+            raise ValueError("Invalid -bimrange/--bimrange: start/end must be >= 0 (bp).")
+    else:
+        if start_num < 0 or end_num < 0:
+            raise ValueError("Invalid -bimrange/--bimrange: start/end must be >= 0 (Mb).")
+        start_bp = int(round(start_num * 1_000_000))
+        end_bp = int(round(end_num * 1_000_000))
+    if start_bp > end_bp:
+        start_bp, end_bp = end_bp, start_bp
+    return chrom, int(start_bp), int(end_bp)
+
+
+def _format_scan_bimrange(item: tuple[str, int, int]) -> str:
+    chrom, start, end = item
+    return f"{str(chrom)}:{int(start)}-{int(end)}"
+
+
+def _format_scan_bimrange_summary(
+    bimranges: Optional[list[tuple[str, int, int]]]
+) -> str:
+    if bimranges is None or len(bimranges) == 0:
+        return ""
+    return ",".join(_format_scan_bimrange(item) for item in bimranges)
 
 
 def _format_cov_display(cov_inputs: Union[list[str], None]) -> str:
@@ -4729,6 +4786,124 @@ def _resolve_ref_alt_columns(
     )
 
 
+def _filter_trait_prepared_meta_by_bimranges(
+    trait_prepared_meta: Optional[dict[str, object]],
+    *,
+    prefix: Optional[str],
+    bimranges: Optional[list[tuple[str, int, int]]],
+    logger: Optional[logging.Logger] = None,
+    route_label: str = "GWAS",
+) -> Optional[dict[str, object]]:
+    if not isinstance(trait_prepared_meta, dict):
+        return trait_prepared_meta
+    if bimranges is None or len(bimranges) == 0:
+        return trait_prepared_meta
+
+    bimrange_key = tuple(
+        (_normalize_bimrange_chr(chrom), int(start), int(end))
+        for chrom, start, end in bimranges
+    )
+    if trait_prepared_meta.get("_scan_bimrange_key") == bimrange_key:
+        return trait_prepared_meta
+
+    prefix_use = str(prefix or trait_prepared_meta.get("bed_prefix", "") or "").strip()
+    if prefix_use == "":
+        raise ValueError(
+            "-bimrange/--bimrange requires PLINK/BIM-backed scan metadata; "
+            "no BED prefix is available for GWAS scan filtering."
+        )
+
+    row_idx_obj = trait_prepared_meta.get(
+        "row_indices",
+        trait_prepared_meta.get("active_row_idx", None),
+    )
+    if row_idx_obj is None:
+        site_keep_obj = trait_prepared_meta.get("site_keep", None)
+        if site_keep_obj is None:
+            raise ValueError(
+                "Trait-prepared GWAS scan metadata is missing both row_indices and site_keep; "
+                "cannot apply -bimrange/--bimrange."
+            )
+        row_idx = np.ascontiguousarray(
+            np.flatnonzero(np.asarray(site_keep_obj, dtype=np.bool_).reshape(-1)).astype(
+                np.int64,
+                copy=False,
+            ),
+            dtype=np.int64,
+        )
+    else:
+        row_idx = np.ascontiguousarray(
+            np.asarray(row_idx_obj, dtype=np.int64).reshape(-1),
+            dtype=np.int64,
+        )
+    if int(row_idx.shape[0]) == 0:
+        raise ValueError(
+            f"No SNPs are available in prepared GWAS scan metadata before applying -bimrange "
+            f"({route_label})."
+        )
+
+    sites = _read_bim_site_columns(str(prefix_use), row_idx)
+    chrom_arr = np.asarray(
+        [_normalize_bimrange_chr(chrom) for chrom in list(sites.chrom)],
+        dtype=object,
+    )
+    pos_arr = np.ascontiguousarray(
+        np.asarray(list(sites.pos), dtype=np.int64).reshape(-1),
+        dtype=np.int64,
+    )
+    keep_mask = np.zeros((int(row_idx.shape[0]),), dtype=np.bool_)
+    for chrom, start, end in bimranges:
+        chrom_norm = _normalize_bimrange_chr(chrom)
+        keep_mask |= (
+            (chrom_arr == chrom_norm)
+            & (pos_arr >= int(start))
+            & (pos_arr <= int(end))
+        )
+    if not bool(np.any(keep_mask)):
+        raise ValueError(
+            "No SNPs remain after applying -bimrange/--bimrange to GWAS scan metadata: "
+            f"{_format_scan_bimrange_summary(list(bimranges))}"
+        )
+
+    out = dict(trait_prepared_meta)
+    out["_scan_bimrange_key"] = bimrange_key
+    out["_scan_bimrange_label"] = _format_scan_bimrange_summary(list(bimranges))
+    if bool(np.all(keep_mask)):
+        return out
+
+    keep_idx = np.flatnonzero(keep_mask).astype(np.int64, copy=False)
+    out["row_indices"] = np.ascontiguousarray(row_idx[keep_idx], dtype=np.int64)
+    for key_name, dtype in (
+        ("missing_rate", np.float32),
+        ("maf", np.float32),
+        ("af", np.float32),
+        ("row_flip", np.bool_),
+    ):
+        if key_name not in trait_prepared_meta:
+            continue
+        arr = np.asarray(trait_prepared_meta[key_name], dtype=dtype).reshape(-1)
+        if int(arr.shape[0]) == int(row_idx.shape[0]):
+            out[key_name] = np.ascontiguousarray(arr[keep_idx], dtype=dtype)
+    site_keep_raw = trait_prepared_meta.get("site_keep", None)
+    if site_keep_raw is not None:
+        site_keep_arr = np.ascontiguousarray(
+            np.asarray(site_keep_raw, dtype=np.bool_).reshape(-1),
+            dtype=np.bool_,
+        )
+        if int(site_keep_arr.shape[0]) > 0:
+            site_keep_new = np.zeros_like(site_keep_arr, dtype=np.bool_)
+            site_keep_new[np.asarray(out["row_indices"], dtype=np.int64)] = True
+            out["site_keep"] = site_keep_new
+    if logger is not None:
+        _log_file_only(
+            logger,
+            logging.INFO,
+            f"{route_label}: applying scan-only -bimrange {out['_scan_bimrange_label']} "
+            f"kept {int(keep_idx.shape[0])}/{int(row_idx.shape[0])} QC-passed SNPs.",
+        )
+    return out
+
+
 def _resolve_gwas_snp_bim_path(genofile: str) -> Union[str, None]:
     path = str(safe_expanduser(str(genofile))).strip()
     if path == "":
@@ -6298,8 +6473,64 @@ def _option_present(argv: Optional[list[str]], *flags: str) -> bool:
     return False
 
 
+def _looks_like_output_directory_hint(path_value: str) -> bool:
+    raw = str(path_value).strip()
+    if raw == "":
+        return False
+    if raw.endswith(("/", "\\")):
+        return True
+    norm = os.path.normpath(raw)
+    tail = os.path.basename(norm)
+    if tail in {"", ".", ".."}:
+        return True
+    try:
+        expanded = safe_expanduser(raw)
+        return bool(expanded.exists() and expanded.is_dir())
+    except Exception:
+        return False
+
+
+def _resolve_gwas_output_prefix(
+    out_value: Optional[str],
+    legacy_prefix: Optional[str],
+    auto_prefix: str,
+    *,
+    out_was_explicit: bool,
+) -> tuple[str, str]:
+    auto_prefix_text = str(auto_prefix).strip() or "JanusX"
+    legacy_prefix_text = str(legacy_prefix).strip() if legacy_prefix is not None else ""
+    out_text = str(out_value).strip() if out_value is not None else ""
+
+    if legacy_prefix_text != "":
+        if out_was_explicit and out_text != "":
+            raw_prefix = os.path.join(out_text, legacy_prefix_text)
+        else:
+            raw_prefix = legacy_prefix_text
+    elif out_was_explicit and out_text != "":
+        if _looks_like_output_directory_hint(out_text):
+            raw_prefix = os.path.join(out_text, auto_prefix_text)
+        else:
+            raw_prefix = out_text
+    else:
+        raw_prefix = auto_prefix_text
+
+    outprefix = os.path.normpath(str(safe_expanduser(raw_prefix)))
+    outdir = os.path.dirname(outprefix)
+    if str(outdir).strip() == "":
+        outdir = "."
+    return str(outdir), str(outprefix)
+
+
 def parse_args(argv: Optional[list[str]] = None):
     show_dev_help = _dev_help_requested(argv)
+    enable_lm2_arg = bool(show_dev_help or _option_present(argv, "-lm2", "--lm2"))
+    enable_lmm2_arg = bool(show_dev_help or _option_present(argv, "-lmm2", "--lmm2"))
+    enable_bimrange_arg = bool(show_dev_help or _option_present(argv, "-bimrange", "--bimrange"))
+    enable_qtn_vcf_arg = bool(show_dev_help or _option_present(argv, "-qvcf", "--qtn-vcf"))
+    enable_qtn_hmp_arg = bool(show_dev_help or _option_present(argv, "-qhmp", "--qtn-hmp"))
+    enable_qtn_bfile_arg = bool(show_dev_help or _option_present(argv, "-qbfile", "--qtn-bfile"))
+    enable_qtn_file_arg = bool(show_dev_help or _option_present(argv, "-qfile", "--qtn-file"))
+    enable_trait_level_arg = bool(show_dev_help or _option_present(argv, "-trait-level", "--trait-level"))
     parser = CliArgumentParser(
         prog="jx gwas",
         formatter_class=cli_help_formatter(),
@@ -6310,50 +6541,71 @@ def parse_args(argv: Optional[list[str]] = None):
             "jx gwas -h -dev",
         ]),
     )
-    parser.set_defaults(snps_only=False)
+    parser.set_defaults(
+        snps_only=False,
+        lm2=None,
+        lmm2=False,
+        bimrange=None,
+        qtn_vcf=None,
+        qtn_hmp=None,
+        qtn_bfile=None,
+        qtn_file=None,
+        trait_level=False,
+    )
     parser.add_argument(
         "-dev", "--dev", action="store_true", default=False, help=argparse.SUPPRESS
     )
 
-    required_group = parser.add_argument_group("Required arguments")
-
-    geno_group = required_group.add_mutually_exclusive_group(required=False)
+    genotype_group = parser.add_argument_group("Genotype Arguments (Required: Select exactly one)")
+    geno_group = genotype_group.add_mutually_exclusive_group(required=False)
     add_common_genotype_source_args(geno_group, include_file=True)
 
+    phenotype_group = parser.add_argument_group("Phenotype Arguments (Required)")
     add_common_pheno_arg(
-        required_group,
+        phenotype_group,
         required=False,
         help_text="Phenotype file (tab-delimited, sample IDs in the first column).",
     )
+    add_common_trait_selector_args(
+        phenotype_group,
+        dest="ncol",
+        help_text=(
+            "Phenotype column(s), accepted as zero-based index (excluding sample ID), "
+            "column name, comma list (e.g. 0,2 or TraitA,TraitB), or numeric range "
+            "(e.g. 0:2). Repeat this flag for multiple traits. (default: all)"
+        ),
+    )
 
-    models_group = parser.add_argument_group("Model Arguments")
+    models_group = parser.add_argument_group("Model Arguments (Required: Select at least one)")
     models_group.add_argument(
         "-lm", "--lm", action="store_true", default=False,
         help="Run the linear model (memmap, low-memory; default: %(default)s).",
     )
-    models_group.add_argument(
-        "-lm2", "--lm2",
-        nargs="?",
-        const="__SELF__",
-        default=None,
-        metavar="COVCOL",
-        help=(
-            "Run LM with SNP-by-covariate interaction terms from selected merged -c covariate columns. "
-            "Column selectors are 0-based and accept items like 0, 0:3, :2, 0,3. "
-            "If no interaction columns are specified, LM2 falls back to the LM fast path."
-        ),
-    )
+    if enable_lm2_arg:
+        models_group.add_argument(
+            "-lm2", "--lm2",
+            nargs="?",
+            const="__SELF__",
+            default=None,
+            metavar="COVCOL",
+            help=(
+                "Run LM with SNP-by-covariate interaction terms from selected merged -c covariate columns. "
+                "Column selectors are 0-based and accept items like 0, 0:3, :2, 0,3. "
+                "If no interaction columns are specified, LM2 falls back to the LM fast path."
+            ),
+        )
     models_group.add_argument(
         "-lmm", "--lmm", action="store_true", default=False,
         help="Run the linear mixed model (memmap, low-memory; default: %(default)s).",
     )
-    models_group.add_argument(
-        "-lmm2", "--lmm2", action="store_true", default=False,
-        help=(
-            "Run exact LMM with Wald beta/se/pwald plus per-SNP ML/plrt output "
-            "(roughly ~2x scan cost versus -lmm; default: %(default)s)."
-        ),
-    )
+    if enable_lmm2_arg:
+        models_group.add_argument(
+            "-lmm2", "--lmm2", action="store_true", default=False,
+            help=(
+                "Run exact LMM with Wald beta/se/pwald plus per-SNP ML/plrt output "
+                "(roughly ~2x scan cost versus -lmm; default: %(default)s)."
+            ),
+        )
     models_group.add_argument(
         "-fvlmm", "--fvlmm", action="store_true", default=False,
         help="Run the fixed-variance LMM spectral scan using the null-model lambda for the whole GWAS (default: %(default)s).",
@@ -6417,7 +6669,6 @@ def parse_args(argv: Optional[list[str]] = None):
     )
 
     optional_group = parser.add_argument_group("Optional Arguments")
-    add_common_trait_selector_args(optional_group, dest="ncol")
     add_common_grm_option_arg(optional_group, default="1", dest="grm")
     optional_group.add_argument(
         "-spk", "--grm-sparse", type=str, default="1", dest="grm_sparse",
@@ -6434,35 +6685,54 @@ def parse_args(argv: Optional[list[str]] = None):
         ),
     )
     add_common_covariate_file_or_site_arg(optional_group, dest="cov", default=None)
-    qtn_group = optional_group.add_mutually_exclusive_group(required=False)
-    qtn_group.add_argument(
-        "-qvcf", "--qtn-vcf", type=str, default=None,
-        help=(
-            "Optional QTN-search genotype VCF for FarmCPU/ALGWAS stage1. "
-            "Ignored by other models."
-        ),
-    )
-    qtn_group.add_argument(
-        "-qhmp", "--qtn-hmp", type=str, default=None,
-        help=(
-            "Optional QTN-search genotype HMP for FarmCPU/ALGWAS stage1. "
-            "Ignored by other models; parsed as HMP regardless of suffix."
-        ),
-    )
-    qtn_group.add_argument(
-        "-qbfile", "--qtn-bfile", type=str, default=None,
-        help=(
-            "Optional QTN-search PLINK BED prefix for FarmCPU/ALGWAS stage1. "
-            "Ignored by other models."
-        ),
-    )
-    qtn_group.add_argument(
-        "-qfile", "--qtn-file", type=str, default=None,
-        help=(
-            "Optional QTN-search numeric FILE matrix for FarmCPU/ALGWAS stage1. "
-            "Ignored by other models."
-        ),
-    )
+    if enable_bimrange_arg:
+        optional_group.add_argument(
+            "-bimrange", "--bimrange", type=str, action="append", default=None,
+            help=(
+                "DEV: restrict only the final GWAS scan to one or more BIM ranges "
+                "(chr:start-end or chr:start:end; Mb by default, large integers treated as bp). "
+                "GRM / PCA / covariate preparation still uses the full genotype."
+            ),
+        )
+    if (
+        enable_qtn_vcf_arg
+        or enable_qtn_hmp_arg
+        or enable_qtn_bfile_arg
+        or enable_qtn_file_arg
+    ):
+        qtn_group = optional_group.add_mutually_exclusive_group(required=False)
+        if enable_qtn_vcf_arg:
+            qtn_group.add_argument(
+                "-qvcf", "--qtn-vcf", type=str, default=None,
+                help=(
+                    "Optional QTN-search genotype VCF for FarmCPU/ALGWAS stage1. "
+                    "Ignored by other models."
+                ),
+            )
+        if enable_qtn_hmp_arg:
+            qtn_group.add_argument(
+                "-qhmp", "--qtn-hmp", type=str, default=None,
+                help=(
+                    "Optional QTN-search genotype HMP for FarmCPU/ALGWAS stage1. "
+                    "Ignored by other models; parsed as HMP regardless of suffix."
+                ),
+            )
+        if enable_qtn_bfile_arg:
+            qtn_group.add_argument(
+                "-qbfile", "--qtn-bfile", type=str, default=None,
+                help=(
+                    "Optional QTN-search PLINK BED prefix for FarmCPU/ALGWAS stage1. "
+                    "Ignored by other models."
+                ),
+            )
+        if enable_qtn_file_arg:
+            qtn_group.add_argument(
+                "-qfile", "--qtn-file", type=str, default=None,
+                help=(
+                    "Optional QTN-search numeric FILE matrix for FarmCPU/ALGWAS stage1. "
+                    "Ignored by other models."
+                ),
+            )
     add_common_variant_filter_args(
         optional_group,
         include_maf=True,
@@ -6525,18 +6795,19 @@ def parse_args(argv: Optional[list[str]] = None):
             "fixed-variance/mixed-model fallback switching."
         ),
     )
-    optional_group.add_argument(
-        "-trait-level", "--trait-level",
-        dest="trait_level",
-        action="store_true",
-        default=False,
-        help=(
-            "Enable additive multi-trait trait-level fast paths for LM/LMM "
-            "with a single combined TSV output. When traits share the same "
-            "non-missing sample mask, JanusX reuses shared metadata and "
-            "mixed-model eigendecomposition across traits."
-        ),
-    )
+    if enable_trait_level_arg:
+        optional_group.add_argument(
+            "-trait-level", "--trait-level",
+            dest="trait_level",
+            action="store_true",
+            default=False,
+            help=(
+                "Enable additive multi-trait trait-level fast paths for LM/LMM "
+                "with a single combined TSV output. When traits share the same "
+                "non-missing sample mask, JanusX reuses shared metadata and "
+                "mixed-model eigendecomposition across traits."
+            ),
+        )
     optional_group.add_argument(
         "-strict-train", "--strict-train",
         "-strict-trait", "--strict-trait",
@@ -6558,8 +6829,21 @@ def parse_args(argv: Optional[list[str]] = None):
         ),
     )
     add_common_thread_arg(optional_group, default_threads=detect_effective_threads())
-    add_common_out_arg(optional_group, default=".")
-    add_common_prefix_arg(optional_group, default=None)
+    optional_group.add_argument(
+        "-o", "--out",
+        type=str,
+        default=None,
+        help=(
+            "Output prefix. Use PREFIX or DIR/PREFIX; when omitted, "
+            "GWAS uses the genotype basename in the current directory."
+        ),
+    )
+    optional_group.add_argument(
+        "-prefix", "--prefix",
+        type=str,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     optional_group.add_argument(
         "-v", "--verbose", action="store_true", default=False,
         help="Show advanced diagnostics and configuration details at the end of the report.",
@@ -6575,6 +6859,8 @@ def parse_args(argv: Optional[list[str]] = None):
         )
 
     args, extras = parser.parse_known_args(argv)
+    args._out_was_explicit = bool(_option_present(raw_argv, "-o", "--out"))
+    args._prefix_was_explicit = bool(_option_present(raw_argv, "-prefix", "--prefix"))
     has_genotype = bool(args.vcf or args.hmp or args.file or args.bfile)
     has_pheno = bool(args.pheno)
     if (not has_pheno) and (not has_genotype):
@@ -6606,6 +6892,12 @@ def parse_args(argv: Optional[list[str]] = None):
         parser.error(str(e))
     try:
         args.qcov = str(_parse_qcov_dim(args.qcov))
+    except ValueError as e:
+        parser.error(str(e))
+    try:
+        args.bimrange_ranges = [
+            _parse_scan_bimrange(x) for x in list(getattr(args, "bimrange", None) or [])
+        ]
     except ValueError as e:
         parser.error(str(e))
     if bool(getattr(args, "farmcpu", False)) and bool(getattr(args, "farmcpu_raw", False)):
@@ -6743,8 +7035,8 @@ def _prepare_qtn_packed_preload(
                 het_threshold=float(getattr(args, "het", 1.0)),
                 snps_only=bool(getattr(args, "snps_only", False)),
                 outprefix=(
-                    str(getattr(args, "out", ""))
-                    if str(getattr(args, "out", "")).strip() != ""
+                    str(getattr(args, "outprefix", ""))
+                    if str(getattr(args, "outprefix", "")).strip() != ""
                     else None
                 ),
                 logger=logger,
@@ -6823,12 +7115,25 @@ def _run_gwas_pipeline(
     if not (0.0 <= args.het <= 1.0):
         raise ValueError("--het must be within [0, 1].")
 
-    gfile, prefix = determine_genotype_source(args)
+    legacy_prefix = getattr(args, "prefix", None)
+    setattr(args, "prefix", None)
+    try:
+        gfile, prefix = determine_genotype_source(args)
+    finally:
+        setattr(args, "prefix", legacy_prefix)
 
-    args.out = os.path.normpath(args.out if args.out is not None else ".")
-    os.makedirs(args.out, 0o755, exist_ok=True)
-    configure_genotype_cache_from_out(args.out)
-    outprefix = os.path.join(args.out, prefix)
+    out_dir, outprefix = _resolve_gwas_output_prefix(
+        getattr(args, "out", None),
+        legacy_prefix,
+        prefix,
+        out_was_explicit=bool(getattr(args, "_out_was_explicit", False)),
+    )
+    args.out = str(out_dir)
+    args.out_dir = str(out_dir)
+    args.outprefix = str(outprefix)
+    args.out_stem = os.path.basename(str(outprefix))
+    os.makedirs(args.out_dir, 0o755, exist_ok=True)
+    configure_genotype_cache_from_out(args.out_dir)
     log_path = f"{outprefix}.gwas.log"
     logger = setup_logging(log_path)
     setattr(logger, "_janusx_gwas_verbose", bool(getattr(args, "verbose", False)))
@@ -6928,6 +7233,7 @@ def _run_gwas_pipeline(
     input_is_file_matrix = bool(_file_matrix_path_cli is not None)
     qtn_input_requested = _qtn_source_from_args(args) is not None
     requested_stream_models: list[str] = []
+    scan_bimranges = list(getattr(args, "bimrange_ranges", []) or [])
     if args.lm:
         requested_stream_models.append("lm")
     if getattr(args, "lm2", None) is not None:
@@ -7086,6 +7392,8 @@ def _run_gwas_pipeline(
         if qtn_input_requested and (args.farmcpu or args.algwas):
             _qtn_kind, _qtn_path, _ = _qtn_source_from_args(args) or ("", "", None)
             cfg_rows.append(("QTN stage1 input", f"{_qtn_kind}:{_qtn_path}"))
+        if len(scan_bimranges) > 0:
+            cfg_rows.append(("Scan bimrange", _format_scan_bimrange_summary(scan_bimranges)))
         if float(args.het) < 1.0:
             cfg_rows.append(("Het filter", f"het<={float(args.het):g}"))
         if args.farmcpu:
@@ -7176,6 +7484,10 @@ def _run_gwas_pipeline(
             ("Memory", memory_cfg),
             ("Force Model", bool(args.force_model)),
         ]
+        if len(scan_bimranges) > 0:
+            advanced_config_rows.append(
+                ("Scan Bimrange", _format_scan_bimrange_summary(scan_bimranges))
+            )
         if float(args.het) < 1.0:
             advanced_config_rows.append(
                 ("Het Filter", f"het<={float(args.het):g}")
@@ -8391,7 +8703,10 @@ def _run_gwas_pipeline(
                         if (
                             route_key not in meta_capable_routes
                             or prefix_meta is None
-                            or str(args.model).lower() != "add"
+                            or (
+                                str(args.model).lower() != "add"
+                                and len(scan_bimranges) == 0
+                            )
                             or gwas_row_stat_mode != "strict-train"
                         ):
                             return False, None
@@ -8414,11 +8729,21 @@ def _run_gwas_pipeline(
                         if (
                             route_key not in meta_capable_routes
                             or prefix_meta is None
-                            or str(args.model).lower() != "add"
+                            or (
+                                str(args.model).lower() != "add"
+                                and len(scan_bimranges) == 0
+                            )
                         ):
                             return None
                         if gwas_row_stat_mode != "strict-train":
                             if global_trait_meta_shared is not None:
+                                global_trait_meta_shared = _filter_trait_prepared_meta_by_bimranges(
+                                    global_trait_meta_shared,
+                                    prefix=str(prefix_meta),
+                                    bimranges=scan_bimranges,
+                                    logger=logger,
+                                    route_label=str(route_name).upper(),
+                                )
                                 return global_trait_meta_shared
                             global_trait_meta_shared = _gwas_logic_meta_global_cached(
                                 str(prefix_meta),
@@ -8430,10 +8755,25 @@ def _run_gwas_pipeline(
                                 logger=logger,
                                 use_spinner=False,
                             )
+                            global_trait_meta_shared = _filter_trait_prepared_meta_by_bimranges(
+                                global_trait_meta_shared,
+                                prefix=str(prefix_meta),
+                                bimranges=scan_bimranges,
+                                logger=logger,
+                                route_label=str(route_name).upper(),
+                            )
                             return global_trait_meta_shared
 
                         cached_meta = trait_shared_meta_cache.get(trait_token)
                         if cached_meta is not None:
+                            cached_meta = _filter_trait_prepared_meta_by_bimranges(
+                                cached_meta,
+                                prefix=str(prefix_meta),
+                                bimranges=scan_bimranges,
+                                logger=logger,
+                                route_label=str(route_name).upper(),
+                            )
+                            trait_shared_meta_cache[trait_token] = cached_meta
                             return cached_meta
                         sample_idx_meta = sample_idx_meta_prefetched
                         if sample_idx_meta is None:
@@ -8463,6 +8803,13 @@ def _run_gwas_pipeline(
                                 task.fail("Computing trait-subset row statistics ...Failed")
                                 raise
                             task.complete("Computing trait-subset row statistics ...Finished")
+                        cached_meta = _filter_trait_prepared_meta_by_bimranges(
+                            cached_meta,
+                            prefix=str(prefix_meta),
+                            bimranges=scan_bimranges,
+                            logger=logger,
+                            route_label=str(route_name).upper(),
+                        )
                         trait_shared_meta_cache[trait_token] = cached_meta
                         return cached_meta
 
@@ -9264,7 +9611,10 @@ def _run_gwas_pipeline(
                         strict_id_to_full_meta = None
             elif (
                 gwas_row_stat_mode == "global"
-                and str(args.model).lower() == "add"
+                and (
+                    str(args.model).lower() == "add"
+                    or len(scan_bimranges) > 0
+                )
             ):
                 global_prefix_meta = _as_plink_prefix(genofile_stream)
                 if global_prefix_meta is not None:
@@ -9277,6 +9627,13 @@ def _run_gwas_pipeline(
                         outprefix=str(outprefix),
                         logger=logger,
                         use_spinner=False,
+                    )
+                    global_trait_meta_single = _filter_trait_prepared_meta_by_bimranges(
+                        global_trait_meta_single,
+                        prefix=str(global_prefix_meta),
+                        bimranges=scan_bimranges,
+                        logger=logger,
+                        route_label="FARMCPU",
                     )
             if bool(strict_trait_meta_ready) and len(trait_names_seq) > 0:
                 gwas_meta_window_mb = int(
@@ -9351,6 +9708,13 @@ def _run_gwas_pipeline(
                             task.complete(
                                 "Computing trait-subset row statistics ...Finished"
                             )
+                        trait_meta_single = _filter_trait_prepared_meta_by_bimranges(
+                            trait_meta_single,
+                            prefix=str(strict_prefix_meta),
+                            bimranges=scan_bimranges,
+                            logger=logger,
+                            route_label="FARMCPU",
+                        )
                     farmcpu_cache_runtime = _force_farmcpu_trait_prepared_deferred_load(
                         farmcpu_cache_runtime,
                     )

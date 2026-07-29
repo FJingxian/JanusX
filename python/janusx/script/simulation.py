@@ -329,6 +329,46 @@ def _count_active_sites_in_intervals(
     return int(total)
 
 
+def _intervals_form_distinct_windows(
+    intervals: list[tuple[str, int, int]],
+) -> bool:
+    spans_by_chrom: dict[str, list[tuple[int, int]]] = {}
+    for chrom, start, end in intervals:
+        chrom_norm = _normalize_bim_chrom(chrom)
+        spans_by_chrom.setdefault(chrom_norm, []).append((int(start), int(end)))
+    for spans in spans_by_chrom.values():
+        spans_sorted = sorted(spans, key=lambda x: (int(x[0]), int(x[1])))
+        prev_end: Optional[int] = None
+        for start, end in spans_sorted:
+            if prev_end is not None and int(start) <= int(prev_end):
+                return False
+            prev_end = int(end)
+    return True
+
+
+def _intervals_have_active_sites_per_window(
+    intervals: list[tuple[str, int, int]],
+    *,
+    active_positions: Optional[dict[str, list[int]]],
+    min_active_sites_per_window: int = 1,
+) -> bool:
+    if active_positions is None:
+        return True
+    min_sites = max(1, int(min_active_sites_per_window))
+    for chrom, start, end in intervals:
+        if (
+            _count_active_sites_in_interval(
+                chrom,
+                int(start),
+                int(end),
+                active_positions=active_positions,
+            )
+            < min_sites
+        ):
+            return False
+    return True
+
+
 def _gff_logic_unit_min_active_sites(
     logic_mode: Optional[str],
     logic_size_weights: Optional[list[float]],
@@ -380,6 +420,14 @@ def _draw_single_causal_gene_unit(
         chosen = sorted((remaining[i] for i in pick_idx), key=lambda x: x[0])
         genes = [str(gene) for gene, _iv in chosen]
         intervals = [iv for _gene, iv in chosen]
+        if len(intervals) > 1 and not _intervals_form_distinct_windows(intervals):
+            continue
+        if len(intervals) > 1 and not _intervals_have_active_sites_per_window(
+            intervals,
+            active_positions=active_positions,
+            min_active_sites_per_window=1,
+        ):
+            continue
         unit_name = "|".join(genes)
         if unit_name in blocked_unit_names:
             continue

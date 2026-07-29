@@ -14,7 +14,8 @@ mod score_gpu;
 
 use self::bs::{beam_search_and_binary_mcc, beam_search_and_continuous_abs_corr, BeamAndResult};
 use self::bs::{
-    beam_search_train_test_continuous_fuzzy, evaluate_rule_continuous_dual,
+    beam_search_train_test_continuous_fuzzy,
+    beam_search_train_test_continuous_fuzzy_with_literal_scores, evaluate_rule_continuous_dual,
     materialize_rule_bits_dual, precompute_literal_singleton_scores_batched,
     LiteralScoreBatchRequest, LiteralSingletonScore,
 };
@@ -64,9 +65,6 @@ use crate::ml::extra_trees::ExtraTreesConfig;
 use crate::ml::pairwise_and::{
     feature_scores_pairwise_and_packed_dual_with_stage1, reset_pairwise_profile,
     snapshot_pairwise_profile,
-};
-use crate::ml::univariate::{
-    feature_scores_abs_corr_stage1, feature_scores_abs_corr_stage1_with_parallel,
 };
 use crate::stats_common::{
     arm_interrupt_trap, check_ctrlc, env_truthy, format_bytes, map_err_string_to_py,
@@ -2520,6 +2518,21 @@ struct GarfieldUnitPrepared {
     local_groups: Vec<usize>,
     geneset_stage_group_target: Option<usize>,
     null_unit_group_bin: u8,
+    train_literal_scores: Option<Vec<LiteralSingletonScore>>,
+}
+
+#[derive(Clone, Debug)]
+struct GarfieldSelectedRows {
+    selected_global_rows: Vec<usize>,
+    train_literal_scores: Option<Vec<LiteralSingletonScore>>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DosageStage1DualSummary {
+    n_ge1: usize,
+    n_ge2: usize,
+    sum_ge1: f64,
+    sum_ge2: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -2586,27 +2599,47 @@ fn beam_search_train_test_continuous_dispatch(
     y_test: &[f64],
     group_ids: &[usize],
     params: BeamSearchParams,
+    literal_scores: Option<&[LiteralSingletonScore]>,
 ) -> Result<Vec<BeamRuleCandidate>, String> {
     if let Some(train_hi) = prepared_bits.train_bits_hi.as_deref() {
         let test_hi = prepared_bits.test_bits_hi().ok_or_else(|| {
             "internal error: fuzzy GARFIELD prepared bits are missing test high bitplane"
                 .to_string()
         })?;
-        beam_search_train_test_continuous_fuzzy(
-            y_train,
-            prepared_bits.train_bits.as_slice(),
-            train_hi,
-            prepared_bits.row_words_train,
-            n_rows,
-            y_train.len(),
-            y_test,
-            prepared_bits.test_bits(),
-            test_hi,
-            prepared_bits.row_words_test,
-            y_test.len(),
-            group_ids,
-            params,
-        )
+        if let Some(scores) = literal_scores {
+            beam_search_train_test_continuous_fuzzy_with_literal_scores(
+                y_train,
+                prepared_bits.train_bits.as_slice(),
+                train_hi,
+                prepared_bits.row_words_train,
+                n_rows,
+                y_train.len(),
+                y_test,
+                prepared_bits.test_bits(),
+                test_hi,
+                prepared_bits.row_words_test,
+                y_test.len(),
+                group_ids,
+                params,
+                scores,
+            )
+        } else {
+            beam_search_train_test_continuous_fuzzy(
+                y_train,
+                prepared_bits.train_bits.as_slice(),
+                train_hi,
+                prepared_bits.row_words_train,
+                n_rows,
+                y_train.len(),
+                y_test,
+                prepared_bits.test_bits(),
+                test_hi,
+                prepared_bits.row_words_test,
+                y_test.len(),
+                group_ids,
+                params,
+            )
+        }
     } else {
         // Legacy packed-0/1 continuous beam path intentionally disabled.
         // Kept in comments so the old routing is still easy to recover if
@@ -4290,6 +4323,219 @@ fn geneset_priority_order_from_scores(scores: &[f64]) -> Vec<usize> {
         sb.total_cmp(&sa).then_with(|| a.cmp(&b))
     });
     order
+}
+
+fn geneset_priority_order_from_scores_subset(scores: &[f64], local_rows: &[usize]) -> Vec<usize> {
+    let mut order = local_rows.to_vec();
+    order.sort_by(|&a, &b| {
+        let sa = if scores
+            .get(a)
+            .copied()
+            .unwrap_or(f64::NEG_INFINITY)
+            .is_finite()
+        {
+            scores[a]
+        } else {
+            f64::NEG_INFINITY
+        };
+        let sb = if scores
+            .get(b)
+            .copied()
+            .unwrap_or(f64::NEG_INFINITY)
+            .is_finite()
+        {
+            scores[b]
+        } else {
+            f64::NEG_INFINITY
+        };
+        sb.total_cmp(&sa).then_with(|| a.cmp(&b))
+    });
+    order
+}
+
+fn take_prefix_per_group_rows(group_rows: &[Vec<usize>], per_group_limit: usize) -> Vec<usize> {
+    if per_group_limit == 0 || group_rows.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::<usize>::new();
+    for rows in group_rows.iter() {
+        out.extend(rows.iter().take(per_group_limit).copied());
+    }
+    out
+}
+
+fn prune_candidate_rows_by_ld_priority(
+    candidate_global_rows: &[usize],
+    priority_local_rows: &[usize],
+    logic_bits: &GarfieldLogicBits,
+    sample_indices: &[usize],
+) -> Result<Vec<usize>, String> {
+    let r2_threshold = garfield_geneset_ld_prune_r2();
+    if candidate_global_rows.len() <= 1
+        || priority_local_rows.is_empty()
+        || !(r2_threshold.is_finite() && r2_threshold > 0.0 && r2_threshold <= 1.0)
+    {
+        return Ok(priority_local_rows
+            .iter()
+            .filter_map(|&local_idx| candidate_global_rows.get(local_idx).copied())
+            .collect::<Vec<_>>());
+    }
+    let n_samples = sample_indices.len();
+    if n_samples <= 1 {
+        return Ok(priority_local_rows
+            .iter()
+            .filter_map(|&local_idx| candidate_global_rows.get(local_idx).copied())
+            .collect::<Vec<_>>());
+    }
+
+    let use_full_identity = sample_indices_are_full_identity(sample_indices, logic_bits.n_samples);
+    let mut packed_rows = Vec::<u64>::new();
+    let row_words = if use_full_identity {
+        logic_bits.row_words
+    } else {
+        let (packed_rows_out, row_words_out) = packed_rows_subset_from_full_bits(
+            logic_bits.bits_flat.as_slice(),
+            logic_bits.row_words,
+            candidate_global_rows,
+            sample_indices,
+            logic_bits.sites.len(),
+            logic_bits.n_samples,
+        )?;
+        packed_rows = packed_rows_out;
+        row_words_out
+    };
+    let row_slice = |local_idx: usize| -> &[u64] {
+        if use_full_identity {
+            let global_idx = candidate_global_rows[local_idx];
+            &logic_bits.bits_flat[global_idx * row_words..(global_idx + 1) * row_words]
+        } else {
+            &packed_rows[local_idx * row_words..(local_idx + 1) * row_words]
+        }
+    };
+
+    let mut support = vec![0usize; candidate_global_rows.len()];
+    let mut variable = vec![false; candidate_global_rows.len()];
+    for local_idx in 0..candidate_global_rows.len() {
+        let cnt = popcount(row_slice(local_idx)) as usize;
+        support[local_idx] = cnt;
+        variable[local_idx] = binary_row_var_from_support(cnt, n_samples) > 0.0;
+    }
+
+    let support_cache = geneset_ld_support_cache(n_samples, r2_threshold);
+    let support_conflict_buckets = support_cache.conflict_supports.as_slice();
+    let exact_bounds = support_cache.exact_bounds.as_slice();
+    let mut kept_local = Vec::<usize>::with_capacity(priority_local_rows.len());
+    let mut kept_by_support = vec![Vec::<usize>::new(); n_samples + 1];
+    let mut seen = vec![false; candidate_global_rows.len()];
+    for &local_idx in priority_local_rows.iter() {
+        check_ctrlc()?;
+        if local_idx >= candidate_global_rows.len() || seen[local_idx] || !variable[local_idx] {
+            continue;
+        }
+        seen[local_idx] = true;
+        let row_i = row_slice(local_idx);
+        let support_i = support[local_idx];
+        let exact_bounds_i = &exact_bounds[support_i];
+        let mut has_conflict = false;
+        for &support_j in support_conflict_buckets[support_i].iter() {
+            let bounds = exact_bounds_i[support_j];
+            for &kept_idx in kept_by_support[support_j].iter() {
+                let row_j = row_slice(kept_idx);
+                if bounds.matches(and_popcount(row_i, row_j) as usize) {
+                    has_conflict = true;
+                    break;
+                }
+            }
+            if has_conflict {
+                break;
+            }
+        }
+        if !has_conflict {
+            kept_local.push(local_idx);
+            kept_by_support[support_i].push(local_idx);
+        }
+    }
+    Ok(kept_local
+        .into_iter()
+        .map(|local_idx| candidate_global_rows[local_idx])
+        .collect::<Vec<_>>())
+}
+
+fn select_geneset_window_candidate_pool_rows(
+    unit: &GarfieldLogicUnit,
+    candidate_global_rows: &[usize],
+    scores: &[f64],
+    per_window_keep_k: usize,
+    logic_bits: &GarfieldLogicBits,
+    sample_indices: &[usize],
+    prune_with_ld: bool,
+) -> Result<Vec<usize>, String> {
+    if candidate_global_rows.is_empty() || per_window_keep_k == 0 || unit.spans.len() <= 1 {
+        return Ok(Vec::new());
+    }
+    let Some(group_ids) = build_unit_window_group_ids(
+        unit,
+        candidate_global_rows,
+        logic_bits.sites.as_slice(),
+        "geneset",
+    ) else {
+        return Ok(Vec::new());
+    };
+    let span_count = unit.spans.len();
+    let mut per_group_local = vec![Vec::<usize>::new(); span_count];
+    let mut overflow_local = Vec::<usize>::new();
+    for (local_idx, &gid) in group_ids.iter().enumerate() {
+        if gid < span_count {
+            per_group_local[gid].push(local_idx);
+        } else {
+            overflow_local.push(local_idx);
+        }
+    }
+
+    let mut per_group_global = Vec::<Vec<usize>>::with_capacity(span_count);
+    for local_rows in per_group_local.iter() {
+        if local_rows.is_empty() {
+            per_group_global.push(Vec::new());
+            continue;
+        }
+        let priority_local =
+            geneset_priority_order_from_scores_subset(scores, local_rows.as_slice());
+        let pruned_global = if prune_with_ld {
+            prune_candidate_rows_by_ld_priority(
+                candidate_global_rows,
+                priority_local.as_slice(),
+                logic_bits,
+                sample_indices,
+            )?
+        } else {
+            priority_local
+                .iter()
+                .filter_map(|&local_idx| candidate_global_rows.get(local_idx).copied())
+                .collect::<Vec<_>>()
+        };
+        per_group_global.push(pruned_global);
+    }
+
+    let mut selected = take_prefix_per_group_rows(per_group_global.as_slice(), per_window_keep_k);
+    if selected.is_empty() && !overflow_local.is_empty() {
+        let overflow_priority =
+            geneset_priority_order_from_scores_subset(scores, overflow_local.as_slice());
+        let overflow_rows = if prune_with_ld {
+            prune_candidate_rows_by_ld_priority(
+                candidate_global_rows,
+                overflow_priority.as_slice(),
+                logic_bits,
+                sample_indices,
+            )?
+        } else {
+            overflow_priority
+                .iter()
+                .filter_map(|&local_idx| candidate_global_rows.get(local_idx).copied())
+                .collect::<Vec<_>>()
+        };
+        selected.extend(overflow_rows.into_iter().take(per_window_keep_k));
+    }
+    Ok(selected)
 }
 
 fn rescue_geneset_missing_groups_local_indices<S: GarfieldChromPosSite>(
@@ -6552,6 +6798,268 @@ fn dosage_stage1_stats_for_row_words(
     (sum_x, sum_x2, sum_xy)
 }
 
+#[inline]
+fn dosage_stage1_dual_summary_for_row_words(
+    row_ge1: &[u64],
+    row_ge2: Option<&[u64]>,
+    sample_indices: &[usize],
+    y: &[f64],
+) -> DosageStage1DualSummary {
+    let mut n_ge1 = 0usize;
+    let mut n_ge2 = 0usize;
+    let mut sum_ge1 = 0.0f64;
+    let mut sum_ge2 = 0.0f64;
+    for (dst_s, &src_s) in sample_indices.iter().enumerate() {
+        let ge1 = ((row_ge1[src_s >> 6] >> (src_s & 63)) & 1u64) != 0;
+        let ge2 = row_ge2
+            .map(|row| ((row[src_s >> 6] >> (src_s & 63)) & 1u64) != 0)
+            .unwrap_or(false);
+        if ge1 {
+            n_ge1 += 1;
+            sum_ge1 += y[dst_s];
+        }
+        if ge2 {
+            n_ge2 += 1;
+            sum_ge2 += y[dst_s];
+        }
+    }
+    DosageStage1DualSummary {
+        n_ge1,
+        n_ge2,
+        sum_ge1,
+        sum_ge2,
+    }
+}
+
+#[inline]
+fn dosage_stage1_positive_score_from_summary(
+    summary: DosageStage1DualSummary,
+    total_sum_y: f64,
+    n_samples: usize,
+) -> ContinuousRuleScore {
+    score::score_cont_centered_gain_dual_from_summary(
+        total_sum_y,
+        n_samples,
+        summary.n_ge1,
+        summary.n_ge2,
+        summary.sum_ge1,
+        summary.sum_ge2,
+    )
+}
+
+#[inline]
+fn dosage_stage1_negated_score_from_summary(
+    summary: DosageStage1DualSummary,
+    total_sum_y: f64,
+    n_samples: usize,
+) -> ContinuousRuleScore {
+    score::score_cont_centered_gain_dual_from_summary(
+        total_sum_y,
+        n_samples,
+        n_samples.saturating_sub(summary.n_ge2),
+        n_samples.saturating_sub(summary.n_ge1),
+        total_sum_y - summary.sum_ge2,
+        total_sum_y - summary.sum_ge1,
+    )
+}
+
+fn dosage_stage1_dual_summaries_from_full_bits(
+    bits_flat: &[u64],
+    bits_hi_flat: Option<&[u64]>,
+    row_words: usize,
+    row_indices: &[usize],
+    sample_indices: &[usize],
+    y: &[f64],
+    n_rows_all: usize,
+    n_samples_all: usize,
+    allow_parallel: bool,
+) -> Result<Vec<DosageStage1DualSummary>, String> {
+    if row_words != words_for_samples(n_samples_all) {
+        return Err(format!(
+            "row_words mismatch for full bit matrix: got {row_words}, expected {}",
+            words_for_samples(n_samples_all)
+        ));
+    }
+    if bits_flat.len() != n_rows_all.saturating_mul(row_words) {
+        return Err("full bit matrix length mismatch".to_string());
+    }
+    if let Some(bits_hi_flat) = bits_hi_flat {
+        if bits_hi_flat.len() != n_rows_all.saturating_mul(row_words) {
+            return Err("full high-bit matrix length mismatch".to_string());
+        }
+    }
+    if sample_indices.len() != y.len() {
+        return Err(format!(
+            "sample_indices length ({}) != y length ({}) while computing dosage stage-1 dual summaries",
+            sample_indices.len(),
+            y.len()
+        ));
+    }
+    if let Some(&row_idx) = row_indices.iter().find(|&&row_idx| row_idx >= n_rows_all) {
+        return Err(format!(
+            "row index out of range while computing dosage stage-1 dual summaries: {row_idx}"
+        ));
+    }
+    if let Some(&sid) = sample_indices.iter().find(|&&sid| sid >= n_samples_all) {
+        return Err(format!(
+            "sample index out of range while computing dosage stage-1 dual summaries: {sid}"
+        ));
+    }
+    let summaries = if sample_indices_are_full_identity(sample_indices, n_samples_all) {
+        let zero_hi = if bits_hi_flat.is_none() {
+            Some(vec![0u64; row_words])
+        } else {
+            None
+        };
+        if allow_parallel && should_parallel_dense_decode(row_indices.len(), sample_indices.len()) {
+            row_indices
+                .par_iter()
+                .map(|&row_idx| {
+                    let row_ge1 = &bits_flat[row_idx * row_words..(row_idx + 1) * row_words];
+                    let row_ge2 = bits_hi_flat
+                        .map(|bits| &bits[row_idx * row_words..(row_idx + 1) * row_words])
+                        .unwrap_or_else(|| zero_hi.as_deref().expect("zero hi row must exist"));
+                    let (n_ge1, n_ge2, sum_ge1, sum_ge2) =
+                        dual_packed_summary(row_ge1, row_ge2, y, n_samples_all);
+                    DosageStage1DualSummary {
+                        n_ge1,
+                        n_ge2,
+                        sum_ge1,
+                        sum_ge2,
+                    }
+                })
+                .collect()
+        } else {
+            row_indices
+                .iter()
+                .map(|&row_idx| {
+                    let row_ge1 = &bits_flat[row_idx * row_words..(row_idx + 1) * row_words];
+                    let row_ge2 = bits_hi_flat
+                        .map(|bits| &bits[row_idx * row_words..(row_idx + 1) * row_words])
+                        .unwrap_or_else(|| zero_hi.as_deref().expect("zero hi row must exist"));
+                    let (n_ge1, n_ge2, sum_ge1, sum_ge2) =
+                        dual_packed_summary(row_ge1, row_ge2, y, n_samples_all);
+                    DosageStage1DualSummary {
+                        n_ge1,
+                        n_ge2,
+                        sum_ge1,
+                        sum_ge2,
+                    }
+                })
+                .collect()
+        }
+    } else if allow_parallel && should_parallel_dense_decode(row_indices.len(), sample_indices.len())
+    {
+        row_indices
+            .par_iter()
+            .map(|&row_idx| {
+                let row_ge1 = &bits_flat[row_idx * row_words..(row_idx + 1) * row_words];
+                let row_ge2 =
+                    bits_hi_flat.map(|bits| &bits[row_idx * row_words..(row_idx + 1) * row_words]);
+                dosage_stage1_dual_summary_for_row_words(row_ge1, row_ge2, sample_indices, y)
+            })
+            .collect()
+    } else {
+        row_indices
+            .iter()
+            .map(|&row_idx| {
+                let row_ge1 = &bits_flat[row_idx * row_words..(row_idx + 1) * row_words];
+                let row_ge2 =
+                    bits_hi_flat.map(|bits| &bits[row_idx * row_words..(row_idx + 1) * row_words]);
+                dosage_stage1_dual_summary_for_row_words(row_ge1, row_ge2, sample_indices, y)
+            })
+            .collect()
+    };
+    Ok(summaries)
+}
+
+fn dosage_stage1_dual_summaries_from_full_bits_range(
+    bits_flat: &[u64],
+    bits_hi_flat: Option<&[u64]>,
+    row_words: usize,
+    row_start: usize,
+    row_end: usize,
+    sample_indices: &[usize],
+    y: &[f64],
+    n_rows_all: usize,
+    n_samples_all: usize,
+) -> Result<Vec<DosageStage1DualSummary>, String> {
+    if row_end <= row_start {
+        return Ok(Vec::new());
+    }
+    let row_indices = (row_start..row_end).collect::<Vec<_>>();
+    dosage_stage1_dual_summaries_from_full_bits(
+        bits_flat,
+        bits_hi_flat,
+        row_words,
+        row_indices.as_slice(),
+        sample_indices,
+        y,
+        n_rows_all,
+        n_samples_all,
+        true,
+    )
+}
+
+fn dosage_stage1_raw_scores_from_dual_summaries(
+    summaries: &[DosageStage1DualSummary],
+    total_sum_y: f64,
+    n_samples: usize,
+    allow_parallel: bool,
+) -> Vec<f64> {
+    if allow_parallel && should_parallel_dense_decode(summaries.len(), n_samples) {
+        summaries
+            .par_iter()
+            .map(|summary| {
+                dosage_stage1_positive_score_from_summary(*summary, total_sum_y, n_samples).raw_score
+            })
+            .collect()
+    } else {
+        summaries
+            .iter()
+            .map(|summary| {
+                dosage_stage1_positive_score_from_summary(*summary, total_sum_y, n_samples).raw_score
+            })
+            .collect()
+    }
+}
+
+fn build_cached_literal_scores_from_selected_dual_summaries(
+    candidate_global_rows: &[usize],
+    selected_global_rows: &[usize],
+    summaries: &[DosageStage1DualSummary],
+    total_sum_y: f64,
+    n_samples: usize,
+) -> Result<Vec<LiteralSingletonScore>, String> {
+    let summary_index = candidate_global_rows
+        .iter()
+        .enumerate()
+        .map(|(i, &global_idx)| (global_idx, i))
+        .collect::<HashMap<usize, usize>>();
+    let mut out =
+        Vec::<LiteralSingletonScore>::with_capacity(selected_global_rows.len().saturating_mul(2));
+    for &global_idx in selected_global_rows.iter() {
+        let src_idx = summary_index.get(&global_idx).copied().ok_or_else(|| {
+            format!(
+                "GARFIELD Corr singleton cache lost stage-1 summary for row {}",
+                global_idx
+            )
+        })?;
+        let summary = summaries[src_idx];
+        let pos = dosage_stage1_positive_score_from_summary(summary, total_sum_y, n_samples);
+        let neg = dosage_stage1_negated_score_from_summary(summary, total_sum_y, n_samples);
+        out.push(LiteralSingletonScore {
+            train: pos,
+            test: pos,
+        });
+        out.push(LiteralSingletonScore {
+            train: neg,
+            test: neg,
+        });
+    }
+    Ok(out)
+}
+
 fn dosage_stage1_stats_from_full_bits(
     bits_flat: &[u64],
     bits_hi_flat: Option<&[u64]>,
@@ -7714,7 +8222,7 @@ fn select_logic_unit_global_rows(
     train_idx_local: &[usize],
     y_train: &[f64],
     allow_parallel: bool,
-) -> Result<Option<Vec<usize>>, String> {
+) -> Result<Option<GarfieldSelectedRows>, String> {
     check_ctrlc()?;
     if unit.indices.is_empty() {
         return Ok(None);
@@ -7739,7 +8247,7 @@ fn select_logic_unit_global_rows(
     }
     let selected_global_rows = if let Some(engine_one) = engine {
         let n_region = candidate_global_rows.len();
-        let keep_k = resolve_ml_keep_k(n_region, ml_top_k, ml_top_frac)
+        let per_window_keep_k = resolve_ml_keep_k(n_region, ml_top_k, ml_top_frac)
             .max(geneset_min_keep_k(unit_kind_lc, unit))
             .min(n_region);
 
@@ -7774,14 +8282,33 @@ fn select_logic_unit_global_rows(
                 feat_sum_x2.as_slice(),
                 feat_sum_xy.as_slice(),
             );
-            let top_local = rescue_geneset_missing_groups_local_indices(
-                unit,
-                candidate_global_rows.as_slice(),
-                topk_indices(&scores, keep_k).as_slice(),
-                geneset_priority_order_from_scores(scores.as_slice()).as_slice(),
-                logic_bits.sites.as_slice(),
-                unit_kind_lc,
-            )?;
+            let top_local = if unit_kind_lc == "geneset" && unit.spans.len() > 1 {
+                select_geneset_window_candidate_pool_rows(
+                    unit,
+                    candidate_global_rows.as_slice(),
+                    scores.as_slice(),
+                    per_window_keep_k,
+                    logic_bits,
+                    train_idx_local,
+                    false,
+                )?
+                .iter()
+                .filter_map(|global_idx| {
+                    candidate_global_rows
+                        .iter()
+                        .position(|&idx| idx == *global_idx)
+                })
+                .collect::<Vec<_>>()
+            } else {
+                rescue_geneset_missing_groups_local_indices(
+                    unit,
+                    candidate_global_rows.as_slice(),
+                    topk_indices(&scores, per_window_keep_k).as_slice(),
+                    geneset_priority_order_from_scores(scores.as_slice()).as_slice(),
+                    logic_bits.sites.as_slice(),
+                    unit_kind_lc,
+                )?
+            };
             GARFIELD_ML_SELECT_NS.fetch_add(
                 t0.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                 Ordering::Relaxed,
@@ -7789,19 +8316,20 @@ fn select_logic_unit_global_rows(
             if top_local.is_empty() {
                 return Ok(None);
             }
-            return Ok(Some(
-                top_local
+            return Ok(Some(GarfieldSelectedRows {
+                selected_global_rows: top_local
                     .iter()
                     .map(|&idx| candidate_global_rows[idx])
                     .collect::<Vec<_>>(),
-            ));
+                train_literal_scores: None,
+            }));
         }
 
         if engine_one == MlEngine::Corr {
             let t0 = Instant::now();
             let corr_allow_parallel =
                 geneset_corr_stage1_allow_parallel(unit_kind_lc, n_region, allow_parallel);
-            let (feat_sum_x, feat_sum_x2, feat_sum_xy) = dosage_stage1_stats_from_full_bits(
+            let summaries = dosage_stage1_dual_summaries_from_full_bits(
                 logic_bits.bits_flat.as_slice(),
                 logic_bits.bits_hi_flat.as_deref(),
                 logic_bits.row_words,
@@ -7812,17 +8340,47 @@ fn select_logic_unit_global_rows(
                 logic_bits.n_samples,
                 corr_allow_parallel,
             )?;
-            let scores = feature_scores_abs_corr_stage1_with_parallel(
-                feat_sum_x.as_slice(),
-                feat_sum_x2.as_slice(),
-                feat_sum_xy.as_slice(),
-                y_train,
+            let total_sum_y = y_train.iter().copied().sum::<f64>();
+            let scores = dosage_stage1_raw_scores_from_dual_summaries(
+                summaries.as_slice(),
+                total_sum_y,
+                y_train.len(),
                 corr_allow_parallel,
             );
+            if unit_kind_lc == "geneset" && unit.spans.len() > 1 {
+                let selected = select_geneset_window_candidate_pool_rows(
+                    unit,
+                    candidate_global_rows.as_slice(),
+                    scores.as_slice(),
+                    per_window_keep_k,
+                    logic_bits,
+                    train_idx_local,
+                    true,
+                )?;
+                GARFIELD_ML_SELECT_NS.fetch_add(
+                    t0.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                    Ordering::Relaxed,
+                );
+                if selected.is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(GarfieldSelectedRows {
+                    train_literal_scores: Some(
+                        build_cached_literal_scores_from_selected_dual_summaries(
+                            candidate_global_rows.as_slice(),
+                            selected.as_slice(),
+                            summaries.as_slice(),
+                            total_sum_y,
+                            y_train.len(),
+                        )?,
+                    ),
+                    selected_global_rows: selected,
+                }));
+            }
             let pruned_global_rows = if defer_corr_geneset_ld_prune {
-                if keep_k < candidate_global_rows.len() {
+                if per_window_keep_k < candidate_global_rows.len() {
                     let mut prescreen_k =
-                        corr_geneset_ld_prescreen_k(candidate_global_rows.len(), keep_k);
+                        corr_geneset_ld_prescreen_k(candidate_global_rows.len(), per_window_keep_k);
                     loop {
                         let top_local = topk_indices(&scores, prescreen_k);
                         let prescreen_rows = top_local
@@ -7836,7 +8394,9 @@ fn select_logic_unit_global_rows(
                             logic_bits,
                             train_idx_local,
                         )?;
-                        if pruned.len() >= keep_k || prescreen_k >= candidate_global_rows.len() {
+                        if pruned.len() >= per_window_keep_k
+                            || prescreen_k >= candidate_global_rows.len()
+                        {
                             break pruned;
                         }
                         let next_k = corr_geneset_ld_prescreen_k(
@@ -7880,10 +8440,10 @@ fn select_logic_unit_global_rows(
             let top_local = rescue_geneset_missing_groups_local_indices(
                 unit,
                 pruned_global_rows.as_slice(),
-                if pruned_global_rows.len() <= keep_k {
-                    (0..pruned_global_rows.len()).collect::<Vec<_>>()
+                if pruned_global_rows.len() <= per_window_keep_k {
+                    topk_indices(pruned_scores.as_slice(), pruned_global_rows.len())
                 } else {
-                    topk_indices(pruned_scores.as_slice(), keep_k)
+                    topk_indices(pruned_scores.as_slice(), per_window_keep_k)
                 }
                 .as_slice(),
                 geneset_priority_order_from_scores(pruned_scores.as_slice()).as_slice(),
@@ -7897,12 +8457,22 @@ fn select_logic_unit_global_rows(
             if top_local.is_empty() {
                 return Ok(None);
             }
-            return Ok(Some(
-                top_local
-                    .iter()
-                    .map(|&idx| pruned_global_rows[idx])
-                    .collect::<Vec<_>>(),
-            ));
+            let selected_global_rows = top_local
+                .iter()
+                .map(|&idx| pruned_global_rows[idx])
+                .collect::<Vec<_>>();
+            return Ok(Some(GarfieldSelectedRows {
+                train_literal_scores: Some(
+                    build_cached_literal_scores_from_selected_dual_summaries(
+                        candidate_global_rows.as_slice(),
+                        selected_global_rows.as_slice(),
+                        summaries.as_slice(),
+                        total_sum_y,
+                        y_train.len(),
+                    )?,
+                ),
+                selected_global_rows,
+            }));
         }
 
         // ---- General ML path (Vec<Vec<u8>>) ----
@@ -7935,30 +8505,61 @@ fn select_logic_unit_global_rows(
             },
             importance,
             perm_cfg,
-            keep_k,
+            if unit_kind_lc == "geneset" && unit.spans.len() > 1 {
+                per_window_keep_k
+                    .saturating_mul(unit.spans.len())
+                    .min(n_region)
+            } else {
+                per_window_keep_k
+            },
             GarfieldMlKeepPolicy::TopK,
             tree_cfg.seed ^ 0xB6D5_0C11_8E91_3F27,
             ml_group_ids.as_deref(),
         )?;
-        let top_local = rescue_geneset_missing_groups_local_indices(
-            unit,
-            candidate_global_rows.as_slice(),
-            top_local_base.as_slice(),
-            geneset_priority_order_from_scores(scores.as_slice()).as_slice(),
-            logic_bits.sites.as_slice(),
-            unit_kind_lc,
-        )?;
+        let top_local = if unit_kind_lc == "geneset" && unit.spans.len() > 1 {
+            select_geneset_window_candidate_pool_rows(
+                unit,
+                candidate_global_rows.as_slice(),
+                scores.as_slice(),
+                per_window_keep_k,
+                logic_bits,
+                train_idx_local,
+                false,
+            )?
+            .iter()
+            .filter_map(|global_idx| {
+                candidate_global_rows
+                    .iter()
+                    .position(|&idx| idx == *global_idx)
+            })
+            .collect::<Vec<_>>()
+        } else {
+            rescue_geneset_missing_groups_local_indices(
+                unit,
+                candidate_global_rows.as_slice(),
+                top_local_base.as_slice(),
+                geneset_priority_order_from_scores(scores.as_slice()).as_slice(),
+                logic_bits.sites.as_slice(),
+                unit_kind_lc,
+            )?
+        };
         if top_local.is_empty() {
             return Ok(None);
         }
-        top_local
-            .iter()
-            .map(|&idx| candidate_global_rows[idx])
-            .collect::<Vec<_>>()
+        GarfieldSelectedRows {
+            selected_global_rows: top_local
+                .iter()
+                .map(|&idx| candidate_global_rows[idx])
+                .collect::<Vec<_>>(),
+            train_literal_scores: None,
+        }
     } else {
-        candidate_global_rows
+        GarfieldSelectedRows {
+            selected_global_rows: candidate_global_rows,
+            train_literal_scores: None,
+        }
     };
-    if selected_global_rows.is_empty() {
+    if selected_global_rows.selected_global_rows.is_empty() {
         return Ok(None);
     }
     Ok(Some(selected_global_rows))
@@ -7982,7 +8583,7 @@ fn prepare_logic_unit_continuous(
     beam_params: BeamSearchParams,
 ) -> Result<Option<GarfieldUnitPrepared>, String> {
     check_ctrlc()?;
-    let Some(selected_global_rows) = select_logic_unit_global_rows(
+    let Some(selected_rows) = select_logic_unit_global_rows(
         unit,
         unit_kind_lc,
         response,
@@ -8000,6 +8601,7 @@ fn prepare_logic_unit_continuous(
     else {
         return Ok(None);
     };
+    let selected_global_rows = selected_rows.selected_global_rows;
 
     let local_groups = build_unit_window_group_ids(
         unit,
@@ -8025,6 +8627,7 @@ fn prepare_logic_unit_continuous(
             unit_kind_lc,
             null_unit_group_count,
         ),
+        train_literal_scores: selected_rows.train_literal_scores,
     }))
 }
 
@@ -8129,7 +8732,7 @@ fn prepare_logic_chunk_continuous(
                 .collect::<Vec<_>>()
         } else if engine_one == MlEngine::Corr {
             let t0 = Instant::now();
-            let (feat_sum_x, feat_sum_x2, feat_sum_xy) = dosage_stage1_stats_from_full_bits_range(
+            let summaries = dosage_stage1_dual_summaries_from_full_bits_range(
                 logic_bits.bits_flat.as_slice(),
                 logic_bits.bits_hi_flat.as_deref(),
                 logic_bits.row_words,
@@ -8140,11 +8743,11 @@ fn prepare_logic_chunk_continuous(
                 logic_bits.sites.len(),
                 logic_bits.n_samples,
             )?;
-            let scores = feature_scores_abs_corr_stage1(
-                feat_sum_x.as_slice(),
-                feat_sum_x2.as_slice(),
-                feat_sum_xy.as_slice(),
-                y_train,
+            let scores = dosage_stage1_raw_scores_from_dual_summaries(
+                summaries.as_slice(),
+                y_train.iter().copied().sum::<f64>(),
+                y_train.len(),
+                true,
             );
             let (top_keep, rand_keep) =
                 resolve_ml_top_random_counts(keep_k, GARFIELD_NULL_ML_TOP_FRAC);
@@ -8242,6 +8845,7 @@ fn prepare_logic_chunk_continuous(
         local_groups,
         geneset_stage_group_target: None,
         null_unit_group_bin: 0,
+        train_literal_scores: None,
     }))
 }
 
@@ -8275,6 +8879,7 @@ fn collect_rule_permutation_nulls_for_repeat(
         perm_test.as_slice(),
         prepared.local_groups.as_slice(),
         beam_params,
+        None,
     )?;
     let mut out = Vec::<GarfieldPermutationNullScores>::new();
 
@@ -8736,10 +9341,17 @@ fn evaluate_logic_unit_prepared_continuous(
     output_null_penalties: Option<Arc<RuleNullPenaltyLookup>>,
     top_rules_per_unit: usize,
     unit_kind_lc: &str,
-    _literal_scores: Option<&[LiteralSingletonScore]>,
     debug_probe: Option<&GarfieldBeamDebugProbe>,
 ) -> Result<GarfieldUnitEvaluationOutput, String> {
     let beam_params_search = beam_params_for_prepared(prepared, beam_params.clone());
+    let literal_scores = if prepared_bits.test_bits.is_none()
+        && prepared_bits.test_bits_hi.is_none()
+        && y_train == y_test
+    {
+        prepared.train_literal_scores.as_deref()
+    } else {
+        None
+    };
     let beam_hits = if prepared_bits.has_fuzzy_bin() {
         beam_search_train_test_continuous_dispatch(
             y_train,
@@ -8748,6 +9360,7 @@ fn evaluate_logic_unit_prepared_continuous(
             y_test,
             prepared.local_groups.as_slice(),
             beam_params_search.clone(),
+            literal_scores,
         )?
     } else {
         // Legacy packed-0/1 continuous beam paths intentionally disabled:
@@ -8978,7 +9591,6 @@ fn evaluate_logic_unit_continuous(
         top_rules_per_unit,
         unit_kind_lc,
         None,
-        None,
     )?
     .records)
 }
@@ -9074,9 +9686,6 @@ fn process_scan_unit_continuous(
                 t0.elapsed().as_secs_f64(),
             )?;
         }
-        // Legacy packed-0/1 singleton precompute is intentionally disabled
-        // together with the non-fuzzy continuous beam path.
-        let literal_scores: Option<Vec<LiteralSingletonScore>> = None;
         if let Some(t0) = unit_t0 {
             garfield_whole_genome_unit_breakpoint(
                 unit.label.as_str(),
@@ -9104,7 +9713,6 @@ fn process_scan_unit_continuous(
             output_null_penalties.clone(),
             top_rules_per_unit,
             unit_kind_lc,
-            literal_scores.as_ref().map(|v| v.as_slice()),
             debug_probe,
         ) {
             Ok(v) => v,
@@ -14920,7 +15528,8 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(selected, vec![0usize, 2usize]);
+        assert_eq!(selected.selected_global_rows, vec![0usize, 2usize]);
+        assert!(selected.train_literal_scores.is_none());
     }
 
     #[test]
@@ -15345,6 +15954,7 @@ mod tests {
             local_groups: vec![0, 1, 2],
             geneset_stage_group_target: Some(3),
             null_unit_group_bin: 0,
+            train_literal_scores: None,
         };
         let out = beam_params_for_prepared(
             &prepared,
@@ -15367,6 +15977,7 @@ mod tests {
             local_groups: vec![0, 1],
             geneset_stage_group_target: Some(2),
             null_unit_group_bin: 0,
+            train_literal_scores: None,
         };
         let out = beam_params_for_prepared(
             &prepared,
@@ -15433,6 +16044,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rescued, vec![1usize, 2usize]);
+    }
+
+    #[test]
+    fn test_take_prefix_per_group_rows_caps_each_group() {
+        let picked = take_prefix_per_group_rows(
+            &[
+                vec![10usize, 11usize, 12usize],
+                vec![20usize],
+                vec![30usize, 31usize],
+            ],
+            2,
+        );
+        assert_eq!(picked, vec![10usize, 11usize, 20usize, 30usize, 31usize]);
     }
 
     #[test]

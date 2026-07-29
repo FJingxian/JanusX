@@ -399,8 +399,8 @@ struct FuzzyBeamSupportSignature {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct LiteralSingletonScore {
-    train: ContinuousRuleScore,
-    test: ContinuousRuleScore,
+    pub(crate) train: ContinuousRuleScore,
+    pub(crate) test: ContinuousRuleScore,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -6908,7 +6908,7 @@ fn collect_known_rule_raw_scores_fuzzy(states: &[FuzzyBeamState]) -> RuleRawScor
     out
 }
 
-pub fn beam_search_train_test_continuous_fuzzy(
+fn beam_search_train_test_continuous_fuzzy_impl(
     y_train: &[f64],
     ge1_train: &[u64],
     ge2_train: &[u64],
@@ -6922,6 +6922,7 @@ pub fn beam_search_train_test_continuous_fuzzy(
     n_test: usize,
     group_ids: &[usize],
     params: BeamSearchParams,
+    literal_scores_override: Option<&[LiteralSingletonScore]>,
 ) -> Result<Vec<BeamRuleCandidate>, String> {
     let beam_t0 = Instant::now();
     let out = (|| {
@@ -6942,19 +6943,33 @@ pub fn beam_search_train_test_continuous_fuzzy(
         )?;
         let sum_y_train = y_train.iter().take(n_train).copied().sum::<f64>();
         let sum_y_test = y_test.iter().take(n_test).copied().sum::<f64>();
-        let literal_scores = precompute_literal_singleton_scores_fuzzy(
-            y_train,
-            n_train,
-            y_test,
-            n_test,
-            ge1_train,
-            ge2_train,
-            row_words_train,
-            ge1_test,
-            ge2_test,
-            row_words_test,
-            n_rows,
-        )?;
+        let literal_scores_storage;
+        let literal_scores = if let Some(scores) = literal_scores_override {
+            let expected = n_rows.saturating_mul(2);
+            if scores.len() != expected {
+                return Err(format!(
+                    "garfield::beam_search_train_test_continuous_fuzzy literal-score override length mismatch: got {}, expected {}",
+                    scores.len(),
+                    expected,
+                ));
+            }
+            scores
+        } else {
+            literal_scores_storage = precompute_literal_singleton_scores_fuzzy(
+                y_train,
+                n_train,
+                y_test,
+                n_test,
+                ge1_train,
+                ge2_train,
+                row_words_train,
+                ge1_test,
+                ge2_test,
+                row_words_test,
+                n_rows,
+            )?;
+            literal_scores_storage.as_slice()
+        };
         let literal_summaries = precompute_dual_literal_summaries(
             y_train,
             ge1_train,
@@ -6984,7 +6999,7 @@ pub fn beam_search_train_test_continuous_fuzzy(
                 needed_words_train,
                 n_train,
                 group_ids,
-                literal_scores.as_slice(),
+                literal_scores,
                 literal_summaries.as_slice(),
                 &params,
             )?;
@@ -7002,7 +7017,7 @@ pub fn beam_search_train_test_continuous_fuzzy(
                     needed_words_train,
                     n_train,
                     group_ids,
-                    literal_scores.as_slice(),
+                    literal_scores,
                     literal_summaries.as_slice(),
                     &params,
                 )?;
@@ -7023,7 +7038,7 @@ pub fn beam_search_train_test_continuous_fuzzy(
                 needed_words_train,
                 n_train,
                 group_ids,
-                literal_scores.as_slice(),
+                literal_scores,
                 literal_summaries.as_slice(),
                 &params,
             )?;
@@ -7045,7 +7060,7 @@ pub fn beam_search_train_test_continuous_fuzzy(
                 needed_words_train,
                 n_train,
                 group_ids,
-                literal_scores.as_slice(),
+                literal_scores,
                 literal_summaries.as_slice(),
                 &params,
             )?;
@@ -7070,7 +7085,7 @@ pub fn beam_search_train_test_continuous_fuzzy(
                     needed_words_train,
                     n_train,
                     group_ids,
-                    literal_scores.as_slice(),
+                    literal_scores,
                     literal_summaries.as_slice(),
                     &params,
                 )?
@@ -7086,7 +7101,7 @@ pub fn beam_search_train_test_continuous_fuzzy(
                     needed_words_train,
                     n_train,
                     group_ids,
-                    literal_scores.as_slice(),
+                    literal_scores,
                     literal_summaries.as_slice(),
                     &params,
                 )?
@@ -7169,7 +7184,7 @@ pub fn beam_search_train_test_continuous_fuzzy(
                 row_words_test,
                 n_rows,
                 n_test,
-                literal_scores.as_slice(),
+                literal_scores,
                 &params,
             )?;
             let train_score = {
@@ -7182,7 +7197,7 @@ pub fn beam_search_train_test_continuous_fuzzy(
                     row_words_train,
                     n_rows,
                     n_train,
-                    literal_scores.as_slice(),
+                    literal_scores,
                     true,
                     params.disable_parent_delta,
                 )?;
@@ -7209,7 +7224,7 @@ pub fn beam_search_train_test_continuous_fuzzy(
                     train: state.train,
                     test,
                 },
-                literal_scores.as_slice(),
+                literal_scores,
                 &params,
             );
             if cand.rule.len() > exhaustive_depth
@@ -7235,6 +7250,73 @@ pub fn beam_search_train_test_continuous_fuzzy(
     GARFIELD_BEAM_PROFILE_CALLS.fetch_add(1, Ordering::Relaxed);
     GARFIELD_BEAM_PROFILE_TOTAL_NS.fetch_add(elapsed_ns_saturating(beam_t0), Ordering::Relaxed);
     out
+}
+
+pub fn beam_search_train_test_continuous_fuzzy(
+    y_train: &[f64],
+    ge1_train: &[u64],
+    ge2_train: &[u64],
+    row_words_train: usize,
+    n_rows: usize,
+    n_train: usize,
+    y_test: &[f64],
+    ge1_test: &[u64],
+    ge2_test: &[u64],
+    row_words_test: usize,
+    n_test: usize,
+    group_ids: &[usize],
+    params: BeamSearchParams,
+) -> Result<Vec<BeamRuleCandidate>, String> {
+    beam_search_train_test_continuous_fuzzy_impl(
+        y_train,
+        ge1_train,
+        ge2_train,
+        row_words_train,
+        n_rows,
+        n_train,
+        y_test,
+        ge1_test,
+        ge2_test,
+        row_words_test,
+        n_test,
+        group_ids,
+        params,
+        None,
+    )
+}
+
+pub(crate) fn beam_search_train_test_continuous_fuzzy_with_literal_scores(
+    y_train: &[f64],
+    ge1_train: &[u64],
+    ge2_train: &[u64],
+    row_words_train: usize,
+    n_rows: usize,
+    n_train: usize,
+    y_test: &[f64],
+    ge1_test: &[u64],
+    ge2_test: &[u64],
+    row_words_test: usize,
+    n_test: usize,
+    group_ids: &[usize],
+    params: BeamSearchParams,
+    literal_scores: &[LiteralSingletonScore],
+) -> Result<Vec<BeamRuleCandidate>, String> {
+    beam_search_train_test_continuous_fuzzy_impl(
+        y_train,
+        ge1_train,
+        ge2_train,
+        row_words_train,
+        n_rows,
+        n_train,
+        y_test,
+        ge1_test,
+        ge2_test,
+        row_words_test,
+        n_test,
+        group_ids,
+        params,
+        Some(literal_scores),
+    )
 }
 
 fn final_test_score_for_rule_fuzzy(

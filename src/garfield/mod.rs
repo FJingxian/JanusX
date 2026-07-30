@@ -128,6 +128,8 @@ const GARFIELD_GENESET_LD_PRUNE_R2_DEFAULT: f64 = 0.80;
 const GARFIELD_GENESET_CORR_SERIAL_MAX_ROWS: usize = 256;
 const GARFIELD_GENESET_CORR_PRESCREEN_SLACK_MIN: usize = 8;
 const GARFIELD_GENESET_CORR_PRESCREEN_SLACK_MAX: usize = 32;
+const GARFIELD_SINGLE_WINDOW_CANDIDATE_MULTIPLIER: usize = 4;
+const GARFIELD_SINGLE_WINDOW_CANDIDATE_ADD: usize = 32;
 static GARFIELD_ML_SELECT_NS: AtomicU64 = AtomicU64::new(0);
 static GARFIELD_DENSE_DOSAGE_DECODE_NS: AtomicU64 = AtomicU64::new(0);
 static GARFIELD_GENESET_LD_PRUNE_NS: AtomicU64 = AtomicU64::new(0);
@@ -370,6 +372,50 @@ fn garfield_geneset_ld_prune_r2() -> f64 {
     parse_env_f64("JX_GARFIELD_GENESET_LD_PRUNE_R2")
         .filter(|v| *v > 0.0 && *v <= 1.0)
         .unwrap_or(GARFIELD_GENESET_LD_PRUNE_R2_DEFAULT)
+}
+
+#[inline]
+fn parse_env_usize_allow_zero(name: &str) -> Option<usize> {
+    env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+}
+
+#[inline]
+fn garfield_single_window_candidate_override() -> Option<(usize, usize)> {
+    let mul = parse_env_usize_allow_zero("JX_GARFIELD_SINGLE_WINDOW_CANDIDATE_MULTIPLIER");
+    let add = parse_env_usize_allow_zero("JX_GARFIELD_SINGLE_WINDOW_CANDIDATE_ADD");
+    if mul.is_none() && add.is_none() {
+        return None;
+    }
+    Some((mul.unwrap_or(1).max(1), add.unwrap_or(0)))
+}
+
+#[inline]
+fn resolve_dynamic_single_window_candidate_pool_k(beam_k: usize, n_region: usize) -> usize {
+    if beam_k == 0 || n_region <= beam_k {
+        return beam_k.min(n_region);
+    }
+    let hard_cap = beam_k
+        .saturating_mul(GARFIELD_SINGLE_WINDOW_CANDIDATE_MULTIPLIER)
+        .max(beam_k.saturating_add(GARFIELD_SINGLE_WINDOW_CANDIDATE_ADD))
+        .min(n_region)
+        .max(beam_k);
+    let ratio = (n_region as f64) / (beam_k as f64);
+    let raw_extra = if ratio <= 2.0 {
+        n_region.saturating_sub(beam_k)
+    } else if ratio <= 4.0 {
+        beam_k / 2
+    } else if ratio <= 8.0 {
+        beam_k.saturating_mul(2) / 3
+    } else {
+        beam_k.saturating_mul(3) / 4
+    };
+    let extra = raw_extra
+        .max(16)
+        .min(96)
+        .min(n_region.saturating_sub(beam_k));
+    beam_k.saturating_add(extra).min(hard_cap).max(beam_k)
 }
 
 #[inline]
@@ -6948,7 +6994,8 @@ fn dosage_stage1_dual_summaries_from_full_bits(
                 })
                 .collect()
         }
-    } else if allow_parallel && should_parallel_dense_decode(row_indices.len(), sample_indices.len())
+    } else if allow_parallel
+        && should_parallel_dense_decode(row_indices.len(), sample_indices.len())
     {
         row_indices
             .par_iter()
@@ -7011,14 +7058,16 @@ fn dosage_stage1_raw_scores_from_dual_summaries(
         summaries
             .par_iter()
             .map(|summary| {
-                dosage_stage1_positive_score_from_summary(*summary, total_sum_y, n_samples).raw_score
+                dosage_stage1_positive_score_from_summary(*summary, total_sum_y, n_samples)
+                    .raw_score
             })
             .collect()
     } else {
         summaries
             .iter()
             .map(|summary| {
-                dosage_stage1_positive_score_from_summary(*summary, total_sum_y, n_samples).raw_score
+                dosage_stage1_positive_score_from_summary(*summary, total_sum_y, n_samples)
+                    .raw_score
             })
             .collect()
     }
@@ -7962,7 +8011,34 @@ fn resolve_ml_keep_k(n_region: usize, ml_top_k: usize, ml_top_frac: f64) -> usiz
 }
 
 #[inline]
-fn corr_geneset_ld_prescreen_k(n_region: usize, keep_k: usize) -> usize {
+fn resolve_stage1_candidate_pool_k(
+    unit_kind_lc: &str,
+    unit: &GarfieldLogicUnit,
+    n_region: usize,
+    ml_top_k: usize,
+    ml_top_frac: f64,
+) -> usize {
+    let beam_k = resolve_ml_keep_k(n_region, ml_top_k, ml_top_frac)
+        .max(geneset_min_keep_k(unit_kind_lc, unit))
+        .min(n_region);
+    if beam_k == 0 {
+        return 0;
+    }
+    if unit_kind_lc == "geneset" && unit.spans.len() > 1 {
+        return beam_k;
+    }
+    if let Some((mul, add)) = garfield_single_window_candidate_override() {
+        return beam_k
+            .saturating_mul(mul)
+            .max(beam_k.saturating_add(add))
+            .min(n_region)
+            .max(beam_k);
+    }
+    resolve_dynamic_single_window_candidate_pool_k(beam_k, n_region)
+}
+
+#[inline]
+fn corr_candidate_pool_prescreen_k(n_region: usize, keep_k: usize) -> usize {
     if n_region == 0 {
         return 0;
     }
@@ -7972,6 +8048,58 @@ fn corr_geneset_ld_prescreen_k(n_region: usize, keep_k: usize) -> usize {
         GARFIELD_GENESET_CORR_PRESCREEN_SLACK_MAX,
     );
     n_region.min(keep_k.saturating_add(slack)).max(keep_k)
+}
+
+fn select_single_window_candidate_pool_rows(
+    candidate_global_rows: &[usize],
+    scores: &[f64],
+    target_k: usize,
+    logic_bits: &GarfieldLogicBits,
+    sample_indices: &[usize],
+) -> Result<Vec<usize>, String> {
+    if candidate_global_rows.is_empty() || target_k == 0 {
+        return Ok(Vec::new());
+    }
+    let target_k = target_k.max(1).min(candidate_global_rows.len());
+    if candidate_global_rows.len() <= target_k {
+        let priority = geneset_priority_order_from_scores(scores);
+        return prune_candidate_rows_by_ld_priority(
+            candidate_global_rows,
+            priority.as_slice(),
+            logic_bits,
+            sample_indices,
+        )
+        .map(|mut picked| {
+            if picked.len() > target_k {
+                picked.truncate(target_k);
+            }
+            picked
+        });
+    }
+    let mut prescreen_k = corr_candidate_pool_prescreen_k(candidate_global_rows.len(), target_k);
+    loop {
+        let priority_local = topk_indices(scores, prescreen_k);
+        let mut pruned = prune_candidate_rows_by_ld_priority(
+            candidate_global_rows,
+            priority_local.as_slice(),
+            logic_bits,
+            sample_indices,
+        )?;
+        if pruned.len() > target_k {
+            pruned.truncate(target_k);
+        }
+        if pruned.len() >= target_k || prescreen_k >= candidate_global_rows.len() {
+            return Ok(pruned);
+        }
+        let next_k = corr_candidate_pool_prescreen_k(
+            candidate_global_rows.len(),
+            prescreen_k.saturating_mul(2),
+        );
+        if next_k <= prescreen_k {
+            return Ok(pruned);
+        }
+        prescreen_k = next_k;
+    }
 }
 
 #[inline]
@@ -8247,9 +8375,11 @@ fn select_logic_unit_global_rows(
     }
     let selected_global_rows = if let Some(engine_one) = engine {
         let n_region = candidate_global_rows.len();
-        let per_window_keep_k = resolve_ml_keep_k(n_region, ml_top_k, ml_top_frac)
+        let beam_keep_k = resolve_ml_keep_k(n_region, ml_top_k, ml_top_frac)
             .max(geneset_min_keep_k(unit_kind_lc, unit))
             .min(n_region);
+        let candidate_pool_k =
+            resolve_stage1_candidate_pool_k(unit_kind_lc, unit, n_region, ml_top_k, ml_top_frac);
 
         // ---- PairwiseAnd fast path: packed subset + cached stage-1 stats ----
         if engine_one == MlEngine::PairwiseAnd {
@@ -8282,45 +8412,34 @@ fn select_logic_unit_global_rows(
                 feat_sum_x2.as_slice(),
                 feat_sum_xy.as_slice(),
             );
-            let top_local = if unit_kind_lc == "geneset" && unit.spans.len() > 1 {
+            let selected_global_rows = if unit_kind_lc == "geneset" && unit.spans.len() > 1 {
                 select_geneset_window_candidate_pool_rows(
                     unit,
                     candidate_global_rows.as_slice(),
                     scores.as_slice(),
-                    per_window_keep_k,
+                    beam_keep_k,
                     logic_bits,
                     train_idx_local,
                     false,
                 )?
-                .iter()
-                .filter_map(|global_idx| {
-                    candidate_global_rows
-                        .iter()
-                        .position(|&idx| idx == *global_idx)
-                })
-                .collect::<Vec<_>>()
             } else {
-                rescue_geneset_missing_groups_local_indices(
-                    unit,
+                select_single_window_candidate_pool_rows(
                     candidate_global_rows.as_slice(),
-                    topk_indices(&scores, per_window_keep_k).as_slice(),
-                    geneset_priority_order_from_scores(scores.as_slice()).as_slice(),
-                    logic_bits.sites.as_slice(),
-                    unit_kind_lc,
+                    scores.as_slice(),
+                    candidate_pool_k,
+                    logic_bits,
+                    train_idx_local,
                 )?
             };
             GARFIELD_ML_SELECT_NS.fetch_add(
                 t0.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                 Ordering::Relaxed,
             );
-            if top_local.is_empty() {
+            if selected_global_rows.is_empty() {
                 return Ok(None);
             }
             return Ok(Some(GarfieldSelectedRows {
-                selected_global_rows: top_local
-                    .iter()
-                    .map(|&idx| candidate_global_rows[idx])
-                    .collect::<Vec<_>>(),
+                selected_global_rows,
                 train_literal_scores: None,
             }));
         }
@@ -8352,7 +8471,7 @@ fn select_logic_unit_global_rows(
                     unit,
                     candidate_global_rows.as_slice(),
                     scores.as_slice(),
-                    per_window_keep_k,
+                    beam_keep_k,
                     logic_bits,
                     train_idx_local,
                     true,
@@ -8378,9 +8497,9 @@ fn select_logic_unit_global_rows(
                 }));
             }
             let pruned_global_rows = if defer_corr_geneset_ld_prune {
-                if per_window_keep_k < candidate_global_rows.len() {
+                if beam_keep_k < candidate_global_rows.len() {
                     let mut prescreen_k =
-                        corr_geneset_ld_prescreen_k(candidate_global_rows.len(), per_window_keep_k);
+                        corr_candidate_pool_prescreen_k(candidate_global_rows.len(), beam_keep_k);
                     loop {
                         let top_local = topk_indices(&scores, prescreen_k);
                         let prescreen_rows = top_local
@@ -8394,12 +8513,11 @@ fn select_logic_unit_global_rows(
                             logic_bits,
                             train_idx_local,
                         )?;
-                        if pruned.len() >= per_window_keep_k
-                            || prescreen_k >= candidate_global_rows.len()
+                        if pruned.len() >= beam_keep_k || prescreen_k >= candidate_global_rows.len()
                         {
                             break pruned;
                         }
-                        let next_k = corr_geneset_ld_prescreen_k(
+                        let next_k = corr_candidate_pool_prescreen_k(
                             candidate_global_rows.len(),
                             prescreen_k.saturating_mul(2),
                         );
@@ -8420,47 +8538,57 @@ fn select_logic_unit_global_rows(
             } else {
                 candidate_global_rows.clone()
             };
-            let score_index = candidate_global_rows
-                .iter()
-                .enumerate()
-                .map(|(i, &global_idx)| (global_idx, i))
-                .collect::<HashMap<usize, usize>>();
-            let pruned_scores = pruned_global_rows
-                .iter()
-                .map(|global_idx| {
-                    let score_idx = score_index.get(global_idx).copied().ok_or_else(|| {
-                        format!(
-                            "GARFIELD Corr geneset prescreen lost score index for row {}",
-                            global_idx
-                        )
-                    })?;
-                    Ok(scores[score_idx])
-                })
-                .collect::<Result<Vec<f64>, String>>()?;
-            let top_local = rescue_geneset_missing_groups_local_indices(
-                unit,
-                pruned_global_rows.as_slice(),
-                if pruned_global_rows.len() <= per_window_keep_k {
-                    topk_indices(pruned_scores.as_slice(), pruned_global_rows.len())
-                } else {
-                    topk_indices(pruned_scores.as_slice(), per_window_keep_k)
-                }
-                .as_slice(),
-                geneset_priority_order_from_scores(pruned_scores.as_slice()).as_slice(),
-                logic_bits.sites.as_slice(),
-                unit_kind_lc,
-            )?;
+            let selected_global_rows = if defer_corr_geneset_ld_prune {
+                let score_index = candidate_global_rows
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &global_idx)| (global_idx, i))
+                    .collect::<HashMap<usize, usize>>();
+                let pruned_scores = pruned_global_rows
+                    .iter()
+                    .map(|global_idx| {
+                        let score_idx = score_index.get(global_idx).copied().ok_or_else(|| {
+                            format!(
+                                "GARFIELD Corr geneset prescreen lost score index for row {}",
+                                global_idx
+                            )
+                        })?;
+                        Ok(scores[score_idx])
+                    })
+                    .collect::<Result<Vec<f64>, String>>()?;
+                let top_local = rescue_geneset_missing_groups_local_indices(
+                    unit,
+                    pruned_global_rows.as_slice(),
+                    if pruned_global_rows.len() <= beam_keep_k {
+                        topk_indices(pruned_scores.as_slice(), pruned_global_rows.len())
+                    } else {
+                        topk_indices(pruned_scores.as_slice(), beam_keep_k)
+                    }
+                    .as_slice(),
+                    geneset_priority_order_from_scores(pruned_scores.as_slice()).as_slice(),
+                    logic_bits.sites.as_slice(),
+                    unit_kind_lc,
+                )?;
+                top_local
+                    .iter()
+                    .map(|&idx| pruned_global_rows[idx])
+                    .collect::<Vec<_>>()
+            } else {
+                select_single_window_candidate_pool_rows(
+                    candidate_global_rows.as_slice(),
+                    scores.as_slice(),
+                    candidate_pool_k,
+                    logic_bits,
+                    train_idx_local,
+                )?
+            };
             GARFIELD_ML_SELECT_NS.fetch_add(
                 t0.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                 Ordering::Relaxed,
             );
-            if top_local.is_empty() {
+            if selected_global_rows.is_empty() {
                 return Ok(None);
             }
-            let selected_global_rows = top_local
-                .iter()
-                .map(|&idx| pruned_global_rows[idx])
-                .collect::<Vec<_>>();
             return Ok(Some(GarfieldSelectedRows {
                 train_literal_scores: Some(
                     build_cached_literal_scores_from_selected_dual_summaries(
@@ -8494,7 +8622,7 @@ fn select_logic_unit_global_rows(
             logic_bits.sites.as_slice(),
             unit_kind_lc,
         );
-        let (top_local_base, scores) = select_ml_top_local_indices_with_scores(
+        let (_top_local_base, scores) = select_ml_top_local_indices_with_scores(
             dense_train.as_slice(),
             y_train,
             response,
@@ -8506,51 +8634,38 @@ fn select_logic_unit_global_rows(
             importance,
             perm_cfg,
             if unit_kind_lc == "geneset" && unit.spans.len() > 1 {
-                per_window_keep_k
-                    .saturating_mul(unit.spans.len())
-                    .min(n_region)
+                beam_keep_k.saturating_mul(unit.spans.len()).min(n_region)
             } else {
-                per_window_keep_k
+                candidate_pool_k
             },
             GarfieldMlKeepPolicy::TopK,
             tree_cfg.seed ^ 0xB6D5_0C11_8E91_3F27,
             ml_group_ids.as_deref(),
         )?;
-        let top_local = if unit_kind_lc == "geneset" && unit.spans.len() > 1 {
+        let selected_global_rows = if unit_kind_lc == "geneset" && unit.spans.len() > 1 {
             select_geneset_window_candidate_pool_rows(
                 unit,
                 candidate_global_rows.as_slice(),
                 scores.as_slice(),
-                per_window_keep_k,
+                beam_keep_k,
                 logic_bits,
                 train_idx_local,
                 false,
             )?
-            .iter()
-            .filter_map(|global_idx| {
-                candidate_global_rows
-                    .iter()
-                    .position(|&idx| idx == *global_idx)
-            })
-            .collect::<Vec<_>>()
         } else {
-            rescue_geneset_missing_groups_local_indices(
-                unit,
+            select_single_window_candidate_pool_rows(
                 candidate_global_rows.as_slice(),
-                top_local_base.as_slice(),
-                geneset_priority_order_from_scores(scores.as_slice()).as_slice(),
-                logic_bits.sites.as_slice(),
-                unit_kind_lc,
+                scores.as_slice(),
+                candidate_pool_k,
+                logic_bits,
+                train_idx_local,
             )?
         };
-        if top_local.is_empty() {
+        if selected_global_rows.is_empty() {
             return Ok(None);
         }
         GarfieldSelectedRows {
-            selected_global_rows: top_local
-                .iter()
-                .map(|&idx| candidate_global_rows[idx])
-                .collect::<Vec<_>>(),
+            selected_global_rows,
             train_literal_scores: None,
         }
     } else {

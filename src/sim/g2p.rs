@@ -102,6 +102,7 @@ const BED_SIM_FAST_WINDOW_MB: usize = 64;
 const MAX_REALIZED_LOGIC_REDRAWS: usize = 64;
 const DEFAULT_REALIZED_LOGIC_DELTA: f64 = 1e-6;
 const DEFAULT_PURE_EPI_VAR_MIN: f64 = 1e-4;
+const DEFAULT_LOGIC_POOL_REPRESENTATIVE_R2: f64 = 0.80;
 
 enum LogicTermSampler {
     None,
@@ -2577,7 +2578,8 @@ fn reservoir_sample_grouped_pools(
         let sampled = reservoir_sample(sub_pools[0].clone(), cap, rng);
         return (sampled.clone(), vec![sampled]);
     }
-    let per_group_cap = cap.max(sub_pools.len()).saturating_add(sub_pools.len() - 1) / sub_pools.len();
+    let per_group_cap =
+        cap.max(sub_pools.len()).saturating_add(sub_pools.len() - 1) / sub_pools.len();
     let mut merged: Vec<usize> = Vec::new();
     let mut seen: HashSet<usize> = HashSet::new();
     let mut sampled_subs: Vec<Vec<usize>> = Vec::with_capacity(sub_pools.len());
@@ -2591,6 +2593,216 @@ fn reservoir_sample_grouped_pools(
         sampled_subs.push(sampled);
     }
     (merged, sampled_subs)
+}
+
+#[inline]
+fn binary_row_variance01(bits: &[u8]) -> f64 {
+    if bits.is_empty() {
+        return 0.0;
+    }
+    let p = bits.iter().filter(|&&v| v != 0).count() as f64 / bits.len() as f64;
+    p * (1.0 - p)
+}
+
+#[inline]
+fn dosage_row_variance(row: &[f32]) -> f64 {
+    if row.is_empty() {
+        return 0.0;
+    }
+    let mean = row.iter().map(|&v| (v as f64).clamp(0.0, 2.0)).sum::<f64>() / row.len() as f64;
+    row.iter()
+        .map(|&v| {
+            let d = (v as f64).clamp(0.0, 2.0) - mean;
+            d * d
+        })
+        .sum::<f64>()
+        / row.len() as f64
+}
+
+#[inline]
+fn logic_pool_representative_r2(logic_ld_max: f64) -> f64 {
+    let thr = if logic_ld_max.is_finite() && logic_ld_max > 0.0 {
+        logic_ld_max.min(DEFAULT_LOGIC_POOL_REPRESENTATIVE_R2)
+    } else {
+        DEFAULT_LOGIC_POOL_REPRESENTATIVE_R2
+    };
+    thr.clamp(0.0, 1.0)
+}
+
+fn logic_pool_priority_order(
+    indices: &[usize],
+    row_map: &HashMap<usize, Vec<f32>>,
+    bin_map: &HashMap<usize, Vec<u8>>,
+    sites: &[SimSiteRecord],
+    logic_effect_model: LogicEffectModel,
+) -> Vec<usize> {
+    let mut order = indices.to_vec();
+    order.sort_by(|&a, &b| {
+        let var_a = match logic_effect_model {
+            LogicEffectModel::Gate => bin_map
+                .get(&a)
+                .map(|row| binary_row_variance01(row.as_slice()))
+                .unwrap_or(f64::NEG_INFINITY),
+            LogicEffectModel::CenteredInteraction => row_map
+                .get(&a)
+                .map(|row| dosage_row_variance(row.as_slice()))
+                .unwrap_or(f64::NEG_INFINITY),
+        };
+        let var_b = match logic_effect_model {
+            LogicEffectModel::Gate => bin_map
+                .get(&b)
+                .map(|row| binary_row_variance01(row.as_slice()))
+                .unwrap_or(f64::NEG_INFINITY),
+            LogicEffectModel::CenteredInteraction => row_map
+                .get(&b)
+                .map(|row| dosage_row_variance(row.as_slice()))
+                .unwrap_or(f64::NEG_INFINITY),
+        };
+        var_b
+            .total_cmp(&var_a)
+            .then_with(|| sites[b].maf.total_cmp(&sites[a].maf))
+            .then_with(|| {
+                normalize_chrom(sites[a].chrom.as_str())
+                    .cmp(&normalize_chrom(sites[b].chrom.as_str()))
+            })
+            .then_with(|| sites[a].pos.cmp(&sites[b].pos))
+            .then_with(|| a.cmp(&b))
+    });
+    order
+}
+
+fn logic_pool_member_r2(
+    left: usize,
+    right: usize,
+    row_map: &HashMap<usize, Vec<f32>>,
+    bin_map: &HashMap<usize, Vec<u8>>,
+    logic_effect_model: LogicEffectModel,
+) -> Result<f64, String> {
+    match logic_effect_model {
+        LogicEffectModel::Gate => Ok(binary_r2(
+            bin_map
+                .get(&left)
+                .ok_or_else(|| "missing logic row".to_string())?,
+            bin_map
+                .get(&right)
+                .ok_or_else(|| "missing logic row".to_string())?,
+        )),
+        LogicEffectModel::CenteredInteraction => Ok(dosage_row_r2(
+            row_map
+                .get(&left)
+                .ok_or_else(|| "missing logic dosage row".to_string())?,
+            row_map
+                .get(&right)
+                .ok_or_else(|| "missing logic dosage row".to_string())?,
+        )),
+    }
+}
+
+fn prune_logic_pool_indices_by_ld(
+    indices: &[usize],
+    row_map: &HashMap<usize, Vec<f32>>,
+    bin_map: &HashMap<usize, Vec<u8>>,
+    sites: &[SimSiteRecord],
+    logic_effect_model: LogicEffectModel,
+    r2_threshold: f64,
+) -> Result<Vec<usize>, String> {
+    if indices.len() <= 1 || !(r2_threshold.is_finite() && r2_threshold > 0.0) {
+        return Ok(logic_pool_priority_order(
+            indices,
+            row_map,
+            bin_map,
+            sites,
+            logic_effect_model,
+        ));
+    }
+    let order = logic_pool_priority_order(indices, row_map, bin_map, sites, logic_effect_model);
+    let mut kept: Vec<usize> = Vec::with_capacity(order.len());
+    for idx in order.into_iter() {
+        let mut conflict = false;
+        for &prev in kept.iter() {
+            if logic_pool_member_r2(idx, prev, row_map, bin_map, logic_effect_model)?
+                > r2_threshold + 1e-12
+            {
+                conflict = true;
+                break;
+            }
+        }
+        if !conflict {
+            kept.push(idx);
+        }
+    }
+    Ok(kept)
+}
+
+fn build_logic_representative_pool(
+    pool_indices: &[usize],
+    sub_pools: &[Vec<usize>],
+    row_map: &HashMap<usize, Vec<f32>>,
+    bin_map: &HashMap<usize, Vec<u8>>,
+    sites: &[SimSiteRecord],
+    logic_effect_model: LogicEffectModel,
+    logic_ld_max: f64,
+    min_grouped_keep: usize,
+) -> Result<(Vec<usize>, Vec<Vec<usize>>), String> {
+    if pool_indices.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let rep_r2 = logic_pool_representative_r2(logic_ld_max);
+    if sub_pools.len() > 1 {
+        let mut merged = Vec::<usize>::new();
+        let mut seen = HashSet::<usize>::new();
+        let mut rep_subs = Vec::<Vec<usize>>::with_capacity(sub_pools.len());
+        for sub in sub_pools.iter() {
+            let pruned = prune_logic_pool_indices_by_ld(
+                sub.as_slice(),
+                row_map,
+                bin_map,
+                sites,
+                logic_effect_model,
+                rep_r2,
+            )?;
+            let kept = if pruned.is_empty() {
+                sub.clone()
+            } else {
+                pruned
+            };
+            if kept.is_empty() {
+                continue;
+            }
+            for idx in kept.iter().copied() {
+                if seen.insert(idx) {
+                    merged.push(idx);
+                }
+            }
+            rep_subs.push(kept);
+        }
+        let grouped_limit = if rep_subs.len() > 1 {
+            rep_subs.len()
+        } else {
+            merged.len()
+        };
+        if grouped_limit < min_grouped_keep || merged.is_empty() {
+            return Ok((pool_indices.to_vec(), sub_pools.to_vec()));
+        }
+        return Ok((merged, rep_subs));
+    }
+    let pruned = prune_logic_pool_indices_by_ld(
+        pool_indices,
+        row_map,
+        bin_map,
+        sites,
+        logic_effect_model,
+        rep_r2,
+    )?;
+    if pruned.len() < min_grouped_keep.max(1) {
+        return Ok((pool_indices.to_vec(), sub_pools.to_vec()));
+    }
+    let rep_subs = if sub_pools.is_empty() {
+        Vec::new()
+    } else {
+        vec![pruned.clone()]
+    };
+    Ok((pruned, rep_subs))
 }
 
 fn filtered_sub_pools(
@@ -3045,7 +3257,8 @@ fn select_logic_terms(
             }
         }
         let empty_blocked: HashSet<usize> = HashSet::new();
-        let usable_sub_pools = filtered_sub_pools(spec.sub_pools.as_slice(), &usable_set, &empty_blocked);
+        let usable_sub_pools =
+            filtered_sub_pools(spec.sub_pools.as_slice(), &usable_set, &empty_blocked);
         if spec.sub_pools.len() > 1 && usable_sub_pools.len() < logic_k_min {
             return Err(format!(
                 "logic-gate candidate pool {ti} lost too many windows after heterozygosity filtering: need >= {logic_k_min} distinct windows, got {}",
@@ -3058,32 +3271,50 @@ fn select_logic_terms(
                 usable_set.len()
             ));
         }
+        let filtered_pool = spec
+            .pool_indices
+            .iter()
+            .copied()
+            .filter(|idx| usable_set.contains(idx))
+            .collect::<Vec<_>>();
+        let filtered_spec_sub_pools =
+            filtered_sub_pools(spec.sub_pools.as_slice(), &usable_set, &empty_blocked);
+        let grouped_k_hi_raw = if filtered_spec_sub_pools.len() > 1 {
+            filtered_spec_sub_pools.len()
+        } else {
+            filtered_pool.len()
+        };
+        let logic_k_min_eff = logic_k_min.min(grouped_k_hi_raw.max(1));
+        let (rep_pool_indices, rep_sub_pools) = build_logic_representative_pool(
+            filtered_pool.as_slice(),
+            filtered_spec_sub_pools.as_slice(),
+            row_map,
+            &bin_map,
+            sites,
+            logic_effect_model,
+            logic_ld_max,
+            logic_k_min_eff,
+        )?;
 
         let mut best: Option<(Vec<usize>, Vec<f64>, f64, f64)> = None;
         let mut best_margin = f64::NEG_INFINITY;
         let mut best_similarity = f64::INFINITY;
         let mut best_signal_var = f64::NEG_INFINITY;
-        let grouped_k_hi = if spec.sub_pools.len() > 1 {
-            spec.sub_pools.len()
+        let grouped_k_hi = if rep_sub_pools.len() > 1 {
+            rep_sub_pools.len()
         } else {
-            usable_set.len()
+            rep_pool_indices.len()
         };
         let logic_k_min_eff = logic_k_min.min(grouped_k_hi.max(1));
         let logic_k_max_eff = logic_k_max.min(grouped_k_hi.max(1));
         let exact_pair_search = logic_k_min_eff == 2 && logic_k_max_eff == 2;
         for _ in 0..logic_max_iter.max(1) {
-            let prefer_unused: Vec<usize> = spec
-                .pool_indices
+            let prefer_unused: Vec<usize> = rep_pool_indices
                 .iter()
                 .copied()
-                .filter(|idx| usable_set.contains(idx) && !used_global.contains(idx))
+                .filter(|idx| !used_global.contains(idx))
                 .collect();
-            let all_avail: Vec<usize> = spec
-                .pool_indices
-                .iter()
-                .copied()
-                .filter(|idx| usable_set.contains(idx))
-                .collect();
+            let all_avail = rep_pool_indices.clone();
             let pool = if prefer_unused.len() >= logic_k_min {
                 prefer_unused
             } else {
@@ -3094,9 +3325,9 @@ fn select_logic_terms(
             }
             if exact_pair_search {
                 let prefer_sub_pools =
-                    filtered_sub_pools(spec.sub_pools.as_slice(), &usable_set, &used_global);
+                    filtered_sub_pools(rep_sub_pools.as_slice(), &usable_set, &used_global);
                 let all_sub_pools =
-                    filtered_sub_pools(spec.sub_pools.as_slice(), &usable_set, &empty_blocked);
+                    filtered_sub_pools(rep_sub_pools.as_slice(), &usable_set, &empty_blocked);
                 let grouped_source = if prefer_sub_pools.len() >= 2 {
                     Some(prefer_sub_pools.as_slice())
                 } else if all_sub_pools.len() >= 2 {
@@ -3123,12 +3354,12 @@ fn select_logic_terms(
                                                 .ok_or_else(|| "missing logic row".to_string())?,
                                         ),
                                         LogicEffectModel::CenteredInteraction => dosage_row_r2(
-                                            row_map
-                                                .get(&members[0])
-                                                .ok_or_else(|| "missing logic dosage row".to_string())?,
-                                            row_map
-                                                .get(&members[1])
-                                                .ok_or_else(|| "missing logic dosage row".to_string())?,
+                                            row_map.get(&members[0]).ok_or_else(|| {
+                                                "missing logic dosage row".to_string()
+                                            })?,
+                                            row_map.get(&members[1]).ok_or_else(|| {
+                                                "missing logic dosage row".to_string()
+                                            })?,
                                         ),
                                     };
                                     if logic_ld_max < 0.999_999 && r2 > logic_ld_max + 1e-12 {
@@ -3137,7 +3368,8 @@ fn select_logic_terms(
                                     let mut orth_basis: Vec<&[f64]> =
                                         Vec::with_capacity(initial_basis.len() + out.len());
                                     orth_basis.extend(initial_basis.iter().copied());
-                                    orth_basis.extend(out.iter().map(|term| term.values.as_slice()));
+                                    orth_basis
+                                        .extend(out.iter().map(|term| term.values.as_slice()));
                                     let Some(eval) = evaluate_logic_candidate(
                                         members.as_slice(),
                                         row_map,
@@ -3149,8 +3381,11 @@ fn select_logic_terms(
                                     else {
                                         continue;
                                     };
-                                    if !logic_candidate_meets_pool_qc(&eval, logic_effect_model, causal_maf_min)
-                                    {
+                                    if !logic_candidate_meets_pool_qc(
+                                        &eval,
+                                        logic_effect_model,
+                                        causal_maf_min,
+                                    ) {
                                         continue;
                                     }
                                     if logic_candidate_is_better(
@@ -3250,8 +3485,11 @@ fn select_logic_terms(
                             else {
                                 continue;
                             };
-                            if !logic_candidate_meets_pool_qc(&eval, logic_effect_model, causal_maf_min)
-                            {
+                            if !logic_candidate_meets_pool_qc(
+                                &eval,
+                                logic_effect_model,
+                                causal_maf_min,
+                            ) {
                                 continue;
                             }
                             if logic_candidate_is_better(
@@ -3316,10 +3554,10 @@ fn select_logic_terms(
                 rng.random_range(logic_k_min_eff..=k_hi)
             };
             let prefer_sub_pools =
-                filtered_sub_pools(spec.sub_pools.as_slice(), &usable_set, &used_global);
+                filtered_sub_pools(rep_sub_pools.as_slice(), &usable_set, &used_global);
             let all_sub_pools =
-                filtered_sub_pools(spec.sub_pools.as_slice(), &usable_set, &empty_blocked);
-            let members = if spec.sub_pools.len() > 1 {
+                filtered_sub_pools(rep_sub_pools.as_slice(), &usable_set, &empty_blocked);
+            let members = if rep_sub_pools.len() > 1 {
                 if let Some(sampled) =
                     sample_members_from_distinct_sub_pools(prefer_sub_pools.as_slice(), k, rng)
                 {
@@ -3512,7 +3750,8 @@ fn select_logic_terms_sampled_specs(
             }
         }
         let empty_blocked: HashSet<usize> = HashSet::new();
-        let usable_sub_pools = filtered_sub_pools(spec.sub_pools.as_slice(), &usable_set, &empty_blocked);
+        let usable_sub_pools =
+            filtered_sub_pools(spec.sub_pools.as_slice(), &usable_set, &empty_blocked);
         if spec.sub_pools.len() > 1 && usable_sub_pools.len() < spec.size {
             return Err(format!(
                 "logic-gate candidate pool {ti} lost too many windows after heterozygosity filtering: need >= {} distinct windows, got {}",
@@ -3527,6 +3766,24 @@ fn select_logic_terms_sampled_specs(
                 usable_set.len()
             ));
         }
+        let filtered_pool = spec
+            .pool_indices
+            .iter()
+            .copied()
+            .filter(|idx| usable_set.contains(idx))
+            .collect::<Vec<_>>();
+        let filtered_spec_sub_pools =
+            filtered_sub_pools(spec.sub_pools.as_slice(), &usable_set, &empty_blocked);
+        let (rep_pool_indices, rep_sub_pools) = build_logic_representative_pool(
+            filtered_pool.as_slice(),
+            filtered_spec_sub_pools.as_slice(),
+            row_map,
+            &bin_map,
+            sites,
+            logic_effect_model,
+            logic_ld_max,
+            spec.size,
+        )?;
 
         let mut best: Option<(Vec<usize>, Vec<f64>, f64, f64)> = None;
         let mut best_margin = f64::NEG_INFINITY;
@@ -3534,20 +3791,19 @@ fn select_logic_terms_sampled_specs(
         let mut best_signal_var = f64::NEG_INFINITY;
         let exact_pair_search = spec.size == 2;
         for _ in 0..logic_max_iter.max(1) {
-            let pool: Vec<usize> = spec
-                .pool_indices
+            let pool: Vec<usize> = rep_pool_indices
                 .iter()
                 .copied()
-                .filter(|idx| usable_set.contains(idx) && !used_global.contains(idx))
+                .filter(|idx| !used_global.contains(idx))
                 .collect();
             if pool.len() < spec.size {
                 break;
             }
             if exact_pair_search {
                 let prefer_sub_pools =
-                    filtered_sub_pools(spec.sub_pools.as_slice(), &usable_set, &used_global);
+                    filtered_sub_pools(rep_sub_pools.as_slice(), &usable_set, &used_global);
                 let all_sub_pools =
-                    filtered_sub_pools(spec.sub_pools.as_slice(), &usable_set, &empty_blocked);
+                    filtered_sub_pools(rep_sub_pools.as_slice(), &usable_set, &empty_blocked);
                 let grouped_source = if prefer_sub_pools.len() >= 2 {
                     Some(prefer_sub_pools.as_slice())
                 } else if all_sub_pools.len() >= 2 {
@@ -3574,12 +3830,12 @@ fn select_logic_terms_sampled_specs(
                                                 .ok_or_else(|| "missing logic row".to_string())?,
                                         ),
                                         LogicEffectModel::CenteredInteraction => dosage_row_r2(
-                                            row_map
-                                                .get(&members[0])
-                                                .ok_or_else(|| "missing logic dosage row".to_string())?,
-                                            row_map
-                                                .get(&members[1])
-                                                .ok_or_else(|| "missing logic dosage row".to_string())?,
+                                            row_map.get(&members[0]).ok_or_else(|| {
+                                                "missing logic dosage row".to_string()
+                                            })?,
+                                            row_map.get(&members[1]).ok_or_else(|| {
+                                                "missing logic dosage row".to_string()
+                                            })?,
                                         ),
                                     };
                                     if logic_ld_max < 0.999_999 && r2 > logic_ld_max + 1e-12 {
@@ -3588,7 +3844,8 @@ fn select_logic_terms_sampled_specs(
                                     let mut orth_basis: Vec<&[f64]> =
                                         Vec::with_capacity(initial_basis.len() + out.len());
                                     orth_basis.extend(initial_basis.iter().copied());
-                                    orth_basis.extend(out.iter().map(|term| term.values.as_slice()));
+                                    orth_basis
+                                        .extend(out.iter().map(|term| term.values.as_slice()));
                                     let Some(eval) = evaluate_logic_candidate(
                                         members.as_slice(),
                                         row_map,
@@ -3600,8 +3857,11 @@ fn select_logic_terms_sampled_specs(
                                     else {
                                         continue;
                                     };
-                                    if !logic_candidate_meets_pool_qc(&eval, logic_effect_model, causal_maf_min)
-                                    {
+                                    if !logic_candidate_meets_pool_qc(
+                                        &eval,
+                                        logic_effect_model,
+                                        causal_maf_min,
+                                    ) {
                                         continue;
                                     }
                                     if logic_candidate_is_better(
@@ -3701,8 +3961,11 @@ fn select_logic_terms_sampled_specs(
                             else {
                                 continue;
                             };
-                            if !logic_candidate_meets_pool_qc(&eval, logic_effect_model, causal_maf_min)
-                            {
+                            if !logic_candidate_meets_pool_qc(
+                                &eval,
+                                logic_effect_model,
+                                causal_maf_min,
+                            ) {
                                 continue;
                             }
                             if logic_candidate_is_better(
@@ -3761,21 +4024,19 @@ fn select_logic_terms_sampled_specs(
                 break;
             }
             let prefer_sub_pools =
-                filtered_sub_pools(spec.sub_pools.as_slice(), &usable_set, &used_global);
+                filtered_sub_pools(rep_sub_pools.as_slice(), &usable_set, &used_global);
             let all_sub_pools =
-                filtered_sub_pools(spec.sub_pools.as_slice(), &usable_set, &empty_blocked);
-            let members = if spec.sub_pools.len() > 1 {
+                filtered_sub_pools(rep_sub_pools.as_slice(), &usable_set, &empty_blocked);
+            let members = if rep_sub_pools.len() > 1 {
                 if let Some(sampled) = sample_members_from_distinct_sub_pools(
                     prefer_sub_pools.as_slice(),
                     spec.size,
                     rng,
                 ) {
                     sampled
-                } else if let Some(sampled) = sample_members_from_distinct_sub_pools(
-                    all_sub_pools.as_slice(),
-                    spec.size,
-                    rng,
-                ) {
+                } else if let Some(sampled) =
+                    sample_members_from_distinct_sub_pools(all_sub_pools.as_slice(), spec.size, rng)
+                {
                     sampled
                 } else {
                     sample_without_replacement(&pool, spec.size, rng)?

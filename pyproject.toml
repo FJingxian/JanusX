@@ -22,9 +22,8 @@ keywords = ["GWAS", "GS", "REML", "Kmer"]
 
 [project.optional-dependencies]
 ml = [
-      "scikit-learn",
-      "xgboost-cpu; (platform_system == 'Linux' and platform_machine == 'x86_64') or (platform_system == 'Windows' and platform_machine == 'AMD64')",
-      "xgboost; not ((platform_system == 'Linux' and platform_machine == 'x86_64') or (platform_system == 'Windows' and platform_machine == 'AMD64'))",
+    "scikit-learn",
+    "xgboost",
 ]
 stats = [
     "statsmodels",
@@ -37,13 +36,12 @@ treeplot = [
     "toyplot",
 ]
 full = [
+    "scikit-learn",
+    "xgboost",
     "statsmodels",
     "dynamicTreeCut",
     "toytree",
     "toyplot",
-    "scikit-learn",
-    "xgboost-cpu; (platform_system == 'Linux' and platform_machine == 'x86_64') or (platform_system == 'Windows' and platform_machine == 'AMD64')",
-    "xgboost; not ((platform_system == 'Linux' and platform_machine == 'x86_64') or (platform_system == 'Windows' and platform_machine == 'AMD64'))",
 ]
 
 [tool.uv]

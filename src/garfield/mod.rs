@@ -5309,41 +5309,18 @@ fn evaluate_simbench_terms(
             output_null_penalties.as_deref(),
             false,
         );
-        let support_bits = if let Some(bits_hi_flat) = logic_bits.bits_hi_flat.as_ref() {
-            let (full_ge1, full_ge2) = materialize_rule_bits_dual(
-                &rule,
-                logic_bits.bits_flat.as_slice(),
-                bits_hi_flat.as_slice(),
-                logic_bits.row_words,
-                n_rule_rows,
-                logic_bits.n_samples,
+        let support_bits = materialize_rule_support_bits_from_selected_rows_full(
+            &rule,
+            selected_row_indices.as_slice(),
+            logic_bits,
+            term.label.as_str(),
+        )
+        .map_err(|e| {
+            format!(
+                "simbench term {} failed to materialize full support bits: {e}",
+                term.term_id
             )
-            .map_err(|e| {
-                format!(
-                    "simbench term {} failed to materialize full support bits: {e}",
-                    term.term_id
-                )
-            })?;
-            GarfieldRuleSupportBits::Dual {
-                ge1: full_ge1.into_boxed_slice(),
-                ge2: full_ge2.into_boxed_slice(),
-            }
-        } else {
-            let full_bits = materialize_rule_bits(
-                &rule,
-                logic_bits.bits_flat.as_slice(),
-                logic_bits.row_words,
-                n_rule_rows,
-                logic_bits.n_samples,
-            )
-            .map_err(|e| {
-                format!(
-                    "simbench term {} failed to materialize full support bits: {e}",
-                    term.term_id
-                )
-            })?;
-            GarfieldRuleSupportBits::Binary(full_bits.into_boxed_slice())
-        };
+        })?;
         let first_site = bench_sites
             .first()
             .ok_or_else(|| format!("simbench term {} has no sites", term.term_id))?;
@@ -5806,18 +5783,16 @@ fn logic_rule_record_local_rule(rec: &GarfieldLogicRuleRecord) -> Result<BeamRul
     Ok(BeamRule { first, rest })
 }
 
-fn materialize_logic_rule_record_support_bits(
-    rec: &GarfieldLogicRuleRecord,
+fn materialize_rule_support_bits_from_selected_rows_full(
+    rule: &BeamRule,
+    selected_row_indices: &[usize],
     logic_bits: &GarfieldLogicBits,
+    label: &str,
 ) -> Result<GarfieldRuleSupportBits, String> {
-    if let Some(bits) = rec.support_bits.as_ref() {
-        return Ok(bits.clone());
-    }
-    let local_rule = logic_rule_record_local_rule(rec)?;
-    let n_rows = rec.selected_row_indices.len();
+    let n_rows = selected_row_indices.len();
     let row_words = logic_bits.row_words;
     let mut bits_flat = Vec::<u64>::with_capacity(n_rows.saturating_mul(row_words));
-    for &global_row_idx in rec.selected_row_indices.iter() {
+    for &global_row_idx in selected_row_indices.iter() {
         let row_start = global_row_idx.saturating_mul(row_words);
         let row_end = row_start.saturating_add(row_words);
         let row = logic_bits
@@ -5826,26 +5801,26 @@ fn materialize_logic_rule_record_support_bits(
             .ok_or_else(|| {
                 format!(
                     "GARFIELD stored rule '{}' row slice out of range: row={} row_words={}",
-                    rec.snp_name, global_row_idx, row_words
+                    label, global_row_idx, row_words
                 )
             })?;
         bits_flat.extend_from_slice(row);
     }
     if let Some(bits_hi_flat) = logic_bits.bits_hi_flat.as_ref() {
         let mut bits_hi = Vec::<u64>::with_capacity(n_rows.saturating_mul(row_words));
-        for &global_row_idx in rec.selected_row_indices.iter() {
+        for &global_row_idx in selected_row_indices.iter() {
             let row_start = global_row_idx.saturating_mul(row_words);
             let row_end = row_start.saturating_add(row_words);
             let row = bits_hi_flat.get(row_start..row_end).ok_or_else(|| {
                 format!(
                     "GARFIELD stored rule '{}' high-bit row slice out of range: row={} row_words={}",
-                    rec.snp_name, global_row_idx, row_words
+                    label, global_row_idx, row_words
                 )
             })?;
             bits_hi.extend_from_slice(row);
         }
         let (ge1, ge2) = materialize_rule_bits_dual(
-            &local_rule,
+            rule,
             bits_flat.as_slice(),
             bits_hi.as_slice(),
             row_words,
@@ -5858,7 +5833,7 @@ fn materialize_logic_rule_record_support_bits(
         })
     } else {
         let bits = materialize_rule_bits(
-            &local_rule,
+            rule,
             bits_flat.as_slice(),
             row_words,
             n_rows,
@@ -5866,6 +5841,22 @@ fn materialize_logic_rule_record_support_bits(
         )?;
         Ok(GarfieldRuleSupportBits::Binary(bits.into_boxed_slice()))
     }
+}
+
+fn materialize_logic_rule_record_support_bits(
+    rec: &GarfieldLogicRuleRecord,
+    logic_bits: &GarfieldLogicBits,
+) -> Result<GarfieldRuleSupportBits, String> {
+    if let Some(bits) = rec.support_bits.as_ref() {
+        return Ok(bits.clone());
+    }
+    let local_rule = logic_rule_record_local_rule(rec)?;
+    materialize_rule_support_bits_from_selected_rows_full(
+        &local_rule,
+        rec.selected_row_indices.as_slice(),
+        logic_bits,
+        rec.snp_name.as_str(),
+    )
 }
 
 fn build_logic_units_from_groups<S: GarfieldChromPosSite>(
@@ -12781,7 +12772,7 @@ pub fn garfield_debug_probe_single_group_from_files(
     groups=None,
     null_groups=None,
     group_names=None,
-    extension=100000,
+    extension=50000,
     step=None,
     scan_bimranges=None,
     bin_mode="bin",
@@ -15914,6 +15905,84 @@ mod tests {
         assert_eq!(
             unpack_dual_bits(dst_ge1.as_slice(), dst_ge2.as_slice(), raw_row.len()),
             unpack_dual_bits(exp_ge1.as_slice(), exp_ge2.as_slice(), raw_row.len())
+        );
+    }
+
+    #[test]
+    fn test_materialize_rule_support_bits_uses_selected_rows_not_full_prefix() {
+        fn pack_dual_flat(rows: &[Vec<f32>]) -> (Vec<u64>, Vec<u64>, usize) {
+            let row_words = words_for_samples(rows[0].len());
+            let mut ge1_flat = Vec::<u64>::with_capacity(rows.len() * row_words);
+            let mut ge2_flat = Vec::<u64>::with_capacity(rows.len() * row_words);
+            for row in rows.iter() {
+                let (ge1, ge2) = pack_test_simbench_raw_row_dual_words(row.as_slice()).unwrap();
+                ge1_flat.extend_from_slice(ge1.as_slice());
+                ge2_flat.extend_from_slice(ge2.as_slice());
+            }
+            (ge1_flat, ge2_flat, row_words)
+        }
+
+        fn unpack_dual_bits(ge1: &[u64], ge2: &[u64], n: usize) -> Vec<u8> {
+            (0..n)
+                .map(|i| {
+                    (((ge1[i >> 6] >> (i & 63)) & 1u64) + ((ge2[i >> 6] >> (i & 63)) & 1u64)) as u8
+                })
+                .collect()
+        }
+
+        let rows = vec![
+            vec![2.0f32, 2.0, 0.0, 0.0],
+            vec![0.0f32, 2.0, 0.0, 2.0],
+            vec![2.0f32, 2.0, 2.0, 0.0],
+        ];
+        let (ge1_flat, ge2_flat, row_words) = pack_dual_flat(rows.as_slice());
+        let logic_bits = GarfieldLogicBits {
+            bits_flat: ge1_flat,
+            bits_hi_flat: Some(ge2_flat),
+            row_words,
+            sample_ids: vec!["s1".into(), "s2".into(), "s3".into(), "s4".into()],
+            sites: vec![test_site("1", 100), test_site("1", 200), test_site("1", 300)]
+                .into_iter()
+                .map(|site| GarfieldLogicSite {
+                    chrom: Arc::from(site.chrom),
+                    pos: site.pos,
+                    snp: Arc::from(site.snp),
+                    ref_allele: Arc::from(site.ref_allele),
+                    alt_allele: Arc::from(site.alt_allele),
+                    mode: GarfieldLogicSiteMode::Bin,
+                })
+                .collect(),
+            group_ids: vec![0, 1, 2],
+            n_samples: 4,
+        };
+        let rule = BeamRule {
+            first: BeamLiteral {
+                row_index: 0,
+                group_id: 0,
+                negated: false,
+            },
+            rest: vec![(
+                BeamBinaryOp::And,
+                BeamLiteral {
+                    row_index: 1,
+                    group_id: 1,
+                    negated: false,
+                },
+            )],
+        };
+        let support = materialize_rule_support_bits_from_selected_rows_full(
+            &rule,
+            &[0usize, 2usize],
+            &logic_bits,
+            "selected_rows_rule",
+        )
+        .unwrap();
+        let GarfieldRuleSupportBits::Dual { ge1, ge2 } = support else {
+            panic!("expected dual support bits");
+        };
+        assert_eq!(
+            unpack_dual_bits(ge1.as_ref(), ge2.as_ref(), 4),
+            vec![2u8, 2, 0, 0]
         );
     }
 

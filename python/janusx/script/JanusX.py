@@ -12,29 +12,28 @@ Options:
 
 Modules:
     Genome-wide Association Studies (GWAS):
-    grm           Build genomic relationship matrix
-    pca           Principal component analysis for population structure
-    gstats        Genotype basic statistics and LD score
     gwas          Run genome-wide association analysis
-    fvlmm2        Joint FvLMM recheck for specified pseudo/interaction loci
     postgwas      Post-process GWAS results and downstream plots
 
     Genomic Selection (GS):
     gs            Genomic prediction and model-based selection
-    reml          Estimate broad/narrow heritability and BLUE by REML
     postgs        Summarize and visualize GS results
 
-    Pipeline and utility:
+    Epistasis Association (GARFIELD):
     garfield      Random-forest based marker-trait association
-    postbsa       Post-process and visualize BSA results
+    postgarfield  Post-process GARFIELD results and downstream plots
+
+    K-mer:
     kmer          K-mer counting workflow via KMC
     kmerge        Merge multi-sample KMC databases into genotype matrix
     kstats        Compute pairwise KMC k-mer statistics
-    view          View .bkmer/.bsite as plain text for pipes
-    tree          Tree workflow entry (`-nj` Neighbor-Joining / `-ml` FastTree ML)
-    treeplot      Visualize Newick/GRM trees with toytree
+
+    Utility:
+    grm           Build genomic relationship matrix
+    pca           Principal component analysis for population structure
+    gstats        Genotype basic statistics and LD score
+    reml          Estimate broad/narrow heritability and BLUE by REML
     fastpop       FastPop ancestry inference
-    hybrid        Build pairwise hybrid genotype matrix from parent lists
     gformat       Convert genotype files across plink/vcf/txt/npy
     gmerge        Merge genotype/variant tables
 '''
@@ -115,10 +114,7 @@ _CLI_MODULE_SECTIONS = [
     (
         "Genome-wide Association Studies (GWAS)",
         [
-            ("grm", "Build genomic relationship matrix"),
-            ("pca", "Principal component analysis for population structure"),
             ("gwas", "Run genome-wide association analysis"),
-            ("fvlmm2", "Joint FvLMM recheck for specified pseudo/interaction loci"),
             ("postgwas", "Post-process GWAS results and downstream plots"),
         ],
     ),
@@ -126,23 +122,32 @@ _CLI_MODULE_SECTIONS = [
         "Genomic Selection (GS)",
         [
             ("gs", "Genomic prediction and model-based selection"),
-            ("reml", "Estimate broad/narrow heritability and BLUE by REML"),
             ("postgs", "Summarize and visualize GS results"),
         ],
     ),
     (
-        "Pipeline and Utility",
+        "Epistasis Association (GARFIELD)",
         [
             ("garfield", "Random-forest based marker-trait association"),
-            ("postbsa", "Post-process and visualize BSA results"),
+            ("postgarfield", "Post-process GARFIELD results and downstream plots"),
+        ],
+    ),
+    (
+        "K-mer",
+        [
             ("kmer", "K-mer counting workflow via KMC"),
             ("kmerge", "Merge multi-sample KMC databases into genotype matrix"),
             ("kstats", "Compute pairwise KMC k-mer statistics"),
-            ("view", "View .bkmer/.bsite as plain text for shell pipes"),
-            ("tree", "Tree workflow entry (`-nj` Neighbor-Joining / `-ml` FastTree ML)"),
-            ("treeplot", "Visualize Newick/GRM trees with toytree"),
+        ],
+    ),
+    (
+        "Utility",
+        [
+            ("grm", "Build genomic relationship matrix"),
+            ("pca", "Principal component analysis for population structure"),
+            ("gstats", "Genotype basic statistics and LD score"),
+            ("reml", "Estimate broad/narrow heritability and BLUE by REML"),
             ("fastpop", "FastPop ancestry inference"),
-            ("hybrid", "Build pairwise hybrid genotype matrix from parent lists"),
             ("gformat", "Convert genotype files across plink/vcf/txt/npy"),
             ("gmerge", "Merge genotype/variant tables"),
         ],

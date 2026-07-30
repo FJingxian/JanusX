@@ -117,7 +117,7 @@ def _resolve_causal_spec(raw_args: Optional[list[str]]) -> CausalSpec:
 def _resolve_gff_sampling_spec(
     raw_args: Optional[list[str]],
     *,
-    default_extension: int = 100_000,
+    default_extension: int = 50_000,
 ) -> Optional[GffSamplingSpec]:
     values = [] if raw_args is None else [str(x).strip() for x in raw_args if str(x).strip() != ""]
     if len(values) == 0:

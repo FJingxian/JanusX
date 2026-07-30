@@ -2695,7 +2695,7 @@ def main() -> None:
     except ValueError as e:
         parser.error(str(e))
 
-    default_extension = 100_000
+    default_extension = 50_000
     if bool(args.whole_genome):
         args.genefiles = []
         args.extension = int(default_extension)

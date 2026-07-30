@@ -12,8 +12,6 @@ dependencies = [
     "rich-argparse",
     "joblib>=1.5",
     "threadpoolctl",
-    "scikit-learn",
-    "xgboost",
 ]
 authors = [
   {name = "Jingxian FU", email = "827888724@qq.com"},
@@ -23,6 +21,11 @@ license = {file = "LICENSE"}
 keywords = ["GWAS", "GS", "REML", "Kmer"]
 
 [project.optional-dependencies]
+ml = [
+      "scikit-learn",
+      "xgboost-cpu; (platform_system == 'Linux' and platform_machine == 'x86_64') or (platform_system == 'Windows' and platform_machine == 'AMD64')",
+      "xgboost; not ((platform_system == 'Linux' and platform_machine == 'x86_64') or (platform_system == 'Windows' and platform_machine == 'AMD64'))",
+]
 stats = [
     "statsmodels",
 ]
@@ -38,6 +41,9 @@ full = [
     "dynamicTreeCut",
     "toytree",
     "toyplot",
+    "scikit-learn",
+    "xgboost-cpu; (platform_system == 'Linux' and platform_machine == 'x86_64') or (platform_system == 'Windows' and platform_machine == 'AMD64')",
+    "xgboost; not ((platform_system == 'Linux' and platform_machine == 'x86_64') or (platform_system == 'Windows' and platform_machine == 'AMD64'))",
 ]
 
 [tool.uv]

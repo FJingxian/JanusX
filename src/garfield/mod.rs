@@ -15941,17 +15941,21 @@ mod tests {
             bits_hi_flat: Some(ge2_flat),
             row_words,
             sample_ids: vec!["s1".into(), "s2".into(), "s3".into(), "s4".into()],
-            sites: vec![test_site("1", 100), test_site("1", 200), test_site("1", 300)]
-                .into_iter()
-                .map(|site| GarfieldLogicSite {
-                    chrom: Arc::from(site.chrom),
-                    pos: site.pos,
-                    snp: Arc::from(site.snp),
-                    ref_allele: Arc::from(site.ref_allele),
-                    alt_allele: Arc::from(site.alt_allele),
-                    mode: GarfieldLogicSiteMode::Bin,
-                })
-                .collect(),
+            sites: vec![
+                test_site("1", 100),
+                test_site("1", 200),
+                test_site("1", 300),
+            ]
+            .into_iter()
+            .map(|site| GarfieldLogicSite {
+                chrom: Arc::from(site.chrom),
+                pos: site.pos,
+                snp: Arc::from(site.snp),
+                ref_allele: Arc::from(site.ref_allele),
+                alt_allele: Arc::from(site.alt_allele),
+                mode: GarfieldLogicSiteMode::Bin,
+            })
+            .collect(),
             group_ids: vec![0, 1, 2],
             n_samples: 4,
         };

@@ -16,7 +16,7 @@ use rand_distr::{Distribution, StandardNormal};
 use rayon::prelude::*;
 
 use crate::eigh::symmetric_eigh_f64_row_major;
-use crate::garfield::bs::evaluate_rule_continuous_dual;
+use crate::garfield::bs::{evaluate_rule_continuous_dual, materialize_rule_bits_dual};
 use crate::garfield::{score_cont_corr_packed, BeamBinaryOp, BeamLiteral, BeamRule};
 use crate::gfcore as core;
 use crate::gfcore::{BedSnpIter, HmpSnpIter, TxtSnpIter, VcfSnpIter};
@@ -1406,12 +1406,6 @@ fn logic_gate_indicator(rows: &[Vec<u8>], mode: LogicGateMode) -> Result<Vec<u8>
     ))
 }
 
-fn logic_gate_centered_values(indicator: &[u8]) -> Vec<f64> {
-    let raw = indicator.iter().map(|&v| v as f64).collect::<Vec<_>>();
-    let mu = mean_f64(&raw);
-    raw.into_iter().map(|v| v - mu).collect()
-}
-
 fn logic_binary_gate_from_bin_map(
     members: &[usize],
     bin_map: &HashMap<usize, Vec<u8>>,
@@ -1531,6 +1525,113 @@ fn pack_dosage_row_dual_words(row: &[f32]) -> Result<(Vec<u64>, Vec<u64>), Strin
     Ok((ge1, ge2))
 }
 
+fn pack_logic_dosage_rows_dual_words(
+    dosage_rows: &[&[f32]],
+) -> Result<(Vec<u64>, Vec<u64>, usize, usize), String> {
+    if dosage_rows.is_empty() {
+        return Err("logic score requires at least one member row".to_string());
+    }
+    let n_samples = dosage_rows[0].len();
+    if let Some((row_idx, row_len)) = dosage_rows
+        .iter()
+        .enumerate()
+        .find_map(|(row_idx, row)| (row.len() != n_samples).then_some((row_idx, row.len())))
+    {
+        return Err(format!(
+            "logic score row length mismatch at member {row_idx}: got {row_len}, expected {n_samples}"
+        ));
+    }
+    let row_words = ((n_samples + 63) >> 6).max(1);
+    let mut ge1_flat = Vec::<u64>::with_capacity(dosage_rows.len().saturating_mul(row_words));
+    let mut ge2_flat = Vec::<u64>::with_capacity(dosage_rows.len().saturating_mul(row_words));
+    for row in dosage_rows.iter() {
+        let (ge1, ge2) = pack_dosage_row_dual_words(row)?;
+        ge1_flat.extend_from_slice(ge1.as_slice());
+        ge2_flat.extend_from_slice(ge2.as_slice());
+    }
+    Ok((ge1_flat, ge2_flat, row_words, n_samples))
+}
+
+#[inline]
+fn dual_bitplanes_to_centered_values(
+    ge1_bits: &[u64],
+    ge2_bits: &[u64],
+    n_samples: usize,
+) -> Vec<f64> {
+    let mut raw = vec![0.0_f64; n_samples];
+    for (i, dst) in raw.iter_mut().enumerate() {
+        let word = i >> 6;
+        let bit = i & 63;
+        let ge1 = ((ge1_bits[word] >> bit) & 1u64) as u8;
+        let ge2 = ((ge2_bits[word] >> bit) & 1u64) as u8;
+        *dst = (ge1 + ge2) as f64;
+    }
+    let mu = mean_f64(raw.as_slice());
+    raw.into_iter().map(|v| v - mu).collect()
+}
+
+#[inline]
+fn dual_rule_gate_maf(n_samples: usize, n_ge1: usize, n_ge2: usize) -> f64 {
+    if n_samples == 0 {
+        return 0.0;
+    }
+    let af = ((n_ge1.saturating_add(n_ge2)) as f64) / (2.0 * (n_samples as f64));
+    af.min(1.0_f64 - af).clamp(0.0, 0.5)
+}
+
+fn materialize_logic_rule_dual_values(
+    mode: LogicGateMode,
+    dosage_rows: &[&[f32]],
+) -> Result<(Vec<f64>, f64, f64), String> {
+    let (ge1_flat, ge2_flat, row_words, n_samples) =
+        pack_logic_dosage_rows_dual_words(dosage_rows)?;
+    let gate_rule = build_logic_rule(mode, dosage_rows.len())?;
+    let (combined_ge1, combined_ge2) = materialize_rule_bits_dual(
+        &gate_rule,
+        ge1_flat.as_slice(),
+        ge2_flat.as_slice(),
+        row_words,
+        dosage_rows.len(),
+        n_samples,
+    )?;
+    let n_ge1 = combined_ge1
+        .iter()
+        .enumerate()
+        .map(|(word_idx, &word)| {
+            if word_idx == combined_ge1.len().saturating_sub(1) && (n_samples & 63) != 0 {
+                let mask = (1u64 << (n_samples & 63)) - 1u64;
+                (word & mask).count_ones() as usize
+            } else {
+                word.count_ones() as usize
+            }
+        })
+        .sum::<usize>();
+    let n_ge2 = combined_ge2
+        .iter()
+        .enumerate()
+        .map(|(word_idx, &word)| {
+            if word_idx == combined_ge2.len().saturating_sub(1) && (n_samples & 63) != 0 {
+                let mask = (1u64 << (n_samples & 63)) - 1u64;
+                (word & mask).count_ones() as usize
+            } else {
+                word.count_ones() as usize
+            }
+        })
+        .sum::<usize>();
+    let raw_af = if n_samples == 0 {
+        0.0
+    } else {
+        (n_ge1 as f64) / (n_samples as f64)
+    };
+    let gate_maf = dual_rule_gate_maf(n_samples, n_ge1, n_ge2);
+    let gate_values = dual_bitplanes_to_centered_values(
+        combined_ge1.as_slice(),
+        combined_ge2.as_slice(),
+        n_samples,
+    );
+    Ok((gate_values, raw_af, gate_maf))
+}
+
 fn build_logic_rule(mode: LogicGateMode, n_members: usize) -> Result<BeamRule, String> {
     if n_members == 0 {
         return Err("logic rule requires at least one member".to_string());
@@ -1562,23 +1663,13 @@ fn score_logic_rule_raw_against_response(
     if dosage_rows.len() <= 1 {
         return Ok(None);
     }
-    let n_samples = y.len();
-    if let Some((row_idx, row_len)) = dosage_rows
-        .iter()
-        .enumerate()
-        .find_map(|(row_idx, row)| (row.len() != n_samples).then_some((row_idx, row.len())))
-    {
+    let (ge1_flat, ge2_flat, row_words, n_samples) =
+        pack_logic_dosage_rows_dual_words(dosage_rows)?;
+    if n_samples != y.len() {
         return Err(format!(
-            "logic score row length mismatch at member {row_idx}: got {row_len}, expected {n_samples}"
+            "logic score response length mismatch: got y={}, expected {n_samples}",
+            y.len()
         ));
-    }
-    let row_words = ((n_samples + 63) >> 6).max(1);
-    let mut ge1_flat = Vec::<u64>::with_capacity(dosage_rows.len().saturating_mul(row_words));
-    let mut ge2_flat = Vec::<u64>::with_capacity(dosage_rows.len().saturating_mul(row_words));
-    for row in dosage_rows.iter() {
-        let (ge1, ge2) = pack_dosage_row_dual_words(row)?;
-        ge1_flat.extend_from_slice(ge1.as_slice());
-        ge2_flat.extend_from_slice(ge2.as_slice());
     }
     let gate_rule = build_logic_rule(mode, dosage_rows.len())?;
     let gate_score = evaluate_rule_continuous_dual(
@@ -1648,55 +1739,44 @@ fn evaluate_logic_candidate(
 ) -> Result<Option<LogicCandidateEval>, String> {
     match logic_effect_model {
         LogicEffectModel::Gate => {
-            let gate_rows: Vec<Vec<u8>> = members
+            let dosage_rows: Vec<Vec<f32>> = members
                 .iter()
                 .map(|idx| {
-                    bin_map
+                    row_map
                         .get(idx)
                         .cloned()
-                        .ok_or_else(|| "missing logic row".to_string())
+                        .ok_or_else(|| "missing logic dosage row".to_string())
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            let literal_rows = logic_gate_literal_rows(&gate_rows, mode)?;
-            let gate_indicator = logic_gate_indicator_from_literals(
-                literal_rows.as_slice(),
-                logic_output_negated(mode),
-            );
-            let raw_af = gate_indicator.iter().filter(|&&v| v != 0).count() as f64
-                / gate_indicator.len() as f64;
-            let gate_maf = raw_af.min(1.0_f64 - raw_af);
-            let gate_values = logic_gate_centered_values(&gate_indicator);
+            let dosage_row_refs = dosage_rows
+                .iter()
+                .map(|row| row.as_slice())
+                .collect::<Vec<_>>();
+            let literal_rows = logic_literal_dosage_rows(dosage_rows.as_slice(), mode)?;
+            let (gate_values, raw_af, gate_maf) =
+                materialize_logic_rule_dual_values(mode, dosage_row_refs.as_slice())?;
             let signal_var = variance_f64(&gate_values);
             if signal_var <= 1e-12 {
                 return Ok(None);
             }
-            let gate_words = pack_binary01_to_words(gate_indicator.as_slice());
-            let gate_proxy_score = score_cont_corr_packed(
+            let Some((gate_proxy_score, parent_scores)) = score_logic_rule_raw_against_response(
+                mode,
+                dosage_row_refs.as_slice(),
                 gate_values.as_slice(),
-                gate_words.as_slice(),
-                gate_values.len(),
-            )
-            .abs();
-            let max_parent_proxy_score = literal_rows
+            )?
+            else {
+                return Ok(None);
+            };
+            let max_parent_proxy_score = parent_scores.into_iter().fold(0.0_f64, f64::max);
+            let parent_gate_max_r2 = literal_rows
                 .iter()
-                .map(|row| {
-                    let words = pack_binary01_to_words(row.as_slice());
-                    score_cont_corr_packed(
-                        gate_values.as_slice(),
-                        words.as_slice(),
-                        gate_values.len(),
-                    )
-                    .abs()
-                })
+                .map(|row| continuous_r2_f64(gate_values.as_slice(), row.as_slice()))
                 .fold(0.0_f64, f64::max);
             Ok(Some(LogicCandidateEval {
                 gate_values,
                 raw_af,
                 gate_maf,
-                parent_gate_max_r2: gate_parent_max_r2(
-                    gate_indicator.as_slice(),
-                    literal_rows.as_slice(),
-                ),
+                parent_gate_max_r2,
                 proxy_margin: gate_proxy_score - max_parent_proxy_score,
                 signal_var,
             }))
@@ -1880,8 +1960,11 @@ fn logic_term_local_proxy_margin(
         })?;
         dosage_rows.push(row.as_slice());
     }
-    let Some((gate_score, parent_scores)) =
-        score_logic_rule_raw_against_response(mode, dosage_rows.as_slice(), term.values.as_slice())?
+    let Some((gate_score, parent_scores)) = score_logic_rule_raw_against_response(
+        mode,
+        dosage_rows.as_slice(),
+        term.values.as_slice(),
+    )?
     else {
         return Ok(None);
     };
@@ -5740,6 +5823,39 @@ mod tests {
             logic_gate_indicator(&[a, b], LogicGateMode::Nan).unwrap(),
             vec![1u8, 0, 0, 0]
         );
+    }
+
+    #[test]
+    fn gate_logic_materializes_dual_dosage_rule_values_under_heterozygotes() {
+        let row0 = vec![0.0_f32, 1.0, 2.0, 2.0];
+        let row1 = vec![0.0_f32, 2.0, 1.0, 2.0];
+        let refs = vec![row0.as_slice(), row1.as_slice()];
+        let (gate_values, raw_af, gate_maf) =
+            materialize_logic_rule_dual_values(LogicGateMode::A, refs.as_slice())
+                .expect("dual-dosage gate values");
+        assert_eq!(gate_values, vec![-1.0_f64, 0.0, 0.0, 1.0]);
+        assert!((raw_af - 0.75).abs() < 1e-12);
+        assert!((gate_maf - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn gate_candidate_eval_uses_dual_dosage_proxy_under_heterozygotes() {
+        let mut row_map: HashMap<usize, Vec<f32>> = HashMap::new();
+        row_map.insert(0, vec![0.0, 1.0, 2.0, 2.0]);
+        row_map.insert(1, vec![0.0, 2.0, 1.0, 2.0]);
+        let eval = evaluate_logic_candidate(
+            &[0, 1],
+            &row_map,
+            &HashMap::new(),
+            LogicGateMode::A,
+            LogicEffectModel::Gate,
+            &[],
+        )
+        .expect("evaluate gate candidate")
+        .expect("candidate should be valid");
+        assert_eq!(eval.gate_values, vec![-1.0_f64, 0.0, 0.0, 1.0]);
+        assert!(eval.proxy_margin > 1e-6);
+        assert!(eval.parent_gate_max_r2 < 1.0);
     }
 
     #[test]

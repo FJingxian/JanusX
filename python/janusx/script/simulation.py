@@ -577,6 +577,31 @@ def _write_causal_units_txt(
     return units_path
 
 
+def _write_causal_unit_truth_table(
+    *,
+    outprefix: str,
+    units: list[dict[str, Any]],
+) -> str:
+    truth_path = f"{outprefix}.causal.unit_truth.tsv"
+    with open(truth_path, "w", encoding="utf-8") as fh:
+        fh.write("unit_kind\tunit_name\tgenes\tintervals\n")
+        for unit in units:
+            genes = [str(g) for g in list(unit.get("genes", []))]
+            intervals = list(unit.get("intervals", []))
+            fh.write(
+                "\t".join(
+                    [
+                        str(unit.get("unit_kind", "")),
+                        str(unit.get("unit_name", "")),
+                        ";".join(genes),
+                        _format_unit_intervals(intervals),
+                    ]
+                )
+                + "\n"
+            )
+    return truth_path
+
+
 def _write_fixed_effects_table(
     *,
     outprefix: str,
@@ -2063,9 +2088,17 @@ def main(argv: Optional[list[str]] = None) -> int:
             outprefix=outprefix,
             units=selected_causal_units,
         )
+        truth_path = _write_causal_unit_truth_table(
+            outprefix=outprefix,
+            units=selected_causal_units,
+        )
         logger.info(
             "Causal units: %s",
             format_path_for_display(str(units_path)),
+        )
+        logger.info(
+            "Causal unit truth: %s",
+            format_path_for_display(str(truth_path)),
         )
     if len(sample_ids) != int(np.asarray(res["phenotype"]).reshape(-1).shape[0]):
         logger.warning("Sample count from inspection differs from Rust phenotype length.")

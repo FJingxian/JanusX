@@ -6,8 +6,6 @@
 // - AND/XOR beam expansion plus negation at the literal level
 // - ternary XOR on literal dosages: same homozygotes -> 0, opposite
 //   homozygotes -> 2, and any heterozygote-involving mismatch -> 1
-// - whole-rule family complements injected as extra parents each layer so OR
-//   / NXOR families can still be reached without directly expanding them
 // - active search/output scoring only exposes bucket null penalties; inactive
 //   compatibility penalty hooks stay pinned off in the current runtime path
 //
@@ -257,78 +255,10 @@ impl BeamRule {
 }
 
 #[inline]
-fn rule_xor_rest_index(rule: &BeamRule) -> Option<usize> {
+fn rule_contains_xor(rule: &BeamRule) -> bool {
     rule.rest
         .iter()
-        .position(|(op, _)| matches!(op, BeamBinaryOp::Xor))
-}
-
-#[inline]
-fn rule_contains_xor(rule: &BeamRule) -> bool {
-    rule_xor_rest_index(rule).is_some()
-}
-
-#[inline]
-fn flip_and_or(op: BeamBinaryOp) -> BeamBinaryOp {
-    match op {
-        BeamBinaryOp::And => BeamBinaryOp::Or,
-        BeamBinaryOp::Or => BeamBinaryOp::And,
-        BeamBinaryOp::Xor => BeamBinaryOp::Xor,
-    }
-}
-
-fn complement_rule_family(rule: &BeamRule) -> Option<BeamRule> {
-    let xor_idx = rule_xor_rest_index(rule);
-    if xor_idx.is_none() {
-        let mut out = BeamRule {
-            first: BeamLiteral {
-                negated: !rule.first.negated,
-                ..rule.first
-            },
-            rest: Vec::with_capacity(rule.rest.len()),
-        };
-        for &(op, lit) in rule.rest.iter() {
-            out.rest.push((
-                flip_and_or(op),
-                BeamLiteral {
-                    negated: !lit.negated,
-                    ..lit
-                },
-            ));
-        }
-        return Some(out);
-    }
-
-    let xor_idx = xor_idx?;
-    if rule.rest[xor_idx].0 != BeamBinaryOp::Xor {
-        return None;
-    }
-    let mut out = BeamRule {
-        first: rule.first,
-        rest: Vec::with_capacity(rule.rest.len()),
-    };
-    for (rest_idx, &(op, lit)) in rule.rest.iter().enumerate() {
-        if rest_idx < xor_idx {
-            out.rest.push((op, lit));
-        } else if rest_idx == xor_idx {
-            out.rest.push((
-                BeamBinaryOp::Xor,
-                BeamLiteral {
-                    negated: !lit.negated,
-                    ..lit
-                },
-            ));
-        } else {
-            out.rest.push((
-                flip_and_or(op),
-                BeamLiteral {
-                    negated: !lit.negated,
-                    ..lit
-                },
-            ));
-        }
-    }
-    Some(out)
+        .any(|(op, _)| matches!(op, BeamBinaryOp::Xor))
 }
 
 #[inline]
@@ -6790,94 +6720,6 @@ fn whole_genome_layer2_parent_variants_fuzzy(
     out
 }
 
-fn whole_rule_family_complement_variant_fuzzy(
-    node: &FuzzyBeamState,
-    sum_y_train: f64,
-    n_train: usize,
-    params: &BeamSearchParams,
-) -> Option<FuzzyBeamState> {
-    let rule = complement_rule_family(&node.rule)?;
-    if rule.lexical_key() == node.rule.lexical_key() {
-        return None;
-    }
-    let (train_n_ge1, train_n_ge2, train_sum_ge1, train_sum_ge2) = complement_dual_summary(
-        sum_y_train,
-        n_train,
-        node.train.n_hit,
-        node.train_n_ge2,
-        node.train_sum_ge1,
-        node.train_sum_ge2,
-    );
-    if !keep_rule_after_dosage_maf_counts(train_n_ge1, train_n_ge2, n_train, params) {
-        return None;
-    }
-    let train = score_cont_centered_gain_dual_from_summary(
-        sum_y_train,
-        n_train,
-        train_n_ge1,
-        train_n_ge2,
-        train_sum_ge1,
-        train_sum_ge2,
-    );
-    let (train_abs_score, train_score) =
-        train_scores_for_rule(&rule, train, train.raw_score, None, None, params);
-    if !keep_state_after_min_gain_pruning(rule.len(), train_score, params) {
-        return None;
-    }
-    let mut combined_train_ge1 = node.combined_train_ge1.clone();
-    let mut combined_train_ge2 = node.combined_train_ge2.clone();
-    complement_dual_bits_in_place_local(
-        combined_train_ge1.as_mut_slice(),
-        combined_train_ge2.as_mut_slice(),
-        n_train,
-    );
-    Some(FuzzyBeamState {
-        rule,
-        combined_train_ge1,
-        combined_train_ge2,
-        train,
-        train_n_ge2,
-        train_sum_ge1,
-        train_sum_ge2,
-        train_abs_score,
-        train_score,
-        max_singleton_train_raw: node.max_singleton_train_raw,
-        max_singleton_test_raw: node.max_singleton_test_raw,
-    })
-}
-
-fn expand_parent_family_variants_fuzzy(
-    parents: &[FuzzyBeamState],
-    sum_y_train: f64,
-    n_train: usize,
-    params: &BeamSearchParams,
-) -> Vec<FuzzyBeamState> {
-    let mut best = HashMap::<RuleLexKey, FuzzyBeamState>::with_capacity(parents.len().saturating_mul(2));
-    for node in parents.iter() {
-        let key = node.rule.lexical_key();
-        if let Some(prev) = best.get(&key) {
-            if cmp_fuzzy_state(node, prev) == std::cmp::Ordering::Less {
-                best.insert(key, node.clone());
-            }
-        } else {
-            best.insert(key, node.clone());
-        }
-        if let Some(comp) =
-            whole_rule_family_complement_variant_fuzzy(node, sum_y_train, n_train, params)
-        {
-            let key = comp.rule.lexical_key();
-            if let Some(prev) = best.get(&key) {
-                if cmp_fuzzy_state(&comp, prev) == std::cmp::Ordering::Less {
-                    best.insert(key, comp);
-                }
-            } else {
-                best.insert(key, comp);
-            }
-        }
-    }
-    best.into_values().collect()
-}
-
 #[inline]
 fn prune_best_fuzzy_state_map(best: &mut HashMap<RuleLexKey, FuzzyBeamStateLite>, keep: usize) {
     if keep == 0 || best.len() <= keep {
@@ -7139,12 +6981,8 @@ fn expand_fuzzy_beam_once_whole_genome_target_parallel(
     if parents.is_empty() {
         return Ok(Vec::new());
     }
-    let expanded_parents = expand_parent_family_variants_fuzzy(parents, sum_y_train, n_train, params);
-    if expanded_parents.is_empty() {
-        return Ok(Vec::new());
-    }
-    let base_rule_raws = Arc::new(collect_known_rule_raw_scores_fuzzy(expanded_parents.as_slice()));
-    let total_expand = expanded_parents
+    let base_rule_raws = Arc::new(collect_known_rule_raw_scores_fuzzy(parents));
+    let total_expand = parents
         .iter()
         .map(|parent| {
             n_rows.saturating_mul(beam_child_branch_count_for_rule(&parent.rule))
@@ -7156,7 +6994,7 @@ fn expand_fuzzy_beam_once_whole_genome_target_parallel(
             .into_par_iter()
             .map(|(start, end)| {
                 expand_fuzzy_beam_once_whole_genome_target_range(
-                    expanded_parents.as_slice(),
+                    parents,
                     start,
                     end,
                     y_train,
@@ -7179,7 +7017,7 @@ fn expand_fuzzy_beam_once_whole_genome_target_parallel(
         merge_best_fuzzy_state_maps(worker_maps, next_cap)?
     } else {
         expand_fuzzy_beam_once_whole_genome_target_range(
-            expanded_parents.as_slice(),
+            parents,
             0,
             n_rows,
             y_train,
@@ -7211,7 +7049,7 @@ fn expand_fuzzy_beam_once_whole_genome_target_parallel(
             n_train,
         )?);
     }
-    let layer = expanded_parents
+    let layer = parents
         .first()
         .map(|p| p.rule.len().saturating_add(1))
         .unwrap_or(0);
@@ -7289,20 +7127,19 @@ fn expand_fuzzy_beam_once(
 ) -> Result<Vec<FuzzyBeamState>, String> {
     check_interrupt_fast()?;
     let next_cap = params.beam_width.min(n_rows.saturating_mul(4).max(1));
-    let parents = expand_parent_family_variants_fuzzy(beam, sum_y_train, n_train, params);
-    if parents.is_empty() {
+    if beam.is_empty() {
         return Ok(Vec::new());
     }
-    let layer = parents
+    let layer = beam
         .first()
         .map(|p| p.rule.len().saturating_add(1))
         .unwrap_or(0);
-    let base_rule_raws = Arc::new(collect_known_rule_raw_scores_fuzzy(parents.as_slice()));
+    let base_rule_raws = Arc::new(collect_known_rule_raw_scores_fuzzy(beam));
     let mut seq = Vec::<FuzzyBeamState>::with_capacity(next_cap);
     let mut parent_raw_cache = RuleRawScoreCache::new();
     let mut ancestor_raw_cache = RuleAncestorBaselineCache::new();
     let mut seen_commutative_children = HashSet::<Vec<(usize, bool, u8)>>::new();
-    for node in parents.iter() {
+    for node in beam.iter() {
         let (start, end) = expansion_row_bounds(&node.rule, n_rows);
         let blind_scan = child_rule_uses_blind_scan(node.rule.len());
         for cand in start..end {
@@ -8583,90 +8420,6 @@ mod tests {
             )],
         };
         assert_eq!(beam_binary_ops_for_rule(&xor_rule), &[BeamBinaryOp::And]);
-    }
-
-    #[test]
-    fn test_complement_rule_family_flips_and_rule_into_or_rule() {
-        let rule = BeamRule {
-            first: BeamLiteral {
-                row_index: 0,
-                group_id: 0,
-                negated: false,
-            },
-            rest: vec![(
-                BeamBinaryOp::And,
-                BeamLiteral {
-                    row_index: 1,
-                    group_id: 1,
-                    negated: true,
-                },
-            )],
-        };
-        let got = complement_rule_family(&rule).unwrap();
-        let want = BeamRule {
-            first: BeamLiteral {
-                negated: true,
-                ..rule.first
-            },
-            rest: vec![(
-                BeamBinaryOp::Or,
-                BeamLiteral {
-                    negated: false,
-                    ..rule.rest[0].1
-                },
-            )],
-        };
-        assert_eq!(got, want);
-    }
-
-    #[test]
-    fn test_complement_rule_family_preserves_single_xor_and_flips_suffix() {
-        let rule = BeamRule {
-            first: BeamLiteral {
-                row_index: 0,
-                group_id: 0,
-                negated: false,
-            },
-            rest: vec![
-                (
-                    BeamBinaryOp::Xor,
-                    BeamLiteral {
-                        row_index: 1,
-                        group_id: 1,
-                        negated: false,
-                    },
-                ),
-                (
-                    BeamBinaryOp::And,
-                    BeamLiteral {
-                        row_index: 2,
-                        group_id: 2,
-                        negated: true,
-                    },
-                ),
-            ],
-        };
-        let got = complement_rule_family(&rule).unwrap();
-        let want = BeamRule {
-            first: rule.first,
-            rest: vec![
-                (
-                    BeamBinaryOp::Xor,
-                    BeamLiteral {
-                        negated: true,
-                        ..rule.rest[0].1
-                    },
-                ),
-                (
-                    BeamBinaryOp::Or,
-                    BeamLiteral {
-                        negated: false,
-                        ..rule.rest[1].1
-                    },
-                ),
-            ],
-        };
-        assert_eq!(got, want);
     }
 
     #[test]

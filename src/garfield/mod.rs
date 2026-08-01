@@ -7,7 +7,7 @@ mod score_gpu;
 
 // GARFIELD runtime note (2026-07):
 // - Active continuous search uses fuzzy 0/1/2 dosage bits only.
-// - Active beam expansion is AND-only; negation remains supported.
+// - Active beam expansion is AND/XOR-only; negation remains supported.
 // - Legacy packed-0/1 continuous beam code and OR-family compatibility helpers
 //   are retained only for backward-compatible parsing/evaluation of old
 //   artifacts and tests, and are intentionally disabled in the main runtime.
@@ -3437,8 +3437,8 @@ fn preferred_display_polarity(
     n_samples: usize,
 ) -> GarfieldRuleDisplayPolarity {
     let _ = (rule, full_bits, n_samples);
-    // Search is AND-only and output should preserve the discovered rule family
-    // directly instead of rewriting complements into OR-form displays.
+    // Search is AND/XOR-only and output should preserve the discovered rule
+    // family directly instead of rewriting complements into OR-form displays.
     GarfieldRuleDisplayPolarity::Original
 }
 

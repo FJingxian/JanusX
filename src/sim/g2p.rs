@@ -46,6 +46,7 @@ enum LogicGateMode {
     Na,
     An,
     Nan,
+    X,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1327,6 +1328,7 @@ fn logic_mode_code(mode: LogicGateMode) -> &'static str {
         LogicGateMode::Na => "na",
         LogicGateMode::An => "an",
         LogicGateMode::Nan => "nan",
+        LogicGateMode::X => "x",
     }
 }
 
@@ -1337,6 +1339,7 @@ fn logic_member_negated(mode: LogicGateMode, idx: usize) -> bool {
         LogicGateMode::Na => idx == 0,
         LogicGateMode::An => idx > 0,
         LogicGateMode::Nan => true,
+        LogicGateMode::X => false,
     }
 }
 
@@ -1344,6 +1347,14 @@ fn logic_member_negated(mode: LogicGateMode, idx: usize) -> bool {
 fn logic_output_negated(mode: LogicGateMode) -> bool {
     let _ = mode;
     false
+}
+
+#[inline]
+fn logic_rule_binary_op(mode: LogicGateMode, rest_idx: usize) -> BeamBinaryOp {
+    match mode {
+        LogicGateMode::X if rest_idx == 0 => BeamBinaryOp::Xor,
+        _ => BeamBinaryOp::And,
+    }
 }
 
 fn logic_gate_literal_rows(rows: &[Vec<u8>], mode: LogicGateMode) -> Result<Vec<Vec<u8>>, String> {
@@ -1373,21 +1384,25 @@ fn logic_gate_literal_rows(rows: &[Vec<u8>], mode: LogicGateMode) -> Result<Vec<
     Ok(out)
 }
 
-fn logic_gate_indicator_from_literals(rows: &[Vec<u8>], output_negated: bool) -> Vec<u8> {
+fn logic_gate_indicator_from_literals(
+    rows: &[Vec<u8>],
+    mode: LogicGateMode,
+    output_negated: bool,
+) -> Vec<u8> {
     if rows.is_empty() {
         return Vec::new();
     }
     let n = rows[0].len();
-    let mut raw = vec![0u8; n];
-    for i in 0..n {
-        let mut ok = true;
-        for row in rows.iter() {
-            if row[i] == 0 {
-                ok = false;
-                break;
-            }
+    let mut raw = rows[0].clone();
+    for (rest_idx, row) in rows.iter().enumerate().skip(1) {
+        let op = logic_rule_binary_op(mode, rest_idx - 1);
+        for i in 0..n {
+            raw[i] = match op {
+                BeamBinaryOp::And => raw[i] & row[i],
+                BeamBinaryOp::Or => raw[i] | row[i],
+                BeamBinaryOp::Xor => raw[i] ^ row[i],
+            };
         }
-        raw[i] = if ok { 1u8 } else { 0u8 };
     }
     if output_negated {
         for v in raw.iter_mut() {
@@ -1402,6 +1417,7 @@ fn logic_gate_indicator(rows: &[Vec<u8>], mode: LogicGateMode) -> Result<Vec<u8>
     let literal_rows = logic_gate_literal_rows(rows, mode)?;
     Ok(logic_gate_indicator_from_literals(
         literal_rows.as_slice(),
+        mode,
         logic_output_negated(mode),
     ))
 }
@@ -1422,7 +1438,11 @@ fn logic_binary_gate_from_bin_map(
         .collect::<Result<Vec<_>, _>>()?;
     let literal_rows = logic_gate_literal_rows(gate_rows.as_slice(), mode)?;
     let gate_indicator =
-        logic_gate_indicator_from_literals(literal_rows.as_slice(), logic_output_negated(mode));
+        logic_gate_indicator_from_literals(
+            literal_rows.as_slice(),
+            mode,
+            logic_output_negated(mode),
+        );
     Ok((literal_rows, gate_indicator))
 }
 
@@ -1644,7 +1664,7 @@ fn build_logic_rule(mode: LogicGateMode, n_members: usize) -> Result<BeamRule, S
     let mut rest = Vec::<(BeamBinaryOp, BeamLiteral)>::with_capacity(n_members.saturating_sub(1));
     for idx in 1..n_members {
         rest.push((
-            BeamBinaryOp::And,
+            logic_rule_binary_op(mode, idx - 1),
             BeamLiteral {
                 row_index: idx,
                 group_id: idx,
@@ -1792,7 +1812,15 @@ fn evaluate_logic_candidate(
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let literal_rows = logic_literal_dosage_rows(dosage_rows.as_slice(), mode)?;
-            let raw_interaction = interaction_product_from_literals(literal_rows.as_slice());
+            let raw_interaction = if matches!(mode, LogicGateMode::X) {
+                let dosage_row_refs = dosage_rows
+                    .iter()
+                    .map(|row| row.as_slice())
+                    .collect::<Vec<_>>();
+                materialize_logic_rule_dual_values(mode, dosage_row_refs.as_slice())?.0
+            } else {
+                interaction_product_from_literals(literal_rows.as_slice())
+            };
             let gate_values = residualize_logic_values_against_basis(
                 raw_interaction.as_slice(),
                 literal_rows.as_slice(),
@@ -2142,7 +2170,22 @@ fn term_label(sites: &[SimSiteRecord], members: &[usize], mode: Option<LogicGate
         mode.map(logic_output_negated).unwrap_or(false) == false,
         "term labels only support target-allele literals"
     );
-    parts.join("&")
+    let Some(mode) = mode else {
+        return parts.join("&");
+    };
+    if parts.len() <= 1 {
+        return parts.join("");
+    }
+    let mut out = parts[0].clone();
+    for (idx, part) in parts.iter().enumerate().skip(1) {
+        match logic_rule_binary_op(mode, idx - 1) {
+            BeamBinaryOp::And => out.push('&'),
+            BeamBinaryOp::Or => out.push('|'),
+            BeamBinaryOp::Xor => out.push('^'),
+        }
+        out.push_str(part);
+    }
+    out
 }
 
 fn normalize_plink_prefix_local(p: &str) -> String {
@@ -2934,11 +2977,13 @@ fn logic_mode_from_str(mode: &str, rng: &mut StdRng) -> Result<LogicGateMode, St
         "na" => Ok(LogicGateMode::Na),
         "an" => Ok(LogicGateMode::An),
         "nan" => Ok(LogicGateMode::Nan),
-        "r" => Ok(match rng.random_range(0..4) {
+        "x" | "xor" => Ok(LogicGateMode::X),
+        "r" => Ok(match rng.random_range(0..5) {
             0 => LogicGateMode::A,
             1 => LogicGateMode::Na,
             2 => LogicGateMode::An,
-            _ => LogicGateMode::Nan,
+            3 => LogicGateMode::Nan,
+            _ => LogicGateMode::X,
         }),
         other => Err(format!("unsupported logic mode: {other}")),
     }
@@ -5737,6 +5782,10 @@ mod tests {
             term_label(&sites, &[0, 1], Some(LogicGateMode::Nan)),
             "1_100[A]&1_200[C]"
         );
+        assert_eq!(
+            term_label(&sites, &[0, 1], Some(LogicGateMode::X)),
+            "1_100[G]^1_200[T]"
+        );
     }
 
     #[test]
@@ -5823,6 +5872,12 @@ mod tests {
             logic_gate_indicator(&[a, b], LogicGateMode::Nan).unwrap(),
             vec![1u8, 0, 0, 0]
         );
+        let a = vec![0u8, 0, 1, 1];
+        let b = vec![0u8, 1, 0, 1];
+        assert_eq!(
+            logic_gate_indicator(&[a, b], LogicGateMode::X).unwrap(),
+            vec![0u8, 1, 1, 0]
+        );
     }
 
     #[test]
@@ -5836,6 +5891,13 @@ mod tests {
         assert_eq!(gate_values, vec![-1.0_f64, 0.0, 0.0, 1.0]);
         assert!((raw_af - 0.75).abs() < 1e-12);
         assert!((gate_maf - 0.5).abs() < 1e-12);
+
+        let (xor_values, xor_raw_af, xor_gate_maf) =
+            materialize_logic_rule_dual_values(LogicGateMode::X, refs.as_slice())
+                .expect("dual-dosage xor values");
+        assert_eq!(xor_values, vec![-0.5_f64, 0.5, 0.5, -0.5]);
+        assert!((xor_raw_af - 0.5).abs() < 1e-12);
+        assert!((xor_gate_maf - 0.25).abs() < 1e-12);
     }
 
     #[test]

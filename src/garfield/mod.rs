@@ -3981,6 +3981,7 @@ enum SimBenchLogic {
     Na,
     An,
     Nan,
+    Xor,
 }
 
 #[derive(Clone, Debug)]
@@ -4003,8 +4004,9 @@ fn parse_simbench_logic(raw: &str) -> Result<SimBenchLogic, String> {
         "na" => Ok(SimBenchLogic::Na),
         "an" => Ok(SimBenchLogic::An),
         "nan" => Ok(SimBenchLogic::Nan),
+        "x" | "xor" => Ok(SimBenchLogic::Xor),
         other => Err(format!(
-            "simbench logic must be one of: single, s, additive, and, or, a, na, an, nan; got {other}"
+            "simbench logic must be one of: single, s, additive, and, or, xor, a, na, an, nan, x; got {other}"
         )),
     }
 }
@@ -4012,7 +4014,9 @@ fn parse_simbench_logic(raw: &str) -> Result<SimBenchLogic, String> {
 #[inline]
 fn simbench_logic_member_negated(logic: SimBenchLogic, idx: usize) -> bool {
     match logic {
-        SimBenchLogic::Single | SimBenchLogic::And | SimBenchLogic::Or => false,
+        SimBenchLogic::Single | SimBenchLogic::And | SimBenchLogic::Or | SimBenchLogic::Xor => {
+            false
+        }
         SimBenchLogic::Na => idx == 0,
         SimBenchLogic::Nan => true,
         SimBenchLogic::An => idx > 0,
@@ -4020,14 +4024,22 @@ fn simbench_logic_member_negated(logic: SimBenchLogic, idx: usize) -> bool {
 }
 
 #[inline]
-fn simbench_logic_join_op(logic: SimBenchLogic) -> Option<BeamBinaryOp> {
+fn simbench_logic_binary_op(logic: SimBenchLogic, rest_idx: usize) -> Option<BeamBinaryOp> {
     match logic {
         SimBenchLogic::Single => None,
         SimBenchLogic::And | SimBenchLogic::Na | SimBenchLogic::An | SimBenchLogic::Nan => {
             Some(BeamBinaryOp::And)
         }
         SimBenchLogic::Or => Some(BeamBinaryOp::Or),
+        SimBenchLogic::Xor if rest_idx == 0 => Some(BeamBinaryOp::Xor),
+        SimBenchLogic::Xor => Some(BeamBinaryOp::And),
     }
+}
+
+fn simbench_logic_display_ops(logic: SimBenchLogic, n_sites: usize) -> Vec<BeamBinaryOp> {
+    (0..n_sites.saturating_sub(1))
+        .filter_map(|rest_idx| simbench_logic_binary_op(logic, rest_idx))
+        .collect()
 }
 
 fn parse_simbench_sites(raw: &str) -> Result<Vec<(String, i32)>, String> {
@@ -4197,8 +4209,8 @@ fn simbench_rule_from_negations(
         negated: negated[0],
     };
     let mut rest = Vec::<(BeamBinaryOp, BeamLiteral)>::with_capacity(n_sites.saturating_sub(1));
-    if let Some(op) = simbench_logic_join_op(logic) {
-        for row_index in 1..n_sites {
+    for row_index in 1..n_sites {
+        if let Some(op) = simbench_logic_binary_op(logic, row_index - 1) {
             rest.push((
                 op,
                 BeamLiteral {
@@ -4247,22 +4259,33 @@ fn simbench_effective_negations<S: GarfieldDisplaySite>(
 }
 
 fn simbench_rule_name<S: GarfieldChromPosSite + GarfieldDisplaySite>(
+    logic: SimBenchLogic,
     negated: &[bool],
     sites: &[S],
 ) -> String {
-    sites
-        .iter()
-        .enumerate()
-        .map(|(idx, site)| literal_target_name(site, negated.get(idx).copied().unwrap_or(false)))
-        .collect::<Vec<_>>()
-        .join("&")
+    let mut it = sites.iter().enumerate();
+    let Some((first_idx, first)) = it.next() else {
+        return String::new();
+    };
+    let mut out = literal_target_name(first, negated.get(first_idx).copied().unwrap_or(false));
+    for (idx, site) in it {
+        if let Some(op) = simbench_logic_binary_op(logic, idx - 1) {
+            out.push_str(logic_symbol_for_display(op, GarfieldRuleDisplayPolarity::Original));
+        }
+        out.push_str(&literal_target_name(
+            site,
+            negated.get(idx).copied().unwrap_or(false),
+        ));
+    }
+    out
 }
 
 fn simbench_rule_bim_name<S: GarfieldChromPosSite + GarfieldDisplaySite>(
+    logic: SimBenchLogic,
     negated: &[bool],
     sites: &[S],
 ) -> String {
-    simbench_rule_name(negated, sites)
+    simbench_rule_name(logic, negated, sites)
 }
 
 fn simbench_rule_bim_alleles<S: GarfieldDisplaySite>(
@@ -4280,6 +4303,7 @@ fn simbench_rule_bim_alleles<S: GarfieldDisplaySite>(
 }
 
 fn simbench_rule_expr<S: GarfieldDisplaySite>(
+    logic: SimBenchLogic,
     negated: &[bool],
     sites: &[S],
 ) -> Result<String, String> {
@@ -4291,7 +4315,9 @@ fn simbench_rule_expr<S: GarfieldDisplaySite>(
     if sites.len() > 1 {
         for (idx, site) in it.enumerate() {
             out.push(' ');
-            out.push_str("AND");
+            if let Some(op) = simbench_logic_binary_op(logic, idx) {
+                out.push_str(expr_symbol_for_display(op, GarfieldRuleDisplayPolarity::Original));
+            }
             out.push(' ');
             out.push_str(&literal_expr(
                 site,
@@ -4323,20 +4349,20 @@ fn simbench_term_unit_name<S: GarfieldChromPosSite>(term: &SimBenchTerm, sites: 
 
 #[inline]
 fn simbench_term_rule_name<S: GarfieldChromPosSite + GarfieldDisplaySite>(
-    _term: &SimBenchTerm,
+    term: &SimBenchTerm,
     negated: &[bool],
     sites: &[S],
 ) -> String {
-    simbench_rule_name(negated, sites)
+    simbench_rule_name(term.logic, negated, sites)
 }
 
 #[inline]
 fn simbench_term_bim_name<S: GarfieldChromPosSite + GarfieldDisplaySite>(
-    _term: &SimBenchTerm,
+    term: &SimBenchTerm,
     negated: &[bool],
     sites: &[S],
 ) -> String {
-    simbench_rule_bim_name(negated, sites)
+    simbench_rule_bim_name(term.logic, negated, sites)
 }
 
 #[inline]
@@ -4970,6 +4996,7 @@ fn match_simbench_ml_context<'a>(
 }
 
 fn build_simbench_delta_score_annotation<S: GarfieldDisplaySite>(
+    logic: SimBenchLogic,
     negated: &[bool],
     sites: &[S],
     y_test: &[f64],
@@ -5005,6 +5032,7 @@ fn build_simbench_delta_score_annotation<S: GarfieldDisplaySite>(
         out.push_str(&format_delta_metric_value(first_raw));
         return Ok(out);
     }
+    let display_ops = simbench_logic_display_ops(logic, sites.len());
     for idx in 1..sites.len() {
         let lit = BeamLiteral {
             row_index: idx,
@@ -5019,11 +5047,18 @@ fn build_simbench_delta_score_annotation<S: GarfieldDisplaySite>(
             row_words_test,
             n_rows,
             n_test,
-            params,
+                params,
         )?;
-        out.push('&');
+        let op = display_ops
+            .get(idx - 1)
+            .copied()
+            .unwrap_or(BeamBinaryOp::And);
+        out.push_str(logic_symbol_for_display(
+            op,
+            GarfieldRuleDisplayPolarity::Original,
+        ));
         out.push_str(&literal_metric_token(single_raw));
-        prefix_rule.rest.push((BeamBinaryOp::And, lit));
+        prefix_rule.rest.push((op, lit));
         let prefix_raw = evaluate_rule_test_raw_score(
             &prefix_rule,
             y_test,
@@ -5342,7 +5377,7 @@ fn evaluate_simbench_terms(
             )
         })?;
         let sim_expr_txt =
-            simbench_rule_expr(effective_negated.as_slice(), bench_sites.as_slice())?;
+            simbench_rule_expr(term.logic, effective_negated.as_slice(), bench_sites.as_slice())?;
         let test_bucket = bucket_from_rule_with_complexity(
             &rule,
             assoc_sc.dosage_maf,
@@ -5382,6 +5417,7 @@ fn evaluate_simbench_terms(
         let bim_snp_name =
             simbench_term_bim_name(term, effective_negated.as_slice(), bench_sites.as_slice());
         let delta_score = build_simbench_delta_score_annotation(
+            term.logic,
             effective_negated.as_slice(),
             bench_sites.as_slice(),
             y_assoc,
@@ -5406,7 +5442,7 @@ fn evaluate_simbench_terms(
             ml_feature_count,
             ml_rank,
             selected_row_indices,
-            display_ops: vec![BeamBinaryOp::And; bench_sites.len().saturating_sub(1)],
+            display_ops: simbench_logic_display_ops(term.logic, bench_sites.len()),
             display_negated: effective_negated,
             snp_name,
             expr: sim_expr_txt,
@@ -15318,6 +15354,7 @@ mod tests {
         let negated = vec![false, false, false];
 
         let actual = build_simbench_delta_score_annotation(
+            SimBenchLogic::And,
             negated.as_slice(),
             sites.as_slice(),
             y.as_slice(),
@@ -15858,6 +15895,8 @@ mod tests {
         assert_eq!(parse_simbench_logic("na").unwrap(), SimBenchLogic::Na);
         assert_eq!(parse_simbench_logic("an").unwrap(), SimBenchLogic::An);
         assert_eq!(parse_simbench_logic("nan").unwrap(), SimBenchLogic::Nan);
+        assert_eq!(parse_simbench_logic("x").unwrap(), SimBenchLogic::Xor);
+        assert_eq!(parse_simbench_logic("xor").unwrap(), SimBenchLogic::Xor);
     }
 
     #[test]
@@ -15872,11 +15911,12 @@ mod tests {
                 "gene\tgeneB\tna\t2:30;2:40\t0.2\n",
                 "gene\tgeneC\tan\t3:50;3:60\t0.3\n",
                 "gene\tgeneD\tnan\t4:70;4:80\t0.4\n",
+                "gene\tgeneE\tx\t5:90;5:100\t0.5\n",
             ),
         )
         .unwrap();
         let terms = parse_simbench_terms(path.to_str().unwrap()).unwrap();
-        assert_eq!(terms.len(), 4);
+        assert_eq!(terms.len(), 5);
         assert_eq!(terms[0].term_id, 1);
         assert_eq!(terms[0].unit_name, "geneA");
         assert_eq!(terms[0].label, "");
@@ -15884,6 +15924,7 @@ mod tests {
         assert_eq!(terms[1].logic, SimBenchLogic::Na);
         assert_eq!(terms[2].logic, SimBenchLogic::An);
         assert_eq!(terms[3].logic, SimBenchLogic::Nan);
+        assert_eq!(terms[4].logic, SimBenchLogic::Xor);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -15900,6 +15941,12 @@ mod tests {
         assert_eq!(an_rule.rest.len(), 1);
         assert_eq!(an_rule.rest[0].0, BeamBinaryOp::And);
         assert!(an_rule.rest[0].1.negated);
+
+        let xor_rule =
+            simbench_rule_from_negations(SimBenchLogic::Xor, &[false, false, false]).unwrap();
+        assert_eq!(xor_rule.rest.len(), 2);
+        assert_eq!(xor_rule.rest[0].0, BeamBinaryOp::Xor);
+        assert_eq!(xor_rule.rest[1].0, BeamBinaryOp::And);
     }
 
     #[test]

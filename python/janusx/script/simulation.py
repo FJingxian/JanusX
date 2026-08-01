@@ -652,7 +652,7 @@ def _remove_optional_file(path: str) -> None:
         pass
 
 
-_LOGIC_GATE_MODES = {"a", "na", "an", "nan", "r"}
+_LOGIC_GATE_MODES = {"a", "na", "an", "nan", "x", "r"}
 
 
 def _parse_logic_size_weights(text: str) -> list[float]:
@@ -1438,10 +1438,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar=("MODE", "WEIGHTS"),
         default=None,
         help=(
-            "Mixed causal-term sampler. MODE is one of a|na|an|nan|r. WEIGHTS is a comma list "
+            "Mixed causal-term sampler. MODE is one of a|na|an|nan|x|r. WEIGHTS is a comma list "
             "whose i-th entry controls the relative probability of sampling term size i "
             "(1=additive single-site, 2=two-site gate, 3=three-site gate, ...). "
-            "Example: `--logic-gate r 3,1,0.5 --causal 100` samples 100 causal terms with "
+            "Mode `x` uses the GARFIELD-active XOR form: the first two literals use `^`, and any "
+            "remaining literals are appended with `&`. Example: `--logic-gate r 3,1,0.5 --causal 100` samples 100 causal terms with "
             "sizes 1/2/3 in proportion to 3:1:0.5."
         ),
     )

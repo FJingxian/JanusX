@@ -49,6 +49,7 @@ _FASTPLOT_HIST_BINS = 15
 _FASTPLOT_MANHATTAN_INTERVAL_RATE = 0.5
 _FASTPLOT_SINGLETON_COLOR = "#C7CCD3"
 _FASTPLOT_SIG_COMBO_COLOR = "#D62728"
+_FASTPLOT_SIG_XOR_COLOR = "#1D4E89"
 _FASTPLOT_COMBO_FDR_THRESHOLD = 0.05
 _FASTPLOT_COMBO_FDR_COLUMNS = ("padj", "pwald_fdr", "p_combo_joint_fdr")
 
@@ -133,19 +134,34 @@ def _normalize_fastplot_style(style: object) -> str:
     return "gwas"
 
 
+def _infer_fastplot_logic_family(token: object) -> str:
+    text = str(token or "").strip()
+    if "^" in text:
+        return "xor"
+    if any(op in text for op in ("&", "|", "*")):
+        return "and"
+    return "singleton"
+
+
 def _prepare_role_layered_manhattan_df(
     results: pd.DataFrame,
     gwasplot,
 ) -> pd.DataFrame | None:
     results_df = results.reset_index(drop=True).copy()
-    if "row_role" not in results_df.columns and "snp" in results_df.columns:
-        snp_text = results_df["snp"].astype(str)
-        inferred_combo = snp_text.str.contains(r"[&|*]", regex=True, na=False)
-        results_df["row_role"] = np.where(inferred_combo, "combo", "singleton")
+    if "snp" in results_df.columns:
+        results_df["logic_family"] = results_df["snp"].map(_infer_fastplot_logic_family)
+    else:
+        results_df["logic_family"] = "singleton"
+    if "row_role" not in results_df.columns:
+        results_df["row_role"] = np.where(
+            results_df["logic_family"].ne("singleton"),
+            "combo",
+            "singleton",
+        )
     if "row_role" not in results_df.columns:
         return None
     if results_df.shape[0] == 0:
-        return pd.DataFrame(columns=["x", "y", "z", "row_role"])
+        return pd.DataFrame(columns=["x", "y", "z", "row_role", "logic_family"])
     results_df["chrom"] = results_df["chrom"].astype(str)
     results_df["pos"] = pd.to_numeric(results_df["pos"], errors="coerce").fillna(0).astype(np.int64)
     results_df["row_role"] = results_df["row_role"].astype(str).str.strip().str.lower()
@@ -169,14 +185,16 @@ def _prepare_role_layered_manhattan_df(
         return None
     keep_idx = np.asarray(getattr(gwasplot, "minidx", []), dtype=np.int64)
     if keep_idx.size == 0:
-        return pd.DataFrame(columns=["x", "y", "z", "row_role"])
+        return pd.DataFrame(columns=["x", "y", "z", "row_role", "logic_family"])
     kept_roles = results_sorted.iloc[keep_idx]["row_role"].to_numpy(dtype=object, copy=False)
     kept_combo_sig = results_sorted.iloc[keep_idx]["__combo_sig"].to_numpy(dtype=bool, copy=False)
+    kept_logic_family = results_sorted.iloc[keep_idx]["logic_family"].to_numpy(dtype=object, copy=False)
     plot_df = gwasplot.df.iloc[keep_idx].copy().reset_index(drop=True)
     plot_df = plot_df.loc[:, ["x", "y", "z"]].copy()
     plot_df["y"] = -np.log10(_fastplot_sanitize_pvalues(plot_df["y"]))
     plot_df["row_role"] = kept_roles
     plot_df["combo_sig"] = kept_combo_sig
+    plot_df["logic_family"] = kept_logic_family
     plot_df = plot_df[np.isfinite(plot_df["x"]) & np.isfinite(plot_df["y"]) & np.isfinite(plot_df["z"])]
     plot_df = plot_df.reset_index(drop=True)
     plot_df.attrs["combo_fdr_col"] = combo_fdr_col
@@ -188,9 +206,8 @@ def _prepare_fastplot_qq_results(results: pd.DataFrame) -> pd.DataFrame:
         return results.copy()
     qq_df = results.reset_index(drop=True).copy()
     if "row_role" not in qq_df.columns and "snp" in qq_df.columns:
-        snp_text = qq_df["snp"].astype(str)
-        inferred_combo = snp_text.str.contains(r"[&|*]", regex=True, na=False)
-        qq_df["row_role"] = np.where(inferred_combo, "combo", "singleton")
+        logic_family = qq_df["snp"].map(_infer_fastplot_logic_family)
+        qq_df["row_role"] = np.where(logic_family.ne("singleton"), "combo", "singleton")
     if "snp" not in qq_df.columns or "row_role" not in qq_df.columns:
         return qq_df
     row_role = qq_df["row_role"].astype(str).str.strip().str.lower()
@@ -236,6 +253,11 @@ def _draw_role_layered_manhattan(
     singleton_mask = plot_df["row_role"] == "singleton"
     combo_mask = plot_df["row_role"] == "combo"
     combo_sig_mask = combo_mask & plot_df.get("combo_sig", False).astype(bool)
+    logic_family = plot_df.get("logic_family", "singleton").astype(str).str.strip().str.lower()
+    xor_mask = logic_family.eq("xor")
+    and_mask = combo_mask & ~xor_mask
+    xor_sig_mask = combo_sig_mask & xor_mask
+    and_sig_mask = combo_sig_mask & and_mask
     combo_bg_mask = combo_mask & ~combo_sig_mask
     combo_palette = list(_bioplotkit_color_set.get(6, []))
     if len(combo_palette) == 0:
@@ -262,8 +284,8 @@ def _draw_role_layered_manhattan(
         )
 
     if has_combo_fdr:
-        if bool(np.any(combo_sig_mask)):
-            combo_sig_df = plot_df.loc[combo_sig_mask, ["x", "y"]]
+        if bool(np.any(and_sig_mask)):
+            combo_sig_df = plot_df.loc[and_sig_mask, ["x", "y"]]
             ax.scatter(
                 combo_sig_df["x"],
                 combo_sig_df["y"],
@@ -273,6 +295,18 @@ def _draw_role_layered_manhattan(
                 linewidths=0.0,
                 rasterized=True,
                 zorder=4,
+            )
+        if bool(np.any(xor_sig_mask)):
+            combo_xor_df = plot_df.loc[xor_sig_mask, ["x", "y"]]
+            ax.scatter(
+                combo_xor_df["x"],
+                combo_xor_df["y"],
+                color=_FASTPLOT_SIG_XOR_COLOR,
+                s=max(1.0, float(scatter_size) * 1.2),
+                alpha=0.95,
+                linewidths=0.0,
+                rasterized=True,
+                zorder=5,
             )
     elif bool(np.any(combo_mask)):
         combo_df = plot_df.loc[combo_mask, ["x", "y", "z"]]

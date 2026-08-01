@@ -71,7 +71,7 @@ except Exception:
     jxrs = None
 
 
-_INTERACTION_RE = re.compile(r"^\s*([^\s&|*]+)\s*([&|*])\s*([^\s&|*]+)\s*$")
+_INTERACTION_RE = re.compile(r"^\s*([^\s&|*^]+)\s*([&|*^])\s*([^\s&|*^]+)\s*$")
 
 
 @dataclass(frozen=True)
@@ -331,15 +331,11 @@ def _make_combo_chunk(
                 )
             out[i] = np.asarray(g1[i] * g2[i], dtype=np.float32)
         elif op == "&":
-            out[i] = np.asarray(
-                2.0 * ((literal1[i] > 0.0) & (literal2[i] > 0.0)),
-                dtype=np.float32,
-            )
+            out[i] = np.minimum(literal1[i], literal2[i]).astype(np.float32, copy=False)
         elif op == "|":
-            out[i] = np.asarray(
-                2.0 * ((literal1[i] > 0.0) | (literal2[i] > 0.0)),
-                dtype=np.float32,
-            )
+            out[i] = np.maximum(literal1[i], literal2[i]).astype(np.float32, copy=False)
+        elif op == "^":
+            out[i] = _xor_dual_chunk(literal1[i], literal2[i])
         else:
             raise ValueError(f"Unsupported interaction operator: {op}")
     return np.ascontiguousarray(out, dtype=np.float32)
@@ -361,10 +357,32 @@ def _literalize_chunk(
         raise ValueError(
             f"Literal negation flag length mismatch: flags={int(neg.shape[0])}, rows={int(arr.shape[0])}."
         )
-    hit = arr > 0.0
+    # GARFIELD logic terms operate on dual-dosage hardcalls in {0,1,2}.
+    hit = np.rint(np.clip(arr, 0.0, 2.0)).astype(np.float32, copy=False)
     if bool(np.any(neg)):
-        hit = np.where(neg.reshape(-1, 1), ~hit, hit)
-    return np.ascontiguousarray((hit.astype(np.float32, copy=False) * 2.0), dtype=np.float32)
+        hit = np.where(neg.reshape(-1, 1), 2.0 - hit, hit)
+    return np.ascontiguousarray(hit, dtype=np.float32)
+
+
+def _xor_dual_chunk(literal1: np.ndarray, literal2: np.ndarray) -> np.ndarray:
+    a = np.ascontiguousarray(np.asarray(literal1, dtype=np.float32), dtype=np.float32)
+    b = np.ascontiguousarray(np.asarray(literal2, dtype=np.float32), dtype=np.float32)
+    if a.shape != b.shape:
+        raise ValueError(f"XOR literal shape mismatch: {a.shape} vs {b.shape}.")
+    out = np.full(a.shape, np.nan, dtype=np.float32)
+    valid = np.isfinite(a) & np.isfinite(b)
+    if not bool(np.any(valid)):
+        return np.ascontiguousarray(out, dtype=np.float32)
+    av = np.rint(np.clip(a[valid], 0.0, 2.0))
+    bv = np.rint(np.clip(b[valid], 0.0, 2.0))
+    same = av == bv
+    has_het = (av == 1.0) | (bv == 1.0)
+    out[valid] = np.where(
+        same,
+        np.where(av == 1.0, 1.0, 0.0),
+        np.where(has_het, 1.0, 2.0),
+    ).astype(np.float32, copy=False)
+    return np.ascontiguousarray(out, dtype=np.float32)
 
 
 def _trait_label(trait_ref: object) -> str:

@@ -123,6 +123,7 @@ const GARFIELD_NULL_ML_TOP_FRAC: f64 = 0.80;
 const GARFIELD_SCAN_MIN_GAIN_EPS: f64 = 1e-6;
 const GARFIELD_SCAN_SURROGATE_TEST_GAIN_MAX: f64 = 0.02;
 const GARFIELD_SCAN_SURROGATE_HAMMING_FRAC_MAX: f64 = 0.02;
+// Active runtime keeps only bucket null penalties in user-visible ranking/output.
 const GARFIELD_DISABLE_STRUCTURE_PRIOR: bool = true;
 const GARFIELD_GENESET_LD_PRUNE_R2_DEFAULT: f64 = 0.80;
 const GARFIELD_GENESET_CORR_SERIAL_MAX_ROWS: usize = 256;
@@ -3344,6 +3345,7 @@ fn logic_symbol_for_display(
     polarity: GarfieldRuleDisplayPolarity,
 ) -> &'static str {
     match (op, polarity) {
+        (BeamBinaryOp::Xor, _) => "^",
         (BeamBinaryOp::And, GarfieldRuleDisplayPolarity::Original)
         | (BeamBinaryOp::Or, GarfieldRuleDisplayPolarity::Complement) => "&",
         (BeamBinaryOp::Or, GarfieldRuleDisplayPolarity::Original)
@@ -3357,6 +3359,7 @@ fn expr_symbol_for_display(
     polarity: GarfieldRuleDisplayPolarity,
 ) -> &'static str {
     match (op, polarity) {
+        (BeamBinaryOp::Xor, _) => "XOR",
         (BeamBinaryOp::And, GarfieldRuleDisplayPolarity::Original)
         | (BeamBinaryOp::Or, GarfieldRuleDisplayPolarity::Complement) => "AND",
         (BeamBinaryOp::Or, GarfieldRuleDisplayPolarity::Original)
@@ -3379,6 +3382,7 @@ fn display_binary_op(op: BeamBinaryOp, polarity: GarfieldRuleDisplayPolarity) ->
         GarfieldRuleDisplayPolarity::Complement => match op {
             BeamBinaryOp::And => BeamBinaryOp::Or,
             BeamBinaryOp::Or => BeamBinaryOp::And,
+            BeamBinaryOp::Xor => BeamBinaryOp::Xor,
         },
     }
 }
@@ -3628,6 +3632,7 @@ fn final_output_score_with_bucket(
     output_null_penalties: Option<&RuleNullPenaltyLookup>,
     is_train: bool,
 ) -> f64 {
+    // Final reported score uses only raw score minus the bucket null penalty.
     raw_score - final_output_null_penalty_for_bucket(bucket, output_null_penalties, is_train)
 }
 
@@ -3820,6 +3825,46 @@ fn build_unit_rule_compare_record(
         raw_score_gap: best_rule_raw_score - best_singleton_raw_score,
         penalty_gap: best_rule_penalty - best_singleton_penalty,
     }))
+}
+
+fn select_reportable_ranked_hits(
+    beam_hits: &[BeamRuleCandidate],
+    ranked_hits: &[(usize, f64)],
+    top_rules_per_unit: usize,
+    raw_design: bool,
+) -> Vec<(usize, f64)> {
+    if ranked_hits.is_empty() {
+        return Vec::new();
+    }
+    let base = if raw_design {
+        ranked_hits.to_vec()
+    } else {
+        let positive_combos = ranked_hits
+            .iter()
+            .copied()
+            .filter(|(idx, score)| beam_hits[*idx].rule.len() > 1 && score_key(*score) > 0.0)
+            .collect::<Vec<_>>();
+        if !positive_combos.is_empty() {
+            positive_combos
+        } else if let Some(best_singleton) = ranked_hits
+            .iter()
+            .copied()
+            .find(|(idx, _)| beam_hits[*idx].rule.len() == 1)
+        {
+            vec![best_singleton]
+        } else {
+            ranked_hits.iter().copied().take(1).collect::<Vec<_>>()
+        }
+    };
+    if top_rules_per_unit == 0 || base.len() <= 1 {
+        return base;
+    }
+    let keep = extend_keep_with_score_ties(
+        base.as_slice(),
+        top_rules_per_unit.min(base.len()),
+        |(_, score)| *score,
+    );
+    base.into_iter().take(keep).collect::<Vec<_>>()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5559,7 +5604,7 @@ fn strip_logic_display_target_suffix(token: &str) -> &str {
 
 #[inline]
 fn parse_logic_record_primary_site(rec: &GarfieldLogicRuleRecord) -> Option<(String, i32)> {
-    let first = strip_logic_display_target_suffix(rec.snp_name.split(['&', '|', '*']).next()?);
+    let first = strip_logic_display_target_suffix(rec.snp_name.split(['&', '|', '*', '^']).next()?);
     let (chrom, pos_txt) = first.rsplit_once('_')?;
     let pos = pos_txt.parse::<i32>().ok()?;
     Some((normalize_chrom(chrom), pos))
@@ -9446,10 +9491,20 @@ fn evaluate_logic_unit_prepared_continuous(
     beam_params: BeamSearchParams,
     output_null_penalties: Option<Arc<RuleNullPenaltyLookup>>,
     top_rules_per_unit: usize,
+    raw_design: bool,
     unit_kind_lc: &str,
     debug_probe: Option<&GarfieldBeamDebugProbe>,
 ) -> Result<GarfieldUnitEvaluationOutput, String> {
     let beam_params_search = beam_params_for_prepared(prepared, beam_params.clone());
+    if env_truthy("JX_GARFIELD_LAYER_DEBUG") {
+        eprintln!(
+            "[GARFIELD-LAYER-DEBUG] unit={} stage=beam_start selected_rows={} beam_width={} max_pick={}",
+            unit.label,
+            prepared.selected_global_rows.len(),
+            beam_params_search.beam_width,
+            beam_params_search.max_pick,
+        );
+    }
     let literal_scores = if prepared_bits.test_bits.is_none()
         && prepared_bits.test_bits_hi.is_none()
         && y_train == y_test
@@ -9481,6 +9536,13 @@ fn evaluate_logic_unit_prepared_continuous(
                 .to_string(),
         );
     };
+    if env_truthy("JX_GARFIELD_LAYER_DEBUG") {
+        eprintln!(
+            "[GARFIELD-LAYER-DEBUG] unit={} stage=beam_end hits={}",
+            unit.label,
+            beam_hits.len(),
+        );
+    }
     if beam_hits.is_empty() {
         return Ok(GarfieldUnitEvaluationOutput::default());
     }
@@ -9536,20 +9598,14 @@ fn evaluate_logic_unit_prepared_continuous(
         output_null_penalties.as_deref(),
         null_complexity_bin,
     )?;
-    let keep_rules = if top_rules_per_unit == 0 {
-        ranked_hits.len()
-    } else {
-        extend_keep_with_score_ties(
-            ranked_hits.as_slice(),
-            top_rules_per_unit.min(ranked_hits.len()),
-            |(_, score)| *score,
-        )
-    };
-    let mut out = Vec::<GarfieldLogicRuleRecord>::with_capacity(keep_rules.max(1));
-    for (rank_idx, (cand_idx, output_score)) in ranked_hits.iter().enumerate() {
-        if rank_idx >= keep_rules {
-            break;
-        }
+    let report_hits = select_reportable_ranked_hits(
+        beam_hits.as_slice(),
+        ranked_hits.as_slice(),
+        top_rules_per_unit,
+        raw_design,
+    );
+    let mut out = Vec::<GarfieldLogicRuleRecord>::with_capacity(report_hits.len().max(1));
+    for (cand_idx, output_score) in report_hits.iter() {
         let cand = &beam_hits[*cand_idx];
         let rendered = render_candidate_rule_for_output(
             cand,
@@ -9655,6 +9711,7 @@ fn evaluate_logic_unit_continuous(
     beam_params: BeamSearchParams,
     output_null_penalties: Option<Arc<RuleNullPenaltyLookup>>,
     top_rules_per_unit: usize,
+    raw_design: bool,
     unit_kind_lc: &str,
 ) -> Result<Vec<GarfieldLogicRuleRecord>, String> {
     let Some(prepared) = prepare_logic_unit_continuous(
@@ -9695,6 +9752,7 @@ fn evaluate_logic_unit_continuous(
         beam_params,
         output_null_penalties,
         top_rules_per_unit,
+        raw_design,
         unit_kind_lc,
         None,
     )?
@@ -9720,6 +9778,7 @@ fn process_scan_unit_continuous(
     beam_params: BeamSearchParams,
     output_null_penalties: Option<Arc<RuleNullPenaltyLookup>>,
     top_rules_per_unit: usize,
+    raw_design: bool,
     unit_kind_lc: &str,
     progress_callback: Option<&Py<PyAny>>,
     scan_progress_done: &AtomicUsize,
@@ -9818,6 +9877,7 @@ fn process_scan_unit_continuous(
             beam_params.clone(),
             output_null_penalties.clone(),
             top_rules_per_unit,
+            raw_design,
             unit_kind_lc,
             debug_probe,
         ) {
@@ -10808,6 +10868,7 @@ fn garfield_logic_search_bed_owned(
     rule_permutation: bool,
     prior_len: Option<Vec<f64>>,
     no_clean: bool,
+    raw_design: bool,
     whole_genome_dev_mode: bool,
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
@@ -12342,6 +12403,7 @@ fn garfield_logic_search_bed_owned(
                         scan_beam_params.clone(),
                         rule_output_null_lookup.clone(),
                         top_rules_per_unit,
+                        raw_design,
                         &unit_kind_lc,
                         progress_callback_parallel,
                         &scan_progress_done,
@@ -12377,6 +12439,7 @@ fn garfield_logic_search_bed_owned(
                 scan_beam_params.clone(),
                 rule_output_null_lookup.clone(),
                 top_rules_per_unit,
+                raw_design,
                 &unit_kind_lc,
                 progress_callback.as_ref(),
                 &scan_progress_done,
@@ -12752,6 +12815,7 @@ pub fn garfield_debug_probe_single_group_from_files(
         None,
         false,
         false,
+        false,
         None,
         0usize,
         Some(probe),
@@ -12819,6 +12883,7 @@ pub fn garfield_debug_probe_single_group_from_files(
     rule_permutation=true,
     prior_len=None,
     no_clean=false,
+    raw_design=false,
     whole_genome_dev_mode=false,
     progress_callback=None,
     progress_every=0
@@ -12883,6 +12948,7 @@ pub fn garfield_logic_search_bed_py<'py>(
     rule_permutation: bool,
     prior_len: Option<Vec<f64>>,
     no_clean: bool,
+    raw_design: bool,
     whole_genome_dev_mode: bool,
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
@@ -12994,6 +13060,7 @@ pub fn garfield_logic_search_bed_py<'py>(
                 rule_permutation,
                 prior_len,
                 no_clean,
+                raw_design,
                 whole_genome_dev_mode,
                 progress_callback,
                 progress_every,
@@ -14526,6 +14593,85 @@ mod tests {
         assert!((score - 7.0).abs() < 1e-12);
     }
 
+    fn make_test_rule_candidate(
+        row_indices: &[usize],
+        ops: &[BeamBinaryOp],
+        test_score: f64,
+    ) -> BeamRuleCandidate {
+        let first = BeamLiteral {
+            row_index: row_indices[0],
+            group_id: row_indices[0],
+            negated: false,
+        };
+        let rest = row_indices
+            .iter()
+            .copied()
+            .skip(1)
+            .enumerate()
+            .map(|(i, row_index)| {
+                (
+                    ops.get(i).copied().unwrap_or(BeamBinaryOp::And),
+                    BeamLiteral {
+                        row_index,
+                        group_id: row_index,
+                        negated: false,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        BeamRuleCandidate {
+            rule: BeamRule { first, rest },
+            train_score: test_score,
+            test_score,
+            train: ContinuousRuleScore {
+                score: test_score,
+                raw_score: test_score,
+                mean_hit: 0.0,
+                mean_miss: 0.0,
+                support_frac: 0.5,
+                dosage_maf: 0.25,
+                n_hit: 4,
+                n_ge2: 0,
+                n_miss: 4,
+            },
+            test: ContinuousRuleScore {
+                score: test_score,
+                raw_score: test_score,
+                mean_hit: 0.0,
+                mean_miss: 0.0,
+                support_frac: 0.5,
+                dosage_maf: 0.25,
+                n_hit: 4,
+                n_ge2: 0,
+                n_miss: 4,
+            },
+        }
+    }
+
+    #[test]
+    fn test_select_reportable_ranked_hits_falls_back_to_best_singleton_when_combo_nonpositive() {
+        let beam_hits = vec![
+            make_test_rule_candidate(&[0, 1], &[BeamBinaryOp::Xor], -0.25),
+            make_test_rule_candidate(&[2], &[], -1.0),
+        ];
+        let ranked_hits = vec![(0usize, -0.25_f64), (1usize, -1.0_f64)];
+        let selected =
+            select_reportable_ranked_hits(beam_hits.as_slice(), ranked_hits.as_slice(), 1, false);
+        assert_eq!(selected, vec![(1usize, -1.0_f64)]);
+    }
+
+    #[test]
+    fn test_select_reportable_ranked_hits_keeps_raw_design_ordering() {
+        let beam_hits = vec![
+            make_test_rule_candidate(&[0, 1], &[BeamBinaryOp::Xor], -0.25),
+            make_test_rule_candidate(&[2], &[], -1.0),
+        ];
+        let ranked_hits = vec![(0usize, -0.25_f64), (1usize, -1.0_f64)];
+        let selected =
+            select_reportable_ranked_hits(beam_hits.as_slice(), ranked_hits.as_slice(), 1, true);
+        assert_eq!(selected, vec![(0usize, -0.25_f64)]);
+    }
+
     #[test]
     fn test_apply_logic_rule_output_limit_count_keeps_ties() {
         let mut records = vec![
@@ -14714,6 +14860,36 @@ mod tests {
         assert_eq!(snp_name, "1_100[A>G]|1_200[A>G]");
         assert_eq!(bim_name, "1_100[A>G]|1_200[A>G]");
         assert_eq!(ml_rank, "1|2");
+    }
+
+    #[test]
+    fn test_rule_display_polarity_preserves_original_xor_rule() {
+        let sites = vec![test_site("1", 100), test_site("1", 200)];
+        let rule = BeamRule {
+            first: BeamLiteral {
+                row_index: 0,
+                group_id: 0,
+                negated: false,
+            },
+            rest: vec![(
+                BeamBinaryOp::Xor,
+                BeamLiteral {
+                    row_index: 1,
+                    group_id: 1,
+                    negated: false,
+                },
+            )],
+        };
+        let polarity = GarfieldRuleDisplayPolarity::Original;
+        let expr = rule_expr_with_polarity(&rule, sites.as_slice(), polarity).unwrap();
+        let snp_name = rule_snp_name_with_polarity(&rule, sites.as_slice(), polarity).unwrap();
+        let bim_name = rule_bim_name_with_polarity(&rule, sites.as_slice(), polarity).unwrap();
+        let ml_rank = rule_ml_rank_name_with_polarity(&rule, polarity);
+
+        assert_eq!(expr, "BIN(1_100) XOR BIN(1_200)");
+        assert_eq!(snp_name, "1_100[G]^1_200[G]");
+        assert_eq!(bim_name, "1_100[G]^1_200[G]");
+        assert_eq!(ml_rank, "1^2");
     }
 
     #[test]

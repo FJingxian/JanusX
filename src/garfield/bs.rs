@@ -3,7 +3,13 @@
 //
 // Active GARFIELD continuous search is intentionally restricted to:
 // - fuzzy dosage rules backed by dual bitplanes (`g >= 1`, `g >= 2`)
-// - AND-family beam expansion plus negation at the literal level
+// - AND/XOR beam expansion plus negation at the literal level
+// - ternary XOR on literal dosages: same homozygotes -> 0, opposite
+//   homozygotes -> 2, and any heterozygote-involving mismatch -> 1
+// - whole-rule family complements injected as extra parents each layer so OR
+//   / NXOR families can still be reached without directly expanding them
+// - active search/output scoring only exposes bucket null penalties; inactive
+//   compatibility penalty hooks stay pinned off in the current runtime path
 //
 // Legacy packed-0/1 continuous helpers and OR-family compatibility code are
 // retained in this file only for backward-compatible rule parsing/evaluation
@@ -135,33 +141,49 @@ pub(crate) fn add_garfield_beam_profile_literal_precompute_ns(delta_ns: u64) {
 pub enum BeamBinaryOp {
     And,
     Or,
+    Xor,
 }
 
 const BEAM_EXPAND_OPS_AND: [BeamBinaryOp; 1] = [BeamBinaryOp::And];
+const BEAM_EXPAND_OPS_AND_XOR: [BeamBinaryOp; 2] = [BeamBinaryOp::And, BeamBinaryOp::Xor];
+const BEAM_CHILD_NEGATIONS_AND: [bool; 2] = [false, true];
+const BEAM_CHILD_NEGATIONS_XOR: [bool; 1] = [false];
 
 #[inline]
 fn beam_binary_op_code(op: BeamBinaryOp) -> u8 {
     match op {
         BeamBinaryOp::And => 1u8,
         BeamBinaryOp::Or => 2u8,
+        BeamBinaryOp::Xor => 3u8,
     }
 }
 
 #[inline]
-fn beam_binary_ops_for_rule(_rule: &BeamRule) -> &'static [BeamBinaryOp] {
-    // Active search is AND-only from singleton seeds onward.
-    //
-    // Legacy/manual OR-family rules are still materializable below so old
-    // artifacts can be evaluated/exported, but OR expansion is intentionally
-    // disabled in the live beam path.
-    //
-    // Legacy code path kept here for reference:
-    // match rule.rest.first().map(|(op, _)| *op) {
-    //     Some(BeamBinaryOp::And) => &BEAM_EXPAND_OPS_AND,
-    //     Some(BeamBinaryOp::Or) => &BEAM_EXPAND_OPS_OR,
-    //     None => &BEAM_EXPAND_OPS_AND,
-    // }
-    &BEAM_EXPAND_OPS_AND
+fn beam_binary_ops_for_rule(rule: &BeamRule) -> &'static [BeamBinaryOp] {
+    if rule_contains_xor(rule) {
+        &BEAM_EXPAND_OPS_AND
+    } else if rule.len() == 1 && rule.first.negated {
+        &BEAM_EXPAND_OPS_AND
+    } else {
+        &BEAM_EXPAND_OPS_AND_XOR
+    }
+}
+
+#[inline]
+fn child_literal_negations_for_op(op: BeamBinaryOp) -> &'static [bool] {
+    match op {
+        BeamBinaryOp::And | BeamBinaryOp::Or => &BEAM_CHILD_NEGATIONS_AND,
+        BeamBinaryOp::Xor => &BEAM_CHILD_NEGATIONS_XOR,
+    }
+}
+
+#[inline]
+fn beam_child_branch_count_for_rule(rule: &BeamRule) -> usize {
+    beam_binary_ops_for_rule(rule)
+        .iter()
+        .map(|op| child_literal_negations_for_op(*op).len())
+        .sum::<usize>()
+        .max(1)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -232,6 +254,81 @@ impl BeamRule {
         }
         out
     }
+}
+
+#[inline]
+fn rule_xor_rest_index(rule: &BeamRule) -> Option<usize> {
+    rule.rest
+        .iter()
+        .position(|(op, _)| matches!(op, BeamBinaryOp::Xor))
+}
+
+#[inline]
+fn rule_contains_xor(rule: &BeamRule) -> bool {
+    rule_xor_rest_index(rule).is_some()
+}
+
+#[inline]
+fn flip_and_or(op: BeamBinaryOp) -> BeamBinaryOp {
+    match op {
+        BeamBinaryOp::And => BeamBinaryOp::Or,
+        BeamBinaryOp::Or => BeamBinaryOp::And,
+        BeamBinaryOp::Xor => BeamBinaryOp::Xor,
+    }
+}
+
+fn complement_rule_family(rule: &BeamRule) -> Option<BeamRule> {
+    let xor_idx = rule_xor_rest_index(rule);
+    if xor_idx.is_none() {
+        let mut out = BeamRule {
+            first: BeamLiteral {
+                negated: !rule.first.negated,
+                ..rule.first
+            },
+            rest: Vec::with_capacity(rule.rest.len()),
+        };
+        for &(op, lit) in rule.rest.iter() {
+            out.rest.push((
+                flip_and_or(op),
+                BeamLiteral {
+                    negated: !lit.negated,
+                    ..lit
+                },
+            ));
+        }
+        return Some(out);
+    }
+
+    let xor_idx = xor_idx?;
+    if rule.rest[xor_idx].0 != BeamBinaryOp::Xor {
+        return None;
+    }
+    let mut out = BeamRule {
+        first: rule.first,
+        rest: Vec::with_capacity(rule.rest.len()),
+    };
+    for (rest_idx, &(op, lit)) in rule.rest.iter().enumerate() {
+        if rest_idx < xor_idx {
+            out.rest.push((op, lit));
+        } else if rest_idx == xor_idx {
+            out.rest.push((
+                BeamBinaryOp::Xor,
+                BeamLiteral {
+                    negated: !lit.negated,
+                    ..lit
+                },
+            ));
+        } else {
+            out.rest.push((
+                flip_and_or(op),
+                BeamLiteral {
+                    negated: !lit.negated,
+                    ..lit
+                },
+            ));
+        }
+    }
+    Some(out)
 }
 
 #[inline]
@@ -472,6 +569,36 @@ const BEAM_PAR_MIN_TOTAL_CANDS: usize = 100_000;
 const BEAM_SIMD_MIN_WORDS: usize = 16;
 const BEAM_BNB_MIN_ROWS: usize = 128;
 const BEAM_BNB_DENSITY_MAX: f64 = 0.08;
+const GARFIELD_LAYER_DEBUG_MAX_LAYERS: usize = 64;
+const GARFIELD_LAYER_DEBUG_FAMILY_COUNT: usize = 3;
+const GARFIELD_LAYER_DEBUG_METRIC_COUNT: usize = 7;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GarfieldLayerDebugFamily {
+    Singleton = 0,
+    And = 1,
+    Xor = 2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GarfieldLayerDebugMetric {
+    Considered = 0,
+    TrainOk = 1,
+    AbsOk = 2,
+    GainOk = 3,
+    ParentOk = 4,
+    Kept = 5,
+    Retained = 6,
+}
+
+static GARFIELD_LAYER_DEBUG_COUNTS: [AtomicU64;
+    GARFIELD_LAYER_DEBUG_MAX_LAYERS
+        * GARFIELD_LAYER_DEBUG_FAMILY_COUNT
+        * GARFIELD_LAYER_DEBUG_METRIC_COUNT] =
+    [const { AtomicU64::new(0) };
+        GARFIELD_LAYER_DEBUG_MAX_LAYERS
+            * GARFIELD_LAYER_DEBUG_FAMILY_COUNT
+            * GARFIELD_LAYER_DEBUG_METRIC_COUNT];
 
 #[derive(Clone, Debug)]
 pub struct BeamAndResult {
@@ -523,6 +650,153 @@ fn parse_env_f64(name: &str) -> Option<f64> {
 #[inline]
 fn garfield_layer_rss_debug_enabled() -> bool {
     parse_env_bool("JX_GARFIELD_LAYER_RSS_DEBUG")
+}
+
+#[inline]
+fn garfield_layer_debug_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| parse_env_bool("JX_GARFIELD_LAYER_DEBUG"))
+}
+
+#[inline]
+fn garfield_layer_debug_index(
+    layer: usize,
+    family: GarfieldLayerDebugFamily,
+    metric: GarfieldLayerDebugMetric,
+) -> Option<usize> {
+    if layer == 0 || layer > GARFIELD_LAYER_DEBUG_MAX_LAYERS {
+        return None;
+    }
+    Some(
+        (((layer - 1) * GARFIELD_LAYER_DEBUG_FAMILY_COUNT) + (family as usize))
+            * GARFIELD_LAYER_DEBUG_METRIC_COUNT
+            + (metric as usize),
+    )
+}
+
+fn garfield_layer_debug_reset() {
+    if !garfield_layer_debug_enabled() {
+        return;
+    }
+    for counter in GARFIELD_LAYER_DEBUG_COUNTS.iter() {
+        counter.store(0, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+fn garfield_layer_debug_add(
+    layer: usize,
+    family: GarfieldLayerDebugFamily,
+    metric: GarfieldLayerDebugMetric,
+    delta: u64,
+) {
+    if !garfield_layer_debug_enabled() {
+        return;
+    }
+    if let Some(idx) = garfield_layer_debug_index(layer, family, metric) {
+        GARFIELD_LAYER_DEBUG_COUNTS[idx].fetch_add(delta, Ordering::Relaxed);
+    }
+}
+
+#[inline]
+fn garfield_layer_debug_family_name(family: GarfieldLayerDebugFamily) -> &'static str {
+    match family {
+        GarfieldLayerDebugFamily::Singleton => "singleton",
+        GarfieldLayerDebugFamily::And => "and",
+        GarfieldLayerDebugFamily::Xor => "xor",
+    }
+}
+
+#[inline]
+fn garfield_layer_debug_rule_family(rule: &BeamRule) -> GarfieldLayerDebugFamily {
+    if rule.len() == 1 {
+        GarfieldLayerDebugFamily::Singleton
+    } else if rule_contains_xor(rule) {
+        GarfieldLayerDebugFamily::Xor
+    } else {
+        GarfieldLayerDebugFamily::And
+    }
+}
+
+#[inline]
+fn garfield_layer_debug_op_family(op: BeamBinaryOp) -> GarfieldLayerDebugFamily {
+    match op {
+        BeamBinaryOp::Xor => GarfieldLayerDebugFamily::Xor,
+        BeamBinaryOp::And | BeamBinaryOp::Or => GarfieldLayerDebugFamily::And,
+    }
+}
+
+fn garfield_layer_debug_record_fuzzy_states(
+    layer: usize,
+    metric: GarfieldLayerDebugMetric,
+    states: &[FuzzyBeamState],
+) {
+    if !garfield_layer_debug_enabled() {
+        return;
+    }
+    let mut counts = [0u64; GARFIELD_LAYER_DEBUG_FAMILY_COUNT];
+    for state in states.iter() {
+        counts[garfield_layer_debug_rule_family(&state.rule) as usize] += 1;
+    }
+    for (family_idx, count) in counts.iter().copied().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        let family = match family_idx {
+            0 => GarfieldLayerDebugFamily::Singleton,
+            1 => GarfieldLayerDebugFamily::And,
+            _ => GarfieldLayerDebugFamily::Xor,
+        };
+        garfield_layer_debug_add(layer, family, metric, count);
+    }
+}
+
+fn garfield_layer_debug_dump(mode: &str, max_layer: usize) {
+    if !garfield_layer_debug_enabled() {
+        return;
+    }
+    let families = [
+        GarfieldLayerDebugFamily::Singleton,
+        GarfieldLayerDebugFamily::And,
+        GarfieldLayerDebugFamily::Xor,
+    ];
+    for layer in 1..=max_layer.min(GARFIELD_LAYER_DEBUG_MAX_LAYERS) {
+        for family in families.iter().copied() {
+            let load = |metric| {
+                garfield_layer_debug_index(layer, family, metric)
+                    .map(|idx| GARFIELD_LAYER_DEBUG_COUNTS[idx].load(Ordering::Relaxed))
+                    .unwrap_or(0)
+            };
+            let considered = load(GarfieldLayerDebugMetric::Considered);
+            let train_ok = load(GarfieldLayerDebugMetric::TrainOk);
+            let abs_ok = load(GarfieldLayerDebugMetric::AbsOk);
+            let gain_ok = load(GarfieldLayerDebugMetric::GainOk);
+            let parent_ok = load(GarfieldLayerDebugMetric::ParentOk);
+            let kept = load(GarfieldLayerDebugMetric::Kept);
+            let retained = load(GarfieldLayerDebugMetric::Retained);
+            if considered == 0
+                && train_ok == 0
+                && abs_ok == 0
+                && gain_ok == 0
+                && parent_ok == 0
+                && kept == 0
+                && retained == 0
+            {
+                continue;
+            }
+            eprintln!(
+                "[GARFIELD-LAYER-DEBUG] mode={mode} layer={layer} family={} considered={} train_ok={} abs_ok={} gain_ok={} parent_ok={} kept={} retained={}",
+                garfield_layer_debug_family_name(family),
+                considered,
+                train_ok,
+                abs_ok,
+                gain_ok,
+                parent_ok,
+                kept,
+                retained,
+            );
+        }
+    }
 }
 
 #[inline]
@@ -1957,6 +2231,12 @@ fn evaluate_child_train_from_parent_virtual(
                 .saturating_sub(inter_n_hit),
             parent_sum_hit + row_sum_hit - inter_sum_hit,
         ),
+        BeamBinaryOp::Xor => (
+            parent_n_hit
+                .saturating_add(row_n_hit)
+                .saturating_sub(inter_n_hit.saturating_mul(2)),
+            parent_sum_hit + row_sum_hit - (2.0 * inter_sum_hit),
+        ),
     };
     let child = score_cont_centered_gain_from_sum_and_n_hit(
         sum_y_train,
@@ -2757,6 +3037,48 @@ fn bitor_assign(dst: &mut [u64], rhs: &[u64]) {
 }
 
 #[inline]
+fn bitxor_assign_masked(dst: &mut [u64], rhs: &[u64], n_valid_bits: usize) {
+    debug_assert_eq!(dst.len(), rhs.len());
+    let needed_words = words_for_samples(n_valid_bits);
+    if needed_words == 0 {
+        return;
+    }
+    let full_words = n_valid_bits >> 6;
+    let rem = n_valid_bits & 63;
+    for i in 0..full_words {
+        dst[i] ^= rhs[i];
+    }
+    if rem != 0 {
+        let mask = (1u64 << rem) - 1u64;
+        dst[full_words] ^= rhs[full_words] & mask;
+    } else if full_words < needed_words {
+        dst[full_words] ^= rhs[full_words];
+    }
+    apply_tail_mask(dst, tail_mask(n_valid_bits));
+}
+
+#[inline]
+fn bitxor_not_assign_masked(dst: &mut [u64], rhs: &[u64], n_valid_bits: usize) {
+    debug_assert_eq!(dst.len(), rhs.len());
+    let needed_words = words_for_samples(n_valid_bits);
+    if needed_words == 0 {
+        return;
+    }
+    let full_words = n_valid_bits >> 6;
+    let rem = n_valid_bits & 63;
+    for i in 0..full_words {
+        dst[i] ^= !rhs[i];
+    }
+    if rem != 0 {
+        let mask = (1u64 << rem) - 1u64;
+        dst[full_words] ^= (!rhs[full_words]) & mask;
+    } else if full_words < needed_words {
+        dst[full_words] ^= !rhs[full_words];
+    }
+    apply_tail_mask(dst, tail_mask(n_valid_bits));
+}
+
+#[inline]
 fn bitand_not_assign_masked(dst: &mut [u64], rhs: &[u64], n_valid_bits: usize) {
     debug_assert_eq!(dst.len(), rhs.len());
     let needed_words = words_for_samples(n_valid_bits);
@@ -2821,6 +3143,8 @@ fn apply_literal_inplace(
             apply_tail_mask(dst, tail_mask(n_samples));
         }
         (BeamBinaryOp::Or, true) => bitor_not_into_masked(dst, row, n_samples),
+        (BeamBinaryOp::Xor, false) => bitxor_assign_masked(dst, row, n_samples),
+        (BeamBinaryOp::Xor, true) => bitxor_not_assign_masked(dst, row, n_samples),
     }
 }
 
@@ -3312,7 +3636,7 @@ fn expand_beam_once_whole_genome_target_range(
                 continue;
             }
             for &op in beam_binary_ops_for_rule(&parent.rule).iter() {
-                for &negated in &[false, true] {
+                for &negated in child_literal_negations_for_op(op).iter() {
                     let literal = BeamLiteral {
                         row_index: cand,
                         group_id: gid,
@@ -3439,8 +3763,7 @@ fn expand_beam_once_whole_genome_target_parallel(
     let total_expand = parents
         .iter()
         .map(|parent| {
-            n_rows
-                .saturating_mul(2usize.saturating_mul(beam_binary_ops_for_rule(&parent.rule).len()))
+            n_rows.saturating_mul(beam_child_branch_count_for_rule(&parent.rule))
         })
         .sum::<usize>();
     let next = if should_parallel(total_expand, params.allow_parallel) {
@@ -3564,7 +3887,7 @@ fn expand_beam_once(
         .map(|node| {
             let (start, end) = expansion_row_bounds(&node.rule, n_rows);
             end.saturating_sub(start)
-                .saturating_mul(2usize.saturating_mul(beam_binary_ops_for_rule(&node.rule).len()))
+                .saturating_mul(beam_child_branch_count_for_rule(&node.rule))
         })
         .sum::<usize>();
 
@@ -3601,7 +3924,7 @@ fn expand_beam_once(
                     }
                     let row = row_prefix(bits_train, row_words_train, cand, needed_words_train);
                     for &op in beam_binary_ops_for_rule(&node.rule).iter() {
-                        for &negated in &[false, true] {
+                        for &negated in child_literal_negations_for_op(op).iter() {
                             let literal = BeamLiteral {
                                 row_index: cand,
                                 group_id: gid,
@@ -3747,7 +4070,7 @@ fn expand_beam_once(
                 }
                 let row = row_prefix(bits_train, row_words_train, cand, needed_words_train);
                 for &op in beam_binary_ops_for_rule(&node.rule).iter() {
-                    for &negated in &[false, true] {
+                    for &negated in child_literal_negations_for_op(op).iter() {
                         let literal = BeamLiteral {
                             row_index: cand,
                             group_id: gid,
@@ -3982,7 +4305,7 @@ fn expand_states_exhaustive(
             let cand_start = node.rule.last_row_index() + 1;
             n_rows
                 .saturating_sub(cand_start)
-                .saturating_mul(2usize.saturating_mul(beam_binary_ops_for_rule(&node.rule).len()))
+                .saturating_mul(beam_child_branch_count_for_rule(&node.rule))
         })
         .sum::<usize>();
     let base_rule_raws = Arc::new(collect_known_rule_raw_scores(frontier));
@@ -4015,7 +4338,7 @@ fn expand_states_exhaustive(
                         }
                         let row = row_prefix(bits_train, row_words_train, cand, needed_words_train);
                         for &op in beam_binary_ops_for_rule(&node.rule).iter() {
-                            for &negated in &[false, true] {
+                            for &negated in child_literal_negations_for_op(op).iter() {
                                 let single = literal_scores[literal_score_index(cand, negated)];
                                 let Some(train) = evaluate_child_train_from_parent_virtual(
                                     &node.combined_train,
@@ -4149,7 +4472,7 @@ fn expand_states_exhaustive(
                 }
                 let row = row_prefix(bits_train, row_words_train, cand, needed_words_train);
                 for &op in beam_binary_ops_for_rule(&node.rule).iter() {
-                    for &negated in &[false, true] {
+                    for &negated in child_literal_negations_for_op(op).iter() {
                         let single = literal_scores[literal_score_index(cand, negated)];
                         let Some(train) = evaluate_child_train_from_parent_virtual(
                             &node.combined_train,
@@ -5247,6 +5570,23 @@ fn masked_not_vec(bits: &[u64], n_samples: usize) -> Vec<u64> {
 }
 
 #[inline]
+fn complement_dual_bits_in_place_local(
+    ge1_bits: &mut [u64],
+    ge2_bits: &mut [u64],
+    n_samples: usize,
+) {
+    debug_assert_eq!(ge1_bits.len(), ge2_bits.len());
+    for i in 0..ge1_bits.len() {
+        let a1 = ge1_bits[i];
+        let a2 = ge2_bits[i];
+        ge1_bits[i] = a2;
+        ge2_bits[i] = a1;
+    }
+    bitnot_masked(ge1_bits, n_samples);
+    bitnot_masked(ge2_bits, n_samples);
+}
+
+#[inline]
 fn apply_first_literal_dual(
     row_ge1: &[u64],
     row_ge2: &[u64],
@@ -5273,9 +5613,6 @@ fn apply_literal_inplace_dual(
     negated: bool,
     n_samples: usize,
 ) {
-    // Legacy OR-family materialization is retained only so old serialized or
-    // manually supplied rules can still be decoded consistently. Active beam
-    // expansion no longer emits OR rules.
     match (op, negated) {
         (BeamBinaryOp::And, true) => {
             bitand_not_assign_masked(dst_ge1, row_ge2, n_samples);
@@ -5294,6 +5631,35 @@ fn apply_literal_inplace_dual(
         (BeamBinaryOp::Or, false) => {
             bitor_assign(dst_ge1, row_ge1);
             bitor_assign(dst_ge2, row_ge2);
+            apply_tail_mask(dst_ge1, tail_mask(n_samples));
+            apply_tail_mask(dst_ge2, tail_mask(n_samples));
+        }
+        (BeamBinaryOp::Xor, negated) => {
+            debug_assert_eq!(dst_ge1.len(), dst_ge2.len());
+            debug_assert_eq!(dst_ge1.len(), row_ge1.len());
+            debug_assert_eq!(dst_ge2.len(), row_ge2.len());
+            let needed_words = words_for_samples(n_samples);
+            if needed_words == 0 {
+                return;
+            }
+            let full_words = n_samples >> 6;
+            let rem = n_samples & 63;
+            for i in 0..needed_words {
+                let mask = if i < full_words || rem == 0 {
+                    u64::MAX
+                } else {
+                    (1u64 << rem) - 1u64
+                };
+                let a1 = dst_ge1[i];
+                let a2 = dst_ge2[i];
+                let (b1, b2) = if negated {
+                    ((!row_ge2[i]) & mask, (!row_ge1[i]) & mask)
+                } else {
+                    (row_ge1[i] & mask, row_ge2[i] & mask)
+                };
+                dst_ge1[i] = ((a1 & !b2) | ((!a2) & b1)) & mask;
+                dst_ge2[i] = (((!a1) & b2) | (a2 & !b1)) & mask;
+            }
             apply_tail_mask(dst_ge1, tail_mask(n_samples));
             apply_tail_mask(dst_ge2, tail_mask(n_samples));
         }
@@ -5413,6 +5779,66 @@ fn literal_dual_summary_with_negation(
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct DualEffectiveIntersections {
+    inter_n_ge1: usize,
+    inter_n_ge2: usize,
+    cross_n_p1_r2: usize,
+    cross_n_p2_r1: usize,
+    inter_sum_ge1: f64,
+    inter_sum_ge2: f64,
+    cross_sum_p1_r2: f64,
+    cross_sum_p2_r1: f64,
+}
+
+#[inline]
+fn effective_dual_intersections(
+    parent: &FuzzyBeamState,
+    row_ge1: &[u64],
+    row_ge2: &[u64],
+    y_train: &[f64],
+    n_train: usize,
+    negated: bool,
+) -> DualEffectiveIntersections {
+    let p1_r1_n = and_popcount(parent.combined_train_ge1.as_slice(), row_ge1) as usize;
+    let p2_r2_n = and_popcount(parent.combined_train_ge2.as_slice(), row_ge2) as usize;
+    let p1_r2_n = and_popcount(parent.combined_train_ge1.as_slice(), row_ge2) as usize;
+    let p2_r1_n = and_popcount(parent.combined_train_ge2.as_slice(), row_ge1) as usize;
+    let t_sum = beam_detail_profile_start();
+    let p1_r1_sum =
+        sum_y_where_both1(parent.combined_train_ge1.as_slice(), row_ge1, y_train, n_train);
+    let p2_r2_sum =
+        sum_y_where_both1(parent.combined_train_ge2.as_slice(), row_ge2, y_train, n_train);
+    let p1_r2_sum =
+        sum_y_where_both1(parent.combined_train_ge1.as_slice(), row_ge2, y_train, n_train);
+    let p2_r1_sum =
+        sum_y_where_both1(parent.combined_train_ge2.as_slice(), row_ge1, y_train, n_train);
+    beam_detail_profile_end(t_sum, &GARFIELD_PROFILE_SUM_Y_BOTH1_NS);
+    if !negated {
+        DualEffectiveIntersections {
+            inter_n_ge1: p1_r1_n,
+            inter_n_ge2: p2_r2_n,
+            cross_n_p1_r2: p1_r2_n,
+            cross_n_p2_r1: p2_r1_n,
+            inter_sum_ge1: p1_r1_sum,
+            inter_sum_ge2: p2_r2_sum,
+            cross_sum_p1_r2: p1_r2_sum,
+            cross_sum_p2_r1: p2_r1_sum,
+        }
+    } else {
+        DualEffectiveIntersections {
+            inter_n_ge1: parent.train.n_hit.saturating_sub(p1_r2_n),
+            inter_n_ge2: parent.train_n_ge2.saturating_sub(p2_r1_n),
+            cross_n_p1_r2: parent.train.n_hit.saturating_sub(p1_r1_n),
+            cross_n_p2_r1: parent.train_n_ge2.saturating_sub(p2_r2_n),
+            inter_sum_ge1: parent.train_sum_ge1 - p1_r2_sum,
+            inter_sum_ge2: parent.train_sum_ge2 - p2_r1_sum,
+            cross_sum_p1_r2: parent.train_sum_ge1 - p1_r1_sum,
+            cross_sum_p2_r1: parent.train_sum_ge2 - p2_r2_sum,
+        }
+    }
+}
+
 #[inline]
 fn evaluate_child_train_from_parent_virtual_fuzzy(
     parent_ge1: &[u64],
@@ -5431,43 +5857,91 @@ fn evaluate_child_train_from_parent_virtual_fuzzy(
 ) -> Option<(ContinuousRuleScore, usize, f64, f64)> {
     let (row_n_ge1, row_n_ge2, row_sum_ge1, row_sum_ge2) =
         literal_dual_summary_with_negation(sum_y_train, n_train, row_summary, negated);
-    let (inter_n_ge1, inter_n_ge2, inter_sum_ge1, inter_sum_ge2) = if negated {
-        let drop_n_ge1 = and_popcount(parent_ge1, row_ge2) as usize;
-        let drop_n_ge2 = and_popcount(parent_ge2, row_ge1) as usize;
-        let t_sum = beam_detail_profile_start();
-        let drop_sum_ge1 = sum_y_where_both1(parent_ge1, row_ge2, y_train, n_train);
-        let drop_sum_ge2 = sum_y_where_both1(parent_ge2, row_ge1, y_train, n_train);
-        beam_detail_profile_end(t_sum, &GARFIELD_PROFILE_SUM_Y_BOTH1_NS);
-        (
-            parent.train.n_hit.saturating_sub(drop_n_ge1),
-            parent.train_n_ge2.saturating_sub(drop_n_ge2),
-            parent.train_sum_ge1 - drop_sum_ge1,
-            parent.train_sum_ge2 - drop_sum_ge2,
-        )
-    } else {
-        let inter_n_ge1 = and_popcount(parent_ge1, row_ge1) as usize;
-        let inter_n_ge2 = and_popcount(parent_ge2, row_ge2) as usize;
-        let t_sum = beam_detail_profile_start();
-        let inter_sum_ge1 = sum_y_where_both1(parent_ge1, row_ge1, y_train, n_train);
-        let inter_sum_ge2 = sum_y_where_both1(parent_ge2, row_ge2, y_train, n_train);
-        beam_detail_profile_end(t_sum, &GARFIELD_PROFILE_SUM_Y_BOTH1_NS);
-        (inter_n_ge1, inter_n_ge2, inter_sum_ge1, inter_sum_ge2)
-    };
     let (child_n_ge1, child_n_ge2, child_sum_ge1, child_sum_ge2) = match op {
-        BeamBinaryOp::And => (inter_n_ge1, inter_n_ge2, inter_sum_ge1, inter_sum_ge2),
+        BeamBinaryOp::And => {
+            let (inter_n_ge1, inter_n_ge2, inter_sum_ge1, inter_sum_ge2) = if negated {
+                let drop_n_ge1 = and_popcount(parent_ge1, row_ge2) as usize;
+                let drop_n_ge2 = and_popcount(parent_ge2, row_ge1) as usize;
+                let t_sum = beam_detail_profile_start();
+                let drop_sum_ge1 = sum_y_where_both1(parent_ge1, row_ge2, y_train, n_train);
+                let drop_sum_ge2 = sum_y_where_both1(parent_ge2, row_ge1, y_train, n_train);
+                beam_detail_profile_end(t_sum, &GARFIELD_PROFILE_SUM_Y_BOTH1_NS);
+                (
+                    parent.train.n_hit.saturating_sub(drop_n_ge1),
+                    parent.train_n_ge2.saturating_sub(drop_n_ge2),
+                    parent.train_sum_ge1 - drop_sum_ge1,
+                    parent.train_sum_ge2 - drop_sum_ge2,
+                )
+            } else {
+                let inter_n_ge1 = and_popcount(parent_ge1, row_ge1) as usize;
+                let inter_n_ge2 = and_popcount(parent_ge2, row_ge2) as usize;
+                let t_sum = beam_detail_profile_start();
+                let inter_sum_ge1 = sum_y_where_both1(parent_ge1, row_ge1, y_train, n_train);
+                let inter_sum_ge2 = sum_y_where_both1(parent_ge2, row_ge2, y_train, n_train);
+                beam_detail_profile_end(t_sum, &GARFIELD_PROFILE_SUM_Y_BOTH1_NS);
+                (inter_n_ge1, inter_n_ge2, inter_sum_ge1, inter_sum_ge2)
+            };
+            (inter_n_ge1, inter_n_ge2, inter_sum_ge1, inter_sum_ge2)
+        }
         BeamBinaryOp::Or => (
-            parent
-                .train
-                .n_hit
-                .saturating_add(row_n_ge1)
-                .saturating_sub(inter_n_ge1),
-            parent
-                .train_n_ge2
-                .saturating_add(row_n_ge2)
-                .saturating_sub(inter_n_ge2),
-            parent.train_sum_ge1 + row_sum_ge1 - inter_sum_ge1,
-            parent.train_sum_ge2 + row_sum_ge2 - inter_sum_ge2,
+            {
+                let inter_n_ge1 = if negated {
+                    let drop_n_ge1 = and_popcount(parent_ge1, row_ge2) as usize;
+                    parent.train.n_hit.saturating_sub(drop_n_ge1)
+                } else {
+                    and_popcount(parent_ge1, row_ge1) as usize
+                };
+                inter_n_ge1
+            },
+            {
+                let inter_n_ge2 = if negated {
+                    let drop_n_ge2 = and_popcount(parent_ge2, row_ge1) as usize;
+                    parent.train_n_ge2.saturating_sub(drop_n_ge2)
+                } else {
+                    and_popcount(parent_ge2, row_ge2) as usize
+                };
+                inter_n_ge2
+            },
+            {
+                let t_sum = beam_detail_profile_start();
+                let value = if negated {
+                    parent.train_sum_ge1
+                        - sum_y_where_both1(parent_ge1, row_ge2, y_train, n_train)
+                } else {
+                    sum_y_where_both1(parent_ge1, row_ge1, y_train, n_train)
+                };
+                beam_detail_profile_end(t_sum, &GARFIELD_PROFILE_SUM_Y_BOTH1_NS);
+                value
+            },
+            {
+                let t_sum = beam_detail_profile_start();
+                let value = if negated {
+                    parent.train_sum_ge2
+                        - sum_y_where_both1(parent_ge2, row_ge1, y_train, n_train)
+                } else {
+                    sum_y_where_both1(parent_ge2, row_ge2, y_train, n_train)
+                };
+                beam_detail_profile_end(t_sum, &GARFIELD_PROFILE_SUM_Y_BOTH1_NS);
+                value
+            },
         ),
+        BeamBinaryOp::Xor => {
+            let inter = effective_dual_intersections(parent, row_ge1, row_ge2, y_train, n_train, negated);
+            (
+                parent
+                    .train
+                    .n_hit
+                    .saturating_add(row_n_ge1)
+                    .saturating_sub(inter.inter_n_ge1)
+                    .saturating_sub(inter.inter_n_ge2),
+                row_n_ge2
+                    .saturating_sub(inter.cross_n_p1_r2)
+                    .saturating_add(parent.train_n_ge2.saturating_sub(inter.cross_n_p2_r1)),
+                parent.train_sum_ge1 + row_sum_ge1 - inter.inter_sum_ge1 - inter.inter_sum_ge2,
+                row_sum_ge2 - inter.cross_sum_p1_r2 + parent.train_sum_ge2
+                    - inter.cross_sum_p2_r1,
+            )
+        }
     };
     let _ = child_rule_len;
     if !keep_rule_after_dosage_maf_counts(child_n_ge1, child_n_ge2, n_train, params) {
@@ -6078,6 +6552,12 @@ fn build_initial_fuzzy_beam(
                 group_id: group_ids[row_idx],
                 negated,
             };
+            garfield_layer_debug_add(
+                1,
+                GarfieldLayerDebugFamily::Singleton,
+                GarfieldLayerDebugMetric::Considered,
+                1,
+            );
             let rule = BeamRule {
                 first: literal,
                 rest: Vec::new(),
@@ -6095,9 +6575,27 @@ fn build_initial_fuzzy_beam(
             if !pass_lmaf {
                 continue;
             }
+            garfield_layer_debug_add(
+                1,
+                GarfieldLayerDebugFamily::Singleton,
+                GarfieldLayerDebugMetric::TrainOk,
+                1,
+            );
             if !pass_gain {
                 continue;
             }
+            garfield_layer_debug_add(
+                1,
+                GarfieldLayerDebugFamily::Singleton,
+                GarfieldLayerDebugMetric::GainOk,
+                1,
+            );
+            garfield_layer_debug_add(
+                1,
+                GarfieldLayerDebugFamily::Singleton,
+                GarfieldLayerDebugMetric::Kept,
+                1,
+            );
             push_top_k_fuzzy_states(
                 &mut seq,
                 FuzzyBeamState {
@@ -6124,7 +6622,13 @@ fn build_initial_fuzzy_beam(
             params,
         ));
     }
-    Ok(filter_fuzzy_beam_candidates(seq, layer_cap, params))
+    let out = filter_fuzzy_beam_candidates(seq, layer_cap, params);
+    garfield_layer_debug_record_fuzzy_states(
+        1,
+        GarfieldLayerDebugMetric::Retained,
+        out.as_slice(),
+    );
+    Ok(out)
 }
 
 fn build_initial_fuzzy_states_exhaustive(
@@ -6161,6 +6665,12 @@ fn build_initial_fuzzy_states_exhaustive(
                 group_id: group_ids[row_idx],
                 negated,
             };
+            garfield_layer_debug_add(
+                1,
+                GarfieldLayerDebugFamily::Singleton,
+                GarfieldLayerDebugMetric::Considered,
+                1,
+            );
             let rule = BeamRule {
                 first: literal,
                 rest: Vec::new(),
@@ -6176,6 +6686,24 @@ fn build_initial_fuzzy_states_exhaustive(
             if !pass_lmaf {
                 continue;
             }
+            garfield_layer_debug_add(
+                1,
+                GarfieldLayerDebugFamily::Singleton,
+                GarfieldLayerDebugMetric::TrainOk,
+                1,
+            );
+            garfield_layer_debug_add(
+                1,
+                GarfieldLayerDebugFamily::Singleton,
+                GarfieldLayerDebugMetric::GainOk,
+                1,
+            );
+            garfield_layer_debug_add(
+                1,
+                GarfieldLayerDebugFamily::Singleton,
+                GarfieldLayerDebugMetric::Kept,
+                1,
+            );
             all.push(FuzzyBeamState {
                 rule,
                 combined_train_ge1: combined_ge1,
@@ -6199,6 +6727,11 @@ fn build_initial_fuzzy_states_exhaustive(
             params,
         ));
     }
+    garfield_layer_debug_record_fuzzy_states(
+        1,
+        GarfieldLayerDebugMetric::Retained,
+        out.as_slice(),
+    );
     Ok(out)
 }
 
@@ -6255,6 +6788,94 @@ fn whole_genome_layer2_parent_variants_fuzzy(
         });
     }
     out
+}
+
+fn whole_rule_family_complement_variant_fuzzy(
+    node: &FuzzyBeamState,
+    sum_y_train: f64,
+    n_train: usize,
+    params: &BeamSearchParams,
+) -> Option<FuzzyBeamState> {
+    let rule = complement_rule_family(&node.rule)?;
+    if rule.lexical_key() == node.rule.lexical_key() {
+        return None;
+    }
+    let (train_n_ge1, train_n_ge2, train_sum_ge1, train_sum_ge2) = complement_dual_summary(
+        sum_y_train,
+        n_train,
+        node.train.n_hit,
+        node.train_n_ge2,
+        node.train_sum_ge1,
+        node.train_sum_ge2,
+    );
+    if !keep_rule_after_dosage_maf_counts(train_n_ge1, train_n_ge2, n_train, params) {
+        return None;
+    }
+    let train = score_cont_centered_gain_dual_from_summary(
+        sum_y_train,
+        n_train,
+        train_n_ge1,
+        train_n_ge2,
+        train_sum_ge1,
+        train_sum_ge2,
+    );
+    let (train_abs_score, train_score) =
+        train_scores_for_rule(&rule, train, train.raw_score, None, None, params);
+    if !keep_state_after_min_gain_pruning(rule.len(), train_score, params) {
+        return None;
+    }
+    let mut combined_train_ge1 = node.combined_train_ge1.clone();
+    let mut combined_train_ge2 = node.combined_train_ge2.clone();
+    complement_dual_bits_in_place_local(
+        combined_train_ge1.as_mut_slice(),
+        combined_train_ge2.as_mut_slice(),
+        n_train,
+    );
+    Some(FuzzyBeamState {
+        rule,
+        combined_train_ge1,
+        combined_train_ge2,
+        train,
+        train_n_ge2,
+        train_sum_ge1,
+        train_sum_ge2,
+        train_abs_score,
+        train_score,
+        max_singleton_train_raw: node.max_singleton_train_raw,
+        max_singleton_test_raw: node.max_singleton_test_raw,
+    })
+}
+
+fn expand_parent_family_variants_fuzzy(
+    parents: &[FuzzyBeamState],
+    sum_y_train: f64,
+    n_train: usize,
+    params: &BeamSearchParams,
+) -> Vec<FuzzyBeamState> {
+    let mut best = HashMap::<RuleLexKey, FuzzyBeamState>::with_capacity(parents.len().saturating_mul(2));
+    for node in parents.iter() {
+        let key = node.rule.lexical_key();
+        if let Some(prev) = best.get(&key) {
+            if cmp_fuzzy_state(node, prev) == std::cmp::Ordering::Less {
+                best.insert(key, node.clone());
+            }
+        } else {
+            best.insert(key, node.clone());
+        }
+        if let Some(comp) =
+            whole_rule_family_complement_variant_fuzzy(node, sum_y_train, n_train, params)
+        {
+            let key = comp.rule.lexical_key();
+            if let Some(prev) = best.get(&key) {
+                if cmp_fuzzy_state(&comp, prev) == std::cmp::Ordering::Less {
+                    best.insert(key, comp);
+                }
+            } else {
+                best.insert(key, comp);
+            }
+        }
+    }
+    best.into_values().collect()
 }
 
 #[inline]
@@ -6320,6 +6941,10 @@ fn expand_fuzzy_beam_once_whole_genome_target_range(
     next_cap: usize,
     params: &BeamSearchParams,
 ) -> Result<HashMap<RuleLexKey, FuzzyBeamStateLite>, String> {
+    let layer = parents
+        .first()
+        .map(|p| p.rule.len().saturating_add(1))
+        .unwrap_or(0);
     let mut local_best = HashMap::<RuleLexKey, FuzzyBeamStateLite>::with_capacity(next_cap.max(1));
     // Whole-genome target scans touch too many unique rules to keep a
     // worker-lifetime ancestor cache. Reuse the maps per target SNP only.
@@ -6343,7 +6968,13 @@ fn expand_fuzzy_beam_once_whole_genome_target_range(
                 continue;
             }
             for &op in beam_binary_ops_for_rule(&parent.rule).iter() {
-                for &negated in &[false, true] {
+                for &negated in child_literal_negations_for_op(op).iter() {
+                    garfield_layer_debug_add(
+                        layer,
+                        garfield_layer_debug_op_family(op),
+                        GarfieldLayerDebugMetric::Considered,
+                        1,
+                    );
                     let Some((train, train_n_ge2, train_sum_ge1, train_sum_ge2)) =
                         evaluate_child_train_from_parent_virtual_fuzzy(
                             parent.combined_train_ge1.as_slice(),
@@ -6363,6 +6994,12 @@ fn expand_fuzzy_beam_once_whole_genome_target_range(
                     else {
                         continue;
                     };
+                    garfield_layer_debug_add(
+                        layer,
+                        garfield_layer_debug_op_family(op),
+                        GarfieldLayerDebugMetric::TrainOk,
+                        1,
+                    );
                     let literal = BeamLiteral {
                         row_index: cand,
                         group_id: gid,
@@ -6418,12 +7055,36 @@ fn expand_fuzzy_beam_once_whole_genome_target_range(
                     ) {
                         continue;
                     }
+                    garfield_layer_debug_add(
+                        layer,
+                        garfield_layer_debug_op_family(op),
+                        GarfieldLayerDebugMetric::AbsOk,
+                        1,
+                    );
                     if !keep_state_after_min_gain_pruning(rule.len(), train_score, params) {
                         continue;
                     }
+                    garfield_layer_debug_add(
+                        layer,
+                        garfield_layer_debug_op_family(op),
+                        GarfieldLayerDebugMetric::GainOk,
+                        1,
+                    );
                     if !keep_child_after_parent_gain_pruning(&rule, train_score, params) {
                         continue;
                     }
+                    garfield_layer_debug_add(
+                        layer,
+                        garfield_layer_debug_op_family(op),
+                        GarfieldLayerDebugMetric::ParentOk,
+                        1,
+                    );
+                    garfield_layer_debug_add(
+                        layer,
+                        garfield_layer_debug_op_family(op),
+                        GarfieldLayerDebugMetric::Kept,
+                        1,
+                    );
                     let state = FuzzyBeamStateLite {
                         rule,
                         train,
@@ -6478,12 +7139,15 @@ fn expand_fuzzy_beam_once_whole_genome_target_parallel(
     if parents.is_empty() {
         return Ok(Vec::new());
     }
-    let base_rule_raws = Arc::new(collect_known_rule_raw_scores_fuzzy(parents));
-    let total_expand = parents
+    let expanded_parents = expand_parent_family_variants_fuzzy(parents, sum_y_train, n_train, params);
+    if expanded_parents.is_empty() {
+        return Ok(Vec::new());
+    }
+    let base_rule_raws = Arc::new(collect_known_rule_raw_scores_fuzzy(expanded_parents.as_slice()));
+    let total_expand = expanded_parents
         .iter()
         .map(|parent| {
-            n_rows
-                .saturating_mul(2usize.saturating_mul(beam_binary_ops_for_rule(&parent.rule).len()))
+            n_rows.saturating_mul(beam_child_branch_count_for_rule(&parent.rule))
         })
         .sum::<usize>();
     let next = if should_parallel(total_expand, params.allow_parallel) {
@@ -6492,7 +7156,7 @@ fn expand_fuzzy_beam_once_whole_genome_target_parallel(
             .into_par_iter()
             .map(|(start, end)| {
                 expand_fuzzy_beam_once_whole_genome_target_range(
-                    parents,
+                    expanded_parents.as_slice(),
                     start,
                     end,
                     y_train,
@@ -6515,7 +7179,7 @@ fn expand_fuzzy_beam_once_whole_genome_target_parallel(
         merge_best_fuzzy_state_maps(worker_maps, next_cap)?
     } else {
         expand_fuzzy_beam_once_whole_genome_target_range(
-            parents,
+            expanded_parents.as_slice(),
             0,
             n_rows,
             y_train,
@@ -6547,7 +7211,17 @@ fn expand_fuzzy_beam_once_whole_genome_target_parallel(
             n_train,
         )?);
     }
-    Ok(filter_fuzzy_beam_candidates(materialized, next_cap, params))
+    let layer = expanded_parents
+        .first()
+        .map(|p| p.rule.len().saturating_add(1))
+        .unwrap_or(0);
+    let out = filter_fuzzy_beam_candidates(materialized, next_cap, params);
+    garfield_layer_debug_record_fuzzy_states(
+        layer,
+        GarfieldLayerDebugMetric::Retained,
+        out.as_slice(),
+    );
+    Ok(out)
 }
 
 fn expand_fuzzy_beam_once_whole_genome_layer2(
@@ -6615,12 +7289,20 @@ fn expand_fuzzy_beam_once(
 ) -> Result<Vec<FuzzyBeamState>, String> {
     check_interrupt_fast()?;
     let next_cap = params.beam_width.min(n_rows.saturating_mul(4).max(1));
-    let base_rule_raws = Arc::new(collect_known_rule_raw_scores_fuzzy(beam));
+    let parents = expand_parent_family_variants_fuzzy(beam, sum_y_train, n_train, params);
+    if parents.is_empty() {
+        return Ok(Vec::new());
+    }
+    let layer = parents
+        .first()
+        .map(|p| p.rule.len().saturating_add(1))
+        .unwrap_or(0);
+    let base_rule_raws = Arc::new(collect_known_rule_raw_scores_fuzzy(parents.as_slice()));
     let mut seq = Vec::<FuzzyBeamState>::with_capacity(next_cap);
     let mut parent_raw_cache = RuleRawScoreCache::new();
     let mut ancestor_raw_cache = RuleAncestorBaselineCache::new();
     let mut seen_commutative_children = HashSet::<Vec<(usize, bool, u8)>>::new();
-    for node in beam.iter() {
+    for node in parents.iter() {
         let (start, end) = expansion_row_bounds(&node.rule, n_rows);
         let blind_scan = child_rule_uses_blind_scan(node.rule.len());
         for cand in start..end {
@@ -6635,7 +7317,13 @@ fn expand_fuzzy_beam_once(
             let row_ge2 = row_prefix(ge2_train, row_words_train, cand, needed_words_train);
             let row_summary = literal_summaries[cand];
             for &op in beam_binary_ops_for_rule(&node.rule).iter() {
-                for &negated in &[false, true] {
+                for &negated in child_literal_negations_for_op(op).iter() {
+                    garfield_layer_debug_add(
+                        layer,
+                        garfield_layer_debug_op_family(op),
+                        GarfieldLayerDebugMetric::Considered,
+                        1,
+                    );
                     let Some((train, train_n_ge2, train_sum_ge1, train_sum_ge2)) =
                         evaluate_child_train_from_parent_virtual_fuzzy(
                             node.combined_train_ge1.as_slice(),
@@ -6655,6 +7343,12 @@ fn expand_fuzzy_beam_once(
                     else {
                         continue;
                     };
+                    garfield_layer_debug_add(
+                        layer,
+                        garfield_layer_debug_op_family(op),
+                        GarfieldLayerDebugMetric::TrainOk,
+                        1,
+                    );
                     let literal = BeamLiteral {
                         row_index: cand,
                         group_id: gid,
@@ -6708,8 +7402,26 @@ fn expand_fuzzy_beam_once(
                         None,
                         params,
                     );
+                    garfield_layer_debug_add(
+                        layer,
+                        garfield_layer_debug_op_family(op),
+                        GarfieldLayerDebugMetric::AbsOk,
+                        1,
+                    );
                     // Exhaustive seed depths enumerate all QC-valid children and leave
                     // gain-based culling to later beam-only layers / final output reranking.
+                    garfield_layer_debug_add(
+                        layer,
+                        garfield_layer_debug_op_family(op),
+                        GarfieldLayerDebugMetric::GainOk,
+                        1,
+                    );
+                    garfield_layer_debug_add(
+                        layer,
+                        garfield_layer_debug_op_family(op),
+                        GarfieldLayerDebugMetric::ParentOk,
+                        1,
+                    );
                     let t_clone = beam_detail_profile_start();
                     let mut child_ge1 = node.combined_train_ge1.clone();
                     let mut child_ge2 = node.combined_train_ge2.clone();
@@ -6740,11 +7452,23 @@ fn expand_fuzzy_beam_once(
                         },
                         next_cap,
                     );
+                    garfield_layer_debug_add(
+                        layer,
+                        garfield_layer_debug_op_family(op),
+                        GarfieldLayerDebugMetric::Kept,
+                        1,
+                    );
                 }
             }
         }
     }
-    Ok(filter_fuzzy_beam_candidates(seq, next_cap, params))
+    let out = filter_fuzzy_beam_candidates(seq, next_cap, params);
+    garfield_layer_debug_record_fuzzy_states(
+        layer,
+        GarfieldLayerDebugMetric::Retained,
+        out.as_slice(),
+    );
+    Ok(out)
 }
 
 fn expand_fuzzy_states_exhaustive(
@@ -6763,6 +7487,10 @@ fn expand_fuzzy_states_exhaustive(
     params: &BeamSearchParams,
 ) -> Result<Vec<FuzzyBeamState>, String> {
     check_interrupt_fast()?;
+    let layer = frontier
+        .first()
+        .map(|p| p.rule.len().saturating_add(1))
+        .unwrap_or(0);
     let mut best = HashMap::<RuleLexKey, FuzzyBeamState>::new();
     let base_rule_raws = collect_known_rule_raw_scores_fuzzy(frontier);
     let mut parent_raw_cache = RuleRawScoreCache::new();
@@ -6781,7 +7509,13 @@ fn expand_fuzzy_states_exhaustive(
             let row_ge2 = row_prefix(ge2_train, row_words_train, cand, needed_words_train);
             let row_summary = literal_summaries[cand];
             for &op in beam_binary_ops_for_rule(&node.rule).iter() {
-                for &negated in &[false, true] {
+                for &negated in child_literal_negations_for_op(op).iter() {
+                    garfield_layer_debug_add(
+                        layer,
+                        garfield_layer_debug_op_family(op),
+                        GarfieldLayerDebugMetric::Considered,
+                        1,
+                    );
                     let Some((train, train_n_ge2, train_sum_ge1, train_sum_ge2)) =
                         evaluate_child_train_from_parent_virtual_fuzzy(
                             node.combined_train_ge1.as_slice(),
@@ -6801,6 +7535,12 @@ fn expand_fuzzy_states_exhaustive(
                     else {
                         continue;
                     };
+                    garfield_layer_debug_add(
+                        layer,
+                        garfield_layer_debug_op_family(op),
+                        GarfieldLayerDebugMetric::TrainOk,
+                        1,
+                    );
                     let literal = BeamLiteral {
                         row_index: cand,
                         group_id: gid,
@@ -6849,12 +7589,30 @@ fn expand_fuzzy_states_exhaustive(
                     ) {
                         continue;
                     }
+                    garfield_layer_debug_add(
+                        layer,
+                        garfield_layer_debug_op_family(op),
+                        GarfieldLayerDebugMetric::AbsOk,
+                        1,
+                    );
                     if !keep_state_after_min_gain_pruning(rule.len(), train_score, params) {
                         continue;
                     }
+                    garfield_layer_debug_add(
+                        layer,
+                        garfield_layer_debug_op_family(op),
+                        GarfieldLayerDebugMetric::GainOk,
+                        1,
+                    );
                     if !keep_child_after_parent_gain_pruning(&rule, train_score, params) {
                         continue;
                     }
+                    garfield_layer_debug_add(
+                        layer,
+                        garfield_layer_debug_op_family(op),
+                        GarfieldLayerDebugMetric::ParentOk,
+                        1,
+                    );
                     let t_clone = beam_detail_profile_start();
                     let mut child_ge1 = node.combined_train_ge1.clone();
                     let mut child_ge2 = node.combined_train_ge2.clone();
@@ -6881,6 +7639,12 @@ fn expand_fuzzy_states_exhaustive(
                         max_singleton_train_raw,
                         max_singleton_test_raw,
                     };
+                    garfield_layer_debug_add(
+                        layer,
+                        garfield_layer_debug_op_family(op),
+                        GarfieldLayerDebugMetric::Kept,
+                        1,
+                    );
                     match best.entry(state.rule.lexical_key()) {
                         std::collections::hash_map::Entry::Vacant(slot) => {
                             slot.insert(state);
@@ -6897,7 +7661,13 @@ fn expand_fuzzy_states_exhaustive(
     }
     let out = best.into_values().collect::<Vec<_>>();
     let width = out.len().max(1);
-    Ok(filter_fuzzy_beam_candidates(out, width, params))
+    let out = filter_fuzzy_beam_candidates(out, width, params);
+    garfield_layer_debug_record_fuzzy_states(
+        layer,
+        GarfieldLayerDebugMetric::Retained,
+        out.as_slice(),
+    );
+    Ok(out)
 }
 
 fn collect_known_rule_raw_scores_fuzzy(states: &[FuzzyBeamState]) -> RuleRawScoreCache {
@@ -6925,6 +7695,7 @@ fn beam_search_train_test_continuous_fuzzy_impl(
     literal_scores_override: Option<&[LiteralSingletonScore]>,
 ) -> Result<Vec<BeamRuleCandidate>, String> {
     let beam_t0 = Instant::now();
+    garfield_layer_debug_reset();
     let out = (|| {
         let (needed_words_train, _needed_words_test) = validate_search_inputs_fuzzy(
             y_train,
@@ -7245,6 +8016,7 @@ fn beam_search_train_test_continuous_fuzzy_impl(
         }
         let mut out = best_by_rule.into_values().collect::<Vec<_>>();
         out.sort_by(cmp_candidate);
+        garfield_layer_debug_dump(mode_name, max_depth);
         Ok(out)
     })();
     GARFIELD_BEAM_PROFILE_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -7657,6 +8429,244 @@ mod tests {
         let (not_ge1, not_ge2) =
             materialize_rule_bits_dual(&not_rule, &ge1, &ge2, row_words, rows.len(), 4).unwrap();
         assert_eq!(unpack_dual_row(&not_ge1, &not_ge2, 4), vec![2u8, 1, 0, 1]);
+    }
+
+    #[test]
+    fn test_materialize_rule_bits_dual_xor_truth_table() {
+        let rows = vec![vec![0u8, 0, 1, 1, 2, 2], vec![0u8, 2, 0, 1, 1, 2]];
+        let (ge1, ge2, row_words) = pack_dual_rows(&rows, 6);
+        let xor_rule = BeamRule {
+            first: BeamLiteral {
+                row_index: 0,
+                group_id: 0,
+                negated: false,
+            },
+            rest: vec![(
+                BeamBinaryOp::Xor,
+                BeamLiteral {
+                    row_index: 1,
+                    group_id: 1,
+                    negated: false,
+                },
+            )],
+        };
+        let (xor_ge1, xor_ge2) =
+            materialize_rule_bits_dual(&xor_rule, &ge1, &ge2, row_words, rows.len(), 6).unwrap();
+        assert_eq!(unpack_dual_row(&xor_ge1, &xor_ge2, 6), vec![0u8, 2, 1, 1, 1, 0]);
+    }
+
+    #[test]
+    fn test_virtual_fuzzy_xor_matches_materialized_rule_score() {
+        let rows = vec![vec![0u8, 0, 1, 1, 2, 2], vec![0u8, 2, 0, 1, 1, 2]];
+        let y = vec![-2.0, 2.0, -0.5, 0.5, 1.5, -1.5];
+        let (ge1, ge2, row_words) = pack_dual_rows(&rows, y.len());
+        let n_rows = rows.len();
+        let n = y.len();
+        let sum_y = y.iter().copied().sum::<f64>();
+        let params = BeamSearchParams {
+            allow_parallel: false,
+            ..BeamSearchParams::default()
+        };
+        let literal_scores = precompute_literal_singleton_scores_fuzzy(
+            &y, n, &y, n, &ge1, &ge2, row_words, &ge1, &ge2, row_words, n_rows,
+        )
+        .unwrap();
+        let literal_summaries =
+            precompute_dual_literal_summaries(&y, &ge1, &ge2, row_words, n_rows, row_words, n);
+        let parent_summary = literal_summaries[0];
+        let (train_n_ge1, train_n_ge2, train_sum_ge1, train_sum_ge2) =
+            literal_dual_summary_with_negation(sum_y, n, parent_summary, false);
+        let parent_rule = BeamRule {
+            first: BeamLiteral {
+                row_index: 0,
+                group_id: 0,
+                negated: false,
+            },
+            rest: Vec::new(),
+        };
+        let parent = FuzzyBeamState {
+            rule: parent_rule,
+            combined_train_ge1: row_prefix(&ge1, row_words, 0, row_words).to_vec(),
+            combined_train_ge2: row_prefix(&ge2, row_words, 0, row_words).to_vec(),
+            train: literal_scores[literal_score_index(0, false)].train,
+            train_n_ge2,
+            train_sum_ge1,
+            train_sum_ge2,
+            train_abs_score: literal_scores[literal_score_index(0, false)].train.raw_score,
+            train_score: literal_scores[literal_score_index(0, false)].train.raw_score,
+            max_singleton_train_raw: literal_scores[literal_score_index(0, false)].train.raw_score,
+            max_singleton_test_raw: literal_scores[literal_score_index(0, false)].test.raw_score,
+        };
+        let row1_ge1 = row_prefix(&ge1, row_words, 1, row_words);
+        let row1_ge2 = row_prefix(&ge2, row_words, 1, row_words);
+        let (virtual_train, virtual_n_ge2, virtual_sum_ge1, virtual_sum_ge2) =
+            evaluate_child_train_from_parent_virtual_fuzzy(
+                parent.combined_train_ge1.as_slice(),
+                parent.combined_train_ge2.as_slice(),
+                &parent,
+                row1_ge1,
+                row1_ge2,
+                literal_summaries[1],
+                &y,
+                sum_y,
+                n,
+                2,
+                BeamBinaryOp::Xor,
+                false,
+                &params,
+            )
+            .unwrap();
+        let xor_rule = BeamRule {
+            first: BeamLiteral {
+                row_index: 0,
+                group_id: 0,
+                negated: false,
+            },
+            rest: vec![(
+                BeamBinaryOp::Xor,
+                BeamLiteral {
+                    row_index: 1,
+                    group_id: 1,
+                    negated: false,
+                },
+            )],
+        };
+        let materialized = evaluate_rule_continuous_dual_with_sum(
+            &xor_rule, &y, sum_y, &ge1, &ge2, row_words, n_rows, n, 0.0, 0.0,
+        )
+        .unwrap();
+        assert_eq!(virtual_train.n_hit, materialized.n_hit);
+        assert_eq!(virtual_n_ge2, materialized.n_ge2);
+        assert!((virtual_sum_ge1 - (materialized.mean_hit * materialized.n_hit as f64)).abs() < 1e-12);
+        let materialized_sum_ge2 = {
+            let (_, ge2_bits) =
+                materialize_rule_bits_dual(&xor_rule, &ge1, &ge2, row_words, n_rows, n).unwrap();
+            sum_y_where_both1(&ge2_bits, &vec![u64::MAX; ge2_bits.len()], &y, n)
+        };
+        assert!((virtual_sum_ge2 - materialized_sum_ge2).abs() < 1e-12);
+        assert!((virtual_train.raw_score - materialized.raw_score).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_beam_binary_ops_for_rule_enforces_single_xor_policy() {
+        let singleton = BeamRule {
+            first: BeamLiteral {
+                row_index: 0,
+                group_id: 0,
+                negated: false,
+            },
+            rest: Vec::new(),
+        };
+        assert_eq!(
+            beam_binary_ops_for_rule(&singleton),
+            &[BeamBinaryOp::And, BeamBinaryOp::Xor]
+        );
+
+        let neg_singleton = BeamRule {
+            first: BeamLiteral {
+                negated: true,
+                ..singleton.first
+            },
+            rest: Vec::new(),
+        };
+        assert_eq!(beam_binary_ops_for_rule(&neg_singleton), &[BeamBinaryOp::And]);
+
+        let xor_rule = BeamRule {
+            first: singleton.first,
+            rest: vec![(
+                BeamBinaryOp::Xor,
+                BeamLiteral {
+                    row_index: 1,
+                    group_id: 1,
+                    negated: false,
+                },
+            )],
+        };
+        assert_eq!(beam_binary_ops_for_rule(&xor_rule), &[BeamBinaryOp::And]);
+    }
+
+    #[test]
+    fn test_complement_rule_family_flips_and_rule_into_or_rule() {
+        let rule = BeamRule {
+            first: BeamLiteral {
+                row_index: 0,
+                group_id: 0,
+                negated: false,
+            },
+            rest: vec![(
+                BeamBinaryOp::And,
+                BeamLiteral {
+                    row_index: 1,
+                    group_id: 1,
+                    negated: true,
+                },
+            )],
+        };
+        let got = complement_rule_family(&rule).unwrap();
+        let want = BeamRule {
+            first: BeamLiteral {
+                negated: true,
+                ..rule.first
+            },
+            rest: vec![(
+                BeamBinaryOp::Or,
+                BeamLiteral {
+                    negated: false,
+                    ..rule.rest[0].1
+                },
+            )],
+        };
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn test_complement_rule_family_preserves_single_xor_and_flips_suffix() {
+        let rule = BeamRule {
+            first: BeamLiteral {
+                row_index: 0,
+                group_id: 0,
+                negated: false,
+            },
+            rest: vec![
+                (
+                    BeamBinaryOp::Xor,
+                    BeamLiteral {
+                        row_index: 1,
+                        group_id: 1,
+                        negated: false,
+                    },
+                ),
+                (
+                    BeamBinaryOp::And,
+                    BeamLiteral {
+                        row_index: 2,
+                        group_id: 2,
+                        negated: true,
+                    },
+                ),
+            ],
+        };
+        let got = complement_rule_family(&rule).unwrap();
+        let want = BeamRule {
+            first: rule.first,
+            rest: vec![
+                (
+                    BeamBinaryOp::Xor,
+                    BeamLiteral {
+                        negated: true,
+                        ..rule.rest[0].1
+                    },
+                ),
+                (
+                    BeamBinaryOp::Or,
+                    BeamLiteral {
+                        negated: false,
+                        ..rule.rest[1].1
+                    },
+                ),
+            ],
+        };
+        assert_eq!(got, want);
     }
 
     #[test]

@@ -540,7 +540,7 @@ def _prepare_site_keep(
 
 
 _GARFIELD_FOLLOWUP_PAIR_RE = re.compile(
-    r"^\s*(!?[^\s&|*]+)\s*([&|*])\s*(!?[^\s&|*]+)\s*$"
+    r"^\s*(!?[^\s&|*^]+)\s*([&|*^])\s*(!?[^\s&|*^]+)\s*$"
 )
 
 
@@ -625,7 +625,7 @@ def _garfield_followup_chisq(beta: object, se: object) -> float:
 
 def _garfield_followup_row_role(snp: object) -> str:
     token = str(snp).strip()
-    return "combo" if any(op in token for op in ("&", "|", "*")) else "singleton"
+    return "combo" if any(op in token for op in ("&", "|", "*", "^")) else "singleton"
 
 
 def _attach_garfield_logic_padj(
@@ -955,7 +955,7 @@ def _collect_garfield_fvlmm2_specs(
                     "snp_name": snp_name,
                     "reason": (
                         "singleton_rule"
-                        if not any(op in snp_name for op in ("|", "&", "*"))
+                        if not any(op in snp_name for op in ("|", "&", "*", "^"))
                         else "requires_exactly_two_literals"
                     ),
                 }
@@ -2296,13 +2296,13 @@ class _GarfieldStageProgress:
 
     def _label(self, stage: str) -> str:
         if stage == "null_prep":
-            return "Preparing Bg Noise"
+            return "Preparing Null Penalty"
         if stage == "null_penalty":
-            return "Estimating Bg Noise"
+            return "Estimating Null Penalty"
         if stage == "structure_prep":
-            return "Preparing Priors"
+            return self.scan_desc
         if stage == "structure_prior":
-            return "Learning Priors"
+            return self.scan_desc
         return self.scan_desc
 
     def update(self, stage: str, done: int, total: int, meta: object | None = None) -> None:
@@ -2566,7 +2566,7 @@ def main() -> None:
         type=str,
         default=None,
         help=(
-            "Set the GARFIELD null-penalty method. Default uses `g99` "
+            "Set the GARFIELD bucket null-penalty method. Default uses `g99` "
             "(GEV/Gumbel-fit extreme-value threshold at target quantile 0.99). "
             "You may also pass `gev`, `gumbel`, `g99`, `g99.9`, or an empirical quantile "
             "such as `q99`, `q99.9`, or `0.99`. "
@@ -2585,6 +2585,13 @@ def main() -> None:
         "--no-clean",
         action="store_true",
         dest="no_clean",
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
+        "--raw-design",
+        action="store_true",
+        dest="raw_design",
+        default=False,
         help=argparse.SUPPRESS,
     )
     optional_group.add_argument(
@@ -2608,7 +2615,8 @@ def main() -> None:
         default=2,
         help=(
             "Start ranking beam candidates by interaction gain from this layer onward "
-            "(default: 2; layer 1 always uses raw score)."
+            "(default: 2; layer 1 uses raw score, and the only active penalty is the "
+            "bucket null penalty)."
         ),
     )
     optional_group.add_argument(
@@ -3211,6 +3219,7 @@ def main() -> None:
                 rule_permutation=True,
                 prior_len=None,
                 no_clean=bool(args.no_clean),
+                raw_design=bool(args.raw_design),
                 whole_genome_dev_mode=bool(str(args.scan_mode).lower() == "wholegenome"),
                 progress_callback=progress_cb,
                 progress_every=0,

@@ -2144,12 +2144,30 @@ fn score_sum_hit(sc: &ContinuousRuleScore) -> f64 {
 }
 
 #[inline]
-fn evaluate_child_train_from_parent_virtual(
+fn binary_pair_intersection(
     parent_bits: &[u64],
-    parent_train: &ContinuousRuleScore,
     row: &[u64],
-    row_train: &ContinuousRuleScore,
     y_train: &[f64],
+    n_train: usize,
+) -> BinaryPairIntersection {
+    let n = and_popcount(parent_bits, row) as usize;
+    let t_sum = beam_detail_profile_start();
+    let sum = sum_y_where_both1(parent_bits, row, y_train, n_train);
+    beam_detail_profile_end(t_sum, &GARFIELD_PROFILE_SUM_Y_BOTH1_NS);
+    BinaryPairIntersection { n, sum }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct BinaryPairIntersection {
+    n: usize,
+    sum: f64,
+}
+
+#[inline]
+fn evaluate_child_train_from_parent_virtual_with_intersection(
+    parent_train: &ContinuousRuleScore,
+    row_train: &ContinuousRuleScore,
+    intersection: BinaryPairIntersection,
     sum_y_train: f64,
     n_train: usize,
     _child_rule_len: usize,
@@ -2161,17 +2179,13 @@ fn evaluate_child_train_from_parent_virtual(
     let parent_sum_hit = score_sum_hit(parent_train);
     let row_n_hit = row_train.n_hit;
     let row_sum_hit = score_sum_hit(row_train);
-    let inter_n_hit_pos = and_popcount(parent_bits, row) as usize;
-    let t_sum = beam_detail_profile_start();
-    let inter_sum_hit_pos = sum_y_where_both1(parent_bits, row, y_train, n_train);
-    beam_detail_profile_end(t_sum, &GARFIELD_PROFILE_SUM_Y_BOTH1_NS);
     let (inter_n_hit, inter_sum_hit) = if negated {
         (
-            parent_n_hit.saturating_sub(inter_n_hit_pos),
-            parent_sum_hit - inter_sum_hit_pos,
+            parent_n_hit.saturating_sub(intersection.n),
+            parent_sum_hit - intersection.sum,
         )
     } else {
-        (inter_n_hit_pos, inter_sum_hit_pos)
+        (intersection.n, intersection.sum)
     };
     let (child_n_hit, child_sum_hit) = match op {
         BeamBinaryOp::And => (inter_n_hit, inter_sum_hit),
@@ -2198,6 +2212,34 @@ fn evaluate_child_train_from_parent_virtual(
         return None;
     }
     Some(child)
+}
+
+#[inline]
+fn evaluate_child_train_from_parent_virtual(
+    parent_bits: &[u64],
+    parent_train: &ContinuousRuleScore,
+    row: &[u64],
+    row_train: &ContinuousRuleScore,
+    y_train: &[f64],
+    sum_y_train: f64,
+    n_train: usize,
+    child_rule_len: usize,
+    op: BeamBinaryOp,
+    negated: bool,
+    params: &BeamSearchParams,
+) -> Option<ContinuousRuleScore> {
+    let intersection = binary_pair_intersection(parent_bits, row, y_train, n_train);
+    evaluate_child_train_from_parent_virtual_with_intersection(
+        parent_train,
+        row_train,
+        intersection,
+        sum_y_train,
+        n_train,
+        child_rule_len,
+        op,
+        negated,
+        params,
+    )
 }
 
 #[inline]
@@ -3614,6 +3656,8 @@ fn expand_beam_once_whole_genome_target_range(
             if candidate_group_is_excluded(&parent.rule, gid, params) {
                 continue;
             }
+            let intersection =
+                binary_pair_intersection(parent.combined_train.as_slice(), row, y_train, n_train);
             for &op in beam_binary_ops_for_rule(&parent.rule).iter() {
                 for &negated in child_literal_negations_for_op(op).iter() {
                     let literal = BeamLiteral {
@@ -3622,12 +3666,10 @@ fn expand_beam_once_whole_genome_target_range(
                         negated,
                     };
                     let single = literal_scores[literal_score_index(cand, negated)];
-                    let Some(train) = evaluate_child_train_from_parent_virtual(
-                        &parent.combined_train,
+                    let Some(train) = evaluate_child_train_from_parent_virtual_with_intersection(
                         &parent.train,
-                        row,
                         &single.train,
-                        y_train,
+                        intersection,
                         sum_y_train,
                         n_train,
                         parent.rule.len() + 1,
@@ -3900,6 +3942,8 @@ fn expand_beam_once(
                         continue;
                     }
                     let row = row_prefix(bits_train, row_words_train, cand, needed_words_train);
+                    let intersection =
+                        binary_pair_intersection(&node.combined_train, row, y_train, n_train);
                     for &op in beam_binary_ops_for_rule(&node.rule).iter() {
                         for &negated in child_literal_negations_for_op(op).iter() {
                             let literal = BeamLiteral {
@@ -3910,19 +3954,19 @@ fn expand_beam_once(
                             let single = literal_scores[literal_score_index(cand, negated)];
                             let canonical_rule =
                                 canonical_commutative_child_rule(&node.rule, op, literal);
-                            let Some(train) = evaluate_child_train_from_parent_virtual(
-                                &node.combined_train,
-                                &node.train,
-                                row,
-                                &single.train,
-                                y_train,
-                                sum_y_train,
-                                n_train,
-                                node.rule.len() + 1,
-                                op,
-                                negated,
-                                params,
-                            ) else {
+                            let Some(train) =
+                                evaluate_child_train_from_parent_virtual_with_intersection(
+                                    &node.train,
+                                    &single.train,
+                                    intersection,
+                                    sum_y_train,
+                                    n_train,
+                                    node.rule.len() + 1,
+                                    op,
+                                    negated,
+                                    params,
+                                )
+                            else {
                                 continue;
                             };
                             let rule = if let Some(rule) = canonical_rule {
@@ -4046,6 +4090,8 @@ fn expand_beam_once(
                     continue;
                 }
                 let row = row_prefix(bits_train, row_words_train, cand, needed_words_train);
+                let intersection =
+                    binary_pair_intersection(&node.combined_train, row, y_train, n_train);
                 for &op in beam_binary_ops_for_rule(&node.rule).iter() {
                     for &negated in child_literal_negations_for_op(op).iter() {
                         let literal = BeamLiteral {
@@ -4063,19 +4109,19 @@ fn expand_beam_once(
                                 }
                             }
                         }
-                        let Some(train) = evaluate_child_train_from_parent_virtual(
-                            &node.combined_train,
-                            &node.train,
-                            row,
-                            &single.train,
-                            y_train,
-                            sum_y_train,
-                            n_train,
-                            node.rule.len() + 1,
-                            op,
-                            negated,
-                            params,
-                        ) else {
+                        let Some(train) =
+                            evaluate_child_train_from_parent_virtual_with_intersection(
+                                &node.train,
+                                &single.train,
+                                intersection,
+                                sum_y_train,
+                                n_train,
+                                node.rule.len() + 1,
+                                op,
+                                negated,
+                                params,
+                            )
+                        else {
                             continue;
                         };
                         let rule = if let Some(rule) = canonical_rule {
@@ -4315,22 +4361,24 @@ fn expand_states_exhaustive(
                             continue;
                         }
                         let row = row_prefix(bits_train, row_words_train, cand, needed_words_train);
+                        let intersection =
+                            binary_pair_intersection(&node.combined_train, row, y_train, n_train);
                         for &op in beam_binary_ops_for_rule(&node.rule).iter() {
                             for &negated in child_literal_negations_for_op(op).iter() {
                                 let single = literal_scores[literal_score_index(cand, negated)];
-                                let Some(train) = evaluate_child_train_from_parent_virtual(
-                                    &node.combined_train,
-                                    &node.train,
-                                    row,
-                                    &single.train,
-                                    y_train,
-                                    sum_y_train,
-                                    n_train,
-                                    node.rule.len() + 1,
-                                    op,
-                                    negated,
-                                    params,
-                                ) else {
+                                let Some(train) =
+                                    evaluate_child_train_from_parent_virtual_with_intersection(
+                                        &node.train,
+                                        &single.train,
+                                        intersection,
+                                        sum_y_train,
+                                        n_train,
+                                        node.rule.len() + 1,
+                                        op,
+                                        negated,
+                                        params,
+                                    )
+                                else {
                                     continue;
                                 };
                                 let literal = BeamLiteral {
@@ -4449,22 +4497,24 @@ fn expand_states_exhaustive(
                     continue;
                 }
                 let row = row_prefix(bits_train, row_words_train, cand, needed_words_train);
+                let intersection =
+                    binary_pair_intersection(&node.combined_train, row, y_train, n_train);
                 for &op in beam_binary_ops_for_rule(&node.rule).iter() {
                     for &negated in child_literal_negations_for_op(op).iter() {
                         let single = literal_scores[literal_score_index(cand, negated)];
-                        let Some(train) = evaluate_child_train_from_parent_virtual(
-                            &node.combined_train,
-                            &node.train,
-                            row,
-                            &single.train,
-                            y_train,
-                            sum_y_train,
-                            n_train,
-                            node.rule.len() + 1,
-                            op,
-                            negated,
-                            params,
-                        ) else {
+                        let Some(train) =
+                            evaluate_child_train_from_parent_virtual_with_intersection(
+                                &node.train,
+                                &single.train,
+                                intersection,
+                                sum_y_train,
+                                n_train,
+                                node.rule.len() + 1,
+                                op,
+                                negated,
+                                params,
+                            )
+                        else {
                             continue;
                         };
                         let literal = BeamLiteral {
@@ -5758,6 +5808,50 @@ fn literal_dual_summary_with_negation(
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+struct DualPairIntersections {
+    p1_r1_n: usize,
+    p2_r2_n: usize,
+    p1_r2_n: usize,
+    p2_r1_n: usize,
+    p1_r1_sum: f64,
+    p2_r2_sum: f64,
+    p1_r2_sum: f64,
+    p2_r1_sum: f64,
+}
+
+#[inline]
+fn dual_pair_intersections_for_params(
+    parent_ge1: &[u64],
+    parent_ge2: &[u64],
+    row_ge1: &[u64],
+    row_ge2: &[u64],
+    y_train: &[f64],
+    n_train: usize,
+    params: &BeamSearchParams,
+) -> DualPairIntersections {
+    let p1_r1_n = and_popcount(parent_ge1, row_ge1) as usize;
+    let p2_r2_n = and_popcount(parent_ge2, row_ge2) as usize;
+    let p1_r2_n = and_popcount(parent_ge1, row_ge2) as usize;
+    let p2_r1_n = and_popcount(parent_ge2, row_ge1) as usize;
+    let t_sum = beam_detail_profile_start();
+    let p1_r1_sum = sum_y_where_both1_for_params(parent_ge1, row_ge1, y_train, n_train, params);
+    let p2_r2_sum = sum_y_where_both1_for_params(parent_ge2, row_ge2, y_train, n_train, params);
+    let p1_r2_sum = sum_y_where_both1_for_params(parent_ge1, row_ge2, y_train, n_train, params);
+    let p2_r1_sum = sum_y_where_both1_for_params(parent_ge2, row_ge1, y_train, n_train, params);
+    beam_detail_profile_end(t_sum, &GARFIELD_PROFILE_SUM_Y_BOTH1_NS);
+    DualPairIntersections {
+        p1_r1_n,
+        p2_r2_n,
+        p1_r2_n,
+        p2_r1_n,
+        p1_r1_sum,
+        p2_r2_sum,
+        p1_r2_sum,
+        p2_r1_sum,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 struct DualEffectiveIntersections {
     inter_n_ge1: usize,
     inter_n_ge2: usize,
@@ -5772,86 +5866,44 @@ struct DualEffectiveIntersections {
 #[inline]
 fn effective_dual_intersections(
     parent: &FuzzyBeamState,
-    row_ge1: &[u64],
-    row_ge2: &[u64],
-    y_train: &[f64],
-    n_train: usize,
+    intersections: DualPairIntersections,
     negated: bool,
-    params: &BeamSearchParams,
 ) -> DualEffectiveIntersections {
-    let p1_r1_n = and_popcount(parent.combined_train_ge1.as_slice(), row_ge1) as usize;
-    let p2_r2_n = and_popcount(parent.combined_train_ge2.as_slice(), row_ge2) as usize;
-    let p1_r2_n = and_popcount(parent.combined_train_ge1.as_slice(), row_ge2) as usize;
-    let p2_r1_n = and_popcount(parent.combined_train_ge2.as_slice(), row_ge1) as usize;
-    let t_sum = beam_detail_profile_start();
-    let p1_r1_sum = sum_y_where_both1_for_params(
-        parent.combined_train_ge1.as_slice(),
-        row_ge1,
-        y_train,
-        n_train,
-        params,
-    );
-    let p2_r2_sum = sum_y_where_both1_for_params(
-        parent.combined_train_ge2.as_slice(),
-        row_ge2,
-        y_train,
-        n_train,
-        params,
-    );
-    let p1_r2_sum = sum_y_where_both1_for_params(
-        parent.combined_train_ge1.as_slice(),
-        row_ge2,
-        y_train,
-        n_train,
-        params,
-    );
-    let p2_r1_sum = sum_y_where_both1_for_params(
-        parent.combined_train_ge2.as_slice(),
-        row_ge1,
-        y_train,
-        n_train,
-        params,
-    );
-    beam_detail_profile_end(t_sum, &GARFIELD_PROFILE_SUM_Y_BOTH1_NS);
     if !negated {
         DualEffectiveIntersections {
-            inter_n_ge1: p1_r1_n,
-            inter_n_ge2: p2_r2_n,
-            cross_n_p1_r2: p1_r2_n,
-            cross_n_p2_r1: p2_r1_n,
-            inter_sum_ge1: p1_r1_sum,
-            inter_sum_ge2: p2_r2_sum,
-            cross_sum_p1_r2: p1_r2_sum,
-            cross_sum_p2_r1: p2_r1_sum,
+            inter_n_ge1: intersections.p1_r1_n,
+            inter_n_ge2: intersections.p2_r2_n,
+            cross_n_p1_r2: intersections.p1_r2_n,
+            cross_n_p2_r1: intersections.p2_r1_n,
+            inter_sum_ge1: intersections.p1_r1_sum,
+            inter_sum_ge2: intersections.p2_r2_sum,
+            cross_sum_p1_r2: intersections.p1_r2_sum,
+            cross_sum_p2_r1: intersections.p2_r1_sum,
         }
     } else {
         DualEffectiveIntersections {
-            inter_n_ge1: parent.train.n_hit.saturating_sub(p1_r2_n),
-            inter_n_ge2: parent.train_n_ge2.saturating_sub(p2_r1_n),
-            cross_n_p1_r2: parent.train.n_hit.saturating_sub(p1_r1_n),
-            cross_n_p2_r1: parent.train_n_ge2.saturating_sub(p2_r2_n),
-            inter_sum_ge1: parent.train_sum_ge1 - p1_r2_sum,
-            inter_sum_ge2: parent.train_sum_ge2 - p2_r1_sum,
-            cross_sum_p1_r2: parent.train_sum_ge1 - p1_r1_sum,
-            cross_sum_p2_r1: parent.train_sum_ge2 - p2_r2_sum,
+            inter_n_ge1: parent.train.n_hit.saturating_sub(intersections.p1_r2_n),
+            inter_n_ge2: parent.train_n_ge2.saturating_sub(intersections.p2_r1_n),
+            cross_n_p1_r2: parent.train.n_hit.saturating_sub(intersections.p1_r1_n),
+            cross_n_p2_r1: parent.train_n_ge2.saturating_sub(intersections.p2_r2_n),
+            inter_sum_ge1: parent.train_sum_ge1 - intersections.p1_r2_sum,
+            inter_sum_ge2: parent.train_sum_ge2 - intersections.p2_r1_sum,
+            cross_sum_p1_r2: parent.train_sum_ge1 - intersections.p1_r1_sum,
+            cross_sum_p2_r1: parent.train_sum_ge2 - intersections.p2_r2_sum,
         }
     }
 }
 
 #[inline]
-fn evaluate_child_train_from_parent_virtual_fuzzy(
-    parent_ge1: &[u64],
-    parent_ge2: &[u64],
+fn evaluate_child_train_from_parent_virtual_fuzzy_with_intersections(
     parent: &FuzzyBeamState,
-    row_ge1: &[u64],
-    row_ge2: &[u64],
     row_summary: DualLiteralSummary,
-    y_train: &[f64],
     sum_y_train: f64,
     n_train: usize,
     child_rule_len: usize,
     op: BeamBinaryOp,
     negated: bool,
+    intersections: DualPairIntersections,
     params: &BeamSearchParams,
 ) -> Option<(ContinuousRuleScore, usize, f64, f64)> {
     let (row_n_ge1, row_n_ge2, row_sum_ge1, row_sum_ge2) =
@@ -5859,83 +5911,58 @@ fn evaluate_child_train_from_parent_virtual_fuzzy(
     let (child_n_ge1, child_n_ge2, child_sum_ge1, child_sum_ge2) = match op {
         BeamBinaryOp::And => {
             let (inter_n_ge1, inter_n_ge2, inter_sum_ge1, inter_sum_ge2) = if negated {
-                let drop_n_ge1 = and_popcount(parent_ge1, row_ge2) as usize;
-                let drop_n_ge2 = and_popcount(parent_ge2, row_ge1) as usize;
-                let t_sum = beam_detail_profile_start();
-                let drop_sum_ge1 =
-                    sum_y_where_both1_for_params(parent_ge1, row_ge2, y_train, n_train, params);
-                let drop_sum_ge2 =
-                    sum_y_where_both1_for_params(parent_ge2, row_ge1, y_train, n_train, params);
-                beam_detail_profile_end(t_sum, &GARFIELD_PROFILE_SUM_Y_BOTH1_NS);
                 (
-                    parent.train.n_hit.saturating_sub(drop_n_ge1),
-                    parent.train_n_ge2.saturating_sub(drop_n_ge2),
-                    parent.train_sum_ge1 - drop_sum_ge1,
-                    parent.train_sum_ge2 - drop_sum_ge2,
+                    parent.train.n_hit.saturating_sub(intersections.p1_r2_n),
+                    parent.train_n_ge2.saturating_sub(intersections.p2_r1_n),
+                    parent.train_sum_ge1 - intersections.p1_r2_sum,
+                    parent.train_sum_ge2 - intersections.p2_r1_sum,
                 )
             } else {
-                let inter_n_ge1 = and_popcount(parent_ge1, row_ge1) as usize;
-                let inter_n_ge2 = and_popcount(parent_ge2, row_ge2) as usize;
-                let t_sum = beam_detail_profile_start();
-                let inter_sum_ge1 =
-                    sum_y_where_both1_for_params(parent_ge1, row_ge1, y_train, n_train, params);
-                let inter_sum_ge2 =
-                    sum_y_where_both1_for_params(parent_ge2, row_ge2, y_train, n_train, params);
-                beam_detail_profile_end(t_sum, &GARFIELD_PROFILE_SUM_Y_BOTH1_NS);
-                (inter_n_ge1, inter_n_ge2, inter_sum_ge1, inter_sum_ge2)
+                (
+                    intersections.p1_r1_n,
+                    intersections.p2_r2_n,
+                    intersections.p1_r1_sum,
+                    intersections.p2_r2_sum,
+                )
             };
             (inter_n_ge1, inter_n_ge2, inter_sum_ge1, inter_sum_ge2)
         }
         BeamBinaryOp::Or => (
             {
                 let inter_n_ge1 = if negated {
-                    let drop_n_ge1 = and_popcount(parent_ge1, row_ge2) as usize;
-                    parent.train.n_hit.saturating_sub(drop_n_ge1)
+                    parent.train.n_hit.saturating_sub(intersections.p1_r2_n)
                 } else {
-                    and_popcount(parent_ge1, row_ge1) as usize
+                    intersections.p1_r1_n
                 };
                 inter_n_ge1
             },
             {
                 let inter_n_ge2 = if negated {
-                    let drop_n_ge2 = and_popcount(parent_ge2, row_ge1) as usize;
-                    parent.train_n_ge2.saturating_sub(drop_n_ge2)
+                    parent.train_n_ge2.saturating_sub(intersections.p2_r1_n)
                 } else {
-                    and_popcount(parent_ge2, row_ge2) as usize
+                    intersections.p2_r2_n
                 };
                 inter_n_ge2
             },
             {
-                let t_sum = beam_detail_profile_start();
                 let value = if negated {
-                    parent.train_sum_ge1
-                        - sum_y_where_both1_for_params(
-                            parent_ge1, row_ge2, y_train, n_train, params,
-                        )
+                    parent.train_sum_ge1 - intersections.p1_r2_sum
                 } else {
-                    sum_y_where_both1_for_params(parent_ge1, row_ge1, y_train, n_train, params)
+                    intersections.p1_r1_sum
                 };
-                beam_detail_profile_end(t_sum, &GARFIELD_PROFILE_SUM_Y_BOTH1_NS);
                 value
             },
             {
-                let t_sum = beam_detail_profile_start();
                 let value = if negated {
-                    parent.train_sum_ge2
-                        - sum_y_where_both1_for_params(
-                            parent_ge2, row_ge1, y_train, n_train, params,
-                        )
+                    parent.train_sum_ge2 - intersections.p2_r1_sum
                 } else {
-                    sum_y_where_both1_for_params(parent_ge2, row_ge2, y_train, n_train, params)
+                    intersections.p2_r2_sum
                 };
-                beam_detail_profile_end(t_sum, &GARFIELD_PROFILE_SUM_Y_BOTH1_NS);
                 value
             },
         ),
         BeamBinaryOp::Xor => {
-            let inter = effective_dual_intersections(
-                parent, row_ge1, row_ge2, y_train, n_train, negated, params,
-            );
+            let inter = effective_dual_intersections(parent, intersections, negated);
             (
                 parent
                     .train
@@ -5964,6 +5991,38 @@ fn evaluate_child_train_from_parent_virtual_fuzzy(
         child_sum_ge2,
     );
     Some((train, child_n_ge2, child_sum_ge1, child_sum_ge2))
+}
+
+#[inline]
+fn evaluate_child_train_from_parent_virtual_fuzzy(
+    parent_ge1: &[u64],
+    parent_ge2: &[u64],
+    parent: &FuzzyBeamState,
+    row_ge1: &[u64],
+    row_ge2: &[u64],
+    row_summary: DualLiteralSummary,
+    y_train: &[f64],
+    sum_y_train: f64,
+    n_train: usize,
+    child_rule_len: usize,
+    op: BeamBinaryOp,
+    negated: bool,
+    params: &BeamSearchParams,
+) -> Option<(ContinuousRuleScore, usize, f64, f64)> {
+    let intersections = dual_pair_intersections_for_params(
+        parent_ge1, parent_ge2, row_ge1, row_ge2, y_train, n_train, params,
+    );
+    evaluate_child_train_from_parent_virtual_fuzzy_with_intersections(
+        parent,
+        row_summary,
+        sum_y_train,
+        n_train,
+        child_rule_len,
+        op,
+        negated,
+        intersections,
+        params,
+    )
 }
 
 #[inline]
@@ -6879,6 +6938,15 @@ fn expand_fuzzy_beam_once_whole_genome_target_range(
             if candidate_group_is_excluded(&parent.rule, gid, params) {
                 continue;
             }
+            let intersections = dual_pair_intersections_for_params(
+                parent.combined_train_ge1.as_slice(),
+                parent.combined_train_ge2.as_slice(),
+                row_ge1,
+                row_ge2,
+                y_train,
+                n_train,
+                params,
+            );
             for &op in beam_binary_ops_for_rule(&parent.rule).iter() {
                 for &negated in child_literal_negations_for_op(op).iter() {
                     garfield_layer_debug_add(
@@ -6888,19 +6956,15 @@ fn expand_fuzzy_beam_once_whole_genome_target_range(
                         1,
                     );
                     let Some((train, train_n_ge2, train_sum_ge1, train_sum_ge2)) =
-                        evaluate_child_train_from_parent_virtual_fuzzy(
-                            parent.combined_train_ge1.as_slice(),
-                            parent.combined_train_ge2.as_slice(),
+                        evaluate_child_train_from_parent_virtual_fuzzy_with_intersections(
                             parent,
-                            row_ge1,
-                            row_ge2,
                             row_summary,
-                            y_train,
                             sum_y_train,
                             n_train,
                             parent.rule.len() + 1,
                             op,
                             negated,
+                            intersections,
                             params,
                         )
                     else {
@@ -7221,6 +7285,15 @@ fn expand_fuzzy_beam_once(
             let row_ge1 = row_prefix(ge1_train, row_words_train, cand, needed_words_train);
             let row_ge2 = row_prefix(ge2_train, row_words_train, cand, needed_words_train);
             let row_summary = literal_summaries[cand];
+            let intersections = dual_pair_intersections_for_params(
+                node.combined_train_ge1.as_slice(),
+                node.combined_train_ge2.as_slice(),
+                row_ge1,
+                row_ge2,
+                y_train,
+                n_train,
+                params,
+            );
             for &op in beam_binary_ops_for_rule(&node.rule).iter() {
                 for &negated in child_literal_negations_for_op(op).iter() {
                     garfield_layer_debug_add(
@@ -7230,19 +7303,15 @@ fn expand_fuzzy_beam_once(
                         1,
                     );
                     let Some((train, train_n_ge2, train_sum_ge1, train_sum_ge2)) =
-                        evaluate_child_train_from_parent_virtual_fuzzy(
-                            node.combined_train_ge1.as_slice(),
-                            node.combined_train_ge2.as_slice(),
+                        evaluate_child_train_from_parent_virtual_fuzzy_with_intersections(
                             node,
-                            row_ge1,
-                            row_ge2,
                             row_summary,
-                            y_train,
                             sum_y_train,
                             n_train,
                             node.rule.len() + 1,
                             op,
                             negated,
+                            intersections,
                             params,
                         )
                     else {
@@ -7413,6 +7482,15 @@ fn expand_fuzzy_states_exhaustive(
             let row_ge1 = row_prefix(ge1_train, row_words_train, cand, needed_words_train);
             let row_ge2 = row_prefix(ge2_train, row_words_train, cand, needed_words_train);
             let row_summary = literal_summaries[cand];
+            let intersections = dual_pair_intersections_for_params(
+                node.combined_train_ge1.as_slice(),
+                node.combined_train_ge2.as_slice(),
+                row_ge1,
+                row_ge2,
+                y_train,
+                n_train,
+                params,
+            );
             for &op in beam_binary_ops_for_rule(&node.rule).iter() {
                 for &negated in child_literal_negations_for_op(op).iter() {
                     garfield_layer_debug_add(
@@ -7422,19 +7500,15 @@ fn expand_fuzzy_states_exhaustive(
                         1,
                     );
                     let Some((train, train_n_ge2, train_sum_ge1, train_sum_ge2)) =
-                        evaluate_child_train_from_parent_virtual_fuzzy(
-                            node.combined_train_ge1.as_slice(),
-                            node.combined_train_ge2.as_slice(),
+                        evaluate_child_train_from_parent_virtual_fuzzy_with_intersections(
                             node,
-                            row_ge1,
-                            row_ge2,
                             row_summary,
-                            y_train,
                             sum_y_train,
                             n_train,
                             node.rule.len() + 1,
                             op,
                             negated,
+                            intersections,
                             params,
                         )
                     else {
@@ -11003,4 +11077,81 @@ mod tests {
         assert_eq!(collapsed.rule.len(), 3);
     }
     */
+
+    #[test]
+    fn test_dual_pair_intersections_match_direct_intersections() {
+        let y = vec![0.2, 1.1, -0.4, 0.8, 1.6, -0.3, 0.7, -1.2, 0.5, 2.0];
+        let parent_ge1 = vec![0b0011_0110_01u64];
+        let parent_ge2 = vec![0b0001_0010_01u64];
+        let row_ge1 = vec![0b0110_1100_10u64];
+        let row_ge2 = vec![0b0010_0100_00u64];
+        let params = BeamSearchParams::default();
+
+        let got = dual_pair_intersections_for_params(
+            parent_ge1.as_slice(),
+            parent_ge2.as_slice(),
+            row_ge1.as_slice(),
+            row_ge2.as_slice(),
+            y.as_slice(),
+            y.len(),
+            &params,
+        );
+
+        assert_eq!(
+            got.p1_r1_n,
+            and_popcount(parent_ge1.as_slice(), row_ge1.as_slice()) as usize
+        );
+        assert_eq!(
+            got.p2_r2_n,
+            and_popcount(parent_ge2.as_slice(), row_ge2.as_slice()) as usize
+        );
+        assert_eq!(
+            got.p1_r2_n,
+            and_popcount(parent_ge1.as_slice(), row_ge2.as_slice()) as usize
+        );
+        assert_eq!(
+            got.p2_r1_n,
+            and_popcount(parent_ge2.as_slice(), row_ge1.as_slice()) as usize
+        );
+        assert_eq!(
+            got.p1_r1_sum,
+            sum_y_where_both1_for_params(
+                parent_ge1.as_slice(),
+                row_ge1.as_slice(),
+                y.as_slice(),
+                y.len(),
+                &params,
+            )
+        );
+        assert_eq!(
+            got.p2_r2_sum,
+            sum_y_where_both1_for_params(
+                parent_ge2.as_slice(),
+                row_ge2.as_slice(),
+                y.as_slice(),
+                y.len(),
+                &params,
+            )
+        );
+        assert_eq!(
+            got.p1_r2_sum,
+            sum_y_where_both1_for_params(
+                parent_ge1.as_slice(),
+                row_ge2.as_slice(),
+                y.as_slice(),
+                y.len(),
+                &params,
+            )
+        );
+        assert_eq!(
+            got.p2_r1_sum,
+            sum_y_where_both1_for_params(
+                parent_ge2.as_slice(),
+                row_ge1.as_slice(),
+                y.as_slice(),
+                y.len(),
+                &params,
+            )
+        );
+    }
 }

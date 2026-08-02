@@ -21,8 +21,9 @@ use super::score::{
     dosage_maf_from_dual_counts, dual_packed_summary, score_cont_centered_gain_dual_from_summary,
     score_cont_centered_gain_dual_packed_with_sum, score_cont_centered_gain_from_sum_and_n_hit,
     score_cont_centered_gain_packed_with_n_hit, score_cont_centered_gain_packed_with_sum,
-    score_cont_corr_packed, sum_y_where_both1, sum_y_where_both1_with_lookup, support_size_packed,
-    validate_continuous_y, ContinuousRuleScore, PackedYSumLookup,
+    score_cont_corr_packed, sum_y_where_both1, sum_y_where_both1_four,
+    sum_y_where_both1_with_lookup, support_size_packed, validate_continuous_y, ContinuousRuleScore,
+    PackedYSumLookup,
 };
 use super::score_gpu::{
     centered_gain_backend_mode_is_auto, parse_centered_gain_backend_mode_from_env,
@@ -6062,20 +6063,27 @@ fn dual_pair_intersections_for_params(
     let p1_r2_n = and_popcount(parent_ge1, row_ge2) as usize;
     let p2_r1_n = and_popcount(parent_ge2, row_ge1) as usize;
     let t_sum = beam_detail_profile_start();
-    let p1_r1_sum = sum_y_where_both1_for_params(parent_ge1, row_ge1, y_train, n_train, params);
-    let p2_r2_sum = sum_y_where_both1_for_params(parent_ge2, row_ge2, y_train, n_train, params);
-    let p1_r2_sum = sum_y_where_both1_for_params(parent_ge1, row_ge2, y_train, n_train, params);
-    let p2_r1_sum = sum_y_where_both1_for_params(parent_ge2, row_ge1, y_train, n_train, params);
+    let sums = sum_y_where_both1_four(
+        [
+            (parent_ge1, row_ge1),
+            (parent_ge2, row_ge2),
+            (parent_ge1, row_ge2),
+            (parent_ge2, row_ge1),
+        ],
+        y_train,
+        n_train,
+        params.y_sum_lookup.as_deref(),
+    );
     beam_detail_profile_end(t_sum, &GARFIELD_PROFILE_SUM_Y_BOTH1_NS);
     DualPairIntersections {
         p1_r1_n,
         p2_r2_n,
         p1_r2_n,
         p2_r1_n,
-        p1_r1_sum,
-        p2_r2_sum,
-        p1_r2_sum,
-        p2_r1_sum,
+        p1_r1_sum: sums[0],
+        p2_r2_sum: sums[1],
+        p1_r2_sum: sums[2],
+        p2_r1_sum: sums[3],
     }
 }
 

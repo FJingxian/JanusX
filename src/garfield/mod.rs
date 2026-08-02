@@ -158,6 +158,9 @@ static GARFIELD_GENESET_LD_UNIT_STATS: OnceLock<Mutex<GarfieldGenesetLdUnitStats
     OnceLock::new();
 
 const GARFIELD_STRUCTURE_TASK_COALESCE_MAX_UNITS_DEFAULT: usize = 32;
+// Keep enough scan chunks to balance heterogeneous window sizes without
+// returning to one Rayon task per window.
+const GARFIELD_SCAN_TASK_COALESCE_MAX_UNITS_DEFAULT: usize = 512;
 const GARFIELD_LOGIC_MMAP_WINDOW_MB_DEFAULT: usize = 128;
 const GARFIELD_DENSE_DECODE_PAR_MIN_ROWS: usize = 64;
 const GARFIELD_DENSE_DECODE_PAR_MIN_SAMPLES: usize = 256;
@@ -381,6 +384,13 @@ fn parse_env_f64(name: &str) -> Option<f64> {
 fn garfield_structure_task_coalesce_max_units() -> usize {
     parse_env_usize("JX_GARFIELD_STRUCTURE_TASK_COALESCE_MAX_UNITS")
         .unwrap_or(GARFIELD_STRUCTURE_TASK_COALESCE_MAX_UNITS_DEFAULT)
+        .max(1)
+}
+
+#[inline]
+fn garfield_scan_task_coalesce_max_units() -> usize {
+    parse_env_usize("JX_GARFIELD_SCAN_TASK_COALESCE_MAX_UNITS")
+        .unwrap_or(GARFIELD_SCAN_TASK_COALESCE_MAX_UNITS_DEFAULT)
         .max(1)
 }
 
@@ -13145,11 +13155,15 @@ fn garfield_logic_search_bed_owned(
         train_fit.residualized_y.as_slice(),
         train_idx_local.len(),
     )?);
+    // A window scan already has many independent units in the outer pool.
+    // Nested row/beam Rayon loops make each unit repeatedly split tiny jobs
+    // and compete with sibling units, which lowers sustained CPU utilization.
+    // Keep inner parallelism only when the scan has too few units to fill the
+    // requested pool; this changes scheduling only, not scoring or pruning.
+    let allow_nested_scan_parallel = unit_parallel_threads <= 1
+        || scanned_units < unit_parallel_threads.saturating_mul(4).max(1);
     let scan_beam_params = BeamSearchParams {
-        // Keep nested parallelism enabled during scan. Rayon will reuse the same
-        // pool and lets a few heavy tail units fan out when outer unit-level
-        // parallelism no longer saturates all workers.
-        allow_parallel: true,
+        allow_parallel: allow_nested_scan_parallel,
         y_sum_lookup: Some(scan_stage1_y_lookup.clone()),
         ..beam_params.clone()
     };
@@ -13162,39 +13176,53 @@ fn garfield_logic_search_bed_owned(
         let skipped_units_parallel = skipped_units.clone();
         pool.install(|| {
             scan_unit_indices
-                .par_iter()
-                .map(|&ui| {
-                    process_scan_unit_continuous(
-                        ui,
-                        units.as_slice(),
-                        response,
-                        engine,
-                        importance,
-                        perm_cfg,
-                        ml_top_k,
-                        ml_top_frac,
-                        tree_cfg,
-                        &logic_bits,
-                        train_idx_local.as_slice(),
-                        test_idx_local.as_slice(),
-                        train_fit.residualized_y.as_slice(),
-                        Some(scan_stage1_y_lookup.as_ref()),
-                        test_fit.residualized_y.as_slice(),
-                        scan_beam_params.clone(),
-                        rule_output_null_lookup.clone(),
-                        top_rules_per_unit,
-                        raw_design,
-                        &unit_kind_lc,
-                        progress_callback_parallel,
-                        &scan_progress_done,
-                        scan_notify_step,
-                        scanned_units,
-                        &skipped_units_parallel,
-                        Some(&scan_mem_tracker),
-                        debug_probe.as_ref(),
-                        ld_support_cache.as_deref(),
-                    )
+                .par_chunks(garfield_task_chunk_units(
+                    scanned_units,
+                    unit_parallel_threads,
+                    garfield_scan_task_coalesce_max_units(),
+                ))
+                .map(|chunk| {
+                    let mut chunk_out =
+                        Vec::<Result<GarfieldUnitEvaluationOutput, String>>::with_capacity(
+                            chunk.len(),
+                        );
+                    for &ui in chunk.iter() {
+                        chunk_out.push(process_scan_unit_continuous(
+                            ui,
+                            units.as_slice(),
+                            response,
+                            engine,
+                            importance,
+                            perm_cfg,
+                            ml_top_k,
+                            ml_top_frac,
+                            tree_cfg,
+                            &logic_bits,
+                            train_idx_local.as_slice(),
+                            test_idx_local.as_slice(),
+                            train_fit.residualized_y.as_slice(),
+                            Some(scan_stage1_y_lookup.as_ref()),
+                            test_fit.residualized_y.as_slice(),
+                            scan_beam_params.clone(),
+                            rule_output_null_lookup.clone(),
+                            top_rules_per_unit,
+                            raw_design,
+                            &unit_kind_lc,
+                            progress_callback_parallel,
+                            &scan_progress_done,
+                            scan_notify_step,
+                            scanned_units,
+                            &skipped_units_parallel,
+                            Some(&scan_mem_tracker),
+                            debug_probe.as_ref(),
+                            ld_support_cache.as_deref(),
+                        ));
+                    }
+                    chunk_out
                 })
+                .collect::<Vec<Vec<Result<GarfieldUnitEvaluationOutput, String>>>>()
+                .into_iter()
+                .flatten()
                 .collect::<Vec<Result<GarfieldUnitEvaluationOutput, String>>>()
         })
     } else {

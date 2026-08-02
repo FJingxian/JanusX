@@ -696,6 +696,84 @@ pub fn sum_y_where_both1_with_lookup(
     sum
 }
 
+/// Sum phenotype values for four packed intersections in one word traversal.
+///
+/// Each output keeps the same word and bit accumulation order as
+/// `sum_y_where_both1`, while sharing the outer word loop and tail handling.
+/// The optional lookup is selected independently for each intersection so
+/// sparse masks still use the cheaper scalar bit walk.
+#[inline]
+pub fn sum_y_where_both1_four(
+    pairs: [(&[u64], &[u64]); 4],
+    y: &[f64],
+    n_samples: usize,
+    lookup: Option<&PackedYSumLookup>,
+) -> [f64; 4] {
+    let full_words = n_samples >> 6;
+    let rem = n_samples & 63;
+    let mut sums = [0.0_f64; 4];
+
+    if let Some(lookup) = lookup {
+        for word_idx in 0..full_words {
+            let masks = [
+                pairs[0].0[word_idx] & pairs[0].1[word_idx],
+                pairs[1].0[word_idx] & pairs[1].1[word_idx],
+                pairs[2].0[word_idx] & pairs[2].1[word_idx],
+                pairs[3].0[word_idx] & pairs[3].1[word_idx],
+            ];
+            sums[0] += sum_y_from_word_lookup_hybrid(lookup, y, word_idx, masks[0]);
+            sums[1] += sum_y_from_word_lookup_hybrid(lookup, y, word_idx, masks[1]);
+            sums[2] += sum_y_from_word_lookup_hybrid(lookup, y, word_idx, masks[2]);
+            sums[3] += sum_y_from_word_lookup_hybrid(lookup, y, word_idx, masks[3]);
+        }
+        if rem != 0 {
+            let word_idx = full_words;
+            let mask = (1u64 << rem) - 1u64;
+            let masks = [
+                (pairs[0].0[word_idx] & pairs[0].1[word_idx]) & mask,
+                (pairs[1].0[word_idx] & pairs[1].1[word_idx]) & mask,
+                (pairs[2].0[word_idx] & pairs[2].1[word_idx]) & mask,
+                (pairs[3].0[word_idx] & pairs[3].1[word_idx]) & mask,
+            ];
+            sums[0] += sum_y_from_word_lookup_hybrid(lookup, y, word_idx, masks[0]);
+            sums[1] += sum_y_from_word_lookup_hybrid(lookup, y, word_idx, masks[1]);
+            sums[2] += sum_y_from_word_lookup_hybrid(lookup, y, word_idx, masks[2]);
+            sums[3] += sum_y_from_word_lookup_hybrid(lookup, y, word_idx, masks[3]);
+        }
+        return sums;
+    }
+
+    for word_idx in 0..full_words {
+        let base = word_idx << 6;
+        let masks = [
+            pairs[0].0[word_idx] & pairs[0].1[word_idx],
+            pairs[1].0[word_idx] & pairs[1].1[word_idx],
+            pairs[2].0[word_idx] & pairs[2].1[word_idx],
+            pairs[3].0[word_idx] & pairs[3].1[word_idx],
+        ];
+        sums[0] += sum_y_from_word_scalar(y, base, masks[0]);
+        sums[1] += sum_y_from_word_scalar(y, base, masks[1]);
+        sums[2] += sum_y_from_word_scalar(y, base, masks[2]);
+        sums[3] += sum_y_from_word_scalar(y, base, masks[3]);
+    }
+    if rem != 0 {
+        let word_idx = full_words;
+        let base = word_idx << 6;
+        let mask = (1u64 << rem) - 1u64;
+        let masks = [
+            (pairs[0].0[word_idx] & pairs[0].1[word_idx]) & mask,
+            (pairs[1].0[word_idx] & pairs[1].1[word_idx]) & mask,
+            (pairs[2].0[word_idx] & pairs[2].1[word_idx]) & mask,
+            (pairs[3].0[word_idx] & pairs[3].1[word_idx]) & mask,
+        ];
+        sums[0] += sum_y_from_word_scalar(y, base, masks[0]);
+        sums[1] += sum_y_from_word_scalar(y, base, masks[1]);
+        sums[2] += sum_y_from_word_scalar(y, base, masks[2]);
+        sums[3] += sum_y_from_word_scalar(y, base, masks[3]);
+    }
+    sums
+}
+
 /// Balanced Accuracy for binary `y` (0/1) vs packed 0/1 bit-vector.
 pub fn score_binary_ba_packed(y: &[u8], bits: &[u64], n_samples: usize) -> f64 {
     if n_samples == 0 {
@@ -1322,6 +1400,34 @@ mod tests {
         (median, checksum)
     }
 
+    fn bench_sum_y_four<F>(
+        pairs: [(&[u64], &[u64]); 4],
+        y: &[f64],
+        n_samples: usize,
+        iters: usize,
+        mut f: F,
+    ) -> (f64, [f64; 4])
+    where
+        F: FnMut([(&[u64], &[u64]); 4], &[f64], usize) -> [f64; 4],
+    {
+        black_box(f(pairs, y, n_samples));
+        let mut samples = [0.0_f64; 5];
+        let mut sink = 0.0_f64;
+        for slot in samples.iter_mut() {
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                let out = black_box(f(pairs, y, n_samples));
+                sink += out.iter().sum::<f64>();
+            }
+            *slot = t0.elapsed().as_secs_f64() * 1e9 / (iters as f64);
+        }
+        black_box(sink);
+        (
+            median_ns_per_call(samples.as_mut_slice()),
+            f(pairs, y, n_samples),
+        )
+    }
+
     #[test]
     fn test_binary_scores_perfect() {
         let y = [0u8, 1, 1, 0, 1, 0, 0, 1];
@@ -1406,6 +1512,41 @@ mod tests {
         let got_lookup =
             sum_y_where_both1_with_lookup(lhs.as_slice(), rhs.as_slice(), y.as_slice(), n, &lookup);
         assert!((got_lookup - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_sum_y_where_both1_four_matches_individual() {
+        let n = 137usize;
+        let y = (0..n)
+            .map(|i| ((i as f64) * 0.125) - 3.0 + ((i % 7) as f64) * 0.05)
+            .collect::<Vec<_>>();
+        let rows = (0..4usize)
+            .map(|seed| {
+                let raw = (0..n)
+                    .map(|i| {
+                        ((i + seed * 3) % (seed + 3) == 0)
+                            || (i >= 48 + seed * 5 && i < 112 + seed * 3)
+                    })
+                    .map(|v| v as u8)
+                    .collect::<Vec<_>>();
+                pack01(raw.as_slice())
+            })
+            .collect::<Vec<_>>();
+        let pairs = [
+            (rows[0].as_slice(), rows[1].as_slice()),
+            (rows[1].as_slice(), rows[2].as_slice()),
+            (rows[0].as_slice(), rows[2].as_slice()),
+            (rows[3].as_slice(), rows[1].as_slice()),
+        ];
+        let expected = pairs.map(|(lhs, rhs)| sum_y_where_both1(lhs, rhs, y.as_slice(), n));
+        let got = sum_y_where_both1_four(pairs, y.as_slice(), n, None);
+        assert_eq!(got, expected);
+
+        let lookup = PackedYSumLookup::build(y.as_slice(), n).unwrap();
+        let expected_lookup = pairs
+            .map(|(lhs, rhs)| sum_y_where_both1_with_lookup(lhs, rhs, y.as_slice(), n, &lookup));
+        let got_lookup = sum_y_where_both1_four(pairs, y.as_slice(), n, Some(&lookup));
+        assert_eq!(got_lookup, expected_lookup);
     }
 
     #[test]
@@ -1561,6 +1702,112 @@ mod tests {
             dense.0.as_slice(),
             dense.1.as_slice(),
             dense.2.as_slice(),
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_sum_y_where_both1_lookup_realistic_samples() {
+        let n_samples = 1_402usize;
+        let lookup_y = (0..n_samples)
+            .map(|i| ((i as f64) * 0.03125) - 7.0 + ((i % 13) as f64) * 0.0075)
+            .collect::<Vec<_>>();
+        let cases = [
+            (
+                "sparse",
+                make_sum_y_bench_inputs(n_samples, |i| {
+                    (
+                        (i % 29) == 0 || (i % 31) == 1,
+                        (i % 37) == 3 || (i % 41) == 0,
+                    )
+                }),
+            ),
+            (
+                "dense",
+                make_sum_y_bench_inputs(n_samples, |i| {
+                    (
+                        ((i & 1) == 0) || ((i % 7) <= 2),
+                        ((i % 3) != 1) || ((i % 11) <= 4),
+                    )
+                }),
+            ),
+        ];
+        for (label, (lhs, rhs, _)) in cases {
+            let iters = 20_000usize;
+            let (scalar_ns, scalar_sum) = bench_sum_y_backend(
+                lhs.as_slice(),
+                rhs.as_slice(),
+                lookup_y.as_slice(),
+                n_samples,
+                iters,
+                sum_y_where_both1,
+            );
+            let lookup = PackedYSumLookup::build(lookup_y.as_slice(), n_samples).unwrap();
+            let (lookup_ns, lookup_sum) = bench_sum_y_backend(
+                lhs.as_slice(),
+                rhs.as_slice(),
+                lookup_y.as_slice(),
+                n_samples,
+                iters,
+                |a, b, c, n| sum_y_where_both1_with_lookup(a, b, c, n, &lookup),
+            );
+            let diff = (scalar_sum - lookup_sum).abs();
+            let tol = scalar_sum.abs().max(1.0) * 1e-10;
+            assert!(diff <= tol, "{label}: diff={diff} tol={tol}");
+            eprintln!(
+                "[sum_y lookup bench][{label}] scalar={scalar_ns:.1} ns/call lookup={lookup_ns:.1} ns/call speedup={:.2}x",
+                scalar_ns / lookup_ns,
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_sum_y_where_both1_four_realistic_samples() {
+        let n_samples = 1_402usize;
+        let y = (0..n_samples)
+            .map(|i| ((i as f64) * 0.03125) - 7.0 + ((i % 13) as f64) * 0.0075)
+            .collect::<Vec<_>>();
+        let rows = [
+            make_sum_y_bench_inputs(n_samples, |i| ((i & 1) == 0, (i % 3) != 1)),
+            make_sum_y_bench_inputs(n_samples, |i| ((i % 7) <= 2, (i % 11) <= 4)),
+            make_sum_y_bench_inputs(n_samples, |i| {
+                ((i % 29) == 0 || (i % 31) == 1, (i % 37) == 3)
+            }),
+            make_sum_y_bench_inputs(n_samples, |i| {
+                ((i % 5) == 0, (i % 41) == 0 || (i % 43) == 2)
+            }),
+        ];
+        let pairs = [
+            (rows[0].0.as_slice(), rows[1].1.as_slice()),
+            (rows[1].0.as_slice(), rows[2].1.as_slice()),
+            (rows[0].0.as_slice(), rows[2].0.as_slice()),
+            (rows[3].1.as_slice(), rows[1].0.as_slice()),
+        ];
+        let iters = 20_000usize;
+        let (individual_ns, individual_sum) =
+            bench_sum_y_four(pairs, y.as_slice(), n_samples, iters, |p, c, n| {
+                p.map(|(a, b)| sum_y_where_both1(a, b, c, n))
+            });
+        let (four_ns, four_sum) =
+            bench_sum_y_four(pairs, y.as_slice(), n_samples, iters, |p, c, n| {
+                sum_y_where_both1_four(p, c, n, None)
+            });
+        let lookup = PackedYSumLookup::build(y.as_slice(), n_samples).unwrap();
+        let (individual_lookup_ns, individual_lookup_sum) =
+            bench_sum_y_four(pairs, y.as_slice(), n_samples, iters, |p, c, n| {
+                p.map(|(a, b)| sum_y_where_both1_with_lookup(a, b, c, n, &lookup))
+            });
+        let (four_lookup_ns, four_lookup_sum) =
+            bench_sum_y_four(pairs, y.as_slice(), n_samples, iters, |p, c, n| {
+                sum_y_where_both1_four(p, c, n, Some(&lookup))
+            });
+        assert_eq!(four_sum, individual_sum);
+        assert_eq!(four_lookup_sum, individual_lookup_sum);
+        eprintln!(
+            "[sum_y four bench] scalar individual={individual_ns:.1} ns/call four={four_ns:.1} ns/call speedup={:.2}x; lookup individual={individual_lookup_ns:.1} ns/call four={four_lookup_ns:.1} ns/call speedup={:.2}x",
+            individual_ns / four_ns,
+            individual_lookup_ns / four_lookup_ns,
         );
     }
 

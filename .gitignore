@@ -51,6 +51,9 @@ bin
 benchmark
 .docker*
 
+# Local development documents
+docs/
+
 # C/C++ / native build artifacts
 *.o
 *.obj

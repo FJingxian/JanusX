@@ -419,6 +419,11 @@ fn garfield_ld_block_words() -> usize {
 }
 
 #[inline]
+fn garfield_ld_support_cache_enabled() -> bool {
+    !env_truthy("JX_GARFIELD_DISABLE_LD_SUPPORT_CACHE")
+}
+
+#[inline]
 fn parse_env_usize_allow_zero(name: &str) -> Option<usize> {
     env::var(name)
         .ok()
@@ -3268,6 +3273,9 @@ struct GarfieldLogicPipelineResult {
     timing_corr_stage1_pool_s: f64,
     timing_corr_stage1_pool_priority_s: f64,
     timing_corr_stage1_pool_ld_s: f64,
+    timing_ld_support_cache_s: f64,
+    ld_support_cache_rows: usize,
+    ld_support_cache_payload_bytes: usize,
     timing_scan_beam_calls: usize,
     timing_clone_bits_s: f64,
     timing_sum_y_both1_s: f64,
@@ -4616,6 +4624,150 @@ fn take_prefix_per_group_rows(group_rows: &[Vec<usize>], per_group_limit: usize)
     out
 }
 
+#[derive(Debug)]
+struct GarfieldLdSupportCache {
+    n_rows: usize,
+    row_words: usize,
+    block_words: usize,
+    block_count: usize,
+    support: Vec<u32>,
+    block_support: Vec<u16>,
+    sparse_global_to_local: Option<HashMap<usize, usize>>,
+}
+
+impl GarfieldLdSupportCache {
+    #[inline]
+    fn local_index(&self, global_idx: usize) -> Option<usize> {
+        if let Some(map) = self.sparse_global_to_local.as_ref() {
+            map.get(&global_idx).copied()
+        } else if global_idx < self.n_rows {
+            Some(global_idx)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    fn block_support_for_local(&self, local_idx: usize) -> &[u16] {
+        let start = local_idx.saturating_mul(self.block_count);
+        &self.block_support[start..start + self.block_count]
+    }
+
+    #[inline]
+    fn compatible_with(&self, logic_bits: &GarfieldLogicBits) -> bool {
+        self.n_rows == logic_bits.sites.len()
+            && self.row_words == logic_bits.row_words
+            && self.block_words == garfield_ld_block_words()
+            && self.block_count == logic_bits.row_words.div_ceil(self.block_words)
+    }
+
+    #[inline]
+    fn payload_bytes(&self) -> usize {
+        self.support
+            .len()
+            .saturating_mul(std::mem::size_of::<u32>())
+            .saturating_add(
+                self.block_support
+                    .len()
+                    .saturating_mul(std::mem::size_of::<u16>()),
+            )
+    }
+}
+
+fn build_garfield_ld_support_cache(
+    logic_bits: &GarfieldLogicBits,
+    requested_global_rows: &[usize],
+    sample_indices: &[usize],
+) -> Result<GarfieldLdSupportCache, String> {
+    if !sample_indices_are_full_identity(sample_indices, logic_bits.n_samples) {
+        return Err("GARFIELD LD support cache requires full-identity sample indices".to_string());
+    }
+    let n_rows = logic_bits.sites.len();
+    if requested_global_rows.iter().any(|&idx| idx >= n_rows) {
+        return Err("GARFIELD LD support cache row index out of range".to_string());
+    }
+    let mut rows = requested_global_rows.to_vec();
+    rows.sort_unstable();
+    rows.dedup();
+    if rows.is_empty() {
+        return Ok(GarfieldLdSupportCache {
+            n_rows,
+            row_words: logic_bits.row_words,
+            block_words: garfield_ld_block_words(),
+            block_count: logic_bits.row_words.div_ceil(garfield_ld_block_words()),
+            support: Vec::new(),
+            block_support: Vec::new(),
+            sparse_global_to_local: Some(HashMap::new()),
+        });
+    }
+
+    let dense = rows.len() == n_rows && rows.iter().enumerate().all(|(idx, &row)| idx == row);
+    let local_rows = if dense { n_rows } else { rows.len() };
+    let block_words = garfield_ld_block_words();
+    let block_count = logic_bits.row_words.div_ceil(block_words);
+    let mut support = vec![0u32; local_rows];
+    let mut block_support = vec![0u16; local_rows.saturating_mul(block_count)];
+    let bits_flat = logic_bits.bits_flat.as_slice();
+    let row_words = logic_bits.row_words;
+
+    support
+        .par_iter_mut()
+        .zip(block_support.par_chunks_mut(block_count))
+        .enumerate()
+        .for_each(|(local_idx, (support_out, block_out))| {
+            let global_idx = if dense { local_idx } else { rows[local_idx] };
+            let row = &bits_flat[global_idx * row_words..(global_idx + 1) * row_words];
+            let count = fill_ld_block_supports(row, block_words, block_out);
+            *support_out = u32::try_from(count).unwrap_or(u32::MAX);
+        });
+
+    let sparse_global_to_local = if dense {
+        None
+    } else {
+        Some(
+            rows.into_iter()
+                .enumerate()
+                .map(|(local_idx, global_idx)| (global_idx, local_idx))
+                .collect::<HashMap<usize, usize>>(),
+        )
+    };
+    Ok(GarfieldLdSupportCache {
+        n_rows,
+        row_words,
+        block_words,
+        block_count,
+        support,
+        block_support,
+        sparse_global_to_local,
+    })
+}
+
+fn collect_scan_ld_cache_rows(
+    units: &[GarfieldLogicUnit],
+    scan_unit_indices: &[usize],
+    n_rows: usize,
+    unit_kind_lc: &str,
+) -> Vec<usize> {
+    if unit_kind_lc == "window" && scan_unit_indices.len() == units.len() {
+        return (0..n_rows).collect();
+    }
+    let mut seen = vec![false; n_rows];
+    for &ui in scan_unit_indices.iter() {
+        let Some(unit) = units.get(ui) else {
+            continue;
+        };
+        for &row_idx in unit.indices.iter() {
+            if row_idx < n_rows {
+                seen[row_idx] = true;
+            }
+        }
+    }
+    seen.into_iter()
+        .enumerate()
+        .filter_map(|(row_idx, keep)| keep.then_some(row_idx))
+        .collect()
+}
+
 #[inline]
 fn fill_ld_block_supports(row: &[u64], block_words: usize, out: &mut [u16]) -> usize {
     debug_assert!(block_words > 0);
@@ -4676,6 +4828,22 @@ fn prune_candidate_rows_by_ld_priority(
     logic_bits: &GarfieldLogicBits,
     sample_indices: &[usize],
 ) -> Result<Vec<usize>, String> {
+    prune_candidate_rows_by_ld_priority_with_cache(
+        candidate_global_rows,
+        priority_local_rows,
+        logic_bits,
+        sample_indices,
+        None,
+    )
+}
+
+fn prune_candidate_rows_by_ld_priority_with_cache(
+    candidate_global_rows: &[usize],
+    priority_local_rows: &[usize],
+    logic_bits: &GarfieldLogicBits,
+    sample_indices: &[usize],
+    support_cache: Option<&GarfieldLdSupportCache>,
+) -> Result<Vec<usize>, String> {
     // This is score-prioritized greedy LD clumping: priority_local_rows must
     // already be ordered by descending single-site score.
     let t0 = garfield_stage_profile_start();
@@ -4684,6 +4852,7 @@ fn prune_candidate_rows_by_ld_priority(
         priority_local_rows,
         logic_bits,
         sample_indices,
+        support_cache,
     );
     garfield_stage_profile_end(t0, &GARFIELD_CORR_STAGE1_POOL_LD_NS);
     result
@@ -4694,6 +4863,7 @@ fn prune_candidate_rows_by_ld_priority_impl(
     priority_local_rows: &[usize],
     logic_bits: &GarfieldLogicBits,
     sample_indices: &[usize],
+    support_cache: Option<&GarfieldLdSupportCache>,
 ) -> Result<Vec<usize>, String> {
     let r2_threshold = garfield_geneset_ld_prune_r2();
     if candidate_global_rows.len() <= 1
@@ -4714,6 +4884,13 @@ fn prune_candidate_rows_by_ld_priority_impl(
     }
 
     let use_full_identity = sample_indices_are_full_identity(sample_indices, logic_bits.n_samples);
+    let support_cache = support_cache.filter(|cache| {
+        use_full_identity
+            && cache.compatible_with(logic_bits)
+            && candidate_global_rows
+                .iter()
+                .all(|&global_idx| cache.local_index(global_idx).is_some())
+    });
     let mut packed_rows = Vec::<u64>::new();
     let row_words = if use_full_identity {
         logic_bits.row_words
@@ -4738,24 +4915,38 @@ fn prune_candidate_rows_by_ld_priority_impl(
         }
     };
 
-    let support_cache = geneset_ld_support_cache(n_samples, r2_threshold);
-    let support_conflict_buckets = support_cache.conflict_supports.as_slice();
-    let exact_bounds = support_cache.exact_bounds.as_slice();
+    let support_bounds_cache = geneset_ld_support_cache(n_samples, r2_threshold);
+    let support_conflict_buckets = support_bounds_cache.conflict_supports.as_slice();
+    let exact_bounds = support_bounds_cache.exact_bounds.as_slice();
     let ld_backend = resolve_reduce_backend();
     let block_words = garfield_ld_block_words();
     let block_count = row_words.div_ceil(block_words);
     let mut block_support = vec![0u16; candidate_global_rows.len() * block_count];
     let mut support = vec![0usize; candidate_global_rows.len()];
     let mut variable = vec![false; candidate_global_rows.len()];
-    for local_idx in 0..candidate_global_rows.len() {
-        let block_start = local_idx * block_count;
-        let cnt = fill_ld_block_supports(
-            row_slice(local_idx),
-            block_words,
-            &mut block_support[block_start..block_start + block_count],
-        );
-        support[local_idx] = cnt;
-        variable[local_idx] = binary_row_var_from_support(cnt, n_samples) > 0.0;
+    if let Some(cache) = support_cache {
+        for (local_idx, &global_idx) in candidate_global_rows.iter().enumerate() {
+            let cache_idx = cache
+                .local_index(global_idx)
+                .ok_or_else(|| "GARFIELD LD support cache lost candidate row".to_string())?;
+            let block_start = local_idx * block_count;
+            let cached_blocks = cache.block_support_for_local(cache_idx);
+            block_support[block_start..block_start + block_count].copy_from_slice(cached_blocks);
+            let cnt = cache.support[cache_idx] as usize;
+            support[local_idx] = cnt;
+            variable[local_idx] = binary_row_var_from_support(cnt, n_samples) > 0.0;
+        }
+    } else {
+        for local_idx in 0..candidate_global_rows.len() {
+            let block_start = local_idx * block_count;
+            let cnt = fill_ld_block_supports(
+                row_slice(local_idx),
+                block_words,
+                &mut block_support[block_start..block_start + block_count],
+            );
+            support[local_idx] = cnt;
+            variable[local_idx] = binary_row_var_from_support(cnt, n_samples) > 0.0;
+        }
     }
 
     let mut kept_local = Vec::<usize>::with_capacity(priority_local_rows.len());
@@ -4821,6 +5012,28 @@ fn select_geneset_window_candidate_pool_rows(
     sample_indices: &[usize],
     prune_with_ld: bool,
 ) -> Result<Vec<usize>, String> {
+    select_geneset_window_candidate_pool_rows_with_cache(
+        unit,
+        candidate_global_rows,
+        scores,
+        per_window_keep_k,
+        logic_bits,
+        sample_indices,
+        prune_with_ld,
+        None,
+    )
+}
+
+fn select_geneset_window_candidate_pool_rows_with_cache(
+    unit: &GarfieldLogicUnit,
+    candidate_global_rows: &[usize],
+    scores: &[f64],
+    per_window_keep_k: usize,
+    logic_bits: &GarfieldLogicBits,
+    sample_indices: &[usize],
+    prune_with_ld: bool,
+    support_cache: Option<&GarfieldLdSupportCache>,
+) -> Result<Vec<usize>, String> {
     if candidate_global_rows.is_empty() || per_window_keep_k == 0 || unit.spans.len() <= 1 {
         return Ok(Vec::new());
     }
@@ -4852,11 +5065,12 @@ fn select_geneset_window_candidate_pool_rows(
         let priority_local =
             geneset_priority_order_from_scores_subset(scores, local_rows.as_slice());
         let pruned_global = if prune_with_ld {
-            prune_candidate_rows_by_ld_priority(
+            prune_candidate_rows_by_ld_priority_with_cache(
                 candidate_global_rows,
                 priority_local.as_slice(),
                 logic_bits,
                 sample_indices,
+                support_cache,
             )?
         } else {
             priority_local
@@ -4872,11 +5086,12 @@ fn select_geneset_window_candidate_pool_rows(
         let overflow_priority =
             geneset_priority_order_from_scores_subset(scores, overflow_local.as_slice());
         let overflow_rows = if prune_with_ld {
-            prune_candidate_rows_by_ld_priority(
+            prune_candidate_rows_by_ld_priority_with_cache(
                 candidate_global_rows,
                 overflow_priority.as_slice(),
                 logic_bits,
                 sample_indices,
+                support_cache,
             )?
         } else {
             overflow_priority
@@ -8219,6 +8434,24 @@ fn maybe_prune_geneset_unit_rows_by_ld(
     logic_bits: &GarfieldLogicBits,
     sample_indices: &[usize],
 ) -> Result<Vec<usize>, String> {
+    maybe_prune_geneset_unit_rows_by_ld_with_cache(
+        unit,
+        candidate_global_rows,
+        unit_kind_lc,
+        logic_bits,
+        sample_indices,
+        None,
+    )
+}
+
+fn maybe_prune_geneset_unit_rows_by_ld_with_cache(
+    unit: &GarfieldLogicUnit,
+    candidate_global_rows: &[usize],
+    unit_kind_lc: &str,
+    logic_bits: &GarfieldLogicBits,
+    sample_indices: &[usize],
+    support_cache: Option<&GarfieldLdSupportCache>,
+) -> Result<Vec<usize>, String> {
     let t0 = Instant::now();
     let r2_threshold = garfield_geneset_ld_prune_r2();
     if unit_kind_lc != "geneset"
@@ -8237,6 +8470,13 @@ fn maybe_prune_geneset_unit_rows_by_ld(
         Ordering::Relaxed,
     );
     let use_full_identity = sample_indices_are_full_identity(sample_indices, logic_bits.n_samples);
+    let support_cache = support_cache.filter(|cache| {
+        use_full_identity
+            && cache.compatible_with(logic_bits)
+            && candidate_global_rows
+                .iter()
+                .all(|&global_idx| cache.local_index(global_idx).is_some())
+    });
     let mut packed_rows = Vec::<u64>::new();
     let row_words = if use_full_identity {
         logic_bits.row_words
@@ -8266,19 +8506,37 @@ fn maybe_prune_geneset_unit_rows_by_ld(
     let mut support = vec![0usize; candidate_global_rows.len()];
     let mut var = vec![0.0_f64; candidate_global_rows.len()];
     let mut variable_local = Vec::<usize>::with_capacity(candidate_global_rows.len());
-    for local_idx in 0..candidate_global_rows.len() {
-        let row = row_slice(local_idx);
-        let block_start = local_idx * block_count;
-        let cnt = fill_ld_block_supports(
-            row,
-            block_words,
-            &mut block_support[block_start..block_start + block_count],
-        );
-        support[local_idx] = cnt;
-        let row_var = binary_row_var_from_support(cnt, n_samples);
-        var[local_idx] = row_var;
-        if row_var > 0.0 {
-            variable_local.push(local_idx);
+    if let Some(cache) = support_cache {
+        for (local_idx, &global_idx) in candidate_global_rows.iter().enumerate() {
+            let cache_idx = cache
+                .local_index(global_idx)
+                .ok_or_else(|| "GARFIELD LD support cache lost geneset row".to_string())?;
+            let block_start = local_idx * block_count;
+            block_support[block_start..block_start + block_count]
+                .copy_from_slice(cache.block_support_for_local(cache_idx));
+            let cnt = cache.support[cache_idx] as usize;
+            support[local_idx] = cnt;
+            let row_var = binary_row_var_from_support(cnt, n_samples);
+            var[local_idx] = row_var;
+            if row_var > 0.0 {
+                variable_local.push(local_idx);
+            }
+        }
+    } else {
+        for local_idx in 0..candidate_global_rows.len() {
+            let row = row_slice(local_idx);
+            let block_start = local_idx * block_count;
+            let cnt = fill_ld_block_supports(
+                row,
+                block_words,
+                &mut block_support[block_start..block_start + block_count],
+            );
+            support[local_idx] = cnt;
+            let row_var = binary_row_var_from_support(cnt, n_samples);
+            var[local_idx] = row_var;
+            if row_var > 0.0 {
+                variable_local.push(local_idx);
+            }
         }
     }
     if variable_local.is_empty() {
@@ -8288,9 +8546,9 @@ fn maybe_prune_geneset_unit_rows_by_ld(
         return Ok(Vec::new());
     }
 
-    let support_cache = geneset_ld_support_cache(n_samples, r2_threshold);
-    let support_conflict_buckets = support_cache.conflict_supports.as_slice();
-    let exact_bounds = support_cache.exact_bounds.as_slice();
+    let support_bounds_cache = geneset_ld_support_cache(n_samples, r2_threshold);
+    let support_conflict_buckets = support_bounds_cache.conflict_supports.as_slice();
+    let exact_bounds = support_bounds_cache.exact_bounds.as_slice();
     let ld_backend = resolve_reduce_backend();
 
     variable_local.sort_by(|&a, &b| {
@@ -8437,6 +8695,24 @@ fn select_single_window_candidate_pool_rows(
     logic_bits: &GarfieldLogicBits,
     sample_indices: &[usize],
 ) -> Result<Vec<usize>, String> {
+    select_single_window_candidate_pool_rows_with_cache(
+        candidate_global_rows,
+        scores,
+        target_k,
+        logic_bits,
+        sample_indices,
+        None,
+    )
+}
+
+fn select_single_window_candidate_pool_rows_with_cache(
+    candidate_global_rows: &[usize],
+    scores: &[f64],
+    target_k: usize,
+    logic_bits: &GarfieldLogicBits,
+    sample_indices: &[usize],
+    support_cache: Option<&GarfieldLdSupportCache>,
+) -> Result<Vec<usize>, String> {
     if candidate_global_rows.is_empty() || target_k == 0 {
         return Ok(Vec::new());
     }
@@ -8445,11 +8721,12 @@ fn select_single_window_candidate_pool_rows(
         let rank_t0 = garfield_stage_profile_start();
         let priority = geneset_priority_order_from_scores(scores);
         garfield_stage_profile_end(rank_t0, &GARFIELD_CORR_STAGE1_POOL_PRIORITY_NS);
-        return prune_candidate_rows_by_ld_priority(
+        return prune_candidate_rows_by_ld_priority_with_cache(
             candidate_global_rows,
             priority.as_slice(),
             logic_bits,
             sample_indices,
+            support_cache,
         )
         .map(|mut picked| {
             if picked.len() > target_k {
@@ -8471,11 +8748,12 @@ fn select_single_window_candidate_pool_rows(
             .filter_map(|&local_idx| candidate_global_rows.get(local_idx).copied())
             .collect::<Vec<_>>();
         let prescreen_priority_local = (0..prescreen_global_rows.len()).collect::<Vec<_>>();
-        let mut pruned = prune_candidate_rows_by_ld_priority(
+        let mut pruned = prune_candidate_rows_by_ld_priority_with_cache(
             prescreen_global_rows.as_slice(),
             prescreen_priority_local.as_slice(),
             logic_bits,
             sample_indices,
+            support_cache,
         )?;
         if pruned.len() > target_k {
             pruned.truncate(target_k);
@@ -8744,6 +9022,43 @@ fn select_logic_unit_global_rows(
     stage1_y_lookup: Option<&PackedYSumLookup>,
     allow_parallel: bool,
 ) -> Result<Option<GarfieldSelectedRows>, String> {
+    select_logic_unit_global_rows_with_ld_cache(
+        unit,
+        unit_kind_lc,
+        response,
+        engine,
+        importance,
+        perm_cfg,
+        ml_top_k,
+        ml_top_frac,
+        tree_cfg,
+        logic_bits,
+        train_idx_local,
+        y_train,
+        stage1_y_lookup,
+        allow_parallel,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn select_logic_unit_global_rows_with_ld_cache(
+    unit: &GarfieldLogicUnit,
+    unit_kind_lc: &str,
+    response: ResponseKind,
+    engine: Option<MlEngine>,
+    importance: ImportanceKind,
+    perm_cfg: PermutationConfig,
+    ml_top_k: usize,
+    ml_top_frac: f64,
+    tree_cfg: ExtraTreesConfig,
+    logic_bits: &GarfieldLogicBits,
+    train_idx_local: &[usize],
+    y_train: &[f64],
+    stage1_y_lookup: Option<&PackedYSumLookup>,
+    allow_parallel: bool,
+    support_cache: Option<&GarfieldLdSupportCache>,
+) -> Result<Option<GarfieldSelectedRows>, String> {
     check_ctrlc()?;
     if unit.indices.is_empty() {
         return Ok(None);
@@ -8755,12 +9070,13 @@ fn select_logic_unit_global_rows(
     let candidate_global_rows = if defer_corr_geneset_ld_prune {
         unit.indices.clone()
     } else {
-        maybe_prune_geneset_unit_rows_by_ld(
+        maybe_prune_geneset_unit_rows_by_ld_with_cache(
             unit,
             unit.indices.as_slice(),
             unit_kind_lc,
             logic_bits,
             train_idx_local,
+            support_cache,
         )?
     };
     if candidate_global_rows.is_empty() {
@@ -8806,7 +9122,7 @@ fn select_logic_unit_global_rows(
                 feat_sum_xy.as_slice(),
             );
             let selected_global_rows = if unit_kind_lc == "geneset" && unit.spans.len() > 1 {
-                select_geneset_window_candidate_pool_rows(
+                select_geneset_window_candidate_pool_rows_with_cache(
                     unit,
                     candidate_global_rows.as_slice(),
                     scores.as_slice(),
@@ -8814,14 +9130,16 @@ fn select_logic_unit_global_rows(
                     logic_bits,
                     train_idx_local,
                     false,
+                    support_cache,
                 )?
             } else {
-                select_single_window_candidate_pool_rows(
+                select_single_window_candidate_pool_rows_with_cache(
                     candidate_global_rows.as_slice(),
                     scores.as_slice(),
                     candidate_pool_k,
                     logic_bits,
                     train_idx_local,
+                    support_cache,
                 )?
             };
             GARFIELD_ML_SELECT_NS.fetch_add(
@@ -8866,7 +9184,7 @@ fn select_logic_unit_global_rows(
             garfield_stage_profile_end(score_t0, &GARFIELD_CORR_STAGE1_SCORE_NS);
             let pool_t0 = garfield_stage_profile_start();
             if unit_kind_lc == "geneset" && unit.spans.len() > 1 {
-                let selected = select_geneset_window_candidate_pool_rows(
+                let selected = select_geneset_window_candidate_pool_rows_with_cache(
                     unit,
                     candidate_global_rows.as_slice(),
                     scores.as_slice(),
@@ -8874,6 +9192,7 @@ fn select_logic_unit_global_rows(
                     logic_bits,
                     train_idx_local,
                     true,
+                    support_cache,
                 )?;
                 garfield_stage_profile_end(pool_t0, &GARFIELD_CORR_STAGE1_POOL_NS);
                 GARFIELD_ML_SELECT_NS.fetch_add(
@@ -8907,12 +9226,13 @@ fn select_logic_unit_global_rows(
                             .iter()
                             .map(|&idx| candidate_global_rows[idx])
                             .collect::<Vec<_>>();
-                        let pruned = maybe_prune_geneset_unit_rows_by_ld(
+                        let pruned = maybe_prune_geneset_unit_rows_by_ld_with_cache(
                             unit,
                             prescreen_rows.as_slice(),
                             unit_kind_lc,
                             logic_bits,
                             train_idx_local,
+                            support_cache,
                         )?;
                         if pruned.len() >= beam_keep_k || prescreen_k >= candidate_global_rows.len()
                         {
@@ -8928,12 +9248,13 @@ fn select_logic_unit_global_rows(
                         prescreen_k = next_k;
                     }
                 } else {
-                    maybe_prune_geneset_unit_rows_by_ld(
+                    maybe_prune_geneset_unit_rows_by_ld_with_cache(
                         unit,
                         candidate_global_rows.as_slice(),
                         unit_kind_lc,
                         logic_bits,
                         train_idx_local,
+                        support_cache,
                     )?
                 }
             } else {
@@ -8975,12 +9296,13 @@ fn select_logic_unit_global_rows(
                     .map(|&idx| pruned_global_rows[idx])
                     .collect::<Vec<_>>()
             } else {
-                select_single_window_candidate_pool_rows(
+                select_single_window_candidate_pool_rows_with_cache(
                     candidate_global_rows.as_slice(),
                     scores.as_slice(),
                     candidate_pool_k,
                     logic_bits,
                     train_idx_local,
+                    support_cache,
                 )?
             };
             garfield_stage_profile_end(pool_t0, &GARFIELD_CORR_STAGE1_POOL_NS);
@@ -9046,7 +9368,7 @@ fn select_logic_unit_global_rows(
             ml_group_ids.as_deref(),
         )?;
         let selected_global_rows = if unit_kind_lc == "geneset" && unit.spans.len() > 1 {
-            select_geneset_window_candidate_pool_rows(
+            select_geneset_window_candidate_pool_rows_with_cache(
                 unit,
                 candidate_global_rows.as_slice(),
                 scores.as_slice(),
@@ -9054,14 +9376,16 @@ fn select_logic_unit_global_rows(
                 logic_bits,
                 train_idx_local,
                 false,
+                support_cache,
             )?
         } else {
-            select_single_window_candidate_pool_rows(
+            select_single_window_candidate_pool_rows_with_cache(
                 candidate_global_rows.as_slice(),
                 scores.as_slice(),
                 candidate_pool_k,
                 logic_bits,
                 train_idx_local,
+                support_cache,
             )?
         };
         if selected_global_rows.is_empty() {
@@ -9101,8 +9425,47 @@ fn prepare_logic_unit_continuous(
     stage1_y_lookup: Option<&PackedYSumLookup>,
     beam_params: BeamSearchParams,
 ) -> Result<Option<GarfieldUnitPrepared>, String> {
+    prepare_logic_unit_continuous_with_ld_cache(
+        unit,
+        unit_kind_lc,
+        response,
+        engine,
+        importance,
+        perm_cfg,
+        ml_top_k,
+        ml_top_frac,
+        tree_cfg,
+        logic_bits,
+        train_idx_local,
+        _test_idx_local,
+        y_train,
+        stage1_y_lookup,
+        beam_params,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_logic_unit_continuous_with_ld_cache(
+    unit: &GarfieldLogicUnit,
+    unit_kind_lc: &str,
+    response: ResponseKind,
+    engine: Option<MlEngine>,
+    importance: ImportanceKind,
+    perm_cfg: PermutationConfig,
+    ml_top_k: usize,
+    ml_top_frac: f64,
+    tree_cfg: ExtraTreesConfig,
+    logic_bits: &GarfieldLogicBits,
+    train_idx_local: &[usize],
+    _test_idx_local: &[usize],
+    y_train: &[f64],
+    stage1_y_lookup: Option<&PackedYSumLookup>,
+    beam_params: BeamSearchParams,
+    support_cache: Option<&GarfieldLdSupportCache>,
+) -> Result<Option<GarfieldUnitPrepared>, String> {
     check_ctrlc()?;
-    let Some(selected_rows) = select_logic_unit_global_rows(
+    let Some(selected_rows) = select_logic_unit_global_rows_with_ld_cache(
         unit,
         unit_kind_lc,
         response,
@@ -9117,6 +9480,7 @@ fn prepare_logic_unit_continuous(
         y_train,
         stage1_y_lookup,
         beam_params.allow_parallel,
+        support_cache,
     )?
     else {
         return Ok(None);
@@ -10163,6 +10527,7 @@ fn process_scan_unit_continuous(
     skipped_units: &Arc<Mutex<Vec<GarfieldSkippedUnitInfo>>>,
     mem_tracker: Option<&GarfieldStageMemoryTracker>,
     debug_probe: Option<&GarfieldBeamDebugProbe>,
+    support_cache: Option<&GarfieldLdSupportCache>,
 ) -> Result<GarfieldUnitEvaluationOutput, String> {
     check_ctrlc()?;
     let unit = &units[ui];
@@ -10177,7 +10542,7 @@ fn process_scan_unit_continuous(
             t0.elapsed().as_secs_f64(),
         )?;
     }
-    if let Some(prepared) = prepare_logic_unit_continuous(
+    if let Some(prepared) = prepare_logic_unit_continuous_with_ld_cache(
         unit,
         unit_kind_lc,
         response,
@@ -10193,6 +10558,7 @@ fn process_scan_unit_continuous(
         y_train,
         stage1_y_lookup,
         beam_params.clone(),
+        support_cache,
     )? {
         if let Some(t0) = unit_t0 {
             garfield_whole_genome_unit_breakpoint(
@@ -11847,6 +12213,43 @@ fn garfield_logic_search_bed_owned(
         ));
     }
     let scanned_units = scan_unit_indices.len();
+    let ld_support_cache_t0 = Instant::now();
+    let ld_support_cache_rows = if garfield_ld_support_cache_enabled()
+        && sample_indices_are_full_identity(train_idx_local.as_slice(), logic_bits.n_samples)
+    {
+        collect_scan_ld_cache_rows(
+            units.as_slice(),
+            scan_unit_indices.as_slice(),
+            logic_bits.sites.len(),
+            unit_kind_lc.as_str(),
+        )
+    } else {
+        Vec::new()
+    };
+    let ld_support_cache = if ld_support_cache_rows.is_empty() {
+        None
+    } else {
+        Some(Arc::new(build_garfield_ld_support_cache(
+            &logic_bits,
+            ld_support_cache_rows.as_slice(),
+            train_idx_local.as_slice(),
+        )?))
+    };
+    let timing_ld_support_cache_s = ld_support_cache_t0.elapsed().as_secs_f64();
+    let ld_support_cache_rows_count = ld_support_cache
+        .as_ref()
+        .map(|cache| {
+            if cache.sparse_global_to_local.is_some() {
+                cache.support.len()
+            } else {
+                cache.n_rows
+            }
+        })
+        .unwrap_or(0);
+    let ld_support_cache_payload_bytes = ld_support_cache
+        .as_ref()
+        .map(|cache| cache.payload_bytes())
+        .unwrap_or(0);
     let max_null_unit_group_count = if grouped_null_mode {
         scan_unit_indices
             .iter()
@@ -11914,7 +12317,7 @@ fn garfield_logic_search_bed_owned(
                         .par_iter()
                         .enumerate()
                         .map(|(null_idx, unit)| {
-                            let prepared = prepare_logic_unit_continuous(
+                            let prepared = prepare_logic_unit_continuous_with_ld_cache(
                                 unit,
                                 &unit_kind_lc,
                                 response,
@@ -11930,6 +12333,7 @@ fn garfield_logic_search_bed_owned(
                                 train_fit.residualized_y.as_slice(),
                                 None,
                                 prep_beam_params.clone(),
+                                ld_support_cache.as_deref(),
                             );
                             let done = prep_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
                             if done % prep_notify_step == 0 || done == null_prep_total {
@@ -11964,7 +12368,7 @@ fn garfield_logic_search_bed_owned(
                     Result<Option<(GarfieldPermutationNullSource, GarfieldUnitPrepared)>, String>,
                 >::with_capacity(null_geneset_units.len());
                 for (null_idx, unit) in null_geneset_units.iter().enumerate() {
-                    let prepared = prepare_logic_unit_continuous(
+                    let prepared = prepare_logic_unit_continuous_with_ld_cache(
                         unit,
                         &unit_kind_lc,
                         response,
@@ -11980,6 +12384,7 @@ fn garfield_logic_search_bed_owned(
                         train_fit.residualized_y.as_slice(),
                         None,
                         prep_beam_params.clone(),
+                        ld_support_cache.as_deref(),
                     );
                     let done = prep_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
                     if done % prep_notify_step == 0 || done == null_prep_total {
@@ -12158,7 +12563,7 @@ fn garfield_logic_search_bed_owned(
                     .par_iter()
                     .copied()
                     .map(|ui| {
-                        let prepared = prepare_logic_unit_continuous(
+                        let prepared = prepare_logic_unit_continuous_with_ld_cache(
                             &units[ui],
                             &unit_kind_lc,
                             response,
@@ -12174,6 +12579,7 @@ fn garfield_logic_search_bed_owned(
                             train_fit.residualized_y.as_slice(),
                             None,
                             prep_beam_params.clone(),
+                            ld_support_cache.as_deref(),
                         );
                         let done = prep_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
                         if done % prep_notify_step == 0 || done == representative_units.len() {
@@ -12203,7 +12609,7 @@ fn garfield_logic_search_bed_owned(
                     representative_units.len(),
                 );
             for &ui in representative_units.iter() {
-                let prepared = prepare_logic_unit_continuous(
+                let prepared = prepare_logic_unit_continuous_with_ld_cache(
                     &units[ui],
                     &unit_kind_lc,
                     response,
@@ -12219,6 +12625,7 @@ fn garfield_logic_search_bed_owned(
                     train_fit.residualized_y.as_slice(),
                     None,
                     prep_beam_params.clone(),
+                    ld_support_cache.as_deref(),
                 );
                 let done = prep_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
                 if done % prep_notify_step == 0 || done == representative_units.len() {
@@ -12785,6 +13192,7 @@ fn garfield_logic_search_bed_owned(
                         &skipped_units_parallel,
                         Some(&scan_mem_tracker),
                         debug_probe.as_ref(),
+                        ld_support_cache.as_deref(),
                     )
                 })
                 .collect::<Vec<Result<GarfieldUnitEvaluationOutput, String>>>()
@@ -12822,6 +13230,7 @@ fn garfield_logic_search_bed_owned(
                 &skipped_units,
                 Some(&scan_mem_tracker),
                 debug_probe.as_ref(),
+                ld_support_cache.as_deref(),
             );
             out.push(chunk_out);
         }
@@ -13001,6 +13410,9 @@ fn garfield_logic_search_bed_owned(
         timing_corr_stage1_pool_s,
         timing_corr_stage1_pool_priority_s,
         timing_corr_stage1_pool_ld_s,
+        timing_ld_support_cache_s,
+        ld_support_cache_rows: ld_support_cache_rows_count,
+        ld_support_cache_payload_bytes,
         timing_scan_beam_calls: scan_beam_profile.calls,
         timing_clone_bits_s: scan_beam_profile.clone_bits_s,
         timing_sum_y_both1_s: scan_beam_profile.sum_y_both1_s,
@@ -13529,6 +13941,15 @@ pub fn garfield_logic_search_bed_py<'py>(
     out.set_item(
         "timing_corr_stage1_pool_ld_s",
         result.timing_corr_stage1_pool_ld_s,
+    )?;
+    out.set_item(
+        "timing_ld_support_cache_s",
+        result.timing_ld_support_cache_s,
+    )?;
+    out.set_item("ld_support_cache_rows", result.ld_support_cache_rows)?;
+    out.set_item(
+        "ld_support_cache_payload_bytes",
+        result.ld_support_cache_payload_bytes,
     )?;
     out.set_item("timing_scan_beam_wall_s", result.timing_scan_beam_wall_s)?;
     out.set_item(
@@ -14540,6 +14961,94 @@ mod tests {
             group_ids,
             n_samples,
         }
+    }
+
+    #[test]
+    fn test_ld_support_cache_matches_uncached_priority_clumping() {
+        Python::initialize();
+        let n_rows = 96usize;
+        let n_samples = 130usize;
+        let row_words = words_for_samples(n_samples);
+        let mut bits_flat = vec![0u64; n_rows * row_words];
+        for row in 0..n_rows {
+            for sample in 0..n_samples {
+                let hit = ((sample * 17 + row * 11 + (row / 7) * 3) % 29) < 9;
+                if hit {
+                    bits_flat[row * row_words + (sample >> 6)] |= 1u64 << (sample & 63);
+                }
+            }
+        }
+        let group_ids = (0..n_rows).collect::<Vec<_>>();
+        let logic_bits = GarfieldLogicBits {
+            bits_flat,
+            bits_hi_flat: None,
+            row_words,
+            sample_ids: (0..n_samples).map(|i| format!("s{i}")).collect(),
+            sites: (0..n_rows)
+                .map(|i| GarfieldLogicSite {
+                    chrom: Arc::<str>::from("1"),
+                    pos: i as i32 + 1,
+                    snp: Arc::<str>::from(format!("snp{i}")),
+                    ref_allele: Arc::<str>::from("A"),
+                    alt_allele: Arc::<str>::from("T"),
+                    mode: GarfieldLogicSiteMode::Bin,
+                })
+                .collect(),
+            group_ids,
+            n_samples,
+        };
+        let sample_indices = (0..n_samples).collect::<Vec<_>>();
+        let candidate_global_rows = (0..n_rows).collect::<Vec<_>>();
+        let priority_local_rows = (0..n_rows).rev().collect::<Vec<_>>();
+        let cache = build_garfield_ld_support_cache(
+            &logic_bits,
+            candidate_global_rows.as_slice(),
+            sample_indices.as_slice(),
+        )
+        .unwrap();
+
+        let uncached = prune_candidate_rows_by_ld_priority(
+            candidate_global_rows.as_slice(),
+            priority_local_rows.as_slice(),
+            &logic_bits,
+            sample_indices.as_slice(),
+        )
+        .unwrap();
+        let cached = prune_candidate_rows_by_ld_priority_with_cache(
+            candidate_global_rows.as_slice(),
+            priority_local_rows.as_slice(),
+            &logic_bits,
+            sample_indices.as_slice(),
+            Some(&cache),
+        )
+        .unwrap();
+        assert_eq!(uncached, cached);
+        assert!(!cached.is_empty());
+
+        let sparse_rows = (3..n_rows).step_by(3).collect::<Vec<_>>();
+        let sparse_priority = sparse_rows.iter().copied().rev().collect::<Vec<_>>();
+        let sparse_cache = build_garfield_ld_support_cache(
+            &logic_bits,
+            sparse_rows.as_slice(),
+            sample_indices.as_slice(),
+        )
+        .unwrap();
+        let sparse_uncached = prune_candidate_rows_by_ld_priority(
+            sparse_rows.as_slice(),
+            sparse_priority.as_slice(),
+            &logic_bits,
+            sample_indices.as_slice(),
+        )
+        .unwrap();
+        let sparse_cached = prune_candidate_rows_by_ld_priority_with_cache(
+            sparse_rows.as_slice(),
+            sparse_priority.as_slice(),
+            &logic_bits,
+            sample_indices.as_slice(),
+            Some(&sparse_cache),
+        )
+        .unwrap();
+        assert_eq!(sparse_uncached, sparse_cached);
     }
 
     #[test]

@@ -3885,6 +3885,191 @@ fn expand_beam_once_whole_genome_layer2(
     )
 }
 
+fn expand_beam_once_parallel_deferred(
+    beam: &[BeamState],
+    y_train: &[f64],
+    sum_y_train: f64,
+    bits_train: &[u64],
+    row_words_train: usize,
+    n_rows: usize,
+    needed_words_train: usize,
+    n_train: usize,
+    group_ids: &[usize],
+    literal_scores: &[LiteralSingletonScore],
+    params: &BeamSearchParams,
+) -> Result<Vec<BeamState>, String> {
+    check_interrupt_fast()?;
+    let next_cap = params.beam_width.min(n_rows.saturating_mul(4).max(1));
+    let base_rule_raws = Arc::new(collect_known_rule_raw_scores(beam));
+    let mut work = Vec::<(usize, usize, usize)>::new();
+    let chunk = GARFIELD_BEAM_PAR_CHUNK_CANDS.max(1);
+    for (bi, node) in beam.iter().enumerate() {
+        let (mut start, end_limit) = expansion_row_bounds(&node.rule, n_rows);
+        while start < end_limit {
+            let end = (start + chunk).min(end_limit);
+            work.push((bi, start, end));
+            start = end;
+        }
+    }
+
+    // Keep candidate scoring and pruning unchanged, but defer bitset
+    // materialization until after global rule deduplication and top-k.
+    let worker_maps = work
+        .into_par_iter()
+        .map(|(bi, start, end)| {
+            let node = &beam[bi];
+            let mut local_best: HashMap<RuleLexKey, BeamStateLite> =
+                HashMap::with_capacity(next_cap);
+            let mut parent_raw_cache = RuleRawScoreCache::new();
+            let mut ancestor_raw_cache = RuleAncestorBaselineCache::new();
+            for cand in start..end {
+                if ((cand - start) & 127) == 0 {
+                    check_interrupt_fast()?;
+                }
+                let gid = group_ids[cand];
+                if candidate_group_is_excluded(&node.rule, gid, params) {
+                    continue;
+                }
+                let row = row_prefix(bits_train, row_words_train, cand, needed_words_train);
+                let intersection =
+                    binary_pair_intersection(&node.combined_train, row, y_train, n_train);
+                for &op in beam_binary_ops_for_rule(&node.rule).iter() {
+                    for &negated in child_literal_negations_for_op(op).iter() {
+                        let literal = BeamLiteral {
+                            row_index: cand,
+                            group_id: gid,
+                            negated,
+                        };
+                        let single = literal_scores[literal_score_index(cand, negated)];
+                        let canonical_rule =
+                            canonical_commutative_child_rule(&node.rule, op, literal);
+                        let Some(train) =
+                            evaluate_child_train_from_parent_virtual_with_intersection(
+                                &node.train,
+                                &single.train,
+                                intersection,
+                                sum_y_train,
+                                n_train,
+                                node.rule.len() + 1,
+                                op,
+                                negated,
+                                params,
+                            )
+                        else {
+                            continue;
+                        };
+                        let rule = if let Some(rule) = canonical_rule {
+                            rule
+                        } else {
+                            let mut rule = node.rule.clone();
+                            rule.rest.push((op, literal));
+                            rule
+                        };
+                        let max_singleton_train_raw =
+                            node.max_singleton_train_raw.max(single.train.raw_score);
+                        let max_singleton_test_raw =
+                            node.max_singleton_test_raw.max(single.test.raw_score);
+                        let direct_parent_train_raw = if rule.len() == 2 {
+                            node.train.raw_score.max(single.train.raw_score)
+                        } else {
+                            best_ancestor_raw_baseline_cached(
+                                &rule,
+                                y_train,
+                                bits_train,
+                                row_words_train,
+                                n_rows,
+                                n_train,
+                                literal_scores,
+                                true,
+                                Some(base_rule_raws.as_ref()),
+                                &mut parent_raw_cache,
+                                &mut ancestor_raw_cache,
+                                params.disable_parent_delta,
+                            )?
+                        };
+                        let (train_abs_score, train_score) = train_scores_for_rule(
+                            &rule,
+                            train,
+                            direct_parent_train_raw,
+                            None,
+                            None,
+                            params,
+                        );
+                        if !keep_child_after_parent_abs_improvement_pruning(
+                            node.train_abs_score,
+                            rule.len(),
+                            train_abs_score,
+                            params,
+                        ) {
+                            continue;
+                        }
+                        if !keep_state_after_min_gain_pruning(rule.len(), train_score, params) {
+                            continue;
+                        }
+                        if !keep_child_after_parent_gain_pruning(&rule, train_score, params) {
+                            continue;
+                        }
+                        let state = BeamStateLite {
+                            rule,
+                            train,
+                            train_abs_score,
+                            train_score,
+                            max_singleton_train_raw,
+                            max_singleton_test_raw,
+                        };
+                        let key = state.rule.lexical_key();
+                        match local_best.entry(key) {
+                            std::collections::hash_map::Entry::Vacant(slot) => {
+                                slot.insert(state);
+                            }
+                            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                                if cmp_state_lite(&state, slot.get()) == std::cmp::Ordering::Less {
+                                    slot.insert(state);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(local_best)
+        })
+        .collect::<Vec<Result<HashMap<RuleLexKey, BeamStateLite>, String>>>();
+
+    let mut global_best =
+        HashMap::<RuleLexKey, BeamStateLite>::with_capacity(next_cap.saturating_mul(2));
+    for worker_map in worker_maps {
+        for (key, state) in worker_map? {
+            match global_best.entry(key) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(state);
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    if cmp_state_lite(&state, slot.get()) == std::cmp::Ordering::Less {
+                        slot.insert(state);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut retained = global_best.into_values().collect::<Vec<_>>();
+    retained.sort_unstable_by(cmp_state_lite);
+    if retained.len() > next_cap {
+        retained.truncate(next_cap);
+    }
+    let mut materialized = Vec::<BeamState>::with_capacity(retained.len());
+    for state in retained {
+        materialized.push(materialize_beam_state_lite(
+            state,
+            bits_train,
+            row_words_train,
+            n_rows,
+            n_train,
+        )?);
+    }
+    Ok(filter_beam_candidates(materialized, next_cap, params))
+}
+
 fn expand_beam_once(
     beam: &[BeamState],
     y_train: &[f64],
@@ -3910,170 +4095,23 @@ fn expand_beam_once(
         })
         .sum::<usize>();
 
-    let next = if should_parallel(total_expand, params.allow_parallel) {
-        let mut work = Vec::<(usize, usize, usize)>::new();
-        let chunk = GARFIELD_BEAM_PAR_CHUNK_CANDS.max(1);
-        for (bi, node) in beam.iter().enumerate() {
-            let (mut start, end_limit) = expansion_row_bounds(&node.rule, n_rows);
-            while start < end_limit {
-                let end = (start + chunk).min(end_limit);
-                work.push((bi, start, end));
-                start = end;
-            }
-        }
-        // Worker-local HashMap dedup: each worker keeps the best candidate
-        // per canonical rule key.  This prevents duplicates from filling up
-        // a fixed-size local Vec and displacing unique candidates before
-        // the global merge.  Lock-free, no cross-worker contention.
-        let worker_maps = work
-            .into_par_iter()
-            .map(|(bi, start, end)| {
-                let node = &beam[bi];
-                let mut local_best: HashMap<RuleLexKey, BeamState> =
-                    HashMap::with_capacity(next_cap);
-                let mut parent_raw_cache = RuleRawScoreCache::new();
-                let mut ancestor_raw_cache = RuleAncestorBaselineCache::new();
-                for cand in start..end {
-                    if ((cand - start) & 127) == 0 {
-                        check_interrupt_fast()?;
-                    }
-                    let gid = group_ids[cand];
-                    if candidate_group_is_excluded(&node.rule, gid, params) {
-                        continue;
-                    }
-                    let row = row_prefix(bits_train, row_words_train, cand, needed_words_train);
-                    let intersection =
-                        binary_pair_intersection(&node.combined_train, row, y_train, n_train);
-                    for &op in beam_binary_ops_for_rule(&node.rule).iter() {
-                        for &negated in child_literal_negations_for_op(op).iter() {
-                            let literal = BeamLiteral {
-                                row_index: cand,
-                                group_id: gid,
-                                negated,
-                            };
-                            let single = literal_scores[literal_score_index(cand, negated)];
-                            let canonical_rule =
-                                canonical_commutative_child_rule(&node.rule, op, literal);
-                            let Some(train) =
-                                evaluate_child_train_from_parent_virtual_with_intersection(
-                                    &node.train,
-                                    &single.train,
-                                    intersection,
-                                    sum_y_train,
-                                    n_train,
-                                    node.rule.len() + 1,
-                                    op,
-                                    negated,
-                                    params,
-                                )
-                            else {
-                                continue;
-                            };
-                            let rule = if let Some(rule) = canonical_rule {
-                                rule
-                            } else {
-                                let mut rule = node.rule.clone();
-                                rule.rest.push((op, literal));
-                                rule
-                            };
-                            let max_singleton_train_raw =
-                                node.max_singleton_train_raw.max(single.train.raw_score);
-                            let max_singleton_test_raw =
-                                node.max_singleton_test_raw.max(single.test.raw_score);
-                            let direct_parent_train_raw = if rule.len() == 2 {
-                                node.train.raw_score.max(single.train.raw_score)
-                            } else {
-                                best_ancestor_raw_baseline_cached(
-                                    &rule,
-                                    y_train,
-                                    bits_train,
-                                    row_words_train,
-                                    n_rows,
-                                    n_train,
-                                    literal_scores,
-                                    true,
-                                    Some(base_rule_raws.as_ref()),
-                                    &mut parent_raw_cache,
-                                    &mut ancestor_raw_cache,
-                                    params.disable_parent_delta,
-                                )?
-                            };
-                            let (train_abs_score, train_score) = train_scores_for_rule(
-                                &rule,
-                                train,
-                                direct_parent_train_raw,
-                                None,
-                                None,
-                                params,
-                            );
-                            if !keep_child_after_parent_abs_improvement_pruning(
-                                node.train_abs_score,
-                                rule.len(),
-                                train_abs_score,
-                                params,
-                            ) {
-                                continue;
-                            }
-                            if !keep_state_after_min_gain_pruning(rule.len(), train_score, params) {
-                                continue;
-                            }
-                            if !keep_child_after_parent_gain_pruning(&rule, train_score, params) {
-                                continue;
-                            }
-                            let t_clone = beam_detail_profile_start();
-                            let mut combined = node.combined_train.clone();
-                            beam_detail_profile_end(t_clone, &GARFIELD_PROFILE_CLONE_BITS_NS);
-                            apply_literal_inplace(&mut combined, row, op, negated, n_train);
-                            let state = BeamState {
-                                rule,
-                                combined_train: combined,
-                                train,
-                                train_abs_score,
-                                train_score,
-                                max_singleton_train_raw,
-                                max_singleton_test_raw,
-                            };
-                            let key = state.rule.lexical_key();
-                            match local_best.entry(key) {
-                                std::collections::hash_map::Entry::Vacant(slot) => {
-                                    slot.insert(state);
-                                }
-                                std::collections::hash_map::Entry::Occupied(mut slot) => {
-                                    if cmp_state(&state, slot.get()) == std::cmp::Ordering::Less {
-                                        slot.insert(state);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(local_best)
-            })
-            .collect::<Vec<Result<HashMap<RuleLexKey, BeamState>, String>>>();
-        // Merge all per-worker maps.  On key collision, keep the best.
-        let mut global_best: HashMap<RuleLexKey, BeamState> =
-            HashMap::with_capacity(next_cap.saturating_mul(2));
-        for wm in worker_maps {
-            for (key, state) in wm? {
-                match global_best.entry(key) {
-                    std::collections::hash_map::Entry::Vacant(slot) => {
-                        slot.insert(state);
-                    }
-                    std::collections::hash_map::Entry::Occupied(mut slot) => {
-                        if cmp_state(&state, slot.get()) == std::cmp::Ordering::Less {
-                            slot.insert(state);
-                        }
-                    }
-                }
-            }
-        }
-        let mut deduped: Vec<BeamState> = global_best.into_values().collect();
-        deduped.sort_unstable_by(|a, b| cmp_state(a, b));
-        if deduped.len() > next_cap {
-            deduped.truncate(next_cap);
-        }
-        deduped
-    } else {
+    if should_parallel(total_expand, params.allow_parallel) {
+        return expand_beam_once_parallel_deferred(
+            beam,
+            y_train,
+            sum_y_train,
+            bits_train,
+            row_words_train,
+            n_rows,
+            needed_words_train,
+            n_train,
+            group_ids,
+            literal_scores,
+            params,
+        );
+    }
+
+    let next = {
         let mut seen_commutative_children = HashSet::<Vec<(usize, bool, u8)>>::new();
         let mut seq = Vec::<BeamState>::with_capacity(next_cap);
         let mut parent_raw_cache = RuleRawScoreCache::new();
@@ -4309,6 +4347,181 @@ fn same_rule(a: &BeamRule, b: &BeamRule) -> bool {
     a == b
 }
 
+fn expand_states_exhaustive_parallel_deferred(
+    frontier: &[BeamState],
+    y_train: &[f64],
+    sum_y_train: f64,
+    bits_train: &[u64],
+    row_words_train: usize,
+    n_rows: usize,
+    needed_words_train: usize,
+    n_train: usize,
+    group_ids: &[usize],
+    literal_scores: &[LiteralSingletonScore],
+    params: &BeamSearchParams,
+) -> Result<Vec<BeamState>, String> {
+    check_interrupt_fast()?;
+    let base_rule_raws = Arc::new(collect_known_rule_raw_scores(frontier));
+    let mut work = Vec::<(usize, usize, usize)>::new();
+    let chunk = GARFIELD_EXHAUSTIVE_PAR_CHUNK_CANDS.max(1);
+    for (bi, node) in frontier.iter().enumerate() {
+        let mut start = node.rule.last_row_index() + 1;
+        while start < n_rows {
+            let end = (start + chunk).min(n_rows);
+            work.push((bi, start, end));
+            start = end;
+        }
+    }
+
+    // Exhaustive seed layers must retain every valid rule. Keep only the
+    // score-bearing state in workers and materialize support bits once after
+    // global rule-key deduplication.
+    let worker_maps = work
+        .into_par_iter()
+        .map(
+            |(bi, start, end)| -> Result<HashMap<RuleLexKey, BeamStateLite>, String> {
+                let node = &frontier[bi];
+                let mut local_best = HashMap::<RuleLexKey, BeamStateLite>::new();
+                let mut parent_raw_cache = RuleRawScoreCache::new();
+                let mut ancestor_raw_cache = RuleAncestorBaselineCache::new();
+                for cand in start..end {
+                    if ((cand - start) & 127) == 0 {
+                        check_interrupt_fast()?;
+                    }
+                    let gid = group_ids[cand];
+                    if candidate_group_is_excluded(&node.rule, gid, params) {
+                        continue;
+                    }
+                    let row = row_prefix(bits_train, row_words_train, cand, needed_words_train);
+                    let intersection =
+                        binary_pair_intersection(&node.combined_train, row, y_train, n_train);
+                    for &op in beam_binary_ops_for_rule(&node.rule).iter() {
+                        for &negated in child_literal_negations_for_op(op).iter() {
+                            let single = literal_scores[literal_score_index(cand, negated)];
+                            let Some(train) =
+                                evaluate_child_train_from_parent_virtual_with_intersection(
+                                    &node.train,
+                                    &single.train,
+                                    intersection,
+                                    sum_y_train,
+                                    n_train,
+                                    node.rule.len() + 1,
+                                    op,
+                                    negated,
+                                    params,
+                                )
+                            else {
+                                continue;
+                            };
+                            let literal = BeamLiteral {
+                                row_index: cand,
+                                group_id: gid,
+                                negated,
+                            };
+                            let mut rule = node.rule.clone();
+                            rule.rest.push((op, literal));
+                            let max_singleton_train_raw =
+                                node.max_singleton_train_raw.max(single.train.raw_score);
+                            let max_singleton_test_raw =
+                                node.max_singleton_test_raw.max(single.test.raw_score);
+                            let direct_parent_train_raw = if rule.len() == 2 {
+                                node.train.raw_score.max(single.train.raw_score)
+                            } else {
+                                best_ancestor_raw_baseline_cached(
+                                    &rule,
+                                    y_train,
+                                    bits_train,
+                                    row_words_train,
+                                    n_rows,
+                                    n_train,
+                                    literal_scores,
+                                    true,
+                                    Some(base_rule_raws.as_ref()),
+                                    &mut parent_raw_cache,
+                                    &mut ancestor_raw_cache,
+                                    params.disable_parent_delta,
+                                )?
+                            };
+                            let (train_abs_score, train_score) = train_scores_for_rule(
+                                &rule,
+                                train,
+                                direct_parent_train_raw,
+                                None,
+                                None,
+                                params,
+                            );
+                            if !keep_child_after_parent_abs_improvement_pruning(
+                                node.train_abs_score,
+                                rule.len(),
+                                train_abs_score,
+                                params,
+                            ) {
+                                continue;
+                            }
+                            if !keep_state_after_min_gain_pruning(rule.len(), train_score, params) {
+                                continue;
+                            }
+                            if !keep_child_after_parent_gain_pruning(&rule, train_score, params) {
+                                continue;
+                            }
+                            let state = BeamStateLite {
+                                rule,
+                                train,
+                                train_abs_score,
+                                train_score,
+                                max_singleton_train_raw,
+                                max_singleton_test_raw,
+                            };
+                            match local_best.entry(state.rule.lexical_key()) {
+                                std::collections::hash_map::Entry::Vacant(slot) => {
+                                    slot.insert(state);
+                                }
+                                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                                    if cmp_state_lite(&state, slot.get())
+                                        == std::cmp::Ordering::Less
+                                    {
+                                        slot.insert(state);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(local_best)
+            },
+        )
+        .collect::<Vec<Result<HashMap<RuleLexKey, BeamStateLite>, String>>>();
+
+    let mut best = HashMap::<RuleLexKey, BeamStateLite>::new();
+    for worker_map in worker_maps {
+        for (key, state) in worker_map? {
+            match best.entry(key) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(state);
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    if cmp_state_lite(&state, slot.get()) == std::cmp::Ordering::Less {
+                        slot.insert(state);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut out = Vec::<BeamState>::with_capacity(best.len());
+    for state in best.into_values() {
+        out.push(materialize_beam_state_lite(
+            state,
+            bits_train,
+            row_words_train,
+            n_rows,
+            n_train,
+        )?);
+    }
+    out.sort_by(cmp_state);
+    Ok(out)
+}
+
 fn expand_states_exhaustive(
     frontier: &[BeamState],
     y_train: &[f64],
@@ -4333,6 +4546,21 @@ fn expand_states_exhaustive(
         })
         .sum::<usize>();
     let base_rule_raws = Arc::new(collect_known_rule_raw_scores(frontier));
+    if should_parallel_exhaustive(total_expand, params.allow_parallel) {
+        return expand_states_exhaustive_parallel_deferred(
+            frontier,
+            y_train,
+            sum_y_train,
+            bits_train,
+            row_words_train,
+            n_rows,
+            needed_words_train,
+            n_train,
+            group_ids,
+            literal_scores,
+            params,
+        );
+    }
     let out = if should_parallel_exhaustive(total_expand, params.allow_parallel) {
         let mut work = Vec::<(usize, usize, usize)>::new();
         let chunk = GARFIELD_EXHAUSTIVE_PAR_CHUNK_CANDS.max(1);
@@ -7445,6 +7673,258 @@ fn expand_fuzzy_beam_once(
     Ok(out)
 }
 
+fn expand_fuzzy_beam_once_parallel(
+    beam: &[FuzzyBeamState],
+    y_train: &[f64],
+    sum_y_train: f64,
+    ge1_train: &[u64],
+    ge2_train: &[u64],
+    row_words_train: usize,
+    n_rows: usize,
+    needed_words_train: usize,
+    n_train: usize,
+    group_ids: &[usize],
+    literal_scores: &[LiteralSingletonScore],
+    literal_summaries: &[DualLiteralSummary],
+    params: &BeamSearchParams,
+) -> Result<Vec<FuzzyBeamState>, String> {
+    check_interrupt_fast()?;
+    if beam.is_empty() {
+        return Ok(Vec::new());
+    }
+    let next_cap = params.beam_width.min(n_rows.saturating_mul(4).max(1));
+    let total_expand = beam
+        .iter()
+        .map(|node| {
+            let (start, end) = expansion_row_bounds(&node.rule, n_rows);
+            end.saturating_sub(start)
+                .saturating_mul(beam_child_branch_count_for_rule(&node.rule))
+        })
+        .sum::<usize>();
+    if !should_parallel(total_expand, params.allow_parallel) {
+        return expand_fuzzy_beam_once(
+            beam,
+            y_train,
+            sum_y_train,
+            ge1_train,
+            ge2_train,
+            row_words_train,
+            n_rows,
+            needed_words_train,
+            n_train,
+            group_ids,
+            literal_scores,
+            literal_summaries,
+            params,
+        );
+    }
+
+    let layer = beam
+        .first()
+        .map(|p| p.rule.len().saturating_add(1))
+        .unwrap_or(0);
+    let base_rule_raws = Arc::new(collect_known_rule_raw_scores_fuzzy(beam));
+    let mut work = Vec::<(usize, usize, usize)>::new();
+    let chunk = GARFIELD_BEAM_PAR_CHUNK_CANDS.max(1);
+    for (bi, node) in beam.iter().enumerate() {
+        let (mut start, end_limit) = expansion_row_bounds(&node.rule, n_rows);
+        while start < end_limit {
+            let end = (start + chunk).min(end_limit);
+            work.push((bi, start, end));
+            start = end;
+        }
+    }
+
+    // Keep the same virtual scoring and pruning as the serial standard-fuzzy
+    // path. Workers only defer bitplane materialization until after merging.
+    let worker_maps = work
+        .into_par_iter()
+        .map(|(bi, start, end)| {
+            let node = &beam[bi];
+            let mut local_best =
+                HashMap::<RuleLexKey, FuzzyBeamStateLite>::with_capacity(next_cap.max(1));
+            let mut parent_raw_cache = RuleRawScoreCache::new();
+            let mut ancestor_raw_cache = RuleAncestorBaselineCache::new();
+            let mut seen_commutative_children = HashSet::<Vec<(usize, bool, u8)>>::new();
+            let blind_scan = child_rule_uses_blind_scan(node.rule.len());
+
+            for cand in start..end {
+                if ((cand - start) & 127) == 0 {
+                    check_interrupt_fast()?;
+                }
+                let gid = group_ids[cand];
+                if candidate_group_is_excluded(&node.rule, gid, params) {
+                    continue;
+                }
+                let row_ge1 = row_prefix(ge1_train, row_words_train, cand, needed_words_train);
+                let row_ge2 = row_prefix(ge2_train, row_words_train, cand, needed_words_train);
+                let row_summary = literal_summaries[cand];
+                let intersections = dual_pair_intersections_for_params(
+                    node.combined_train_ge1.as_slice(),
+                    node.combined_train_ge2.as_slice(),
+                    row_ge1,
+                    row_ge2,
+                    y_train,
+                    n_train,
+                    params,
+                );
+                for &op in beam_binary_ops_for_rule(&node.rule).iter() {
+                    for &negated in child_literal_negations_for_op(op).iter() {
+                        garfield_layer_debug_add(
+                            layer,
+                            garfield_layer_debug_op_family(op),
+                            GarfieldLayerDebugMetric::Considered,
+                            1,
+                        );
+                        let Some((train, train_n_ge2, train_sum_ge1, train_sum_ge2)) =
+                            evaluate_child_train_from_parent_virtual_fuzzy_with_intersections(
+                                node,
+                                row_summary,
+                                sum_y_train,
+                                n_train,
+                                node.rule.len() + 1,
+                                op,
+                                negated,
+                                intersections,
+                                params,
+                            )
+                        else {
+                            continue;
+                        };
+                        garfield_layer_debug_add(
+                            layer,
+                            garfield_layer_debug_op_family(op),
+                            GarfieldLayerDebugMetric::TrainOk,
+                            1,
+                        );
+                        let literal = BeamLiteral {
+                            row_index: cand,
+                            group_id: gid,
+                            negated,
+                        };
+                        let canonical_rule =
+                            canonical_commutative_child_rule(&node.rule, op, literal);
+                        if blind_scan {
+                            if let Some(rule) = canonical_rule.as_ref() {
+                                if !seen_commutative_children.insert(rule.lexical_key()) {
+                                    continue;
+                                }
+                            }
+                        }
+                        let rule = if let Some(rule) = canonical_rule {
+                            rule
+                        } else {
+                            let mut rule = node.rule.clone();
+                            rule.rest.push((op, literal));
+                            rule
+                        };
+                        let single = literal_scores[literal_score_index(cand, negated)];
+                        let max_singleton_train_raw =
+                            node.max_singleton_train_raw.max(single.train.raw_score);
+                        let max_singleton_test_raw =
+                            node.max_singleton_test_raw.max(single.test.raw_score);
+                        let direct_parent_train_raw = if rule.len() == 2 {
+                            node.train.raw_score.max(single.train.raw_score)
+                        } else {
+                            best_ancestor_raw_baseline_fuzzy_cached(
+                                &rule,
+                                y_train,
+                                sum_y_train,
+                                ge1_train,
+                                ge2_train,
+                                row_words_train,
+                                n_rows,
+                                n_train,
+                                literal_scores,
+                                true,
+                                Some(base_rule_raws.as_ref()),
+                                &mut parent_raw_cache,
+                                &mut ancestor_raw_cache,
+                                params.disable_parent_delta,
+                            )?
+                        };
+                        let (train_abs_score, train_score) = train_scores_for_rule(
+                            &rule,
+                            train,
+                            direct_parent_train_raw,
+                            None,
+                            None,
+                            params,
+                        );
+                        // Standard fuzzy exhaustive seed layers intentionally
+                        // retain all QC-valid children; later layers/output
+                        // apply the configured ranking and pruning.
+                        garfield_layer_debug_add(
+                            layer,
+                            garfield_layer_debug_op_family(op),
+                            GarfieldLayerDebugMetric::AbsOk,
+                            1,
+                        );
+                        garfield_layer_debug_add(
+                            layer,
+                            garfield_layer_debug_op_family(op),
+                            GarfieldLayerDebugMetric::GainOk,
+                            1,
+                        );
+                        garfield_layer_debug_add(
+                            layer,
+                            garfield_layer_debug_op_family(op),
+                            GarfieldLayerDebugMetric::ParentOk,
+                            1,
+                        );
+                        let state = FuzzyBeamStateLite {
+                            rule,
+                            train,
+                            train_n_ge2,
+                            train_sum_ge1,
+                            train_sum_ge2,
+                            train_abs_score,
+                            train_score,
+                            max_singleton_train_raw,
+                            max_singleton_test_raw,
+                        };
+                        let key = state.rule.lexical_key();
+                        match local_best.entry(key) {
+                            std::collections::hash_map::Entry::Vacant(slot) => {
+                                slot.insert(state);
+                            }
+                            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                                if cmp_fuzzy_state_lite(&state, slot.get())
+                                    == std::cmp::Ordering::Less
+                                {
+                                    slot.insert(state);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            prune_best_fuzzy_state_map(&mut local_best, next_cap);
+            Ok(local_best)
+        })
+        .collect::<Vec<Result<HashMap<RuleLexKey, FuzzyBeamStateLite>, String>>>();
+
+    let next = merge_best_fuzzy_state_maps(worker_maps, next_cap)?;
+    let mut materialized = Vec::<FuzzyBeamState>::with_capacity(next.len());
+    for cand in next.into_iter() {
+        materialized.push(materialize_fuzzy_beam_state_lite(
+            cand,
+            ge1_train,
+            ge2_train,
+            row_words_train,
+            n_rows,
+            n_train,
+        )?);
+    }
+    let out = filter_fuzzy_beam_candidates(materialized, next_cap, params);
+    garfield_layer_debug_record_fuzzy_states(
+        layer,
+        GarfieldLayerDebugMetric::Retained,
+        out.as_slice(),
+    );
+    Ok(out)
+}
+
 fn expand_fuzzy_states_exhaustive(
     frontier: &[FuzzyBeamState],
     y_train: &[f64],
@@ -7840,7 +8320,7 @@ fn beam_search_train_test_continuous_fuzzy_impl(
                     &params,
                 )?
             } else {
-                expand_fuzzy_beam_once(
+                expand_fuzzy_beam_once_parallel(
                     beam.as_slice(),
                     y_train,
                     sum_y_train,
@@ -8204,6 +8684,43 @@ mod tests {
         }
     }
 
+    fn fuzzy_beam_state_from_rule_for_test(
+        rule: BeamRule,
+        y: &[f64],
+        ge1: &[u64],
+        ge2: &[u64],
+        row_words: usize,
+        n_rows: usize,
+        literal_scores: &[LiteralSingletonScore],
+    ) -> FuzzyBeamState {
+        let (combined_train_ge1, combined_train_ge2) =
+            materialize_rule_bits_dual(&rule, ge1, ge2, row_words, n_rows, y.len()).unwrap();
+        let sum_y = y.iter().copied().sum::<f64>();
+        let (n_hit, n_ge2, sum_ge1, sum_ge2) =
+            dual_packed_summary(&combined_train_ge1, &combined_train_ge2, y, y.len());
+        let train = score_cont_centered_gain_dual_from_summary(
+            sum_y,
+            y.len(),
+            n_hit,
+            n_ge2,
+            sum_ge1,
+            sum_ge2,
+        );
+        FuzzyBeamState {
+            rule: rule.clone(),
+            combined_train_ge1,
+            combined_train_ge2,
+            train,
+            train_n_ge2: n_ge2,
+            train_sum_ge1: sum_ge1,
+            train_sum_ge2: sum_ge2,
+            train_abs_score: train.raw_score,
+            train_score: train.raw_score,
+            max_singleton_train_raw: rule_max_singleton_raw(&rule, literal_scores, true),
+            max_singleton_test_raw: rule_max_singleton_raw(&rule, literal_scores, false),
+        }
+    }
+
     fn assert_same_beam_states(actual: &[BeamState], expected: &[BeamState]) {
         assert_eq!(actual.len(), expected.len());
         for (got, want) in actual.iter().zip(expected.iter()) {
@@ -8211,6 +8728,20 @@ mod tests {
             assert_eq!(got.combined_train, want.combined_train);
             assert!((got.train.raw_score - want.train.raw_score).abs() < 1e-12);
             assert!((got.train_abs_score - want.train_abs_score).abs() < 1e-12);
+            assert!((got.train_score - want.train_score).abs() < 1e-12);
+        }
+    }
+
+    fn assert_same_fuzzy_beam_states(actual: &[FuzzyBeamState], expected: &[FuzzyBeamState]) {
+        assert_eq!(actual.len(), expected.len());
+        for (got, want) in actual.iter().zip(expected.iter()) {
+            assert_eq!(got.rule.lexical_key(), want.rule.lexical_key());
+            assert_eq!(got.combined_train_ge1, want.combined_train_ge1);
+            assert_eq!(got.combined_train_ge2, want.combined_train_ge2);
+            assert_eq!(got.train_n_ge2, want.train_n_ge2);
+            assert!((got.train_sum_ge1 - want.train_sum_ge1).abs() < 1e-12);
+            assert!((got.train_sum_ge2 - want.train_sum_ge2).abs() < 1e-12);
+            assert!((got.train.raw_score - want.train.raw_score).abs() < 1e-12);
             assert!((got.train_score - want.train_score).abs() < 1e-12);
         }
     }
@@ -8614,6 +9145,306 @@ mod tests {
         };
         assert!((virtual_sum_ge2 - materialized_sum_ge2).abs() < 1e-12);
         assert!((virtual_train.raw_score - materialized.raw_score).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_standard_fuzzy_parallel_expansion_matches_serial() {
+        init_python_for_tests();
+        let n_rows = 40usize;
+        let n_samples = 16usize;
+        let rows = (0..n_rows)
+            .map(|row_idx| {
+                (0..n_samples)
+                    .map(|sample_idx| ((row_idx + sample_idx * 2) % 3) as u8)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let y = (0..n_samples)
+            .map(|idx| idx as f64 - 7.5)
+            .collect::<Vec<_>>();
+        let (ge1, ge2, row_words) = pack_dual_rows(rows.as_slice(), n_samples);
+        let literal_scores = precompute_literal_singleton_scores_fuzzy(
+            y.as_slice(),
+            n_samples,
+            y.as_slice(),
+            n_samples,
+            ge1.as_slice(),
+            ge2.as_slice(),
+            row_words,
+            ge1.as_slice(),
+            ge2.as_slice(),
+            row_words,
+            n_rows,
+        )
+        .unwrap();
+        let literal_summaries = precompute_dual_literal_summaries(
+            y.as_slice(),
+            ge1.as_slice(),
+            ge2.as_slice(),
+            row_words,
+            n_rows,
+            row_words,
+            n_samples,
+        );
+        let group_ids = (0..n_rows).collect::<Vec<_>>();
+        let mut parent_rules = (0..30usize)
+            .map(|row_idx| BeamRule {
+                first: BeamLiteral {
+                    row_index: row_idx,
+                    group_id: row_idx,
+                    negated: false,
+                },
+                rest: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        parent_rules.extend((0..10usize).map(|row_idx| BeamRule {
+            first: BeamLiteral {
+                row_index: row_idx,
+                group_id: row_idx,
+                negated: false,
+            },
+            rest: vec![(
+                BeamBinaryOp::And,
+                BeamLiteral {
+                    row_index: row_idx + 10,
+                    group_id: row_idx + 10,
+                    negated: row_idx % 2 == 1,
+                },
+            )],
+        }));
+        let parents = parent_rules
+            .into_iter()
+            .map(|rule| {
+                fuzzy_beam_state_from_rule_for_test(
+                    rule,
+                    y.as_slice(),
+                    ge1.as_slice(),
+                    ge2.as_slice(),
+                    row_words,
+                    n_rows,
+                    literal_scores.as_slice(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let params_serial = BeamSearchParams {
+            rank_mode: BeamRankMode::Raw,
+            beam_width: 32,
+            allow_parallel: false,
+            ..BeamSearchParams::default()
+        };
+        let serial = expand_fuzzy_beam_once(
+            parents.as_slice(),
+            y.as_slice(),
+            y.iter().copied().sum::<f64>(),
+            ge1.as_slice(),
+            ge2.as_slice(),
+            row_words,
+            n_rows,
+            row_words,
+            n_samples,
+            group_ids.as_slice(),
+            literal_scores.as_slice(),
+            literal_summaries.as_slice(),
+            &params_serial,
+        )
+        .unwrap();
+        let params_parallel = BeamSearchParams {
+            allow_parallel: true,
+            ..params_serial.clone()
+        };
+        let parallel = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap()
+            .install(|| {
+                expand_fuzzy_beam_once_parallel(
+                    parents.as_slice(),
+                    y.as_slice(),
+                    y.iter().copied().sum::<f64>(),
+                    ge1.as_slice(),
+                    ge2.as_slice(),
+                    row_words,
+                    n_rows,
+                    row_words,
+                    n_samples,
+                    group_ids.as_slice(),
+                    literal_scores.as_slice(),
+                    literal_summaries.as_slice(),
+                    &params_parallel,
+                )
+            })
+            .unwrap();
+        assert_same_fuzzy_beam_states(parallel.as_slice(), serial.as_slice());
+    }
+
+    #[test]
+    fn test_standard_bin_parallel_expansion_matches_serial_after_deferred_materialization() {
+        init_python_for_tests();
+        let n_rows = 40usize;
+        let n_samples = 16usize;
+        let rows = (0..n_rows)
+            .map(|row_idx| {
+                (0..n_samples)
+                    .map(|sample_idx| ((row_idx + sample_idx * 3) % 2) as u8)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let y = (0..n_samples)
+            .map(|idx| idx as f64 - 7.5)
+            .collect::<Vec<_>>();
+        let (bits, row_words) = pack_rows(rows.as_slice(), n_samples);
+        let literal_scores =
+            literal_scores_for_test(y.as_slice(), bits.as_slice(), row_words, n_rows);
+        let group_ids = (0..n_rows).collect::<Vec<_>>();
+        let parents = (0..10usize)
+            .map(|row_idx| {
+                beam_state_from_rule_for_test(
+                    BeamRule {
+                        first: BeamLiteral {
+                            row_index: row_idx,
+                            group_id: row_idx,
+                            negated: false,
+                        },
+                        rest: Vec::new(),
+                    },
+                    y.as_slice(),
+                    bits.as_slice(),
+                    row_words,
+                    n_rows,
+                    literal_scores.as_slice(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let params_serial = BeamSearchParams {
+            rank_mode: BeamRankMode::Raw,
+            beam_width: 32,
+            allow_parallel: false,
+            ..BeamSearchParams::default()
+        };
+        let serial = expand_beam_once(
+            parents.as_slice(),
+            y.as_slice(),
+            y.iter().copied().sum::<f64>(),
+            bits.as_slice(),
+            row_words,
+            n_rows,
+            row_words,
+            n_samples,
+            group_ids.as_slice(),
+            literal_scores.as_slice(),
+            &params_serial,
+        )
+        .unwrap();
+        let params_parallel = BeamSearchParams {
+            allow_parallel: true,
+            ..params_serial.clone()
+        };
+        let parallel = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap()
+            .install(|| {
+                expand_beam_once_parallel_deferred(
+                    parents.as_slice(),
+                    y.as_slice(),
+                    y.iter().copied().sum::<f64>(),
+                    bits.as_slice(),
+                    row_words,
+                    n_rows,
+                    row_words,
+                    n_samples,
+                    group_ids.as_slice(),
+                    literal_scores.as_slice(),
+                    &params_parallel,
+                )
+            })
+            .unwrap();
+        assert_same_beam_states(parallel.as_slice(), serial.as_slice());
+    }
+
+    #[test]
+    fn test_exhaustive_bin_parallel_expansion_matches_serial_after_deferred_materialization() {
+        init_python_for_tests();
+        let n_rows = 40usize;
+        let n_samples = 16usize;
+        let rows = (0..n_rows)
+            .map(|row_idx| {
+                (0..n_samples)
+                    .map(|sample_idx| ((row_idx + sample_idx * 3) % 2) as u8)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let y = (0..n_samples)
+            .map(|idx| idx as f64 - 7.5)
+            .collect::<Vec<_>>();
+        let (bits, row_words) = pack_rows(rows.as_slice(), n_samples);
+        let literal_scores =
+            literal_scores_for_test(y.as_slice(), bits.as_slice(), row_words, n_rows);
+        let group_ids = (0..n_rows).collect::<Vec<_>>();
+        let parents = (0..10usize)
+            .map(|row_idx| {
+                beam_state_from_rule_for_test(
+                    BeamRule {
+                        first: BeamLiteral {
+                            row_index: row_idx,
+                            group_id: row_idx,
+                            negated: false,
+                        },
+                        rest: Vec::new(),
+                    },
+                    y.as_slice(),
+                    bits.as_slice(),
+                    row_words,
+                    n_rows,
+                    literal_scores.as_slice(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let params_serial = BeamSearchParams {
+            rank_mode: BeamRankMode::Raw,
+            beam_width: 32,
+            allow_parallel: false,
+            ..BeamSearchParams::default()
+        };
+        let serial = expand_states_exhaustive(
+            parents.as_slice(),
+            y.as_slice(),
+            y.iter().copied().sum::<f64>(),
+            bits.as_slice(),
+            row_words,
+            n_rows,
+            row_words,
+            n_samples,
+            group_ids.as_slice(),
+            literal_scores.as_slice(),
+            &params_serial,
+        )
+        .unwrap();
+        let params_parallel = BeamSearchParams {
+            allow_parallel: true,
+            ..params_serial.clone()
+        };
+        let parallel = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap()
+            .install(|| {
+                expand_states_exhaustive_parallel_deferred(
+                    parents.as_slice(),
+                    y.as_slice(),
+                    y.iter().copied().sum::<f64>(),
+                    bits.as_slice(),
+                    row_words,
+                    n_rows,
+                    row_words,
+                    n_samples,
+                    group_ids.as_slice(),
+                    literal_scores.as_slice(),
+                    &params_parallel,
+                )
+            })
+            .unwrap();
+        assert_same_beam_states(parallel.as_slice(), serial.as_slice());
     }
 
     #[test]

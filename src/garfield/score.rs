@@ -13,6 +13,9 @@ use rayon::prelude::*;
 use std::borrow::Cow;
 
 const BATCH_PAR_MIN_ROWS: usize = 64;
+const SUM_Y_LOOKUP_SEGMENTS_PER_WORD: usize = 8;
+const SUM_Y_LOOKUP_VALUES_PER_SEGMENT: usize = 256;
+const SUM_Y_LOOKUP_MIN_POPCNT: u32 = 6;
 #[cfg(target_arch = "x86_64")]
 const SUM_Y_MASKLOAD_MIN_POPCNT: u32 = 10;
 #[cfg(target_arch = "aarch64")]
@@ -310,6 +313,40 @@ pub fn dual_packed_summary(
 }
 
 #[inline]
+pub fn dual_packed_summary_with_lookup(
+    ge1_bits: &[u64],
+    ge2_bits: &[u64],
+    y: &[f64],
+    n_samples: usize,
+    lookup: &PackedYSumLookup,
+) -> (usize, usize, f64, f64) {
+    let full_words = n_samples >> 6;
+    let rem = n_samples & 63;
+    let mut n_ge1 = 0usize;
+    let mut n_ge2 = 0usize;
+    let mut sum_ge1 = 0.0_f64;
+    let mut sum_ge2 = 0.0_f64;
+    for word_idx in 0..full_words {
+        let ge1 = ge1_bits[word_idx];
+        let ge2 = ge2_bits[word_idx];
+        n_ge1 += ge1.count_ones() as usize;
+        n_ge2 += ge2.count_ones() as usize;
+        sum_ge1 += sum_y_from_word_lookup_hybrid(lookup, y, word_idx, ge1);
+        sum_ge2 += sum_y_from_word_lookup_hybrid(lookup, y, word_idx, ge2);
+    }
+    if rem != 0 {
+        let mask = (1u64 << rem) - 1u64;
+        let ge1 = ge1_bits[full_words] & mask;
+        let ge2 = ge2_bits[full_words] & mask;
+        n_ge1 += ge1.count_ones() as usize;
+        n_ge2 += ge2.count_ones() as usize;
+        sum_ge1 += sum_y_from_word_lookup_hybrid(lookup, y, full_words, ge1);
+        sum_ge2 += sum_y_from_word_lookup_hybrid(lookup, y, full_words, ge2);
+    }
+    (n_ge1, n_ge2, sum_ge1, sum_ge2)
+}
+
+#[inline]
 fn cont_mean_diff_corr_from_row(
     y: &[f64],
     bits: &[u64],
@@ -373,6 +410,77 @@ fn sum_y_from_word_scalar(y: &[f64], base: usize, mut word: u64) -> f64 {
         word &= word - 1;
     }
     s
+}
+
+/// Per-trait 8-bit subset-sum table for packed phenotype-weighted supports.
+/// Dense supports use the table while sparse words retain the exact scalar walk.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PackedYSumLookup {
+    n_words: usize,
+    values: Vec<f64>,
+}
+
+impl PackedYSumLookup {
+    pub fn build(y: &[f64], n_samples: usize) -> Result<Self, String> {
+        if y.len() < n_samples {
+            return Err(format!(
+                "PackedYSumLookup requires {n_samples} phenotype values, got {}",
+                y.len()
+            ));
+        }
+        let n_words = words_for_samples(n_samples);
+        let stride = SUM_Y_LOOKUP_SEGMENTS_PER_WORD * SUM_Y_LOOKUP_VALUES_PER_SEGMENT;
+        let mut values = vec![0.0_f64; n_words.saturating_mul(stride)];
+        for word_idx in 0..n_words {
+            let word_base = word_idx.saturating_mul(stride);
+            let sample_base = word_idx << 6;
+            for segment_idx in 0..SUM_Y_LOOKUP_SEGMENTS_PER_WORD {
+                let table_base =
+                    word_base + segment_idx.saturating_mul(SUM_Y_LOOKUP_VALUES_PER_SEGMENT);
+                for mask in 1usize..SUM_Y_LOOKUP_VALUES_PER_SEGMENT {
+                    let mut bits = mask as u8;
+                    let mut sum = 0.0_f64;
+                    while bits != 0 {
+                        let bit = bits.trailing_zeros() as usize;
+                        let sample_idx = sample_base + (segment_idx << 3) + bit;
+                        if sample_idx < n_samples {
+                            sum += y[sample_idx];
+                        }
+                        bits &= bits - 1;
+                    }
+                    values[table_base + mask] = sum;
+                }
+            }
+        }
+        Ok(Self { n_words, values })
+    }
+
+    #[inline]
+    fn sum_word(&self, word_idx: usize, word: u64) -> f64 {
+        debug_assert!(word_idx < self.n_words);
+        let stride = SUM_Y_LOOKUP_SEGMENTS_PER_WORD * SUM_Y_LOOKUP_VALUES_PER_SEGMENT;
+        let word_base = word_idx.saturating_mul(stride);
+        let mut sum = 0.0_f64;
+        for segment_idx in 0..SUM_Y_LOOKUP_SEGMENTS_PER_WORD {
+            let mask = ((word >> (segment_idx << 3)) & 0xff) as usize;
+            sum += self.values[word_base + segment_idx * SUM_Y_LOOKUP_VALUES_PER_SEGMENT + mask];
+        }
+        sum
+    }
+}
+
+#[inline]
+fn sum_y_from_word_lookup_hybrid(
+    lookup: &PackedYSumLookup,
+    y: &[f64],
+    word_idx: usize,
+    word: u64,
+) -> f64 {
+    if word.count_ones() < SUM_Y_LOOKUP_MIN_POPCNT {
+        sum_y_from_word_scalar(y, word_idx << 6, word)
+    } else {
+        lookup.sum_word(word_idx, word)
+    }
 }
 
 #[inline]
@@ -558,6 +666,34 @@ pub fn sum_y_where_both1(lhs: &[u64], rhs: &[u64], y: &[f64], n_samples: usize) 
     {
         sum_y_where_both1_scalar(lhs, rhs, y, n_samples)
     }
+}
+
+/// Sum phenotype residuals where both packed supports are set, reusing a
+/// trait-level subset-sum table for dense intersections.
+#[inline]
+pub fn sum_y_where_both1_with_lookup(
+    lhs: &[u64],
+    rhs: &[u64],
+    y: &[f64],
+    n_samples: usize,
+    lookup: &PackedYSumLookup,
+) -> f64 {
+    let full_words = n_samples >> 6;
+    let rem = n_samples & 63;
+    let mut sum = 0.0_f64;
+    for word_idx in 0..full_words {
+        sum += sum_y_from_word_lookup_hybrid(lookup, y, word_idx, lhs[word_idx] & rhs[word_idx]);
+    }
+    if rem != 0 {
+        let mask = (1u64 << rem) - 1u64;
+        sum += sum_y_from_word_lookup_hybrid(
+            lookup,
+            y,
+            full_words,
+            (lhs[full_words] & rhs[full_words]) & mask,
+        );
+    }
+    sum
 }
 
 /// Balanced Accuracy for binary `y` (0/1) vs packed 0/1 bit-vector.
@@ -1266,6 +1402,40 @@ mod tests {
         let expected = sum_y_where_both1_scalar(lhs.as_slice(), rhs.as_slice(), y.as_slice(), n);
         let got = sum_y_where_both1(lhs.as_slice(), rhs.as_slice(), y.as_slice(), n);
         assert!((got - expected).abs() < 1e-12);
+        let lookup = PackedYSumLookup::build(y.as_slice(), n).unwrap();
+        let got_lookup =
+            sum_y_where_both1_with_lookup(lhs.as_slice(), rhs.as_slice(), y.as_slice(), n, &lookup);
+        assert!((got_lookup - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_dual_packed_summary_lookup_matches_scalar_reference() {
+        let n = 137usize;
+        let y = (0..n)
+            .map(|i| ((i as f64) * 0.125) - 3.0 + ((i % 7) as f64) * 0.05)
+            .collect::<Vec<_>>();
+        let ge1_raw = (0..n)
+            .map(|i| ((i % 3) != 1 || (i >= 96 && i < 128)) as u8)
+            .collect::<Vec<_>>();
+        let ge2_raw = ge1_raw
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| (v != 0 && ((i % 5) <= 2 || (i >= 64 && i < 120))) as u8)
+            .collect::<Vec<_>>();
+        let ge1 = pack01(ge1_raw.as_slice());
+        let ge2 = pack01(ge2_raw.as_slice());
+        let expected = dual_packed_summary(ge1.as_slice(), ge2.as_slice(), y.as_slice(), n);
+        let lookup = PackedYSumLookup::build(y.as_slice(), n).unwrap();
+        let got = dual_packed_summary_with_lookup(
+            ge1.as_slice(),
+            ge2.as_slice(),
+            y.as_slice(),
+            n,
+            &lookup,
+        );
+        assert_eq!((got.0, got.1), (expected.0, expected.1));
+        assert!((got.2 - expected.2).abs() < 1e-12);
+        assert!((got.3 - expected.3).abs() < 1e-12);
     }
 
     #[cfg(target_arch = "x86_64")]

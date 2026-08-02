@@ -1437,12 +1437,11 @@ fn logic_binary_gate_from_bin_map(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let literal_rows = logic_gate_literal_rows(gate_rows.as_slice(), mode)?;
-    let gate_indicator =
-        logic_gate_indicator_from_literals(
-            literal_rows.as_slice(),
-            mode,
-            logic_output_negated(mode),
-        );
+    let gate_indicator = logic_gate_indicator_from_literals(
+        literal_rows.as_slice(),
+        mode,
+        logic_output_negated(mode),
+    );
     Ok((literal_rows, gate_indicator))
 }
 

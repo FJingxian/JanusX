@@ -5,17 +5,18 @@ mod sampling;
 mod score;
 mod score_gpu;
 
-// GARFIELD runtime note (2026-07):
-// - Active continuous search uses fuzzy 0/1/2 dosage bits only.
+// GARFIELD runtime note (2026-08):
+// - Active BIN search uses packed 0/1 homozygote bits only:
+//   0 -> 0, 2 -> 1, and 1/NA are treated as missing then mode-imputed.
+// - Active MBIN/fuzzy compatibility helpers remain available in-tree for
+//   backward-compatible parsing/evaluation and targeted debugging.
 // - Active beam expansion is AND/XOR-only; negation remains supported.
-// - Legacy packed-0/1 continuous beam code and OR-family compatibility helpers
-//   are retained only for backward-compatible parsing/evaluation of old
-//   artifacts and tests, and are intentionally disabled in the main runtime.
 
 use self::bs::{beam_search_and_binary_mcc, beam_search_and_continuous_abs_corr, BeamAndResult};
 use self::bs::{
     beam_search_train_test_continuous_fuzzy,
-    beam_search_train_test_continuous_fuzzy_with_literal_scores, evaluate_rule_continuous_dual,
+    beam_search_train_test_continuous_fuzzy_with_literal_scores,
+    beam_search_train_test_continuous_with_literal_scores, evaluate_rule_continuous_dual,
     materialize_rule_bits_dual, precompute_literal_singleton_scores_batched,
     LiteralScoreBatchRequest, LiteralSingletonScore,
 };
@@ -85,6 +86,7 @@ use rand::seq::index::sample as sample_indices_without_replacement;
 use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
@@ -108,10 +110,12 @@ use residual::{garfield_residualize_exact_from_grm_rust, GarfieldResidualResult}
 pub use sampling::stratified_test_mask;
 #[allow(unused_imports)]
 pub use score::{
-    dual_packed_summary, score_binary_ba_mcc_batch_py, score_binary_ba_py, score_binary_mcc_packed,
-    score_binary_mcc_py, score_cont_centered_gain_packed_with_sum, score_cont_corr_packed,
-    score_cont_corr_py, score_cont_mean_diff_corr_batch_py, score_cont_mean_diff_py,
+    dual_packed_summary, dual_packed_summary_with_lookup, score_binary_ba_mcc_batch_py,
+    score_binary_ba_py, score_binary_mcc_packed, score_binary_mcc_py,
+    score_cont_centered_gain_packed_with_sum, score_cont_corr_packed, score_cont_corr_py,
+    score_cont_mean_diff_corr_batch_py, score_cont_mean_diff_py,
     score_cont_weighted_mean_diff_packed, support_size_packed, ContinuousRuleScore,
+    PackedYSumLookup,
 };
 pub use score_gpu::{
     garfield_compare_score_cont_centered_gain_batch_metal_vs_cpu_py,
@@ -247,6 +251,7 @@ impl Default for GarfieldGenesetLdExactBounds {
 }
 
 impl GarfieldGenesetLdExactBounds {
+    #[cfg(test)]
     #[inline]
     fn matches(self, both_one: usize) -> bool {
         let both_one = u32::try_from(both_one).unwrap_or(u32::MAX);
@@ -870,7 +875,7 @@ fn parse_bin_mode(mode: &str) -> Result<GarfieldBinMode, String> {
     match t.as_str() {
         "bin" | "bin02" => Ok(GarfieldBinMode::Bin),
         // MBIN is retained only as a compatibility alias. The active GARFIELD
-        // path is BIN with fuzzy 0/1/2 dosage logic.
+        // path is BIN with packed 0/1 homozygote logic (0->0, 2->1, 1/NA->mode).
         "mbin" => Ok(GarfieldBinMode::Bin),
         _ => Err("mode must be one of: bin, mbin(alias->bin)".to_string()),
     }
@@ -1613,49 +1618,35 @@ fn encode_row_to_bits(
     impute: bool,
     het: f32,
 ) -> Option<Vec<EncodedRow>> {
-    let keep = process_snp_row(
-        &mut row,
-        &mut site.ref_allele,
-        &mut site.alt_allele,
-        maf,
-        geno,
-        impute,
-        false,
-        het,
-    );
-    if !keep {
-        return None;
-    }
-    if matches!(mode, GarfieldBinMode::Bin) {
-        let mut non_missing = 0usize;
-        let mut het_count = 0usize;
-        for &v in row.iter() {
-            if let Some(g) = normalize_genotype3(v) {
-                non_missing += 1;
-                if g == 1 {
-                    het_count += 1;
-                }
-            }
-        }
-        if non_missing == 0 {
-            return None;
-        }
-        let het_rate = het_count as f32 / non_missing as f32;
-        if het_rate > het {
-            return None;
-        }
-    }
-
     match mode {
         GarfieldBinMode::Bin => {
+            let _ = (impute, het);
             let mut c0 = 0usize;
             let mut c2 = 0usize;
+            let mut logic_missing = 0usize;
+            let n_samples = row.len();
             for &v in row.iter() {
                 match normalize_genotype3(v) {
                     Some(0) => c0 += 1,
                     Some(2) => c2 += 1,
-                    _ => {}
+                    _ => logic_missing += 1,
                 }
+            }
+            if n_samples == 0 {
+                return None;
+            }
+            let missing_rate = (logic_missing as f32) / (n_samples as f32);
+            if missing_rate > geno {
+                return None;
+            }
+            let usable_homo = n_samples.saturating_sub(logic_missing);
+            if usable_homo == 0 {
+                return None;
+            }
+            let alt_freq = (c2 as f32) / (usable_homo as f32);
+            let maf_obs = alt_freq.min(1.0_f32 - alt_freq).max(0.0_f32);
+            if maf_obs < maf {
+                return None;
             }
             let mode02 = if c2 > c0 { 2u8 } else { 0u8 };
             let mut bits = vec![0u8; row_bytes];
@@ -1676,6 +1667,19 @@ fn encode_row_to_bits(
             Some(vec![EncodedRow { site, bits }])
         }
         GarfieldBinMode::Mbin => {
+            let keep = process_snp_row(
+                &mut row,
+                &mut site.ref_allele,
+                &mut site.alt_allele,
+                maf,
+                geno,
+                impute,
+                false,
+                het,
+            );
+            if !keep {
+                return None;
+            }
             let mut dom = vec![0u8; row_bytes];
             let mut rec = vec![0u8; row_bytes];
             let mut het_bits = vec![0u8; row_bytes];
@@ -2621,32 +2625,38 @@ struct DosageStage1DualSummary {
 }
 
 #[derive(Clone, Debug)]
-struct GarfieldUnitBitMatrices {
-    train_bits: Vec<u64>,
-    train_bits_hi: Option<Vec<u64>>,
+struct GarfieldUnitBitMatrices<'a> {
+    train_bits: Cow<'a, [u64]>,
+    train_bits_hi: Option<Cow<'a, [u64]>>,
     row_words_train: usize,
-    test_bits: Option<Vec<u64>>,
-    test_bits_hi: Option<Vec<u64>>,
+    test_bits: Option<Cow<'a, [u64]>>,
+    test_bits_hi: Option<Cow<'a, [u64]>>,
     row_words_test: usize,
-    selected_bits_full: Option<Vec<u64>>,
-    selected_bits_full_hi: Option<Vec<u64>>,
+    selected_bits_full: Option<Cow<'a, [u64]>>,
+    selected_bits_full_hi: Option<Cow<'a, [u64]>>,
     selected_bits_full_alias_train: bool,
     selected_bits_full_hi_alias_train: bool,
 }
 
-impl GarfieldUnitBitMatrices {
+impl GarfieldUnitBitMatrices<'_> {
+    #[inline]
+    fn train_bits(&self) -> &[u64] {
+        self.train_bits.as_ref()
+    }
+
+    #[inline]
+    fn train_bits_hi(&self) -> Option<&[u64]> {
+        self.train_bits_hi.as_deref()
+    }
+
     #[inline]
     fn test_bits(&self) -> &[u64] {
-        self.test_bits
-            .as_deref()
-            .unwrap_or(self.train_bits.as_slice())
+        self.test_bits.as_deref().unwrap_or(self.train_bits())
     }
 
     #[inline]
     fn test_bits_hi(&self) -> Option<&[u64]> {
-        self.test_bits_hi
-            .as_deref()
-            .or(self.train_bits_hi.as_deref())
+        self.test_bits_hi.as_deref().or(self.train_bits_hi())
     }
 
     #[inline]
@@ -2658,7 +2668,7 @@ impl GarfieldUnitBitMatrices {
     fn selected_bits_full(&self) -> Option<&[u64]> {
         self.selected_bits_full.as_deref().or_else(|| {
             if self.selected_bits_full_alias_train {
-                Some(self.train_bits.as_slice())
+                Some(self.train_bits())
             } else {
                 None
             }
@@ -2669,7 +2679,7 @@ impl GarfieldUnitBitMatrices {
     fn selected_bits_full_hi(&self) -> Option<&[u64]> {
         self.selected_bits_full_hi.as_deref().or_else(|| {
             if self.selected_bits_full_hi_alias_train {
-                self.train_bits_hi.as_deref()
+                self.train_bits_hi()
             } else {
                 None
             }
@@ -2679,14 +2689,14 @@ impl GarfieldUnitBitMatrices {
 
 fn beam_search_train_test_continuous_dispatch(
     y_train: &[f64],
-    prepared_bits: &GarfieldUnitBitMatrices,
+    prepared_bits: &GarfieldUnitBitMatrices<'_>,
     n_rows: usize,
     y_test: &[f64],
     group_ids: &[usize],
     params: BeamSearchParams,
     literal_scores: Option<&[LiteralSingletonScore]>,
 ) -> Result<Vec<BeamRuleCandidate>, String> {
-    if let Some(train_hi) = prepared_bits.train_bits_hi.as_deref() {
+    if let Some(train_hi) = prepared_bits.train_bits_hi() {
         let test_hi = prepared_bits.test_bits_hi().ok_or_else(|| {
             "internal error: fuzzy GARFIELD prepared bits are missing test high bitplane"
                 .to_string()
@@ -2694,7 +2704,7 @@ fn beam_search_train_test_continuous_dispatch(
         if let Some(scores) = literal_scores {
             beam_search_train_test_continuous_fuzzy_with_literal_scores(
                 y_train,
-                prepared_bits.train_bits.as_slice(),
+                prepared_bits.train_bits(),
                 train_hi,
                 prepared_bits.row_words_train,
                 n_rows,
@@ -2711,7 +2721,7 @@ fn beam_search_train_test_continuous_dispatch(
         } else {
             beam_search_train_test_continuous_fuzzy(
                 y_train,
-                prepared_bits.train_bits.as_slice(),
+                prepared_bits.train_bits(),
                 train_hi,
                 prepared_bits.row_words_train,
                 n_rows,
@@ -2726,28 +2736,36 @@ fn beam_search_train_test_continuous_dispatch(
             )
         }
     } else {
-        // Legacy packed-0/1 continuous beam path intentionally disabled.
-        // Kept in comments so the old routing is still easy to recover if
-        // backward-compatibility work is ever needed again.
-        //
-        // beam_search_train_test_continuous(
-        //     y_train,
-        //     prepared_bits.train_bits.as_slice(),
-        //     prepared_bits.row_words_train,
-        //     n_rows,
-        //     y_train.len(),
-        //     y_test,
-        //     prepared_bits.test_bits(),
-        //     prepared_bits.row_words_test,
-        //     y_test.len(),
-        //     group_ids,
-        //     params,
-        // )
-        let _ = (y_train, n_rows, y_test, group_ids, params);
-        Err(
-            "legacy packed-0/1 GARFIELD continuous path is disabled; active search requires fuzzy 0/1/2 dosage bits"
-                .to_string(),
-        )
+        if let Some(scores) = literal_scores {
+            beam_search_train_test_continuous_with_literal_scores(
+                y_train,
+                prepared_bits.train_bits(),
+                prepared_bits.row_words_train,
+                n_rows,
+                y_train.len(),
+                y_test,
+                prepared_bits.test_bits(),
+                prepared_bits.row_words_test,
+                y_test.len(),
+                group_ids,
+                params,
+                scores,
+            )
+        } else {
+            beam_search_train_test_continuous(
+                y_train,
+                prepared_bits.train_bits(),
+                prepared_bits.row_words_train,
+                n_rows,
+                y_train.len(),
+                y_test,
+                prepared_bits.test_bits(),
+                prepared_bits.row_words_test,
+                y_test.len(),
+                group_ids,
+                params,
+            )
+        }
     }
 }
 
@@ -2870,59 +2888,92 @@ fn garfield_sites_have_distinct_snp_names(sites: &[SiteInfo]) -> bool {
     true
 }
 
-fn materialize_prepared_bit_matrices(
+fn materialize_prepared_bit_matrices<'a>(
     prepared: &GarfieldUnitPrepared,
-    logic_bits: &GarfieldLogicBits,
+    logic_bits: &'a GarfieldLogicBits,
     train_idx_local: &[usize],
     test_idx_local: &[usize],
     include_full_bits: bool,
-) -> Result<GarfieldUnitBitMatrices, String> {
+) -> Result<GarfieldUnitBitMatrices<'a>, String> {
     let t0 = Instant::now();
     let contiguous = selected_rows_contiguous_range(prepared.selected_global_rows.as_slice());
     let train_is_full_sample =
         sample_indices_are_full_identity(train_idx_local, logic_bits.n_samples);
     let (train_bits, row_words_train) = if let Some((row_start, row_end)) = contiguous {
-        packed_rows_subset_from_full_bits_range(
-            logic_bits.bits_flat.as_slice(),
-            logic_bits.row_words,
-            row_start,
-            row_end,
-            train_idx_local,
-            logic_bits.sites.len(),
-            logic_bits.n_samples,
-        )?
-    } else {
-        packed_rows_subset_from_full_bits(
-            logic_bits.bits_flat.as_slice(),
-            logic_bits.row_words,
-            prepared.selected_global_rows.as_slice(),
-            train_idx_local,
-            logic_bits.sites.len(),
-            logic_bits.n_samples,
-        )?
-    };
-    let train_bits_hi = if let Some(bits_hi_flat) = logic_bits.bits_hi_flat.as_ref() {
-        Some(if let Some((row_start, row_end)) = contiguous {
-            packed_rows_subset_from_full_bits_range(
-                bits_hi_flat.as_slice(),
+        if train_is_full_sample {
+            (
+                Cow::Borrowed(borrow_rows_from_full_bits_range(
+                    logic_bits.bits_flat.as_slice(),
+                    logic_bits.row_words,
+                    row_start,
+                    row_end,
+                    logic_bits.sites.len(),
+                    logic_bits.n_samples,
+                    "garfield::train_bits_borrowed_range",
+                )?),
+                logic_bits.row_words,
+            )
+        } else {
+            let (bits, row_words_train) = packed_rows_subset_from_full_bits_range(
+                logic_bits.bits_flat.as_slice(),
                 logic_bits.row_words,
                 row_start,
                 row_end,
                 train_idx_local,
                 logic_bits.sites.len(),
                 logic_bits.n_samples,
-            )?
-            .0
+            )?;
+            (Cow::Owned(bits), row_words_train)
+        }
+    } else {
+        let (bits, row_words_train) = packed_rows_subset_from_full_bits(
+            logic_bits.bits_flat.as_slice(),
+            logic_bits.row_words,
+            prepared.selected_global_rows.as_slice(),
+            train_idx_local,
+            logic_bits.sites.len(),
+            logic_bits.n_samples,
+        )?;
+        (Cow::Owned(bits), row_words_train)
+    };
+    let train_bits_hi = if let Some(bits_hi_flat) = logic_bits.bits_hi_flat.as_ref() {
+        Some(if let Some((row_start, row_end)) = contiguous {
+            if train_is_full_sample {
+                Cow::Borrowed(borrow_rows_from_full_bits_range(
+                    bits_hi_flat.as_slice(),
+                    logic_bits.row_words,
+                    row_start,
+                    row_end,
+                    logic_bits.sites.len(),
+                    logic_bits.n_samples,
+                    "garfield::train_bits_hi_borrowed_range",
+                )?)
+            } else {
+                Cow::Owned(
+                    packed_rows_subset_from_full_bits_range(
+                        bits_hi_flat.as_slice(),
+                        logic_bits.row_words,
+                        row_start,
+                        row_end,
+                        train_idx_local,
+                        logic_bits.sites.len(),
+                        logic_bits.n_samples,
+                    )?
+                    .0,
+                )
+            }
         } else {
-            packed_rows_subset_from_full_bits(
-                bits_hi_flat.as_slice(),
-                logic_bits.row_words,
-                prepared.selected_global_rows.as_slice(),
-                train_idx_local,
-                logic_bits.sites.len(),
-                logic_bits.n_samples,
-            )?
-            .0
+            Cow::Owned(
+                packed_rows_subset_from_full_bits(
+                    bits_hi_flat.as_slice(),
+                    logic_bits.row_words,
+                    prepared.selected_global_rows.as_slice(),
+                    train_idx_local,
+                    logic_bits.sites.len(),
+                    logic_bits.n_samples,
+                )?
+                .0,
+            )
         })
     } else {
         None
@@ -2930,16 +2981,31 @@ fn materialize_prepared_bit_matrices(
     let (test_bits, row_words_test) = if train_idx_local == test_idx_local {
         (None, row_words_train)
     } else if let Some((row_start, row_end)) = contiguous {
-        let (bits, row_words_test) = packed_rows_subset_from_full_bits_range(
-            logic_bits.bits_flat.as_slice(),
-            logic_bits.row_words,
-            row_start,
-            row_end,
-            test_idx_local,
-            logic_bits.sites.len(),
-            logic_bits.n_samples,
-        )?;
-        (Some(bits), row_words_test)
+        if sample_indices_are_full_identity(test_idx_local, logic_bits.n_samples) {
+            (
+                Some(Cow::Borrowed(borrow_rows_from_full_bits_range(
+                    logic_bits.bits_flat.as_slice(),
+                    logic_bits.row_words,
+                    row_start,
+                    row_end,
+                    logic_bits.sites.len(),
+                    logic_bits.n_samples,
+                    "garfield::test_bits_borrowed_range",
+                )?)),
+                logic_bits.row_words,
+            )
+        } else {
+            let (bits, row_words_test) = packed_rows_subset_from_full_bits_range(
+                logic_bits.bits_flat.as_slice(),
+                logic_bits.row_words,
+                row_start,
+                row_end,
+                test_idx_local,
+                logic_bits.sites.len(),
+                logic_bits.n_samples,
+            )?;
+            (Some(Cow::Owned(bits)), row_words_test)
+        }
     } else {
         let (bits, row_words_test) = packed_rows_subset_from_full_bits(
             logic_bits.bits_flat.as_slice(),
@@ -2949,32 +3015,48 @@ fn materialize_prepared_bit_matrices(
             logic_bits.sites.len(),
             logic_bits.n_samples,
         )?;
-        (Some(bits), row_words_test)
+        (Some(Cow::Owned(bits)), row_words_test)
     };
     let test_bits_hi = if let Some(bits_hi_flat) = logic_bits.bits_hi_flat.as_ref() {
         if train_idx_local == test_idx_local {
             None
         } else if let Some((row_start, row_end)) = contiguous {
-            let (bits, _) = packed_rows_subset_from_full_bits_range(
-                bits_hi_flat.as_slice(),
-                logic_bits.row_words,
-                row_start,
-                row_end,
-                test_idx_local,
-                logic_bits.sites.len(),
-                logic_bits.n_samples,
-            )?;
-            Some(bits)
+            if sample_indices_are_full_identity(test_idx_local, logic_bits.n_samples) {
+                Some(Cow::Borrowed(borrow_rows_from_full_bits_range(
+                    bits_hi_flat.as_slice(),
+                    logic_bits.row_words,
+                    row_start,
+                    row_end,
+                    logic_bits.sites.len(),
+                    logic_bits.n_samples,
+                    "garfield::test_bits_hi_borrowed_range",
+                )?))
+            } else {
+                Some(Cow::Owned(
+                    packed_rows_subset_from_full_bits_range(
+                        bits_hi_flat.as_slice(),
+                        logic_bits.row_words,
+                        row_start,
+                        row_end,
+                        test_idx_local,
+                        logic_bits.sites.len(),
+                        logic_bits.n_samples,
+                    )?
+                    .0,
+                ))
+            }
         } else {
-            let (bits, _) = packed_rows_subset_from_full_bits(
-                bits_hi_flat.as_slice(),
-                logic_bits.row_words,
-                prepared.selected_global_rows.as_slice(),
-                test_idx_local,
-                logic_bits.sites.len(),
-                logic_bits.n_samples,
-            )?;
-            Some(bits)
+            Some(Cow::Owned(
+                packed_rows_subset_from_full_bits(
+                    bits_hi_flat.as_slice(),
+                    logic_bits.row_words,
+                    prepared.selected_global_rows.as_slice(),
+                    test_idx_local,
+                    logic_bits.sites.len(),
+                    logic_bits.n_samples,
+                )?
+                .0,
+            ))
         }
     } else {
         None
@@ -2983,20 +3065,22 @@ fn materialize_prepared_bit_matrices(
         include_full_bits && train_is_full_sample && row_words_train == logic_bits.row_words;
     let selected_bits_full = if include_full_bits && !alias_full_to_train {
         Some(if let Some((row_start, row_end)) = contiguous {
-            gather_rows_by_range(
+            Cow::Borrowed(borrow_rows_from_full_bits_range(
                 logic_bits.bits_flat.as_slice(),
                 logic_bits.row_words,
                 row_start,
                 row_end,
-                "garfield::unit_bits_range",
-            )?
+                logic_bits.sites.len(),
+                logic_bits.n_samples,
+                "garfield::unit_bits_borrowed_range",
+            )?)
         } else {
-            gather_rows_by_indices(
+            Cow::Owned(gather_rows_by_indices(
                 logic_bits.bits_flat.as_slice(),
                 logic_bits.row_words,
                 prepared.selected_global_rows.as_slice(),
                 "garfield::unit_bits_indices",
-            )?
+            )?)
         })
     } else {
         None
@@ -3004,20 +3088,22 @@ fn materialize_prepared_bit_matrices(
     let selected_bits_full_hi = if include_full_bits && !alias_full_to_train {
         if let Some(bits_hi_flat) = logic_bits.bits_hi_flat.as_ref() {
             Some(if let Some((row_start, row_end)) = contiguous {
-                gather_rows_by_range(
+                Cow::Borrowed(borrow_rows_from_full_bits_range(
                     bits_hi_flat.as_slice(),
                     logic_bits.row_words,
                     row_start,
                     row_end,
-                    "garfield::unit_bits_hi_range",
-                )?
+                    logic_bits.sites.len(),
+                    logic_bits.n_samples,
+                    "garfield::unit_bits_hi_borrowed_range",
+                )?)
             } else {
-                gather_rows_by_indices(
+                Cow::Owned(gather_rows_by_indices(
                     bits_hi_flat.as_slice(),
                     logic_bits.row_words,
                     prepared.selected_global_rows.as_slice(),
                     "garfield::unit_bits_hi_indices",
-                )?
+                )?)
             })
         } else {
             None
@@ -3177,6 +3263,11 @@ struct GarfieldLogicPipelineResult {
     timing_scan_beam_wall_s: f64,
     timing_scan_literal_score_wall_s: f64,
     timing_scan_ml_select_wall_s: f64,
+    timing_corr_stage1_summary_s: f64,
+    timing_corr_stage1_score_s: f64,
+    timing_corr_stage1_pool_s: f64,
+    timing_corr_stage1_pool_priority_s: f64,
+    timing_corr_stage1_pool_ld_s: f64,
     timing_scan_beam_calls: usize,
     timing_clone_bits_s: f64,
     timing_sum_y_both1_s: f64,
@@ -4308,7 +4399,10 @@ fn simbench_rule_name<S: GarfieldChromPosSite + GarfieldDisplaySite>(
     let mut out = literal_target_name(first, negated.get(first_idx).copied().unwrap_or(false));
     for (idx, site) in it {
         if let Some(op) = simbench_logic_binary_op(logic, idx - 1) {
-            out.push_str(logic_symbol_for_display(op, GarfieldRuleDisplayPolarity::Original));
+            out.push_str(logic_symbol_for_display(
+                op,
+                GarfieldRuleDisplayPolarity::Original,
+            ));
         }
         out.push_str(&literal_target_name(
             site,
@@ -4354,7 +4448,10 @@ fn simbench_rule_expr<S: GarfieldDisplaySite>(
         for (idx, site) in it.enumerate() {
             out.push(' ');
             if let Some(op) = simbench_logic_binary_op(logic, idx) {
-                out.push_str(expr_symbol_for_display(op, GarfieldRuleDisplayPolarity::Original));
+                out.push_str(expr_symbol_for_display(
+                    op,
+                    GarfieldRuleDisplayPolarity::Original,
+                ));
             }
             out.push(' ');
             out.push_str(&literal_expr(
@@ -4984,6 +5081,7 @@ fn build_simbench_ml_contexts(
             train_idx_local,
             test_idx_local,
             y_train,
+            None,
             beam_params.clone(),
         )?
         else {
@@ -5184,7 +5282,7 @@ fn build_simbench_delta_score_annotation<S: GarfieldDisplaySite>(
             row_words_test,
             n_rows,
             n_test,
-                params,
+            params,
         )?;
         let op = display_ops
             .get(idx - 1)
@@ -5513,8 +5611,11 @@ fn evaluate_simbench_terms(
                 term.term_id
             )
         })?;
-        let sim_expr_txt =
-            simbench_rule_expr(term.logic, effective_negated.as_slice(), bench_sites.as_slice())?;
+        let sim_expr_txt = simbench_rule_expr(
+            term.logic,
+            effective_negated.as_slice(),
+            bench_sites.as_slice(),
+        )?;
         let test_bucket = bucket_from_rule_with_complexity(
             &rule,
             assoc_sc.dosage_maf,
@@ -6501,7 +6602,10 @@ fn fill_bin_logic_row_bits_pure_line(
     }
 }
 
+// Retained only for backward-compatible debugging of old fuzzy 0/1/2 BIN
+// artifacts. The active BIN runtime now uses `fill_bin_logic_row_bits`.
 #[inline]
+#[allow(dead_code)]
 fn fill_bin_logic_row_bits_fuzzy(
     row: &[u8],
     flip: bool,
@@ -6650,28 +6754,18 @@ fn convert_prepared_bed_to_logic_bits(
     let out_sites = build_logic_sites_from_metadata(sites, row_flip, mode);
     let n_rows = out_sites.len();
     let mut bits_flat = vec![0u64; n_rows.saturating_mul(row_words)];
-    let mut bits_hi_flat = match mode {
-        GarfieldBinMode::Bin => Some(vec![0u64; n_rows.saturating_mul(row_words)]),
-        GarfieldBinMode::Mbin => None,
-    };
-    match bits_hi_flat.as_mut() {
-        Some(bits_hi) => {
+    let bits_hi_flat = None;
+    match mode {
+        GarfieldBinMode::Bin => {
             bits_flat
                 .par_chunks_mut(row_words)
-                .zip(bits_hi.par_chunks_mut(row_words))
                 .zip(row_flip.par_iter().copied())
                 .zip(packed.par_chunks(bytes_per_snp))
-                .for_each(|(((dst_rows, dst_hi_rows), flip), row)| {
-                    fill_bin_logic_row_bits_fuzzy(
-                        row,
-                        flip,
-                        sample_plan.as_slice(),
-                        dst_rows,
-                        dst_hi_rows,
-                    )
+                .for_each(|((dst_rows, flip), row)| {
+                    fill_bin_logic_row_bits(row, flip, sample_plan.as_slice(), dst_rows)
                 });
         }
-        None => {
+        GarfieldBinMode::Mbin => {
             bits_flat
                 .par_chunks_mut(row_mul * row_words)
                 .zip(row_flip.par_iter().copied())
@@ -6752,10 +6846,7 @@ fn convert_bed_prefix_to_logic_bits(
     drop(sites);
     let n_rows = out_sites.len();
     let mut bits_flat = vec![0u64; n_rows.saturating_mul(row_words)];
-    let mut bits_hi_flat = match mode {
-        GarfieldBinMode::Bin => Some(vec![0u64; n_rows.saturating_mul(row_words)]),
-        GarfieldBinMode::Mbin => None,
-    };
+    let bits_hi_flat = None;
     if let Some(tracker) = mem_tracker {
         tracker.sample_now();
     }
@@ -6815,28 +6906,18 @@ fn convert_bed_prefix_to_logic_bits(
         let bed_ref: &BedSnpIter = &bed_iter;
         let dst_lo =
             &mut bits_flat[kept_start * row_mul * row_words..kept_end * row_mul * row_words];
-        let dst_hi_opt = bits_hi_flat
-            .as_mut()
-            .map(|v| &mut v[kept_start * row_mul * row_words..kept_end * row_mul * row_words]);
-        if let Some(dst_hi) = dst_hi_opt {
+        if matches!(mode, GarfieldBinMode::Bin) {
             dst_lo
-                .par_chunks_mut(row_mul * row_words)
-                .zip(dst_hi.par_chunks_mut(row_words))
+                .par_chunks_mut(row_words)
                 .enumerate()
-                .for_each(|(off, (dst_rows, dst_hi_rows))| {
+                .for_each(|(off, dst_rows)| {
                     let kept_idx = kept_start + off;
                     let src_row = row_source_indices[kept_idx];
                     let flip = row_flip[kept_idx];
                     let row = bed_ref
                         .packed_snp_bytes_at(src_row)
                         .expect("windowed BED logic conversion row should be mapped");
-                    fill_bin_logic_row_bits_fuzzy(
-                        row,
-                        flip,
-                        sample_plan.as_slice(),
-                        dst_rows,
-                        dst_hi_rows,
-                    );
+                    fill_bin_logic_row_bits(row, flip, sample_plan.as_slice(), dst_rows);
                 });
         } else {
             dst_lo
@@ -7127,6 +7208,7 @@ fn dosage_stage1_dual_summaries_from_full_bits(
     y: &[f64],
     n_rows_all: usize,
     n_samples_all: usize,
+    y_lookup: Option<&PackedYSumLookup>,
     allow_parallel: bool,
 ) -> Result<Vec<DosageStage1DualSummary>, String> {
     if row_words != words_for_samples(n_samples_all) {
@@ -7174,8 +7256,11 @@ fn dosage_stage1_dual_summaries_from_full_bits(
                     let row_ge2 = bits_hi_flat
                         .map(|bits| &bits[row_idx * row_words..(row_idx + 1) * row_words])
                         .unwrap_or_else(|| zero_hi.as_deref().expect("zero hi row must exist"));
-                    let (n_ge1, n_ge2, sum_ge1, sum_ge2) =
-                        dual_packed_summary(row_ge1, row_ge2, y, n_samples_all);
+                    let (n_ge1, n_ge2, sum_ge1, sum_ge2) = if let Some(lookup) = y_lookup {
+                        dual_packed_summary_with_lookup(row_ge1, row_ge2, y, n_samples_all, lookup)
+                    } else {
+                        dual_packed_summary(row_ge1, row_ge2, y, n_samples_all)
+                    };
                     DosageStage1DualSummary {
                         n_ge1,
                         n_ge2,
@@ -7192,8 +7277,11 @@ fn dosage_stage1_dual_summaries_from_full_bits(
                     let row_ge2 = bits_hi_flat
                         .map(|bits| &bits[row_idx * row_words..(row_idx + 1) * row_words])
                         .unwrap_or_else(|| zero_hi.as_deref().expect("zero hi row must exist"));
-                    let (n_ge1, n_ge2, sum_ge1, sum_ge2) =
-                        dual_packed_summary(row_ge1, row_ge2, y, n_samples_all);
+                    let (n_ge1, n_ge2, sum_ge1, sum_ge2) = if let Some(lookup) = y_lookup {
+                        dual_packed_summary_with_lookup(row_ge1, row_ge2, y, n_samples_all, lookup)
+                    } else {
+                        dual_packed_summary(row_ge1, row_ge2, y, n_samples_all)
+                    };
                     DosageStage1DualSummary {
                         n_ge1,
                         n_ge2,
@@ -7253,6 +7341,7 @@ fn dosage_stage1_dual_summaries_from_full_bits_range(
         y,
         n_rows_all,
         n_samples_all,
+        None,
         true,
     )
 }
@@ -7288,6 +7377,7 @@ fn build_cached_literal_scores_from_selected_dual_summaries(
     summaries: &[DosageStage1DualSummary],
     total_sum_y: f64,
     n_samples: usize,
+    single_plane_binary: bool,
 ) -> Result<Vec<LiteralSingletonScore>, String> {
     let summary_index = candidate_global_rows
         .iter()
@@ -7304,8 +7394,30 @@ fn build_cached_literal_scores_from_selected_dual_summaries(
             )
         })?;
         let summary = summaries[src_idx];
-        let pos = dosage_stage1_positive_score_from_summary(summary, total_sum_y, n_samples);
-        let neg = dosage_stage1_negated_score_from_summary(summary, total_sum_y, n_samples);
+        let (pos, neg) = if single_plane_binary {
+            // Single-plane BIN rows encode only one homozygote class. Their raw
+            // centered-gain score is identical to the dual-summary route when
+            // n_ge2==0, but dosage_maf must remain the binary minor-class
+            // frequency instead of being halved as if the row were 0/1 dosage.
+            let pos = score::score_cont_centered_gain_from_sum_and_n_hit(
+                total_sum_y,
+                summary.sum_ge1,
+                n_samples,
+                summary.n_ge1,
+            );
+            let neg = score::score_cont_centered_gain_from_sum_and_n_hit(
+                total_sum_y,
+                total_sum_y - summary.sum_ge1,
+                n_samples,
+                n_samples.saturating_sub(summary.n_ge1),
+            );
+            (pos, neg)
+        } else {
+            (
+                dosage_stage1_positive_score_from_summary(summary, total_sum_y, n_samples),
+                dosage_stage1_negated_score_from_summary(summary, total_sum_y, n_samples),
+            )
+        };
         out.push(LiteralSingletonScore {
             train: pos,
             test: pos,
@@ -7803,6 +7915,39 @@ fn packed_rows_subset_from_full_bits_range(
     Ok((out, row_words_sub))
 }
 
+fn borrow_rows_from_full_bits_range<'a>(
+    bits_flat: &'a [u64],
+    row_words_full: usize,
+    row_start: usize,
+    row_end: usize,
+    n_rows_all: usize,
+    n_samples_all: usize,
+    ctx: &str,
+) -> Result<&'a [u64], String> {
+    if row_end <= row_start {
+        return Ok(&bits_flat[0..0]);
+    }
+    if row_end > n_rows_all {
+        return Err(format!(
+            "{ctx}: row range out of bounds: [{row_start}, {row_end}) vs n_rows={n_rows_all}"
+        ));
+    }
+    if row_words_full != words_for_samples(n_samples_all) {
+        return Err(format!(
+            "{ctx}: row_words mismatch for full bit matrix: got {row_words_full}, expected {}",
+            words_for_samples(n_samples_all)
+        ));
+    }
+    if bits_flat.len() != n_rows_all.saturating_mul(row_words_full) {
+        return Err(format!("{ctx}: full bit matrix length mismatch"));
+    }
+    let start = row_start.saturating_mul(row_words_full);
+    let end = row_end.saturating_mul(row_words_full);
+    bits_flat
+        .get(start..end)
+        .ok_or_else(|| format!("{ctx}: bit slice range out of bounds"))
+}
+
 fn packed_rows_subset_from_full_bits(
     bits_flat: &[u64],
     row_words_full: usize,
@@ -8297,7 +8442,9 @@ fn select_single_window_candidate_pool_rows(
     }
     let target_k = target_k.max(1).min(candidate_global_rows.len());
     if candidate_global_rows.len() <= target_k {
+        let rank_t0 = garfield_stage_profile_start();
         let priority = geneset_priority_order_from_scores(scores);
+        garfield_stage_profile_end(rank_t0, &GARFIELD_CORR_STAGE1_POOL_PRIORITY_NS);
         return prune_candidate_rows_by_ld_priority(
             candidate_global_rows,
             priority.as_slice(),
@@ -8313,10 +8460,20 @@ fn select_single_window_candidate_pool_rows(
     }
     let mut prescreen_k = corr_candidate_pool_prescreen_k(candidate_global_rows.len(), target_k);
     loop {
+        let rank_t0 = garfield_stage_profile_start();
         let priority_local = topk_indices(scores, prescreen_k);
+        garfield_stage_profile_end(rank_t0, &GARFIELD_CORR_STAGE1_POOL_PRIORITY_NS);
+        // Only the score-prioritized prescreen rows can be retained by this
+        // pass. Packing the rest of the window would add LD work without
+        // changing the greedy result.
+        let prescreen_global_rows = priority_local
+            .iter()
+            .filter_map(|&local_idx| candidate_global_rows.get(local_idx).copied())
+            .collect::<Vec<_>>();
+        let prescreen_priority_local = (0..prescreen_global_rows.len()).collect::<Vec<_>>();
         let mut pruned = prune_candidate_rows_by_ld_priority(
-            candidate_global_rows,
-            priority_local.as_slice(),
+            prescreen_global_rows.as_slice(),
+            prescreen_priority_local.as_slice(),
             logic_bits,
             sample_indices,
         )?;
@@ -8584,6 +8741,7 @@ fn select_logic_unit_global_rows(
     logic_bits: &GarfieldLogicBits,
     train_idx_local: &[usize],
     y_train: &[f64],
+    stage1_y_lookup: Option<&PackedYSumLookup>,
     allow_parallel: bool,
 ) -> Result<Option<GarfieldSelectedRows>, String> {
     check_ctrlc()?;
@@ -8683,6 +8841,7 @@ fn select_logic_unit_global_rows(
             let t0 = Instant::now();
             let corr_allow_parallel =
                 geneset_corr_stage1_allow_parallel(unit_kind_lc, n_region, allow_parallel);
+            let summary_t0 = garfield_stage_profile_start();
             let summaries = dosage_stage1_dual_summaries_from_full_bits(
                 logic_bits.bits_flat.as_slice(),
                 logic_bits.bits_hi_flat.as_deref(),
@@ -8692,15 +8851,20 @@ fn select_logic_unit_global_rows(
                 y_train,
                 logic_bits.sites.len(),
                 logic_bits.n_samples,
+                stage1_y_lookup,
                 corr_allow_parallel,
             )?;
+            garfield_stage_profile_end(summary_t0, &GARFIELD_CORR_STAGE1_SUMMARY_NS);
             let total_sum_y = y_train.iter().copied().sum::<f64>();
+            let score_t0 = garfield_stage_profile_start();
             let scores = dosage_stage1_raw_scores_from_dual_summaries(
                 summaries.as_slice(),
                 total_sum_y,
                 y_train.len(),
                 corr_allow_parallel,
             );
+            garfield_stage_profile_end(score_t0, &GARFIELD_CORR_STAGE1_SCORE_NS);
+            let pool_t0 = garfield_stage_profile_start();
             if unit_kind_lc == "geneset" && unit.spans.len() > 1 {
                 let selected = select_geneset_window_candidate_pool_rows(
                     unit,
@@ -8711,6 +8875,7 @@ fn select_logic_unit_global_rows(
                     train_idx_local,
                     true,
                 )?;
+                garfield_stage_profile_end(pool_t0, &GARFIELD_CORR_STAGE1_POOL_NS);
                 GARFIELD_ML_SELECT_NS.fetch_add(
                     t0.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                     Ordering::Relaxed,
@@ -8726,6 +8891,7 @@ fn select_logic_unit_global_rows(
                             summaries.as_slice(),
                             total_sum_y,
                             y_train.len(),
+                            logic_bits.bits_hi_flat.is_none(),
                         )?,
                     ),
                     selected_global_rows: selected,
@@ -8817,6 +8983,7 @@ fn select_logic_unit_global_rows(
                     train_idx_local,
                 )?
             };
+            garfield_stage_profile_end(pool_t0, &GARFIELD_CORR_STAGE1_POOL_NS);
             GARFIELD_ML_SELECT_NS.fetch_add(
                 t0.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                 Ordering::Relaxed,
@@ -8832,6 +8999,7 @@ fn select_logic_unit_global_rows(
                         summaries.as_slice(),
                         total_sum_y,
                         y_train.len(),
+                        logic_bits.bits_hi_flat.is_none(),
                     )?,
                 ),
                 selected_global_rows,
@@ -8930,6 +9098,7 @@ fn prepare_logic_unit_continuous(
     train_idx_local: &[usize],
     _test_idx_local: &[usize],
     y_train: &[f64],
+    stage1_y_lookup: Option<&PackedYSumLookup>,
     beam_params: BeamSearchParams,
 ) -> Result<Option<GarfieldUnitPrepared>, String> {
     check_ctrlc()?;
@@ -8946,6 +9115,7 @@ fn prepare_logic_unit_continuous(
         logic_bits,
         train_idx_local,
         y_train,
+        stage1_y_lookup,
         beam_params.allow_parallel,
     )?
     else {
@@ -9201,7 +9371,7 @@ fn prepare_logic_chunk_continuous(
 
 fn collect_rule_permutation_nulls_for_repeat(
     prepared: &GarfieldUnitPrepared,
-    prepared_bits: &GarfieldUnitBitMatrices,
+    prepared_bits: &GarfieldUnitBitMatrices<'_>,
     y_train: &[f64],
     y_test: &[f64],
     split_applied: bool,
@@ -9408,7 +9578,7 @@ fn symmetric_kl_len_probs(a: &[f64; 6], b: &[f64; 6]) -> f64 {
 
 fn collect_rule_structure_posterior_for_repeat(
     prepared: &GarfieldUnitPrepared,
-    prepared_bits: &GarfieldUnitBitMatrices,
+    prepared_bits: &GarfieldUnitBitMatrices<'_>,
     y_train: &[f64],
     y_test: &[f64],
     split_applied: bool,
@@ -9426,7 +9596,7 @@ fn collect_rule_structure_posterior_for_repeat(
     let boot_train_bits = {
         let row_indices = (0..prepared.selected_global_rows.len()).collect::<Vec<_>>();
         let (bits, _) = packed_rows_subset_from_full_bits(
-            prepared_bits.train_bits.as_slice(),
+            prepared_bits.train_bits(),
             prepared_bits.row_words_train,
             row_indices.as_slice(),
             boot_train_idx.as_slice(),
@@ -9435,7 +9605,7 @@ fn collect_rule_structure_posterior_for_repeat(
         )?;
         bits
     };
-    let boot_train_bits_hi = if let Some(train_bits_hi) = prepared_bits.train_bits_hi.as_deref() {
+    let boot_train_bits_hi = if let Some(train_bits_hi) = prepared_bits.train_bits_hi() {
         let row_indices = (0..prepared.selected_global_rows.len()).collect::<Vec<_>>();
         let (bits, _) = packed_rows_subset_from_full_bits(
             train_bits_hi,
@@ -9511,12 +9681,19 @@ fn collect_rule_structure_posterior_for_repeat(
             beam_params,
         )?
     } else {
-        // Legacy packed-0/1 null-search path intentionally disabled together
-        // with the corresponding main search path.
-        return Err(
-            "legacy packed-0/1 GARFIELD continuous null path is disabled; active search requires fuzzy 0/1/2 dosage bits"
-                .to_string(),
-        );
+        beam_search_train_test_continuous(
+            boot_y_train.as_slice(),
+            boot_train_bits.as_slice(),
+            boot_row_words_train,
+            prepared.selected_global_rows.len(),
+            boot_y_train.len(),
+            boot_y_test.as_slice(),
+            boot_test_bits.as_slice(),
+            boot_row_words_test,
+            boot_y_test.len(),
+            prepared.local_groups.as_slice(),
+            beam_params,
+        )?
     };
 
     if perm_hits.is_empty() {
@@ -9682,7 +9859,7 @@ fn evaluate_logic_unit_prepared_continuous(
     ui: usize,
     unit: &GarfieldLogicUnit,
     prepared: &GarfieldUnitPrepared,
-    prepared_bits: &GarfieldUnitBitMatrices,
+    prepared_bits: &GarfieldUnitBitMatrices<'_>,
     logic_bits: &GarfieldLogicBits,
     test_idx_local: &[usize],
     y_train: &[f64],
@@ -9723,17 +9900,15 @@ fn evaluate_logic_unit_prepared_continuous(
             literal_scores,
         )?
     } else {
-        // Legacy packed-0/1 continuous beam paths intentionally disabled:
-        //
-        // if let Some(scores) = literal_scores {
-        //     beam_search_train_test_continuous_with_literal_scores(...)
-        // } else {
-        //     beam_search_train_test_continuous(...)
-        // }
-        return Err(
-            "legacy packed-0/1 GARFIELD continuous path is disabled; active search requires fuzzy 0/1/2 dosage bits"
-                .to_string(),
-        );
+        beam_search_train_test_continuous_dispatch(
+            y_train,
+            prepared_bits,
+            prepared.selected_global_rows.len(),
+            y_test,
+            prepared.local_groups.as_slice(),
+            beam_params_search.clone(),
+            literal_scores,
+        )?
     };
     if env_truthy("JX_GARFIELD_LAYER_DEBUG") {
         eprintln!(
@@ -9861,14 +10036,14 @@ fn evaluate_logic_unit_prepared_continuous(
 #[allow(dead_code)]
 fn precompute_literal_singleton_scores_for_unit(
     prepared: &GarfieldUnitPrepared,
-    prepared_bits: &GarfieldUnitBitMatrices,
+    prepared_bits: &GarfieldUnitBitMatrices<'_>,
     y_train: &[f64],
     y_test: &[f64],
 ) -> Result<Vec<LiteralSingletonScore>, String> {
     // Legacy packed-0/1 singleton precompute helper retained only so the
     // disabled non-fuzzy route can be resurrected or inspected if needed.
     let requests = [LiteralScoreBatchRequest {
-        bits_train: prepared_bits.train_bits.as_slice(),
+        bits_train: prepared_bits.train_bits(),
         row_words_train: prepared_bits.row_words_train,
         bits_test: prepared_bits.test_bits(),
         row_words_test: prepared_bits.row_words_test,
@@ -9927,6 +10102,7 @@ fn evaluate_logic_unit_continuous(
         train_idx_local,
         test_idx_local,
         y_train,
+        None,
         beam_params.clone(),
     )?
     else {
@@ -9973,6 +10149,7 @@ fn process_scan_unit_continuous(
     train_idx_local: &[usize],
     test_idx_local: &[usize],
     y_train: &[f64],
+    stage1_y_lookup: Option<&PackedYSumLookup>,
     y_test: &[f64],
     beam_params: BeamSearchParams,
     output_null_penalties: Option<Arc<RuleNullPenaltyLookup>>,
@@ -10014,6 +10191,7 @@ fn process_scan_unit_continuous(
         train_idx_local,
         test_idx_local,
         y_train,
+        stage1_y_lookup,
         beam_params.clone(),
     )? {
         if let Some(t0) = unit_t0 {
@@ -11192,7 +11370,7 @@ fn garfield_logic_search_bed_owned(
         )?;
         (
             meta.row_source_indices,
-            None,
+            Some(meta.row_flip),
             Vec::new(),
             meta.n_samples,
             meta.bytes_per_snp,
@@ -11483,11 +11661,8 @@ fn garfield_logic_search_bed_owned(
         GarfieldBinMode::Bin => 1usize,
         GarfieldBinMode::Mbin => 3usize,
     };
-    let mut logic_row_flip = if using_external_grm {
-        logic_row_flip_external
-            .as_ref()
-            .ok_or_else(|| "internal error: logic row_flip missing for BED conversion".to_string())?
-            .clone()
+    let mut logic_row_flip = if let Some(prepared_row_flip) = logic_row_flip_external.as_ref() {
+        prepared_row_flip.clone()
     } else if grouped_active_mode {
         Vec::new()
     } else {
@@ -11543,24 +11718,7 @@ fn garfield_logic_search_bed_owned(
         )?;
         logic_row_source_indices = active_meta.row_source_indices;
         logic_sites = active_meta.sites;
-        let active_row_meta = compute_bed_row_meta_owned_for_source_rows(
-            &prefix,
-            logic_row_source_indices.as_slice(),
-            Some(selected_sample_indices.as_slice()),
-        )?;
-        if active_row_meta.n_samples != n_samples_total {
-            return Err(format!(
-                "internal error: active row-meta sample count {} != expected {}",
-                active_row_meta.n_samples, n_samples_total
-            ));
-        }
-        if active_row_meta.bytes_per_snp != bytes_per_snp {
-            return Err(format!(
-                "internal error: active row-meta bytes_per_snp {} != expected {}",
-                active_row_meta.bytes_per_snp, bytes_per_snp
-            ));
-        }
-        logic_row_flip = active_row_meta.row_flip;
+        logic_row_flip = active_meta.row_flip;
     }
     let (null_chunks, mut null_chunk_valid_total) = if rule_permutation && !grouped_null_mode {
         sample_null_chunks_stratified(
@@ -11652,6 +11810,7 @@ fn garfield_logic_search_bed_owned(
         rank_mode,
         null_penalties: None,
         structure_prior: None,
+        y_sum_lookup: None,
         disable_parent_delta: false,
         null_complexity_bin: 0,
         group_constraint: BeamGroupConstraintMode::AlwaysExclude,
@@ -11769,6 +11928,7 @@ fn garfield_logic_search_bed_owned(
                                 train_idx_local.as_slice(),
                                 test_idx_local.as_slice(),
                                 train_fit.residualized_y.as_slice(),
+                                None,
                                 prep_beam_params.clone(),
                             );
                             let done = prep_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
@@ -11818,6 +11978,7 @@ fn garfield_logic_search_bed_owned(
                         train_idx_local.as_slice(),
                         test_idx_local.as_slice(),
                         train_fit.residualized_y.as_slice(),
+                        None,
                         prep_beam_params.clone(),
                     );
                     let done = prep_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
@@ -12011,6 +12172,7 @@ fn garfield_logic_search_bed_owned(
                             train_idx_local.as_slice(),
                             test_idx_local.as_slice(),
                             train_fit.residualized_y.as_slice(),
+                            None,
                             prep_beam_params.clone(),
                         );
                         let done = prep_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
@@ -12055,6 +12217,7 @@ fn garfield_logic_search_bed_owned(
                     train_idx_local.as_slice(),
                     test_idx_local.as_slice(),
                     train_fit.residualized_y.as_slice(),
+                    None,
                     prep_beam_params.clone(),
                 );
                 let done = prep_progress_done.fetch_add(1, Ordering::Relaxed) + 1;
@@ -12569,15 +12732,20 @@ fn garfield_logic_search_bed_owned(
         )
     };
     let unit_parallel_threads = threads_eff.max(1);
+    let scan_mem_tracker = GarfieldStageMemoryTracker::new(rss_debug_enabled);
+    let scan_mem_start = scan_mem_tracker.start_stage();
+    let scan_stage1_y_lookup = Arc::new(PackedYSumLookup::build(
+        train_fit.residualized_y.as_slice(),
+        train_idx_local.len(),
+    )?);
     let scan_beam_params = BeamSearchParams {
         // Keep nested parallelism enabled during scan. Rayon will reuse the same
         // pool and lets a few heavy tail units fan out when outer unit-level
         // parallelism no longer saturates all workers.
         allow_parallel: true,
+        y_sum_lookup: Some(scan_stage1_y_lookup.clone()),
         ..beam_params.clone()
     };
-    let scan_mem_tracker = GarfieldStageMemoryTracker::new(rss_debug_enabled);
-    let scan_mem_start = scan_mem_tracker.start_stage();
     let skipped_units = Arc::new(Mutex::new(Vec::<GarfieldSkippedUnitInfo>::new()));
     let unit_results = if unit_parallel_threads > 1 {
         let pool = ThreadPoolBuilder::new()
@@ -12603,6 +12771,7 @@ fn garfield_logic_search_bed_owned(
                         train_idx_local.as_slice(),
                         test_idx_local.as_slice(),
                         train_fit.residualized_y.as_slice(),
+                        Some(scan_stage1_y_lookup.as_ref()),
                         test_fit.residualized_y.as_slice(),
                         scan_beam_params.clone(),
                         rule_output_null_lookup.clone(),
@@ -12639,6 +12808,7 @@ fn garfield_logic_search_bed_owned(
                 train_idx_local.as_slice(),
                 test_idx_local.as_slice(),
                 train_fit.residualized_y.as_slice(),
+                Some(scan_stage1_y_lookup.as_ref()),
                 test_fit.residualized_y.as_slice(),
                 scan_beam_params.clone(),
                 rule_output_null_lookup.clone(),
@@ -12681,6 +12851,16 @@ fn garfield_logic_search_bed_owned(
     let ld_unit_stats = garfield_geneset_ld_unit_stats_snapshot();
     let timing_scan_ml_select_wall_s =
         (GARFIELD_ML_SELECT_NS.load(Ordering::Relaxed) as f64) * 1e-9;
+    let timing_corr_stage1_summary_s =
+        (GARFIELD_CORR_STAGE1_SUMMARY_NS.load(Ordering::Relaxed) as f64) * 1e-9;
+    let timing_corr_stage1_score_s =
+        (GARFIELD_CORR_STAGE1_SCORE_NS.load(Ordering::Relaxed) as f64) * 1e-9;
+    let timing_corr_stage1_pool_s =
+        (GARFIELD_CORR_STAGE1_POOL_NS.load(Ordering::Relaxed) as f64) * 1e-9;
+    let timing_corr_stage1_pool_priority_s =
+        (GARFIELD_CORR_STAGE1_POOL_PRIORITY_NS.load(Ordering::Relaxed) as f64) * 1e-9;
+    let timing_corr_stage1_pool_ld_s =
+        (GARFIELD_CORR_STAGE1_POOL_LD_NS.load(Ordering::Relaxed) as f64) * 1e-9;
     let scan_beam_profile = snapshot_garfield_beam_profile();
     let (pw_marg, pw_pack, pw_kern, pw_comb) = snapshot_pairwise_profile();
 
@@ -12816,6 +12996,11 @@ fn garfield_logic_search_bed_owned(
         timing_scan_ml_select_wall_s,
         timing_scan_beam_wall_s,
         timing_scan_literal_score_wall_s,
+        timing_corr_stage1_summary_s,
+        timing_corr_stage1_score_s,
+        timing_corr_stage1_pool_s,
+        timing_corr_stage1_pool_priority_s,
+        timing_corr_stage1_pool_ld_s,
         timing_scan_beam_calls: scan_beam_profile.calls,
         timing_clone_bits_s: scan_beam_profile.clone_bits_s,
         timing_sum_y_both1_s: scan_beam_profile.sum_y_both1_s,
@@ -13324,6 +13509,26 @@ pub fn garfield_logic_search_bed_py<'py>(
     out.set_item(
         "timing_scan_ml_select_wall_s",
         result.timing_scan_ml_select_wall_s,
+    )?;
+    out.set_item(
+        "timing_corr_stage1_summary_s",
+        result.timing_corr_stage1_summary_s,
+    )?;
+    out.set_item(
+        "timing_corr_stage1_score_s",
+        result.timing_corr_stage1_score_s,
+    )?;
+    out.set_item(
+        "timing_corr_stage1_pool_s",
+        result.timing_corr_stage1_pool_s,
+    )?;
+    out.set_item(
+        "timing_corr_stage1_pool_priority_s",
+        result.timing_corr_stage1_pool_priority_s,
+    )?;
+    out.set_item(
+        "timing_corr_stage1_pool_ld_s",
+        result.timing_corr_stage1_pool_ld_s,
     )?;
     out.set_item("timing_scan_beam_wall_s", result.timing_scan_beam_wall_s)?;
     out.set_item(
@@ -14313,6 +14518,85 @@ mod tests {
         }
         let group_ids = (0..n_rows).map(|i| i % 96).collect::<Vec<_>>();
         (bits_flat, row_words, group_ids)
+    }
+
+    fn build_test_logic_bits(n_rows: usize, n_samples: usize) -> GarfieldLogicBits {
+        let (bits_flat, row_words, group_ids) = build_test_bits(n_rows, n_samples);
+        GarfieldLogicBits {
+            bits_flat,
+            bits_hi_flat: None,
+            row_words,
+            sample_ids: (0..n_samples).map(|i| format!("s{i}")).collect(),
+            sites: (0..n_rows)
+                .map(|i| GarfieldLogicSite {
+                    chrom: Arc::<str>::from("1"),
+                    pos: i as i32 + 1,
+                    snp: Arc::<str>::from(format!("snp{i}")),
+                    ref_allele: Arc::<str>::from("A"),
+                    alt_allele: Arc::<str>::from("T"),
+                    mode: GarfieldLogicSiteMode::Bin,
+                })
+                .collect(),
+            group_ids,
+            n_samples,
+        }
+    }
+
+    #[test]
+    fn test_materialize_prepared_bit_matrices_borrows_train_bits_for_full_identity_range() {
+        let logic_bits = build_test_logic_bits(6, 130);
+        let prepared = GarfieldUnitPrepared {
+            selected_global_rows: vec![1, 2, 3],
+            local_groups: vec![0, 1, 2],
+            geneset_stage_group_target: None,
+            null_unit_group_bin: 0,
+            train_literal_scores: None,
+        };
+        let train_idx_local = (0..logic_bits.n_samples).collect::<Vec<_>>();
+        let prepared_bits = materialize_prepared_bit_matrices(
+            &prepared,
+            &logic_bits,
+            train_idx_local.as_slice(),
+            train_idx_local.as_slice(),
+            true,
+        )
+        .unwrap();
+        assert!(matches!(prepared_bits.train_bits, Cow::Borrowed(_)));
+        assert!(prepared_bits.test_bits.is_none());
+        assert!(prepared_bits.selected_bits_full_alias_train);
+        let expected =
+            &logic_bits.bits_flat[logic_bits.row_words..logic_bits.row_words.saturating_mul(4)];
+        assert_eq!(prepared_bits.train_bits(), expected);
+        assert_eq!(prepared_bits.selected_bits_full().unwrap(), expected);
+    }
+
+    #[test]
+    fn test_materialize_prepared_bit_matrices_keeps_full_bits_borrowed_for_subset_samples() {
+        let logic_bits = build_test_logic_bits(6, 130);
+        let prepared = GarfieldUnitPrepared {
+            selected_global_rows: vec![2, 3, 4],
+            local_groups: vec![0, 1, 2],
+            geneset_stage_group_target: None,
+            null_unit_group_bin: 0,
+            train_literal_scores: None,
+        };
+        let train_idx_local = (0..96).collect::<Vec<_>>();
+        let prepared_bits = materialize_prepared_bit_matrices(
+            &prepared,
+            &logic_bits,
+            train_idx_local.as_slice(),
+            train_idx_local.as_slice(),
+            true,
+        )
+        .unwrap();
+        assert!(matches!(prepared_bits.train_bits, Cow::Owned(_)));
+        assert!(matches!(
+            prepared_bits.selected_bits_full,
+            Some(Cow::Borrowed(_))
+        ));
+        let expected = &logic_bits.bits_flat
+            [logic_bits.row_words.saturating_mul(2)..logic_bits.row_words.saturating_mul(5)];
+        assert_eq!(prepared_bits.selected_bits_full().unwrap(), expected);
     }
 
     fn pack_test_binary_rows(rows: &[Vec<u8>]) -> (Vec<u64>, usize) {
@@ -16011,6 +16295,7 @@ mod tests {
             &logic_bits,
             &[0, 1, 2, 3],
             &[0.1, 0.2, 0.3, 0.4],
+            None,
             false,
         )
         .unwrap()
@@ -16212,6 +16497,46 @@ mod tests {
             format_simbench_ml_rank(&[false, true, false], &ranks),
             "2&!5&."
         );
+    }
+
+    #[test]
+    fn test_cached_bin_singletons_keep_binary_maf_semantics() {
+        let candidate_global_rows = vec![11usize];
+        let selected_global_rows = vec![11usize];
+        let summaries = vec![DosageStage1DualSummary {
+            n_ge1: 8usize,
+            n_ge2: 0usize,
+            sum_ge1: 4.0_f64,
+            sum_ge2: 0.0_f64,
+        }];
+
+        let binary = build_cached_literal_scores_from_selected_dual_summaries(
+            candidate_global_rows.as_slice(),
+            selected_global_rows.as_slice(),
+            summaries.as_slice(),
+            10.0_f64,
+            10usize,
+            true,
+        )
+        .unwrap();
+        let dual = build_cached_literal_scores_from_selected_dual_summaries(
+            candidate_global_rows.as_slice(),
+            selected_global_rows.as_slice(),
+            summaries.as_slice(),
+            10.0_f64,
+            10usize,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(binary.len(), 2);
+        assert_eq!(dual.len(), 2);
+        assert!((binary[0].train.raw_score - dual[0].train.raw_score).abs() < 1e-12);
+        assert!((binary[1].train.raw_score - dual[1].train.raw_score).abs() < 1e-12);
+        assert!((binary[0].train.dosage_maf - 0.2_f64).abs() < 1e-12);
+        assert!((binary[1].train.dosage_maf - 0.2_f64).abs() < 1e-12);
+        assert!((dual[0].train.dosage_maf - 0.4_f64).abs() < 1e-12);
+        assert!((dual[1].train.dosage_maf - 0.4_f64).abs() < 1e-12);
     }
 
     #[test]

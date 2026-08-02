@@ -1654,32 +1654,25 @@ fn pure_line_filter_status_from_counts(
     hom_alt: usize,
     maf_threshold: f32,
     max_missing_rate: f32,
-    het_threshold: f32,
+    _het_threshold: f32,
 ) -> (u8, f32, f32) {
+    let logic_missing = raw_missing.saturating_add(het).min(n_samples);
     let missing_rate = if n_samples > 0 {
-        (raw_missing as f32) / (n_samples as f32)
+        (logic_missing as f32) / (n_samples as f32)
     } else {
         0.0_f32
     };
-    let non_missing = n_samples.saturating_sub(raw_missing.min(n_samples));
-    let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
-    let alt_freq = if non_missing > 0 {
-        (alt_sum as f32) / (2.0_f32 * non_missing as f32)
+    let usable_homo = n_samples.saturating_sub(logic_missing);
+    let alt_freq = if usable_homo > 0 {
+        (hom_alt as f32) / (usable_homo as f32)
     } else {
         0.0_f32
     };
     let maf = alt_freq.min(1.0_f32 - alt_freq).max(0.0_f32);
-    let het_rate = if non_missing > 0 {
-        (het as f32) / (non_missing as f32)
-    } else {
-        0.0_f32
-    };
     let mut status = if missing_rate > max_missing_rate {
         PURE_LINE_FILTER_FAIL_MISSING
-    } else if non_missing == 0 {
+    } else if usable_homo == 0 {
         PURE_LINE_FILTER_FAIL_NO_NON_MISSING
-    } else if het_rate > het_threshold {
-        PURE_LINE_FILTER_FAIL_HET
     } else if maf < maf_threshold {
         PURE_LINE_FILTER_FAIL_MAF
     } else {
@@ -1722,15 +1715,14 @@ fn format_zero_sites_pure_line_error(
     };
     let mut message = format!(
         "No SNPs left after pure-line BED filtering for {sample_scope} across {n_snps} sites. \
-Pure-line GARFIELD counts only true NA as missing and applies heterozygosity separately. \
+Pure-line GARFIELD treats heterozygotes as logic-missing, so -geno/--geno controls NA+Het together. \
 Primary fail counts: missing_rate>{max_missing_rate}={fail_missing}, \
-het_rate>{het_threshold}={fail_het}, zero_non_missing_calls={fail_no_non_missing}, \
-maf<{maf_threshold}={fail_maf}{snp_filter_note}. \
-Sites with >=1 heterozygote in the selected samples: {het_sites}; sites with PLINK missing calls: \
-{raw_missing_sites}. This usually means the selected samples do not satisfy GARFIELD's pure-line \
-assumption or the filters are too strict."
+zero_homozygous_calls={fail_no_non_missing}, maf<{maf_threshold}={fail_maf}{snp_filter_note}. \
+Legacy het-only rejects at threshold {het_threshold}: {fail_het}. Sites with >=1 heterozygote in the \
+selected samples: {het_sites}; sites with PLINK missing calls: {raw_missing_sites}. This usually \
+means the selected samples do not satisfy GARFIELD's pure-line assumption or the filters are too strict."
     );
-    message.push_str(" Try relaxing -geno/--geno, -het/--het, or -maf/--maf.");
+    message.push_str(" Try relaxing -geno/--geno or -maf/--maf.");
     if snps_only {
         message.push_str(" If appropriate, also disable SNP-only filtering.");
     }
@@ -6152,10 +6144,10 @@ pub(crate) fn load_bed_2bit_packed_subset_owned_for_stats_samples_pure_line(
             .zip(std_keep.par_iter_mut())
             .zip(row_flip_keep.par_iter_mut())
             .for_each(|((((row, miss_v), maf_v), std_v), row_flip_v)| {
-                let (missing, het, hom_alt) = if stats_identity {
-                    count_packed_row_counts(row, n_samples)
+                let (logic_missing, hom_alt) = if stats_identity {
+                    count_packed_row_pure_line_counts(row, n_samples)
                 } else {
-                    count_packed_row_counts_selected_with_excluded(
+                    count_packed_row_pure_line_counts_selected_with_excluded(
                         row,
                         n_samples,
                         stats_sample_indices,
@@ -6163,19 +6155,18 @@ pub(crate) fn load_bed_2bit_packed_subset_owned_for_stats_samples_pure_line(
                     )
                 };
                 let miss = if stats_n_samples > 0 {
-                    (missing as f32) / (stats_n_samples as f32)
+                    (logic_missing.min(stats_n_samples) as f32) / (stats_n_samples as f32)
                 } else {
                     0.0_f32
                 };
-                let non_missing = stats_n_samples.saturating_sub(missing.min(stats_n_samples));
-                let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
-                let af = if non_missing > 0 {
-                    (alt_sum as f32) / (2.0_f32 * non_missing as f32)
+                let usable_homo =
+                    stats_n_samples.saturating_sub(logic_missing.min(stats_n_samples));
+                let af = if usable_homo > 0 {
+                    (hom_alt as f32) / (usable_homo as f32)
                 } else {
                     0.0_f32
                 };
-                let maf = af.min(1.0_f32 - af).max(0.0_f32);
-                let std = (2.0_f32 * maf * (1.0_f32 - maf)).sqrt();
+                let std = (af * (1.0_f32 - af)).max(0.0_f32).sqrt();
                 *miss_v = miss;
                 *maf_v = af.clamp(0.0, 1.0);
                 *std_v = std;
@@ -6212,10 +6203,10 @@ pub(crate) fn load_bed_2bit_packed_subset_owned_for_stats_samples_pure_line(
                 let row = &packed_src[src_off..src_off + bytes_per_snp];
                 dst_row.copy_from_slice(row);
 
-                let (missing, het, hom_alt) = if stats_identity {
-                    count_packed_row_counts(row, n_samples)
+                let (logic_missing, hom_alt) = if stats_identity {
+                    count_packed_row_pure_line_counts(row, n_samples)
                 } else {
-                    count_packed_row_counts_selected_with_excluded(
+                    count_packed_row_pure_line_counts_selected_with_excluded(
                         row,
                         n_samples,
                         stats_sample_indices,
@@ -6223,19 +6214,18 @@ pub(crate) fn load_bed_2bit_packed_subset_owned_for_stats_samples_pure_line(
                     )
                 };
                 let miss = if stats_n_samples > 0 {
-                    (missing as f32) / (stats_n_samples as f32)
+                    (logic_missing.min(stats_n_samples) as f32) / (stats_n_samples as f32)
                 } else {
                     0.0_f32
                 };
-                let non_missing = stats_n_samples.saturating_sub(missing.min(stats_n_samples));
-                let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
-                let af = if non_missing > 0 {
-                    (alt_sum as f32) / (2.0_f32 * non_missing as f32)
+                let usable_homo =
+                    stats_n_samples.saturating_sub(logic_missing.min(stats_n_samples));
+                let af = if usable_homo > 0 {
+                    (hom_alt as f32) / (usable_homo as f32)
                 } else {
                     0.0_f32
                 };
-                let maf = af.min(1.0_f32 - af).max(0.0_f32);
-                let std = (2.0_f32 * maf * (1.0_f32 - maf)).sqrt();
+                let std = (af * (1.0_f32 - af)).max(0.0_f32).sqrt();
                 *miss_v = miss;
                 *maf_v = af.clamp(0.0, 1.0);
                 *std_v = std;
@@ -8468,7 +8458,7 @@ mod tests {
         count_packed_row_pure_line_counts_selected_with_excluded,
         evaluate_packed_row_keep_and_flip, format_zero_sites_pure_line_error,
         precompute_excluded_sample_indices, pure_line_filter_status_from_counts,
-        pure_line_filter_status_reason, PURE_LINE_FILTER_FAIL_HET, PURE_LINE_FILTER_KEEP,
+        pure_line_filter_status_reason, PURE_LINE_FILTER_FAIL_MISSING, PURE_LINE_FILTER_KEEP,
     };
 
     fn pack_plink_codes(codes: &[u8]) -> Vec<u8> {
@@ -8535,33 +8525,32 @@ mod tests {
         let msg = format_zero_sites_pure_line_error(
             240, 1940, 10300, 0.02, 0.05, 0.2, false, 9800, 300, 100, 400, 0, 9900, 50,
         );
-        assert!(msg.contains("counts only true NA as missing"));
-        assert!(msg.contains("het_rate>0.2=300"));
+        assert!(msg.contains("treats heterozygotes as logic-missing"));
+        assert!(msg.contains("Legacy het-only rejects at threshold 0.2: 300"));
         assert!(msg.contains("selected samples"));
         assert!(msg.contains("-geno/--geno"));
-        assert!(msg.contains("-het/--het"));
         assert!(msg.contains("hybrid or outbred"));
     }
 
     #[test]
-    fn pure_line_filter_keeps_het_out_of_missing_rate() {
+    fn pure_line_filter_counts_het_inside_missing_rate() {
         let (status, missing_rate, alt_freq) =
-            pure_line_filter_status_from_counts(10, 1, 4, 2, 0.02, 0.11, 1.0);
+            pure_line_filter_status_from_counts(10, 1, 4, 2, 0.02, 0.60, 1.0);
         assert_eq!(
             pure_line_filter_status_reason(status),
             PURE_LINE_FILTER_KEEP
         );
-        assert!((missing_rate - 0.1).abs() < 1e-6);
-        assert!((alt_freq - (8.0_f32 / 18.0_f32)).abs() < 1e-6);
+        assert!((missing_rate - 0.5).abs() < 1e-6);
+        assert!((alt_freq - 0.4_f32).abs() < 1e-6);
     }
 
     #[test]
-    fn pure_line_filter_can_fail_on_het_rate_independently() {
+    fn pure_line_filter_can_fail_on_combined_missing_rate() {
         let (status, _missing_rate, _alt_freq) =
-            pure_line_filter_status_from_counts(10, 1, 4, 2, 0.02, 0.11, 0.4);
+            pure_line_filter_status_from_counts(10, 1, 4, 2, 0.02, 0.49, 0.4);
         assert_eq!(
             pure_line_filter_status_reason(status),
-            PURE_LINE_FILTER_FAIL_HET
+            PURE_LINE_FILTER_FAIL_MISSING
         );
     }
 

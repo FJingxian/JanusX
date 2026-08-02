@@ -2836,9 +2836,8 @@ def main() -> None:
     if args.feature_source_requested == "mbin":
         logger.warning(
             "MBIN encoding is deprecated for GARFIELD pure-line mode; using BIN instead. "
-            "Current BIN beam search preserves 0/1/2 dosage with fuzzy AND/NOT logic; "
-            "legacy packed-0/1 and OR search paths are disabled; "
-            "only true missing calls are imputed during decoding."
+            "Current BIN beam search uses packed 0/1 homozygote logic (0->0, 2->1, 1/NA->mode). "
+            "Heterozygotes are treated as logic-missing and folded into -geno filtering."
         )
     ml_skipped = args.engine in ml_skip_tokens
     engine_runtime = "none" if ml_skipped else str(args.engine)

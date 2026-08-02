@@ -21,8 +21,8 @@ use super::score::{
     dosage_maf_from_dual_counts, dual_packed_summary, score_cont_centered_gain_dual_from_summary,
     score_cont_centered_gain_dual_packed_with_sum, score_cont_centered_gain_from_sum_and_n_hit,
     score_cont_centered_gain_packed_with_n_hit, score_cont_centered_gain_packed_with_sum,
-    score_cont_corr_packed, sum_y_where_both1, support_size_packed, validate_continuous_y,
-    ContinuousRuleScore,
+    score_cont_corr_packed, sum_y_where_both1, sum_y_where_both1_with_lookup, support_size_packed,
+    validate_continuous_y, ContinuousRuleScore, PackedYSumLookup,
 };
 use super::score_gpu::{
     centered_gain_backend_mode_is_auto, parse_centered_gain_backend_mode_from_env,
@@ -311,6 +311,8 @@ pub struct BeamSearchParams {
     pub rank_mode: BeamRankMode,
     pub null_penalties: Option<Arc<RuleNullPenaltyLookup>>,
     pub structure_prior: Option<Arc<RuleStructurePrior>>,
+    /// Trait-level lookup shared by scan units to accelerate dense support sums.
+    pub y_sum_lookup: Option<Arc<PackedYSumLookup>>,
     pub disable_parent_delta: bool,
     pub null_complexity_bin: u8,
     pub group_constraint: BeamGroupConstraintMode,
@@ -334,12 +336,28 @@ impl Default for BeamSearchParams {
             rank_mode: BeamRankMode::InteractionGain,
             null_penalties: None,
             structure_prior: None,
+            y_sum_lookup: None,
             disable_parent_delta: false,
             null_complexity_bin: 0,
             group_constraint: BeamGroupConstraintMode::AlwaysExclude,
             allow_parallel: true,
             whole_genome_dev_mode: false,
         }
+    }
+}
+
+#[inline]
+fn sum_y_where_both1_for_params(
+    lhs: &[u64],
+    rhs: &[u64],
+    y: &[f64],
+    n_samples: usize,
+    params: &BeamSearchParams,
+) -> f64 {
+    if let Some(lookup) = params.y_sum_lookup.as_deref() {
+        sum_y_where_both1_with_lookup(lhs, rhs, y, n_samples, lookup)
+    } else {
+        sum_y_where_both1(lhs, rhs, y, n_samples)
     }
 }
 
@@ -380,12 +398,6 @@ struct BeamStateLite {
     train_score: f64,
     max_singleton_train_raw: f64,
     max_singleton_test_raw: f64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct BeamSupportSignature {
-    train_bits: Vec<u64>,
-    test_bits: Option<Vec<u64>>,
 }
 
 #[derive(Clone, Debug)]
@@ -524,11 +536,10 @@ enum GarfieldLayerDebugMetric {
 static GARFIELD_LAYER_DEBUG_COUNTS: [AtomicU64;
     GARFIELD_LAYER_DEBUG_MAX_LAYERS
         * GARFIELD_LAYER_DEBUG_FAMILY_COUNT
-        * GARFIELD_LAYER_DEBUG_METRIC_COUNT] =
-    [const { AtomicU64::new(0) };
-        GARFIELD_LAYER_DEBUG_MAX_LAYERS
-            * GARFIELD_LAYER_DEBUG_FAMILY_COUNT
-            * GARFIELD_LAYER_DEBUG_METRIC_COUNT];
+        * GARFIELD_LAYER_DEBUG_METRIC_COUNT] = [const { AtomicU64::new(0) };
+    GARFIELD_LAYER_DEBUG_MAX_LAYERS
+        * GARFIELD_LAYER_DEBUG_FAMILY_COUNT
+        * GARFIELD_LAYER_DEBUG_METRIC_COUNT];
 
 #[derive(Clone, Debug)]
 pub struct BeamAndResult {
@@ -1835,12 +1846,21 @@ fn keep_rule_after_dosage_maf_pruning(sc: &ContinuousRuleScore, params: &BeamSea
     sc.dosage_maf >= params.maf_threshold
 }
 
+#[inline]
+fn keep_initial_literal_after_seed_pruning(sc: &ContinuousRuleScore) -> bool {
+    let n_samples = sc.n_hit.saturating_add(sc.n_miss);
+    if !fuzzy_rule_has_dosage_variation(sc.n_hit, sc.n_ge2, n_samples) {
+        return false;
+    }
+    sc.dosage_maf.is_finite()
+}
+
 #[derive(Clone, Debug, Default)]
 struct FuzzyInitialLiteralStats {
     n_rows: usize,
     n_literals: usize,
     n_variable: usize,
-    n_pass_lmaf: usize,
+    n_pass_seed_basic: usize,
     n_pass_gain: usize,
     max_dosage_maf: Option<f64>,
 }
@@ -1849,7 +1869,7 @@ struct FuzzyInitialLiteralStats {
 fn update_fuzzy_initial_literal_stats(
     stats: &mut FuzzyInitialLiteralStats,
     sc: &ContinuousRuleScore,
-    pass_lmaf: bool,
+    pass_seed_basic: bool,
     pass_gain: bool,
 ) {
     stats.n_literals = stats.n_literals.saturating_add(1);
@@ -1865,8 +1885,8 @@ fn update_fuzzy_initial_literal_stats(
                 .unwrap_or(sc.dosage_maf),
         );
     }
-    if pass_lmaf {
-        stats.n_pass_lmaf = stats.n_pass_lmaf.saturating_add(1);
+    if pass_seed_basic {
+        stats.n_pass_seed_basic = stats.n_pass_seed_basic.saturating_add(1);
     }
     if pass_gain {
         stats.n_pass_gain = stats.n_pass_gain.saturating_add(1);
@@ -1884,11 +1904,11 @@ fn format_no_valid_initial_literals_fuzzy(
         .map(|v| format!("{v:.4}"))
         .unwrap_or_else(|| "NA".to_string());
     format!(
-        "{ctx}: no valid initial literals (rows={}, literals={}, variable={}, pass_lmaf={}, pass_gain={}, lmaf={:.4}, max_singleton_dosage_maf={})",
+        "{ctx}: no valid initial literals (rows={}, literals={}, variable={}, pass_seed_basic={}, pass_gain={}, combo_lmaf={:.4}, max_singleton_dosage_maf={})",
         stats.n_rows,
         stats.n_literals,
         stats.n_variable,
-        stats.n_pass_lmaf,
+        stats.n_pass_seed_basic,
         stats.n_pass_gain,
         params.maf_threshold,
         max_dosage_maf_txt
@@ -2558,7 +2578,36 @@ fn materialize_beam_state_lite(
 ) -> Result<BeamState, String> {
     let combined_train =
         materialize_rule_bits(&cand.rule, bits_train, row_words_train, n_rows, n_train)?;
-    Ok(BeamState {
+    Ok(beam_state_from_lite_and_bits(combined_train, cand))
+}
+
+#[inline]
+fn beam_state_into_lite_and_bits(state: BeamState) -> (Vec<u64>, BeamStateLite) {
+    let BeamState {
+        rule,
+        combined_train,
+        train,
+        train_abs_score,
+        train_score,
+        max_singleton_train_raw,
+        max_singleton_test_raw,
+    } = state;
+    (
+        combined_train,
+        BeamStateLite {
+            rule,
+            train,
+            train_abs_score,
+            train_score,
+            max_singleton_train_raw,
+            max_singleton_test_raw,
+        },
+    )
+}
+
+#[inline]
+fn beam_state_from_lite_and_bits(combined_train: Vec<u64>, cand: BeamStateLite) -> BeamState {
+    BeamState {
         rule: cand.rule,
         combined_train,
         train: cand.train,
@@ -2566,7 +2615,7 @@ fn materialize_beam_state_lite(
         train_score: cand.train_score,
         max_singleton_train_raw: cand.max_singleton_train_raw,
         max_singleton_test_raw: cand.max_singleton_test_raw,
-    })
+    }
 }
 
 #[inline]
@@ -3216,7 +3265,7 @@ fn build_initial_beam(
                             None,
                             params,
                         );
-                        if !keep_rule_after_dosage_maf_pruning(&train, params) {
+                        if !keep_initial_literal_after_seed_pruning(&train) {
                             continue;
                         }
                         if !keep_state_after_min_gain_pruning(rule.len(), train_score, params) {
@@ -3269,7 +3318,7 @@ fn build_initial_beam(
                 let train = single.train;
                 let (train_abs_score, train_score) =
                     train_scores_for_rule(&rule, train, train.raw_score, None, None, params);
-                if !keep_rule_after_dosage_maf_pruning(&train, params) {
+                if !keep_initial_literal_after_seed_pruning(&train) {
                     continue;
                 }
                 if !keep_state_after_min_gain_pruning(rule.len(), train_score, params) {
@@ -3353,7 +3402,7 @@ fn build_initial_states_exhaustive(
                             None,
                             params,
                         );
-                        if !keep_rule_after_dosage_maf_pruning(&train, params) {
+                        if !keep_initial_literal_after_seed_pruning(&train) {
                             continue;
                         }
                         local.push(BeamState {
@@ -3397,7 +3446,7 @@ fn build_initial_states_exhaustive(
                 let train = single.train;
                 let (train_abs_score, train_score) =
                     train_scores_for_rule(&rule, train, train.raw_score, None, None, params);
-                if !keep_rule_after_dosage_maf_pruning(&train, params) {
+                if !keep_initial_literal_after_seed_pruning(&train) {
                     continue;
                 }
                 seq.push(BeamState {
@@ -3451,7 +3500,7 @@ fn whole_genome_layer2_parent_variants(
     let train = single.train;
     let (train_abs_score, train_score) =
         train_scores_for_rule(&rule, train, train.raw_score, None, None, params);
-    if keep_rule_after_dosage_maf_pruning(&train, params)
+    if keep_initial_literal_after_seed_pruning(&train)
         && keep_state_after_min_gain_pruning(rule.len(), train_score, params)
     {
         out.push(BeamState {
@@ -3692,9 +3741,7 @@ fn expand_beam_once_whole_genome_target_parallel(
     let base_rule_raws = Arc::new(collect_known_rule_raw_scores(parents));
     let total_expand = parents
         .iter()
-        .map(|parent| {
-            n_rows.saturating_mul(beam_child_branch_count_for_rule(&parent.rule))
-        })
+        .map(|parent| n_rows.saturating_mul(beam_child_branch_count_for_rule(&parent.rule)))
         .sum::<usize>();
     let next = if should_parallel(total_expand, params.allow_parallel) {
         let work = whole_genome_target_work_ranges(n_rows);
@@ -4132,23 +4179,24 @@ fn dedup_states_by_rule_key(states: Vec<BeamState>) -> Vec<BeamState> {
 }
 
 fn dedup_states_by_train_bits(states: Vec<BeamState>) -> Vec<BeamState> {
-    let mut best = HashMap::<Vec<u64>, BeamState>::with_capacity(states.len());
+    let mut best = HashMap::<Vec<u64>, BeamStateLite>::with_capacity(states.len());
     for state in states.into_iter() {
-        let t_clone = beam_detail_profile_start();
-        let key = state.combined_train.clone();
-        beam_detail_profile_end(t_clone, &GARFIELD_PROFILE_CLONE_BITS_NS);
-        match best.entry(key) {
+        let (train_bits, state) = beam_state_into_lite_and_bits(state);
+        match best.entry(train_bits) {
             std::collections::hash_map::Entry::Vacant(slot) => {
                 slot.insert(state);
             }
             std::collections::hash_map::Entry::Occupied(mut slot) => {
-                if cmp_state(&state, slot.get()) == std::cmp::Ordering::Less {
+                if cmp_state_lite(&state, slot.get()) == std::cmp::Ordering::Less {
                     slot.insert(state);
                 }
             }
         }
     }
-    let mut out = best.into_values().collect::<Vec<_>>();
+    let mut out = best
+        .into_iter()
+        .map(|(train_bits, state)| beam_state_from_lite_and_bits(train_bits, state))
+        .collect::<Vec<_>>();
     out.sort_by(cmp_state);
     out
 }
@@ -4165,47 +4213,47 @@ fn dedup_states_by_support_signature(
         return Ok(dedup_states_by_train_bits(states));
     }
 
-    let mut groups = HashMap::<Vec<u64>, Vec<BeamState>>::with_capacity(states.len());
+    let mut groups = HashMap::<Vec<u64>, Vec<BeamStateLite>>::with_capacity(states.len());
     for state in states.into_iter() {
-        let t_clone = beam_detail_profile_start();
-        let train_bits = state.combined_train.clone();
-        beam_detail_profile_end(t_clone, &GARFIELD_PROFILE_CLONE_BITS_NS);
+        let (train_bits, state) = beam_state_into_lite_and_bits(state);
         groups.entry(train_bits).or_default().push(state);
     }
 
-    let mut best = HashMap::<BeamSupportSignature, BeamState>::with_capacity(groups.len());
+    let mut out = Vec::<BeamState>::with_capacity(groups.len());
     for (train_bits, grouped_states) in groups.into_iter() {
         if grouped_states.len() == 1 {
             let state = grouped_states.into_iter().next().unwrap();
-            let key = BeamSupportSignature {
-                train_bits,
-                test_bits: None,
-            };
-            best.insert(key, state);
+            out.push(beam_state_from_lite_and_bits(train_bits, state));
             continue;
         }
+
+        let mut best = HashMap::<Vec<u64>, BeamStateLite>::with_capacity(grouped_states.len());
         for state in grouped_states.into_iter() {
-            let t_clone = beam_detail_profile_start();
             let test_bits =
                 materialize_rule_bits(&state.rule, bits_test, row_words_test, n_rows, n_test)?;
-            let key = BeamSupportSignature {
-                train_bits: train_bits.clone(),
-                test_bits: Some(test_bits),
-            };
-            beam_detail_profile_end(t_clone, &GARFIELD_PROFILE_CLONE_BITS_NS);
-            match best.entry(key) {
+            match best.entry(test_bits) {
                 std::collections::hash_map::Entry::Vacant(slot) => {
                     slot.insert(state);
                 }
                 std::collections::hash_map::Entry::Occupied(mut slot) => {
-                    if cmp_state(&state, slot.get()) == std::cmp::Ordering::Less {
+                    if cmp_state_lite(&state, slot.get()) == std::cmp::Ordering::Less {
                         slot.insert(state);
                     }
                 }
             }
         }
+
+        let retained_len = best.len();
+        let mut owned_train_bits = Some(train_bits);
+        for (idx, (_, state)) in best.into_iter().enumerate() {
+            let combined_train = if idx + 1 == retained_len {
+                owned_train_bits.take().unwrap()
+            } else {
+                owned_train_bits.as_ref().unwrap().clone()
+            };
+            out.push(beam_state_from_lite_and_bits(combined_train, state));
+        }
     }
-    let mut out = best.into_values().collect::<Vec<_>>();
     out.sort_by(cmp_state);
     Ok(out)
 }
@@ -5729,20 +5777,41 @@ fn effective_dual_intersections(
     y_train: &[f64],
     n_train: usize,
     negated: bool,
+    params: &BeamSearchParams,
 ) -> DualEffectiveIntersections {
     let p1_r1_n = and_popcount(parent.combined_train_ge1.as_slice(), row_ge1) as usize;
     let p2_r2_n = and_popcount(parent.combined_train_ge2.as_slice(), row_ge2) as usize;
     let p1_r2_n = and_popcount(parent.combined_train_ge1.as_slice(), row_ge2) as usize;
     let p2_r1_n = and_popcount(parent.combined_train_ge2.as_slice(), row_ge1) as usize;
     let t_sum = beam_detail_profile_start();
-    let p1_r1_sum =
-        sum_y_where_both1(parent.combined_train_ge1.as_slice(), row_ge1, y_train, n_train);
-    let p2_r2_sum =
-        sum_y_where_both1(parent.combined_train_ge2.as_slice(), row_ge2, y_train, n_train);
-    let p1_r2_sum =
-        sum_y_where_both1(parent.combined_train_ge1.as_slice(), row_ge2, y_train, n_train);
-    let p2_r1_sum =
-        sum_y_where_both1(parent.combined_train_ge2.as_slice(), row_ge1, y_train, n_train);
+    let p1_r1_sum = sum_y_where_both1_for_params(
+        parent.combined_train_ge1.as_slice(),
+        row_ge1,
+        y_train,
+        n_train,
+        params,
+    );
+    let p2_r2_sum = sum_y_where_both1_for_params(
+        parent.combined_train_ge2.as_slice(),
+        row_ge2,
+        y_train,
+        n_train,
+        params,
+    );
+    let p1_r2_sum = sum_y_where_both1_for_params(
+        parent.combined_train_ge1.as_slice(),
+        row_ge2,
+        y_train,
+        n_train,
+        params,
+    );
+    let p2_r1_sum = sum_y_where_both1_for_params(
+        parent.combined_train_ge2.as_slice(),
+        row_ge1,
+        y_train,
+        n_train,
+        params,
+    );
     beam_detail_profile_end(t_sum, &GARFIELD_PROFILE_SUM_Y_BOTH1_NS);
     if !negated {
         DualEffectiveIntersections {
@@ -5793,8 +5862,10 @@ fn evaluate_child_train_from_parent_virtual_fuzzy(
                 let drop_n_ge1 = and_popcount(parent_ge1, row_ge2) as usize;
                 let drop_n_ge2 = and_popcount(parent_ge2, row_ge1) as usize;
                 let t_sum = beam_detail_profile_start();
-                let drop_sum_ge1 = sum_y_where_both1(parent_ge1, row_ge2, y_train, n_train);
-                let drop_sum_ge2 = sum_y_where_both1(parent_ge2, row_ge1, y_train, n_train);
+                let drop_sum_ge1 =
+                    sum_y_where_both1_for_params(parent_ge1, row_ge2, y_train, n_train, params);
+                let drop_sum_ge2 =
+                    sum_y_where_both1_for_params(parent_ge2, row_ge1, y_train, n_train, params);
                 beam_detail_profile_end(t_sum, &GARFIELD_PROFILE_SUM_Y_BOTH1_NS);
                 (
                     parent.train.n_hit.saturating_sub(drop_n_ge1),
@@ -5806,8 +5877,10 @@ fn evaluate_child_train_from_parent_virtual_fuzzy(
                 let inter_n_ge1 = and_popcount(parent_ge1, row_ge1) as usize;
                 let inter_n_ge2 = and_popcount(parent_ge2, row_ge2) as usize;
                 let t_sum = beam_detail_profile_start();
-                let inter_sum_ge1 = sum_y_where_both1(parent_ge1, row_ge1, y_train, n_train);
-                let inter_sum_ge2 = sum_y_where_both1(parent_ge2, row_ge2, y_train, n_train);
+                let inter_sum_ge1 =
+                    sum_y_where_both1_for_params(parent_ge1, row_ge1, y_train, n_train, params);
+                let inter_sum_ge2 =
+                    sum_y_where_both1_for_params(parent_ge2, row_ge2, y_train, n_train, params);
                 beam_detail_profile_end(t_sum, &GARFIELD_PROFILE_SUM_Y_BOTH1_NS);
                 (inter_n_ge1, inter_n_ge2, inter_sum_ge1, inter_sum_ge2)
             };
@@ -5836,9 +5909,11 @@ fn evaluate_child_train_from_parent_virtual_fuzzy(
                 let t_sum = beam_detail_profile_start();
                 let value = if negated {
                     parent.train_sum_ge1
-                        - sum_y_where_both1(parent_ge1, row_ge2, y_train, n_train)
+                        - sum_y_where_both1_for_params(
+                            parent_ge1, row_ge2, y_train, n_train, params,
+                        )
                 } else {
-                    sum_y_where_both1(parent_ge1, row_ge1, y_train, n_train)
+                    sum_y_where_both1_for_params(parent_ge1, row_ge1, y_train, n_train, params)
                 };
                 beam_detail_profile_end(t_sum, &GARFIELD_PROFILE_SUM_Y_BOTH1_NS);
                 value
@@ -5847,16 +5922,20 @@ fn evaluate_child_train_from_parent_virtual_fuzzy(
                 let t_sum = beam_detail_profile_start();
                 let value = if negated {
                     parent.train_sum_ge2
-                        - sum_y_where_both1(parent_ge2, row_ge1, y_train, n_train)
+                        - sum_y_where_both1_for_params(
+                            parent_ge2, row_ge1, y_train, n_train, params,
+                        )
                 } else {
-                    sum_y_where_both1(parent_ge2, row_ge2, y_train, n_train)
+                    sum_y_where_both1_for_params(parent_ge2, row_ge2, y_train, n_train, params)
                 };
                 beam_detail_profile_end(t_sum, &GARFIELD_PROFILE_SUM_Y_BOTH1_NS);
                 value
             },
         ),
         BeamBinaryOp::Xor => {
-            let inter = effective_dual_intersections(parent, row_ge1, row_ge2, y_train, n_train, negated);
+            let inter = effective_dual_intersections(
+                parent, row_ge1, row_ge2, y_train, n_train, negated, params,
+            );
             (
                 parent
                     .train
@@ -5868,8 +5947,7 @@ fn evaluate_child_train_from_parent_virtual_fuzzy(
                     .saturating_sub(inter.cross_n_p1_r2)
                     .saturating_add(parent.train_n_ge2.saturating_sub(inter.cross_n_p2_r1)),
                 parent.train_sum_ge1 + row_sum_ge1 - inter.inter_sum_ge1 - inter.inter_sum_ge2,
-                row_sum_ge2 - inter.cross_sum_p1_r2 + parent.train_sum_ge2
-                    - inter.cross_sum_p2_r1,
+                row_sum_ge2 - inter.cross_sum_p1_r2 + parent.train_sum_ge2 - inter.cross_sum_p2_r1,
             )
         }
     };
@@ -6498,11 +6576,11 @@ fn build_initial_fuzzy_beam(
             let train = single.train;
             let (train_abs_score, train_score) =
                 train_scores_for_rule(&rule, train, train.raw_score, None, None, params);
-            let pass_lmaf = keep_rule_after_dosage_maf_pruning(&train, params);
-            let pass_gain =
-                pass_lmaf && keep_state_after_min_gain_pruning(rule.len(), train_score, params);
-            update_fuzzy_initial_literal_stats(&mut diag, &train, pass_lmaf, pass_gain);
-            if !pass_lmaf {
+            let pass_seed_basic = keep_initial_literal_after_seed_pruning(&train);
+            let pass_gain = pass_seed_basic
+                && keep_state_after_min_gain_pruning(rule.len(), train_score, params);
+            update_fuzzy_initial_literal_stats(&mut diag, &train, pass_seed_basic, pass_gain);
+            if !pass_seed_basic {
                 continue;
             }
             garfield_layer_debug_add(
@@ -6553,11 +6631,7 @@ fn build_initial_fuzzy_beam(
         ));
     }
     let out = filter_fuzzy_beam_candidates(seq, layer_cap, params);
-    garfield_layer_debug_record_fuzzy_states(
-        1,
-        GarfieldLayerDebugMetric::Retained,
-        out.as_slice(),
-    );
+    garfield_layer_debug_record_fuzzy_states(1, GarfieldLayerDebugMetric::Retained, out.as_slice());
     Ok(out)
 }
 
@@ -6611,9 +6685,9 @@ fn build_initial_fuzzy_states_exhaustive(
             let train = single.train;
             let (train_abs_score, train_score) =
                 train_scores_for_rule(&rule, train, train.raw_score, None, None, params);
-            let pass_lmaf = keep_rule_after_dosage_maf_pruning(&train, params);
-            update_fuzzy_initial_literal_stats(&mut diag, &train, pass_lmaf, pass_lmaf);
-            if !pass_lmaf {
+            let pass_seed_basic = keep_initial_literal_after_seed_pruning(&train);
+            update_fuzzy_initial_literal_stats(&mut diag, &train, pass_seed_basic, pass_seed_basic);
+            if !pass_seed_basic {
                 continue;
             }
             garfield_layer_debug_add(
@@ -6657,11 +6731,7 @@ fn build_initial_fuzzy_states_exhaustive(
             params,
         ));
     }
-    garfield_layer_debug_record_fuzzy_states(
-        1,
-        GarfieldLayerDebugMetric::Retained,
-        out.as_slice(),
-    );
+    garfield_layer_debug_record_fuzzy_states(1, GarfieldLayerDebugMetric::Retained, out.as_slice());
     Ok(out)
 }
 
@@ -6700,7 +6770,7 @@ fn whole_genome_layer2_parent_variants_fuzzy(
     let train = single.train;
     let (train_abs_score, train_score) =
         train_scores_for_rule(&rule, train, train.raw_score, None, None, params);
-    if keep_rule_after_dosage_maf_pruning(&train, params)
+    if keep_initial_literal_after_seed_pruning(&train)
         && keep_state_after_min_gain_pruning(rule.len(), train_score, params)
     {
         out.push(FuzzyBeamState {
@@ -6984,9 +7054,7 @@ fn expand_fuzzy_beam_once_whole_genome_target_parallel(
     let base_rule_raws = Arc::new(collect_known_rule_raw_scores_fuzzy(parents));
     let total_expand = parents
         .iter()
-        .map(|parent| {
-            n_rows.saturating_mul(beam_child_branch_count_for_rule(&parent.rule))
-        })
+        .map(|parent| n_rows.saturating_mul(beam_child_branch_count_for_rule(&parent.rule)))
         .sum::<usize>();
     let next = if should_parallel(total_expand, params.allow_parallel) {
         let work = whole_genome_target_work_ranges(n_rows);
@@ -8066,6 +8134,7 @@ mod tests {
         assert_eq!(actual.len(), expected.len());
         for (got, want) in actual.iter().zip(expected.iter()) {
             assert_eq!(got.rule.lexical_key(), want.rule.lexical_key());
+            assert_eq!(got.combined_train, want.combined_train);
             assert!((got.train.raw_score - want.train.raw_score).abs() < 1e-12);
             assert!((got.train_abs_score - want.train_abs_score).abs() < 1e-12);
             assert!((got.train_score - want.train_score).abs() < 1e-12);
@@ -8110,7 +8179,69 @@ mod tests {
     }
 
     #[test]
+    fn test_train_bit_dedup_keeps_best_state_without_changing_bits() {
+        init_python_for_tests();
+        let y = vec![0.2, 1.1, -0.4, 0.8];
+        let train_rows = vec![vec![1, 0, 0, 1], vec![1, 0, 0, 1], vec![0, 1, 1, 0]];
+        let (train_bits, row_words_train) = pack_rows(&train_rows, y.len());
+        let literal_scores =
+            literal_scores_for_test(&y, train_bits.as_slice(), row_words_train, train_rows.len());
+        let state_a = beam_state_from_rule_for_test(
+            BeamRule {
+                first: BeamLiteral {
+                    row_index: 0,
+                    group_id: 0,
+                    negated: false,
+                },
+                rest: Vec::new(),
+            },
+            &y,
+            train_bits.as_slice(),
+            row_words_train,
+            train_rows.len(),
+            literal_scores.as_slice(),
+        );
+        let state_b = beam_state_from_rule_for_test(
+            BeamRule {
+                first: BeamLiteral {
+                    row_index: 1,
+                    group_id: 1,
+                    negated: false,
+                },
+                rest: Vec::new(),
+            },
+            &y,
+            train_bits.as_slice(),
+            row_words_train,
+            train_rows.len(),
+            literal_scores.as_slice(),
+        );
+        let state_c = beam_state_from_rule_for_test(
+            BeamRule {
+                first: BeamLiteral {
+                    row_index: 2,
+                    group_id: 2,
+                    negated: false,
+                },
+                rest: Vec::new(),
+            },
+            &y,
+            train_bits.as_slice(),
+            row_words_train,
+            train_rows.len(),
+            literal_scores.as_slice(),
+        );
+
+        let deduped =
+            dedup_states_by_train_bits(vec![state_c.clone(), state_b.clone(), state_a.clone()]);
+        let mut expected = vec![state_a, state_c];
+        expected.sort_by(cmp_state);
+        assert_same_beam_states(deduped.as_slice(), expected.as_slice());
+    }
+
+    #[test]
     fn test_support_signature_dedup_keeps_distinct_test_support() {
+        init_python_for_tests();
         let y = vec![0.2, 1.1, -0.4, 0.8];
         let train_rows = vec![vec![1, 0, 0, 1], vec![1, 0, 0, 1]];
         let test_rows = vec![vec![1, 0, 1, 0], vec![0, 1, 1, 0]];
@@ -8158,7 +8289,9 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(deduped.len(), 2);
+        let mut expected_distinct = vec![state_a.clone(), state_b.clone()];
+        expected_distinct.sort_by(cmp_state);
+        assert_same_beam_states(deduped.as_slice(), expected_distinct.as_slice());
 
         let shared = dedup_states_by_support_signature(
             vec![state_a, state_b],
@@ -8169,8 +8302,22 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(shared.len(), 1);
-        assert_eq!(shared[0].rule.first.row_index, 0);
+        let expected_shared = vec![beam_state_from_rule_for_test(
+            BeamRule {
+                first: BeamLiteral {
+                    row_index: 0,
+                    group_id: 0,
+                    negated: false,
+                },
+                rest: Vec::new(),
+            },
+            &y,
+            train_bits.as_slice(),
+            row_words_train,
+            train_rows.len(),
+            literal_scores.as_slice(),
+        )];
+        assert_same_beam_states(shared.as_slice(), expected_shared.as_slice());
     }
 
     #[test]
@@ -8289,7 +8436,10 @@ mod tests {
         };
         let (xor_ge1, xor_ge2) =
             materialize_rule_bits_dual(&xor_rule, &ge1, &ge2, row_words, rows.len(), 6).unwrap();
-        assert_eq!(unpack_dual_row(&xor_ge1, &xor_ge2, 6), vec![0u8, 2, 1, 1, 1, 0]);
+        assert_eq!(
+            unpack_dual_row(&xor_ge1, &xor_ge2, 6),
+            vec![0u8, 2, 1, 1, 1, 0]
+        );
     }
 
     #[test]
@@ -8329,9 +8479,15 @@ mod tests {
             train_n_ge2,
             train_sum_ge1,
             train_sum_ge2,
-            train_abs_score: literal_scores[literal_score_index(0, false)].train.raw_score,
-            train_score: literal_scores[literal_score_index(0, false)].train.raw_score,
-            max_singleton_train_raw: literal_scores[literal_score_index(0, false)].train.raw_score,
+            train_abs_score: literal_scores[literal_score_index(0, false)]
+                .train
+                .raw_score,
+            train_score: literal_scores[literal_score_index(0, false)]
+                .train
+                .raw_score,
+            max_singleton_train_raw: literal_scores[literal_score_index(0, false)]
+                .train
+                .raw_score,
             max_singleton_test_raw: literal_scores[literal_score_index(0, false)].test.raw_score,
         };
         let row1_ge1 = row_prefix(&ge1, row_words, 1, row_words);
@@ -8374,7 +8530,9 @@ mod tests {
         .unwrap();
         assert_eq!(virtual_train.n_hit, materialized.n_hit);
         assert_eq!(virtual_n_ge2, materialized.n_ge2);
-        assert!((virtual_sum_ge1 - (materialized.mean_hit * materialized.n_hit as f64)).abs() < 1e-12);
+        assert!(
+            (virtual_sum_ge1 - (materialized.mean_hit * materialized.n_hit as f64)).abs() < 1e-12
+        );
         let materialized_sum_ge2 = {
             let (_, ge2_bits) =
                 materialize_rule_bits_dual(&xor_rule, &ge1, &ge2, row_words, n_rows, n).unwrap();
@@ -8406,7 +8564,10 @@ mod tests {
             },
             rest: Vec::new(),
         };
-        assert_eq!(beam_binary_ops_for_rule(&neg_singleton), &[BeamBinaryOp::And]);
+        assert_eq!(
+            beam_binary_ops_for_rule(&neg_singleton),
+            &[BeamBinaryOp::And]
+        );
 
         let xor_rule = BeamRule {
             first: singleton.first,
@@ -9000,6 +9161,39 @@ mod tests {
             &singleton_minor,
             &params
         ));
+    }
+
+    #[test]
+    fn test_initial_singleton_seed_pruning_ignores_lmaf_but_requires_variation() {
+        let params = BeamSearchParams {
+            maf_threshold: 0.20,
+            ..BeamSearchParams::default()
+        };
+        let rare_but_variable = ContinuousRuleScore {
+            score: 0.0,
+            raw_score: 0.0,
+            mean_hit: 1.0,
+            mean_miss: 0.0,
+            support_frac: 0.05,
+            dosage_maf: 0.05,
+            n_hit: 5,
+            n_ge2: 0,
+            n_miss: 95,
+        };
+        let non_variable = ContinuousRuleScore {
+            support_frac: 1.0,
+            dosage_maf: 0.0,
+            n_hit: 100,
+            n_ge2: 0,
+            n_miss: 0,
+            ..rare_but_variable
+        };
+        assert!(keep_initial_literal_after_seed_pruning(&rare_but_variable));
+        assert!(!keep_rule_after_dosage_maf_pruning(
+            &rare_but_variable,
+            &params
+        ));
+        assert!(!keep_initial_literal_after_seed_pruning(&non_variable));
     }
 
     #[test]

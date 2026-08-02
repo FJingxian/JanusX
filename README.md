@@ -24,12 +24,11 @@ JanusX (Joint Association and Novel Utility for Selection) is a GWAS and genomic
 
 **Main capabilities**:
 
-- GWAS: `LM`, `LMM`, `FastLMM`, `FarmCPU`
-- Genomic selection: `GBLUP`, `adBLUP`, `rrBLUP`, `BayesA/B/Cpi`, and ML models (`RF/ET/GBDT/XGB/SVM/ENET`)
-- Streaming genotype IO for VCF/HMP/PLINK/TXT/NPY
-- Post-analysis workflows: `postgwas`, `postgarfield`, `postbsa`
-- Utility workflows: `grm`, `pca`, `gformat`, `gmerge`, `hybrid`, `fastpop`, `webui`, `sim`, `simulation`
-- Launcher pipelines: `fastq2vcf`, `fastq2count`
+- Genome-Wide Association Study (GWAS): `lm`, `lmm`, `fvlmm`, `farmcpu`
+- Genomic Selection (GS): `BLUP`, `BayesA/B/Cpi`, and ML models (`RF/ET/GBDT/XGB/SVM/ENET`)
+- Streaming genotype IO for VCF/HMP/PLINK
+- Post-analysis workflows: `postgwas`, `postgs`
+- Utility workflows: `grm`, `pca`, `gformat`, `gmerge`, `fastpop`
 
 ---
 
@@ -154,7 +153,7 @@ jx <module> -h
 - `pca`
 - `gwas`
 - `postgwas` (Visualization, `manh` `qq` `ldblock`)
-- `fastpop` (population-structure analysis; `jx adamixture` kept as compatibility alias)
+- `fastpop` (population-structure analysis)
 
 Attribution note:
 
@@ -165,7 +164,6 @@ Attribution note:
 
 - `gs`
 - `postgs` (Visualization)
-- `reml` (Estimation of broaden heritability and blup values)
 
 **GARFIELD**:
 

@@ -38,7 +38,10 @@ use crate::bincore::{
     discover_id_sidecar, discover_site_sidecar, parse_bin01_header, resolve_bin01_path, BinWindow,
 };
 use crate::binwriter::{Bin01SiteMode, Bin01SiteRecordRef, Bin01Writer};
-use crate::bitwise::{and_popcount, bitand_assign, bitnot_masked, popcount};
+use crate::bitwise::{
+    and_popcount_bounded_blocks_with_backend, bitand_assign, bitnot_masked, resolve_reduce_backend,
+    ReduceBackend,
+};
 use crate::breader::{
     gather_rows_by_indices, gather_rows_by_range, load_bin01_as_u64_words,
     load_bin01_packed_payload_owned, load_bin01_selected_rows_as_u64_words,
@@ -131,6 +134,7 @@ const GARFIELD_GENESET_CORR_PRESCREEN_SLACK_MIN: usize = 8;
 const GARFIELD_GENESET_CORR_PRESCREEN_SLACK_MAX: usize = 32;
 const GARFIELD_SINGLE_WINDOW_CANDIDATE_MULTIPLIER: usize = 4;
 const GARFIELD_SINGLE_WINDOW_CANDIDATE_ADD: usize = 32;
+const GARFIELD_LD_BLOCK_WORDS_DEFAULT: usize = 8;
 static GARFIELD_ML_SELECT_NS: AtomicU64 = AtomicU64::new(0);
 static GARFIELD_DENSE_DOSAGE_DECODE_NS: AtomicU64 = AtomicU64::new(0);
 static GARFIELD_GENESET_LD_PRUNE_NS: AtomicU64 = AtomicU64::new(0);
@@ -138,6 +142,11 @@ static GARFIELD_GENESET_LD_EXACT_PAIRS: AtomicU64 = AtomicU64::new(0);
 static GARFIELD_GENESET_LD_ROWS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static GARFIELD_GENESET_LD_ROWS_KEPT: AtomicU64 = AtomicU64::new(0);
 static GARFIELD_MATERIALIZE_BITS_NS: AtomicU64 = AtomicU64::new(0);
+static GARFIELD_CORR_STAGE1_SUMMARY_NS: AtomicU64 = AtomicU64::new(0);
+static GARFIELD_CORR_STAGE1_SCORE_NS: AtomicU64 = AtomicU64::new(0);
+static GARFIELD_CORR_STAGE1_POOL_NS: AtomicU64 = AtomicU64::new(0);
+static GARFIELD_CORR_STAGE1_POOL_PRIORITY_NS: AtomicU64 = AtomicU64::new(0);
+static GARFIELD_CORR_STAGE1_POOL_LD_NS: AtomicU64 = AtomicU64::new(0);
 static GARFIELD_GENESET_LD_SUPPORT_CACHE: OnceLock<
     Mutex<HashMap<(usize, u64), Arc<GarfieldGenesetLdSupportCacheEntry>>>,
 > = OnceLock::new();
@@ -166,6 +175,27 @@ fn timing_share_pct(part_s: f64, whole_s: f64) -> f64 {
         (part_s / whole_s) * 100.0
     } else {
         0.0
+    }
+}
+
+#[inline]
+fn garfield_stage_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_truthy("JX_GARFIELD_STAGE_PROFILE"))
+}
+
+#[inline]
+fn garfield_stage_profile_start() -> Option<Instant> {
+    garfield_stage_profile_enabled().then(Instant::now)
+}
+
+#[inline]
+fn garfield_stage_profile_end(start: Option<Instant>, counter: &AtomicU64) {
+    if let Some(t0) = start {
+        counter.fetch_add(
+            t0.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
     }
 }
 
@@ -373,6 +403,14 @@ fn garfield_geneset_ld_prune_r2() -> f64 {
     parse_env_f64("JX_GARFIELD_GENESET_LD_PRUNE_R2")
         .filter(|v| *v > 0.0 && *v <= 1.0)
         .unwrap_or(GARFIELD_GENESET_LD_PRUNE_R2_DEFAULT)
+}
+
+#[inline]
+fn garfield_ld_block_words() -> usize {
+    match parse_env_usize("JX_GARFIELD_LD_BLOCK_WORDS") {
+        Some(8) => 8,
+        _ => GARFIELD_LD_BLOCK_WORDS_DEFAULT,
+    }
 }
 
 #[inline]
@@ -4481,7 +4519,80 @@ fn take_prefix_per_group_rows(group_rows: &[Vec<usize>], per_group_limit: usize)
     out
 }
 
+#[inline]
+fn fill_ld_block_supports(row: &[u64], block_words: usize, out: &mut [u16]) -> usize {
+    debug_assert!(block_words > 0);
+    debug_assert_eq!(out.len(), row.len().div_ceil(block_words));
+    let mut total = 0usize;
+    for (block_idx, block) in row.chunks(block_words).enumerate() {
+        let block_support = block
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum::<usize>();
+        out[block_idx] = u16::try_from(block_support).unwrap_or(u16::MAX);
+        total = total.saturating_add(block_support);
+    }
+    total
+}
+
+#[inline(always)]
+fn ld_bounds_match_blocks(
+    row_i: &[u64],
+    row_j: &[u64],
+    support_i_blocks: &[u16],
+    support_j_blocks: &[u16],
+    support_i: u64,
+    support_j: u64,
+    bounds: GarfieldGenesetLdExactBounds,
+    block_words: usize,
+    backend: ReduceBackend,
+) -> bool {
+    match block_words {
+        8 => and_popcount_bounded_blocks_with_backend::<8>(
+            row_i,
+            row_j,
+            support_i_blocks,
+            support_j_blocks,
+            support_i,
+            support_j,
+            bounds.low_max,
+            bounds.high_min,
+            backend,
+        ),
+        _ => and_popcount_bounded_blocks_with_backend::<4>(
+            row_i,
+            row_j,
+            support_i_blocks,
+            support_j_blocks,
+            support_i,
+            support_j,
+            bounds.low_max,
+            bounds.high_min,
+            backend,
+        ),
+    }
+}
+
 fn prune_candidate_rows_by_ld_priority(
+    candidate_global_rows: &[usize],
+    priority_local_rows: &[usize],
+    logic_bits: &GarfieldLogicBits,
+    sample_indices: &[usize],
+) -> Result<Vec<usize>, String> {
+    // This is score-prioritized greedy LD clumping: priority_local_rows must
+    // already be ordered by descending single-site score.
+    let t0 = garfield_stage_profile_start();
+    let result = prune_candidate_rows_by_ld_priority_impl(
+        candidate_global_rows,
+        priority_local_rows,
+        logic_bits,
+        sample_indices,
+    );
+    garfield_stage_profile_end(t0, &GARFIELD_CORR_STAGE1_POOL_LD_NS);
+    result
+}
+
+fn prune_candidate_rows_by_ld_priority_impl(
     candidate_global_rows: &[usize],
     priority_local_rows: &[usize],
     logic_bits: &GarfieldLogicBits,
@@ -4530,17 +4641,26 @@ fn prune_candidate_rows_by_ld_priority(
         }
     };
 
+    let support_cache = geneset_ld_support_cache(n_samples, r2_threshold);
+    let support_conflict_buckets = support_cache.conflict_supports.as_slice();
+    let exact_bounds = support_cache.exact_bounds.as_slice();
+    let ld_backend = resolve_reduce_backend();
+    let block_words = garfield_ld_block_words();
+    let block_count = row_words.div_ceil(block_words);
+    let mut block_support = vec![0u16; candidate_global_rows.len() * block_count];
     let mut support = vec![0usize; candidate_global_rows.len()];
     let mut variable = vec![false; candidate_global_rows.len()];
     for local_idx in 0..candidate_global_rows.len() {
-        let cnt = popcount(row_slice(local_idx)) as usize;
+        let block_start = local_idx * block_count;
+        let cnt = fill_ld_block_supports(
+            row_slice(local_idx),
+            block_words,
+            &mut block_support[block_start..block_start + block_count],
+        );
         support[local_idx] = cnt;
         variable[local_idx] = binary_row_var_from_support(cnt, n_samples) > 0.0;
     }
 
-    let support_cache = geneset_ld_support_cache(n_samples, r2_threshold);
-    let support_conflict_buckets = support_cache.conflict_supports.as_slice();
-    let exact_bounds = support_cache.exact_bounds.as_slice();
     let mut kept_local = Vec::<usize>::with_capacity(priority_local_rows.len());
     let mut kept_by_support = vec![Vec::<usize>::new(); n_samples + 1];
     let mut seen = vec![false; candidate_global_rows.len()];
@@ -4556,9 +4676,26 @@ fn prune_candidate_rows_by_ld_priority(
         let mut has_conflict = false;
         for &support_j in support_conflict_buckets[support_i].iter() {
             let bounds = exact_bounds_i[support_j];
+            if bounds.low_max == GARFIELD_GENESET_LD_NO_BOUND
+                && bounds.high_min == GARFIELD_GENESET_LD_NO_BOUND
+            {
+                continue;
+            }
             for &kept_idx in kept_by_support[support_j].iter() {
                 let row_j = row_slice(kept_idx);
-                if bounds.matches(and_popcount(row_i, row_j) as usize) {
+                let block_start_i = local_idx * block_count;
+                let block_start_j = kept_idx * block_count;
+                if ld_bounds_match_blocks(
+                    row_i,
+                    row_j,
+                    &block_support[block_start_i..block_start_i + block_count],
+                    &block_support[block_start_j..block_start_j + block_count],
+                    support_i as u64,
+                    support[kept_idx] as u64,
+                    bounds,
+                    block_words,
+                    ld_backend,
+                ) {
                     has_conflict = true;
                     break;
                 }
@@ -7978,12 +8115,20 @@ fn maybe_prune_geneset_unit_rows_by_ld(
             &packed_rows[local_idx * row_words..(local_idx + 1) * row_words]
         }
     };
+    let block_words = garfield_ld_block_words();
+    let block_count = row_words.div_ceil(block_words);
+    let mut block_support = vec![0u16; candidate_global_rows.len() * block_count];
     let mut support = vec![0usize; candidate_global_rows.len()];
     let mut var = vec![0.0_f64; candidate_global_rows.len()];
     let mut variable_local = Vec::<usize>::with_capacity(candidate_global_rows.len());
     for local_idx in 0..candidate_global_rows.len() {
         let row = row_slice(local_idx);
-        let cnt = popcount(row) as usize;
+        let block_start = local_idx * block_count;
+        let cnt = fill_ld_block_supports(
+            row,
+            block_words,
+            &mut block_support[block_start..block_start + block_count],
+        );
         support[local_idx] = cnt;
         let row_var = binary_row_var_from_support(cnt, n_samples);
         var[local_idx] = row_var;
@@ -8001,6 +8146,7 @@ fn maybe_prune_geneset_unit_rows_by_ld(
     let support_cache = geneset_ld_support_cache(n_samples, r2_threshold);
     let support_conflict_buckets = support_cache.conflict_supports.as_slice();
     let exact_bounds = support_cache.exact_bounds.as_slice();
+    let ld_backend = resolve_reduce_backend();
 
     variable_local.sort_by(|&a, &b| {
         let ga = candidate_global_rows[a];
@@ -8026,10 +8172,27 @@ fn maybe_prune_geneset_unit_rows_by_ld(
         let exact_bounds_i = &exact_bounds[support_i];
         for &support_j in support_conflict_buckets[support_i].iter() {
             let bounds = exact_bounds_i[support_j];
+            if bounds.low_max == GARFIELD_GENESET_LD_NO_BOUND
+                && bounds.high_min == GARFIELD_GENESET_LD_NO_BOUND
+            {
+                continue;
+            }
             for &kept_idx in kept_by_support[support_j].iter() {
                 exact_pairs = exact_pairs.saturating_add(1);
                 let row_j = row_slice(kept_idx);
-                if bounds.matches(and_popcount(row_i, row_j) as usize) {
+                let block_start_i = local_idx * block_count;
+                let block_start_j = kept_idx * block_count;
+                if ld_bounds_match_blocks(
+                    row_i,
+                    row_j,
+                    &block_support[block_start_i..block_start_i + block_count],
+                    &block_support[block_start_j..block_start_j + block_count],
+                    support_i as u64,
+                    support[kept_idx] as u64,
+                    bounds,
+                    block_words,
+                    ld_backend,
+                ) {
                     has_conflict = true;
                     break;
                 }
@@ -12378,6 +12541,11 @@ fn garfield_logic_search_bed_owned(
     garfield_geneset_ld_unit_stats_reset();
     GARFIELD_MATERIALIZE_BITS_NS.store(0, Ordering::Relaxed);
     GARFIELD_ML_SELECT_NS.store(0, Ordering::Relaxed);
+    GARFIELD_CORR_STAGE1_SUMMARY_NS.store(0, Ordering::Relaxed);
+    GARFIELD_CORR_STAGE1_SCORE_NS.store(0, Ordering::Relaxed);
+    GARFIELD_CORR_STAGE1_POOL_NS.store(0, Ordering::Relaxed);
+    GARFIELD_CORR_STAGE1_POOL_PRIORITY_NS.store(0, Ordering::Relaxed);
+    GARFIELD_CORR_STAGE1_POOL_LD_NS.store(0, Ordering::Relaxed);
     let scan_stage_t0 = Instant::now();
     let scan_progress_done = AtomicUsize::new(0);
     garfield_stage_progress_notify(

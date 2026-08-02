@@ -105,7 +105,7 @@ fn bitwise_backend_debug() -> bool {
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum ReduceBackend {
+pub(crate) enum ReduceBackend {
     Scalar,
     #[cfg(target_arch = "x86_64")]
     Avx2,
@@ -241,6 +241,20 @@ fn and_popcount_serial(lhs: &[u64], rhs: &[u64]) -> u64 {
     a0 + a1 + a2 + a3
 }
 
+#[inline(always)]
+fn and_popcount_scalar_block4(lhs: &[u64], rhs: &[u64]) -> u64 {
+    (lhs[0] & rhs[0]).count_ones() as u64
+        + (lhs[1] & rhs[1]).count_ones() as u64
+        + (lhs[2] & rhs[2]).count_ones() as u64
+        + (lhs[3] & rhs[3]).count_ones() as u64
+}
+
+#[inline(always)]
+fn and_popcount_scalar_block8(lhs: &[u64], rhs: &[u64]) -> u64 {
+    and_popcount_scalar_block4(&lhs[..4], &rhs[..4])
+        + and_popcount_scalar_block4(&lhs[4..8], &rhs[4..8])
+}
+
 #[inline]
 fn king_pair_counts_serial(
     zi: &[u64],
@@ -356,6 +370,18 @@ unsafe fn and_popcount_simd_avx512(lhs: &[u64], rhs: &[u64]) -> u64 {
     lanes.iter().copied().sum::<u64>() + and_popcount_serial(&lhs[i..], &rhs[i..])
 }
 
+#[cfg(all(target_arch = "x86_64", feature = "simd-avx512"))]
+#[target_feature(enable = "avx512f,avx512vpopcntdq")]
+unsafe fn and_popcount_simd_avx512_block8(lhs: &[u64], rhs: &[u64]) -> u64 {
+    use core::arch::x86_64::*;
+    let lv = _mm512_loadu_si512(lhs.as_ptr() as *const _);
+    let rv = _mm512_loadu_si512(rhs.as_ptr() as *const _);
+    let counts = _mm512_popcnt_epi64(_mm512_and_si512(lv, rv));
+    let mut lanes = [0u64; 8];
+    _mm512_storeu_si512(lanes.as_mut_ptr() as *mut _, counts);
+    lanes.iter().copied().sum()
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn popcount_simd_avx2(words: &[u64]) -> u64 {
@@ -397,6 +423,28 @@ unsafe fn and_popcount_simd_avx2(lhs: &[u64], rhs: &[u64]) -> u64 {
         i += 4;
     }
     acc + and_popcount_serial(&lhs[i..], &rhs[i..])
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn and_popcount_simd_avx2_block4(lhs: &[u64], rhs: &[u64]) -> u64 {
+    use core::arch::x86_64::*;
+    let lut4 = _mm256_setr_epi8(
+        0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4, 0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3,
+        3, 4,
+    );
+    let low_mask = _mm256_set1_epi8(0x0f_i8);
+    let zero = _mm256_setzero_si256();
+    let lv = _mm256_loadu_si256(lhs.as_ptr() as *const __m256i);
+    let rv = _mm256_loadu_si256(rhs.as_ptr() as *const __m256i);
+    popcount_u8x32_avx2(_mm256_and_si256(lv, rv), lut4, low_mask, zero)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn and_popcount_simd_avx2_block8(lhs: &[u64], rhs: &[u64]) -> u64 {
+    and_popcount_simd_avx2_block4(&lhs[..4], &rhs[..4])
+        + and_popcount_simd_avx2_block4(&lhs[4..8], &rhs[4..8])
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -543,6 +591,24 @@ unsafe fn and_popcount_simd_neon(lhs: &[u64], rhs: &[u64]) -> u64 {
         i += 2;
     }
     acc + and_popcount_serial(&lhs[i..], &rhs[i..])
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn and_popcount_simd_neon_block4(lhs: &[u64], rhs: &[u64]) -> u64 {
+    use core::arch::aarch64::*;
+    let l0 = vld1q_u64(lhs.as_ptr());
+    let r0 = vld1q_u64(rhs.as_ptr());
+    let l1 = vld1q_u64(lhs.as_ptr().add(2));
+    let r1 = vld1q_u64(rhs.as_ptr().add(2));
+    popcount_u64x2_neon(vandq_u64(l0, r0)) + popcount_u64x2_neon(vandq_u64(l1, r1))
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn and_popcount_simd_neon_block8(lhs: &[u64], rhs: &[u64]) -> u64 {
+    and_popcount_simd_neon_block4(&lhs[..4], &rhs[..4])
+        + and_popcount_simd_neon_block4(&lhs[4..8], &rhs[4..8])
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -749,6 +815,343 @@ fn and_popcount_chunk_by_backend(lhs: &[u64], rhs: &[u64], backend: ReduceBacken
             }
         }
     }
+}
+
+#[inline(always)]
+fn and_popcount_kernel_scalar(lhs: &[u64], rhs: &[u64]) -> u64 {
+    and_popcount_serial(lhs, rhs)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn and_popcount_kernel_avx2(lhs: &[u64], rhs: &[u64]) -> u64 {
+    unsafe { and_popcount_simd_avx2(lhs, rhs) }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "simd-avx512"))]
+#[inline(always)]
+fn and_popcount_kernel_avx512(lhs: &[u64], rhs: &[u64]) -> u64 {
+    unsafe { and_popcount_simd_avx512(lhs, rhs) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn and_popcount_kernel_neon(lhs: &[u64], rhs: &[u64]) -> u64 {
+    unsafe { and_popcount_simd_neon(lhs, rhs) }
+}
+
+#[inline(always)]
+fn and_popcount_kernel_scalar_block4(lhs: &[u64], rhs: &[u64]) -> u64 {
+    and_popcount_scalar_block4(lhs, rhs)
+}
+
+#[inline(always)]
+fn and_popcount_kernel_scalar_block8(lhs: &[u64], rhs: &[u64]) -> u64 {
+    and_popcount_scalar_block8(lhs, rhs)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn and_popcount_kernel_avx2_block4(lhs: &[u64], rhs: &[u64]) -> u64 {
+    unsafe { and_popcount_simd_avx2_block4(lhs, rhs) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn and_popcount_kernel_avx2_block8(lhs: &[u64], rhs: &[u64]) -> u64 {
+    unsafe { and_popcount_simd_avx2_block8(lhs, rhs) }
+}
+
+#[cfg(all(target_arch = "x86_64", feature = "simd-avx512"))]
+#[inline(always)]
+fn and_popcount_kernel_avx512_block8(lhs: &[u64], rhs: &[u64]) -> u64 {
+    unsafe { and_popcount_simd_avx512_block8(lhs, rhs) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn and_popcount_kernel_neon_block4(lhs: &[u64], rhs: &[u64]) -> u64 {
+    unsafe { and_popcount_simd_neon_block4(lhs, rhs) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn and_popcount_kernel_neon_block8(lhs: &[u64], rhs: &[u64]) -> u64 {
+    unsafe { and_popcount_simd_neon_block8(lhs, rhs) }
+}
+
+#[inline(always)]
+fn bounded_block_early_exit(
+    count: u64,
+    remaining_lhs: u64,
+    remaining_rhs: u64,
+    low_max: u32,
+    high_min: u32,
+) -> Option<bool> {
+    let remaining_max = remaining_lhs.min(remaining_rhs);
+    if high_min != u32::MAX && count >= u64::from(high_min) {
+        return Some(true);
+    }
+    if low_max != u32::MAX && count.saturating_add(remaining_max) <= u64::from(low_max) {
+        return Some(true);
+    }
+    if low_max != u32::MAX
+        && high_min != u32::MAX
+        && count > u64::from(low_max)
+        && count.saturating_add(remaining_max) < u64::from(high_min)
+    {
+        return Some(false);
+    }
+    None
+}
+
+#[inline(always)]
+fn and_popcount_bounded_blocks_kernel<const BLOCK_WORDS: usize, F, T>(
+    lhs: &[u64],
+    rhs: &[u64],
+    lhs_block_support: &[u16],
+    rhs_block_support: &[u16],
+    lhs_support: u64,
+    rhs_support: u64,
+    low_max: u32,
+    high_min: u32,
+    full_kernel: F,
+    tail_kernel: T,
+) -> bool
+where
+    F: Fn(&[u64], &[u64]) -> u64,
+    T: Fn(&[u64], &[u64]) -> u64,
+{
+    let full_block_count = lhs.len() / BLOCK_WORDS;
+    let tail_start = full_block_count * BLOCK_WORDS;
+    let mut count = 0u64;
+    let mut remaining_lhs = lhs_support;
+    let mut remaining_rhs = rhs_support;
+
+    let mut block_idx = 0usize;
+    while block_idx < full_block_count {
+        let start = block_idx * BLOCK_WORDS;
+        count += full_kernel(
+            &lhs[start..start + BLOCK_WORDS],
+            &rhs[start..start + BLOCK_WORDS],
+        );
+        remaining_lhs = remaining_lhs.saturating_sub(u64::from(lhs_block_support[block_idx]));
+        remaining_rhs = remaining_rhs.saturating_sub(u64::from(rhs_block_support[block_idx]));
+        if let Some(result) =
+            bounded_block_early_exit(count, remaining_lhs, remaining_rhs, low_max, high_min)
+        {
+            return result;
+        }
+        block_idx += 1;
+    }
+
+    if tail_start < lhs.len() {
+        count += tail_kernel(&lhs[tail_start..], &rhs[tail_start..]);
+        remaining_lhs = remaining_lhs.saturating_sub(u64::from(lhs_block_support[block_idx]));
+        remaining_rhs = remaining_rhs.saturating_sub(u64::from(rhs_block_support[block_idx]));
+        if let Some(result) =
+            bounded_block_early_exit(count, remaining_lhs, remaining_rhs, low_max, high_min)
+        {
+            return result;
+        }
+    }
+
+    (low_max != u32::MAX && count <= u64::from(low_max))
+        || (high_min != u32::MAX && count >= u64::from(high_min))
+}
+
+#[inline(always)]
+fn and_popcount_bounded_blocks_dispatch<const BLOCK_WORDS: usize>(
+    lhs: &[u64],
+    rhs: &[u64],
+    lhs_block_support: &[u16],
+    rhs_block_support: &[u16],
+    lhs_support: u64,
+    rhs_support: u64,
+    low_max: u32,
+    high_min: u32,
+    backend: ReduceBackend,
+) -> bool {
+    match backend {
+        ReduceBackend::Scalar => {
+            if BLOCK_WORDS == 8 {
+                and_popcount_bounded_blocks_kernel::<BLOCK_WORDS, _, _>(
+                    lhs,
+                    rhs,
+                    lhs_block_support,
+                    rhs_block_support,
+                    lhs_support,
+                    rhs_support,
+                    low_max,
+                    high_min,
+                    and_popcount_kernel_scalar_block8,
+                    and_popcount_kernel_scalar,
+                )
+            } else {
+                and_popcount_bounded_blocks_kernel::<BLOCK_WORDS, _, _>(
+                    lhs,
+                    rhs,
+                    lhs_block_support,
+                    rhs_block_support,
+                    lhs_support,
+                    rhs_support,
+                    low_max,
+                    high_min,
+                    and_popcount_kernel_scalar_block4,
+                    and_popcount_kernel_scalar,
+                )
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        ReduceBackend::Avx2 => {
+            if BLOCK_WORDS == 8 {
+                and_popcount_bounded_blocks_kernel::<BLOCK_WORDS, _, _>(
+                    lhs,
+                    rhs,
+                    lhs_block_support,
+                    rhs_block_support,
+                    lhs_support,
+                    rhs_support,
+                    low_max,
+                    high_min,
+                    and_popcount_kernel_avx2_block8,
+                    and_popcount_kernel_avx2,
+                )
+            } else {
+                and_popcount_bounded_blocks_kernel::<BLOCK_WORDS, _, _>(
+                    lhs,
+                    rhs,
+                    lhs_block_support,
+                    rhs_block_support,
+                    lhs_support,
+                    rhs_support,
+                    low_max,
+                    high_min,
+                    and_popcount_kernel_avx2_block4,
+                    and_popcount_kernel_avx2,
+                )
+            }
+        }
+        #[cfg(all(target_arch = "x86_64", feature = "simd-avx512"))]
+        ReduceBackend::Avx512 => {
+            if BLOCK_WORDS == 8 {
+                and_popcount_bounded_blocks_kernel::<BLOCK_WORDS, _, _>(
+                    lhs,
+                    rhs,
+                    lhs_block_support,
+                    rhs_block_support,
+                    lhs_support,
+                    rhs_support,
+                    low_max,
+                    high_min,
+                    and_popcount_kernel_avx512_block8,
+                    and_popcount_kernel_avx512,
+                )
+            } else {
+                and_popcount_bounded_blocks_kernel::<BLOCK_WORDS, _, _>(
+                    lhs,
+                    rhs,
+                    lhs_block_support,
+                    rhs_block_support,
+                    lhs_support,
+                    rhs_support,
+                    low_max,
+                    high_min,
+                    and_popcount_kernel_scalar_block4,
+                    and_popcount_kernel_avx512,
+                )
+            }
+        }
+        #[cfg(target_arch = "aarch64")]
+        ReduceBackend::Neon => {
+            if BLOCK_WORDS == 8 {
+                and_popcount_bounded_blocks_kernel::<BLOCK_WORDS, _, _>(
+                    lhs,
+                    rhs,
+                    lhs_block_support,
+                    rhs_block_support,
+                    lhs_support,
+                    rhs_support,
+                    low_max,
+                    high_min,
+                    and_popcount_kernel_neon_block8,
+                    and_popcount_kernel_neon,
+                )
+            } else {
+                and_popcount_bounded_blocks_kernel::<BLOCK_WORDS, _, _>(
+                    lhs,
+                    rhs,
+                    lhs_block_support,
+                    rhs_block_support,
+                    lhs_support,
+                    rhs_support,
+                    low_max,
+                    high_min,
+                    and_popcount_kernel_neon_block4,
+                    and_popcount_kernel_neon,
+                )
+            }
+        }
+    }
+}
+
+/// Evaluate a bounded `lhs & rhs` popcount using block-level early exits.
+///
+/// `lhs_block_support` and `rhs_block_support` contain the number of set bits
+/// in each block; `lhs_support` and `rhs_support` are their total supports.
+/// `u32::MAX` means that the corresponding bound is disabled.
+/// The result is exactly equivalent to applying the two bounds to the full
+/// intersection count; only the point at which the count is evaluated differs.
+#[inline(always)]
+pub(crate) fn and_popcount_bounded_blocks_with_backend<const BLOCK_WORDS: usize>(
+    lhs: &[u64],
+    rhs: &[u64],
+    lhs_block_support: &[u16],
+    rhs_block_support: &[u16],
+    lhs_support: u64,
+    rhs_support: u64,
+    low_max: u32,
+    high_min: u32,
+    backend: ReduceBackend,
+) -> bool {
+    debug_assert!(
+        matches!(BLOCK_WORDS, 4 | 8),
+        "bounded popcount supports only 4- or 8-word blocks"
+    );
+    debug_assert_eq!(lhs.len(), rhs.len(), "bounded popcount length mismatch");
+    let block_count = lhs.len().div_ceil(BLOCK_WORDS);
+    debug_assert_eq!(
+        lhs_block_support.len(),
+        block_count,
+        "bounded popcount lhs block-support length mismatch"
+    );
+    debug_assert_eq!(
+        rhs_block_support.len(),
+        block_count,
+        "bounded popcount rhs block-support length mismatch"
+    );
+
+    if low_max != u32::MAX && lhs_support.min(rhs_support) <= u64::from(low_max) {
+        return true;
+    }
+    if low_max == u32::MAX
+        && high_min != u32::MAX
+        && lhs_support.min(rhs_support) < u64::from(high_min)
+    {
+        return false;
+    }
+
+    and_popcount_bounded_blocks_dispatch::<BLOCK_WORDS>(
+        lhs,
+        rhs,
+        lhs_block_support,
+        rhs_block_support,
+        lhs_support,
+        rhs_support,
+        low_max,
+        high_min,
+        backend,
+    )
 }
 
 #[inline]
@@ -993,7 +1396,7 @@ fn choose_reduce_backend() -> ReduceBackend {
 }
 
 #[inline]
-fn resolve_reduce_backend() -> ReduceBackend {
+pub(crate) fn resolve_reduce_backend() -> ReduceBackend {
     static BACKEND: OnceLock<ReduceBackend> = OnceLock::new();
     *BACKEND.get_or_init(|| {
         let b = choose_reduce_backend();
@@ -1355,6 +1758,197 @@ mod tests {
         let a = [0b1011u64, 0b1100u64, u64::MAX];
         let b = [0b0110u64, 0b0101u64, 0];
         assert_eq!(and_popcount(&a, &b), 1 + 1 + 0);
+    }
+
+    fn block_supports<const BLOCK_WORDS: usize>(words: &[u64]) -> Vec<u16> {
+        words
+            .chunks(BLOCK_WORDS)
+            .map(|block| popcount_serial(block) as u16)
+            .collect()
+    }
+
+    fn assert_bounded_block_result<const BLOCK_WORDS: usize>(
+        lhs: &[u64],
+        rhs: &[u64],
+        low_max: u32,
+        high_min: u32,
+    ) {
+        let expected_count = and_popcount(lhs, rhs);
+        let expected = (low_max != u32::MAX && expected_count <= u64::from(low_max))
+            || (high_min != u32::MAX && expected_count >= u64::from(high_min));
+        let lhs_support = block_supports::<BLOCK_WORDS>(lhs);
+        let rhs_support = block_supports::<BLOCK_WORDS>(rhs);
+        let actual = and_popcount_bounded_blocks_with_backend::<BLOCK_WORDS>(
+            lhs,
+            rhs,
+            &lhs_support,
+            &rhs_support,
+            lhs_support.iter().map(|&v| u64::from(v)).sum(),
+            rhs_support.iter().map(|&v| u64::from(v)).sum(),
+            low_max,
+            high_min,
+            resolve_reduce_backend(),
+        );
+        assert_eq!(
+            actual,
+            expected,
+            "block_words={BLOCK_WORDS} lhs_words={} low_max={low_max} high_min={high_min}",
+            lhs.len()
+        );
+    }
+
+    #[test]
+    fn test_and_popcount_bounded_blocks_matches_full_count() {
+        let lhs = [
+            0xFFFF_0000_0000_0001u64,
+            0x0000_0000_0000_00FFu64,
+            0xF0F0_F0F0_F0F0_F0F0u64,
+            0x0123_4567_89AB_CDEFu64,
+            0xAAAA_AAAA_AAAA_AAAAu64,
+        ];
+        let rhs = [
+            0x0F0F_0000_0000_0001u64,
+            0x0000_0000_0000_FF00u64,
+            0xFFFF_0000_FFFF_0000u64,
+            0xFEDC_BA98_7654_3210u64,
+            0x5555_5555_5555_5555u64,
+        ];
+
+        for &(low_max, high_min) in &[
+            (u32::MAX, u32::MAX),
+            (0, u32::MAX),
+            (1, u32::MAX),
+            (u32::MAX, 1),
+            (u32::MAX, 32),
+            (0, 32),
+            (8, 16),
+            (16, 8),
+        ] {
+            assert_bounded_block_result::<4>(&lhs, &rhs, low_max, high_min);
+            assert_bounded_block_result::<8>(&lhs, &rhs, low_max, high_min);
+        }
+    }
+
+    #[test]
+    fn test_and_popcount_bounded_blocks_exhaustive_short_vectors() {
+        let limits = [u32::MAX, 0, 1, 4, 8, 16];
+        for lhs_mask in 0u64..=0xFF {
+            for rhs_mask in 0u64..=0xFF {
+                let lhs = [lhs_mask, !lhs_mask, lhs_mask.rotate_left(17)];
+                let rhs = [rhs_mask, rhs_mask.rotate_left(11), !rhs_mask];
+                for &low_max in limits.iter() {
+                    for &high_min in limits.iter() {
+                        assert_bounded_block_result::<4>(&lhs, &rhs, low_max, high_min);
+                        assert_bounded_block_result::<8>(&lhs, &rhs, low_max, high_min);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_and_popcount_bounded_block_widths() {
+        let n_words = std::env::var("JANUSX_BITWISE_BLOCK_BENCH_WORDS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(22);
+        let iters = std::env::var("JANUSX_BITWISE_BLOCK_BENCH_ITERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(5_000_000);
+        let lhs = make_words(n_words, 0x1234_5678_9ABC_DEF0);
+        let rhs = make_words(n_words, 0x0FED_CBA9_8765_4321);
+        let lhs_support4 = block_supports::<4>(&lhs);
+        let rhs_support4 = block_supports::<4>(&rhs);
+        let lhs_support8 = block_supports::<8>(&lhs);
+        let rhs_support8 = block_supports::<8>(&rhs);
+        let lhs_total = lhs_support8.iter().map(|&v| u64::from(v)).sum::<u64>();
+        let rhs_total = rhs_support8.iter().map(|&v| u64::from(v)).sum::<u64>();
+        let backend = resolve_reduce_backend();
+        let mut sink = 0u64;
+
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            sink ^= and_popcount(&lhs, &rhs);
+        }
+        let full = t0.elapsed();
+
+        let t1 = Instant::now();
+        for _ in 0..iters {
+            sink ^= and_popcount_bounded_blocks_with_backend::<4>(
+                &lhs,
+                &rhs,
+                &lhs_support4,
+                &rhs_support4,
+                lhs_total,
+                rhs_total,
+                u32::MAX,
+                u32::MAX,
+                backend,
+            ) as u64;
+        }
+        let block4 = t1.elapsed();
+
+        let t2 = Instant::now();
+        for _ in 0..iters {
+            sink ^= and_popcount_bounded_blocks_with_backend::<8>(
+                &lhs,
+                &rhs,
+                &lhs_support8,
+                &rhs_support8,
+                lhs_total,
+                rhs_total,
+                u32::MAX,
+                u32::MAX,
+                backend,
+            ) as u64;
+        }
+        let block8 = t2.elapsed();
+
+        let t3 = Instant::now();
+        for _ in 0..iters {
+            sink ^= and_popcount_bounded_blocks_with_backend::<8>(
+                &lhs,
+                &rhs,
+                &lhs_support8,
+                &rhs_support8,
+                lhs_total,
+                rhs_total,
+                u32::MAX,
+                1,
+                backend,
+            ) as u64;
+        }
+        let early_high = t3.elapsed();
+
+        let t4 = Instant::now();
+        for _ in 0..iters {
+            sink ^= and_popcount_bounded_blocks_with_backend::<8>(
+                &lhs,
+                &rhs,
+                &lhs_support8,
+                &rhs_support8,
+                lhs_total,
+                rhs_total,
+                u32::try_from(n_words.saturating_mul(64)).unwrap_or(u32::MAX),
+                u32::MAX,
+                backend,
+            ) as u64;
+        }
+        let early_low = t4.elapsed();
+
+        println!(
+            "bounded_block_bench words={} iters={} full_ms={:.3} block4_ms={:.3} block8_ms={:.3} early_high_ms={:.3} early_low_ms={:.3} sink={}",
+            n_words,
+            iters,
+            full.as_secs_f64() * 1e3,
+            block4.as_secs_f64() * 1e3,
+            block8.as_secs_f64() * 1e3,
+            early_high.as_secs_f64() * 1e3,
+            early_low.as_secs_f64() * 1e3,
+            black_box(sink)
+        );
     }
 
     #[test]

@@ -18,12 +18,12 @@ use super::permutation::{
     RuleNullPenaltyLookup, RuleStructurePrior,
 };
 use super::score::{
-    dosage_maf_from_dual_counts, dual_packed_summary, score_cont_centered_gain_dual_from_summary,
-    score_cont_centered_gain_dual_packed_with_sum, score_cont_centered_gain_from_sum_and_n_hit,
-    score_cont_centered_gain_packed_with_n_hit, score_cont_centered_gain_packed_with_sum,
-    score_cont_corr_packed, sum_y_where_both1, sum_y_where_both1_four,
-    sum_y_where_both1_with_lookup, support_size_packed, validate_continuous_y, ContinuousRuleScore,
-    PackedYSumLookup,
+    binary_maf_from_n_hit, dosage_maf_from_dual_counts, dual_packed_summary,
+    score_cont_centered_gain_dual_from_summary, score_cont_centered_gain_dual_packed_with_sum,
+    score_cont_centered_gain_from_sum_and_n_hit, score_cont_centered_gain_packed_with_n_hit,
+    score_cont_centered_gain_packed_with_sum, score_cont_corr_packed, sum_y_where_both1,
+    sum_y_where_both1_four, sum_y_where_both1_with_lookup, support_size_packed,
+    validate_continuous_y, ContinuousRuleScore, PackedYSumLookup,
 };
 use super::score_gpu::{
     centered_gain_backend_mode_is_auto, parse_centered_gain_backend_mode_from_env,
@@ -319,6 +319,7 @@ pub struct BeamSearchParams {
     pub group_constraint: BeamGroupConstraintMode,
     pub allow_parallel: bool,
     pub whole_genome_dev_mode: bool,
+    pub filter_xor_substates: bool,
 }
 
 impl Default for BeamSearchParams {
@@ -343,6 +344,7 @@ impl Default for BeamSearchParams {
             group_constraint: BeamGroupConstraintMode::AlwaysExclude,
             allow_parallel: true,
             whole_genome_dev_mode: false,
+            filter_xor_substates: true,
         }
     }
 }
@@ -1848,6 +1850,40 @@ fn keep_rule_after_dosage_maf_pruning(sc: &ContinuousRuleScore, params: &BeamSea
 }
 
 #[inline]
+fn keep_binary_lmaf_count(n_hit: usize, n_samples: usize, params: &BeamSearchParams) -> bool {
+    if n_hit == 0 || n_hit >= n_samples {
+        return false;
+    }
+    if !(params.maf_threshold.is_finite() && params.maf_threshold > 0.0) {
+        return true;
+    }
+    binary_maf_from_n_hit(n_samples, n_hit) >= params.maf_threshold
+}
+
+#[inline]
+fn keep_xor_substates_binary(
+    parent_n_hit: usize,
+    row_n_hit: usize,
+    intersection_n: usize,
+    n_samples: usize,
+    negated: bool,
+    params: &BeamSearchParams,
+) -> bool {
+    let (effective_row_n, effective_intersection_n) = if negated {
+        (
+            n_samples.saturating_sub(row_n_hit),
+            parent_n_hit.saturating_sub(intersection_n),
+        )
+    } else {
+        (row_n_hit, intersection_n)
+    };
+    let parent_and_not_row = parent_n_hit.saturating_sub(effective_intersection_n);
+    let not_parent_and_row = effective_row_n.saturating_sub(effective_intersection_n);
+    keep_binary_lmaf_count(parent_and_not_row, n_samples, params)
+        && keep_binary_lmaf_count(not_parent_and_row, n_samples, params)
+}
+
+#[inline]
 fn keep_initial_literal_after_seed_pruning(sc: &ContinuousRuleScore) -> bool {
     let n_samples = sc.n_hit.saturating_add(sc.n_miss);
     if !fuzzy_rule_has_dosage_variation(sc.n_hit, sc.n_ge2, n_samples) {
@@ -2188,6 +2224,19 @@ fn evaluate_child_train_from_parent_virtual_with_intersection(
     } else {
         (intersection.n, intersection.sum)
     };
+    if matches!(op, BeamBinaryOp::Xor)
+        && params.filter_xor_substates
+        && !keep_xor_substates_binary(
+            parent_n_hit,
+            row_n_hit,
+            intersection.n,
+            n_train,
+            negated,
+            params,
+        )
+    {
+        return None;
+    }
     let (child_n_hit, child_sum_hit) = match op {
         BeamBinaryOp::And => (inter_n_hit, inter_sum_hit),
         BeamBinaryOp::Or => (
@@ -6131,6 +6180,37 @@ fn effective_dual_intersections(
 }
 
 #[inline]
+fn keep_xor_substates_dual(
+    parent: &FuzzyBeamState,
+    row_n_ge1: usize,
+    row_n_ge2: usize,
+    intersections: DualEffectiveIntersections,
+    n_samples: usize,
+    params: &BeamSearchParams,
+) -> bool {
+    let parent_and_not_row_ge1 = parent
+        .train
+        .n_hit
+        .saturating_sub(intersections.cross_n_p1_r2);
+    let parent_and_not_row_ge2 = parent
+        .train_n_ge2
+        .saturating_sub(intersections.cross_n_p2_r1);
+    let not_parent_and_row_ge1 = row_n_ge1.saturating_sub(intersections.cross_n_p2_r1);
+    let not_parent_and_row_ge2 = row_n_ge2.saturating_sub(intersections.cross_n_p1_r2);
+    keep_rule_after_dosage_maf_counts(
+        parent_and_not_row_ge1,
+        parent_and_not_row_ge2,
+        n_samples,
+        params,
+    ) && keep_rule_after_dosage_maf_counts(
+        not_parent_and_row_ge1,
+        not_parent_and_row_ge2,
+        n_samples,
+        params,
+    )
+}
+
+#[inline]
 fn evaluate_child_train_from_parent_virtual_fuzzy_with_intersections(
     parent: &FuzzyBeamState,
     row_summary: DualLiteralSummary,
@@ -6144,6 +6224,18 @@ fn evaluate_child_train_from_parent_virtual_fuzzy_with_intersections(
 ) -> Option<(ContinuousRuleScore, usize, f64, f64)> {
     let (row_n_ge1, row_n_ge2, row_sum_ge1, row_sum_ge2) =
         literal_dual_summary_with_negation(sum_y_train, n_train, row_summary, negated);
+    let xor_intersections = if matches!(op, BeamBinaryOp::Xor) {
+        Some(effective_dual_intersections(parent, intersections, negated))
+    } else {
+        None
+    };
+    if params.filter_xor_substates {
+        if let Some(effective) = xor_intersections {
+            if !keep_xor_substates_dual(parent, row_n_ge1, row_n_ge2, effective, n_train, params) {
+                return None;
+            }
+        }
+    }
     let (child_n_ge1, child_n_ge2, child_sum_ge1, child_sum_ge2) = match op {
         BeamBinaryOp::And => {
             let (inter_n_ge1, inter_n_ge2, inter_sum_ge1, inter_sum_ge2) = if negated {
@@ -6198,7 +6290,7 @@ fn evaluate_child_train_from_parent_virtual_fuzzy_with_intersections(
             },
         ),
         BeamBinaryOp::Xor => {
-            let inter = effective_dual_intersections(parent, intersections, negated);
+            let inter = xor_intersections.expect("XOR intersections must be initialized");
             (
                 parent
                     .train
@@ -8600,6 +8692,154 @@ fn final_test_score_for_rule_fuzzy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_binary_xor_lmaf_requires_both_directional_substates() {
+        let params = BeamSearchParams {
+            maf_threshold: 0.2,
+            filter_xor_substates: true,
+            ..BeamSearchParams::default()
+        };
+        let parent = score_cont_centered_gain_from_sum_and_n_hit(0.0, 0.0, 100, 30);
+        let rare_row = score_cont_centered_gain_from_sum_and_n_hit(0.0, 0.0, 100, 5);
+        let common_row = score_cont_centered_gain_from_sum_and_n_hit(0.0, 0.0, 100, 30);
+        let no_overlap = BinaryPairIntersection { n: 0, sum: 0.0 };
+
+        assert!(evaluate_child_train_from_parent_virtual_with_intersection(
+            &parent,
+            &common_row,
+            no_overlap,
+            0.0,
+            100,
+            2,
+            BeamBinaryOp::Xor,
+            false,
+            &params,
+        )
+        .is_some());
+        assert!(evaluate_child_train_from_parent_virtual_with_intersection(
+            &parent,
+            &rare_row,
+            no_overlap,
+            0.0,
+            100,
+            2,
+            BeamBinaryOp::Xor,
+            false,
+            &params,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn test_binary_xor_lmaf_filter_can_be_disabled() {
+        let params = BeamSearchParams {
+            maf_threshold: 0.2,
+            filter_xor_substates: false,
+            ..BeamSearchParams::default()
+        };
+        let parent = score_cont_centered_gain_from_sum_and_n_hit(0.0, 0.0, 100, 30);
+        let rare_row = score_cont_centered_gain_from_sum_and_n_hit(0.0, 0.0, 100, 5);
+
+        assert!(evaluate_child_train_from_parent_virtual_with_intersection(
+            &parent,
+            &rare_row,
+            BinaryPairIntersection { n: 0, sum: 0.0 },
+            0.0,
+            100,
+            2,
+            BeamBinaryOp::Xor,
+            false,
+            &params,
+        )
+        .is_some());
+    }
+
+    fn test_fuzzy_state(n_ge1: usize, n_ge2: usize) -> FuzzyBeamState {
+        FuzzyBeamState {
+            rule: BeamRule {
+                first: BeamLiteral {
+                    row_index: 0,
+                    group_id: 0,
+                    negated: false,
+                },
+                rest: Vec::new(),
+            },
+            combined_train_ge1: Vec::new(),
+            combined_train_ge2: Vec::new(),
+            train: score_cont_centered_gain_dual_from_summary(0.0, 100, n_ge1, n_ge2, 0.0, 0.0),
+            train_n_ge2: n_ge2,
+            train_sum_ge1: 0.0,
+            train_sum_ge2: 0.0,
+            train_abs_score: 0.0,
+            train_score: 0.0,
+            max_singleton_train_raw: 0.0,
+            max_singleton_test_raw: 0.0,
+        }
+    }
+
+    #[test]
+    fn test_dual_xor_lmaf_requires_both_directional_substates() {
+        let params = BeamSearchParams {
+            maf_threshold: 0.1,
+            filter_xor_substates: true,
+            ..BeamSearchParams::default()
+        };
+        let parent = test_fuzzy_state(30, 0);
+        let rare_row = DualLiteralSummary {
+            pos_n_ge1: 5,
+            pos_n_ge2: 0,
+            pos_sum_ge1: 0.0,
+            pos_sum_ge2: 0.0,
+        };
+        let no_overlap = DualPairIntersections::default();
+
+        assert!(
+            evaluate_child_train_from_parent_virtual_fuzzy_with_intersections(
+                &parent,
+                rare_row,
+                0.0,
+                100,
+                2,
+                BeamBinaryOp::Xor,
+                false,
+                no_overlap,
+                &params,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn test_dual_xor_lmaf_filter_can_be_disabled() {
+        let params = BeamSearchParams {
+            maf_threshold: 0.1,
+            filter_xor_substates: false,
+            ..BeamSearchParams::default()
+        };
+        let parent = test_fuzzy_state(30, 0);
+        let rare_row = DualLiteralSummary {
+            pos_n_ge1: 5,
+            pos_n_ge2: 0,
+            pos_sum_ge1: 0.0,
+            pos_sum_ge2: 0.0,
+        };
+
+        assert!(
+            evaluate_child_train_from_parent_virtual_fuzzy_with_intersections(
+                &parent,
+                rare_row,
+                0.0,
+                100,
+                2,
+                BeamBinaryOp::Xor,
+                false,
+                DualPairIntersections::default(),
+                &params,
+            )
+            .is_some()
+        );
+    }
 
     fn pack_rows(rows: &[Vec<u8>], n_samples: usize) -> (Vec<u64>, usize) {
         let row_words = words_for_samples(n_samples);

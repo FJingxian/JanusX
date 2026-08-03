@@ -164,6 +164,8 @@ const GARFIELD_STRUCTURE_TASK_COALESCE_MAX_UNITS_DEFAULT: usize = 32;
 // Keep enough scan chunks to balance heterogeneous window sizes without
 // returning to one Rayon task per window.
 const GARFIELD_SCAN_TASK_COALESCE_MAX_UNITS_DEFAULT: usize = 512;
+const GARFIELD_PERM_SLOT_TASK_MAX_SLOTS_DEFAULT: usize = 1;
+const GARFIELD_PERM_BITS_CACHE_MAX_MB_DEFAULT: usize = 256;
 const GARFIELD_LOGIC_MMAP_WINDOW_MB_DEFAULT: usize = 128;
 const GARFIELD_DENSE_DECODE_PAR_MIN_ROWS: usize = 64;
 const GARFIELD_DENSE_DECODE_PAR_MIN_SAMPLES: usize = 256;
@@ -395,6 +397,56 @@ fn garfield_scan_task_coalesce_max_units() -> usize {
     parse_env_usize("JX_GARFIELD_SCAN_TASK_COALESCE_MAX_UNITS")
         .unwrap_or(GARFIELD_SCAN_TASK_COALESCE_MAX_UNITS_DEFAULT)
         .max(1)
+}
+
+#[inline]
+fn garfield_perm_slot_task_max_slots() -> usize {
+    parse_env_usize_allow_zero("JX_GARFIELD_PERM_SLOT_TASK_MAX_SLOTS")
+        .unwrap_or(GARFIELD_PERM_SLOT_TASK_MAX_SLOTS_DEFAULT)
+}
+
+#[inline]
+fn garfield_perm_bits_cache_max_bytes() -> usize {
+    parse_env_mb_usize("JX_GARFIELD_PERM_BITS_CACHE_MAX_MB")
+        .unwrap_or(GARFIELD_PERM_BITS_CACHE_MAX_MB_DEFAULT)
+        .saturating_mul(1024 * 1024)
+}
+
+#[inline]
+fn estimate_permutation_bits_cache_bytes(
+    null_prepared: &[(GarfieldPermutationNullSource, GarfieldUnitPrepared)],
+    logic_bits: &GarfieldLogicBits,
+    train_idx_local: &[usize],
+    test_idx_local: &[usize],
+) -> usize {
+    let train_words = if sample_indices_are_full_identity(train_idx_local, logic_bits.n_samples) {
+        logic_bits.row_words
+    } else {
+        words_for_samples(train_idx_local.len())
+    };
+    let test_words = if train_idx_local == test_idx_local {
+        0
+    } else if sample_indices_are_full_identity(test_idx_local, logic_bits.n_samples) {
+        logic_bits.row_words
+    } else {
+        words_for_samples(test_idx_local.len())
+    };
+    let planes = if logic_bits.bits_hi_flat.is_some() {
+        2usize
+    } else {
+        1usize
+    };
+    null_prepared.iter().fold(0usize, |total, (_, prepared)| {
+        let words = train_words.saturating_add(test_words);
+        total.saturating_add(
+            prepared
+                .selected_global_rows
+                .len()
+                .saturating_mul(words)
+                .saturating_mul(planes)
+                .saturating_mul(std::mem::size_of::<u64>()),
+        )
+    })
 }
 
 #[inline]
@@ -11187,12 +11239,12 @@ fn process_scan_unit_continuous(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-fn process_rule_permutation_task_chunk(
+fn process_rule_permutation_task_chunk<'bits>(
     slot_indices: &[usize],
     rep_start: usize,
     rep_end: usize,
     null_prepared: &[(GarfieldPermutationNullSource, GarfieldUnitPrepared)],
+    prepared_bits_cache: Option<&[GarfieldUnitBitMatrices<'bits>]>,
     logic_bits: &GarfieldLogicBits,
     train_idx_local: &[usize],
     test_idx_local: &[usize],
@@ -11214,16 +11266,35 @@ fn process_rule_permutation_task_chunk(
     for &slot in slot_indices.iter() {
         check_ctrlc()?;
         let (source, prepared) = &null_prepared[slot];
-        let prepared_bits = materialize_prepared_bit_matrices(
-            prepared,
-            logic_bits,
-            train_idx_local,
-            test_idx_local,
-            false,
-        )?;
-        if let Some(tracker) = mem_tracker {
-            tracker.sample_now();
+        let prepared_bits_owned = if prepared_bits_cache.is_none() {
+            Some(materialize_prepared_bit_matrices(
+                prepared,
+                logic_bits,
+                train_idx_local,
+                test_idx_local,
+                false,
+            )?)
+        } else {
+            None
+        };
+        if prepared_bits_cache.is_none() {
+            if let Some(tracker) = mem_tracker {
+                tracker.sample_now();
+            }
         }
+        let prepared_bits = if let Some(cache) = prepared_bits_cache {
+            cache.get(slot).ok_or_else(|| {
+                format!(
+                    "GARFIELD permutation bit cache missing slot {} (cache size={})",
+                    slot,
+                    cache.len()
+                )
+            })?
+        } else {
+            prepared_bits_owned
+                .as_ref()
+                .expect("permutation bit materialization must exist when cache is disabled")
+        };
         for rep in rep_start..rep_end {
             if ((rep - rep_start) & 7) == 0 {
                 check_ctrlc()?;
@@ -12144,6 +12215,7 @@ fn garfield_logic_search_bed_owned(
     prior_len: Option<Vec<f64>>,
     no_clean: bool,
     raw_design: bool,
+    filter_xor_substates: bool,
     whole_genome_dev_mode: bool,
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
@@ -12701,6 +12773,7 @@ fn garfield_logic_search_bed_owned(
         group_constraint: BeamGroupConstraintMode::AlwaysExclude,
         allow_parallel: true,
         whole_genome_dev_mode,
+        filter_xor_substates,
     };
     let total_units = units.len();
     let scan_unit_indices = if grouped_active_mode {
@@ -13280,6 +13353,52 @@ fn garfield_logic_search_bed_owned(
         } else {
             None
         };
+        // A null slot is evaluated for several permutation repeats. Keep its
+        // prepared bit matrix alive across repeats instead of rebuilding the
+        // same row gathers and allocations for every slot x repeat job. Fall
+        // back to the historical per-slot materialization when the estimated
+        // cache would exceed the bounded memory budget.
+        let permutation_bits_cache = if estimate_permutation_bits_cache_bytes(
+            null_prepared.as_slice(),
+            &logic_bits,
+            train_idx_local.as_slice(),
+            test_idx_local.as_slice(),
+        ) <= garfield_perm_bits_cache_max_bytes()
+        {
+            let cache = if let Some(pool) = perm_pool.as_ref() {
+                pool.install(|| {
+                    null_prepared
+                        .par_iter()
+                        .map(|(_, prepared)| {
+                            materialize_prepared_bit_matrices(
+                                prepared,
+                                &logic_bits,
+                                train_idx_local.as_slice(),
+                                test_idx_local.as_slice(),
+                                false,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, String>>()
+                })?
+            } else {
+                null_prepared
+                    .iter()
+                    .map(|(_, prepared)| {
+                        materialize_prepared_bit_matrices(
+                            prepared,
+                            &logic_bits,
+                            train_idx_local.as_slice(),
+                            test_idx_local.as_slice(),
+                            false,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, String>>()?
+            };
+            null_mem_tracker.sample_now();
+            Some(cache)
+        } else {
+            None
+        };
         let max_perm_repeats = perm_cfg.n_repeats.max(1);
         let mut rep_start = 0usize;
         'perm_batches: while rep_start < max_perm_repeats {
@@ -13287,7 +13406,11 @@ fn garfield_logic_search_bed_owned(
             let n_slots = null_prepared.len();
             let slot_indices = (0..n_slots).collect::<Vec<_>>();
             let slot_grain = if perm_threads > 1 {
-                n_slots.div_ceil(perm_threads.saturating_mul(4)).max(1)
+                let default_grain = n_slots.div_ceil(perm_threads.saturating_mul(4)).max(1);
+                match garfield_perm_slot_task_max_slots() {
+                    0 => default_grain,
+                    max_slots => default_grain.min(max_slots.max(1)),
+                }
             } else {
                 n_slots.max(1)
             };
@@ -13303,6 +13426,7 @@ fn garfield_logic_search_bed_owned(
                                 rep_start,
                                 rep_end,
                                 null_prepared.as_slice(),
+                                permutation_bits_cache.as_deref(),
                                 &logic_bits,
                                 train_idx_local.as_slice(),
                                 test_idx_local.as_slice(),
@@ -13330,6 +13454,7 @@ fn garfield_logic_search_bed_owned(
                             rep_start,
                             rep_end,
                             null_prepared.as_slice(),
+                            permutation_bits_cache.as_deref(),
                             &logic_bits,
                             train_idx_local.as_slice(),
                             test_idx_local.as_slice(),
@@ -14153,6 +14278,7 @@ pub fn garfield_debug_probe_single_group_from_files(
         None,
         false,
         false,
+        true,
         false,
         None,
         0usize,
@@ -14222,6 +14348,7 @@ pub fn garfield_debug_probe_single_group_from_files(
     prior_len=None,
     no_clean=false,
     raw_design=false,
+    filter_xor_substates=true,
     whole_genome_dev_mode=false,
     progress_callback=None,
     progress_every=0
@@ -14287,6 +14414,7 @@ pub fn garfield_logic_search_bed_py<'py>(
     prior_len: Option<Vec<f64>>,
     no_clean: bool,
     raw_design: bool,
+    filter_xor_substates: bool,
     whole_genome_dev_mode: bool,
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
@@ -14399,6 +14527,7 @@ pub fn garfield_logic_search_bed_py<'py>(
                 prior_len,
                 no_clean,
                 raw_design,
+                filter_xor_substates,
                 whole_genome_dev_mode,
                 progress_callback,
                 progress_every,

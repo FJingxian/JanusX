@@ -2595,6 +2595,14 @@ def main() -> None:
         help=argparse.SUPPRESS,
     )
     optional_group.add_argument(
+        "-nf-xor",
+        "--nf-xor",
+        action="store_true",
+        dest="disable_xor_substate_filter",
+        default=False,
+        help=argparse.SUPPRESS,
+    )
+    optional_group.add_argument(
         "-global",
         "--global",
         dest="global_stats",
@@ -3219,6 +3227,7 @@ def main() -> None:
                 prior_len=None,
                 no_clean=bool(args.no_clean),
                 raw_design=bool(args.raw_design),
+                filter_xor_substates=not bool(args.disable_xor_substate_filter),
                 whole_genome_dev_mode=bool(str(args.scan_mode).lower() == "wholegenome"),
                 progress_callback=progress_cb,
                 progress_every=0,
@@ -3428,6 +3437,7 @@ def main() -> None:
             "rank_schedule_runtime": rank_schedule_runtime,
             "rank_score": rank_score_runtime,
             "rank_score_runtime": rank_score_runtime,
+            "xor_substate_lmaf_filter": not bool(args.disable_xor_substate_filter),
             "ml_top_k": (None if ml_skipped else int(args.ml_top_k_runtime)),
             "extension": int(args.extension),
             "step": int(args.step),

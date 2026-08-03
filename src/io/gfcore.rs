@@ -164,6 +164,62 @@ impl BimChunkReader {
         Ok(sites)
     }
 
+    /// Read a sequential BIM range while materializing only rows selected by
+    /// `keep`. Unselected rows are still checked for the six required BIM
+    /// fields, but their String payload is never allocated.
+    pub fn read_range_masked(
+        &mut self,
+        start: usize,
+        end: usize,
+        keep: &[bool],
+    ) -> Result<Vec<SiteInfo>, String> {
+        if start > end {
+            return Err(format!("invalid BIM range: start {start} > end {end}"));
+        }
+        if keep.len() != end.saturating_sub(start) {
+            return Err(format!(
+                "BIM mask length mismatch: got {}, expected {}",
+                keep.len(),
+                end.saturating_sub(start)
+            ));
+        }
+        if start < self.next_row {
+            return Err(format!(
+                "BIM range must be read sequentially: requested start {start} < current {}",
+                self.next_row
+            ));
+        }
+
+        while self.next_row < start {
+            self.read_next_line()?.ok_or_else(|| {
+                format!(
+                    "BIM ended early: needed row {start} but only saw {} rows from {}",
+                    self.next_row,
+                    self.path.display()
+                )
+            })?;
+        }
+
+        let kept_n = keep.iter().filter(|&&selected| selected).count();
+        let mut sites = Vec::with_capacity(kept_n);
+        for &selected in keep.iter() {
+            let (row_idx, line) = self.read_next_line()?.ok_or_else(|| {
+                format!(
+                    "BIM ended early: needed row {end} but only saw {} rows from {}",
+                    self.next_row,
+                    self.path.display()
+                )
+            })?;
+            let line = line.trim_end();
+            if selected {
+                sites.push(parse_bim_line(&self.path, row_idx + 1, line)?);
+            } else {
+                validate_bim_line_shape(&self.path, row_idx + 1, line)?;
+            }
+        }
+        Ok(sites)
+    }
+
     pub fn read_selected_rows(&mut self, row_indices: &[usize]) -> Result<Vec<SiteInfo>, String> {
         if row_indices.is_empty() {
             return Ok(Vec::new());
@@ -222,17 +278,25 @@ impl BimChunkReader {
         ))
     }
 
-    fn read_next_site(&mut self) -> Result<Option<SiteInfo>, String> {
+    fn read_next_line(&mut self) -> Result<Option<(usize, String)>, String> {
         let mut line = String::new();
+        let line_no = self.next_row + 1;
         let bytes = self
             .reader
             .read_line(&mut line)
-            .map_err(|e| format!("{}:{}: {}", self.path.display(), self.next_row + 1, e))?;
+            .map_err(|e| format!("{}:{}: {}", self.path.display(), line_no, e))?;
         if bytes == 0 {
             return Ok(None);
         }
         let row_idx = self.next_row;
         self.next_row = self.next_row.saturating_add(1);
+        Ok(Some((row_idx, line)))
+    }
+
+    fn read_next_site(&mut self) -> Result<Option<SiteInfo>, String> {
+        let Some((row_idx, line)) = self.read_next_line()? else {
+            return Ok(None);
+        };
         parse_bim_line(&self.path, row_idx + 1, line.trim_end()).map(Some)
     }
 }
@@ -316,6 +380,14 @@ pub(crate) struct DecodedSnpRowCounts {
     pub(crate) alt_sum: f64,
     pub(crate) non_missing: usize,
     pub(crate) het_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DecodedSnpPureLineCounts {
+    pub(crate) logic_missing: usize,
+    pub(crate) hom_alt: usize,
+    pub(crate) has_raw_missing: bool,
+    pub(crate) has_het: bool,
 }
 
 #[inline]
@@ -1405,6 +1477,19 @@ fn parse_bim_line(path: &Path, line_no: usize, line: &str) -> Result<SiteInfo, S
     })
 }
 
+#[inline]
+fn validate_bim_line_shape(path: &Path, line_no: usize, line: &str) -> Result<(), String> {
+    let mut cols = line.split_whitespace();
+    if (0..6).any(|_| cols.next().is_none()) {
+        return Err(format!(
+            "Malformed BIM line at {}:{}: {line}",
+            path.display(),
+            line_no
+        ));
+    }
+    Ok(())
+}
+
 fn read_bim_columns_file(
     path: &Path,
     row_indices: Option<&[usize]>,
@@ -2220,6 +2305,39 @@ impl BedSnpIter {
     }
 
     #[inline]
+    fn decode_snp_bytes_pure_line_counts_only(&self, snp_bytes: &[u8]) -> DecodedSnpPureLineCounts {
+        let byte_lut = packed_byte_lut();
+        let mut counts = DecodedSnpPureLineCounts::default();
+        let full_bytes = self.n_samples / 4;
+        let rem = self.n_samples % 4;
+        for &b in snp_bytes.iter().take(full_bytes) {
+            let idx = b as usize;
+            counts.logic_missing += byte_lut.logic_missing[idx] as usize;
+            counts.hom_alt += byte_lut.hom_alt[idx] as usize;
+            counts.has_raw_missing |= byte_lut.has_raw_missing[idx];
+            counts.has_het |= byte_lut.has_het[idx];
+        }
+        if rem > 0 {
+            let codes = &byte_lut.code4[snp_bytes[full_bytes] as usize];
+            for &code in codes.iter().take(rem) {
+                match code {
+                    0b01 => {
+                        counts.logic_missing += 1;
+                        counts.has_raw_missing = true;
+                    }
+                    0b10 => {
+                        counts.logic_missing += 1;
+                        counts.has_het = true;
+                    }
+                    0b11 => counts.hom_alt += 1,
+                    _ => {}
+                }
+            }
+        }
+        counts
+    }
+
+    #[inline]
     fn decode_snp_bytes_selected_into_with_counts(
         &self,
         snp_bytes: &[u8],
@@ -2313,6 +2431,17 @@ impl BedSnpIter {
         }
         let snp_bytes = self.snp_bytes(snp_idx)?;
         Some(self.decode_snp_bytes_counts_only(snp_bytes))
+    }
+
+    pub fn decode_snp_pure_line_counts_only_at(
+        &self,
+        snp_idx: usize,
+    ) -> Option<DecodedSnpPureLineCounts> {
+        if snp_idx >= self.n_snps {
+            return None;
+        }
+        let snp_bytes = self.snp_bytes(snp_idx)?;
+        Some(self.decode_snp_bytes_pure_line_counts_only(snp_bytes))
     }
 
     pub fn decode_snp_selected_counts_only_at(
@@ -3337,9 +3466,9 @@ impl TxtSnpIter {
 #[cfg(test)]
 mod tests {
     use super::{
-        process_snp_row_with_stats, process_snp_row_with_stats_preserve_alt, read_bim, TxtSnpIter,
-        BIN01_MAGIC, BIN_SITE_MAGIC, LEGACY_BSITE_HEADER_LEN, LEGACY_BSITE_MAGIC,
-        LEGACY_BSITE_VERSION,
+        process_snp_row_with_stats, process_snp_row_with_stats_preserve_alt, read_bim,
+        BimChunkReader, TxtSnpIter, BIN01_MAGIC, BIN_SITE_MAGIC, LEGACY_BSITE_HEADER_LEN,
+        LEGACY_BSITE_MAGIC, LEGACY_BSITE_VERSION,
     };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3426,6 +3555,29 @@ mod tests {
         assert!((row1[1] - 0.5).abs() < 1e-6);
         assert!((row1[2] + 0.6).abs() < 1e-6);
         assert!(it.next_snp().is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bim_chunk_reader_masked_range_only_materializes_kept_rows() {
+        let dir = make_temp_dir("bim_masked_range");
+        let prefix = dir.join("toy");
+        let bim_path = prefix.with_extension("bim");
+        fs::write(
+            &bim_path,
+            "1 rs1 0 10 A G\n1 rs2 0 20 C T\n1 rs3 0 30 G A\n1 rs4 0 40 T C\n",
+        )
+        .unwrap();
+
+        let mut reader = BimChunkReader::open(prefix.to_str().unwrap()).unwrap();
+        let sites = reader
+            .read_range_masked(0, 4, &[false, true, false, true])
+            .unwrap();
+        assert_eq!(sites.len(), 2);
+        assert_eq!(sites[0].snp, "rs2");
+        assert_eq!(sites[1].snp, "rs4");
+        reader.ensure_exhausted(4).unwrap();
 
         let _ = fs::remove_dir_all(&dir);
     }

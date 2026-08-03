@@ -30,6 +30,13 @@ pub(crate) struct PackedByteLut {
     pub(crate) nonmiss: [u8; 256],
     pub(crate) alt_sum: [u8; 256],
     pub(crate) het_sum: [u8; 256],
+    pub(crate) logic_missing: [u8; 256],
+    pub(crate) hom_alt: [u8; 256],
+    pub(crate) logic_alt_bits: [u8; 256],
+    pub(crate) logic_ref_bits: [u8; 256],
+    pub(crate) logic_missing_bits: [u8; 256],
+    pub(crate) has_raw_missing: [bool; 256],
+    pub(crate) has_het: [bool; 256],
     pub(crate) sq_sum: [u8; 256],
     pub(crate) code4: [[u8; 4]; 256],
 }
@@ -40,6 +47,13 @@ pub(crate) fn packed_byte_lut() -> &'static PackedByteLut {
         let mut nonmiss = [0u8; 256];
         let mut alt_sum = [0u8; 256];
         let mut het_sum = [0u8; 256];
+        let mut logic_missing = [0u8; 256];
+        let mut hom_alt = [0u8; 256];
+        let mut logic_alt_bits = [0u8; 256];
+        let mut logic_ref_bits = [0u8; 256];
+        let mut logic_missing_bits = [0u8; 256];
+        let mut has_raw_missing = [false; 256];
+        let mut has_het = [false; 256];
         let mut sq_sum = [0u8; 256];
         let mut code4 = [[0u8; 4]; 256];
         for b in 0u16..=255 {
@@ -47,6 +61,13 @@ pub(crate) fn packed_byte_lut() -> &'static PackedByteLut {
             let mut nm = 0u8;
             let mut alt = 0u8;
             let mut het = 0u8;
+            let mut logic_miss = 0u8;
+            let mut hom_alt_count = 0u8;
+            let mut alt_bits = 0u8;
+            let mut ref_bits = 0u8;
+            let mut missing_bits = 0u8;
+            let mut raw_missing = false;
+            let mut has_heterozygote = false;
             let mut sq = 0u8;
             let mut codes = [0u8; 4];
             for lane in 0..4usize {
@@ -55,17 +76,28 @@ pub(crate) fn packed_byte_lut() -> &'static PackedByteLut {
                 match code {
                     0b00 => {
                         nm += 1;
+                        ref_bits |= 1u8 << lane;
                     }
                     0b10 => {
                         nm += 1;
                         alt += 1;
                         het += 1;
+                        logic_miss += 1;
+                        missing_bits |= 1u8 << lane;
+                        has_heterozygote = true;
                         sq += 1;
                     }
                     0b11 => {
                         nm += 1;
                         alt += 2;
+                        hom_alt_count += 1;
+                        alt_bits |= 1u8 << lane;
                         sq += 4;
+                    }
+                    0b01 => {
+                        logic_miss += 1;
+                        missing_bits |= 1u8 << lane;
+                        raw_missing = true;
                     }
                     _ => {}
                 }
@@ -74,6 +106,13 @@ pub(crate) fn packed_byte_lut() -> &'static PackedByteLut {
             nonmiss[idx] = nm;
             alt_sum[idx] = alt;
             het_sum[idx] = het;
+            logic_missing[idx] = logic_miss;
+            hom_alt[idx] = hom_alt_count;
+            logic_alt_bits[idx] = alt_bits;
+            logic_ref_bits[idx] = ref_bits;
+            logic_missing_bits[idx] = missing_bits;
+            has_raw_missing[idx] = raw_missing;
+            has_het[idx] = has_heterozygote;
             sq_sum[idx] = sq;
             code4[idx] = codes;
         }
@@ -81,6 +120,13 @@ pub(crate) fn packed_byte_lut() -> &'static PackedByteLut {
             nonmiss,
             alt_sum,
             het_sum,
+            logic_missing,
+            hom_alt,
+            logic_alt_bits,
+            logic_ref_bits,
+            logic_missing_bits,
+            has_raw_missing,
+            has_het,
             sq_sum,
             code4,
         }

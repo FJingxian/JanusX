@@ -34,6 +34,7 @@ use self::permutation::{
     DEFAULT_RULE_STRUCTURE_BOOTSTRAP_MAX_REPEATS, DEFAULT_RULE_STRUCTURE_BOOTSTRAP_MIN_REPEATS,
     DEFAULT_RULE_STRUCTURE_BOOTSTRAP_STABLE_REPEATS, DEFAULT_RULE_STRUCTURE_DENSITY_TOPK,
 };
+use crate::bedmath::packed_byte_lut;
 use crate::bincore::{
     append_suffix, bin01_header_bytes, bin01_id_sidecar_path, bin_prefix, build_windows_from_sites,
     discover_id_sidecar, discover_site_sidecar, parse_bin01_header, resolve_bin01_path, BinWindow,
@@ -51,13 +52,15 @@ use crate::bstats::{apply_tail_mask, tail_mask, words_for_samples};
 use crate::eigh::load_square_matrix_f64_from_file;
 use crate::gblup::{build_grm_from_meta_stream, StreamKernelMode};
 use crate::gfcore::{
-    process_snp_row, read_fam, BedSnpIter, HmpSnpIter, SiteInfo, TxtSnpIter, VcfSnpIter,
+    process_snp_row, read_fam, BedSnpIter, BimChunkReader, HmpSnpIter, SiteInfo, TxtSnpIter,
+    VcfSnpIter,
 };
 use crate::gfreader::{
     build_sample_selection, compute_bed_row_meta_owned_for_source_rows,
-    prepare_bed_logic_meta_owned_for_stats_samples_pure_line,
+    prepare_bed_logic_meta_owned_for_precomputed_site_keep,
     prepare_bed_logic_meta_owned_for_stats_samples_pure_line_intervals,
     prepare_bed_logic_meta_owned_for_stats_samples_pure_line_with_mmap_window,
+    sample_indices_are_identity,
 };
 use crate::gload::load_file_owned;
 use crate::ml::common::{
@@ -2134,8 +2137,8 @@ fn allocate_stratified_chunk_quotas(
     quotas
 }
 
-fn sample_null_chunks_stratified(
-    sites: &[SiteInfo],
+fn sample_null_chunks_stratified<S: GarfieldChromPosSite>(
+    sites: &[S],
     extension: usize,
     target_chunks: usize,
     min_snp_count: usize,
@@ -2881,6 +2884,225 @@ fn build_logic_sites_from_metadata(
 }
 
 #[inline]
+fn intern_logic_site_text_owned(pool: &mut HashSet<Arc<str>>, text: &str) -> Arc<str> {
+    if let Some(existing) = pool.get(text) {
+        return existing.clone();
+    }
+    let shared: Arc<str> = Arc::from(text);
+    pool.insert(shared.clone());
+    shared
+}
+
+fn build_logic_sites_from_metadata_owned_direct(
+    sites: Vec<SiteInfo>,
+    row_flip: &[bool],
+    mode: GarfieldBinMode,
+) -> Vec<GarfieldLogicSite> {
+    let row_mul = match mode {
+        GarfieldBinMode::Bin => 1usize,
+        GarfieldBinMode::Mbin => 3usize,
+    };
+    if row_flip.len() != sites.len() {
+        panic!(
+            "build_logic_sites_from_metadata_owned row_flip/site mismatch: row_flip={}, sites={}",
+            row_flip.len(),
+            sites.len()
+        );
+    }
+    let use_inherited_snp_names = garfield_sites_have_distinct_snp_names(sites.as_slice());
+    let mut out = Vec::<GarfieldLogicSite>::with_capacity(sites.len().saturating_mul(row_mul));
+    let mut chrom_pool = HashSet::<Arc<str>>::new();
+    let mut snp_pool = HashSet::<Arc<str>>::new();
+    let mut allele_pool = HashSet::<Arc<str>>::new();
+    for (site_idx, site) in sites.into_iter().enumerate() {
+        let SiteInfo {
+            chrom: chrom_text,
+            pos,
+            snp: snp_text,
+            ref_allele: ref_text_owned,
+            alt_allele: alt_text_owned,
+        } = site;
+        let chrom = intern_logic_site_text_owned(&mut chrom_pool, chrom_text.as_str());
+        let snp_name = if use_inherited_snp_names {
+            if snp_text.trim().len() == snp_text.len() {
+                Arc::<str>::from(snp_text)
+            } else {
+                Arc::<str>::from(snp_text.trim())
+            }
+        } else {
+            let fallback = format!("{}_{}", chrom_text, pos);
+            intern_logic_site_text_owned(&mut snp_pool, fallback.as_str())
+        };
+        let flip = row_flip[site_idx];
+        let (ref_text, alt_text) = if flip {
+            (alt_text_owned.as_str(), ref_text_owned.as_str())
+        } else {
+            (ref_text_owned.as_str(), alt_text_owned.as_str())
+        };
+        let ref_allele = intern_logic_site_text_owned(&mut allele_pool, ref_text);
+        let alt_allele = intern_logic_site_text_owned(&mut allele_pool, alt_text);
+        let push_mode = |out: &mut Vec<GarfieldLogicSite>, mode_one: GarfieldLogicSiteMode| {
+            out.push(GarfieldLogicSite {
+                chrom: chrom.clone(),
+                pos,
+                snp: snp_name.clone(),
+                ref_allele: ref_allele.clone(),
+                alt_allele: alt_allele.clone(),
+                mode: mode_one,
+            });
+        };
+        match mode {
+            GarfieldBinMode::Bin => push_mode(&mut out, GarfieldLogicSiteMode::Bin),
+            GarfieldBinMode::Mbin => {
+                push_mode(&mut out, GarfieldLogicSiteMode::Dom);
+                push_mode(&mut out, GarfieldLogicSiteMode::Rec);
+                push_mode(&mut out, GarfieldLogicSiteMode::Het);
+            }
+        }
+    }
+    out
+}
+
+/// Build final logic-site metadata directly from the retained BIM rows.
+///
+/// The normal window path can retain millions of SNPs. Materializing a
+/// `Vec<SiteInfo>` first duplicates the metadata allocation while it is
+/// immediately converted into `GarfieldLogicSite`. Stream selected BIM rows
+/// instead, keeping only the final representation. Duplicate or missing BIM
+/// IDs retain the historical chrom_pos fallback.
+fn build_logic_sites_from_bim_owned_direct(
+    prefix: &str,
+    n_snps_total: usize,
+    row_source_indices: &[usize],
+    row_flip: &[bool],
+    mode: GarfieldBinMode,
+) -> Result<Vec<GarfieldLogicSite>, String> {
+    if row_source_indices.len() != row_flip.len() {
+        return Err(format!(
+            "BIM logic metadata row mismatch: source_rows={}, row_flip={}",
+            row_source_indices.len(),
+            row_flip.len()
+        ));
+    }
+    if row_source_indices.is_empty() {
+        return Err("BIM logic metadata has no retained rows".to_string());
+    }
+    if row_source_indices.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err("BIM logic metadata source rows must be strictly increasing".to_string());
+    }
+    if row_source_indices.last().copied().unwrap_or(0) >= n_snps_total {
+        return Err(format!(
+            "BIM logic metadata source row out of range: max={} n_snps={}",
+            row_source_indices.last().copied().unwrap_or(0),
+            n_snps_total
+        ));
+    }
+
+    let row_mul = match mode {
+        GarfieldBinMode::Bin => 1usize,
+        GarfieldBinMode::Mbin => 3usize,
+    };
+    let mut out =
+        Vec::<GarfieldLogicSite>::with_capacity(row_source_indices.len().saturating_mul(row_mul));
+    let mut chrom_pool = HashSet::<Arc<str>>::new();
+    let mut snp_pool = HashSet::<Arc<str>>::new();
+    let mut allele_pool = HashSet::<Arc<str>>::new();
+    let mut inherited_names_valid = true;
+    let mut source_cursor = 0usize;
+    let mut site_idx = 0usize;
+    let chunk_rows = 131_072usize;
+    let mut bim = BimChunkReader::open(&normalize_plink_prefix(prefix))?;
+
+    let mut append_site = |site: SiteInfo| {
+        let SiteInfo {
+            chrom: chrom_text,
+            pos,
+            snp: snp_text,
+            ref_allele: ref_text_owned,
+            alt_allele: alt_text_owned,
+        } = site;
+        let chrom = intern_logic_site_text_owned(&mut chrom_pool, chrom_text.as_str());
+        let snp_text = snp_text.trim();
+        let snp_name = if garfield_snp_name_missing(snp_text) {
+            inherited_names_valid = false;
+            Arc::<str>::from("")
+        } else {
+            let candidate = Arc::<str>::from(snp_text);
+            if !snp_pool.insert(candidate.clone()) {
+                inherited_names_valid = false;
+            }
+            candidate
+        };
+        let flip = row_flip[site_idx];
+        let (ref_text, alt_text) = if flip {
+            (alt_text_owned.as_str(), ref_text_owned.as_str())
+        } else {
+            (ref_text_owned.as_str(), alt_text_owned.as_str())
+        };
+        let ref_allele = intern_logic_site_text_owned(&mut allele_pool, ref_text);
+        let alt_allele = intern_logic_site_text_owned(&mut allele_pool, alt_text);
+        let push_mode = |out: &mut Vec<GarfieldLogicSite>, mode_one: GarfieldLogicSiteMode| {
+            out.push(GarfieldLogicSite {
+                chrom: chrom.clone(),
+                pos,
+                snp: snp_name.clone(),
+                ref_allele: ref_allele.clone(),
+                alt_allele: alt_allele.clone(),
+                mode: mode_one,
+            });
+        };
+        match mode {
+            GarfieldBinMode::Bin => push_mode(&mut out, GarfieldLogicSiteMode::Bin),
+            GarfieldBinMode::Mbin => {
+                push_mode(&mut out, GarfieldLogicSiteMode::Dom);
+                push_mode(&mut out, GarfieldLogicSiteMode::Rec);
+                push_mode(&mut out, GarfieldLogicSiteMode::Het);
+            }
+        }
+        site_idx += 1;
+    };
+
+    let mut base = 0usize;
+    while base < n_snps_total {
+        let end = (base + chunk_rows).min(n_snps_total);
+        let mut keep = vec![false; end - base];
+        while source_cursor < row_source_indices.len() && row_source_indices[source_cursor] < end {
+            let source_row = row_source_indices[source_cursor];
+            if source_row < base {
+                return Err(format!(
+                    "BIM logic metadata source row moved backwards: row={} base={}",
+                    source_row, base
+                ));
+            }
+            keep[source_row - base] = true;
+            source_cursor += 1;
+        }
+        for site in bim.read_range_masked(base, end, keep.as_slice())? {
+            append_site(site);
+        }
+        base = end;
+    }
+    bim.ensure_exhausted(n_snps_total)?;
+    if source_cursor != row_source_indices.len() || site_idx != row_source_indices.len() {
+        return Err(format!(
+            "BIM logic metadata selection mismatch: selected_rows={} source_rows={} sites={}",
+            source_cursor,
+            row_source_indices.len(),
+            site_idx
+        ));
+    }
+
+    if !inherited_names_valid {
+        let mut fallback_pool = HashSet::<Arc<str>>::new();
+        for site in out.iter_mut() {
+            let fallback = format!("{}_{}", site.chrom, site.pos);
+            site.snp = intern_logic_site_text_owned(&mut fallback_pool, fallback.as_str());
+        }
+    }
+    Ok(out)
+}
+
+#[inline]
 fn garfield_snp_name_missing(raw_name: &str) -> bool {
     let text = raw_name.trim();
     text.is_empty() || text == "." || text.eq_ignore_ascii_case("nan")
@@ -2890,13 +3112,15 @@ fn garfield_sites_have_distinct_snp_names(sites: &[SiteInfo]) -> bool {
     if sites.is_empty() {
         return false;
     }
-    let mut seen = HashSet::<String>::with_capacity(sites.len());
+    // Borrow BIM strings instead of allocating a second String for every
+    // marker while checking uniqueness.
+    let mut seen = HashSet::<&str>::with_capacity(sites.len());
     for site in sites.iter() {
         let snp_name = site.snp.trim();
         if garfield_snp_name_missing(snp_name) {
             return false;
         }
-        if !seen.insert(snp_name.to_string()) {
+        if !seen.insert(snp_name) {
             return false;
         }
     }
@@ -6807,6 +7031,150 @@ fn fill_bin_logic_row_bits(
     }
 }
 
+/// Materialize one binary logic row in a single genotype pass.
+///
+/// Known 0/2 calls are written immediately. Missing calls are kept in a
+/// reusable scratch row and merged only when the modal known state is 2.
+/// This preserves the existing mode imputation while avoiding a second full
+/// sample-plan decode for every SNP.
+#[inline]
+fn fill_bin_logic_row_bits_one_pass(
+    row: &[u8],
+    flip: bool,
+    sample_plan: &[LogicSamplePlanEntry],
+    dst_words: &mut [u64],
+    missing_words: &mut [u64],
+) {
+    debug_assert_eq!(dst_words.len(), missing_words.len());
+    missing_words.fill(0);
+    let mut c0 = 0usize;
+    let mut c2 = 0usize;
+    for entry in sample_plan.iter() {
+        let byte = row[entry.src_byte_idx];
+        for lane in 0..entry.n_lanes as usize {
+            let code = (byte >> entry.src_shifts[lane]) & 0b11;
+            let word_idx = entry.dst_word_idx[lane];
+            let bit = entry.dst_bit[lane];
+            match code {
+                0b00 => {
+                    if flip {
+                        c2 += 1;
+                        dst_words[word_idx] |= bit;
+                    } else {
+                        c0 += 1;
+                    }
+                }
+                0b10 => {
+                    missing_words[word_idx] |= bit;
+                }
+                0b11 => {
+                    if flip {
+                        c0 += 1;
+                    } else {
+                        c2 += 1;
+                        dst_words[word_idx] |= bit;
+                    }
+                }
+                0b01 => {
+                    missing_words[word_idx] |= bit;
+                }
+                _ => unreachable!("PLINK genotype code is two bits"),
+            }
+        }
+    }
+
+    if c2 > c0 {
+        for (dst, &missing) in dst_words.iter_mut().zip(missing_words.iter()) {
+            *dst |= missing;
+        }
+    }
+}
+
+/// Materialize a binary logic row directly when selected samples are the
+/// identity order. Each BED byte contributes one output nibble, avoiding the
+/// per-sample gather plan and its temporary missing bit row.
+#[inline]
+fn fill_bin_logic_row_bits_identity(
+    row: &[u8],
+    n_samples: usize,
+    flip: bool,
+    dst_words: &mut [u64],
+) {
+    let active_bytes = n_samples.div_ceil(4);
+    debug_assert!(row.len() >= active_bytes);
+    if active_bytes == 0 || dst_words.is_empty() {
+        return;
+    }
+
+    let lut = packed_byte_lut();
+    let rem_lanes = n_samples & 3;
+    let mut raw_c0 = 0usize;
+    let mut raw_c2 = 0usize;
+    for byte_idx in 0..active_bytes {
+        let active_lanes = if rem_lanes > 0 && byte_idx + 1 == active_bytes {
+            rem_lanes
+        } else {
+            4
+        };
+        let mut byte = row[byte_idx];
+        if active_lanes < 4 {
+            byte &= (1u8 << (active_lanes * 2)) - 1u8;
+        }
+        let idx = byte as usize;
+        let missing = lut.logic_missing[idx] as usize;
+        let hom_alt = lut.hom_alt[idx] as usize;
+        raw_c2 += hom_alt;
+        raw_c0 += active_lanes.saturating_sub(missing).saturating_sub(hom_alt);
+    }
+
+    // A flip swaps the two homozygous states, while heterozygotes and raw
+    // missing calls remain the mode-imputed missing state.
+    let mode_is_one = if flip {
+        raw_c0 > raw_c2
+    } else {
+        raw_c2 > raw_c0
+    };
+    for (word_idx, dst) in dst_words.iter_mut().enumerate() {
+        let byte_start = word_idx.saturating_mul(16);
+        let byte_end = (byte_start + 16).min(active_bytes);
+        let mut word = 0u64;
+        let mut missing = 0u64;
+        for byte_idx in byte_start..byte_end {
+            let active_lanes = if rem_lanes > 0 && byte_idx + 1 == active_bytes {
+                rem_lanes
+            } else {
+                4
+            };
+            let mut byte = row[byte_idx];
+            if active_lanes < 4 {
+                byte &= (1u8 << (active_lanes * 2)) - 1u8;
+            }
+            let idx = byte as usize;
+            let shift = ((byte_idx - byte_start) * 4) as u32;
+            let one_bits = if flip {
+                lut.logic_ref_bits[idx]
+            } else {
+                lut.logic_alt_bits[idx]
+            };
+            word |= (one_bits as u64) << shift;
+            missing |= (lut.logic_missing_bits[idx] as u64) << shift;
+        }
+        if mode_is_one {
+            word |= missing;
+        }
+        *dst = word;
+    }
+
+    let tail_bits = n_samples & 63;
+    if tail_bits > 0 {
+        if let Some(last) = dst_words.last_mut() {
+            if let Some(mask) = tail_mask(tail_bits) {
+                *last &= mask;
+            }
+        }
+    }
+}
+
 #[inline]
 #[allow(dead_code)]
 fn fill_bin_logic_row_bits_pure_line(
@@ -6925,6 +7293,99 @@ fn fill_mbin_logic_row_bits(
     }
 }
 
+#[inline]
+fn fill_mbin_logic_row_bits_one_pass(
+    row: &[u8],
+    flip: bool,
+    sample_plan: &[LogicSamplePlanEntry],
+    row_words: usize,
+    dst_words: &mut [u64],
+    missing_words: &mut [u64],
+) {
+    debug_assert_eq!(dst_words.len(), row_words.saturating_mul(3));
+    debug_assert_eq!(missing_words.len(), row_words);
+    missing_words.fill(0);
+    let mut c0 = 0usize;
+    let mut c1 = 0usize;
+    let mut c2 = 0usize;
+    let (dom_bits, rem) = dst_words.split_at_mut(row_words);
+    let (rec_bits, het_bits) = rem.split_at_mut(row_words);
+
+    for entry in sample_plan.iter() {
+        let byte = row[entry.src_byte_idx];
+        for lane in 0..entry.n_lanes as usize {
+            let code = (byte >> entry.src_shifts[lane]) & 0b11;
+            let word_idx = entry.dst_word_idx[lane];
+            let bit = entry.dst_bit[lane];
+            let g = match code {
+                0b00 => {
+                    if flip {
+                        2
+                    } else {
+                        0
+                    }
+                }
+                0b10 => 1,
+                0b11 => {
+                    if flip {
+                        0
+                    } else {
+                        2
+                    }
+                }
+                0b01 => {
+                    missing_words[word_idx] |= bit;
+                    continue;
+                }
+                _ => unreachable!("PLINK genotype code is two bits"),
+            };
+            match g {
+                0 => c0 += 1,
+                1 => {
+                    c1 += 1;
+                    dom_bits[word_idx] |= bit;
+                    het_bits[word_idx] |= bit;
+                }
+                2 => {
+                    c2 += 1;
+                    dom_bits[word_idx] |= bit;
+                    rec_bits[word_idx] |= bit;
+                }
+                _ => unreachable!("binary genotype state must be 0, 1, or 2"),
+            }
+        }
+    }
+
+    let mode3 = if c2 >= c1 && c2 >= c0 {
+        2usize
+    } else if c1 >= c0 {
+        1usize
+    } else {
+        0usize
+    };
+    if mode3 == 1 {
+        for (dom, het, &missing) in dom_bits
+            .iter_mut()
+            .zip(het_bits.iter_mut())
+            .zip(missing_words.iter())
+            .map(|((dom, het), missing)| (dom, het, missing))
+        {
+            *dom |= missing;
+            *het |= missing;
+        }
+    } else if mode3 == 2 {
+        for (dom, rec, &missing) in dom_bits
+            .iter_mut()
+            .zip(rec_bits.iter_mut())
+            .zip(missing_words.iter())
+            .map(|((dom, rec), missing)| (dom, rec, missing))
+        {
+            *dom |= missing;
+            *rec |= missing;
+        }
+    }
+}
+
 #[allow(dead_code)]
 fn convert_prepared_bed_to_logic_bits(
     packed: &[u8],
@@ -7020,10 +7481,11 @@ fn convert_bed_prefix_to_logic_bits(
     row_flip: &[bool],
     sites: Vec<SiteInfo>,
     sample_indices: &[usize],
-    sample_ids: &[String],
+    sample_ids: Vec<String>,
     mode: GarfieldBinMode,
     mem_tracker: Option<&GarfieldStageMemoryTracker>,
 ) -> Result<GarfieldLogicBits, String> {
+    let total_t0 = Instant::now();
     if bytes_per_snp == 0 {
         return Err("bytes_per_snp must be > 0".to_string());
     }
@@ -7041,18 +7503,19 @@ fn convert_bed_prefix_to_logic_bits(
             ));
         }
     }
-    if row_source_indices.len() != sites.len() {
+    let sites_deferred = sites.is_empty();
+    if !sites_deferred && row_source_indices.len() != sites.len() {
         return Err(format!(
             "row_source_indices/site metadata mismatch: rows={}, filtered sites={}",
             row_source_indices.len(),
             sites.len()
         ));
     }
-    if row_flip.len() != sites.len() {
+    if row_flip.len() != row_source_indices.len() {
         return Err(format!(
-            "row_flip/site metadata mismatch: row_flip={}, filtered sites={}",
+            "row_flip/source row metadata mismatch: row_flip={}, source_rows={}",
             row_flip.len(),
-            sites.len()
+            row_source_indices.len()
         ));
     }
     if row_source_indices.is_empty() {
@@ -7061,24 +7524,14 @@ fn convert_bed_prefix_to_logic_bits(
 
     let n_samples = sample_indices.len();
     let row_words = words_for_samples(n_samples);
+    let sample_identity =
+        sample_indices.len() == n_samples_total && sample_indices_are_identity(sample_indices);
     let sample_plan = build_logic_sample_plan(sample_indices);
-    let row_mul = match mode {
-        GarfieldBinMode::Bin => 1usize,
-        GarfieldBinMode::Mbin => 3usize,
-    };
-    let group_ids = build_logic_mode_group_ids(sites.len(), mode);
-    let out_sites = build_logic_sites_from_metadata(sites.as_slice(), row_flip, mode);
-    drop(sites);
-    let n_rows = out_sites.len();
-    let mut bits_flat = vec![0u64; n_rows.saturating_mul(row_words)];
-    let bits_hi_flat = None;
-    if let Some(tracker) = mem_tracker {
-        tracker.sample_now();
-    }
-
     let bed_prefix = normalize_plink_prefix(prefix);
+    let bed_open_t0 = Instant::now();
     let mut bed_iter =
         BedSnpIter::new_for_grm_window(bed_prefix.as_str(), garfield_logic_mmap_window_mb())?;
+    let bed_open_secs = bed_open_t0.elapsed().as_secs_f64();
     if bed_iter.n_samples() != n_samples_total {
         return Err(format!(
             "BED sample count mismatch while converting to logic bits: bed={}, expected={}",
@@ -7096,6 +7549,33 @@ fn convert_bed_prefix_to_logic_bits(
             bytes_per_snp
         ));
     }
+    let row_mul = match mode {
+        GarfieldBinMode::Bin => 1usize,
+        GarfieldBinMode::Mbin => 3usize,
+    };
+    let sites_t0 = Instant::now();
+    let out_sites = if sites.is_empty() {
+        build_logic_sites_from_bim_owned_direct(
+            prefix,
+            bed_iter.n_snps(),
+            row_source_indices,
+            row_flip,
+            mode,
+        )?
+    } else {
+        build_logic_sites_from_metadata_owned_direct(sites, row_flip, mode)
+    };
+    let sites_secs = sites_t0.elapsed().as_secs_f64();
+    let group_ids = build_logic_mode_group_ids(row_source_indices.len(), mode);
+    let n_rows = out_sites.len();
+    let bits_alloc_t0 = Instant::now();
+    let mut bits_flat = vec![0u64; n_rows.saturating_mul(row_words)];
+    let bits_alloc_secs = bits_alloc_t0.elapsed().as_secs_f64();
+    let bits_hi_flat = None;
+    if let Some(tracker) = mem_tracker {
+        tracker.sample_now();
+    }
+
     if let Some(&max_row) = row_source_indices.last() {
         if max_row >= bed_iter.n_snps() {
             return Err(format!(
@@ -7106,6 +7586,7 @@ fn convert_bed_prefix_to_logic_bits(
         }
     }
 
+    let fill_t0 = Instant::now();
     let mut kept_start = 0usize;
     while kept_start < row_source_indices.len() {
         check_ctrlc()?;
@@ -7132,49 +7613,90 @@ fn convert_bed_prefix_to_logic_bits(
         let dst_lo =
             &mut bits_flat[kept_start * row_mul * row_words..kept_end * row_mul * row_words];
         if matches!(mode, GarfieldBinMode::Bin) {
-            dst_lo
-                .par_chunks_mut(row_words)
-                .enumerate()
-                .for_each(|(off, dst_rows)| {
-                    let kept_idx = kept_start + off;
-                    let src_row = row_source_indices[kept_idx];
-                    let flip = row_flip[kept_idx];
-                    let row = bed_ref
-                        .packed_snp_bytes_at(src_row)
-                        .expect("windowed BED logic conversion row should be mapped");
-                    fill_bin_logic_row_bits(row, flip, sample_plan.as_slice(), dst_rows);
-                });
+            if sample_identity {
+                dst_lo
+                    .par_chunks_mut(row_words)
+                    .enumerate()
+                    .for_each(|(off, dst_rows)| {
+                        let kept_idx = kept_start + off;
+                        let src_row = row_source_indices[kept_idx];
+                        let flip = row_flip[kept_idx];
+                        let row = bed_ref
+                            .packed_snp_bytes_at(src_row)
+                            .expect("windowed BED logic conversion row should be mapped");
+                        fill_bin_logic_row_bits_identity(row, n_samples, flip, dst_rows);
+                    });
+            } else {
+                dst_lo.par_chunks_mut(row_words).enumerate().for_each_init(
+                    || vec![0u64; row_words],
+                    |missing_words, (off, dst_rows)| {
+                        let kept_idx = kept_start + off;
+                        let src_row = row_source_indices[kept_idx];
+                        let flip = row_flip[kept_idx];
+                        let row = bed_ref
+                            .packed_snp_bytes_at(src_row)
+                            .expect("windowed BED logic conversion row should be mapped");
+                        fill_bin_logic_row_bits_one_pass(
+                            row,
+                            flip,
+                            sample_plan.as_slice(),
+                            dst_rows,
+                            missing_words.as_mut_slice(),
+                        );
+                    },
+                );
+            }
         } else {
             dst_lo
                 .par_chunks_mut(row_mul * row_words)
                 .enumerate()
-                .for_each(|(off, dst_rows)| {
-                    let kept_idx = kept_start + off;
-                    let src_row = row_source_indices[kept_idx];
-                    let flip = row_flip[kept_idx];
-                    let row = bed_ref
-                        .packed_snp_bytes_at(src_row)
-                        .expect("windowed BED logic conversion row should be mapped");
-                    fill_mbin_logic_row_bits(
-                        row,
-                        flip,
-                        sample_plan.as_slice(),
-                        row_words,
-                        dst_rows,
-                    );
-                });
+                .for_each_init(
+                    || vec![0u64; row_words],
+                    |missing_words, (off, dst_rows)| {
+                        let kept_idx = kept_start + off;
+                        let src_row = row_source_indices[kept_idx];
+                        let flip = row_flip[kept_idx];
+                        let row = bed_ref
+                            .packed_snp_bytes_at(src_row)
+                            .expect("windowed BED logic conversion row should be mapped");
+                        fill_mbin_logic_row_bits_one_pass(
+                            row,
+                            flip,
+                            sample_plan.as_slice(),
+                            row_words,
+                            dst_rows,
+                            missing_words.as_mut_slice(),
+                        );
+                    },
+                );
         }
         if let Some(tracker) = mem_tracker {
             tracker.sample_now();
         }
         kept_start = kept_end;
     }
+    if env_truthy("JX_BED_LOGIC_META_TIMING") {
+        eprintln!(
+            "GARFIELD logic bits timing: sites={:.3}s, alloc={:.3}s, bed_open={:.3}s, fill={:.3}s, total={:.3}s, mode={:?}, source_rows={}, output_rows={}, samples={}, row_words={}, mmap_window_mb={}",
+            sites_secs,
+            bits_alloc_secs,
+            bed_open_secs,
+            fill_t0.elapsed().as_secs_f64(),
+            total_t0.elapsed().as_secs_f64(),
+            mode,
+            row_source_indices.len(),
+            n_rows,
+            n_samples,
+            row_words,
+            garfield_logic_mmap_window_mb(),
+        );
+    }
 
     Ok(GarfieldLogicBits {
         bits_flat,
         bits_hi_flat,
         row_words,
-        sample_ids: sample_ids.to_vec(),
+        sample_ids,
         sites: out_sites,
         group_ids,
         n_samples,
@@ -11751,39 +12273,24 @@ fn garfield_logic_search_bed_owned(
             meta.n_samples,
             meta.bytes_per_snp,
         )
-    } else if let Some(site_keep_precomputed) = site_keep_precomputed {
-        let _ = site_keep_precomputed;
-        let meta = prepare_bed_logic_meta_owned_for_stats_samples_pure_line(
-            &prefix,
-            maf_threshold,
-            max_missing_rate,
-            het_threshold,
-            snps_only,
-            Some(selected_sample_indices.as_slice()),
-        )?;
-        let logic_row_flip = if using_external_grm {
-            Some(meta.row_flip.clone())
-        } else {
-            None
-        };
-        (
-            meta.row_source_indices,
-            logic_row_flip,
-            meta.sites,
-            meta.n_samples,
-            meta.bytes_per_snp,
-        )
     } else {
-        let meta = prepare_bed_logic_meta_owned_for_stats_samples_pure_line(
-            &prefix,
-            maf_threshold,
-            max_missing_rate,
-            het_threshold,
-            snps_only,
-            Some(selected_sample_indices.as_slice()),
-        )?;
+        let meta = if let Some(site_keep_precomputed) = site_keep_precomputed {
+            prepare_bed_logic_meta_owned_for_precomputed_site_keep(&prefix, site_keep_precomputed)?
+        } else {
+            prepare_bed_logic_meta_owned_for_stats_samples_pure_line_with_mmap_window(
+                &prefix,
+                maf_threshold,
+                max_missing_rate,
+                het_threshold,
+                snps_only,
+                Some(selected_sample_indices.as_slice()),
+                false,
+                Some(garfield_logic_mmap_window_mb()),
+                threads_eff,
+            )?
+        };
         let logic_row_flip = if using_external_grm {
-            Some(meta.row_flip.clone())
+            Some(meta.row_flip)
         } else {
             None
         };
@@ -12096,17 +12603,6 @@ fn garfield_logic_search_bed_owned(
         logic_sites = active_meta.sites;
         logic_row_flip = active_meta.row_flip;
     }
-    let (null_chunks, mut null_chunk_valid_total) = if rule_permutation && !grouped_null_mode {
-        sample_null_chunks_stratified(
-            logic_sites.as_slice(),
-            extension.max(1),
-            DEFAULT_RULE_NULL_PHYSICAL_CHUNKS,
-            DEFAULT_RULE_NULL_MIN_SNPS_PER_CHUNK,
-            seed,
-        )?
-    } else {
-        (Vec::new(), grouped_null_pool_total)
-    };
     let global_bits_mem_tracker = GarfieldStageMemoryTracker::new(rss_debug_enabled);
     let global_bits_mem_start = global_bits_mem_tracker.start_stage();
     let logic_bits = convert_bed_prefix_to_logic_bits(
@@ -12117,10 +12613,12 @@ fn garfield_logic_search_bed_owned(
         logic_row_flip.as_slice(),
         logic_sites,
         selected_sample_indices.as_slice(),
-        selected_sample_ids.as_slice(),
+        selected_sample_ids,
         mode,
         Some(&global_bits_mem_tracker),
     )?;
+    drop(logic_row_source_indices);
+    drop(logic_row_flip);
     garfield_prepare_breakpoint(
         "logic_bits_ready",
         Some(&format!(
@@ -12132,6 +12630,17 @@ fn garfield_logic_search_bed_owned(
     if let Some(debug) = memory_debug.as_mut() {
         debug.global_bits_loaded = global_bits_mem_tracker.finish_stage(global_bits_mem_start);
     }
+    let (null_chunks, mut null_chunk_valid_total) = if rule_permutation && !grouped_null_mode {
+        sample_null_chunks_stratified(
+            logic_bits.sites.as_slice(),
+            extension.max(1),
+            DEFAULT_RULE_NULL_PHYSICAL_CHUNKS,
+            DEFAULT_RULE_NULL_MIN_SNPS_PER_CHUNK,
+            seed,
+        )?
+    } else {
+        (Vec::new(), grouped_null_pool_total)
+    };
     let units = if grouped_active_mode {
         build_logic_units(
             logic_bits.sites.as_slice(),
@@ -15989,6 +16498,33 @@ mod tests {
     }
 
     #[test]
+    fn test_owned_logic_sites_direct_builder_preserves_unique_and_duplicate_names() {
+        let unique = build_logic_sites_from_metadata_owned_direct(
+            vec![
+                test_named_site("1", 100, "rsA"),
+                test_named_site("1", 200, "rsB"),
+            ],
+            &[false, false],
+            GarfieldBinMode::Bin,
+        );
+        assert_eq!(unique.len(), 2);
+        assert_eq!(unique[0].snp.as_ref(), "rsA");
+        assert_eq!(unique[1].snp.as_ref(), "rsB");
+
+        let duplicate = build_logic_sites_from_metadata_owned_direct(
+            vec![
+                test_named_site("1", 100, "dup"),
+                test_named_site("1", 200, "dup"),
+            ],
+            &[false, false],
+            GarfieldBinMode::Bin,
+        );
+        assert_eq!(duplicate.len(), 2);
+        assert_eq!(duplicate[0].snp.as_ref(), "1_100");
+        assert_eq!(duplicate[1].snp.as_ref(), "1_200");
+    }
+
+    #[test]
     fn test_build_logic_sites_from_metadata_applies_row_flip_to_alleles() {
         let logic_sites = build_logic_sites_from_metadata(
             &vec![
@@ -17159,6 +17695,151 @@ mod tests {
             unpack_dual_bits(dst_ge1.as_slice(), dst_ge2.as_slice(), raw_row.len()),
             unpack_dual_bits(exp_ge1.as_slice(), exp_ge2.as_slice(), raw_row.len())
         );
+    }
+
+    #[test]
+    fn test_fill_bin_logic_row_bits_one_pass_matches_reference() {
+        fn pack_raw_hardcalls(geno: &[u8]) -> Vec<u8> {
+            let mut out = vec![0u8; geno.len().div_ceil(4)];
+            for (i, &g) in geno.iter().enumerate() {
+                let code = match g {
+                    0 => 0b00u8,
+                    1 => 0b10u8,
+                    2 => 0b11u8,
+                    _ => 0b01u8,
+                };
+                out[i >> 2] |= code << ((i & 3) * 2);
+            }
+            out
+        }
+
+        let raw_row = vec![0u8, 2, 3, 1, 2, 0, 1, 3, 2, 0, 1];
+        let packed_row = pack_raw_hardcalls(raw_row.as_slice());
+        let sample_indices = vec![10usize, 0, 7, 2, 8, 3, 5, 1, 9, 4, 6];
+        let sample_plan = build_logic_sample_plan(sample_indices.as_slice());
+        for flip in [false, true] {
+            let mut expected = vec![0u64; words_for_samples(sample_indices.len())];
+            fill_bin_logic_row_bits(
+                packed_row.as_slice(),
+                flip,
+                sample_plan.as_slice(),
+                expected.as_mut_slice(),
+            );
+
+            let mut actual = vec![0u64; expected.len()];
+            let mut missing = vec![0u64; expected.len()];
+            fill_bin_logic_row_bits_one_pass(
+                packed_row.as_slice(),
+                flip,
+                sample_plan.as_slice(),
+                actual.as_mut_slice(),
+                missing.as_mut_slice(),
+            );
+            assert_eq!(actual, expected, "flip={flip}");
+        }
+    }
+
+    #[test]
+    fn test_fill_bin_logic_row_bits_identity_matches_sample_plan() {
+        fn pack_raw_hardcalls(geno: &[u8]) -> Vec<u8> {
+            let mut out = vec![0u8; geno.len().div_ceil(4)];
+            for (i, &g) in geno.iter().enumerate() {
+                let code = match g {
+                    0 => 0b00u8,
+                    1 => 0b10u8,
+                    2 => 0b11u8,
+                    _ => 0b01u8,
+                };
+                out[i >> 2] |= code << ((i & 3) * 2);
+            }
+            out
+        }
+
+        let geno = (0usize..77)
+            .map(|i| match i % 4 {
+                0 => 0u8,
+                1 => 1u8,
+                2 => 2u8,
+                _ => 3u8,
+            })
+            .collect::<Vec<_>>();
+        let packed = pack_raw_hardcalls(geno.as_slice());
+        let sample_indices = (0..geno.len()).collect::<Vec<_>>();
+        let sample_plan = build_logic_sample_plan(sample_indices.as_slice());
+        for flip in [false, true] {
+            let mut expected = vec![0u64; words_for_samples(geno.len())];
+            fill_bin_logic_row_bits(
+                packed.as_slice(),
+                flip,
+                sample_plan.as_slice(),
+                expected.as_mut_slice(),
+            );
+
+            let mut actual = vec![0u64; expected.len()];
+            fill_bin_logic_row_bits_identity(
+                packed.as_slice(),
+                geno.len(),
+                flip,
+                actual.as_mut_slice(),
+            );
+            assert_eq!(actual, expected, "flip={flip}");
+
+            let mut one_pass = vec![0u64; expected.len()];
+            let mut one_pass_missing = vec![0u64; expected.len()];
+            fill_bin_logic_row_bits_one_pass(
+                packed.as_slice(),
+                flip,
+                sample_plan.as_slice(),
+                one_pass.as_mut_slice(),
+                one_pass_missing.as_mut_slice(),
+            );
+            assert_eq!(one_pass, expected, "one-pass flip={flip}");
+        }
+    }
+
+    #[test]
+    fn test_fill_mbin_logic_row_bits_one_pass_matches_reference() {
+        fn pack_raw_hardcalls(geno: &[u8]) -> Vec<u8> {
+            let mut out = vec![0u8; geno.len().div_ceil(4)];
+            for (i, &g) in geno.iter().enumerate() {
+                let code = match g {
+                    0 => 0b00u8,
+                    1 => 0b10u8,
+                    2 => 0b11u8,
+                    _ => 0b01u8,
+                };
+                out[i >> 2] |= code << ((i & 3) * 2);
+            }
+            out
+        }
+
+        let raw_row = vec![0u8, 2, 3, 1, 2, 0, 1, 3, 2, 0, 1];
+        let packed_row = pack_raw_hardcalls(raw_row.as_slice());
+        let sample_indices = vec![10usize, 0, 7, 2, 8, 3, 5, 1, 9, 4, 6];
+        let sample_plan = build_logic_sample_plan(sample_indices.as_slice());
+        let row_words = words_for_samples(sample_indices.len());
+        for flip in [false, true] {
+            let mut expected = vec![0u64; row_words * 3];
+            fill_mbin_logic_row_bits(
+                packed_row.as_slice(),
+                flip,
+                sample_plan.as_slice(),
+                row_words,
+                expected.as_mut_slice(),
+            );
+
+            let mut actual = vec![0u64; expected.len()];
+            let mut missing = vec![0u64; row_words];
+            fill_mbin_logic_row_bits_one_pass(
+                packed_row.as_slice(),
+                flip,
+                sample_plan.as_slice(),
+                row_words,
+                actual.as_mut_slice(),
+                missing.as_mut_slice(),
+            );
+            assert_eq!(actual, expected, "flip={flip}");
+        }
     }
 
     #[test]

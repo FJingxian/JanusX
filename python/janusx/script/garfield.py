@@ -3409,6 +3409,8 @@ def main() -> None:
             "rule_null_report_pvalue": bool(args.rule_null_report_pvalue_runtime),
             "rule_null_quantile_spec": args.rule_null_quantile_spec_runtime,
             "bg_noise_summary": result.get("bg_noise_summary"),
+            "scheduler_scan": result.get("scheduler_scan"),
+            "scheduler_permutation": result.get("scheduler_permutation"),
             "rule_permutation_active": bool(result.get("rule_permutation_active", False)),
             "null_chunk_bp": int(result.get("null_chunk_bp", 0)),
             "null_chunk_min_snps": int(result.get("null_chunk_min_snps", 0)),

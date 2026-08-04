@@ -2187,9 +2187,24 @@ fn binary_pair_intersection(
     y_train: &[f64],
     n_train: usize,
 ) -> BinaryPairIntersection {
+    binary_pair_intersection_with_lookup(parent_bits, row, y_train, n_train, None)
+}
+
+#[inline]
+fn binary_pair_intersection_with_lookup(
+    parent_bits: &[u64],
+    row: &[u64],
+    y_train: &[f64],
+    n_train: usize,
+    y_sum_lookup: Option<&PackedYSumLookup>,
+) -> BinaryPairIntersection {
     let n = and_popcount(parent_bits, row) as usize;
     let t_sum = beam_detail_profile_start();
-    let sum = sum_y_where_both1(parent_bits, row, y_train, n_train);
+    let sum = if let Some(lookup) = y_sum_lookup {
+        sum_y_where_both1_with_lookup(parent_bits, row, y_train, n_train, lookup)
+    } else {
+        sum_y_where_both1(parent_bits, row, y_train, n_train)
+    };
     beam_detail_profile_end(t_sum, &GARFIELD_PROFILE_SUM_Y_BOTH1_NS);
     BinaryPairIntersection { n, sum }
 }
@@ -3706,8 +3721,13 @@ fn expand_beam_once_whole_genome_target_range(
             if candidate_group_is_excluded(&parent.rule, gid, params) {
                 continue;
             }
-            let intersection =
-                binary_pair_intersection(parent.combined_train.as_slice(), row, y_train, n_train);
+            let intersection = binary_pair_intersection_with_lookup(
+                parent.combined_train.as_slice(),
+                row,
+                y_train,
+                n_train,
+                params.y_sum_lookup.as_deref(),
+            );
             for &op in beam_binary_ops_for_rule(&parent.rule).iter() {
                 for &negated in child_literal_negations_for_op(op).iter() {
                     let literal = BeamLiteral {
@@ -3981,8 +4001,13 @@ fn expand_beam_once_parallel_deferred(
                     continue;
                 }
                 let row = row_prefix(bits_train, row_words_train, cand, needed_words_train);
-                let intersection =
-                    binary_pair_intersection(&node.combined_train, row, y_train, n_train);
+                let intersection = binary_pair_intersection_with_lookup(
+                    &node.combined_train,
+                    row,
+                    y_train,
+                    n_train,
+                    params.y_sum_lookup.as_deref(),
+                );
                 for &op in beam_binary_ops_for_rule(&node.rule).iter() {
                     for &negated in child_literal_negations_for_op(op).iter() {
                         let literal = BeamLiteral {
@@ -4178,8 +4203,13 @@ fn expand_beam_once(
                     continue;
                 }
                 let row = row_prefix(bits_train, row_words_train, cand, needed_words_train);
-                let intersection =
-                    binary_pair_intersection(&node.combined_train, row, y_train, n_train);
+                let intersection = binary_pair_intersection_with_lookup(
+                    &node.combined_train,
+                    row,
+                    y_train,
+                    n_train,
+                    params.y_sum_lookup.as_deref(),
+                );
                 for &op in beam_binary_ops_for_rule(&node.rule).iter() {
                     for &negated in child_literal_negations_for_op(op).iter() {
                         let literal = BeamLiteral {
@@ -4443,8 +4473,13 @@ fn expand_states_exhaustive_parallel_deferred(
                         continue;
                     }
                     let row = row_prefix(bits_train, row_words_train, cand, needed_words_train);
-                    let intersection =
-                        binary_pair_intersection(&node.combined_train, row, y_train, n_train);
+                    let intersection = binary_pair_intersection_with_lookup(
+                        &node.combined_train,
+                        row,
+                        y_train,
+                        n_train,
+                        params.y_sum_lookup.as_deref(),
+                    );
                     for &op in beam_binary_ops_for_rule(&node.rule).iter() {
                         for &negated in child_literal_negations_for_op(op).iter() {
                             let single = literal_scores[literal_score_index(cand, negated)];
@@ -4639,8 +4674,13 @@ fn expand_states_exhaustive(
                             continue;
                         }
                         let row = row_prefix(bits_train, row_words_train, cand, needed_words_train);
-                        let intersection =
-                            binary_pair_intersection(&node.combined_train, row, y_train, n_train);
+                        let intersection = binary_pair_intersection_with_lookup(
+                            &node.combined_train,
+                            row,
+                            y_train,
+                            n_train,
+                            params.y_sum_lookup.as_deref(),
+                        );
                         for &op in beam_binary_ops_for_rule(&node.rule).iter() {
                             for &negated in child_literal_negations_for_op(op).iter() {
                                 let single = literal_scores[literal_score_index(cand, negated)];
@@ -4775,8 +4815,13 @@ fn expand_states_exhaustive(
                     continue;
                 }
                 let row = row_prefix(bits_train, row_words_train, cand, needed_words_train);
-                let intersection =
-                    binary_pair_intersection(&node.combined_train, row, y_train, n_train);
+                let intersection = binary_pair_intersection_with_lookup(
+                    &node.combined_train,
+                    row,
+                    y_train,
+                    n_train,
+                    params.y_sum_lookup.as_deref(),
+                );
                 for &op in beam_binary_ops_for_rule(&node.rule).iter() {
                     for &negated in child_literal_negations_for_op(op).iter() {
                         let single = literal_scores[literal_score_index(cand, negated)];
@@ -9608,6 +9653,29 @@ mod tests {
             })
             .unwrap();
         assert_same_beam_states(parallel.as_slice(), serial.as_slice());
+    }
+
+    #[test]
+    fn test_binary_pair_intersection_lookup_matches_direct_sum() {
+        let n_samples = 130usize;
+        let y = (0..n_samples)
+            .map(|idx| (idx as f64 * 0.25) - 13.0)
+            .collect::<Vec<_>>();
+        let row_words = words_for_samples(n_samples);
+        let lhs = vec![u64::MAX; row_words];
+        let rhs = vec![u64::MAX; row_words];
+        let lookup = PackedYSumLookup::build(y.as_slice(), n_samples).unwrap();
+        let direct = binary_pair_intersection(&lhs, &rhs, y.as_slice(), n_samples);
+        let cached = binary_pair_intersection_with_lookup(
+            &lhs,
+            &rhs,
+            y.as_slice(),
+            n_samples,
+            Some(&lookup),
+        );
+
+        assert_eq!(direct.n, cached.n);
+        assert_eq!(direct.sum.to_bits(), cached.sum.to_bits());
     }
 
     #[test]

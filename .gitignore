@@ -53,6 +53,8 @@ benchmark
 
 # Local development documents
 docs/
+.agents/
+.agent/
 
 # C/C++ / native build artifacts
 *.o

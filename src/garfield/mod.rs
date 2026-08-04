@@ -165,6 +165,7 @@ const GARFIELD_STRUCTURE_TASK_COALESCE_MAX_UNITS_DEFAULT: usize = 32;
 // returning to one Rayon task per window.
 const GARFIELD_SCAN_TASK_COALESCE_MAX_UNITS_DEFAULT: usize = 512;
 const GARFIELD_PERM_SLOT_TASK_MAX_SLOTS_DEFAULT: usize = 1;
+const GARFIELD_PERM_TASK_COALESCE_MAX_TASKS_DEFAULT: usize = 64;
 const GARFIELD_PERM_BITS_CACHE_MAX_MB_DEFAULT: usize = 256;
 const GARFIELD_LOGIC_MMAP_WINDOW_MB_DEFAULT: usize = 128;
 const GARFIELD_DENSE_DECODE_PAR_MIN_ROWS: usize = 64;
@@ -209,6 +210,103 @@ fn garfield_stage_profile_end(start: Option<Instant>, counter: &AtomicU64) {
             Ordering::Relaxed,
         );
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct GarfieldSchedulerTaskSample {
+    elapsed_s: f64,
+    work_units: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct GarfieldSchedulerTaskSummary {
+    task_count: usize,
+    total_work_units: usize,
+    total_elapsed_s: f64,
+    min_elapsed_s: f64,
+    p50_elapsed_s: f64,
+    p95_elapsed_s: f64,
+    max_elapsed_s: f64,
+}
+
+type GarfieldSchedulerTaskCollector = Arc<Mutex<Vec<GarfieldSchedulerTaskSample>>>;
+
+#[inline]
+fn garfield_scheduler_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_truthy("JX_GARFIELD_SCHEDULER_PROFILE"))
+}
+
+#[inline]
+fn new_garfield_scheduler_task_collector() -> Option<GarfieldSchedulerTaskCollector> {
+    garfield_scheduler_profile_enabled()
+        .then(|| Arc::new(Mutex::new(Vec::<GarfieldSchedulerTaskSample>::new())))
+}
+
+#[inline]
+fn record_garfield_scheduler_task(
+    collector: Option<&GarfieldSchedulerTaskCollector>,
+    elapsed_s: f64,
+    work_units: usize,
+) {
+    let Some(collector) = collector else {
+        return;
+    };
+    if !elapsed_s.is_finite() {
+        return;
+    }
+    if let Ok(mut samples) = collector.lock() {
+        samples.push(GarfieldSchedulerTaskSample {
+            elapsed_s,
+            work_units,
+        });
+    }
+}
+
+#[inline]
+fn scheduler_percentile(sorted_values: &[f64], quantile: f64) -> f64 {
+    if sorted_values.is_empty() {
+        return 0.0;
+    }
+    let quantile = quantile.clamp(0.0, 1.0);
+    let rank = ((quantile * sorted_values.len() as f64).ceil() as usize)
+        .saturating_sub(1)
+        .min(sorted_values.len().saturating_sub(1));
+    sorted_values[rank]
+}
+
+fn summarize_scheduler_task_samples(
+    samples: &[GarfieldSchedulerTaskSample],
+) -> GarfieldSchedulerTaskSummary {
+    if samples.is_empty() {
+        return GarfieldSchedulerTaskSummary::default();
+    }
+    let mut elapsed = samples
+        .iter()
+        .map(|sample| sample.elapsed_s)
+        .filter(|value| value.is_finite())
+        .collect::<Vec<_>>();
+    if elapsed.is_empty() {
+        return GarfieldSchedulerTaskSummary::default();
+    }
+    elapsed.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    GarfieldSchedulerTaskSummary {
+        task_count: elapsed.len(),
+        total_work_units: samples.iter().map(|sample| sample.work_units).sum(),
+        total_elapsed_s: elapsed.iter().sum(),
+        min_elapsed_s: elapsed[0],
+        p50_elapsed_s: scheduler_percentile(elapsed.as_slice(), 0.50),
+        p95_elapsed_s: scheduler_percentile(elapsed.as_slice(), 0.95),
+        max_elapsed_s: *elapsed.last().unwrap_or(&0.0),
+    }
+}
+
+fn summarize_garfield_scheduler_task_collector(
+    collector: Option<&GarfieldSchedulerTaskCollector>,
+) -> Option<GarfieldSchedulerTaskSummary> {
+    let collector = collector?;
+    let samples = collector.lock().ok()?;
+    Some(summarize_scheduler_task_samples(samples.as_slice()))
 }
 
 #[derive(Default, Clone, Debug)]
@@ -406,6 +504,18 @@ fn garfield_perm_slot_task_max_slots() -> usize {
 }
 
 #[inline]
+fn garfield_perm_task_coalesce_max_tasks() -> usize {
+    parse_env_usize("JX_GARFIELD_PERM_TASK_COALESCE_MAX_TASKS")
+        .unwrap_or(GARFIELD_PERM_TASK_COALESCE_MAX_TASKS_DEFAULT)
+        .max(1)
+}
+
+#[inline]
+fn garfield_scheduler_optimization_enabled() -> bool {
+    !env_truthy("JX_GARFIELD_DISABLE_SCHEDULER_OPT")
+}
+
+#[inline]
 fn garfield_perm_bits_cache_max_bytes() -> usize {
     parse_env_mb_usize("JX_GARFIELD_PERM_BITS_CACHE_MAX_MB")
         .unwrap_or(GARFIELD_PERM_BITS_CACHE_MAX_MB_DEFAULT)
@@ -458,6 +568,74 @@ fn garfield_task_chunk_units(total_units: usize, threads: usize, max_units: usiz
     }
     let target_tasks = threads.saturating_mul(4).max(1);
     total_units.div_ceil(target_tasks).clamp(1, max_units)
+}
+
+/// Build contiguous scan chunks with approximately equal SNP work instead of
+/// equal unit counts. Unit order is preserved so result ordering remains
+/// deterministic, while heterogeneous windows no longer leave the last Rayon
+/// workers with most of the expensive units.
+fn garfield_cost_balanced_unit_chunks(
+    unit_indices: &[usize],
+    units: &[GarfieldLogicUnit],
+    threads: usize,
+    max_units: usize,
+) -> Vec<Vec<usize>> {
+    if unit_indices.is_empty() {
+        return Vec::new();
+    }
+    if threads <= 1 {
+        return vec![unit_indices.to_vec()];
+    }
+    let target_tasks = threads.saturating_mul(4).max(1).min(unit_indices.len());
+    let total_work = unit_indices.iter().fold(0usize, |total, &ui| {
+        total.saturating_add(
+            units
+                .get(ui)
+                .map(|unit| unit.indices.len().max(1))
+                .unwrap_or(1),
+        )
+    });
+    let target_work = total_work.div_ceil(target_tasks).max(1);
+    let max_units = max_units.max(1);
+    let mut chunks = Vec::<Vec<usize>>::with_capacity(target_tasks);
+    let mut current = Vec::<usize>::new();
+    let mut current_work = 0usize;
+
+    for &ui in unit_indices.iter() {
+        let work = units
+            .get(ui)
+            .map(|unit| unit.indices.len().max(1))
+            .unwrap_or(1);
+        let should_split = !current.is_empty()
+            && (current.len() >= max_units
+                || (current_work >= target_work && chunks.len() + 1 < target_tasks));
+        if should_split {
+            chunks.push(std::mem::take(&mut current));
+            current_work = 0;
+        }
+        current.push(ui);
+        current_work = current_work.saturating_add(work);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn garfield_scan_task_chunks(
+    unit_indices: &[usize],
+    units: &[GarfieldLogicUnit],
+    threads: usize,
+    max_units: usize,
+) -> Vec<Vec<usize>> {
+    if garfield_scheduler_optimization_enabled() {
+        return garfield_cost_balanced_unit_chunks(unit_indices, units, threads, max_units);
+    }
+    let chunk_size = garfield_task_chunk_units(unit_indices.len(), threads, max_units);
+    unit_indices
+        .chunks(chunk_size.max(1))
+        .map(|chunk| chunk.to_vec())
+        .collect()
 }
 
 #[inline]
@@ -3531,6 +3709,8 @@ struct GarfieldLogicPipelineResult {
     posterior_json: Option<String>,
     memory_debug: Option<GarfieldMemoryDebugSummary>,
     bg_noise_summary: Option<GarfieldBgNoiseSummary>,
+    scheduler_scan: Option<GarfieldSchedulerTaskSummary>,
+    scheduler_permutation: Option<GarfieldSchedulerTaskSummary>,
     rule_permutation_active: bool,
     null_chunk_bp: usize,
     null_chunk_min_snps: usize,
@@ -3673,6 +3853,21 @@ fn garfield_memory_debug_to_pydict<'py>(
         "structure_prior",
         garfield_stage_memory_debug_to_pydict(py, &debug.structure_prior)?,
     )?;
+    Ok(out)
+}
+
+fn garfield_scheduler_task_summary_to_pydict<'py>(
+    py: Python<'py>,
+    summary: &GarfieldSchedulerTaskSummary,
+) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py);
+    out.set_item("task_count", summary.task_count)?;
+    out.set_item("total_work_units", summary.total_work_units)?;
+    out.set_item("total_elapsed_s", summary.total_elapsed_s)?;
+    out.set_item("min_elapsed_s", summary.min_elapsed_s)?;
+    out.set_item("p50_elapsed_s", summary.p50_elapsed_s)?;
+    out.set_item("p95_elapsed_s", summary.p95_elapsed_s)?;
+    out.set_item("max_elapsed_s", summary.max_elapsed_s)?;
     Ok(out)
 }
 
@@ -5130,6 +5325,27 @@ fn prune_candidate_rows_by_ld_priority_with_cache(
     sample_indices: &[usize],
     support_cache: Option<&GarfieldLdSupportCache>,
 ) -> Result<Vec<usize>, String> {
+    prune_candidate_rows_by_ld_priority_with_cache_limit(
+        candidate_global_rows,
+        priority_local_rows,
+        logic_bits,
+        sample_indices,
+        support_cache,
+        None,
+    )
+}
+
+fn prune_candidate_rows_by_ld_priority_with_cache_limit(
+    candidate_global_rows: &[usize],
+    priority_local_rows: &[usize],
+    logic_bits: &GarfieldLogicBits,
+    sample_indices: &[usize],
+    support_cache: Option<&GarfieldLdSupportCache>,
+    max_kept: Option<usize>,
+) -> Result<Vec<usize>, String> {
+    if max_kept == Some(0) {
+        return Ok(Vec::new());
+    }
     // This is score-prioritized greedy LD clumping: priority_local_rows must
     // already be ordered by descending single-site score.
     let t0 = garfield_stage_profile_start();
@@ -5139,6 +5355,7 @@ fn prune_candidate_rows_by_ld_priority_with_cache(
         logic_bits,
         sample_indices,
         support_cache,
+        max_kept,
     );
     garfield_stage_profile_end(t0, &GARFIELD_CORR_STAGE1_POOL_LD_NS);
     result
@@ -5150,7 +5367,9 @@ fn prune_candidate_rows_by_ld_priority_impl(
     logic_bits: &GarfieldLogicBits,
     sample_indices: &[usize],
     support_cache: Option<&GarfieldLdSupportCache>,
+    max_kept: Option<usize>,
 ) -> Result<Vec<usize>, String> {
+    let max_kept = max_kept.unwrap_or(usize::MAX);
     let r2_threshold = garfield_geneset_ld_prune_r2();
     if candidate_global_rows.len() <= 1
         || priority_local_rows.is_empty()
@@ -5159,6 +5378,7 @@ fn prune_candidate_rows_by_ld_priority_impl(
         return Ok(priority_local_rows
             .iter()
             .filter_map(|&local_idx| candidate_global_rows.get(local_idx).copied())
+            .take(max_kept)
             .collect::<Vec<_>>());
     }
     let n_samples = sample_indices.len();
@@ -5166,6 +5386,7 @@ fn prune_candidate_rows_by_ld_priority_impl(
         return Ok(priority_local_rows
             .iter()
             .filter_map(|&local_idx| candidate_global_rows.get(local_idx).copied())
+            .take(max_kept)
             .collect::<Vec<_>>());
     }
 
@@ -5281,6 +5502,9 @@ fn prune_candidate_rows_by_ld_priority_impl(
         if !has_conflict {
             kept_local.push(local_idx);
             kept_by_support[support_i].push(local_idx);
+            if kept_local.len() >= max_kept {
+                break;
+            }
         }
     }
     Ok(kept_local
@@ -5351,12 +5575,13 @@ fn select_geneset_window_candidate_pool_rows_with_cache(
         let priority_local =
             geneset_priority_order_from_scores_subset(scores, local_rows.as_slice());
         let pruned_global = if prune_with_ld {
-            prune_candidate_rows_by_ld_priority_with_cache(
+            prune_candidate_rows_by_ld_priority_with_cache_limit(
                 candidate_global_rows,
                 priority_local.as_slice(),
                 logic_bits,
                 sample_indices,
                 support_cache,
+                Some(per_window_keep_k),
             )?
         } else {
             priority_local
@@ -5372,12 +5597,13 @@ fn select_geneset_window_candidate_pool_rows_with_cache(
         let overflow_priority =
             geneset_priority_order_from_scores_subset(scores, overflow_local.as_slice());
         let overflow_rows = if prune_with_ld {
-            prune_candidate_rows_by_ld_priority_with_cache(
+            prune_candidate_rows_by_ld_priority_with_cache_limit(
                 candidate_global_rows,
                 overflow_priority.as_slice(),
                 logic_bits,
                 sample_indices,
                 support_cache,
+                Some(per_window_keep_k),
             )?
         } else {
             overflow_priority
@@ -9305,12 +9531,13 @@ fn select_single_window_candidate_pool_rows_with_cache(
         let rank_t0 = garfield_stage_profile_start();
         let priority = geneset_priority_order_from_scores(scores);
         garfield_stage_profile_end(rank_t0, &GARFIELD_CORR_STAGE1_POOL_PRIORITY_NS);
-        return prune_candidate_rows_by_ld_priority_with_cache(
+        return prune_candidate_rows_by_ld_priority_with_cache_limit(
             candidate_global_rows,
             priority.as_slice(),
             logic_bits,
             sample_indices,
             support_cache,
+            Some(target_k),
         )
         .map(|mut picked| {
             if picked.len() > target_k {
@@ -9332,12 +9559,13 @@ fn select_single_window_candidate_pool_rows_with_cache(
             .filter_map(|&local_idx| candidate_global_rows.get(local_idx).copied())
             .collect::<Vec<_>>();
         let prescreen_priority_local = (0..prescreen_global_rows.len()).collect::<Vec<_>>();
-        let mut pruned = prune_candidate_rows_by_ld_priority_with_cache(
+        let mut pruned = prune_candidate_rows_by_ld_priority_with_cache_limit(
             prescreen_global_rows.as_slice(),
             prescreen_priority_local.as_slice(),
             logic_bits,
             sample_indices,
             support_cache,
+            Some(target_k),
         )?;
         if pruned.len() > target_k {
             pruned.truncate(target_k);
@@ -11341,9 +11569,10 @@ fn process_rule_permutation_task_chunk<'bits>(
 /// list so callers can balance work across workers regardless of the
 /// slot/repeat ratio.
 #[allow(dead_code)]
-fn process_rule_permutation_task_chunk_flat(
+fn process_rule_permutation_task_chunk_flat<'bits>(
     task_chunk: &[(usize, usize)],
     null_prepared: &[(GarfieldPermutationNullSource, GarfieldUnitPrepared)],
+    prepared_bits_cache: Option<&[GarfieldUnitBitMatrices<'bits>]>,
     logic_bits: &GarfieldLogicBits,
     train_idx_local: &[usize],
     test_idx_local: &[usize],
@@ -11364,16 +11593,35 @@ fn process_rule_permutation_task_chunk_flat(
     for &(slot, rep) in task_chunk.iter() {
         check_ctrlc()?;
         let (source, prepared) = &null_prepared[slot];
-        let prepared_bits = materialize_prepared_bit_matrices(
-            prepared,
-            logic_bits,
-            train_idx_local,
-            test_idx_local,
-            false,
-        )?;
-        if let Some(tracker) = mem_tracker {
-            tracker.sample_now();
+        let prepared_bits_owned = if prepared_bits_cache.is_none() {
+            Some(materialize_prepared_bit_matrices(
+                prepared,
+                logic_bits,
+                train_idx_local,
+                test_idx_local,
+                false,
+            )?)
+        } else {
+            None
+        };
+        if prepared_bits_cache.is_none() {
+            if let Some(tracker) = mem_tracker {
+                tracker.sample_now();
+            }
         }
+        let prepared_bits = if let Some(cache) = prepared_bits_cache {
+            cache.get(slot).ok_or_else(|| {
+                format!(
+                    "GARFIELD permutation bit cache missing slot {} (cache size={})",
+                    slot,
+                    cache.len()
+                )
+            })?
+        } else {
+            prepared_bits_owned
+                .as_ref()
+                .expect("permutation bit materialization must exist when cache is disabled")
+        };
         let rep_seed = seed
             ^ (source.seed_id().wrapping_mul(0x94D0_49BB_1331_11EB))
             ^ ((rep as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
@@ -12234,6 +12482,8 @@ fn garfield_logic_search_bed_owned(
     let (selected_sample_indices, selected_sample_ids) =
         build_sample_selection(fam_sample_ids.as_slice(), sample_ids, sample_indices)?;
     let threads_eff = effective_threads_local(threads);
+    let scheduler_scan_tasks = new_garfield_scheduler_task_collector();
+    let scheduler_permutation_tasks = new_garfield_scheduler_task_collector();
     let unit_kind_lc = unit_kind.trim().to_ascii_lowercase();
     let grouped_active_mode = matches!(unit_kind_lc.as_str(), "gene" | "geneset" | "group");
     let grouped_null_mode = matches!(unit_kind_lc.as_str(), "gene" | "geneset");
@@ -13414,14 +13664,105 @@ fn garfield_logic_search_bed_owned(
             } else {
                 n_slots.max(1)
             };
+            let use_flat_perm_tasks = garfield_scheduler_optimization_enabled()
+                && permutation_bits_cache.is_some()
+                && perm_threads > 1
+                && (n_slots < perm_threads.saturating_mul(2) || repeats_per_batch > 1);
+            let flat_perm_tasks = if use_flat_perm_tasks {
+                let mut tasks = Vec::<(usize, usize)>::with_capacity(
+                    n_slots.saturating_mul(rep_end.saturating_sub(rep_start)),
+                );
+                for slot in 0..n_slots {
+                    for rep in rep_start..rep_end {
+                        tasks.push((slot, rep));
+                    }
+                }
+                Some(tasks)
+            } else {
+                None
+            };
+            let flat_perm_grain = flat_perm_tasks.as_ref().map(|tasks| {
+                garfield_task_chunk_units(
+                    tasks.len(),
+                    perm_threads,
+                    garfield_perm_task_coalesce_max_tasks(),
+                )
+            });
             let batch_results: Vec<
                 Result<Vec<(usize, Vec<GarfieldPermutationNullScores>)>, String>,
-            > = if let Some(pool) = perm_pool.as_ref() {
+            > = if let (Some(pool), Some(tasks), Some(grain)) = (
+                perm_pool.as_ref(),
+                flat_perm_tasks.as_ref(),
+                flat_perm_grain,
+            ) {
+                pool.install(|| {
+                    tasks
+                        .par_chunks(grain)
+                        .map(|task_chunk| {
+                            let task_t0 =
+                                scheduler_permutation_tasks.as_ref().map(|_| Instant::now());
+                            let task_work_units = if task_t0.is_some() {
+                                task_chunk
+                                    .iter()
+                                    .map(|&(slot, _)| {
+                                        null_prepared[slot].1.selected_global_rows.len()
+                                    })
+                                    .sum()
+                            } else {
+                                0
+                            };
+                            let result = process_rule_permutation_task_chunk_flat(
+                                task_chunk,
+                                null_prepared.as_slice(),
+                                permutation_bits_cache.as_deref(),
+                                &logic_bits,
+                                train_idx_local.as_slice(),
+                                test_idx_local.as_slice(),
+                                train_fit.residualized_y.as_slice(),
+                                test_fit.residualized_y.as_slice(),
+                                split_applied,
+                                perm_beam_params.clone(),
+                                null_keep_topk,
+                                seed,
+                                progress_callback_parallel,
+                                &null_progress_done,
+                                null_notify_step,
+                                permutation_task_total,
+                                Some(&null_mem_tracker),
+                            );
+                            if let Some(task_t0) = task_t0 {
+                                record_garfield_scheduler_task(
+                                    scheduler_permutation_tasks.as_ref(),
+                                    task_t0.elapsed().as_secs_f64(),
+                                    task_work_units,
+                                );
+                            }
+                            result
+                        })
+                        .collect()
+                })
+            } else if let Some(pool) = perm_pool.as_ref() {
                 pool.install(|| {
                     slot_indices
                         .par_chunks(slot_grain)
                         .map(|slot_chunk| {
-                            process_rule_permutation_task_chunk(
+                            let task_t0 =
+                                scheduler_permutation_tasks.as_ref().map(|_| Instant::now());
+                            let task_work_units = if task_t0.is_some() {
+                                slot_chunk
+                                    .iter()
+                                    .map(|&slot| {
+                                        null_prepared[slot]
+                                            .1
+                                            .selected_global_rows
+                                            .len()
+                                            .saturating_mul(rep_end.saturating_sub(rep_start))
+                                    })
+                                    .sum()
+                            } else {
+                                0
+                            };
+                            let result = process_rule_permutation_task_chunk(
                                 slot_chunk,
                                 rep_start,
                                 rep_end,
@@ -13441,7 +13782,15 @@ fn garfield_logic_search_bed_owned(
                                 null_notify_step,
                                 permutation_task_total,
                                 Some(&null_mem_tracker),
-                            )
+                            );
+                            if let Some(task_t0) = task_t0 {
+                                record_garfield_scheduler_task(
+                                    scheduler_permutation_tasks.as_ref(),
+                                    task_t0.elapsed().as_secs_f64(),
+                                    task_work_units,
+                                );
+                            }
+                            result
                         })
                         .collect()
                 })
@@ -13449,7 +13798,22 @@ fn garfield_logic_search_bed_owned(
                 slot_indices
                     .chunks(slot_grain)
                     .map(|slot_chunk| {
-                        process_rule_permutation_task_chunk(
+                        let task_t0 = scheduler_permutation_tasks.as_ref().map(|_| Instant::now());
+                        let task_work_units = if task_t0.is_some() {
+                            slot_chunk
+                                .iter()
+                                .map(|&slot| {
+                                    null_prepared[slot]
+                                        .1
+                                        .selected_global_rows
+                                        .len()
+                                        .saturating_mul(rep_end.saturating_sub(rep_start))
+                                })
+                                .sum()
+                        } else {
+                            0
+                        };
+                        let result = process_rule_permutation_task_chunk(
                             slot_chunk,
                             rep_start,
                             rep_end,
@@ -13469,7 +13833,15 @@ fn garfield_logic_search_bed_owned(
                             null_notify_step,
                             permutation_task_total,
                             Some(&null_mem_tracker),
-                        )
+                        );
+                        if let Some(task_t0) = task_t0 {
+                            record_garfield_scheduler_task(
+                                scheduler_permutation_tasks.as_ref(),
+                                task_t0.elapsed().as_secs_f64(),
+                                task_work_units,
+                            );
+                        }
+                        result
                     })
                     .collect()
             };
@@ -13801,6 +14173,12 @@ fn garfield_logic_search_bed_owned(
         y_sum_lookup: Some(scan_stage1_y_lookup.clone()),
         ..beam_params.clone()
     };
+    let scan_unit_chunks = garfield_scan_task_chunks(
+        scan_unit_indices.as_slice(),
+        units.as_slice(),
+        unit_parallel_threads,
+        garfield_scan_task_coalesce_max_units(),
+    );
     let skipped_units = Arc::new(Mutex::new(Vec::<GarfieldSkippedUnitInfo>::new()));
     let unit_results = if unit_parallel_threads > 1 {
         let pool = ThreadPoolBuilder::new()
@@ -13809,13 +14187,15 @@ fn garfield_logic_search_bed_owned(
             .map_err(|e| format!("build GARFIELD unit thread pool: {e}"))?;
         let skipped_units_parallel = skipped_units.clone();
         pool.install(|| {
-            scan_unit_indices
-                .par_chunks(garfield_task_chunk_units(
-                    scanned_units,
-                    unit_parallel_threads,
-                    garfield_scan_task_coalesce_max_units(),
-                ))
+            scan_unit_chunks
+                .par_iter()
                 .map(|chunk| {
+                    let task_t0 = scheduler_scan_tasks.as_ref().map(|_| Instant::now());
+                    let task_work_units = if task_t0.is_some() {
+                        chunk.iter().map(|&ui| units[ui].indices.len()).sum()
+                    } else {
+                        0
+                    };
                     let mut chunk_out =
                         Vec::<Result<GarfieldUnitEvaluationOutput, String>>::with_capacity(
                             chunk.len(),
@@ -13852,6 +14232,13 @@ fn garfield_logic_search_bed_owned(
                             ld_support_cache.as_deref(),
                         ));
                     }
+                    if let Some(task_t0) = task_t0 {
+                        record_garfield_scheduler_task(
+                            scheduler_scan_tasks.as_ref(),
+                            task_t0.elapsed().as_secs_f64(),
+                            task_work_units,
+                        );
+                    }
                     chunk_out
                 })
                 .collect::<Vec<Vec<Result<GarfieldUnitEvaluationOutput, String>>>>()
@@ -13863,6 +14250,15 @@ fn garfield_logic_search_bed_owned(
         let mut out = Vec::<Result<GarfieldUnitEvaluationOutput, String>>::with_capacity(
             scan_unit_indices.len(),
         );
+        let task_t0 = scheduler_scan_tasks.as_ref().map(|_| Instant::now());
+        let task_work_units = if task_t0.is_some() {
+            scan_unit_indices
+                .iter()
+                .map(|&ui| units[ui].indices.len())
+                .sum()
+        } else {
+            0
+        };
         for &ui in scan_unit_indices.iter() {
             let chunk_out = process_scan_unit_continuous(
                 ui,
@@ -13895,6 +14291,13 @@ fn garfield_logic_search_bed_owned(
                 ld_support_cache.as_deref(),
             );
             out.push(chunk_out);
+        }
+        if let Some(task_t0) = task_t0 {
+            record_garfield_scheduler_task(
+                scheduler_scan_tasks.as_ref(),
+                task_t0.elapsed().as_secs_f64(),
+                task_work_units,
+            );
         }
         out
     };
@@ -14002,6 +14405,9 @@ fn garfield_logic_search_bed_owned(
     let timing_beam_share_of_total_pct = timing_share_pct(timing_scan_beam_wall_s, total_wall_s);
     let timing_beam_share_of_scan_pct =
         timing_share_pct(timing_scan_beam_wall_s, scan_stage_wall_s);
+    let scheduler_scan = summarize_garfield_scheduler_task_collector(scheduler_scan_tasks.as_ref());
+    let scheduler_permutation =
+        summarize_garfield_scheduler_task_collector(scheduler_permutation_tasks.as_ref());
 
     let structure_prior_for_output = rule_structure_prior.clone();
     let mut pseudo_prefix_out = None;
@@ -14036,6 +14442,8 @@ fn garfield_logic_search_bed_owned(
         posterior_json: posterior_json_out,
         memory_debug,
         bg_noise_summary,
+        scheduler_scan,
+        scheduler_permutation,
         rule_permutation_active: null_permutation_active || soft_structure_mode,
         null_chunk_bp,
         null_chunk_min_snps: DEFAULT_RULE_NULL_MIN_SNPS_PER_CHUNK,
@@ -14554,6 +14962,22 @@ pub fn garfield_logic_search_bed_py<'py>(
         )?;
     } else {
         out.set_item("bg_noise_summary", py.None())?;
+    }
+    if let Some(summary) = result.scheduler_scan.as_ref() {
+        out.set_item(
+            "scheduler_scan",
+            garfield_scheduler_task_summary_to_pydict(py, summary)?,
+        )?;
+    } else {
+        out.set_item("scheduler_scan", py.None())?;
+    }
+    if let Some(summary) = result.scheduler_permutation.as_ref() {
+        out.set_item(
+            "scheduler_permutation",
+            garfield_scheduler_task_summary_to_pydict(py, summary)?,
+        )?;
+    } else {
+        out.set_item("scheduler_permutation", py.None())?;
     }
     out.set_item("rule_permutation_active", result.rule_permutation_active)?;
     out.set_item("null_chunk_bp", result.null_chunk_bp)?;
@@ -15573,6 +15997,74 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[test]
+    fn test_scheduler_profile_summary_reports_percentiles_and_work() {
+        let samples = vec![
+            GarfieldSchedulerTaskSample {
+                elapsed_s: 1.0,
+                work_units: 10,
+            },
+            GarfieldSchedulerTaskSample {
+                elapsed_s: 2.0,
+                work_units: 20,
+            },
+            GarfieldSchedulerTaskSample {
+                elapsed_s: 3.0,
+                work_units: 30,
+            },
+            GarfieldSchedulerTaskSample {
+                elapsed_s: 4.0,
+                work_units: 40,
+            },
+        ];
+        let summary = summarize_scheduler_task_samples(&samples);
+        assert_eq!(summary.task_count, 4);
+        assert_eq!(summary.total_work_units, 100);
+        assert_eq!(summary.min_elapsed_s, 1.0);
+        assert_eq!(summary.max_elapsed_s, 4.0);
+        assert_eq!(summary.p50_elapsed_s, 2.0);
+        assert_eq!(summary.p95_elapsed_s, 4.0);
+    }
+
+    #[test]
+    fn test_scheduler_profile_summary_handles_empty_samples() {
+        let summary = summarize_scheduler_task_samples(&[]);
+        assert_eq!(summary.task_count, 0);
+        assert_eq!(summary.total_work_units, 0);
+        assert_eq!(summary.min_elapsed_s, 0.0);
+        assert_eq!(summary.p50_elapsed_s, 0.0);
+        assert_eq!(summary.p95_elapsed_s, 0.0);
+        assert_eq!(summary.max_elapsed_s, 0.0);
+    }
+
+    #[test]
+    fn test_scan_scheduler_preserves_order_and_balances_work() {
+        let units = (1usize..=8)
+            .map(|n| GarfieldLogicUnit {
+                label: format!("u{n}"),
+                indices: vec![0usize; n],
+                spans: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let indices = (0usize..units.len()).collect::<Vec<_>>();
+        let chunks = garfield_cost_balanced_unit_chunks(&indices, &units, 2, 8);
+        let flattened = chunks.iter().flatten().copied().collect::<Vec<_>>();
+        assert_eq!(flattened, indices);
+        assert!(chunks.len() >= 2);
+        let work = chunks
+            .iter()
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .map(|&ui| units[ui].indices.len())
+                    .sum::<usize>()
+            })
+            .collect::<Vec<_>>();
+        let max_work = *work.iter().max().unwrap();
+        let min_work = *work.iter().min().unwrap();
+        assert!(max_work.saturating_sub(min_work) <= 8);
+    }
+
     fn make_temp_dir(prefix: &str) -> PathBuf {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -15690,6 +16182,17 @@ mod tests {
         .unwrap();
         assert_eq!(uncached, cached);
         assert!(!cached.is_empty());
+
+        let limited = prune_candidate_rows_by_ld_priority_with_cache_limit(
+            candidate_global_rows.as_slice(),
+            priority_local_rows.as_slice(),
+            &logic_bits,
+            sample_indices.as_slice(),
+            Some(&cache),
+            Some(3),
+        )
+        .unwrap();
+        assert_eq!(limited, cached.iter().take(3).copied().collect::<Vec<_>>());
 
         let sparse_rows = (3..n_rows).step_by(3).collect::<Vec<_>>();
         let sparse_priority = sparse_rows.iter().copied().rev().collect::<Vec<_>>();

@@ -18,12 +18,13 @@ use super::permutation::{
     RuleNullPenaltyLookup, RuleStructurePrior,
 };
 use super::score::{
-    binary_maf_from_n_hit, dosage_maf_from_dual_counts, dual_packed_summary,
-    score_cont_centered_gain_dual_from_summary, score_cont_centered_gain_dual_packed_with_sum,
-    score_cont_centered_gain_from_sum_and_n_hit, score_cont_centered_gain_packed_with_n_hit,
-    score_cont_centered_gain_packed_with_sum, score_cont_corr_packed, sum_y_where_both1,
-    sum_y_where_both1_four, sum_y_where_both1_with_lookup, support_size_packed,
-    validate_continuous_y, ContinuousRuleScore, PackedYSumLookup,
+    and_popcount_sum_y_where_both1_with_lookup, binary_maf_from_n_hit, dosage_maf_from_dual_counts,
+    dual_packed_summary, score_cont_centered_gain_dual_from_summary,
+    score_cont_centered_gain_dual_packed_with_sum, score_cont_centered_gain_from_sum_and_n_hit,
+    score_cont_centered_gain_packed_with_n_hit, score_cont_centered_gain_packed_with_sum,
+    score_cont_corr_packed, sum_y_where_both1, sum_y_where_both1_four,
+    sum_y_where_both1_with_lookup, support_size_packed, validate_continuous_y, ContinuousRuleScore,
+    PackedYSumLookup,
 };
 use super::score_gpu::{
     centered_gain_backend_mode_is_auto, parse_centered_gain_backend_mode_from_env,
@@ -2198,12 +2199,16 @@ fn binary_pair_intersection_with_lookup(
     n_train: usize,
     y_sum_lookup: Option<&PackedYSumLookup>,
 ) -> BinaryPairIntersection {
-    let n = and_popcount(parent_bits, row) as usize;
     let t_sum = beam_detail_profile_start();
-    let sum = if let Some(lookup) = y_sum_lookup {
-        sum_y_where_both1_with_lookup(parent_bits, row, y_train, n_train, lookup)
+    let (n, sum) = if let Some(lookup) = y_sum_lookup {
+        let (n, sum) =
+            and_popcount_sum_y_where_both1_with_lookup(parent_bits, row, y_train, n_train, lookup);
+        (n as usize, sum)
     } else {
-        sum_y_where_both1(parent_bits, row, y_train, n_train)
+        (
+            and_popcount(parent_bits, row) as usize,
+            sum_y_where_both1(parent_bits, row, y_train, n_train),
+        )
     };
     beam_detail_profile_end(t_sum, &GARFIELD_PROFILE_SUM_Y_BOTH1_NS);
     BinaryPairIntersection { n, sum }
@@ -4456,152 +4461,135 @@ fn expand_states_exhaustive_parallel_deferred(
     // Exhaustive seed layers must retain every valid rule. Keep only the
     // score-bearing state in workers and materialize support bits once after
     // global rule-key deduplication.
-    let worker_maps = work
+    let worker_states = work
         .into_par_iter()
-        .map(
-            |(bi, start, end)| -> Result<HashMap<RuleLexKey, BeamStateLite>, String> {
-                let node = &frontier[bi];
-                let mut local_best = HashMap::<RuleLexKey, BeamStateLite>::new();
-                let mut parent_raw_cache = RuleRawScoreCache::new();
-                let mut ancestor_raw_cache = RuleAncestorBaselineCache::new();
-                for cand in start..end {
-                    if ((cand - start) & 127) == 0 {
-                        check_interrupt_fast()?;
-                    }
-                    let gid = group_ids[cand];
-                    if candidate_group_is_excluded(&node.rule, gid, params) {
-                        continue;
-                    }
-                    let row = row_prefix(bits_train, row_words_train, cand, needed_words_train);
-                    let intersection = binary_pair_intersection_with_lookup(
-                        &node.combined_train,
-                        row,
-                        y_train,
-                        n_train,
-                        params.y_sum_lookup.as_deref(),
-                    );
-                    for &op in beam_binary_ops_for_rule(&node.rule).iter() {
-                        for &negated in child_literal_negations_for_op(op).iter() {
-                            let single = literal_scores[literal_score_index(cand, negated)];
-                            let Some(train) =
-                                evaluate_child_train_from_parent_virtual_with_intersection(
-                                    &node.train,
-                                    &single.train,
-                                    intersection,
-                                    sum_y_train,
-                                    n_train,
-                                    node.rule.len() + 1,
-                                    op,
-                                    negated,
-                                    params,
-                                )
-                            else {
-                                continue;
-                            };
-                            let literal = BeamLiteral {
-                                row_index: cand,
-                                group_id: gid,
+        .map(|(bi, start, end)| -> Result<Vec<BeamStateLite>, String> {
+            let node = &frontier[bi];
+            let mut local_states = Vec::<BeamStateLite>::new();
+            let mut parent_raw_cache = RuleRawScoreCache::new();
+            let mut ancestor_raw_cache = RuleAncestorBaselineCache::new();
+            for cand in start..end {
+                if ((cand - start) & 127) == 0 {
+                    check_interrupt_fast()?;
+                }
+                let gid = group_ids[cand];
+                if candidate_group_is_excluded(&node.rule, gid, params) {
+                    continue;
+                }
+                let row = row_prefix(bits_train, row_words_train, cand, needed_words_train);
+                let intersection = binary_pair_intersection_with_lookup(
+                    &node.combined_train,
+                    row,
+                    y_train,
+                    n_train,
+                    params.y_sum_lookup.as_deref(),
+                );
+                for &op in beam_binary_ops_for_rule(&node.rule).iter() {
+                    for &negated in child_literal_negations_for_op(op).iter() {
+                        let single = literal_scores[literal_score_index(cand, negated)];
+                        let Some(train) =
+                            evaluate_child_train_from_parent_virtual_with_intersection(
+                                &node.train,
+                                &single.train,
+                                intersection,
+                                sum_y_train,
+                                n_train,
+                                node.rule.len() + 1,
+                                op,
                                 negated,
-                            };
-                            let mut rule = node.rule.clone();
-                            rule.rest.push((op, literal));
-                            let max_singleton_train_raw =
-                                node.max_singleton_train_raw.max(single.train.raw_score);
-                            let max_singleton_test_raw =
-                                node.max_singleton_test_raw.max(single.test.raw_score);
-                            let direct_parent_train_raw = if rule.len() == 2 {
-                                node.train.raw_score.max(single.train.raw_score)
-                            } else {
-                                best_ancestor_raw_baseline_cached(
-                                    &rule,
-                                    y_train,
-                                    bits_train,
-                                    row_words_train,
-                                    n_rows,
-                                    n_train,
-                                    literal_scores,
-                                    true,
-                                    Some(base_rule_raws.as_ref()),
-                                    &mut parent_raw_cache,
-                                    &mut ancestor_raw_cache,
-                                    params.disable_parent_delta,
-                                )?
-                            };
-                            let (train_abs_score, train_score) = train_scores_for_rule(
+                                params,
+                            )
+                        else {
+                            continue;
+                        };
+                        let literal = BeamLiteral {
+                            row_index: cand,
+                            group_id: gid,
+                            negated,
+                        };
+                        let mut rule = node.rule.clone();
+                        rule.rest.push((op, literal));
+                        let max_singleton_train_raw =
+                            node.max_singleton_train_raw.max(single.train.raw_score);
+                        let max_singleton_test_raw =
+                            node.max_singleton_test_raw.max(single.test.raw_score);
+                        let direct_parent_train_raw = if rule.len() == 2 {
+                            node.train.raw_score.max(single.train.raw_score)
+                        } else {
+                            best_ancestor_raw_baseline_cached(
                                 &rule,
-                                train,
-                                direct_parent_train_raw,
-                                None,
-                                None,
-                                params,
-                            );
-                            if !keep_child_after_parent_abs_improvement_pruning(
-                                node.train_abs_score,
-                                rule.len(),
-                                train_abs_score,
-                                params,
-                            ) {
-                                continue;
-                            }
-                            if !keep_state_after_min_gain_pruning(rule.len(), train_score, params) {
-                                continue;
-                            }
-                            if !keep_child_after_parent_gain_pruning(&rule, train_score, params) {
-                                continue;
-                            }
-                            let state = BeamStateLite {
-                                rule,
-                                train,
-                                train_abs_score,
-                                train_score,
-                                max_singleton_train_raw,
-                                max_singleton_test_raw,
-                            };
-                            match local_best.entry(state.rule.lexical_key()) {
-                                std::collections::hash_map::Entry::Vacant(slot) => {
-                                    slot.insert(state);
-                                }
-                                std::collections::hash_map::Entry::Occupied(mut slot) => {
-                                    if cmp_state_lite(&state, slot.get())
-                                        == std::cmp::Ordering::Less
-                                    {
-                                        slot.insert(state);
-                                    }
-                                }
-                            }
+                                y_train,
+                                bits_train,
+                                row_words_train,
+                                n_rows,
+                                n_train,
+                                literal_scores,
+                                true,
+                                Some(base_rule_raws.as_ref()),
+                                &mut parent_raw_cache,
+                                &mut ancestor_raw_cache,
+                                params.disable_parent_delta,
+                            )?
+                        };
+                        let (train_abs_score, train_score) = train_scores_for_rule(
+                            &rule,
+                            train,
+                            direct_parent_train_raw,
+                            None,
+                            None,
+                            params,
+                        );
+                        if !keep_child_after_parent_abs_improvement_pruning(
+                            node.train_abs_score,
+                            rule.len(),
+                            train_abs_score,
+                            params,
+                        ) {
+                            continue;
                         }
-                    }
-                }
-                Ok(local_best)
-            },
-        )
-        .collect::<Vec<Result<HashMap<RuleLexKey, BeamStateLite>, String>>>();
-
-    let mut best = HashMap::<RuleLexKey, BeamStateLite>::new();
-    for worker_map in worker_maps {
-        for (key, state) in worker_map? {
-            match best.entry(key) {
-                std::collections::hash_map::Entry::Vacant(slot) => {
-                    slot.insert(state);
-                }
-                std::collections::hash_map::Entry::Occupied(mut slot) => {
-                    if cmp_state_lite(&state, slot.get()) == std::cmp::Ordering::Less {
-                        slot.insert(state);
+                        if !keep_state_after_min_gain_pruning(rule.len(), train_score, params) {
+                            continue;
+                        }
+                        if !keep_child_after_parent_gain_pruning(&rule, train_score, params) {
+                            continue;
+                        }
+                        let state = BeamStateLite {
+                            rule,
+                            train,
+                            train_abs_score,
+                            train_score,
+                            max_singleton_train_raw,
+                            max_singleton_test_raw,
+                        };
+                        // Exhaustive expansion appends a strictly larger row index to a
+                        // unique parent rule. The parent, candidate, operation, and
+                        // negation therefore identify a unique rule; defer sorting until
+                        // after all workers finish instead of allocating a lexical-key map
+                        // for every candidate.
+                        local_states.push(state);
                     }
                 }
             }
-        }
-    }
+            Ok(local_states)
+        })
+        .collect::<Vec<Result<Vec<BeamStateLite>, String>>>();
 
-    let mut out = Vec::<BeamState>::with_capacity(best.len());
-    for state in best.into_values() {
-        out.push(materialize_beam_state_lite(
-            state,
-            bits_train,
-            row_words_train,
-            n_rows,
-            n_train,
-        )?);
+    let state_count = worker_states
+        .iter()
+        .filter_map(|states| states.as_ref().ok())
+        .map(Vec::len)
+        .sum::<usize>();
+    let mut out = Vec::<BeamState>::with_capacity(state_count);
+    for worker_state in worker_states {
+        for state in worker_state? {
+            out.push(materialize_beam_state_lite(
+                state,
+                bits_train,
+                row_words_train,
+                n_rows,
+                n_train,
+            )?);
+        }
     }
     out.sort_by(cmp_state);
     Ok(out)
@@ -9662,10 +9650,21 @@ mod tests {
             .map(|idx| (idx as f64 * 0.25) - 13.0)
             .collect::<Vec<_>>();
         let row_words = words_for_samples(n_samples);
-        let lhs = vec![u64::MAX; row_words];
-        let rhs = vec![u64::MAX; row_words];
+        let mut lhs = vec![u64::MAX; row_words];
+        let mut rhs = vec![u64::MAX; row_words];
+        let tail_mask = (1u64 << (n_samples & 63)) - 1;
+        lhs[row_words - 1] = tail_mask;
+        rhs[row_words - 1] = tail_mask;
         let lookup = PackedYSumLookup::build(y.as_slice(), n_samples).unwrap();
         let direct = binary_pair_intersection(&lhs, &rhs, y.as_slice(), n_samples);
+        let (fused_n, fused_sum) =
+            crate::garfield::score::and_popcount_sum_y_where_both1_with_lookup(
+                &lhs,
+                &rhs,
+                y.as_slice(),
+                n_samples,
+                &lookup,
+            );
         let cached = binary_pair_intersection_with_lookup(
             &lhs,
             &rhs,
@@ -9676,6 +9675,8 @@ mod tests {
 
         assert_eq!(direct.n, cached.n);
         assert_eq!(direct.sum.to_bits(), cached.sum.to_bits());
+        assert_eq!(fused_n as usize, cached.n);
+        assert_eq!(fused_sum.to_bits(), cached.sum.to_bits());
     }
 
     #[test]

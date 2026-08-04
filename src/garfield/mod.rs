@@ -74,8 +74,8 @@ use crate::ml::pairwise_and::{
     snapshot_pairwise_profile,
 };
 use crate::stats_common::{
-    arm_interrupt_trap, check_ctrlc, env_truthy, format_bytes, map_err_string_to_py,
-    process_memory_usage,
+    arm_interrupt_trap, check_ctrlc, env_truthy, format_bytes, interrupt_requested,
+    map_err_string_to_py, process_memory_usage, INTERRUPTED_MSG,
 };
 
 use numpy::ndarray::{Array1, Array2};
@@ -142,6 +142,10 @@ const GARFIELD_GENESET_CORR_PRESCREEN_SLACK_MAX: usize = 32;
 const GARFIELD_SINGLE_WINDOW_CANDIDATE_MULTIPLIER: usize = 4;
 const GARFIELD_SINGLE_WINDOW_CANDIDATE_ADD: usize = 32;
 const GARFIELD_LD_BLOCK_WORDS_DEFAULT: usize = 8;
+// Poll the native interrupt flag in the LD candidate loop instead of
+// reacquiring the Python GIL for every candidate. Set the interval to 1 to
+// reproduce the previous full check_ctrlc behavior for A/B benchmarks.
+const GARFIELD_LD_INTERRUPT_CHECK_INTERVAL_DEFAULT: usize = 64;
 static GARFIELD_ML_SELECT_NS: AtomicU64 = AtomicU64::new(0);
 static GARFIELD_DENSE_DOSAGE_DECODE_NS: AtomicU64 = AtomicU64::new(0);
 static GARFIELD_GENESET_LD_PRUNE_NS: AtomicU64 = AtomicU64::new(0);
@@ -659,6 +663,24 @@ fn garfield_ld_block_words() -> usize {
         Some(8) => 8,
         _ => GARFIELD_LD_BLOCK_WORDS_DEFAULT,
     }
+}
+
+#[inline]
+fn garfield_ld_interrupt_check_interval() -> usize {
+    parse_env_usize("JX_GARFIELD_LD_INTERRUPT_CHECK_INTERVAL")
+        .unwrap_or(GARFIELD_LD_INTERRUPT_CHECK_INTERVAL_DEFAULT)
+        .max(1)
+}
+
+#[inline]
+fn check_garfield_ld_interrupt(candidate_offset: usize, interval: usize) -> Result<(), String> {
+    if interval == 1 {
+        return check_ctrlc();
+    }
+    if candidate_offset % interval == 0 && interrupt_requested() {
+        return Err(INTERRUPTED_MSG.to_string());
+    }
+    Ok(())
 }
 
 #[inline]
@@ -5459,8 +5481,9 @@ fn prune_candidate_rows_by_ld_priority_impl(
     let mut kept_local = Vec::<usize>::with_capacity(priority_local_rows.len());
     let mut kept_by_support = vec![Vec::<usize>::new(); n_samples + 1];
     let mut seen = vec![false; candidate_global_rows.len()];
-    for &local_idx in priority_local_rows.iter() {
-        check_ctrlc()?;
+    let interrupt_interval = garfield_ld_interrupt_check_interval();
+    for (candidate_offset, &local_idx) in priority_local_rows.iter().enumerate() {
+        check_garfield_ld_interrupt(candidate_offset, interrupt_interval)?;
         if local_idx >= candidate_global_rows.len() || seen[local_idx] || !variable[local_idx] {
             continue;
         }
@@ -5507,6 +5530,7 @@ fn prune_candidate_rows_by_ld_priority_impl(
             }
         }
     }
+    check_garfield_ld_interrupt(priority_local_rows.len(), interrupt_interval)?;
     Ok(kept_local
         .into_iter()
         .map(|local_idx| candidate_global_rows[local_idx])
@@ -9377,8 +9401,9 @@ fn maybe_prune_geneset_unit_rows_by_ld_with_cache(
     let mut kept_local = Vec::<usize>::with_capacity(variable_local.len());
     let mut kept_by_support = vec![Vec::<usize>::new(); n_samples + 1];
     let mut exact_pairs = 0u64;
-    for &local_idx in variable_local.iter() {
-        check_ctrlc()?;
+    let interrupt_interval = garfield_ld_interrupt_check_interval();
+    for (candidate_offset, &local_idx) in variable_local.iter().enumerate() {
+        check_garfield_ld_interrupt(candidate_offset, interrupt_interval)?;
         let row_i = row_slice(local_idx);
         let mut has_conflict = false;
         let support_i = support[local_idx];
@@ -9419,6 +9444,7 @@ fn maybe_prune_geneset_unit_rows_by_ld_with_cache(
             kept_by_support[support_i].push(local_idx);
         }
     }
+    check_garfield_ld_interrupt(variable_local.len(), interrupt_interval)?;
 
     kept_local.sort_unstable();
     let kept_local = rescue_geneset_missing_groups_local_indices(

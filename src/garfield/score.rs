@@ -696,6 +696,36 @@ pub fn sum_y_where_both1_with_lookup(
     sum
 }
 
+/// Count and sum one packed intersection in a single word traversal.
+///
+/// The inputs are expected to have unused tail bits masked, matching the
+/// invariant used by GARFIELD beam states and packed genotype rows.
+#[inline]
+pub fn and_popcount_sum_y_where_both1_with_lookup(
+    lhs: &[u64],
+    rhs: &[u64],
+    y: &[f64],
+    n_samples: usize,
+    lookup: &PackedYSumLookup,
+) -> (u64, f64) {
+    let full_words = n_samples >> 6;
+    let rem = n_samples & 63;
+    let mut n = 0u64;
+    let mut sum = 0.0_f64;
+    for word_idx in 0..full_words {
+        let word = lhs[word_idx] & rhs[word_idx];
+        n += word.count_ones() as u64;
+        sum += sum_y_from_word_lookup_hybrid(lookup, y, word_idx, word);
+    }
+    if rem != 0 {
+        let mask = (1u64 << rem) - 1u64;
+        let word = (lhs[full_words] & rhs[full_words]) & mask;
+        n += word.count_ones() as u64;
+        sum += sum_y_from_word_lookup_hybrid(lookup, y, full_words, word);
+    }
+    (n, sum)
+}
+
 /// Sum phenotype values for four packed intersections in one word traversal.
 ///
 /// Each output keeps the same word and bit accumulation order as

@@ -4479,22 +4479,19 @@ fn select_reportable_ranked_hits(
     let base = if raw_design {
         ranked_hits.to_vec()
     } else {
-        let positive_combos = ranked_hits
-            .iter()
-            .copied()
-            .filter(|(idx, score)| beam_hits[*idx].rule.len() > 1 && score_key(*score) > 0.0)
-            .collect::<Vec<_>>();
-        if !positive_combos.is_empty() {
-            positive_combos
-        } else if let Some(best_singleton) = ranked_hits
-            .iter()
-            .copied()
-            .find(|(idx, _)| beam_hits[*idx].rule.len() == 1)
-        {
-            vec![best_singleton]
-        } else {
-            ranked_hits.iter().copied().take(1).collect::<Vec<_>>()
-        }
+        // The displayed score may include a null/bucket penalty.  That
+        // penalty is useful for ranking against the null model, but it must
+        // not decide whether a singleton or a logical combination is
+        // reportable.  Keep both rule families in one ranking and select by
+        // the unpenalized test score instead.
+        let mut raw_ranked = ranked_hits.to_vec();
+        raw_ranked.sort_by(|(a_idx, _), (b_idx, _)| {
+            score_key(beam_hits[*b_idx].test.raw_score)
+                .partial_cmp(&score_key(beam_hits[*a_idx].test.raw_score))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| cmp_candidate(&beam_hits[*a_idx], &beam_hits[*b_idx]))
+        });
+        raw_ranked
     };
     if top_rules_per_unit == 0 || base.len() <= 1 {
         return base;
@@ -4502,7 +4499,7 @@ fn select_reportable_ranked_hits(
     let keep = extend_keep_with_score_ties(
         base.as_slice(),
         top_rules_per_unit.min(base.len()),
-        |(_, score)| *score,
+        |(idx, _)| beam_hits[*idx].test.raw_score,
     );
     base.into_iter().take(keep).collect::<Vec<_>>()
 }
@@ -16841,7 +16838,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_reportable_ranked_hits_falls_back_to_best_singleton_when_combo_nonpositive() {
+    fn test_select_reportable_ranked_hits_keeps_highest_raw_score_when_all_nonpositive() {
         let beam_hits = vec![
             make_test_rule_candidate(&[0, 1], &[BeamBinaryOp::Xor], -0.25),
             make_test_rule_candidate(&[2], &[], -1.0),
@@ -16849,7 +16846,39 @@ mod tests {
         let ranked_hits = vec![(0usize, -0.25_f64), (1usize, -1.0_f64)];
         let selected =
             select_reportable_ranked_hits(beam_hits.as_slice(), ranked_hits.as_slice(), 1, false);
-        assert_eq!(selected, vec![(1usize, -1.0_f64)]);
+        assert_eq!(selected, vec![(0usize, -0.25_f64)]);
+    }
+
+    #[test]
+    fn test_select_reportable_ranked_hits_uses_highest_unpenalized_raw_score() {
+        let mut combo = make_test_rule_candidate(&[0, 1], &[BeamBinaryOp::Xor], 12.0);
+        combo.test.raw_score = 5.0;
+        let mut singleton = make_test_rule_candidate(&[2], &[], 10.0);
+        singleton.test.raw_score = 20.0;
+        let beam_hits = vec![combo, singleton];
+        let ranked_hits = vec![(0usize, 12.0_f64), (1usize, 10.0_f64)];
+        let selected =
+            select_reportable_ranked_hits(beam_hits.as_slice(), ranked_hits.as_slice(), 1, false);
+        assert_eq!(selected, vec![(1usize, 10.0_f64)]);
+    }
+
+    #[test]
+    fn test_select_reportable_ranked_hits_applies_topk_to_singleton_only_unit() {
+        let beam_hits = vec![
+            make_test_rule_candidate(&[0], &[], -0.10),
+            make_test_rule_candidate(&[1], &[], -0.20),
+            make_test_rule_candidate(&[2], &[], -0.30),
+            make_test_rule_candidate(&[3, 4], &[BeamBinaryOp::And], -0.40),
+        ];
+        let ranked_hits = vec![
+            (0usize, -0.10_f64),
+            (1usize, -0.20_f64),
+            (2usize, -0.30_f64),
+            (3usize, -0.40_f64),
+        ];
+        let selected =
+            select_reportable_ranked_hits(beam_hits.as_slice(), ranked_hits.as_slice(), 2, false);
+        assert_eq!(selected, vec![(0usize, -0.10_f64), (1usize, -0.20_f64)]);
     }
 
     #[test]

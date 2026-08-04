@@ -1811,15 +1811,22 @@ fn evaluate_logic_candidate(
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let literal_rows = logic_literal_dosage_rows(dosage_rows.as_slice(), mode)?;
-            let raw_interaction = if matches!(mode, LogicGateMode::X) {
-                let dosage_row_refs = dosage_rows
-                    .iter()
-                    .map(|row| row.as_slice())
-                    .collect::<Vec<_>>();
-                materialize_logic_rule_dual_values(mode, dosage_row_refs.as_slice())?.0
+            let dosage_row_refs = dosage_rows
+                .iter()
+                .map(|row| row.as_slice())
+                .collect::<Vec<_>>();
+            let xor_dual_values = if matches!(mode, LogicGateMode::X) {
+                Some(materialize_logic_rule_dual_values(
+                    mode,
+                    dosage_row_refs.as_slice(),
+                )?)
             } else {
-                interaction_product_from_literals(literal_rows.as_slice())
+                None
             };
+            let raw_interaction = xor_dual_values
+                .as_ref()
+                .map(|(values, _raw_af, _gate_maf)| values.clone())
+                .unwrap_or_else(|| interaction_product_from_literals(literal_rows.as_slice()));
             let gate_values = residualize_logic_values_against_basis(
                 raw_interaction.as_slice(),
                 literal_rows.as_slice(),
@@ -1828,6 +1835,34 @@ fn evaluate_logic_candidate(
             let signal_var = variance_f64(&gate_values);
             if signal_var <= DEFAULT_PURE_EPI_VAR_MIN {
                 return Ok(None);
+            }
+            if let Some((raw_gate_values, raw_af, gate_maf)) = xor_dual_values {
+                // XOR is represented by two dosage bit planes throughout
+                // GARFIELD/FvLMM.  Keep pure-epistasis candidate QC on that
+                // same dual-state representation instead of collapsing
+                // heterozygotes to binary presence here.
+                let Some((gate_proxy_score, parent_scores)) =
+                    score_logic_rule_raw_against_response(
+                        mode,
+                        dosage_row_refs.as_slice(),
+                        gate_values.as_slice(),
+                    )?
+                else {
+                    return Ok(None);
+                };
+                let max_parent_proxy_score = parent_scores.into_iter().fold(0.0_f64, f64::max);
+                let parent_gate_max_r2 = literal_rows
+                    .iter()
+                    .map(|row| continuous_r2_f64(raw_gate_values.as_slice(), row.as_slice()))
+                    .fold(0.0_f64, f64::max);
+                return Ok(Some(LogicCandidateEval {
+                    gate_values,
+                    raw_af,
+                    gate_maf,
+                    parent_gate_max_r2,
+                    proxy_margin: gate_proxy_score - max_parent_proxy_score,
+                    signal_var,
+                }));
             }
             let (literal_gate_rows, gate_indicator) =
                 logic_binary_gate_from_bin_map(members, bin_map, mode)?;
@@ -5917,6 +5952,25 @@ mod tests {
         assert_eq!(eval.gate_values, vec![-1.0_f64, 0.0, 0.0, 1.0]);
         assert!(eval.proxy_margin > 1e-6);
         assert!(eval.parent_gate_max_r2 < 1.0);
+    }
+
+    #[test]
+    fn centered_xor_candidate_qc_uses_dual_dosage_maf() {
+        let mut row_map: HashMap<usize, Vec<f32>> = HashMap::new();
+        row_map.insert(0, vec![0.0, 1.0, 2.0, 2.0]);
+        row_map.insert(1, vec![0.0, 2.0, 1.0, 2.0]);
+        let eval = evaluate_logic_candidate(
+            &[0, 1],
+            &row_map,
+            &HashMap::new(),
+            LogicGateMode::X,
+            LogicEffectModel::CenteredInteraction,
+            &[],
+        )
+        .expect("evaluate centered XOR candidate")
+        .expect("centered XOR candidate should be valid");
+        assert!((eval.raw_af - 0.5).abs() < 1e-12);
+        assert!((eval.gate_maf - 0.25).abs() < 1e-12);
     }
 
     #[test]

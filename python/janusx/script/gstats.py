@@ -47,6 +47,12 @@ class LdscWindowSpec:
     label: str
 
 
+# Keep dense LD-score point clouds out of the PDF vector layer.  The axes,
+# labels, annotations, and summary line remain vector elements.
+_LDSC_RASTERIZE_THRESHOLD = 50_000
+_LDSC_RASTER_DPI = 200
+
+
 def _require_rust_backend() -> None:
     if jxrs is None:
         raise RuntimeError(
@@ -166,7 +172,7 @@ def _read_bim_table(prefix: str) -> pd.DataFrame:
     out = bim.iloc[:, [0, 3]].copy()
     out.columns = ["chr", "pos"]
     out["chr"] = out["chr"].astype(str).str.strip()
-    out["pos"] = pd.to_numeric(out["pos"], errors="raise").astype(np.int64, copy=False)
+    out["pos"] = pd.to_numeric(out["pos"], errors="raise").astype(np.int64)
     return out
 
 
@@ -304,6 +310,7 @@ def _setup_pdf_matplotlib():
     matplotlib.use("Agg", force=True)
     matplotlib.rcParams["pdf.fonttype"] = 42
     matplotlib.rcParams["ps.fonttype"] = 42
+    matplotlib.rcParams["pdf.compression"] = 9
     import matplotlib.pyplot as plt
 
     return plt
@@ -436,6 +443,8 @@ def _plot_ldsc_pdf(df: pd.DataFrame, out_pdf: str, *, window_label: str, n_sampl
 
     fig, ax = plt.subplots(1, 1, figsize=(12.0, 5.2))
     fig.patch.set_facecolor("white")
+    n_plot_points = int(finite.sum())
+    rasterize_points = n_plot_points >= _LDSC_RASTERIZE_THRESHOLD
     ax.scatter(
         x[finite],
         ldsc[finite],
@@ -443,6 +452,7 @@ def _plot_ldsc_pdf(df: pd.DataFrame, out_pdf: str, *, window_label: str, n_sampl
         s=8,
         linewidths=0.0,
         alpha=0.85,
+        rasterized=rasterize_points,
     )
     ax.axhline(float(np.nanmean(ldsc[finite])), color="#111827", linestyle="--", linewidth=1.1, alpha=0.9)
     ax.set_title(f"LD score Manhattan plot ({window_label}, N={int(n_samples):,})", fontsize=12)
@@ -454,7 +464,7 @@ def _plot_ldsc_pdf(df: pd.DataFrame, out_pdf: str, *, window_label: str, n_sampl
     ax.text(
         0.99,
         0.97,
-        f"site={int(finite.sum()):,}\nmean={float(np.nanmean(ldsc[finite])):.4f}",
+        f"site={n_plot_points:,}\nmean={float(np.nanmean(ldsc[finite])):.4f}",
         transform=ax.transAxes,
         ha="right",
         va="top",
@@ -462,7 +472,10 @@ def _plot_ldsc_pdf(df: pd.DataFrame, out_pdf: str, *, window_label: str, n_sampl
         color="#374151",
     )
     fig.tight_layout()
-    fig.savefig(out_pdf, format="pdf", bbox_inches="tight")
+    save_kwargs = {"format": "pdf", "bbox_inches": "tight"}
+    if rasterize_points:
+        save_kwargs["dpi"] = _LDSC_RASTER_DPI
+    fig.savefig(out_pdf, **save_kwargs)
     plt.close(fig)
 
 

@@ -129,6 +129,7 @@ _DEFAULT_CIRCLE_LW = 1.0
 _POSTGWAS_LEGEND_SIZE_SCALE = 1.35
 _POSTGWAS_LEGEND_SIZE_MIN_BONUS = 2.0
 _POSTGWAS_LD_LINK_Y = 0.0
+_POSTGWAS_RASTERIZE_THRESHOLD = 50_000
 _PANEL_WIDTH_IN = 8.0
 _PANEL_LEFT_IN = 0.95
 _PANEL_RIGHT_IN = 0.20
@@ -5447,11 +5448,22 @@ def _postgwas_output_format_from_path(path: str) -> str:
     return ext.lstrip(".").strip().lower()
 
 
-def _postgwas_should_rasterize_dense_layers(output_format: object) -> bool:
+def _postgwas_should_rasterize_dense_layers(
+    output_format: object,
+    *,
+    n_points: Optional[int] = None,
+) -> bool:
     fmt = str(output_format).strip().lower()
-    # Single-file PDF stays vector-friendly by default; merge mode overrides
-    # this per artist and rasterizes dense layers explicitly.
-    return fmt != "pdf"
+    if fmt != "pdf":
+        return True
+    # Keep small PDF plots vector-friendly, but avoid embedding one vector
+    # marker/path per site in large Manhattan or circular plots.
+    if n_points is None:
+        return False
+    try:
+        return int(n_points) >= _POSTGWAS_RASTERIZE_THRESHOLD
+    except (TypeError, ValueError):
+        return False
 
 
 def _postgwas_savefig_kwargs(output_format: object) -> dict[str, object]:
@@ -5926,7 +5938,10 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 )
         width_in = float(_PANEL_WIDTH_IN)
         dpi = 300
-        rasterized = _postgwas_should_rasterize_dense_layers(args.format)
+        rasterized = _postgwas_should_rasterize_dense_layers(
+            args.format,
+            n_points=int(df.shape[0]),
+        )
         manh_ratio_for_font = float(args.manh_ratio) if args.manh_ratio is not None else 2.0
         manh_fontsize_target = _postgwas_resolve_fontsize(
             args,
@@ -6111,6 +6126,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         alpha=(float(single_alpha) if single_alpha is not None else 0.85),
                         zorder=10,
                         s=single_scatter_size,
+                        rasterized=rasterized,
                         **_marker_scatter_style("D"),
                     )
                     for idx in draw_hl_idx:

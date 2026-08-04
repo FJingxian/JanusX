@@ -757,7 +757,10 @@ def _postgarfield_create_circle_background(
     )
     min_logp = float(args.ylim_min) if args.ylim_min is not None else 0.0
     max_logp = float(args.ylim_max) if args.ylim_max is not None else None
-    rasterized = _postgwas_should_rasterize_dense_layers(args.format)
+    rasterized = _postgwas_should_rasterize_dense_layers(
+        args.format,
+        n_points=int(background_df.shape[0]),
+    )
 
     fig_circle, ax_circle = plt.subplots(
         figsize=(float(args.circle_size), float(args.circle_size)),
@@ -885,7 +888,10 @@ def _postgarfield_write_category_outputs(
     )
     min_logp = float(args.ylim_min) if args.ylim_min is not None else 0.0
     max_logp = float(args.ylim_max) if args.ylim_max is not None else None
-    rasterized = _postgwas_should_rasterize_dense_layers(args.format)
+    rasterized = _postgwas_should_rasterize_dense_layers(
+        args.format,
+        n_points=int(background_df.shape[0]),
+    )
     for category, category_desc in _GARFIELD_CATEGORY_SPECS:
         df_cat = category_frames.get(category, pd.DataFrame()).copy()
         out_tsv = os.path.join(outdir, f"{output_stem}.sig.{category}.tsv")

@@ -1718,7 +1718,10 @@ fn rank_rule_score_components_base(
     params: &BeamSearchParams,
 ) -> f64 {
     let use_gain = rank_mode_uses_gain(rule_len, params);
-    let base = if use_gain {
+    // A singleton has no interaction parent.  Under the unified gain
+    // schedule its gain is therefore defined as its own score; interaction
+    // gain starts when the second literal is added.
+    let base = if use_gain && rule_len > 1 {
         raw_score - direct_parent_raw
     } else {
         raw_score
@@ -2340,7 +2343,11 @@ fn keep_child_after_parent_abs_improvement_pruning(
 
 #[inline]
 fn gain_threshold_applies(rule_len: usize, params: &BeamSearchParams) -> bool {
-    rank_mode_uses_gain(rule_len, params)
+    // Layer 1 keeps every valid singleton seed.  With GainFromLayer(1), its
+    // rank score is still defined as gain (= the singleton score), but the
+    // min-gain filter is only meaningful for interaction extensions and must
+    // not discard seeds after the bucket null penalty is applied.
+    rule_len > 1 && rank_mode_uses_gain(rule_len, params)
 }
 
 #[inline]
@@ -10898,6 +10905,30 @@ mod tests {
         assert!((single_score - 0.8).abs() < 1e-12);
         assert!((pair_score - 0.8).abs() < 1e-12);
         assert!((triple_score - 0.2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_gain_from_layer_one_uses_singleton_score_as_gain() {
+        let params = BeamSearchParams {
+            rank_mode: BeamRankMode::GainFromLayer(1),
+            ..BeamSearchParams::default()
+        };
+        let single_score = rank_rule_score_components(1, 0, 0.8, 0.6, &params);
+        let pair_score = rank_rule_score_components(2, 0, 0.8, 0.6, &params);
+        assert!((single_score - 0.8).abs() < 1e-12);
+        assert!((pair_score - 0.2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_gain_from_layer_one_does_not_filter_singleton_seeds() {
+        let params = BeamSearchParams {
+            min_gain: 1e-6,
+            rank_mode: BeamRankMode::GainFromLayer(1),
+            ..BeamSearchParams::default()
+        };
+        assert!(keep_state_after_min_gain_pruning(1, -10.0, &params));
+        assert!(!keep_state_after_min_gain_pruning(2, 1e-7, &params));
+        assert!(keep_state_after_min_gain_pruning(2, 1e-4, &params));
     }
 
     #[test]

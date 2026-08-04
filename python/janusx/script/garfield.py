@@ -1990,9 +1990,14 @@ def _describe_rank_schedule(rank_score_runtime: str) -> str:
     if m is not None:
         gain_start = int(m.group(1))
         if gain_start <= 1:
-            return "gain from layer 1 (all gain)"
+            return "gain from layer 1 (layer 1 gain = score; interaction gain thereafter)"
         return f"raw through layer {gain_start - 1}, gain from layer {gain_start}"
     return mode
+
+
+def _dev_help_requested(argv: Optional[list[str]] = None) -> bool:
+    tokens = list(sys.argv[1:] if argv is None else argv)
+    return ("-dev" in tokens) or ("--dev" in tokens)
 
 
 def _parse_rule_null_penalty_spec(
@@ -2447,6 +2452,7 @@ def main() -> None:
 
     t_start = time.time()
     use_spinner = stdout_is_tty()
+    show_dev_help = _dev_help_requested()
 
     parser = CliArgumentParser(prog="jx garfield", formatter_class=cli_help_formatter())
 
@@ -2545,12 +2551,9 @@ def main() -> None:
         "-engine",
         "--engine",
         type=str.upper,
-        choices=["AUTO", "CORR", "RF", "GBDT", "GBDT2", "NONE", "SKIP", "DIRECT"],
+        choices=["CORR", "RF", "GBDT"],
         default="CORR",
-        help=(
-            "ML engine for candidate search. Default: CORR. "
-            "Use NONE/SKIP/DIRECT to bypass ML and pass all unit variants directly to beam search."
-        ),
+        help="ML engine for candidate search. Default: CORR.",
     )
     optional_group.add_argument(
         "-width",
@@ -2615,16 +2618,19 @@ def main() -> None:
     )
     optional_group.add_argument("--prior-not", type=float, default=None, help=argparse.SUPPRESS)
     optional_group.add_argument("-layer", "--layer", type=int, default=None, help="Maximum beam-search rule depth (default: 4).")
-    optional_group.add_argument(
+    dev_group = parser.add_argument_group("Development Arguments (show with -dev)")
+    dev_group.add_argument(
         "-gain",
         "--gain-layer",
         dest="gain_layer",
         type=int,
-        default=2,
+        default=1,
         help=(
             "Start ranking beam candidates by interaction gain from this layer onward "
-            "(default: 2; layer 1 uses raw score, and the only active penalty is the "
-            "bucket null penalty)."
+            "(default: 1; layer 1 gain is its own score, later layers use interaction "
+            "gain, and the bucket null penalty remains active)."
+            if show_dev_help
+            else argparse.SUPPRESS
         ),
     )
     optional_group.add_argument(
@@ -2775,8 +2781,8 @@ def main() -> None:
     )
     if int(args.layer) <= 0:
         parser.error("-layer must be > 0")
-    if int(args.gain_layer) < 2:
-        parser.error("-gain/--gain-layer must be >= 2")
+    if int(args.gain_layer) < 1:
+        parser.error("-gain/--gain-layer must be >= 1")
     if int(args.rule_topk) <= 0:
         parser.error("-topk/--topk must be > 0")
     if int(args.fold) >= 2:
@@ -2795,8 +2801,6 @@ def main() -> None:
 
     if args.engine is not None:
         args.engine = str(args.engine).upper()
-        if args.engine == "AUTO":
-            args.engine = "CORR"
     if str(args.scan_mode).lower() == "wholegenome":
         args.engine = "NONE"
 

@@ -3,7 +3,7 @@ import numpy as np
 from types import SimpleNamespace
 
 from scipy.linalg import cho_solve
-from scipy.optimize import minimize
+from scipy.optimize import minimize, minimize_scalar
 from scipy import sparse
 from tqdm import tqdm
 
@@ -22,6 +22,138 @@ except Exception:
     _rust_prepare_sparse_onehot_blup_cache = None  # type: ignore[assignment]
 
 _OBJ_PENALTY = 1e30
+_SPARSE_LOG_VAR_FLOOR = float(np.log(1e-12))
+_SPARSE_LOG_VAR_CEIL = float(np.log(1e12))
+
+
+def _sparse_log_variance_objective(cache: typing.Any, eta: np.ndarray | float) -> float:
+    """Evaluate the sparse one-hot REML objective in log variance-ratio space."""
+    eta_arr = np.asarray(eta, dtype=float).reshape(-1)
+    if eta_arr.size == 0 or not np.all(np.isfinite(eta_arr)):
+        return _OBJ_PENALTY
+    eta_arr = np.clip(eta_arr, _SPARSE_LOG_VAR_FLOOR, _SPARSE_LOG_VAR_CEIL)
+    theta = np.exp(eta_arr)
+    value = cache.objective(np.concatenate([theta, np.asarray([1.0])]).tolist())
+    value = float(value)
+    return value if np.isfinite(value) else _OBJ_PENALTY
+
+
+def _fit_sparse_log_variance_ratios(
+    cache: typing.Any,
+    n_random_terms: int,
+    maxiter: int,
+) -> tuple[np.ndarray, typing.Any] | None:
+    """Optimize positive sparse random/residual ratios without raw-scale drift.
+
+    The residual ratio is fixed to one.  With one random component this is a
+    genuinely one-dimensional bounded problem, so a bracketed scalar solver is
+    more reliable than raw-scale L-BFGS-B.  Multiple components use the same
+    log parameterization with a bounded L-BFGS-B solve.
+    """
+    if n_random_terms <= 0:
+        return None
+    lower = _SPARSE_LOG_VAR_FLOOR
+    upper = _SPARSE_LOG_VAR_CEIL
+    if n_random_terms == 1:
+        result = minimize_scalar(
+            lambda eta: _sparse_log_variance_objective(cache, np.asarray([eta])),
+            method="bounded",
+            bounds=(lower, upper),
+            options={
+                "xatol": 1e-10,
+                "maxiter": max(40, int(maxiter) * 4),
+            },
+        )
+        if not bool(result.success) or not np.isfinite(float(result.fun)):
+            return None
+        eta = np.asarray([float(result.x)], dtype=float)
+    else:
+        # Locate the joint solution cheaply in log space, then use at most
+        # three narrow one-dimensional bracket refinements.  A full coordinate
+        # solve would repeat dozens of sparse factorizations for every term.
+        eta0 = np.zeros(n_random_terms, dtype=float)
+        result = minimize(
+            lambda values: _sparse_log_variance_objective(cache, values),
+            eta0,
+            method="L-BFGS-B",
+            bounds=[(lower, upper)] * n_random_terms,
+            options={
+                "maxiter": max(20, int(maxiter)),
+                "ftol": 1e-12,
+                "gtol": 1e-8,
+                "maxls": 50,
+            },
+        )
+        if not bool(result.success) or not np.isfinite(float(result.fun)):
+            return None
+        eta = np.asarray(result.x, dtype=float).reshape(-1)
+        current = float(result.fun)
+        nfev = int(getattr(result, "nfev", 0))
+        completed = 0
+        for sweep in range(min(3, max(1, int(maxiter)))):
+            previous_eta = eta.copy()
+            previous_obj = current
+            for component in range(n_random_terms):
+                center = float(eta[component])
+                bracket = (max(lower, center - 2.0), min(upper, center + 2.0))
+
+                def coordinate_objective(value: float) -> float:
+                    trial = eta.copy()
+                    trial[component] = float(value)
+                    return _sparse_log_variance_objective(cache, trial)
+
+                coordinate = minimize_scalar(
+                    coordinate_objective,
+                    method="bounded",
+                    bounds=bracket,
+                    options={"xatol": 1e-8, "maxiter": 24},
+                )
+                nfev += int(getattr(coordinate, "nfev", 0))
+                # SciPy's bounded solver can report MAXFUN on an extremely
+                # flat profile even when the finite candidate is already at
+                # the bracket minimum.  The preceding joint solve supplies
+                # the convergence gate; retain a finite refinement candidate.
+                if not np.isfinite(float(coordinate.fun)):
+                    return None
+                eta[component] = float(coordinate.x)
+                current = float(coordinate.fun)
+            completed = sweep + 1
+            if (
+                abs(previous_obj - current) <= 1e-10 * (1.0 + abs(current))
+                and float(np.max(np.abs(previous_eta - eta))) <= 1e-7
+            ):
+                break
+        # Explicitly test the non-negative boundary.  L-BFGS-B may stop at an
+        # interior point when the profile is nearly flat toward zero, while a
+        # variance component such as line×environment is genuinely estimated
+        # at zero by REML/lme4.
+        for component in range(n_random_terms):
+            boundary = eta.copy()
+            boundary[component] = lower
+            boundary_obj = _sparse_log_variance_objective(cache, boundary)
+            if boundary_obj <= current + 1e-10 * (1.0 + abs(current)):
+                eta = boundary
+                current = float(boundary_obj)
+        result.x = eta.copy()
+        result.fun = float(current)
+        result.nfev = nfev
+        result.nit = int(getattr(result, "nit", 0)) + completed
+        result.message = "log_l_bfgs_with_bracket_refinement"
+
+    if eta.size != n_random_terms or not np.all(np.isfinite(eta)):
+        return None
+    theta = np.concatenate([np.exp(np.clip(eta, lower, upper)), np.asarray([1.0])])
+    if not np.all(np.isfinite(theta)) or np.any(theta <= 0.0):
+        return None
+    final_obj = _sparse_log_variance_objective(cache, eta)
+    if not np.isfinite(final_obj):
+        return None
+    try:
+        result.x = theta.copy()
+        result.fun = float(final_obj)
+    except Exception:
+        pass
+    return theta, result
 
 def REML(
     theta: np.ndarray,
@@ -51,17 +183,32 @@ def REML(
     theta = np.asarray(theta, dtype=float).reshape(-1)
     X = np.asarray(X, dtype=float)
     y = np.asarray(y, dtype=float)
+    if (
+        theta.size != len(Klist) + 1
+        or not np.all(np.isfinite(theta))
+        or np.any(theta <= 0.0)
+    ):
+        return _OBJ_PENALTY
     n, p = X.shape
     V = theta[-1] * np.eye(n, dtype=float)
     for num, K in enumerate(Klist):
         V += theta[num] * np.asarray(K, dtype=float)
-    L = np.linalg.cholesky(V)
+    try:
+        L = np.linalg.cholesky(V)
+    except np.linalg.LinAlgError:
+        return _OBJ_PENALTY
     VinvX = cho_solve((L, True), X)
     Vinvy = cho_solve((L, True), y)
     XTV_invX = X.T @ VinvX
     XTV_invy = X.T @ Vinvy
 
-    beta = np.linalg.solve(XTV_invX, XTV_invy)
+    beta, _residuals, rank, _singular = np.linalg.lstsq(
+        np.asarray(XTV_invX, dtype=float),
+        np.asarray(XTV_invy, dtype=float),
+        rcond=None,
+    )
+    if int(rank) < int(p):
+        return _OBJ_PENALTY
     r = y - X @ beta
     Vinvr = cho_solve((L, True), r)
 
@@ -323,7 +470,10 @@ def _prepare_sparse_onehot_blup_cache_py(
     if _rust_prepare_sparse_onehot_blup_cache is None:
         return None
     try:
-        x_arr = np.asarray(X.toarray(), dtype=np.float64) if sparse.issparse(X) else np.asarray(X, dtype=np.float64)
+        x_arr = np.ascontiguousarray(
+            X.toarray() if sparse.issparse(X) else X,
+            dtype=np.float64,
+        )
         random_terms = []
         for idx, z in enumerate(Z_list):
             random_terms.append(
@@ -389,6 +539,8 @@ def _fit_multi_kernel_ai_reml_rust(
             return None
         if (not np.all(np.isfinite(theta))) or np.any(theta <= 0.0):
             return None
+        if not bool(converged):
+            return None
         result = SimpleNamespace(
             x=theta.copy(),
             success=bool(converged),
@@ -416,33 +568,15 @@ def _fit_sparse_z_reml_rust(
         return None
     p_fixed = int(X.shape[1])
     z_cols = [int(v) for v in cache.z_cols]
-    theta0 = np.ones(len(z_cols), dtype=float)
-    bounds = [(1e-12, None)] * theta0.size
-
-    pbar = None
-    callback = None
-    if progress:
-        pbar = tqdm(total=maxiter, desc="REML", ncols=100)
-
-        def callback(theta):
-            pbar.update(1)
-            full_theta = np.concatenate([np.asarray(theta, dtype=float).reshape(-1), [1.0]])
-            pbar.set_postfix({"theta": np.round(full_theta, 4)})
+    # The bracketed solver has no per-evaluation callback; avoid displaying a
+    # misleading zero-progress bar on this sparse path.
+    _ = progress
 
     try:
-        result = minimize(
-            lambda theta: float(
-                cache.objective(
-                    np.concatenate([np.asarray(theta, dtype=float).reshape(-1), [1.0]]).tolist()
-                )
-            ),
-            theta0,
-            method="L-BFGS-B",
-            bounds=bounds,
-            callback=callback,
-            options={"maxiter": maxiter},
-        )
-        theta = np.concatenate([np.asarray(result.x, dtype=float).reshape(-1), [1.0]])
+        optimized = _fit_sparse_log_variance_ratios(cache, len(z_cols), maxiter)
+        if optimized is None:
+            return None
+        theta, result = optimized
         if (not np.all(np.isfinite(theta))) or np.any(theta <= 0.0):
             return None
         fit = cache.fit(theta.tolist())
@@ -472,9 +606,6 @@ def _fit_sparse_z_reml_rust(
         return theta, result, fit_arrays, z_cols
     except Exception:
         return None
-    finally:
-        if pbar is not None:
-            pbar.close()
 
 class BLUP:
     def __init__(
@@ -553,7 +684,26 @@ class BLUP:
         if len(self.Z_list) == 0 and len(self.G_list) == 0: # 无随机协变量 进入一般线性模型
             self.theta = None
             self.V = None
-            self.beta = np.linalg.solve(self.X.T@self.X,self.X.T@self.y)
+            # Solve the least-squares problem on X directly.  Forming and
+            # solving X'X was both less stable for aliased designs and could
+            # enter the mixed Accelerate/OpenBLAS path that sporadically
+            # crashed the full REML CLI with SIGSEGV.
+            x_for_lstsq = (
+                np.asarray(self.X.toarray(), dtype=float)
+                if sparse.issparse(self.X)
+                else np.asarray(self.X, dtype=float)
+            )
+            beta_hat, _residuals, rank, _singular = np.linalg.lstsq(
+                x_for_lstsq,
+                np.asarray(self.y, dtype=float),
+                rcond=None,
+            )
+            if int(rank) < int(x_for_lstsq.shape[1]):
+                raise np.linalg.LinAlgError(
+                    "Fixed-effect design is rank deficient: "
+                    f"rank={int(rank)}, columns={int(x_for_lstsq.shape[1])}."
+                )
+            self.beta = np.asarray(beta_hat, dtype=float)
             self.u = None
             self.u_by_Z = None
             self.g = None
@@ -564,12 +714,15 @@ class BLUP:
             self._g_scales = []
             self._z_fitted = None
             self._z_standardized = False
-            self._cov_beta = np.linalg.pinv(self.X.T @ self.X) * (
-                float(((self.y - self.X @ self.beta).T @ (self.y - self.X @ self.beta))[0, 0])
+            xtx = x_for_lstsq.T @ x_for_lstsq
+            fitted = x_for_lstsq @ self.beta
+            residuals = self.y - fitted
+            self._cov_beta = np.linalg.pinv(xtx) * (
+                float((residuals.T @ residuals)[0, 0])
                 / max(1, self.n - self.p)
             )
-            self.fitted = self.X@self.beta
-            self.residuals = self.y - self.fitted 
+            self.fitted = fitted
+            self.residuals = residuals
             self.result = None
             pass
         else:
@@ -668,8 +821,9 @@ class BLUP:
                     theta0,
                     args=(self.y, self.X, Klist),
                     method="L-BFGS-B",
+                    bounds=[(1e-12, None)] * len(theta0),
                     callback=callback,
-                    options={"maxiter": self.maxiter},
+                    options={"maxiter": self.maxiter, "ftol": 1e-12, "gtol": 1e-8},
                 )
                 theta = np.asarray(result.x, dtype=float)
                 if pbar is not None:
@@ -683,7 +837,16 @@ class BLUP:
             L = np.linalg.cholesky(V)
             VinvX = cho_solve((L,True), self.X)
             Vinvy = cho_solve((L,True), self.y)
-            beta_hat = np.linalg.solve(self.X.T @ VinvX, self.X.T @ Vinvy)
+            beta_hat, _residuals, rank, _singular = np.linalg.lstsq(
+                np.asarray(self.X.T @ VinvX, dtype=float),
+                np.asarray(self.X.T @ Vinvy, dtype=float),
+                rcond=None,
+            )
+            if int(rank) < int(self.X.shape[1]):
+                raise np.linalg.LinAlgError(
+                    "GLS fixed-effect design is rank deficient: "
+                    f"rank={int(rank)}, columns={int(self.X.shape[1])}."
+                )
             r = self.y - self.X @ beta_hat
             Vinvr = cho_solve((L,True), r)
 

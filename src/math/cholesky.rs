@@ -775,6 +775,7 @@ fn build_solve_workspace_req(
 
 fn build_sparse_cholesky_analysis<V: SparseGrmCscView + ?Sized>(
     csc: &V,
+    amd_dense: f64,
 ) -> Result<
     (
         usize,
@@ -819,7 +820,10 @@ fn build_sparse_cholesky_analysis<V: SparseGrmCscView + ?Sized>(
         &mut perm,
         &mut perm_inv,
         base_lower.symbolic(),
-        amd::Control::default(),
+        amd::Control {
+            dense: amd_dense,
+            aggressive: true,
+        },
         PodStack::new(&mut amd_mem),
     )
     .map_err(|e| format!("sparse AMD ordering failed: {e}"))?;
@@ -1536,6 +1540,13 @@ impl SparseJxgrmCholesky {
 pub(crate) fn sparse_cholesky_analyze_jxgrm_view<V: SparseGrmCscView + ?Sized>(
     csc: &V,
 ) -> Result<SparseJxgrmCholeskyAnalysis, String> {
+    sparse_cholesky_analyze_jxgrm_view_with_dense(csc, 10.0)
+}
+
+fn sparse_cholesky_analyze_jxgrm_view_with_dense<V: SparseGrmCscView + ?Sized>(
+    csc: &V,
+    amd_dense: f64,
+) -> Result<SparseJxgrmCholeskyAnalysis, String> {
     let (
         n,
         perm,
@@ -1545,7 +1556,7 @@ pub(crate) fn sparse_cholesky_analyze_jxgrm_view<V: SparseGrmCscView + ?Sized>(
         base_perm_row_indices,
         base_perm_values,
         diag_positions,
-    ) = build_sparse_cholesky_analysis(csc)?;
+    ) = build_sparse_cholesky_analysis(csc, amd_dense)?;
     Ok(SparseJxgrmCholeskyAnalysis {
         n,
         perm,
@@ -1562,6 +1573,19 @@ pub fn sparse_cholesky_analyze_jxgrm_csc(
     csc: &SparseGrmCsc,
 ) -> Result<SparseJxgrmCholeskyAnalysis, String> {
     sparse_cholesky_analyze_jxgrm_view(csc)
+}
+
+/// Analyze a one-hot random-effect cross-product pattern.
+///
+/// One-hot incidence matrices can contain a small factor level connected to
+/// hundreds or thousands of levels in another factor.  faer's dense-node AMD
+/// heuristic is unstable for that pattern in 0.18.2; disabling only that
+/// heuristic keeps AMD ordering while leaving the general sparse-GRM path
+/// unchanged.
+pub(crate) fn sparse_cholesky_analyze_jxgrm_csc_onehot(
+    csc: &SparseGrmCsc,
+) -> Result<SparseJxgrmCholeskyAnalysis, String> {
+    sparse_cholesky_analyze_jxgrm_view_with_dense(csc, f64::INFINITY)
 }
 
 pub fn sparse_cholesky_from_jxgrm_csc(
@@ -1730,5 +1754,42 @@ mod tests {
         assert_eq!(second_progress.len(), 1);
         assert_eq!(second_progress[0], (csc.n_samples + 1, csc.n_samples + 1));
         let _ = std::fs::remove_file(out_str);
+    }
+
+    #[test]
+    fn sparse_jxgrm_analyzes_large_two_factor_onehot_pattern() {
+        let n_lines = 500usize;
+        let n_env = 6usize;
+        let n = n_lines + n_env;
+        let mut col_ptr = Vec::with_capacity(n + 1);
+        let mut row_indices = Vec::new();
+        let mut values = Vec::new();
+        col_ptr.push(0);
+        for line in 0..n_lines {
+            row_indices.push(line as u32);
+            values.push(6.0);
+            for env in 0..n_env {
+                row_indices.push((n_lines + env) as u32);
+                values.push(1.0);
+            }
+            col_ptr.push(row_indices.len() as u64);
+        }
+        for env in 0..n_env {
+            row_indices.push((n_lines + env) as u32);
+            values.push(n_lines as f64);
+            col_ptr.push(row_indices.len() as u64);
+        }
+        let csc = SparseGrmCsc {
+            n_samples: n,
+            nnz: row_indices.len(),
+            col_ptr,
+            row_indices,
+            values,
+        };
+        let analysis = sparse_cholesky_analyze_jxgrm_csc_onehot(&csc);
+        assert!(
+            analysis.is_ok(),
+            "large two-factor CSC analysis failed: {analysis:?}"
+        );
     }
 }

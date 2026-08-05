@@ -1,5 +1,5 @@
 use crate::cholesky::{
-    sparse_cholesky_analyze_jxgrm_csc, SparseJxgrmCholesky, SparseJxgrmCholeskyAnalysis,
+    sparse_cholesky_analyze_jxgrm_csc_onehot, SparseJxgrmCholesky, SparseJxgrmCholeskyAnalysis,
 };
 use crate::linalg::{cholesky_inplace, cholesky_logdet, cholesky_solve_into};
 use crate::spgrm::SparseGrmCsc;
@@ -388,7 +388,7 @@ fn build_sparse_onehot_model_cache_core(
         return Err("Sparse one-hot BLUP requires at least one random term".to_string());
     }
     let (ztz_csc, z_cols, z_col_term_index) = build_lower_csc_from_factors(factors.as_slice())?;
-    let analysis = Arc::new(sparse_cholesky_analyze_jxgrm_csc(&ztz_csc)?);
+    let analysis = Arc::new(sparse_cholesky_analyze_jxgrm_csc_onehot(&ztz_csc)?);
     let xtx = dense_xtx(x_row_major.as_slice(), n_obs, p_fixed);
     let xty = dense_xty(x_row_major.as_slice(), y.as_slice(), n_obs, p_fixed);
     let ztx = ztx_from_factors(factors.as_slice(), x_row_major.as_slice(), n_obs, p_fixed);

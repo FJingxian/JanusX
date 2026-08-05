@@ -31,8 +31,8 @@ import numpy as np
 import pandas as pd
 from scipy import sparse
 from scipy.linalg import cho_solve
-from scipy.optimize import minimize
-from scipy.sparse.linalg import spsolve
+from scipy.optimize import minimize, minimize_scalar
+from scipy.sparse.linalg import lsqr, spsolve
 from scipy.stats import t as student_t
 
 from janusx.assoc.workflow_model_packed import (
@@ -83,6 +83,17 @@ class _EffectSpec:
         return "continuous"
 
 
+@dataclass(frozen=True)
+class _GxeEnvironmentInfo:
+    """Effective environment metadata for one compiled GxE random term."""
+
+    label: str
+    n_levels: int
+    h_env: float
+    min_cell_n: int
+    max_cell_n: int
+
+
 @dataclass
 class _CompiledModelTerms:
     fixed_specs: list[_EffectSpec]
@@ -120,6 +131,39 @@ class _Stage1BlueResult:
     sample_ids: list[str]
     values: np.ndarray
     noise_diag: np.ndarray | None = None
+    solver: str = "generic"
+
+
+@dataclass
+class _Stage1GroupedCache:
+    """Compact stage-1 representation for random effects nested within line."""
+
+    y_by_line: list[np.ndarray]
+    w_by_line: list[np.ndarray]
+    z_by_line: list[list[np.ndarray]]
+    line_levels: list[str]
+    fixed_mean: np.ndarray
+    random_names: list[str]
+    n_obs: int
+    n_fixed: int
+    patterns: list["_Stage1GroupedPattern"]
+
+
+@dataclass
+class _Stage1GroupedPattern:
+    line_indices: np.ndarray
+    w: np.ndarray
+    z_terms: list[np.ndarray]
+
+
+@dataclass
+class _Stage1GroupedProfile:
+    logdet_r: float
+    logdet_x: float
+    ypy: float
+    gamma: np.ndarray
+    blue_values: np.ndarray
+    noise_ratio: np.ndarray
 
 
 @dataclass
@@ -546,6 +590,90 @@ def _harmonic_mean(values: Iterable[float | int]) -> float:
     return float(arr.size / np.sum(1.0 / arr))
 
 
+def _build_gxe_environment_infos(
+    df: pd.DataFrame,
+    *,
+    line_col: str,
+    gxe_specs: list[_EffectSpec],
+) -> list[_GxeEnvironmentInfo]:
+    """Summarize observed environment replication for each GxE term.
+
+    A term such as ``loc:year`` has its own combined environment key.  The
+    metadata is deliberately kept per term because separate GxE variance
+    components can have different effective environment counts.
+    """
+
+    line_ids = df[line_col].astype("string").fillna("NA").astype(str)
+    out: list[_GxeEnvironmentInfo] = []
+    for spec in gxe_specs:
+        env_key = _effect_factor_series(df, spec).astype("string").fillna("NA").astype(str)
+        cells = pd.DataFrame({"line": line_ids.to_numpy(dtype=object), "env": env_key.to_numpy(dtype=object)})
+        cell_counts = cells.groupby(["line", "env"], sort=False, observed=False).size()
+        if cell_counts.empty:
+            out.append(
+                _GxeEnvironmentInfo(
+                    label=str(spec.label),
+                    n_levels=0,
+                    h_env=1.0,
+                    min_cell_n=0,
+                    max_cell_n=0,
+                )
+            )
+            continue
+        env_per_line = cell_counts.groupby(level=0, sort=False).size()
+        out.append(
+            _GxeEnvironmentInfo(
+                label=str(spec.label),
+                n_levels=int(env_key.nunique(dropna=False)),
+                h_env=max(1.0, _harmonic_mean(env_per_line.to_numpy(dtype=float))),
+                min_cell_n=int(cell_counts.min()),
+                max_cell_n=int(cell_counts.max()),
+            )
+        )
+    return out
+
+
+def _adjust_gxe_variance_components(
+    terms: list[tuple[_GxeEnvironmentInfo, float]],
+) -> tuple[float, float]:
+    """Return phenotype-scale GxE contribution and its effective h_env."""
+
+    finite_terms = [
+        (info, float(var))
+        for info, var in terms
+        if np.isfinite(float(var)) and float(var) >= 0.0
+    ]
+    if not finite_terms:
+        return 0.0, 1.0
+    adjusted = float(
+        sum(var / max(float(info.h_env), 1.0) for info, var in finite_terms)
+    )
+    total = float(sum(var for _info, var in finite_terms))
+    if adjusted > 0.0 and total > 0.0:
+        return adjusted, float(total / adjusted)
+    return adjusted, max(1.0, _harmonic_mean(info.h_env for info, _var in finite_terms))
+
+
+def _gxe_terms_are_unreplicated(infos: list[_GxeEnvironmentInfo]) -> bool:
+    """Whether every requested GxE term has at most one observation/cell."""
+
+    return bool(infos) and all(int(info.max_cell_n) <= 1 for info in infos)
+
+
+def _gxe_specs_with_variances(
+    gxe_specs: list[_EffectSpec],
+    terms: list[tuple[_GxeEnvironmentInfo, float]],
+) -> list[tuple[_EffectSpec, float]]:
+    """Attach compiled GxE variances to their original effect specifications."""
+
+    spec_by_label = {str(spec.label): spec for spec in gxe_specs}
+    return [
+        (spec_by_label[info.label], float(variance))
+        for info, variance in terms
+        if info.label in spec_by_label
+    ]
+
+
 def _effective_env_plot_counts(
     sample_ids_sub: pd.Series,
     sub: pd.DataFrame,
@@ -874,6 +1002,464 @@ def _build_stage1_blue_terms(
     return list(random_terms_all), list(fixed_terms_all)
 
 
+def _stage1_grouped_random_rows(
+    z: typing.Union[np.ndarray, sparse.spmatrix],
+    line_codes: np.ndarray,
+    n_obs: int,
+    term_name: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Extract one non-zero column/value per row without densifying ``z``."""
+
+    if sparse.issparse(z):
+        z_csr = z.tocsr().astype(float)
+        if z_csr.shape[0] != n_obs:
+            raise ValueError(
+                f"Stage-1 random term `{term_name}` has {z_csr.shape[0]} rows; "
+                f"expected {n_obs}."
+            )
+        row_counts = np.diff(z_csr.indptr)
+        if bool(np.any(row_counts > 1)):
+            raise ValueError(
+                f"Stage-1 random term `{term_name}` is not one-column-per-row "
+                "and cannot use the line-nested solver."
+            )
+        present = row_counts == 1
+        rows = np.flatnonzero(present)
+        starts = z_csr.indptr[:-1][present]
+        columns = z_csr.indices[starts].astype(np.int64, copy=False)
+        values = z_csr.data[starts].astype(float, copy=False)
+        n_cols = int(z_csr.shape[1])
+    else:
+        arr = np.asarray(z, dtype=float)
+        if arr.ndim != 2 or arr.shape[0] != n_obs:
+            raise ValueError(
+                f"Stage-1 random term `{term_name}` must have shape ({n_obs}, q); "
+                f"got {arr.shape}."
+            )
+        active = np.abs(arr) > 1e-12
+        row_counts = np.sum(active, axis=1)
+        if bool(np.any(row_counts > 1)):
+            raise ValueError(
+                f"Stage-1 random term `{term_name}` is not one-column-per-row "
+                "and cannot use the line-nested solver."
+            )
+        present = row_counts == 1
+        rows = np.flatnonzero(present)
+        columns = np.argmax(active[rows], axis=1).astype(np.int64, copy=False)
+        values = arr[rows, columns].astype(float, copy=False)
+        n_cols = int(arr.shape[1])
+
+    # A line-nested random column must never be used by observations from two
+    # different lines.  This is the exact condition that makes the marginal
+    # covariance block diagonal by line.
+    owners = np.full(n_cols, -1, dtype=np.int64)
+    for line_code, column in zip(line_codes[rows], columns):
+        previous = int(owners[int(column)])
+        if previous < 0:
+            owners[int(column)] = int(line_code)
+        elif previous != int(line_code):
+            raise ValueError(
+                f"Stage-1 random term `{term_name}` is not line-nested: "
+                f"column {int(column)} is shared by lines {previous} and {int(line_code)}."
+            )
+    return rows, columns, values
+
+
+def _prepare_stage1_grouped_cache(
+    y_obs: np.ndarray,
+    sub: pd.DataFrame,
+    *,
+    line_col: str,
+    fixed_matrix: np.ndarray | None,
+    random_matrices: list[typing.Union[np.ndarray, sparse.spmatrix]],
+    random_names: list[str],
+) -> _Stage1GroupedCache:
+    """Build a compact per-line cache without a line-dummy design matrix."""
+
+    y_vec = np.asarray(y_obs, dtype=float).reshape(-1)
+    n_obs = int(y_vec.shape[0])
+    line_ids = sub[line_col].astype("string").fillna("NA").astype(str).to_numpy()
+    if line_ids.shape[0] != n_obs:
+        raise ValueError(
+            f"Stage-1 line column has {line_ids.shape[0]} rows but y has {n_obs}."
+        )
+    line_levels = sorted(pd.unique(line_ids).tolist())
+    line_to_code = {str(value): idx for idx, value in enumerate(line_levels)}
+    line_codes = np.asarray(
+        [line_to_code[str(value)] for value in line_ids], dtype=np.int64
+    )
+    row_groups = [
+        np.flatnonzero(line_codes == line_code).astype(np.int64, copy=False)
+        for line_code in range(len(line_levels))
+    ]
+
+    if fixed_matrix is None:
+        w_arr = np.zeros((n_obs, 0), dtype=float)
+    else:
+        w_arr = np.asarray(fixed_matrix, dtype=float)
+        if w_arr.ndim != 2 or w_arr.shape[0] != n_obs:
+            raise ValueError(
+                "Stage-1 fixed design must have shape (n_obs, n_fixed); "
+                f"got {w_arr.shape} for n_obs={n_obs}."
+            )
+        if not np.all(np.isfinite(w_arr)):
+            raise ValueError("Stage-1 fixed design contains non-finite values.")
+        w_arr = np.ascontiguousarray(w_arr, dtype=float)
+    n_fixed = int(w_arr.shape[1])
+
+    if len(random_names) != len(random_matrices):
+        names = [f"z{idx}" for idx in range(len(random_matrices))]
+    else:
+        names = [str(value) for value in random_names]
+
+    local_terms: list[list[np.ndarray]] = [
+        [np.zeros((len(rows), 0), dtype=float) for rows in row_groups]
+        for _ in random_matrices
+    ]
+    for term_idx, (term_name, z) in enumerate(zip(names, random_matrices)):
+        rows, columns, values = _stage1_grouped_random_rows(
+            z,
+            line_codes,
+            n_obs,
+            term_name,
+        )
+        for line_code, group_rows in enumerate(row_groups):
+            keep = line_codes[rows] == line_code
+            if not bool(np.any(keep)):
+                continue
+            observed_rows = rows[keep]
+            observed_columns = columns[keep]
+            observed_values = values[keep]
+            unique_columns = np.unique(observed_columns)
+            column_map = {
+                int(column): local_idx
+                for local_idx, column in enumerate(unique_columns.tolist())
+            }
+            local = np.zeros(
+                (len(group_rows), len(unique_columns)),
+                dtype=float,
+            )
+            row_positions = np.searchsorted(group_rows, observed_rows)
+            for row_pos, column, value in zip(
+                row_positions,
+                observed_columns,
+                observed_values,
+            ):
+                local[int(row_pos), column_map[int(column)]] = float(value)
+            local_terms[term_idx][line_code] = local
+
+    z_by_line = [
+        [local_terms[term_idx][line_code] for term_idx in range(len(random_matrices))]
+        for line_code in range(len(line_levels))
+    ]
+    pattern_map: dict[tuple[object, ...], list[int]] = {}
+    for line_code, group_rows in enumerate(row_groups):
+        w_i = np.ascontiguousarray(w_arr[group_rows, :], dtype=float)
+        z_i_terms = [
+            np.ascontiguousarray(z_by_line[line_code][term_idx], dtype=float)
+            for term_idx in range(len(random_matrices))
+        ]
+        key: tuple[object, ...] = (
+            w_i.shape,
+            w_i.tobytes(),
+            tuple((z_i.shape, z_i.tobytes()) for z_i in z_i_terms),
+        )
+        pattern_map.setdefault(key, []).append(line_code)
+    patterns = [
+        _Stage1GroupedPattern(
+            line_indices=np.asarray(indices, dtype=np.int64),
+            w=np.ascontiguousarray(w_arr[row_groups[indices[0]], :], dtype=float),
+            z_terms=[
+                np.ascontiguousarray(z_by_line[indices[0]][term_idx], dtype=float)
+                for term_idx in range(len(random_matrices))
+            ],
+        )
+        for indices in pattern_map.values()
+    ]
+
+    return _Stage1GroupedCache(
+        y_by_line=[y_vec[rows] for rows in row_groups],
+        w_by_line=[w_arr[rows, :] for rows in row_groups],
+        z_by_line=z_by_line,
+        line_levels=[str(value) for value in line_levels],
+        fixed_mean=np.mean(w_arr, axis=0) if n_obs > 0 else np.zeros(n_fixed),
+        random_names=names,
+        n_obs=n_obs,
+        n_fixed=n_fixed,
+        patterns=patterns,
+    )
+
+
+def _stage1_grouped_profile(
+    cache: _Stage1GroupedCache,
+    random_variances: list[float] | np.ndarray,
+    residual_variance: float,
+) -> _Stage1GroupedProfile:
+    """Evaluate grouped GLS sufficient statistics and BLUE covariance."""
+
+    n_random = len(cache.random_names)
+    variances = np.asarray(random_variances, dtype=float).reshape(-1)
+    if variances.size != n_random:
+        raise ValueError(
+            f"Grouped stage-1 variance count {variances.size} does not match "
+            f"random terms {n_random}."
+        )
+    if not np.all(np.isfinite(variances)) or np.any(variances < 0.0):
+        raise ValueError("Grouped stage-1 random variances must be finite and non-negative.")
+    residual = float(residual_variance)
+    if not np.isfinite(residual) or residual <= 0.0:
+        raise ValueError("Grouped stage-1 residual variance must be finite and positive.")
+
+    p = int(cache.n_fixed)
+    normal_fixed = np.zeros((p, p), dtype=float)
+    rhs_fixed = np.zeros(p, dtype=float)
+    n_lines = len(cache.line_levels)
+    line_d = np.zeros(n_lines, dtype=float)
+    line_b = np.zeros((n_lines, p), dtype=float)
+    line_s = np.zeros(n_lines, dtype=float)
+    logdet_r = 0.0
+    y0 = 0.0
+    for pattern in cache.patterns:
+        line_indices = pattern.line_indices
+        w_i = pattern.w
+        z_terms = pattern.z_terms
+        n_i = int(w_i.shape[0])
+        covariance = np.eye(n_i, dtype=float) * residual
+        for variance, z_i in zip(variances, z_terms):
+            if float(variance) <= 0.0 or z_i.shape[1] == 0:
+                continue
+            covariance += float(variance) * (z_i @ z_i.T)
+        try:
+            chol = np.linalg.cholesky(covariance)
+        except np.linalg.LinAlgError as exc:
+            raise ValueError("Grouped stage-1 covariance block is not positive definite.") from exc
+        logdet_r += float(line_indices.size) * float(
+            2.0 * np.sum(np.log(np.diag(chol)))
+        )
+
+        one = np.ones(n_i, dtype=float)
+        if p > 0:
+            rhs = np.column_stack((one, w_i))
+        else:
+            rhs = one.reshape(-1, 1)
+        solved = cho_solve((chol, True), rhs)
+        q_one = solved[:, 0]
+        if p > 0:
+            q_w = solved[:, 1 : 1 + p]
+        else:
+            q_w = np.zeros((n_i, 0), dtype=float)
+        y_matrix = np.vstack([cache.y_by_line[int(idx)] for idx in line_indices])
+        q_y_matrix = cho_solve((chol, True), y_matrix.T).T
+        d_i = float(one @ q_one)
+        if not np.isfinite(d_i) or d_i <= 0.0:
+            raise ValueError("Grouped stage-1 line information is not positive.")
+        b_i = np.asarray(w_i.T @ q_one, dtype=float).reshape(-1)
+        a_i = np.asarray(w_i.T @ q_w, dtype=float).reshape(p, p)
+        s_i = q_y_matrix @ one
+        c_i = q_y_matrix @ w_i if p > 0 else np.zeros((line_indices.size, 0), dtype=float)
+        qy_i = np.sum(y_matrix * q_y_matrix, axis=1)
+        line_d[line_indices] = d_i
+        if p > 0:
+            line_b[line_indices, :] = b_i.reshape(1, -1)
+        line_s[line_indices] = s_i
+        if p > 0:
+            normal_fixed += float(line_indices.size) * (
+                a_i - np.outer(b_i, b_i) / d_i
+            )
+            rhs_fixed += np.sum(c_i, axis=0) - b_i * (float(np.sum(s_i)) / d_i)
+        y0 += float(np.sum(qy_i) - np.sum(s_i * s_i) / d_i)
+
+    if p > 0:
+        normal_fixed = (normal_fixed + normal_fixed.T) * 0.5
+        try:
+            chol_fixed = np.linalg.cholesky(normal_fixed)
+        except np.linalg.LinAlgError as exc:
+            raise ValueError(
+                "Grouped stage-1 fixed effects are rank deficient after line elimination."
+            ) from exc
+        gamma = cho_solve((chol_fixed, True), rhs_fixed)
+        inv_fixed = cho_solve(
+            (chol_fixed, True),
+            np.eye(p, dtype=float),
+        )
+        logdet_x = float(2.0 * np.sum(np.log(np.diag(chol_fixed))))
+    else:
+        gamma = np.zeros(0, dtype=float)
+        inv_fixed = np.zeros((0, 0), dtype=float)
+        logdet_x = 0.0
+
+    blue_values = np.empty(len(cache.line_levels), dtype=float)
+    noise_ratio = np.empty(len(cache.line_levels), dtype=float)
+    for idx in range(n_lines):
+        d_i = float(line_d[idx])
+        b_i = line_b[idx, :]
+        s_i = float(line_s[idx])
+        alpha_i = (s_i - float(b_i @ gamma)) / d_i
+        h_i = cache.fixed_mean - (b_i / d_i)
+        blue_values[idx] = alpha_i + float(cache.fixed_mean @ gamma)
+        noise_ratio[idx] = (1.0 / d_i) + float(h_i @ inv_fixed @ h_i)
+    ypy = float(y0 - (rhs_fixed @ gamma if p > 0 else 0.0))
+    if not np.isfinite(ypy) or ypy <= 0.0:
+        raise ValueError(f"Grouped stage-1 profiled quadratic form is invalid: yPy={ypy}.")
+    return _Stage1GroupedProfile(
+        logdet_r=float(logdet_r),
+        logdet_x=float(logdet_x + np.sum(np.log(line_d))),
+        ypy=ypy,
+        gamma=gamma,
+        blue_values=blue_values,
+        noise_ratio=np.maximum(noise_ratio, 0.0),
+    )
+
+
+def _fit_stage1_grouped_gls_fixed_variance(
+    *,
+    y_obs: np.ndarray,
+    sub: pd.DataFrame,
+    line_col: str,
+    fixed_matrix: np.ndarray | None,
+    random_matrices: list[typing.Union[np.ndarray, sparse.spmatrix]],
+    random_names: list[str],
+    random_variances: list[float] | np.ndarray,
+    resid_var: float,
+) -> _Stage1BlueResult:
+    """Solve line BLUEs exactly for supplied covariance components.
+
+    This small helper is intentionally exposed to the local regression tests;
+    the production stage-1 route wraps it with a profiled grouped REML fit.
+    """
+
+    cache = _prepare_stage1_grouped_cache(
+        y_obs,
+        sub,
+        line_col=line_col,
+        fixed_matrix=fixed_matrix,
+        random_matrices=random_matrices,
+        random_names=random_names,
+    )
+    profile = _stage1_grouped_profile(cache, random_variances, resid_var)
+    return _Stage1BlueResult(
+        sample_ids=cache.line_levels,
+        values=profile.blue_values,
+        noise_diag=profile.noise_ratio,
+        solver="grouped_gls",
+    )
+
+
+def _fit_stage1_grouped_reml(
+    *,
+    y_obs: np.ndarray,
+    sub: pd.DataFrame,
+    line_col: str,
+    fixed_matrix: np.ndarray | None,
+    random_matrices: list[typing.Union[np.ndarray, sparse.spmatrix]],
+    random_names: list[str],
+    initial_variances: dict[str, float] | None,
+    resid_var: float | None,
+    maxiter: int,
+) -> _Stage1BlueResult:
+    """Profile REML after analytically eliminating all line-level effects."""
+
+    cache = _prepare_stage1_grouped_cache(
+        y_obs,
+        sub,
+        line_col=line_col,
+        fixed_matrix=fixed_matrix,
+        random_matrices=random_matrices,
+        random_names=random_names,
+    )
+    n_random = len(cache.random_names)
+    residual_floor = 1e-12
+    degrees = int(cache.n_obs - len(cache.line_levels) - cache.n_fixed)
+    if degrees <= 0:
+        raise ValueError(
+            "Grouped stage-1 REML has non-positive residual degrees of freedom: "
+            f"n={cache.n_obs}, lines={len(cache.line_levels)}, fixed={cache.n_fixed}."
+        )
+    lower = float(np.log(1e-12))
+    upper = float(np.log(1e12))
+
+    def objective(eta: np.ndarray | float) -> float:
+        eta_arr = np.asarray(eta, dtype=float).reshape(-1)
+        if eta_arr.size != n_random or not np.all(np.isfinite(eta_arr)):
+            return 1e30
+        ratios = np.exp(np.clip(eta_arr, lower, upper))
+        try:
+            profile = _stage1_grouped_profile(cache, ratios, 1.0)
+        except (ValueError, np.linalg.LinAlgError, FloatingPointError):
+            return 1e30
+        sigma2 = profile.ypy / float(degrees)
+        if not np.isfinite(sigma2) or sigma2 <= residual_floor:
+            return 1e30
+        value = 0.5 * (
+            profile.logdet_r
+            + profile.logdet_x
+            + float(degrees) * np.log(sigma2)
+        )
+        return float(value) if np.isfinite(value) else 1e30
+
+    if n_random > 0:
+        init = np.ones(n_random, dtype=float)
+        if initial_variances and resid_var is not None:
+            residual_init = float(resid_var)
+            if np.isfinite(residual_init) and residual_init > 0.0:
+                for idx, name in enumerate(cache.random_names):
+                    value = float(initial_variances.get(str(name), np.nan))
+                    if np.isfinite(value) and value > 0.0:
+                        init[idx] = value / residual_init
+        eta0 = np.log(np.clip(init, 1e-12, 1e12))
+        if n_random == 1:
+            result = minimize_scalar(
+                lambda value: objective(np.asarray([value], dtype=float)),
+                method="bounded",
+                bounds=(lower, upper),
+                options={"xatol": 1e-9, "maxiter": max(40, int(maxiter) * 4)},
+            )
+            if not bool(result.success) or not np.isfinite(float(result.fun)):
+                raise ValueError("Grouped stage-1 REML optimization did not converge.")
+            eta = np.asarray([float(result.x)], dtype=float)
+            best_value = float(result.fun)
+        else:
+            result = minimize(
+                objective,
+                eta0,
+                method="L-BFGS-B",
+                bounds=[(lower, upper)] * n_random,
+                options={
+                    "maxiter": max(20, int(maxiter)),
+                    "ftol": 1e-12,
+                    "gtol": 1e-8,
+                    "maxls": 50,
+                },
+            )
+            if not bool(result.success) or not np.isfinite(float(result.fun)):
+                raise ValueError("Grouped stage-1 REML optimization did not converge.")
+            eta = np.asarray(result.x, dtype=float).reshape(-1)
+            best_value = float(result.fun)
+            # Explicit boundary probes preserve non-negative REML behavior for
+            # nearly flat GxE components.
+            for idx in range(n_random):
+                boundary = eta.copy()
+                boundary[idx] = lower
+                boundary_value = objective(boundary)
+                if boundary_value <= best_value + 1e-10 * (1.0 + abs(best_value)):
+                    eta = boundary
+                    best_value = float(boundary_value)
+    else:
+        eta = np.zeros(0, dtype=float)
+
+    ratios = np.exp(np.clip(eta, lower, upper))
+    profile = _stage1_grouped_profile(cache, ratios, 1.0)
+    sigma2 = profile.ypy / float(degrees)
+    if not np.isfinite(sigma2) or sigma2 <= residual_floor:
+        raise ValueError("Grouped stage-1 REML residual variance is invalid.")
+    return _Stage1BlueResult(
+        sample_ids=cache.line_levels,
+        values=profile.blue_values,
+        noise_diag=profile.noise_ratio * sigma2,
+        solver="grouped_reml",
+    )
+
+
 def _fit_stage1_blue(
     y_obs: np.ndarray,
     sub: pd.DataFrame,
@@ -883,10 +1469,12 @@ def _fit_stage1_blue(
     env_cols: list[str] | None = None,
     stage1_random_terms: list[_TermSpec] | None = None,
     gxe_var: float | None = None,
+    gxe_variance_terms: list[tuple[_GxeEnvironmentInfo, float]] | None = None,
     resid_var: float | None = None,
     maxiter: int = 100,
     logger: typing.Any = None,
     compiled: _CompiledModelTerms | None = None,
+    random_variances: dict[str, float] | None = None,
 ) -> _Stage1BlueResult:
     if compiled is not None:
         return _fit_stage1_blue_compiled(
@@ -895,6 +1483,9 @@ def _fit_stage1_blue(
             line_col=line_col,
             compiled=compiled,
             maxiter=maxiter,
+            gxe_variance_terms=gxe_variance_terms,
+            resid_var=resid_var,
+            random_variances=random_variances,
         )
 
     env_cols = list(env_cols or [])
@@ -1115,8 +1706,45 @@ def _fit_stage1_blue_compiled(
     line_col: str,
     compiled: _CompiledModelTerms,
     maxiter: int,
+    gxe_variance_terms: list[tuple[_GxeEnvironmentInfo, float]] | None = None,
+    resid_var: float | None = None,
+    random_variances: dict[str, float] | None = None,
 ) -> _Stage1BlueResult:
     """Fit BLUEs with the exact compiled fixed/random nuisance design."""
+
+    if _can_use_stage1_sparse_wls(compiled, gxe_variance_terms):
+        return _fit_stage1_blue_compiled_sparse_wls(
+            y_obs=y_obs,
+            sub=sub,
+            line_col=line_col,
+            compiled=compiled,
+            gxe_variance_terms=list(gxe_variance_terms or []),
+            resid_var=resid_var,
+        )
+
+    # Replicated GxE/GxC designs are nested within line.  Eliminate the
+    # thousands of line coefficients analytically and fit the remaining small
+    # covariance blocks.  Crossed random terms fail the line-nested check and
+    # continue through the generic BLUP fallback below.
+    grouped_allowed = not any(
+        int(info.max_cell_n) <= 1
+        for info, _variance in list(gxe_variance_terms or [])
+    )
+    if grouped_allowed:
+        try:
+            return _fit_stage1_grouped_reml(
+                y_obs=y_obs,
+                sub=sub,
+                line_col=line_col,
+                fixed_matrix=compiled.fixed_matrix,
+                random_matrices=compiled.random_matrices,
+                random_names=compiled.random_names,
+                initial_variances=random_variances,
+                resid_var=resid_var,
+                maxiter=maxiter,
+            )
+        except (ValueError, np.linalg.LinAlgError, FloatingPointError):
+            pass
 
     line_ids = sub[line_col].astype("string").fillna("NA").astype(str)
     line_fixed, _line_fixed_names = _onehot_encode_series(
@@ -1200,6 +1828,132 @@ def _fit_stage1_blue_compiled(
         sample_ids=[str(value) for value in line_levels],
         values=np.asarray(blue_values, dtype=float),
         noise_diag=noise_diag,
+    )
+
+
+def _can_use_stage1_sparse_wls(
+    compiled: _CompiledModelTerms,
+    gxe_variance_terms: list[tuple[_GxeEnvironmentInfo, float]] | None,
+) -> bool:
+    """Identify stage-1 designs that do not need the high-dimensional BLUP.
+
+    A line fixed-effect BLUE with no additional random terms is ordinary
+    weighted least squares.  For an unreplicated line×environment term the
+    GxE columns are one-hot cell indicators and cannot be separated from the
+    residual; fitting that sparse random design only creates a very large
+    ``p²q`` Rust workload.  In both cases a sparse WLS solve is the stable,
+    identifiable stage-1 operation.
+    """
+
+    if compiled.random_specs or compiled.gxc_specs:
+        return False
+    if len(compiled.random_matrices) == 0:
+        return True
+    if len(compiled.random_matrices) != len(compiled.gxe_specs):
+        return False
+    infos = [info for info, _variance in list(gxe_variance_terms or [])]
+    if len(infos) != len(compiled.gxe_specs):
+        return False
+    return _gxe_terms_are_unreplicated(infos)
+
+
+def _fit_stage1_blue_compiled_sparse_wls(
+    y_obs: np.ndarray,
+    sub: pd.DataFrame,
+    *,
+    line_col: str,
+    compiled: _CompiledModelTerms,
+    gxe_variance_terms: list[tuple[_GxeEnvironmentInfo, float]],
+    resid_var: float | None,
+) -> _Stage1BlueResult:
+    """Fit the line BLUE using sparse weighted least squares.
+
+    This path deliberately omits unreplicated GxE cell indicators from the
+    stage-1 design.  Their variance is retained as observation noise, because
+    one observation per line×environment cell provides no information to
+    distinguish that component from residual error.
+    """
+
+    y_vec = np.asarray(y_obs, dtype=float).reshape(-1)
+    line_ids = sub[line_col].astype("string").fillna("NA").astype(str)
+    line_fixed, _line_fixed_names = _onehot_encode_series(
+        line_ids,
+        prefix=line_col,
+        drop_first=True,
+        sparse_output=True,
+    )
+    line_fixed = line_fixed.tocsr().astype(float)
+    n = int(y_vec.shape[0])
+    if line_fixed.shape[0] != n:
+        raise ValueError(
+            f"Stage-1 line design has {line_fixed.shape[0]} rows but y has {n}."
+        )
+
+    blocks: list[sparse.spmatrix] = [sparse.csr_matrix(np.ones((n, 1), dtype=float))]
+    fixed_count = 0
+    if compiled.fixed_matrix is not None:
+        fixed = sparse.csr_matrix(np.asarray(compiled.fixed_matrix, dtype=float))
+        if fixed.shape[0] != n:
+            raise ValueError(
+                f"Stage-1 fixed design has {fixed.shape[0]} rows but y has {n}."
+            )
+        if fixed.shape[1] > 0:
+            blocks.append(fixed)
+            fixed_count = int(fixed.shape[1])
+    if line_fixed.shape[1] > 0:
+        blocks.append(line_fixed)
+    x = sparse.hstack(blocks, format="csc", dtype=float)
+
+    gxe_noise = 0.0
+    for _info, variance in gxe_variance_terms:
+        value = float(variance)
+        if np.isfinite(value) and value >= 0.0:
+            gxe_noise += value
+    residual = float(resid_var) if resid_var is not None else 1.0
+    if (not np.isfinite(residual)) or residual < 0.0:
+        residual = 1.0
+    observation_variance = max(gxe_noise + residual, 1e-12)
+    sqrt_weight = np.full(n, 1.0 / np.sqrt(observation_variance), dtype=float)
+    x_weighted = x.multiply(sqrt_weight.reshape(-1, 1))
+    y_weighted = y_vec * sqrt_weight
+
+    # SuperLU avoids the BLAS/LAPACK normal-equation call that was observed to
+    # segfault in the fixed-only BLUP path.  A tiny ridge also makes aliased
+    # treatment columns deterministic; fall back to LSQR if SuperLU reports a
+    # non-finite solution.
+    xtx = (x_weighted.T @ x_weighted).tocsc()
+    ridge = sparse.eye(int(x.shape[1]), format="csc", dtype=float) * 1e-10
+    xtx = xtx + ridge
+    xty = np.asarray(x_weighted.T @ y_weighted.reshape(-1, 1), dtype=float).reshape(-1)
+    beta = np.asarray(spsolve(xtx, xty), dtype=float).reshape(-1)
+    if beta.shape[0] != int(x.shape[1]) or not np.all(np.isfinite(beta)):
+        lsqr_result = lsqr(
+            x_weighted,
+            y_weighted,
+            damp=1e-8,
+            atol=1e-10,
+            btol=1e-10,
+            iter_lim=max(1000, 4 * int(x.shape[1])),
+        )
+        beta = np.asarray(lsqr_result[0], dtype=float).reshape(-1)
+    if beta.shape[0] != int(x.shape[1]) or not np.all(np.isfinite(beta)):
+        raise np.linalg.LinAlgError("Sparse stage-1 weighted least-squares solve failed.")
+
+    line_levels = sorted(pd.unique(line_ids).tolist())
+    line_effects = np.zeros(len(line_levels), dtype=float)
+    line_start = 1 + fixed_count
+    if line_effects.size > 1:
+        line_effects[1:] = beta[line_start : line_start + line_effects.size - 1]
+    fixed_mean = 0.0
+    if fixed_count > 0:
+        fixed_mean = float(
+            np.mean(np.asarray(compiled.fixed_matrix, dtype=float) @ beta[1 : 1 + fixed_count])
+        )
+    blue_values = float(beta[0]) + fixed_mean + line_effects
+    return _Stage1BlueResult(
+        sample_ids=[str(value) for value in line_levels],
+        values=np.asarray(blue_values, dtype=float),
+        noise_diag=None,
     )
 
 
@@ -1298,6 +2052,53 @@ def _line_level_noise_diag(
     return (vge_use / np.maximum(env_counts, 1.0)) + (ve_use / np.maximum(plot_counts, 1.0))
 
 
+def _line_level_noise_diag_gxe(
+    sub: pd.DataFrame,
+    *,
+    line_col: str,
+    line_ids: list[str],
+    gxe_terms: list[tuple[_EffectSpec, float]],
+    resid_var: float,
+) -> np.ndarray:
+    """Approximate line-level BLUE noise for term-specific GxE effects.
+
+    Each compiled GxE term has its own environment key (for example ``loc``
+    versus ``loc:year``).  Dividing all GxE variance by one shared environment
+    count silently mis-scales mixed GxE designs, so accumulate each component
+    using the number of observed environments for that term and add the
+    residual contribution using the observed plot count.
+    """
+
+    sid = sub[line_col].astype("string").fillna("NA").astype(str)
+    out = np.zeros(len(line_ids), dtype=float)
+    for spec, variance in gxe_terms:
+        var = float(variance)
+        if (not np.isfinite(var)) or var < 0.0:
+            continue
+        env_key = _effect_factor_series(sub, spec).astype("string").fillna("NA").astype(str)
+        env_per_line = (
+            pd.DataFrame({"line": sid, "env": env_key})
+            .drop_duplicates()
+            .groupby("line", sort=False, observed=False)["env"]
+            .nunique()
+        )
+        env_counts = np.asarray(
+            [float(env_per_line.get(str(sid_i), 1.0)) for sid_i in line_ids],
+            dtype=float,
+        )
+        out += var / np.maximum(env_counts, 1.0)
+
+    plot_per_line = sid.groupby(sid, sort=False).size()
+    plot_counts = np.asarray(
+        [float(plot_per_line.get(str(sid_i), 1.0)) for sid_i in line_ids],
+        dtype=float,
+    )
+    ve = float(resid_var)
+    if np.isfinite(ve) and ve >= 0.0:
+        out += ve / np.maximum(plot_counts, 1.0)
+    return out
+
+
 # Joint additive + line-nonadditive REML is the active dense narrow path.
 # Sparse REML uses the same stage-1 uncertainty on the reported phenotype scale.
 def _prepare_joint_kernel_inputs(
@@ -1361,7 +2162,7 @@ def _joint_kernel_state(
     vinvy = cho_solve((l, True), y)
     xt_vinv_x = (x.T @ vinvx + (x.T @ vinvx).T) / 2.0
     lx = np.linalg.cholesky(xt_vinv_x)
-    beta = np.linalg.solve(xt_vinv_x, x.T @ vinvy)
+    beta = cho_solve((lx, True), x.T @ vinvy)
     r = y - x @ beta
     vinvr = cho_solve((l, True), r)
 
@@ -1426,7 +2227,11 @@ def _fit_joint_line_kernel_approx(
 
     cand: list[tuple[float, float]] = []
     try:
-        sol = np.linalg.solve(a + np.eye(2, dtype=float) * 1e-12, b)
+        sol, _residuals, _rank, _singular = np.linalg.lstsq(
+            a + np.eye(2, dtype=float) * 1e-12,
+            b,
+            rcond=None,
+        )
         cand.append((max(float(sol[0]), 0.0), max(float(sol[1]), 0.0)))
     except Exception:
         pass
@@ -1668,7 +2473,8 @@ def _sparse_additive_blup_from_subset(
     vinvx = cho_solve((l, True), x)
     vinvy = cho_solve((l, True), y)
     xt_vinv_x = (x.T @ vinvx + (x.T @ vinvx).T) * 0.5
-    beta = np.linalg.solve(xt_vinv_x, x.T @ vinvy)
+    lx = np.linalg.cholesky(xt_vinv_x)
+    beta = cho_solve((lx, True), x.T @ vinvy)
     residual = y - x @ beta
     vinvr = cho_solve((l, True), residual)
     return np.asarray(float(sigma_g2) * (k @ vinvr), dtype=float).reshape(-1)
@@ -2225,7 +3031,6 @@ def main(argv: list[str] | None = None) -> None:
 
     line_col = str(all_cols[0])
     effect_cols = [c for c in all_cols if c != line_col]
-    env_cols: list[str] = []
     raw_line = df[line_col].copy()
     if raw_line.isna().any() or raw_line.astype("string").str.strip().eq("").any():
         raise ValueError("The first phenotype-table column must contain non-empty sample/line IDs.")
@@ -2234,6 +3039,12 @@ def main(argv: list[str] | None = None) -> None:
     random_specs = _parse_effect_specs(args.rcov, "random", effect_cols, df)
     gxe_specs = _parse_effect_specs(args.gxe, "gxe", effect_cols, df)
     gxc_specs = _parse_effect_specs(args.gxc, "gxc", effect_cols, df)
+    # Keep the environment sources explicit.  The previous implementation
+    # initialized this list but never populated it from ``-gxe``; every h²
+    # correction therefore used an effective environment count of one.
+    env_cols = _unique_preserve(
+        source for spec in gxe_specs for source in spec.sources
+    )
 
     source_columns = _unique_preserve(
         source
@@ -2378,11 +3189,6 @@ def main(argv: list[str] | None = None) -> None:
                 [
                     ("Out dir", outdir),
                     ("Prefix", prefix),
-                    ("BLUE file", f"{outprefix}.blue.txt"),
-                    ("BLUP file", f"{outprefix}.blup.txt"),
-                    ("GBLUP file", f"{outprefix}.gblup.txt" if (grm_ctx is not None or sparse_grm_ctx is not None) else "None"),
-                    ("Summary file", f"{outprefix}.reml.summary.tsv"),
-                    ("Log file", log_path),
                 ],
             ),
         ],
@@ -2463,7 +3269,6 @@ def main(argv: list[str] | None = None) -> None:
             sub = df.loc[mask, sub_cols].copy()
             y = pd.to_numeric(sub[trait], errors="coerce").to_numpy(dtype=float).reshape(-1, 1)
             line_ids_sub = sub[line_col].astype("string").fillna("NA").astype(str)
-            env_key = _combine_key(sub, env_cols, "__ENV__").astype(str)
 
             compiled = _compile_model_terms(
                 sub,
@@ -2473,6 +3278,35 @@ def main(argv: list[str] | None = None) -> None:
                 gxe_specs=gxe_specs,
                 gxc_specs=gxc_specs,
             )
+            gxe_env_infos = _build_gxe_environment_infos(
+                sub,
+                line_col=line_col,
+                gxe_specs=gxe_specs,
+            )
+            if gxe_env_infos:
+                logger.info(
+                    "Trait %s: GxE environment metadata: %s",
+                    trait,
+                    "; ".join(
+                        f"{info.label}(levels={info.n_levels}, h_env={_fmt_metric(info.h_env)}, "
+                        f"cell_n={info.min_cell_n}-{info.max_cell_n})"
+                        for info in gxe_env_infos
+                    ),
+                )
+                if _gxe_terms_are_unreplicated(gxe_env_infos):
+                    logger.warning(
+                        "Trait %s: all requested GxE terms have one observation per line×environment cell; "
+                        "GxE and residual are not separately identifiable. Stage-1 BLUE will use a sparse WLS "
+                        "path with their combined observation noise.",
+                        trait,
+                    )
+                elif any(int(info.max_cell_n) <= 1 for info in gxe_env_infos):
+                    logger.warning(
+                        "Trait %s: GxE terms have mixed replication; the unreplicated terms cannot be separated "
+                        "from residual, so the exact high-dimensional stage-1 random design is retained for the "
+                        "replicated terms. Consider fitting those GxE terms separately if this is slow.",
+                        trait,
+                    )
             x_broad = compiled.fixed_matrix
             line_z = compiled.line_z
             z_list = [line_z, *compiled.random_matrices]
@@ -2504,6 +3338,8 @@ def main(argv: list[str] | None = None) -> None:
             gxe_indices = [
                 idx for idx, name in enumerate(z_names) if name in gxe_labels
             ]
+            gxe_variance_terms: list[tuple[_GxeEnvironmentInfo, float]] = []
+            gxe_adjusted = 0.0
             if getattr(broad_model, "var", None) is not None and len(z_names) > 0:
                 var_all = np.asarray(broad_model.var, dtype=float).reshape(-1)
                 if var_all.size >= (len(z_names) + 1):
@@ -2538,6 +3374,27 @@ def main(argv: list[str] | None = None) -> None:
                     total_var = float(np.sum(rand_var) + ve)
                     vg = float(rand_var[line_idx]) if line_idx >= 0 else np.nan
                     vge = float(np.sum(rand_var[gxe_indices])) if gxe_indices else 0.0
+                    info_by_label = {info.label: info for info in gxe_env_infos}
+                    for spec in gxe_specs:
+                        term_name = f"{line_col}×{spec.label}"
+                        if term_name not in z_names:
+                            continue
+                        info = info_by_label.get(spec.label)
+                        if info is None:
+                            continue
+                        term_idx = z_names.index(term_name)
+                        gxe_variance_terms.append((info, float(rand_var[term_idx])))
+                    gxe_adjusted, effective_gxe_h_env = _adjust_gxe_variance_components(
+                        gxe_variance_terms
+                    )
+                    if gxe_variance_terms:
+                        logger.info(
+                            "Trait %s: GxE variance correction = %s (raw=%s, effective h_env=%s)",
+                            trait,
+                            _fmt_metric(gxe_adjusted),
+                            _fmt_metric(vge),
+                            _fmt_metric(effective_gxe_h_env),
+                        )
                     if total_var > 0.0 and line_idx >= 0:
                         pve_line = float(rand_var[line_idx] / total_var)
                         pve_e = float(ve / total_var)
@@ -2552,7 +3409,10 @@ def main(argv: list[str] | None = None) -> None:
                         env_cols,
                         [],
                     )
-                    denom = vg + (vge / h_env) + (ve / h_plot)
+                    if gxe_variance_terms:
+                        h_env = float(effective_gxe_h_env)
+                        r_eff = max(1.0, float(h_plot / h_env))
+                    denom = vg + gxe_adjusted + (ve / h_plot)
                     if np.isfinite(vg) and np.isfinite(denom) and denom > 0.0:
                         hsqr = float(vg / denom)
 
@@ -2586,11 +3446,19 @@ def main(argv: list[str] | None = None) -> None:
                 line_col=line_col,
                 trait=trait,
                 gxe_var=vge,
+                gxe_variance_terms=gxe_variance_terms,
                 resid_var=ve,
                 maxiter=int(args.maxiter),
                 logger=logger,
                 compiled=compiled,
+                random_variances=dict(random_variances),
             )
+            if stage1_blue.solver != "generic":
+                logger.info(
+                    "Trait %s: stage-1 BLUE solver = %s",
+                    trait,
+                    stage1_blue.solver,
+                )
             blue_map = {
                 str(sid): float(val)
                 for sid, val in zip(stage1_blue.sample_ids, stage1_blue.values)
@@ -2652,13 +3520,26 @@ def main(argv: list[str] | None = None) -> None:
                             logger.warning(
                                 f"Trait {trait}: BLUE covariance diagonal was incomplete; using conservative line-level fallback for invalid entries."
                             )
-                            fallback_noise = _line_level_noise_diag(
-                                sub,
-                                line_col=line_col,
-                                env_cols=env_cols,
-                                line_ids=kept_ids,
-                                vge=vge,
-                                ve=ve,
+                            fallback_noise = (
+                                _line_level_noise_diag_gxe(
+                                    sub,
+                                    line_col=line_col,
+                                    line_ids=kept_ids,
+                                    gxe_terms=_gxe_specs_with_variances(
+                                        gxe_specs,
+                                        gxe_variance_terms,
+                                    ),
+                                    resid_var=ve,
+                                )
+                                if gxe_variance_terms
+                                else _line_level_noise_diag(
+                                    sub,
+                                    line_col=line_col,
+                                    env_cols=env_cols,
+                                    line_ids=kept_ids,
+                                    vge=vge,
+                                    ve=ve,
+                                )
                             )
                             noise_diag = np.where(
                                 np.isfinite(noise_diag) & (noise_diag >= 0.0),
@@ -2666,13 +3547,26 @@ def main(argv: list[str] | None = None) -> None:
                                 fallback_noise,
                             )
                     else:
-                        noise_diag = _line_level_noise_diag(
-                            sub,
-                            line_col=line_col,
-                            env_cols=env_cols,
-                            line_ids=kept_ids,
-                            vge=vge,
-                            ve=ve,
+                        noise_diag = (
+                            _line_level_noise_diag_gxe(
+                                sub,
+                                line_col=line_col,
+                                line_ids=kept_ids,
+                                gxe_terms=_gxe_specs_with_variances(
+                                    gxe_specs,
+                                    gxe_variance_terms,
+                                ),
+                                resid_var=ve,
+                            )
+                            if gxe_variance_terms
+                            else _line_level_noise_diag(
+                                sub,
+                                line_col=line_col,
+                                env_cols=env_cols,
+                                line_ids=kept_ids,
+                                vge=vge,
+                                ve=ve,
+                            )
                         )
                     try:
                         noise_mean_joint = float(np.mean(noise_diag)) if noise_diag.size > 0 else np.nan

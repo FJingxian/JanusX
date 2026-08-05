@@ -1377,7 +1377,7 @@ def _resolve_trait_iter(
     Resolve requested trait selectors to actual phenotype column keys.
 
     Rust task dispatch serializes trait names as strings, while phenotype
-    tables loaded through some `-n/--n` paths may still carry integer column
+    tables loaded through some `-n/--ncol` paths may still carry integer column
     labels. Accept either form and preserve the real column key for downstream
     access.
     """
@@ -2311,7 +2311,7 @@ def load_phenotype(
 
         if len(requested_specs) == 0:
             msg = (
-                "No phenotype selector was provided for -n/--n. "
+                "No phenotype selector was provided for -n/--ncol. "
                 "Use zero-based indices, ranges, or column names, e.g. "
                 "-n 0 -n 3 or -n TraitA."
             )
@@ -6883,7 +6883,7 @@ def parse_args(argv: Optional[list[str]] = None):
     if len(extras) > 0:
         parser.error("unrecognized arguments: " + " ".join(extras))
     try:
-        args.ncol = parse_trait_selector_specs(args.ncol, label="-n/--n")
+        args.ncol = parse_trait_selector_specs(args.ncol, label="-n/--ncol")
     except ValueError as e:
         parser.error(str(e))
     try:

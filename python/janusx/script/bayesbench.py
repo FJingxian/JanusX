@@ -145,11 +145,11 @@ def _parse_row_blocks(raw: str) -> list[int | None]:
 def _parse_single_trait_arg(raw: str | None) -> object | None:
     if raw is None:
         return None
-    parsed = parse_trait_selector_specs([raw], label="-n/--n")
+    parsed = parse_trait_selector_specs([raw], label="-n/--ncol")
     if parsed is None or len(parsed) == 0:
         return None
     if len(parsed) > 1:
-        raise ValueError("`-n/--n` for bayesbench currently accepts one phenotype selector.")
+        raise ValueError("`-n/--ncol` for bayesbench currently accepts one phenotype selector.")
     return parsed[0]
 
 
@@ -419,7 +419,7 @@ def _read_pheno(path: Path, trait_selector: object | None, trait_name: str | Non
     if df.shape[1] < 2:
         raise ValueError("Phenotype file must contain sample ID and at least one trait column.")
     if trait_selector is not None and trait_name is not None:
-        raise ValueError("Use either `-n/--n` or `--trait`, not both.")
+        raise ValueError("Use either `-n/--ncol` or `--trait`, not both.")
     id_col = df.columns[0]
     if trait_name is not None:
         if trait_name not in df.columns:
@@ -432,16 +432,16 @@ def _read_pheno(path: Path, trait_selector: object | None, trait_name: str | Non
         selected_cols, invalid_specs = resolve_trait_selectors(
             trait_cols,
             [trait_selector],
-            label="-n/--n",
+            label="-n/--ncol",
         )
         if len(selected_cols) == 0:
             raise ValueError(
-                f"`-n/--n` not found: {trait_selector}. Valid index range is 0..{int(df.shape[1]) - 2} "
+                f"`-n/--ncol` not found: {trait_selector}. Valid index range is 0..{int(df.shape[1]) - 2} "
                 f"or one of columns: {', '.join(str(c) for c in trait_cols[:10])}"
                 + (" ..." if len(trait_cols) > 10 else "")
             )
         if len(invalid_specs) > 0:
-            raise ValueError(f"`-n/--n` not found: {invalid_specs[0]}")
+            raise ValueError(f"`-n/--ncol` not found: {invalid_specs[0]}")
         target_col = trait_cols[int(selected_cols[0])]
     out = pd.DataFrame(
         {
@@ -547,16 +547,16 @@ def _load_builtin_wheat_dataset(args: argparse.Namespace) -> dict[str, Any]:
         selected_cols, invalid_specs = resolve_trait_selectors(
             trait_labels,
             [trait_selector],
-            label="-n/--n",
+            label="-n/--ncol",
         )
         if len(selected_cols) == 0:
             raise ValueError(
-                f"`-n/--n` not found for builtin wheat: {trait_selector}. "
+                f"`-n/--ncol` not found for builtin wheat: {trait_selector}. "
                 f"Valid selectors are 0..{int(y_mat.shape[1]) - 1} or "
                 + ", ".join(trait_labels)
             )
         if len(invalid_specs) > 0:
-            raise ValueError(f"`-n/--n` not found for builtin wheat: {invalid_specs[0]}")
+            raise ValueError(f"`-n/--ncol` not found for builtin wheat: {invalid_specs[0]}")
         target_idx = int(selected_cols[0])
     y = np.asarray(y_mat[:, target_idx], dtype=np.float64).reshape(-1)
     keep_samples = np.isfinite(y)

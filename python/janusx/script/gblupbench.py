@@ -596,18 +596,18 @@ def _read_pheno(path: Path, ncol: Optional[list[object]]) -> tuple[pd.DataFrame,
         trait_col = trait_cols[0]
     else:
         if len(ncol) == 0:
-            raise ValueError("`-n/--n` is empty. Provide one phenotype selector.")
+            raise ValueError("`-n/--ncol` is empty. Provide one phenotype selector.")
         if len(ncol) > 1:
-            raise ValueError("`jx gblupbench` currently supports one trait at a time; pass a single `-n/--n` selector.")
-        selected_cols, invalid_specs = resolve_trait_selectors(trait_cols, ncol, label="-n/--n")
+            raise ValueError("`jx gblupbench` currently supports one trait at a time; pass a single `-n/--ncol` selector.")
+        selected_cols, invalid_specs = resolve_trait_selectors(trait_cols, ncol, label="-n/--ncol")
         if len(selected_cols) == 0:
             raise ValueError(
-                f"`-n/--n` not found: {ncol[0]}. Valid index range is 0..{int(df.shape[1]) - 2} "
+                f"`-n/--ncol` not found: {ncol[0]}. Valid index range is 0..{int(df.shape[1]) - 2} "
                 f"or one of columns: {', '.join(str(c) for c in trait_cols[:10])}"
                 + (" ..." if len(trait_cols) > 10 else "")
             )
         if len(invalid_specs) > 0:
-            raise ValueError(f"`-n/--n` not found: {invalid_specs[0]}")
+            raise ValueError(f"`-n/--ncol` not found: {invalid_specs[0]}")
         trait_col = trait_cols[int(selected_cols[0])]
 
     out = pd.DataFrame(
@@ -772,7 +772,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         (tk == "-trait") or tk.startswith("-trait=") or (tk == "--trait") or tk.startswith("--trait=")
         for tk in tokens
     ):
-        p.error("`-trait/--trait` has been replaced by `-n/--n` (phenotype selector: zero-based index or column name, excluding sample ID).")
+        p.error("`-trait/--trait` has been replaced by `-n/--ncol` (phenotype selector: zero-based index or column name, excluding sample ID).")
 
     args, extras = p.parse_known_args(argv)
     if len(extras) > 0:
@@ -796,11 +796,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
             )
 
     try:
-        args.ncol = parse_trait_selector_specs(args.ncol, label="-n/--n")
+        args.ncol = parse_trait_selector_specs(args.ncol, label="-n/--ncol")
     except ValueError as e:
         p.error(str(e))
     if args.ncol is not None and len(args.ncol) > 1:
-        p.error("`jx gblupbench` currently supports one trait at a time; pass a single `-n/--n` selector.")
+        p.error("`jx gblupbench` currently supports one trait at a time; pass a single `-n/--ncol` selector.")
 
     if int(args.cv) < 2:
         p.error("--cv must be >= 2.")

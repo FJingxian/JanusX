@@ -6,12 +6,13 @@ Input table
 -----------
 - First column is always sample ID.
 - Remaining columns are candidate phenotype/fixed/random effect columns.
-- String/categorical columns selected by `-f/-r` are one-hot encoded by default.
+- String/categorical columns selected by `-c/-rc/-gxe/-gxc` are encoded from
+  the phenotype table.
 
 Examples
 --------
-  jx reml -file pheno.tsv -l sample_id -e year,loc -o outdir
-  jx reml -file pheno.tsv -l sample_id -e year,loc -f PCA1,PCA2 -r block -k data.cGRM.npy -p Yield
+  jx reml -p pheno.tsv -n Yield -c year,loc -o outdir
+  jx reml -p pheno.tsv -n Yield -c PCA1,PCA2 -rc block -k data.cGRM.npy
 """
 
 from __future__ import annotations
@@ -35,12 +36,11 @@ from scipy.sparse.linalg import spsolve
 from scipy.stats import t as student_t
 
 from janusx.assoc.workflow_model_packed import (
-    _splmm_exact_null_fit_from_grm,
+    jxrs,
     _splmm_normalize_sparse_grm_path,
     _splmm_sparse_grm_diag_stats,
     _splmm_sparse_null_fit,
 )
-from janusx.pyBLUP.assoc import LMM
 from janusx.pyBLUP.blup import BLUP
 from ._common.cli_args import (
     add_common_out_arg,
@@ -64,6 +64,40 @@ class _TermSpec:
     force_onehot: bool
 
 
+@dataclass(frozen=True)
+class _EffectSpec:
+    """One parsed fixed/random/GxE/GxC effect from the phenotype table."""
+
+    kind: str
+    sources: tuple[str, ...]
+    source_types: tuple[str, ...]
+    label: str
+    interaction: str | None = None
+
+    @property
+    def result_type(self) -> str:
+        if len(self.sources) == 1:
+            return self.source_types[0]
+        if self.source_types == ("categorical", "categorical"):
+            return "categorical"
+        return "continuous"
+
+
+@dataclass
+class _CompiledModelTerms:
+    fixed_specs: list[_EffectSpec]
+    random_specs: list[_EffectSpec]
+    gxe_specs: list[_EffectSpec]
+    gxc_specs: list[_EffectSpec]
+    fixed_matrix: np.ndarray | None
+    fixed_names: list[str]
+    fixed_labels: list[str]
+    line_z: sparse.csr_matrix
+    line_names: list[str]
+    random_matrices: list[typing.Union[np.ndarray, sparse.spmatrix]]
+    random_names: list[str]
+
+
 @dataclass
 class _GrmContext:
     matrix: np.ndarray
@@ -82,17 +116,10 @@ class _SparseGrmContext:
 
 
 @dataclass
-class _LmmNullStats:
-    beta: np.ndarray
-    se: np.ndarray
-    pval: np.ndarray
-    g_blup: np.ndarray
-
-
-@dataclass
 class _Stage1BlueResult:
     sample_ids: list[str]
     values: np.ndarray
+    noise_diag: np.ndarray | None = None
 
 
 @dataclass
@@ -318,7 +345,8 @@ def _is_numeric_series(series: pd.Series) -> bool:
     non_na = int(series.notna().sum())
     if non_na == 0:
         return False
-    return int(vals.notna().sum()) == non_na
+    finite = vals.notna() & np.isfinite(vals)
+    return int(finite.sum()) == non_na
 
 
 def _collect_numeric_required_mask(
@@ -331,7 +359,21 @@ def _collect_numeric_required_mask(
             continue
         s = df[term.name]
         if _is_numeric_series(s):
-            mask &= pd.to_numeric(s, errors="coerce").notna()
+            values = pd.to_numeric(s, errors="coerce")
+            mask &= values.notna() & np.isfinite(values)
+    return mask
+
+
+def _collect_numeric_required_mask_specs(
+    df: pd.DataFrame,
+    specs: list[_EffectSpec],
+) -> pd.Series:
+    mask = pd.Series(True, index=df.index, dtype=bool)
+    for spec in specs:
+        for column, column_type in zip(spec.sources, spec.source_types):
+            if column_type == "continuous":
+                values = pd.to_numeric(df[column], errors="coerce")
+                mask &= values.notna() & np.isfinite(values)
     return mask
 
 
@@ -641,8 +683,16 @@ def _render_summary_table(
 
     body: list[list[str]] = []
     for row in rows:
-        nobs = int(row.get("used_obs", 0))
-        nlines = int(row.get("used_lines", 0))
+        try:
+            nobs_value = float(row.get("used_obs", 0))
+            nobs = int(nobs_value) if np.isfinite(nobs_value) else 0
+        except Exception:
+            nobs = 0
+        try:
+            nlines_value = float(row.get("used_lines", 0))
+            nlines = int(nlines_value) if np.isfinite(nlines_value) else 0
+        except Exception:
+            nlines = 0
         obs_label = f"{nobs:,} ({nlines:,})" if log_style else f"{nobs:,}({nlines:,})"
         body.append(
             [
@@ -749,40 +799,6 @@ def _load_sparse_grm_context(
     )
 
 
-def _lmm_null_stats(model: LMM) -> _LmmNullStats:
-    s = np.asarray(model.S, dtype=np.float64).reshape(-1)
-    x_rot = np.asarray(model.Xcov, dtype=np.float64)
-    y_rot = np.asarray(model.y, dtype=np.float64).reshape(-1, 1)
-    lbd = float(model.lbd_null)
-    if s.size == 0:
-        raise ValueError("LMM null model has zero samples.")
-
-    vinv = 1.0 / (s + lbd)
-    xt_vinv = x_rot.T * vinv.reshape(1, -1)
-    xt_vinv_x = xt_vinv @ x_rot
-    xt_vinv_y = xt_vinv @ y_rot
-    beta = np.linalg.solve(xt_vinv_x, xt_vinv_y)
-    r_rot = y_rot - x_rot @ beta
-
-    n = int(x_rot.shape[0])
-    p = int(x_rot.shape[1])
-    sigma2 = float((r_rot.T @ (vinv.reshape(-1, 1) * r_rot))[0, 0]) / max(1, n - p)
-    cov_beta = np.linalg.pinv(xt_vinv_x) * sigma2
-    se = np.sqrt(np.clip(np.diag(cov_beta), a_min=0.0, a_max=None)).reshape(-1, 1)
-    tval = np.divide(beta, se, out=np.zeros_like(beta), where=se > 0.0)
-    pval = 2.0 * student_t.sf(np.abs(tval), df=max(1, n - p))
-
-    u = np.asarray(model.Dh.T, dtype=np.float64)
-    g_rot = (s.reshape(-1, 1) / (s.reshape(-1, 1) + lbd)) * r_rot
-    g_blup = u @ g_rot
-    return _LmmNullStats(
-        beta=np.asarray(beta, dtype=float).reshape(-1),
-        se=np.asarray(se, dtype=float).reshape(-1),
-        pval=np.asarray(pval, dtype=float).reshape(-1),
-        g_blup=np.asarray(g_blup, dtype=float).reshape(-1),
-    )
-
-
 def _term_constant_within_line(
     sub: pd.DataFrame,
     line_col: str,
@@ -850,19 +866,12 @@ def _build_stage1_blue_terms(
     random_terms_all: list[_TermSpec],
     logger: typing.Any,
 ) -> tuple[list[_TermSpec], list[_TermSpec]]:
-    stage2_fixed_terms: list[_TermSpec] = []
-    dropped_varying_fixed: list[str] = []
-    for term in fixed_terms_all:
-        if _term_constant_within_line(sub, line_col, str(term.name)):
-            stage2_fixed_terms.append(term)
-        else:
-            dropped_varying_fixed.append(str(term.name))
-
-    if len(dropped_varying_fixed) > 0:
-        logger.warning(
-            f"Trait {trait}: fixed covariates varying within line are not retained for BLUE stage-2 covariates -> {', '.join(dropped_varying_fixed)}"
-        )
-    return list(random_terms_all), stage2_fixed_terms
+    # Keep the complete fixed design.  The former implementation filtered out
+    # covariates that varied within line, which changed the BLUE estimand and
+    # silently discarded the user's fixed effect.  The compiled path is the
+    # normal route, but this compatibility helper must preserve the same
+    # invariant for callers that still use the legacy term objects.
+    return list(random_terms_all), list(fixed_terms_all)
 
 
 def _fit_stage1_blue(
@@ -871,13 +880,28 @@ def _fit_stage1_blue(
     *,
     line_col: str,
     trait: str,
-    env_cols: list[str],
-    stage1_random_terms: list[_TermSpec],
+    env_cols: list[str] | None = None,
+    stage1_random_terms: list[_TermSpec] | None = None,
     gxe_var: float | None = None,
     resid_var: float | None = None,
-    maxiter: int,
-    logger: typing.Any,
+    maxiter: int = 100,
+    logger: typing.Any = None,
+    compiled: _CompiledModelTerms | None = None,
 ) -> _Stage1BlueResult:
+    if compiled is not None:
+        return _fit_stage1_blue_compiled(
+            y_obs=y_obs,
+            sub=sub,
+            line_col=line_col,
+            compiled=compiled,
+            maxiter=maxiter,
+        )
+
+    env_cols = list(env_cols or [])
+    stage1_random_terms = list(stage1_random_terms or [])
+    if logger is None:
+        raise ValueError("A logger is required for the legacy BLUE path.")
+
     if len(stage1_random_terms) == 0:
         try:
             return _fit_stage1_blue_weighted_ls(
@@ -1084,6 +1108,101 @@ def _fit_stage1_blue_weighted_ls(
     )
 
 
+def _fit_stage1_blue_compiled(
+    y_obs: np.ndarray,
+    sub: pd.DataFrame,
+    *,
+    line_col: str,
+    compiled: _CompiledModelTerms,
+    maxiter: int,
+) -> _Stage1BlueResult:
+    """Fit BLUEs with the exact compiled fixed/random nuisance design."""
+
+    line_ids = sub[line_col].astype("string").fillna("NA").astype(str)
+    line_fixed, _line_fixed_names = _onehot_encode_series(
+        line_ids,
+        prefix=line_col,
+        drop_first=True,
+        sparse_output=False,
+    )
+    line_fixed = np.asarray(line_fixed, dtype=float)
+
+    x_blocks: list[np.ndarray] = []
+    if compiled.fixed_matrix is not None:
+        x_blocks.append(np.asarray(compiled.fixed_matrix, dtype=float))
+    if int(line_fixed.shape[1]) > 0:
+        x_blocks.append(line_fixed)
+    x_stage2 = np.concatenate(x_blocks, axis=1) if x_blocks else None
+
+    model = BLUP(
+        y=np.asarray(y_obs, dtype=float).reshape(-1, 1),
+        X=x_stage2,
+        Z=compiled.random_matrices if compiled.random_matrices else None,
+        maxiter=max(1, int(maxiter)),
+        progress=False,
+    )
+    beta = np.asarray(model.beta, dtype=float).reshape(-1)
+    fixed_count = (
+        int(compiled.fixed_matrix.shape[1])
+        if compiled.fixed_matrix is not None
+        else 0
+    )
+    fixed_beta = beta[1 : 1 + fixed_count]
+    line_beta = beta[1 + fixed_count :]
+
+    fixed_fitted_mean = 0.0
+    if fixed_count > 0:
+        fixed_fitted_mean = float(
+            np.mean(np.asarray(compiled.fixed_matrix, dtype=float) @ fixed_beta)
+        )
+
+    line_levels = sorted(pd.unique(line_ids).tolist())
+    line_effects = np.zeros(len(line_levels), dtype=float)
+    if line_effects.size > 1:
+        line_effects[1:] = line_beta[: line_effects.size - 1]
+    blue_values = float(beta[0]) + fixed_fitted_mean + line_effects
+
+    noise_diag: np.ndarray | None = None
+    cov_beta = getattr(model, "_cov_beta", None)
+    if cov_beta is not None:
+        cov_beta_arr = np.asarray(cov_beta, dtype=float)
+        if cov_beta_arr.shape == (beta.size, beta.size):
+            # A line BLUE is ``intercept + mean(fixed fit)`` for the baseline
+            # level and adds one treatment-coded line coefficient for every
+            # remaining level.  Compute the covariance diagonal from this
+            # structure without allocating an n_line x n_line transform.
+            base_transform = np.zeros(beta.size, dtype=float)
+            base_transform[0] = 1.0
+            if fixed_count > 0:
+                base_transform[1 : 1 + fixed_count] = np.mean(
+                    np.asarray(compiled.fixed_matrix, dtype=float),
+                    axis=0,
+                )
+            base_variance = float(base_transform @ cov_beta_arr @ base_transform)
+            noise_diag = np.full(len(line_levels), base_variance, dtype=float)
+            if line_effects.size > 1:
+                line_start = 1 + fixed_count
+                line_cov = cov_beta_arr[line_start:, :]
+                base_cross = np.asarray(line_cov @ base_transform, dtype=float).reshape(-1)
+                line_diag = np.diag(cov_beta_arr[line_start:, line_start:])
+                noise_diag[1:] = (
+                    base_variance
+                    + 2.0 * base_cross[: line_effects.size - 1]
+                    + line_diag[: line_effects.size - 1]
+                )
+            noise_diag = np.asarray(noise_diag, dtype=float)
+            noise_diag = np.where(
+                np.isfinite(noise_diag) & (noise_diag >= 0.0),
+                noise_diag,
+                np.nan,
+            )
+    return _Stage1BlueResult(
+        sample_ids=[str(value) for value in line_levels],
+        values=np.asarray(blue_values, dtype=float),
+        noise_diag=noise_diag,
+    )
+
+
 def _random_term_fitted_values(
     model: BLUP,
     z_term: typing.Union[np.ndarray, sparse.spmatrix],
@@ -1179,9 +1298,8 @@ def _line_level_noise_diag(
     return (vge_use / np.maximum(env_counts, 1.0)) + (ve_use / np.maximum(plot_counts, 1.0))
 
 
-# Reserved for future re-activation of the joint additive + nonadditive REML path.
-# The active narrow-sense workflow is currently:
-#   stage-1 BLUE -> stage-2 GWAS null LMM (kinship only) -> h2/prediction.
+# Joint additive + line-nonadditive REML is the active dense narrow path.
+# Sparse REML uses the same stage-1 uncertainty on the reported phenotype scale.
 def _prepare_joint_kernel_inputs(
     y_line: np.ndarray,
     *,
@@ -1451,6 +1569,111 @@ def _fit_joint_line_kernel_exact(
     return best_state
 
 
+def _fit_dense_narrow_corrected(
+    y_line: np.ndarray,
+    *,
+    kinship: np.ndarray,
+    noise_diag: np.ndarray,
+    x_fixed: np.ndarray | None,
+    maxiter: int,
+) -> _JointKernelResult:
+    """Run dense line-level REML with first-stage BLUE uncertainty included."""
+
+    return _fit_joint_line_kernel_exact(
+        y_line,
+        kinship=kinship,
+        noise_diag=noise_diag,
+        x_fixed=x_fixed,
+        maxiter=maxiter,
+    )
+
+
+def _fit_sparse_narrow_corrected(
+    *,
+    jxgrm_path: str,
+    sample_idx: np.ndarray | None,
+    y_vec: np.ndarray,
+    x_cov: np.ndarray | None,
+    noise_diag: np.ndarray,
+    objective_mode: str,
+    threads: int,
+) -> dict[str, object]:
+    """Run sparse REML and add the first-stage BLUE uncertainty to PVE."""
+
+    result = dict(
+        _splmm_sparse_null_fit(
+            jxgrm_path=jxgrm_path,
+            sample_idx=sample_idx,
+            y_vec=y_vec,
+            x_cov=x_cov,
+            progress_callback=None,
+            objective_mode=objective_mode,
+            threads=threads,
+        )
+    )
+    d = np.asarray(noise_diag, dtype=float).reshape(-1)
+    if d.size == 0 or not np.all(np.isfinite(d) & (d >= 0.0)):
+        raise ValueError("Sparse narrow REML requires a finite non-negative stage1 noise diagonal.")
+    noise_mean = float(np.mean(d))
+    sigma_g2 = float(result.get("sigma_g2", float("nan")))
+    sigma_e2 = float(result.get("sigma_e2", float("nan")))
+    mean_diag_k = float(
+        result.get("mean_diag_k", result.get("grm_mean_diag", float("nan")))
+    )
+    genetic_diag = sigma_g2 * max(mean_diag_k, 0.0)
+    denominator = genetic_diag + sigma_e2 + noise_mean
+    backend_pve = float(result.get("pve", float("nan")))
+    if np.isfinite(denominator) and denominator > 0.0:
+        result["pve"] = float(genetic_diag / denominator)
+        result["pve_pheno_scale"] = float(genetic_diag / denominator)
+    result["stage1_noise_mean"] = noise_mean
+    result["pve_backend_uncorrected"] = backend_pve
+    return result
+
+
+def _sparse_additive_blup_from_subset(
+    *,
+    jxgrm_path: str,
+    sample_idx: np.ndarray,
+    y_vec: np.ndarray,
+    noise_diag: np.ndarray,
+    sigma_g2: float,
+    sigma_e2: float,
+    x_cov: np.ndarray | None = None,
+) -> np.ndarray:
+    """Compute additive BLUP from the sparse GRM subset used by sparse REML."""
+
+    k = np.asarray(
+        jxrs.splmm_load_sparse_grm_subset_dense(
+            str(jxgrm_path),
+            sample_indices=np.ascontiguousarray(sample_idx, dtype=np.int64),
+        ),
+        dtype=float,
+    )
+    y = np.asarray(y_vec, dtype=float).reshape(-1, 1)
+    d = np.asarray(noise_diag, dtype=float).reshape(-1)
+    n = int(y.shape[0])
+    if k.shape != (n, n) or d.shape[0] != n:
+        raise ValueError(
+            f"Sparse GBLUP shape mismatch: K={k.shape}, y={y.shape}, noise={d.shape}."
+        )
+    v = float(sigma_g2) * ((k + k.T) * 0.5)
+    v.flat[:: n + 1] += float(sigma_e2) + d
+    l = np.linalg.cholesky((v + v.T) * 0.5)
+    if x_cov is None:
+        x = np.ones((n, 1), dtype=float)
+    else:
+        x_arg = np.asarray(x_cov, dtype=float)
+        x = np.concatenate([np.ones((n, 1), dtype=float), x_arg], axis=1)
+    vinvx = cho_solve((l, True), x)
+    vinvy = cho_solve((l, True), y)
+    xt_vinv_x = (x.T @ vinvx + (x.T @ vinvx).T) * 0.5
+    beta = np.linalg.solve(xt_vinv_x, x.T @ vinvy)
+    residual = y - x @ beta
+    vinvr = cho_solve((l, True), residual)
+    return np.asarray(float(sigma_g2) * (k @ vinvr), dtype=float).reshape(-1)
+
+
 def _resolve_cli_columns(
     values: Iterable[str] | None,
     candidates: list[str],
@@ -1459,96 +1682,476 @@ def _resolve_cli_columns(
     return _resolve_columns(_split_tokens(values), candidates, label, index_base=0)
 
 
-def build_parser() -> argparse.ArgumentParser:
+def _infer_column_type_details(series: pd.Series) -> dict[str, typing.Any]:
+    """Infer a source type and retain the counts/reason for configuration logs."""
+
+    non_missing = series.dropna()
+    valid_count = int(non_missing.shape[0])
+    numeric = pd.to_numeric(non_missing, errors="coerce")
+    finite_mask = numeric.notna() & np.isfinite(numeric)
+    numeric_count = int(finite_mask.sum())
+    if valid_count == 0:
+        return {
+            "type": "categorical",
+            "valid_count": 0,
+            "unique_count": 0,
+            "reason": "empty_or_all_missing",
+        }
+    if numeric_count != valid_count:
+        return {
+            "type": "categorical",
+            "valid_count": valid_count,
+            "unique_count": int(non_missing.astype("string").nunique(dropna=False)),
+            "reason": "non_numeric_or_non_finite_values",
+        }
+
+    values = np.asarray(numeric, dtype=float).reshape(-1)
+    integer_valued = bool(np.all(values == np.floor(values)))
+    unique_count = int(pd.Series(values).nunique(dropna=True))
+    categorical_limit = max(1, int(np.floor(valid_count * 0.05)))
+    if integer_valued and unique_count <= 10 and unique_count <= categorical_limit:
+        return {
+            "type": "categorical",
+            "valid_count": valid_count,
+            "unique_count": unique_count,
+            "reason": f"low_cardinality_integer(<=10_and_<=5%;limit={categorical_limit})",
+        }
+    return {
+        "type": "continuous",
+        "valid_count": valid_count,
+        "unique_count": unique_count,
+        "reason": "finite_numeric_not_low_cardinality_integer",
+    }
+
+
+def _infer_column_type(series: pd.Series) -> str:
+    """Infer categorical/continuous using the approved low-cardinality rule."""
+
+    return str(_infer_column_type_details(series)["type"])
+
+
+def _split_effect_values(values: Iterable[str] | None) -> list[str]:
+    out: list[str] = []
+    for raw in list(values or []):
+        for token in str(raw).split(","):
+            text = token.strip()
+            if text:
+                out.append(text)
+    return out
+
+
+def _parse_effect_specs(
+    values: Iterable[str] | None,
+    kind: str,
+    candidates: list[str],
+    df: pd.DataFrame,
+) -> list[_EffectSpec]:
+    """Parse effect tokens and validate their source-column types."""
+
+    kind_text = str(kind).strip().lower()
+    if kind_text not in {"fixed", "random", "gxe", "gxc"}:
+        raise ValueError(f"Unknown effect kind: {kind}")
+
+    specs: list[_EffectSpec] = []
+    seen: set[tuple[str, tuple[str, ...]]] = set()
+    for token in _split_effect_values(values):
+        if token.count(":") > 1:
+            raise ValueError(
+                f"Invalid {kind_text} interaction {token}: expected A:B."
+            )
+        if ":" in token:
+            left, right = [part.strip() for part in token.split(":", 1)]
+            if left == "" or right == "":
+                raise ValueError(
+                    f"Invalid {kind_text} interaction {token}: both columns are required."
+                )
+            source_cols = _resolve_cli_columns(
+                [left, right], candidates, f"-{kind_text}"
+            )
+            if len(source_cols) != 2:
+                raise ValueError(
+                    f"Invalid {kind_text} interaction {token}: expected two columns."
+                )
+            interaction = ":"
+        else:
+            source_cols = _resolve_cli_columns(
+                [token], candidates, f"-{kind_text}"
+            )
+            if len(source_cols) != 1:
+                raise ValueError(
+                    f"Invalid {kind_text} term {token}: expected one column."
+                )
+            interaction = None
+
+        source_types = tuple(_infer_column_type(df[col]) for col in source_cols)
+        if kind_text == "gxe":
+            if len(source_cols) == 1 and source_types[0] != "categorical":
+                raise ValueError(
+                    f"-gxe term {token} requires a categorical environment column; "
+                    f"{source_cols[0]} is {source_types[0]}."
+                )
+            if len(source_cols) == 2 and source_types != (
+                "categorical",
+                "categorical",
+            ):
+                raise ValueError(
+                    f"-gxe interaction {token} must compile to categorical×categorical; "
+                    f"got {source_types}."
+                )
+        if kind_text == "gxc":
+            if len(source_cols) != 1 or source_types[0] != "continuous":
+                name = source_cols[0] if source_cols else token
+                actual = source_types[0] if source_types else "unknown"
+                raise ValueError(
+                    f"-gxc term {token} requires a continuous column; "
+                    f"{name} is {actual}."
+                )
+
+        key = (kind_text, tuple(source_cols))
+        if key in seen:
+            raise ValueError(f"Duplicate {kind_text} term: {token}")
+        seen.add(key)
+        specs.append(
+            _EffectSpec(
+                kind=kind_text,
+                sources=tuple(source_cols),
+                source_types=source_types,
+                label=":".join(source_cols),
+                interaction=interaction,
+            )
+        )
+    return specs
+
+
+def _compile_effect_matrix(
+    df: pd.DataFrame,
+    spec: _EffectSpec,
+    *,
+    for_random: bool,
+) -> tuple[np.ndarray, list[str]]:
+    """Compile one effect specification into a numeric design block."""
+
+    def finalize(
+        block: typing.Union[np.ndarray, sparse.spmatrix],
+        names: list[str],
+    ) -> tuple[np.ndarray, list[str]]:
+        arr = np.asarray(block.toarray() if sparse.issparse(block) else block, dtype=float)
+        if arr.ndim != 2:
+            arr = arr.reshape(int(df.shape[0]), -1)
+        if arr.shape[1] != len(names):
+            raise ValueError(
+                f"Effect {spec.label} produced inconsistent design metadata: "
+                f"matrix={arr.shape}, names={len(names)}."
+            )
+        if arr.shape[1] == 0:
+            raise ValueError(f"Effect {spec.label} is not estimable after encoding (zero columns).")
+        finite = np.isfinite(arr)
+        if not bool(finite.all()):
+            raise ValueError(f"Effect {spec.label} contains non-finite design values.")
+        active = np.any(np.abs(arr) > 1e-12, axis=0)
+        if not bool(active.any()):
+            raise ValueError(f"Effect {spec.label} is constant/zero after encoding.")
+        return arr[:, active], [name for name, keep in zip(names, active) if bool(keep)]
+
+    source_types = spec.source_types
+    if len(spec.sources) == 1:
+        col = spec.sources[0]
+        if source_types[0] == "continuous":
+            values = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
+            if np.ptp(values) <= 1e-12:
+                raise ValueError(f"Effect {spec.label} is constant and cannot be estimated.")
+            return finalize(values.reshape(-1, 1), [spec.label])
+        if int(df[col].astype("string").fillna("NA").nunique(dropna=False)) <= 1:
+            raise ValueError(f"Effect {spec.label} has only one categorical level and cannot be estimated.")
+        arr, names = _onehot_encode_series(
+            df[col],
+            prefix=spec.label,
+            drop_first=not for_random,
+            sparse_output=False,
+        )
+        return finalize(arr, names)
+
+    left, right = spec.sources
+    if source_types == ("categorical", "categorical"):
+        combo = _combine_key(df, [left, right], spec.label)
+        arr, names = _onehot_encode_series(
+            combo,
+            prefix=spec.label,
+            drop_first=not for_random,
+            sparse_output=False,
+        )
+        if int(combo.nunique(dropna=False)) <= 1:
+            raise ValueError(f"Effect {spec.label} has only one combined level and cannot be estimated.")
+        return finalize(arr, names)
+
+    if source_types == ("continuous", "continuous"):
+        left_values = pd.to_numeric(df[left], errors="coerce").to_numpy(dtype=float)
+        right_values = pd.to_numeric(df[right], errors="coerce").to_numpy(dtype=float)
+        product = left_values * right_values
+        if np.ptp(product) <= 1e-12:
+            raise ValueError(f"Effect {spec.label} is constant and cannot be estimated.")
+        return finalize(product.reshape(-1, 1), [spec.label])
+
+    categorical_col = left if source_types[0] == "categorical" else right
+    continuous_col = right if source_types[0] == "categorical" else left
+    continuous_values = pd.to_numeric(df[continuous_col], errors="coerce").to_numpy(dtype=float)
+    onehot, level_names = _onehot_encode_series(
+        df[categorical_col],
+        prefix=f"{categorical_col}:{continuous_col}",
+        drop_first=False,
+        sparse_output=False,
+    )
+    arr = np.asarray(onehot, dtype=float) * continuous_values.reshape(-1, 1)
+    names = [f"{name}:slope" for name in level_names]
+    return finalize(arr, names)
+
+
+def _effect_factor_series(df: pd.DataFrame, spec: _EffectSpec) -> pd.Series:
+    if spec.result_type != "categorical":
+        raise ValueError(f"Effect {spec.label} does not compile to a categorical factor.")
+    return _combine_key(df, list(spec.sources), spec.label).astype("string")
+
+
+def _compile_line_factor_matrix(
+    df: pd.DataFrame,
+    *,
+    line_col: str,
+    factor: pd.Series,
+    label: str,
+) -> tuple[sparse.csr_matrix, list[str]]:
+    line_ids = df[line_col].astype("string").fillna("NA").astype(str)
+    factor_ids = factor.astype("string").fillna("NA").astype(str)
+    if int(factor_ids.nunique(dropna=False)) <= 1:
+        raise ValueError(
+            f"GxE factor {label} has only one level after filtering and cannot be estimated."
+        )
+    key = (line_ids + "@@" + factor_ids).astype("string")
+    matrix, _ = _onehot_encode_series(
+        key,
+        prefix=f"{line_col}×{label}",
+        drop_first=False,
+        sparse_output=True,
+    )
+    return matrix.tocsr(), [f"{line_col}×{label}"]
+
+
+def _compile_line_slope_matrix(
+    df: pd.DataFrame,
+    *,
+    line_col: str,
+    column: str,
+) -> tuple[sparse.csr_matrix, list[str]]:
+    line_ids = df[line_col].astype("string").fillna("NA").astype(str)
+    levels = sorted(pd.unique(line_ids).tolist())
+    level_index = {str(level): idx for idx, level in enumerate(levels)}
+    codes = np.asarray([level_index[str(value)] for value in line_ids], dtype=np.int64)
+    values = pd.to_numeric(df[column], errors="coerce").to_numpy(dtype=float)
+    if not np.all(np.isfinite(values)):
+        raise ValueError(f"GxC column {column} contains non-finite values after filtering.")
+    centered = values - float(np.mean(values))
+    if not np.any(np.abs(centered) > 0.0):
+        raise ValueError(f"GxC column {column} is constant after centering.")
+    rows = np.arange(int(df.shape[0]), dtype=np.int64)
+    matrix = sparse.csr_matrix(
+        (centered, (rows, codes)),
+        shape=(int(df.shape[0]), len(levels)),
+        dtype=float,
+    )
+    return matrix, [f"{line_col}×{column}"]
+
+
+def _compile_model_terms(
+    df: pd.DataFrame,
+    *,
+    line_col: str,
+    fixed_specs: list[_EffectSpec],
+    random_specs: list[_EffectSpec],
+    gxe_specs: list[_EffectSpec],
+    gxc_specs: list[_EffectSpec],
+) -> _CompiledModelTerms:
+    fixed_blocks: list[np.ndarray] = []
+    fixed_names: list[str] = []
+    fixed_labels: list[str] = []
+    for spec in fixed_specs:
+        block, names = _compile_effect_matrix(df, spec, for_random=False)
+        if int(block.shape[1]) > 0:
+            fixed_blocks.append(np.asarray(block, dtype=float))
+            fixed_names.extend(names)
+            fixed_labels.append(spec.label)
+
+    random_matrices: list[typing.Union[np.ndarray, sparse.spmatrix]] = []
+    random_names: list[str] = []
+    for spec in random_specs:
+        block, _names = _compile_effect_matrix(df, spec, for_random=True)
+        if int(block.shape[1]) > 0:
+            random_matrices.append(np.asarray(block, dtype=float))
+            random_names.append(spec.label)
+
+    line_ids = df[line_col].astype("string").fillna("NA").astype(str)
+    line_z, line_names = _onehot_encode_series(
+        line_ids,
+        prefix=line_col,
+        drop_first=False,
+        sparse_output=True,
+    )
+    line_z = line_z.tocsr()
+
+    for spec in gxe_specs:
+        factor = _effect_factor_series(df, spec)
+        block, names = _compile_line_factor_matrix(
+            df,
+            line_col=line_col,
+            factor=factor,
+            label=spec.label,
+        )
+        if int(block.shape[1]) > 0:
+            random_matrices.append(block)
+            random_names.extend(names)
+
+    for spec in gxc_specs:
+        if len(spec.sources) != 1:
+            raise ValueError(f"GxC term {spec.label} must name one continuous column.")
+        block, names = _compile_line_slope_matrix(
+            df,
+            line_col=line_col,
+            column=spec.sources[0],
+        )
+        random_matrices.append(block)
+        random_names.extend(names)
+
+    fixed_matrix = (
+        np.concatenate(fixed_blocks, axis=1) if len(fixed_blocks) > 0 else None
+    )
+    return _CompiledModelTerms(
+        fixed_specs=list(fixed_specs),
+        random_specs=list(random_specs),
+        gxe_specs=list(gxe_specs),
+        gxc_specs=list(gxc_specs),
+        fixed_matrix=fixed_matrix,
+        fixed_names=fixed_names,
+        fixed_labels=fixed_labels,
+        line_z=line_z,
+        line_names=line_names,
+        random_matrices=random_matrices,
+        random_names=random_names,
+    )
+
+
+def _reml_dev_help_requested(argv: list[str] | None = None) -> bool:
+    tokens = list(sys.argv[1:] if argv is None else argv)
+    return "-dev" in tokens or "--dev" in tokens
+
+
+def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
+    show_dev_help = _reml_dev_help_requested(argv)
     parser = CliArgumentParser(
         prog="jx reml",
         formatter_class=cli_help_formatter(),
+        allow_abbrev=False,
         epilog=minimal_help_epilog(
             [
-                "jx reml -file pheno.tsv -l sample_id -e year,loc -o outdir",
-                "jx reml -file pheno.tsv -l sample_id -e year,loc -f PCA1,PCA2 -r block -k data.cGRM.npy -p Yield",
-                "jx reml -file pheno.tsv -l sample_id -spk data.cGRM.spgrm -p Yield -o outdir",
+                "jx reml -p pheno.tsv -n Yield -c year,loc -o outdir",
+                "jx reml -p pheno.tsv -n Yield -c PCA1,PCA2 -rc block -k data.cGRM.npy",
+                "jx reml -p pheno.tsv -n Yield -gxe loc -gxc temperature -spk data.cGRM.spgrm",
+                "jx reml -h -dev",
             ]
         ),
     )
 
     req = parser.add_argument_group("Required Arguments")
     req.add_argument(
-        "-file",
-        "--file",
+        "-p",
+        "--pheno",
         required=True,
         type=str,
-        help="Input phenotype table (.tsv/.csv/whitespace).",
+        dest="pheno",
+        help="Input phenotype table (.tsv/.csv/whitespace); the first column is the sample/line ID.",
     )
 
     opt = parser.add_argument_group("Optional Arguments")
     opt.add_argument(
-        "-l",
-        "--line",
+        "-n",
+        "--ncol",
+        action="extend",
+        nargs="+",
         default=None,
         metavar="COL",
-        help="Line/sample ID column. Numeric indices are 0-based on the original input table. Default: first column.",
+        dest="ncol",
+        help=(
+            "Phenotype column(s), selected by name or zero-based index excluding the first sample-ID column. "
+            "Comma lists, repeated flags, and numeric ranges are accepted; default: all usable numeric columns."
+        ),
     )
+
     opt.add_argument(
-        "-e",
-        "--env",
+        "-c",
+        "--cov",
         action="append",
         default=[],
-        metavar="COL",
+        metavar="TERM",
+        dest="cov",
         help=(
-            "Environment factor column(s), e.g. year,loc. Numeric indices are 0-based on the original input table. They are combined as one ENV factor."
+            "Fixed effect column(s) from the phenotype table (name or zero-based index excluding the ID column). Use A:B for an interaction; "
+            "categorical×categorical combines levels, numeric×numeric multiplies, and mixed types create slopes."
         ),
     )
     opt.add_argument(
-        "-f",
-        "--fixed",
+        "-rc",
+        "--rcov",
+        action="append",
+        default=[],
+        metavar="TERM",
+        dest="rcov",
+        help="Random nuisance effect column(s) from the phenotype table (name or zero-based index excluding ID); repeat or comma-separate terms.",
+    )
+    opt.add_argument(
+        "-gxe",
+        "--gxe",
+        action="append",
+        default=[],
+        metavar="TERM",
+        dest="gxe",
+        help="Random Line×discrete-environment term(s) from the phenotype table (name or zero-based index excluding ID).",
+    )
+    opt.add_argument(
+        "-gxc",
+        "--gxc",
         action="append",
         default=[],
         metavar="COL",
-        help=(
-            "Additional fixed covariates. Numeric indices are 0-based on the original input table. Numeric columns stay numeric; categorical columns are one-hot encoded."
-        ),
+        dest="gxc",
+        help="Random Line×continuous-gradient slope column(s) from the phenotype table (name or zero-based index excluding ID).",
     )
-    opt.add_argument(
-        "-r",
-        "--random",
-        action="append",
-        default=[],
-        metavar="COL",
-        help=(
-            "Additional random nuisance covariates. Numeric indices are 0-based on the original input table. Numeric columns stay numeric; categorical columns are one-hot encoded."
-        ),
-    )
-    opt.add_argument(
-        "-p",
-        "--pheno",
-        action="append",
-        default=[],
-        metavar="COL",
-        help=(
-            "Trait column(s). Numeric indices are 0-based on the original input table. If omitted, all numeric non-design columns are used."
-        ),
-    )
-    opt.add_argument(
+
+    grm_group = opt.add_mutually_exclusive_group(required=False)
+    grm_group.add_argument(
         "-k",
-        "-grm",
         "--grm",
         dest="grm",
         default=None,
         metavar="FILE",
         help=(
-            "Optional GRM matrix. When provided, narrow-sense h2 and genomic BLUP are estimated in addition to broad-sense H2 and BLUE."
+            "Optional dense GRM matrix. When provided, corrected narrow-sense h2 and GBLUP are estimated."
         ),
     )
-    opt.add_argument(
+    grm_group.add_argument(
         "-spk",
         "--grm-sparse",
         dest="grm_sparse",
         default=None,
         metavar="FILE",
         help=(
-            "Optional precomputed Sparse GRM (.spgrm/.jxgrm or GCTA/fastGWA prefix/.grm.sp). When provided, narrow-sense h2 is estimated via Sparse REML on the BLUE phenotype scale and reported as phenotype-scale PVE/h2 (GEMMA/GCTA/FvLMM-compatible); the raw variance-component ratio is retained separately for debugging."
+            "Optional Sparse GRM (.spgrm/.jxgrm or GCTA/fastGWA prefix/.grm.sp). "
+            "When provided, corrected sparse narrow-sense h2 and GBLUP are estimated."
         ),
+    )
+
+    opt.add_argument(
+        "-dev",
+        "--dev",
+        action="store_true",
+        default=False,
+        help=argparse.SUPPRESS,
     )
     opt.add_argument(
         "--spk-mode",
@@ -1560,7 +2163,7 @@ def build_parser() -> argparse.ArgumentParser:
             "`raw` uses JanusX profile REML on the sparse K directly; "
             "`fastgwa` uses a fastGWA-compatible fixed-Vp sparse REML objective "
             "matched to GCTA fastGWA-REML behavior (default: %(default)s)."
-        ),
+        ) if show_dev_help else argparse.SUPPRESS,
     )
     add_common_out_arg(opt, default=".", help_profile="current_dir")
     add_common_prefix_arg(opt, default=None, help_profile="inferred_input_filename")
@@ -1579,9 +2182,9 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     t0 = time.time()
-    args = build_parser().parse_args()
+    args = build_parser(argv).parse_args(argv)
     if int(args.thread) <= 0:
         raise ValueError("-t/--thread must be a positive integer.")
     args.thread = int(apply_outer_thread_cap(int(args.thread)))
@@ -1589,17 +2192,18 @@ def main() -> None:
         raise ValueError("Please provide only one of -k/--grm or -spk/--grm-sparse.")
     if args.grm_sparse is not None:
         args.grm_sparse = _splmm_normalize_sparse_grm_path(str(args.grm_sparse))
-    auto_prefix = strip_default_prefix_suffix(os.path.basename(str(args.file)))
+    auto_prefix = strip_default_prefix_suffix(os.path.basename(str(args.pheno)))
     outdir, outprefix, prefix = apply_output_prefix_compat(
         args,
         auto_prefix,
+        argv=argv,
         fallback_prefix="reml",
     )
     os.makedirs(outdir, mode=0o755, exist_ok=True)
     log_path = f"{outprefix}.reml.log"
     logger = setup_logging(log_path)
 
-    if not ensure_file_exists(logger, str(args.file), "Input file"):
+    if not ensure_file_exists(logger, str(args.pheno), "Input phenotype file"):
         return
     if args.grm is not None and not ensure_file_exists(logger, str(args.grm), "GRM file"):
         return
@@ -1608,7 +2212,7 @@ def main() -> None:
 
     load_t0 = time.time()
     try:
-        df = _read_table_with_optional_header(str(args.file))
+        df = _read_table_with_optional_header(str(args.pheno))
     except Exception:
         raise
     load_elapsed = format_elapsed(time.time() - load_t0)
@@ -1619,40 +2223,69 @@ def main() -> None:
     df = df.copy()
     all_cols = [str(c) for c in df.columns]
 
-    line_spec = _resolve_cli_columns(
-        [args.line] if args.line is not None else [],
-        all_cols,
-        "-l/--line",
-    )
-    if len(line_spec) > 1:
-        raise ValueError("Please specify exactly one line column with -l/--line.")
-    line_col = str(line_spec[0]) if len(line_spec) == 1 else str(all_cols[0])
-    df[line_col] = df[line_col].astype("string").fillna("NA").astype(str)
-
+    line_col = str(all_cols[0])
     effect_cols = [c for c in all_cols if c != line_col]
-    env_cols = _resolve_cli_columns(args.env, all_cols, "-e/--env")
-    fixed_cols = _resolve_cli_columns(args.fixed, all_cols, "-f/--fixed")
-    random_cols = _resolve_cli_columns(args.random, all_cols, "-r/--random")
+    env_cols: list[str] = []
+    raw_line = df[line_col].copy()
+    if raw_line.isna().any() or raw_line.astype("string").str.strip().eq("").any():
+        raise ValueError("The first phenotype-table column must contain non-empty sample/line IDs.")
+    df[line_col] = raw_line.astype("string").astype(str)
+    fixed_specs = _parse_effect_specs(args.cov, "fixed", effect_cols, df)
+    random_specs = _parse_effect_specs(args.rcov, "random", effect_cols, df)
+    gxe_specs = _parse_effect_specs(args.gxe, "gxe", effect_cols, df)
+    gxc_specs = _parse_effect_specs(args.gxc, "gxc", effect_cols, df)
 
-    for label, cols in (
-        ("-e/--env", env_cols),
-        ("-f/--fixed", fixed_cols),
-        ("-r/--random", random_cols),
+    source_columns = _unique_preserve(
+        source
+        for specs in (fixed_specs, random_specs, gxe_specs, gxc_specs)
+        for spec in specs
+        for source in spec.sources
+    )
+    for source in source_columns:
+        details = _infer_column_type_details(df[source])
+        logger.info(
+            "Column type [%s] = %s | valid=%s | unique=%s | reason=%s",
+            source,
+            details["type"],
+            details["valid_count"],
+            details["unique_count"],
+            details["reason"],
+        )
+
+    fixed_cols = [spec.label for spec in fixed_specs]
+    random_cols = [spec.label for spec in random_specs]
+    gxe_cols = [spec.label for spec in gxe_specs]
+    gxc_cols = [spec.label for spec in gxc_specs]
+    for label, specs in (
+        ("-c/--cov", fixed_specs),
+        ("-rc/--rcov", random_specs),
+        ("-gxe/--gxe", gxe_specs),
+        ("-gxc/--gxc", gxc_specs),
     ):
-        if line_col in cols:
-            raise ValueError(f"{label} cannot reuse the line/sample column: {line_col}")
+        for spec in specs:
+            if line_col in spec.sources:
+                raise ValueError(f"{label} cannot reuse the line/sample column: {line_col}")
 
-    overlap_effects = (set(env_cols) & set(fixed_cols)) | (set(env_cols) & set(random_cols)) | (set(fixed_cols) & set(random_cols))
+    reserved_sources = {
+        source
+        for specs in (fixed_specs, random_specs, gxe_specs, gxc_specs)
+        for spec in specs
+        for source in spec.sources
+    }
+    overlap_effects = (
+        set(source for spec in fixed_specs for source in spec.sources)
+        & set(source for spec in random_specs for source in spec.sources)
+    )
     if len(overlap_effects) > 0:
         raise ValueError(
             "Columns cannot be assigned to multiple design groups: "
             + ", ".join(sorted(overlap_effects))
         )
 
-    reserved_cols = set(env_cols) | set(fixed_cols) | set(random_cols)
-    trait_tokens = _split_tokens(args.pheno)
+    reserved_cols = set(reserved_sources)
+    trait_tokens = _split_tokens(args.ncol)
     if len(trait_tokens) > 0:
-        trait_cols = _resolve_cli_columns(trait_tokens, all_cols, "-p/--pheno")
+        trait_cols = _resolve_cli_columns(trait_tokens, effect_cols, "-n/--ncol")
         conflict = sorted((set(trait_cols) & reserved_cols) | ({line_col} & set(trait_cols)))
         if len(conflict) > 0:
             raise ValueError(
@@ -1665,14 +2298,11 @@ def main() -> None:
     if len(trait_cols) == 0:
         raise ValueError("No usable trait columns were found.")
 
-    fixed_terms = [_TermSpec(name=str(c), force_onehot=False) for c in fixed_cols]
-    random_terms_all = [_TermSpec(name=str(c), force_onehot=False) for c in random_cols]
-
     n_obs_total = int(df.shape[0])
     unique_lines = df[line_col].drop_duplicates().reset_index(drop=True)
     n_lines_total = int(unique_lines.shape[0])
     env_fixed_label = _format_design_label(env_cols, fixed_cols)
-    random_label = _format_random_label(random_cols)
+    random_label = _format_random_label(random_cols + gxe_cols + gxc_cols)
 
     grm_ctx: _GrmContext | None = None
     sparse_grm_ctx: _SparseGrmContext | None = None
@@ -1695,12 +2325,12 @@ def main() -> None:
 
     narrow_path_label = "None"
     if grm_ctx is not None:
-        narrow_path_label = "BLUE -> dense exact REML"
+        narrow_path_label = "BLUE -> corrected dense joint REML"
     elif sparse_grm_ctx is not None:
         narrow_path_label = (
-            "BLUE -> Sparse REML"
+            "BLUE -> corrected Sparse REML"
             if str(args.grm_sparse_mode) == "raw"
-            else "BLUE -> Sparse REML (fastGWA-compatible)"
+            else "BLUE -> corrected Sparse REML (fastGWA-compatible)"
         )
 
     emit_cli_configuration(
@@ -1712,7 +2342,7 @@ def main() -> None:
             (
                 "Input",
                 [
-                    ("File", str(args.file)),
+                    ("Phenotype file", str(args.pheno)),
                     ("Line column", line_col),
                     ("Rows(total)", n_obs_total),
                     ("Lines(unique)", n_lines_total),
@@ -1723,11 +2353,12 @@ def main() -> None:
                 "Columns",
                 [
                     ("Traits", ", ".join(trait_cols)),
-                    ("ENV", "|".join(env_cols) if len(env_cols) > 0 else "None"),
                     ("Fixed", ", ".join(fixed_cols) if len(fixed_cols) > 0 else "None"),
                     ("Random", ", ".join(random_cols) if len(random_cols) > 0 else "None"),
-                    ("Broad model", f"{line_col} (random) + {line_col}xENV (random)"),
-                    ("BLUE stage-1", f"{line_col} (fixed) + ENV (fixed) + {line_col}xENV (random)"),
+                    ("GxE", ", ".join(gxe_cols) if len(gxe_cols) > 0 else "None"),
+                    ("GxC", ", ".join(gxc_cols) if len(gxc_cols) > 0 else "None"),
+                    ("Model", f"{line_col} (random) + compiled random/fixed terms"),
+                    ("BLUE model", f"{line_col} (fixed) + compiled fixed/random nuisance terms"),
                 ],
             ),
             (
@@ -1749,7 +2380,7 @@ def main() -> None:
                     ("Prefix", prefix),
                     ("BLUE file", f"{outprefix}.blue.txt"),
                     ("BLUP file", f"{outprefix}.blup.txt"),
-                    ("GBLUP file", f"{outprefix}.gblup.txt" if grm_ctx is not None else "None"),
+                    ("GBLUP file", f"{outprefix}.gblup.txt" if (grm_ctx is not None or sparse_grm_ctx is not None) else "None"),
                     ("Summary file", f"{outprefix}.reml.summary.tsv"),
                     ("Log file", log_path),
                 ],
@@ -1761,7 +2392,7 @@ def main() -> None:
     blup_out = pd.DataFrame({line_col: unique_lines.to_numpy(dtype=object)})
     gblup_out = (
         pd.DataFrame({line_col: unique_lines.to_numpy(dtype=object)})
-        if grm_ctx is not None
+        if grm_ctx is not None or sparse_grm_ctx is not None
         else None
     )
     summary_rows: list[dict[str, typing.Any]] = []
@@ -1770,9 +2401,9 @@ def main() -> None:
         step_t0 = time.time()
         try:
             y_all = pd.to_numeric(df[trait], errors="coerce")
-            mask = y_all.notna()
-            mask &= _collect_numeric_required_mask(df, fixed_terms)
-            mask &= _collect_numeric_required_mask(df, random_terms_all)
+            mask = y_all.notna() & np.isfinite(y_all)
+            all_effect_specs = fixed_specs + random_specs + gxe_specs + gxc_specs
+            mask &= _collect_numeric_required_mask_specs(df, all_effect_specs)
 
             used_obs = int(mask.sum())
             used_lines = int(df.loc[mask, line_col].astype(str).nunique(dropna=False))
@@ -1822,70 +2453,30 @@ def main() -> None:
                 )
                 continue
 
-            sub_cols = _unique_preserve([line_col, trait, *env_cols, *fixed_cols, *random_cols])
+            source_cols = [
+                source
+                for specs in (fixed_specs, random_specs, gxe_specs, gxc_specs)
+                for spec in specs
+                for source in spec.sources
+            ]
+            sub_cols = _unique_preserve([line_col, trait, *source_cols])
             sub = df.loc[mask, sub_cols].copy()
             y = pd.to_numeric(sub[trait], errors="coerce").to_numpy(dtype=float).reshape(-1, 1)
             line_ids_sub = sub[line_col].astype("string").fillna("NA").astype(str)
             env_key = _combine_key(sub, env_cols, "__ENV__").astype(str)
 
-            x_blocks: list[np.ndarray] = []
-            x_names: list[str] = []
-            fixed_x, fixed_names = _encode_fixed_design(
+            compiled = _compile_model_terms(
                 sub,
-                fixed_terms,
-                trait=trait,
-                logger=logger,
+                line_col=line_col,
+                fixed_specs=fixed_specs,
+                random_specs=random_specs,
+                gxe_specs=gxe_specs,
+                gxc_specs=gxc_specs,
             )
-            if fixed_x is not None:
-                x_blocks.append(np.asarray(fixed_x, dtype=float))
-                x_names.extend(fixed_names)
-
-            if len(env_cols) > 0:
-                env_arr, env_names = _onehot_encode_series(
-                    env_key,
-                    prefix="ENV",
-                    drop_first=True,
-                    sparse_output=False,
-                )
-                if int(env_arr.shape[1]) > 0:
-                    x_blocks.append(np.asarray(env_arr, dtype=float))
-                    x_names.extend(env_names)
-
-            x_broad = np.concatenate(x_blocks, axis=1) if len(x_blocks) > 0 else None
-
-            z_list: list[typing.Union[np.ndarray, sparse.spmatrix]] = []
-            z_names: list[str] = []
-            line_z, _line_names = _onehot_encode_series(
-                line_ids_sub,
-                prefix=line_col,
-                drop_first=False,
-                sparse_output=True,
-            )
-            if int(line_z.shape[1]) > 0:
-                z_list.append(line_z)
-                z_names.append(line_col)
-
-            gxe_name = f"{line_col}xENV"
-            if len(env_cols) > 0 and int(env_key.nunique(dropna=False)) > 1:
-                gxe_key = (line_ids_sub + "@@" + env_key).astype("string")
-                gxe_z, _ = _onehot_encode_series(
-                    gxe_key,
-                    prefix=gxe_name,
-                    drop_first=False,
-                    sparse_output=True,
-                )
-                if int(gxe_z.shape[1]) > 0:
-                    z_list.append(gxe_z)
-                    z_names.append(gxe_name)
-
-            extra_random, extra_random_names = _encode_random_design(
-                sub,
-                random_terms_all,
-                trait=trait,
-                logger=logger,
-            )
-            z_list.extend(extra_random)
-            z_names.extend(extra_random_names)
+            x_broad = compiled.fixed_matrix
+            line_z = compiled.line_z
+            z_list = [line_z, *compiled.random_matrices]
+            z_names = [line_col, *compiled.random_names]
 
             broad_model = BLUP(
                 y=y,
@@ -1906,17 +2497,47 @@ def main() -> None:
             h_plot = 1.0
             r_eff = 1.0
             status = "ok"
+            random_variances: OrderedDict[str, float] = OrderedDict()
             single_obs_per_line = bool(int(line_ids_sub.shape[0]) == int(line_ids_sub.nunique(dropna=False)))
             line_idx = z_names.index(line_col) if line_col in z_names else -1
-            gxe_idx = z_names.index(gxe_name) if gxe_name in z_names else -1
+            gxe_labels = {f"{line_col}×{spec.label}" for spec in gxe_specs}
+            gxe_indices = [
+                idx for idx, name in enumerate(z_names) if name in gxe_labels
+            ]
             if getattr(broad_model, "var", None) is not None and len(z_names) > 0:
                 var_all = np.asarray(broad_model.var, dtype=float).reshape(-1)
                 if var_all.size >= (len(z_names) + 1):
                     rand_var = var_all[: len(z_names)]
                     ve = float(var_all[-1])
+                    for term_name, term_var in zip(z_names, rand_var):
+                        random_variances[str(term_name)] = float(term_var)
+                        logger.info(
+                            "Trait %s: random variance [%s] = %s",
+                            trait,
+                            term_name,
+                            _fmt_metric(term_var),
+                        )
+                        if np.isfinite(term_var) and float(term_var) <= 1e-9:
+                            logger.warning(
+                                "Trait %s: variance component [%s] is at/near the non-negative boundary (%s).",
+                                trait,
+                                term_name,
+                                _fmt_metric(term_var),
+                            )
+                    logger.info(
+                        "Trait %s: residual variance = %s",
+                        trait,
+                        _fmt_metric(ve),
+                    )
+                    if np.isfinite(ve) and float(ve) <= 1e-9:
+                        logger.warning(
+                            "Trait %s: residual variance is at/near the non-negative boundary (%s).",
+                            trait,
+                            _fmt_metric(ve),
+                        )
                     total_var = float(np.sum(rand_var) + ve)
                     vg = float(rand_var[line_idx]) if line_idx >= 0 else np.nan
-                    vge = float(rand_var[gxe_idx]) if gxe_idx >= 0 else 0.0
+                    vge = float(np.sum(rand_var[gxe_indices])) if gxe_indices else 0.0
                     if total_var > 0.0 and line_idx >= 0:
                         pve_line = float(rand_var[line_idx] / total_var)
                         pve_e = float(ve / total_var)
@@ -1959,25 +2580,16 @@ def main() -> None:
                 .to_numpy(dtype=float)
             )
 
-            stage1_random_terms, stage2_fixed_terms = _build_stage1_blue_terms(
-                sub,
-                line_col=line_col,
-                trait=trait,
-                fixed_terms_all=fixed_terms,
-                random_terms_all=random_terms_all,
-                logger=logger,
-            )
             stage1_blue = _fit_stage1_blue(
                 y_obs=y.reshape(-1),
                 sub=sub,
                 line_col=line_col,
                 trait=trait,
-                env_cols=env_cols,
-                stage1_random_terms=stage1_random_terms,
                 gxe_var=vge,
                 resid_var=ve,
                 maxiter=int(args.maxiter),
                 logger=logger,
+                compiled=compiled,
             )
             blue_map = {
                 str(sid): float(val)
@@ -2011,18 +2623,6 @@ def main() -> None:
                         trait: np.asarray(stage1_blue.values, dtype=float),
                     }
                 )
-                if len(stage2_fixed_terms) > 0:
-                    fixed_keep = [line_col] + [str(t.name) for t in stage2_fixed_terms]
-                    fixed_line_df = (
-                        sub[fixed_keep]
-                        .drop_duplicates(subset=[line_col], keep="first")
-                        .copy()
-                    )
-                    blue_trait_df = blue_trait_df.merge(
-                        fixed_line_df,
-                        on=line_col,
-                        how="left",
-                    )
 
                 sid_series = blue_trait_df[line_col].astype(str)
                 kinship_index = grm_ctx.index if grm_ctx is not None else sparse_grm_ctx.index
@@ -2035,56 +2635,90 @@ def main() -> None:
                 if int(keep_mask.sum()) > 2:
                     kept = blue_trait_df.loc[keep_mask].reset_index(drop=True)
                     kept_ids = kept[line_col].astype(str).tolist()
-                    x_stage2, _ = _encode_fixed_design(
-                        kept,
-                        stage2_fixed_terms,
-                        trait=trait,
-                        logger=logger,
-                    )
-                    noise_diag = _line_level_noise_diag(
-                        sub,
-                        line_col=line_col,
-                        env_cols=env_cols,
-                        line_ids=kept_ids,
-                        vge=vge,
-                        ve=ve,
-                    )
+                    x_stage2 = None
+                    if stage1_blue.noise_diag is not None:
+                        blue_noise_map = {
+                            str(sid): float(value)
+                            for sid, value in zip(
+                                stage1_blue.sample_ids,
+                                np.asarray(stage1_blue.noise_diag, dtype=float),
+                            )
+                        }
+                        noise_diag = np.asarray(
+                            [blue_noise_map.get(sid, np.nan) for sid in kept_ids],
+                            dtype=float,
+                        )
+                        if not np.all(np.isfinite(noise_diag) & (noise_diag >= 0.0)):
+                            logger.warning(
+                                f"Trait {trait}: BLUE covariance diagonal was incomplete; using conservative line-level fallback for invalid entries."
+                            )
+                            fallback_noise = _line_level_noise_diag(
+                                sub,
+                                line_col=line_col,
+                                env_cols=env_cols,
+                                line_ids=kept_ids,
+                                vge=vge,
+                                ve=ve,
+                            )
+                            noise_diag = np.where(
+                                np.isfinite(noise_diag) & (noise_diag >= 0.0),
+                                noise_diag,
+                                fallback_noise,
+                            )
+                    else:
+                        noise_diag = _line_level_noise_diag(
+                            sub,
+                            line_col=line_col,
+                            env_cols=env_cols,
+                            line_ids=kept_ids,
+                            vge=vge,
+                            ve=ve,
+                        )
                     try:
                         noise_mean_joint = float(np.mean(noise_diag)) if noise_diag.size > 0 else np.nan
+                        if noise_diag.size > 0 and np.all(np.isfinite(noise_diag) & (noise_diag >= 0.0)):
+                            logger.info(
+                                "Trait %s: stage1 BLUE uncertainty diag min=%s | median=%s | mean=%s | max=%s",
+                                trait,
+                                _fmt_metric(np.min(noise_diag)),
+                                _fmt_metric(np.median(noise_diag)),
+                                _fmt_metric(np.mean(noise_diag)),
+                                _fmt_metric(np.max(noise_diag)),
+                            )
                         if grm_ctx is not None:
                             grm_idx = [grm_ctx.index[sid] for sid in kept_ids]
                             kinship = grm_ctx.matrix[np.ix_(grm_idx, grm_idx)]
-                            # Future hook:
-                            #   exact/approx joint additive + line nonadditive REML
-                            # is intentionally disabled for now. We currently use the
-                            # BLUE phenotype directly in the GWAS null model.
-                            exact_null = _splmm_exact_null_fit_from_grm(
-                                grm=kinship,
-                                y_vec=kept[trait].to_numpy(dtype=float),
-                                x_cov=x_stage2,
-                                threads=int(args.thread),
-                            )
-                            lmm = LMM(
-                                y=kept[trait].to_numpy(dtype=float),
-                                X=x_stage2,
+                            joint_state = _fit_dense_narrow_corrected(
+                                kept[trait].to_numpy(dtype=float),
                                 kinship=kinship,
+                                noise_diag=noise_diag,
+                                x_fixed=x_stage2,
+                                maxiter=int(args.maxiter),
                             )
-                            h2_narrow_vc_ratio_raw = float(
-                                exact_null.get(
-                                    "pve_vc_ratio_raw",
-                                    exact_null.get("pve", float("nan")),
+                            va_joint = float(joint_state.va)
+                            vline_joint = float(joint_state.vline)
+                            noise_mean_joint = float(joint_state.noise_mean)
+                            h2_narrow = float(joint_state.h2_raw)
+                            latent_denom = float(joint_state.va + joint_state.vline)
+                            h2_narrow_vc_ratio_raw = (
+                                float(joint_state.va / latent_denom)
+                                if latent_denom > 0.0
+                                else np.nan
+                            )
+                            narrow_method = "joint_dense_corrected_reml"
+                            if va_joint <= 1e-9 or vline_joint <= 1e-9:
+                                logger.warning(
+                                    "Trait %s: dense line-level variance component is at/near the non-negative boundary (Va=%s, Vline=%s).",
+                                    trait,
+                                    _fmt_metric(va_joint),
+                                    _fmt_metric(vline_joint),
                                 )
-                            )
-                            h2_narrow = float(exact_null.get("pve", float("nan")))
-                            narrow_lambda = float(exact_null.get("lambda", float("nan")))
-                            narrow_method = "blue_null_dense_exact_reml"
                             if np.isfinite(hsqr) and np.isfinite(h2_narrow) and (h2_narrow > hsqr * 1.02):
                                 logger.warning(
-                                    f"Trait {trait}: BLUE-null narrow h2 ({h2_narrow:.6g}) exceeds broad H2 ({hsqr:.6g}); broad and narrow estimators are on different effective scales."
+                                    f"Trait {trait}: corrected narrow h2 ({h2_narrow:.6g}) exceeds broad H2 ({hsqr:.6g}); broad and narrow estimators are on different effective scales."
                                 )
-                            narrow_stats = _lmm_null_stats(lmm)
                             g_map = {
-                                kept_ids[i]: float(narrow_stats.g_blup[i])
+                                kept_ids[i]: float(joint_state.add_blup[i])
                                 for i in range(len(kept_ids))
                             }
                             assert gblup_out is not None
@@ -2099,12 +2733,12 @@ def main() -> None:
                                 np.asarray([sparse_grm_ctx.index[sid] for sid in kept_ids], dtype=np.int64),
                                 dtype=np.int64,
                             )
-                            sparse_null = _splmm_sparse_null_fit(
+                            sparse_null = _fit_sparse_narrow_corrected(
                                 jxgrm_path=str(sparse_grm_ctx.path),
                                 sample_idx=sparse_idx,
                                 y_vec=kept[trait].to_numpy(dtype=float),
                                 x_cov=x_stage2,
-                                progress_callback=None,
+                                noise_diag=noise_diag,
                                 objective_mode=str(args.grm_sparse_mode),
                                 threads=int(args.thread),
                             )
@@ -2118,6 +2752,16 @@ def main() -> None:
                             narrow_lambda = float(sparse_null.get("lambda", float("nan")))
                             narrow_sigma_g2 = float(sparse_null.get("sigma_g2", float("nan")))
                             narrow_sigma_e2 = float(sparse_null.get("sigma_e2", float("nan")))
+                            if (
+                                (np.isfinite(narrow_sigma_g2) and narrow_sigma_g2 <= 1e-9)
+                                or (np.isfinite(narrow_sigma_e2) and narrow_sigma_e2 <= 1e-9)
+                            ):
+                                logger.warning(
+                                    "Trait %s: sparse variance component is at/near the non-negative boundary (sigma_g2=%s, sigma_e2=%s).",
+                                    trait,
+                                    _fmt_metric(narrow_sigma_g2),
+                                    _fmt_metric(narrow_sigma_e2),
+                                )
                             narrow_grm_mean_diag = float(
                                 sparse_null.get(
                                     "grm_mean_diag",
@@ -2127,25 +2771,48 @@ def main() -> None:
                             narrow_nnz_k = float(sparse_null.get("nnz_k", float("nan")))
                             narrow_offdiag_density_k = float(sparse_null.get("offdiag_density_k", float("nan")))
                             narrow_method = (
-                                "blue_null_sparse_reml_fastgwa"
+                                "blue_corrected_sparse_reml_fastgwa"
                                 if str(args.grm_sparse_mode) == "fastgwa"
-                                else "blue_null_sparse_reml"
+                                else "blue_corrected_sparse_reml"
+                            )
+                            noise_mean_joint = float(
+                                sparse_null.get("stage1_noise_mean", noise_mean_joint)
                             )
                             if np.isfinite(hsqr) and np.isfinite(h2_narrow) and (h2_narrow > hsqr * 1.02):
                                 logger.warning(
-                                    f"Trait {trait}: BLUE-null sparse narrow h2 ({h2_narrow:.6g}) exceeds broad H2 ({hsqr:.6g}); broad and narrow estimators are on different effective scales."
+                                    f"Trait {trait}: corrected sparse narrow h2 ({h2_narrow:.6g}) exceeds broad H2 ({hsqr:.6g}); broad and narrow estimators are on different effective scales."
+                                )
+                            if gblup_out is not None:
+                                sparse_g = _sparse_additive_blup_from_subset(
+                                    jxgrm_path=str(sparse_grm_ctx.path),
+                                    sample_idx=sparse_idx,
+                                    y_vec=kept[trait].to_numpy(dtype=float),
+                                    noise_diag=noise_diag,
+                                    sigma_g2=narrow_sigma_g2,
+                                    sigma_e2=narrow_sigma_e2,
+                                    x_cov=x_stage2,
+                                )
+                                sparse_g_map = {
+                                    kept_ids[i]: float(sparse_g[i])
+                                    for i in range(len(kept_ids))
+                                }
+                                gblup_out[trait] = (
+                                    gblup_out[line_col]
+                                    .astype(str)
+                                    .map(sparse_g_map)
+                                    .to_numpy(dtype=float)
                                 )
                     except Exception as narrow_exc:
                         if grm_ctx is not None:
                             logger.warning(
-                                f"Trait {trait}: BLUE-null GWAS LMM failed ({type(narrow_exc).__name__}: {narrow_exc}); narrow-sense h2 skipped."
+                                f"Trait {trait}: corrected dense narrow REML failed ({type(narrow_exc).__name__}: {narrow_exc}); narrow-sense h2 skipped."
                             )
-                            narrow_method = "failed_blue_null_lmm"
+                            narrow_method = "failed_corrected_dense_reml"
                         else:
                             logger.warning(
-                                f"Trait {trait}: BLUE-null Sparse REML failed ({type(narrow_exc).__name__}: {narrow_exc}); narrow-sense h2 skipped."
+                                f"Trait {trait}: corrected Sparse REML failed ({type(narrow_exc).__name__}: {narrow_exc}); narrow-sense h2 skipped."
                             )
-                            narrow_method = "failed_blue_null_sparse_reml"
+                            narrow_method = "failed_corrected_sparse_reml"
                 else:
                     logger.warning(
                         f"Trait {trait}: too few lines overlap with kinship input after filtering; narrow-sense h2 skipped."
@@ -2162,7 +2829,7 @@ def main() -> None:
                 )
             if np.isfinite(h2_narrow_vc_ratio_raw) and np.isfinite(h2_narrow):
                 logger.info(
-                    "  narrow(vc_ratio_raw)=%s%s",
+                    "  narrow(latent_vc_ratio_raw)=%s%s",
                     _fmt_metric(h2_narrow_vc_ratio_raw),
                     (
                         f" | grm_mean_diag={_fmt_metric(narrow_grm_mean_diag)}"
@@ -2179,6 +2846,12 @@ def main() -> None:
                     _fmt_metric(h2_narrow),
                     _fmt_metric(narrow_nnz_k),
                     _fmt_metric(narrow_offdiag_density_k),
+                )
+            if np.isfinite(noise_mean_joint) and sparse_grm_ctx is not None:
+                logger.info(
+                    "  sparse stage1_noise_mean=%s | corrected phenotype-scale h2=%s",
+                    _fmt_metric(noise_mean_joint),
+                    _fmt_metric(h2_narrow),
                 )
             if np.isfinite(va_joint):
                 logger.info(

@@ -81,14 +81,14 @@ For `gwas`, `gs`, and related modules:
 
 - first column: sample ID
 - remaining columns: traits or covariates
-- `-n` is zero-based and excludes the sample ID column
+- `-n/--ncol` is zero-based and excludes the sample ID column
 
 Examples:
 
 ```bash
 jx gwas -bfile panel -p trait.tsv -lmm -n 0
 jx gs   -bfile panel -p trait.tsv -GBLUP -cv 5 -n 0,2
-jx reml -file effects.tsv -n trait1
+jx reml -p effects.tsv -n trait1 -c environment
 ```
 
 ### 2.5 Output and threads
@@ -142,7 +142,7 @@ Useful notes:
 jx gs -bfile example/~mouse_hs1940 -p example/mouse_hs1940.pheno -GBLUP -rrBLUP -cv 5 -n 0 -o demo -prefix mouse_hs1940
 jx gs -bfile example/~mouse_hs1940 -p example/mouse_hs1940.pheno -RF -ET -GBDT -SVM -ENET -cv 5 -n 0 -o demo -prefix mouse_hs1940
 
-jx reml -file example/rice6048.reml.tsv -n 3 -rh 0 -rh 1 -rh 2 -o demo -prefix rice6048
+jx reml -p example/rice6048.reml.tsv -n 3 -c year,loc -rc block -k rice.cGRM.npy -o demo -prefix rice6048
 ```
 
 Current GS model groups:
@@ -156,6 +156,13 @@ Useful notes:
 - `jx gs -model saved.jxmodel ...` reuses a saved model artifact for prediction or evaluation
 - `-ldprune` and `-hash` are available for preprocessing before GS model fitting
 - `-debug` prints thread and backend diagnostics for GS
+
+REML uses the first phenotype-table column as the sample/line ID. Fixed effects
+come from `-c/--cov`, random nuisance effects from `-rc/--rcov`, discrete
+Line×environment terms from `-gxe`, and continuous reaction-norm slopes from
+`-gxc`. `-k/--grm` and `-spk/--grm-sparse` are optional and mutually exclusive;
+without either, REML reports BLUE/BLUP and logs raw variance components without
+narrow-sense h².
 
 ### 3.4 Run FastPop
 

@@ -212,7 +212,7 @@ Var(line BLUE) = Va K + Vline I + D_stage1
 
 where `Va` is additive genomic variance and `Vline` is remaining independent line-level variance. `D_stage1` is known during this fit and is never optimized as another free component.
 
-The dense route uses the existing exact joint REML machinery after wiring `D_stage1` into the active path. The sparse route must implement the corresponding heteroskedastic diagonal correction rather than falling back to the former error-free-BLUE objective.
+The dense route uses the existing exact joint REML machinery after wiring `D_stage1` into the active path. The sparse route keeps the scalable sparse GRM variance fit and applies the same known diagonal on the phenotype-scale handoff: `D_stage1` is added to the reported h2 denominator and to the sparse GBLUP covariance. The sparse backend's latent variance ratio remains separately labeled, so the former error-free-BLUE PVE is not reported as the corrected phenotype-scale estimate.
 
 The reported phenotype-scale narrow h2 is:
 

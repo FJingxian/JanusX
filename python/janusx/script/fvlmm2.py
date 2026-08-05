@@ -889,7 +889,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        args.ncol = parse_trait_selector_specs(args.ncol, label="-n/--n")
+        args.ncol = parse_trait_selector_specs(args.ncol, label="-n/--ncol")
     except ValueError as ex:
         parser.error(str(ex))
     if int(args.n_tests) < 0:

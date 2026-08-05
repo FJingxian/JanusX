@@ -2826,7 +2826,7 @@ def main() -> None:
     args.gain_start_layer_runtime = int(args.gain_layer)
 
     try:
-        args.ncol = parse_trait_selector_specs(args.ncol, label="-n/--n")
+        args.ncol = parse_trait_selector_specs(args.ncol, label="-n/--ncol")
     except ValueError as e:
         parser.error(str(e))
 

@@ -19279,7 +19279,7 @@ def parse_args(argv: typing.Optional[list[str]] = None):
     if len(extras) > 0:
         parser.error("unrecognized arguments: " + " ".join(extras))
     try:
-        args.ncol = parse_trait_selector_specs(args.ncol, label="-n/--n")
+        args.ncol = parse_trait_selector_specs(args.ncol, label="-n/--ncol")
     except ValueError as e:
         parser.error(str(e))
     if (args.limit_predtrain is not None) and (int(args.limit_predtrain) < 0):
@@ -20243,7 +20243,7 @@ def _run_gs_pipeline_impl(
             selected_cols, invalid_specs = resolve_trait_selectors(
                 list(pheno.columns),
                 args.ncol,
-                label="-n/--n",
+                label="-n/--ncol",
             )
         except ValueError as ex:
             logger.error(str(ex))

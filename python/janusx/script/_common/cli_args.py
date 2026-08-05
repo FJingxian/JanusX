@@ -662,6 +662,16 @@ def trait_selector_help_text() -> str:
     )
 
 
+class _RemovedTraitSelectorAction(argparse.Action):
+    """Reject the removed ``--n`` spelling instead of treating it as ``--ncol``."""
+
+    def __call__(self, parser, namespace, values, option_string=None):  # type: ignore[no-untyped-def]
+        raise argparse.ArgumentError(
+            self,
+            "--n was removed; use -n/--ncol",
+        )
+
+
 def add_common_trait_selector_args(
     group: argparse._ArgumentGroup,
     *,
@@ -671,7 +681,7 @@ def add_common_trait_selector_args(
 ) -> None:
     group.add_argument(
         "-n",
-        "--n",
+        "--ncol",
         action="extend",
         nargs="+",
         metavar=str(label),
@@ -681,13 +691,10 @@ def add_common_trait_selector_args(
         help=str(help_text) if help_text is not None else trait_selector_help_text(),
     )
     group.add_argument(
-        "--ncol",
-        action="extend",
+        "--n",
         nargs="+",
+        action=_RemovedTraitSelectorAction,
         metavar=str(label),
-        type=str,
-        default=None,
-        dest=str(dest),
         help=argparse.SUPPRESS,
     )
 
@@ -765,7 +772,7 @@ def add_common_prefix_arg(
 def parse_trait_selector_specs(
     values: Sequence[object] | None,
     *,
-    label: str = "-n/--n",
+    label: str = "-n/--ncol",
 ) -> list[object] | None:
     """
     Parse mixed phenotype selectors from CLI.
@@ -832,7 +839,7 @@ def resolve_trait_selectors(
     columns: Sequence[object],
     selectors: Sequence[object] | None,
     *,
-    label: str = "-n/--n",
+    label: str = "-n/--ncol",
 ) -> tuple[list[int], list[str]]:
     """
     Resolve mixed phenotype selectors against a column list.

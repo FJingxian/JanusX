@@ -51,8 +51,8 @@ bin
 benchmark
 .docker*
 
-# Local development documents
-docs/
+# Local development documents live under doc/ so the repository has one
+# canonical documentation tree.
 .agents/
 .agent/
 

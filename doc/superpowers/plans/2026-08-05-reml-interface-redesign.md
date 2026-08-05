@@ -28,7 +28,7 @@
 - Modify any direct trait-selector consumers found by tests/search (GWAS, GS, ggval, and benchmark wrappers) only where they define or forward the old public `--n` spelling.
 - Create `test/test_reml_interface.py`: parser, grammar, type inference, design propagation, uncertainty handoff, and output-contract tests using stdlib `unittest`.
 - Create `test/test_reml_integration.py` only if the focused suite becomes too large for one module; use synthetic data and temporary files, never repository benchmark outputs.
-- Update `docs/superpowers/specs/2026-08-05-reml-interface-redesign-design.md` only if implementation discovers a contract discrepancy; otherwise keep the approved spec unchanged.
+- Update `doc/superpowers/specs/2026-08-05-reml-interface-redesign-design.md` only if implementation discovers a contract discrepancy; otherwise keep the approved spec unchanged.
 
 ### Task 1: Establish failing CLI and selector tests
 

@@ -4967,7 +4967,9 @@ pub fn spgrm_bed_to_jxgrm_core(
                 sample_idx,
                 window_mb,
                 threads,
-                progress_callback,
+                // Metadata filtering is a fast prepass. Keep it on the indeterminate
+                // spinner instead of mixing its units with the expensive GRM compute bar.
+                None,
                 0usize,
                 progress_every,
             )?
@@ -5001,7 +5003,9 @@ pub fn spgrm_bed_to_jxgrm_core(
         Some(idx) => Cow::Borrowed(idx),
         None => Cow::Owned((0..prepared.n_samples).collect()),
     };
-    let progress_done_offset = prepared.n_snps_total;
+    // The metadata prepass is not part of the determinate compute progress. The
+    // sparse-GRM accumulation owns a fresh 0..100% progress range below.
+    let progress_done_offset = 0usize;
     spgrm_stream_bed_to_jxgrm_core(
         &bed_prefix,
         selected_idx.as_ref(),
@@ -5999,6 +6003,7 @@ pub fn spgrm_dense_npy_to_jxgrm<'py>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pyo3::types::{PyCFunction, PyDict, PyTuple};
 
     fn pack_site_major_dosages(sample_major: &[Vec<Option<u8>>]) -> Vec<u8> {
         let n_samples = sample_major.len();
@@ -6371,6 +6376,97 @@ mod tests {
         let _ = std::fs::remove_file(format!("{prefix_str}.fam"));
         let _ = std::fs::remove_file(path_full);
         let _ = std::fs::remove_file(path_window);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn spgrm_bed_progress_tracks_compute_only() {
+        let geno = vec![
+            vec![Some(0), Some(0), Some(1), Some(2)],
+            vec![Some(0), Some(1), Some(1), Some(2)],
+            vec![Some(2), Some(1), Some(2), Some(1)],
+            vec![Some(2), Some(2), Some(2), Some(0)],
+        ];
+
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "janusx_spgrm_progress_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let prefix = dir.join("toy");
+        let prefix_str = prefix.to_string_lossy().to_string();
+        write_toy_plink(&prefix_str, &geno);
+        let out_prefix = dir.join("out");
+        let out_prefix_str = out_prefix.to_string_lossy().to_string();
+        let progress_events = Arc::new(Mutex::new(Vec::<(usize, usize)>::new()));
+        let progress_events_capture = Arc::clone(&progress_events);
+
+        Python::initialize();
+        let (out_path, n_samples, _nnz) = Python::attach(|py| -> PyResult<_> {
+            let callback = PyCFunction::new_closure(
+                py,
+                None,
+                None,
+                move |args: &Bound<'_, PyTuple>,
+                      _kwargs: Option<&Bound<'_, PyDict>>|
+                      -> PyResult<()> {
+                    let event = args.extract::<(usize, usize)>()?;
+                    progress_events_capture.lock().unwrap().push(event);
+                    Ok(())
+                },
+            )?;
+            let callback = callback.unbind().into_any();
+            let result = spgrm_bed_to_jxgrm_core(
+                &prefix_str,
+                None,
+                &out_prefix_str,
+                1usize,
+                0.0_f64,
+                true,
+                0.0_f32,
+                1.0_f32,
+                0.0_f32,
+                false,
+                0usize,
+                0usize,
+                1usize,
+                Some(1usize),
+                Some(&callback),
+                1usize,
+            )
+            .map_err(map_err_string_to_py)?;
+            Ok(result)
+        })
+        .unwrap();
+
+        let events = progress_events.lock().unwrap().clone();
+        let expected_total = geno[0].len();
+        assert!(!events.is_empty());
+        assert!(
+            events.iter().all(|&(_done, total)| total == expected_total),
+            "unexpected progress totals: {events:?}"
+        );
+        assert_eq!(events.first().copied(), Some((0usize, expected_total)));
+        assert_eq!(
+            events.last().copied(),
+            Some((expected_total, expected_total))
+        );
+        assert!(
+            events.windows(2).all(|window| window[0].0 <= window[1].0),
+            "progress regressed: {events:?}"
+        );
+
+        assert_eq!(n_samples, geno.len());
+        let _ = std::fs::remove_file(format!("{prefix_str}.bed"));
+        let _ = std::fs::remove_file(format!("{prefix_str}.bim"));
+        let _ = std::fs::remove_file(format!("{prefix_str}.fam"));
+        let _ = std::fs::remove_file(out_path);
         let _ = std::fs::remove_dir_all(dir);
     }
 

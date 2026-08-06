@@ -2395,6 +2395,38 @@ fn grm_stream_decode_batch_rows(row_step: usize, n_samples: usize, elem_bytes: u
 }
 
 #[inline]
+fn open_grm_bed_iter(
+    prefix: &str,
+    use_extra_filters: bool,
+    het_threshold: f32,
+    mmap_window_mb: Option<usize>,
+) -> Result<BedSnpIter, String> {
+    if use_extra_filters {
+        if let Some(window_mb) = mmap_window_mb {
+            // The filtered route needs BIM metadata for -snps-only, but it
+            // must still use a windowed BED mapping when a memory budget
+            // requested one. Otherwise a GWAS -mem value is silently
+            // defeated by a full-file mmap here.
+            BedSnpIter::new_with_fill_window(
+                prefix,
+                0.0,
+                1.0,
+                false,
+                false,
+                het_threshold,
+                window_mb,
+            )
+        } else {
+            BedSnpIter::new_with_fill(prefix, 0.0, 1.0, false, false, het_threshold)
+        }
+    } else if let Some(window_mb) = mmap_window_mb {
+        BedSnpIter::new_for_grm_window(prefix, window_mb)
+    } else {
+        BedSnpIter::new_for_grm(prefix)
+    }
+}
+
+#[inline]
 fn grm_decode_backend_tag() -> &'static str {
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     {
@@ -3992,14 +4024,8 @@ pub fn grm_stream_bed_f64<'py>(
         return Ok((grm, eff_m, n_samples));
     }
 
-    let mut it = if use_extra_filters {
-        BedSnpIter::new_with_fill(&prefix, 0.0, 1.0, false, false, het_thr)
-            .map_err(PyRuntimeError::new_err)?
-    } else if let Some(window_mb) = mmap_window_mb {
-        BedSnpIter::new_for_grm_window(&prefix, window_mb).map_err(PyRuntimeError::new_err)?
-    } else {
-        BedSnpIter::new_for_grm(&prefix).map_err(PyRuntimeError::new_err)?
-    };
+    let mut it = open_grm_bed_iter(&prefix, use_extra_filters, het_thr, mmap_window_mb)
+        .map_err(PyRuntimeError::new_err)?;
     let n_samples = it.n_samples();
     let n_total = it.n_snps();
     if n_samples == 0 {
@@ -4760,14 +4786,8 @@ pub fn grm_stream_bed_f32<'py>(
         return Ok((grm32, eff_m, n_samples));
     }
 
-    let mut it = if use_extra_filters {
-        BedSnpIter::new_with_fill(&prefix, 0.0, 1.0, false, false, het_thr)
-            .map_err(PyRuntimeError::new_err)?
-    } else if let Some(window_mb) = mmap_window_mb {
-        BedSnpIter::new_for_grm_window(&prefix, window_mb).map_err(PyRuntimeError::new_err)?
-    } else {
-        BedSnpIter::new_for_grm(&prefix).map_err(PyRuntimeError::new_err)?
-    };
+    let mut it = open_grm_bed_iter(&prefix, use_extra_filters, het_thr, mmap_window_mb)
+        .map_err(PyRuntimeError::new_err)?;
     let n_samples = it.n_samples();
     let n_total = it.n_snps();
     if n_samples == 0 {
@@ -5920,7 +5940,9 @@ pub fn grm_sim_bench_f32(
 
 #[cfg(test)]
 mod tests {
-    use super::grm_decode_threads_default_for_backend;
+    use super::{grm_decode_threads_default_for_backend, open_grm_bed_iter};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn grm_decode_threads_accelerate_keeps_legacy_defaults() {
@@ -5936,5 +5958,33 @@ mod tests {
         assert_eq!(grm_decode_threads_default_for_backend(4, "openblas"), 1);
         assert_eq!(grm_decode_threads_default_for_backend(8, "openblas"), 1);
         assert_eq!(grm_decode_threads_default_for_backend(32, "openblas"), 1);
+    }
+
+    #[test]
+    fn grm_filtering_keeps_memory_windowed_bed_decode() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "janusx_grm_windowed_filter_{}_{}",
+            std::process::id(),
+            stamp
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let prefix = dir.join("case");
+        fs::write(
+            prefix.with_extension("fam"),
+            "F1 I1 0 0 1 1\nF1 I2 0 0 1 1\nF1 I3 0 0 1 1\nF1 I4 0 0 1 1\n",
+        )
+        .unwrap();
+        fs::write(prefix.with_extension("bim"), "1 rs1 0 1 A G\n").unwrap();
+        fs::write(prefix.with_extension("bed"), [0x6c, 0x1b, 0x01, 0x00]).unwrap();
+
+        let iter = open_grm_bed_iter(prefix.to_str().unwrap(), true, 0.0, Some(1)).unwrap();
+        assert!(iter.is_windowed());
+
+        drop(iter);
+        fs::remove_dir_all(dir).unwrap();
     }
 }

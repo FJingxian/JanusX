@@ -7877,6 +7877,7 @@ def _run_gwas_pipeline(
                                 logger=logger,
                                 use_spinner=bool(use_spinner),
                                 method=prepared_splmm_sparse_method,
+                                memory_mb=float(args._memory_mb),
                             )
 
                     splmm_post_grm_hook = _prepare_splmm_sparse_after_grm

@@ -98,6 +98,30 @@ fn env_positive_usize(name: &str) -> Option<usize> {
 }
 
 #[inline]
+fn choose_fvlmm_blas_tile_rows(rows: usize, threads: usize) -> usize {
+    if rows == 0 {
+        return 1;
+    }
+    if threads <= 1 || rows <= 64 {
+        return rows;
+    }
+    let target_tasks = threads.saturating_mul(2).max(1);
+    let tile_rows = rows.div_ceil(target_tasks);
+    tile_rows.clamp(64, 2048).min(rows)
+}
+
+#[inline]
+fn fvlmm_rotate_kernel_prefers_tiled() -> bool {
+    matches!(
+        std::env::var("JX_FVLMM_ROTATE_KERNEL")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("blas_tiled") | Some("tiled")
+    )
+}
+
+#[inline]
 fn row_major_mat_mul_prefers_snp_parallel_rhs(
     rows: usize,
     cols: usize,
@@ -403,6 +427,59 @@ fn rotate_snp_block_with_ut_blas(
     debug_assert!(u_t.len() >= n.saturating_mul(n));
     debug_assert!(out_block.len() >= rows.saturating_mul(n));
 
+    if fvlmm_rotate_kernel_prefers_tiled() {
+        let tile_rows = choose_fvlmm_blas_tile_rows(rows, threads.max(1));
+        let mut run = || {
+            out_block
+                .par_chunks_mut(tile_rows.saturating_mul(n).max(1))
+                .enumerate()
+                .for_each(|(chunk_idx, out_chunk)| {
+                    let row_start = chunk_idx * tile_rows;
+                    let rows_here = out_chunk.len() / n;
+                    let a_start = row_start * n;
+                    let a_end = a_start + rows_here * n;
+                    let a_block = &snp_block[a_start..a_end];
+                    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+                    unsafe {
+                        cblas_sgemm_dispatch(
+                            CBLAS_ROW_MAJOR,
+                            CBLAS_NO_TRANS,
+                            CBLAS_TRANS,
+                            rows_here as CblasInt,
+                            n as CblasInt,
+                            n as CblasInt,
+                            1.0_f32,
+                            a_block.as_ptr(),
+                            n as CblasInt,
+                            u_t.as_ptr(),
+                            n as CblasInt,
+                            0.0_f32,
+                            out_chunk.as_mut_ptr(),
+                            n as CblasInt,
+                        );
+                    }
+                    #[cfg(not(any(
+                        target_os = "macos",
+                        target_os = "linux",
+                        target_os = "windows"
+                    )))]
+                    {
+                        rotate_snp_block_with_ut(a_block, rows_here, n, u_t, out_chunk);
+                    }
+                });
+        };
+        // Accelerate exposes only a process-wide single/multi-thread switch.
+        // Tile-level Rayon parallelism is therefore paired with single-thread
+        // BLAS calls to avoid nested oversubscription.
+        let _blas_guard = BlasThreadGuard::enter(1);
+        if let Some(tp) = proj_pool {
+            tp.install(run);
+        } else {
+            run();
+        }
+        return;
+    }
+
     if assoc_rotate_prefers_rayon_rowmajor_f32_kernel() {
         let thread_hint = if threads > 0 {
             threads
@@ -702,9 +779,81 @@ fn rotate_finalize_pipeline_default_for_backend(
     !prefers_rayon_rotate && block_rows < total_rows && assoc_threads > 1 && proj_threads > 1
 }
 
+#[inline]
+fn fvlmm_bed_other_nanos(total_nanos: u64, accounted_nanos: u64) -> u64 {
+    total_nanos.saturating_sub(accounted_nanos)
+}
+
+#[inline]
+fn fvlmm_bed_stage_timing_enabled() -> bool {
+    env_truthy("JX_FVLMM_BED_STAGE_TIMING")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_fvlmm_bed_stage_timing(
+    total_nanos: u64,
+    decode_nanos: u64,
+    projection_nanos: u64,
+    association_nanos: u64,
+    tsv_nanos: u64,
+    rows_scanned: usize,
+    rows_written: usize,
+    n: usize,
+    p: usize,
+    block_rows: usize,
+    threads: usize,
+    proj_threads: usize,
+    assoc_threads: usize,
+    pipeline: bool,
+) {
+    let accounted_nanos = decode_nanos
+        .saturating_add(projection_nanos)
+        .saturating_add(association_nanos)
+        .saturating_add(tsv_nanos);
+    let other_nanos = fvlmm_bed_other_nanos(total_nanos, accounted_nanos);
+    let pct = |nanos: u64| -> f64 {
+        if total_nanos == 0 {
+            0.0
+        } else {
+            (nanos as f64) * 100.0 / (total_nanos as f64)
+        }
+    };
+    let active_over_wall = if total_nanos == 0 {
+        0.0
+    } else {
+        (accounted_nanos as f64) / (total_nanos as f64)
+    };
+    eprintln!(
+        "FvLMM BED timing: decode={:.3}s ({:.1}%), projection={:.3}s ({:.1}%), association={:.3}s ({:.1}%), tsv={:.3}s ({:.1}%), other={:.3}s ({:.1}%), total={:.3}s, active_over_wall={:.2}x, rows_scanned={}, rows_written={}, n={}, p={}, block_rows={}, backend={}, threads={}, proj_threads={}, assoc_threads={}, pipeline={}",
+        (decode_nanos as f64) * 1e-9,
+        pct(decode_nanos),
+        (projection_nanos as f64) * 1e-9,
+        pct(projection_nanos),
+        (association_nanos as f64) * 1e-9,
+        pct(association_nanos),
+        (tsv_nanos as f64) * 1e-9,
+        pct(tsv_nanos),
+        (other_nanos as f64) * 1e-9,
+        pct(other_nanos),
+        (total_nanos as f64) * 1e-9,
+        active_over_wall,
+        rows_scanned,
+        rows_written,
+        n,
+        p,
+        block_rows,
+        rust_sgemm_backend_tag(),
+        threads,
+        proj_threads,
+        assoc_threads,
+        pipeline,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
+        choose_fvlmm_blas_tile_rows, fvlmm_bed_other_nanos,
         normalize_default_assoc_threads_for_backend, rotate_finalize_pipeline_default_for_backend,
     };
 
@@ -741,6 +890,23 @@ mod tests {
             8,
             8,
         ));
+    }
+
+    #[test]
+    fn bed_timing_other_never_becomes_negative() {
+        assert_eq!(fvlmm_bed_other_nanos(0, 0), 0);
+        assert_eq!(fvlmm_bed_other_nanos(100, 40), 60);
+        assert_eq!(fvlmm_bed_other_nanos(100, 120), 0);
+    }
+
+    #[test]
+    fn tiled_projection_tile_rows_cover_small_and_large_blocks() {
+        assert_eq!(choose_fvlmm_blas_tile_rows(0, 8), 1);
+        assert_eq!(choose_fvlmm_blas_tile_rows(32, 8), 32);
+        let tile = choose_fvlmm_blas_tile_rows(10_000, 8);
+        assert!(tile >= 64);
+        assert!(tile <= 10_000);
+        assert_eq!(10_000usize.div_ceil(tile), 16);
     }
 }
 
@@ -1876,14 +2042,15 @@ pub fn fvlmm_assoc_chunk_from_snp_with_cache_f32<'py>(
     let assoc_pool = get_cached_pool(assoc_threads)?;
     let block_rows = rotate_block_rows.max(1);
     let cache_arc = Arc::clone(&cache.cache);
-    let use_pipeline = use_rotate_finalize_pipeline(rotate_finalize_pipeline_default_for_backend(
-        rust_sgemm_backend_tag(),
-        assoc_rotate_prefers_rayon_rowmajor_f32_kernel(),
-        block_rows,
-        m,
-        proj_threads,
-        assoc_threads,
-    ));
+    let use_pipeline = !fvlmm_rotate_kernel_prefers_tiled()
+        && use_rotate_finalize_pipeline(rotate_finalize_pipeline_default_for_backend(
+            rust_sgemm_backend_tag(),
+            assoc_rotate_prefers_rayon_rowmajor_f32_kernel(),
+            block_rows,
+            m,
+            proj_threads,
+            assoc_threads,
+        ));
 
     py.detach(|| {
         let total_t0 = Instant::now();
@@ -2018,14 +2185,15 @@ pub fn fvlmm_assoc_chunk_from_snp_f32<'py>(
     let proj_pool = get_cached_pool(proj_threads)?;
     let assoc_pool = get_cached_pool(assoc_threads)?;
     let block_rows = rotate_block_rows.max(1);
-    let use_pipeline = use_rotate_finalize_pipeline(rotate_finalize_pipeline_default_for_backend(
-        rust_sgemm_backend_tag(),
-        assoc_rotate_prefers_rayon_rowmajor_f32_kernel(),
-        block_rows,
-        m,
-        proj_threads,
-        assoc_threads,
-    ));
+    let use_pipeline = !fvlmm_rotate_kernel_prefers_tiled()
+        && use_rotate_finalize_pipeline(rotate_finalize_pipeline_default_for_backend(
+            rust_sgemm_backend_tag(),
+            assoc_rotate_prefers_rayon_rowmajor_f32_kernel(),
+            block_rows,
+            m,
+            proj_threads,
+            assoc_threads,
+        ));
 
     py.detach(|| {
         let total_t0 = Instant::now();
@@ -2191,14 +2359,15 @@ pub fn fvlmm_assoc_chunk_from_snp_to_tsv_f32<'py>(
     let proj_pool = get_cached_pool(proj_threads)?;
     let assoc_pool = get_cached_pool(assoc_threads)?;
     let block_rows = rotate_block_rows.max(1);
-    let use_pipeline = use_rotate_finalize_pipeline(rotate_finalize_pipeline_default_for_backend(
-        rust_sgemm_backend_tag(),
-        assoc_rotate_prefers_rayon_rowmajor_f32_kernel(),
-        block_rows,
-        m,
-        proj_threads,
-        assoc_threads,
-    ));
+    let use_pipeline = !fvlmm_rotate_kernel_prefers_tiled()
+        && use_rotate_finalize_pipeline(rotate_finalize_pipeline_default_for_backend(
+            rust_sgemm_backend_tag(),
+            assoc_rotate_prefers_rayon_rowmajor_f32_kernel(),
+            block_rows,
+            m,
+            proj_threads,
+            assoc_threads,
+        ));
 
     let progress_block = if progress_every == 0 {
         m.max(1)
@@ -2589,6 +2758,14 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
             let assoc_pool = get_cached_pool(assoc_threads).map_err(|e| format!("{e}"))?;
             let sample_subset_plan = decode_plan.subset_decode_plan();
             let dense_subset_pos = decode_plan.dense_subset_pos();
+            let stage_timing = fvlmm_bed_stage_timing_enabled();
+            let stage_total_t0 = Instant::now();
+            let stage_decode_nanos = AtomicU64::new(0);
+            let stage_projection_nanos = AtomicU64::new(0);
+            let stage_association_nanos = AtomicU64::new(0);
+            let stage_tsv_nanos = AtomicU64::new(0);
+
+            let scan_chunk_snps = rotate_block_rows.max(1).min(total_scan_units.max(1));
 
             // ============================================================
             // TSV writer
@@ -2604,8 +2781,6 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
             // Double-buffer pipeline: count+decode (bg) || rotate+assoc+write (main)
             // Uses generic pipeline from src/io/pipeline.rs.
             // ============================================================
-            let scan_chunk_snps = rotate_block_rows.max(1).min(total_scan_units.max(1));
-
             let mut text_buf = String::with_capacity(scan_chunk_snps * 128);
             let mut total_rows = 0usize;
             let output_row_limit = gwas_max_output_rows_env();
@@ -2631,6 +2806,7 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                 if chunk_start >= total_scan_units {
                     return false;
                 }
+                let decode_t0 = stage_timing.then(Instant::now);
                 chunk.clear();
                 let chunk_end = (chunk_start + scan_chunk_snps).min(total_scan_units);
                 let prepared_batch = prepared_meta.as_ref().map(
@@ -2863,6 +3039,9 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
 
                 chunk.scanned_to = chunk_end;
                 chunk_start = chunk_end;
+                if let Some(t0) = decode_t0 {
+                    record_elapsed_nanos(&stage_decode_nanos, t0);
+                }
                 chunk_start < total_scan_units
             };
 
@@ -2870,7 +3049,7 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
             let consumer = |chunk: &mut StreamingChunk| {
                 let rows = chunk.rows;
                 if rows > 0 {
-                    // Rotate – large SGEMM
+                    let projection_t0 = stage_timing.then(Instant::now);
                     rotate_snp_block_with_ut_blas(
                         &chunk.g_block[..rows * n],
                         rows,
@@ -2880,8 +3059,11 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                         proj_threads,
                         proj_pool.as_ref(),
                     );
+                    if let Some(t0) = projection_t0 {
+                        record_elapsed_nanos(&stage_projection_nanos, t0);
+                    }
 
-                    // Assoc – large SGEMM
+                    let association_t0 = stage_timing.then(Instant::now);
                     assoc_fixed_lambda_rot_block_blas_f32(
                         &chunk.rot_block[..rows * n],
                         rows,
@@ -2894,8 +3076,12 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                         assoc_pool.as_ref(),
                         nullml,
                     );
+                    if let Some(t0) = association_t0 {
+                        record_elapsed_nanos(&stage_association_nanos, t0);
+                    }
 
                     // Format TSV and write
+                    let tsv_t0 = stage_timing.then(Instant::now);
                     let write_rows = output_row_limit
                         .map(|limit| limit.saturating_sub(written_total).min(rows))
                         .unwrap_or(rows);
@@ -2934,6 +3120,9 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                     if write_rows > 0 {
                         send_text_buf(&writer, &mut text_buf)?;
                         written_total = written_total.saturating_add(write_rows);
+                    }
+                    if let Some(t0) = tsv_t0 {
+                        record_elapsed_nanos(&stage_tsv_nanos, t0);
                     }
                 }
 
@@ -2980,7 +3169,32 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                 });
             }
 
+            let writer_finish_t0 = stage_timing.then(Instant::now);
             writer.finish()?;
+            if let Some(t0) = writer_finish_t0 {
+                record_elapsed_nanos(&stage_tsv_nanos, t0);
+            }
+            if stage_timing {
+                emit_fvlmm_bed_stage_timing(
+                    stage_total_t0
+                        .elapsed()
+                        .as_nanos()
+                        .min(u128::from(u64::MAX)) as u64,
+                    stage_decode_nanos.load(Ordering::Relaxed),
+                    stage_projection_nanos.load(Ordering::Relaxed),
+                    stage_association_nanos.load(Ordering::Relaxed),
+                    stage_tsv_nanos.load(Ordering::Relaxed),
+                    total_scan_units,
+                    written_total,
+                    n,
+                    p,
+                    scan_chunk_snps,
+                    threads,
+                    proj_threads,
+                    assoc_threads,
+                    total_scan_units > scan_chunk_snps,
+                );
+            }
             Ok((total_rows, pve_out, log_det_v_out))
         })
         .map_err(PyRuntimeError::new_err)?;

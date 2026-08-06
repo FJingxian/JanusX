@@ -5365,13 +5365,35 @@ def _gwas_fvlmm_scan_stage_ctx(threads: int):
     - `full` (legacy default): BLAS=t, Rayon=t
     - `blas_t_rayon_1`: BLAS=t, Rayon=1
     - `generic`: reuse the generic GWAS scan stage (BLAS=1, Rayon=t)
+
+    The Rust projection/association budgets are exported separately through
+    ``JX_FVLMM_PROJ_THREADS`` and ``JX_FVLMM_ASSOC_THREADS`` for the duration
+    of this context, so the stage labels match the native kernels.
     """
     spec = _gwas_fvlmm_scan_stage_thread_plan(threads)
-    with runtime_thread_stage(
-        blas_threads=int(spec["blas_threads"]),
-        rayon_threads=int(spec["rayon_threads"]),
-    ):
-        yield
+    rust_spec = _gwas_fvlmm_rust_stage_thread_plan(
+        threads,
+        mode=_resolve_fvlmm_scan_stage_mode(),
+    )
+    rust_env = {
+        "JX_FVLMM_PROJ_THREADS": str(int(rust_spec["proj_threads"])),
+        "JX_FVLMM_ASSOC_THREADS": str(int(rust_spec["assoc_threads"])),
+    }
+    old_env = {key: os.environ.get(key) for key in rust_env}
+    for key, value in rust_env.items():
+        os.environ[key] = value
+    try:
+        with runtime_thread_stage(
+            blas_threads=int(spec["blas_threads"]),
+            rayon_threads=int(spec["rayon_threads"]),
+        ):
+            yield
+    finally:
+        for key, old_value in old_env.items():
+            if old_value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old_value
 
 
 def _gwas_fvlmm_scan_stage_thread_plan(threads: int) -> dict[str, int]:
@@ -5382,6 +5404,59 @@ def _gwas_fvlmm_scan_stage_thread_plan(threads: int) -> dict[str, int]:
     if mode == "generic":
         return _gwas_scan_stage_thread_plan(t)
     return {"blas_threads": int(t), "rayon_threads": int(t)}
+
+
+def _gwas_fvlmm_rust_stage_thread_plan(
+    threads: int,
+    *,
+    mode: Optional[str] = None,
+) -> dict[str, int]:
+    """Resolve the Rust FvLMM projection and association budgets.
+
+    The Python stage plan controls BLAS/OpenMP and the default Rayon runtime,
+    while the Rust kernels also need explicit per-stage budgets.  Keeping the
+    two values separate prevents ``rayon=1`` from accidentally disabling the
+    projection SGEMM in the ``blas_t_rayon_1`` mode.
+    """
+    t = max(1, int(threads))
+    scan_mode = (
+        _resolve_fvlmm_scan_stage_mode()
+        if mode is None
+        else str(mode).strip().lower()
+    )
+    if scan_mode in {"blas-rayon", "blas_only", "dedicated"}:
+        scan_mode = "blas_t_rayon_1"
+    elif scan_mode in {"scan", "blas_1_rayon_t"}:
+        scan_mode = "generic"
+    elif scan_mode in {"both", "legacy", "blas_t_rayon_t"}:
+        scan_mode = "full"
+
+    if scan_mode == "blas_t_rayon_1":
+        proj_threads = t
+        assoc_threads = 1
+    elif scan_mode == "generic":
+        proj_threads = 1
+        assoc_threads = t
+    else:
+        proj_threads = t
+        assoc_threads = t
+
+    def _positive_env(name: str) -> Optional[int]:
+        raw = str(os.environ.get(name, "")).strip()
+        if not raw:
+            return None
+        try:
+            value = int(raw)
+        except ValueError:
+            return None
+        return value if value > 0 else None
+
+    proj_override = _positive_env("JX_FVLMM_PROJ_THREADS")
+    assoc_override = _positive_env("JX_FVLMM_ASSOC_THREADS")
+    return {
+        "proj_threads": int(proj_override or proj_threads),
+        "assoc_threads": int(assoc_override or assoc_threads),
+    }
 
 
 def _resolve_gwas_eigh_driver(n_samples: int) -> str:
@@ -7205,6 +7280,11 @@ def _run_gwas_pipeline(
         f"fvlmm_scan_stage={_resolve_fvlmm_scan_stage_mode()}"
     )
     if fvlmm_scan_spec is not None:
+        _rotate_kernel = str(os.environ.get("JX_FVLMM_ROTATE_KERNEL", "")).strip().lower()
+        if _rotate_kernel in {"blas_tiled", "tiled"}:
+            _append_advanced_note(f"FvLMM rotate kernel: {_rotate_kernel}")
+        else:
+            _append_advanced_note("FvLMM rotate kernel: blas")
         _fb = int(fvlmm_scan_spec["blas_threads"])
         _fr = int(fvlmm_scan_spec["rayon_threads"])
         if _fb == _fr:
@@ -7212,6 +7292,12 @@ def _run_gwas_pipeline(
         else:
             _append_advanced_note(f"FvLMM scan BLAS threads: {_fb}")
             _append_advanced_note(f"FvLMM scan Rayon threads: {_fr}")
+        _frust = _gwas_fvlmm_rust_stage_thread_plan(int(args.thread))
+        _append_advanced_note(
+            "FvLMM Rust stages: "
+            f"projection={int(_frust['proj_threads'])}, "
+            f"association={int(_frust['assoc_threads'])}"
+        )
     if thread_capped:
         logger.warning(
             f"Warning: Requested threads={requested_threads} exceeds local effective={detected_threads}; "

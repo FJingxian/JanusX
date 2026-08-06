@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import concurrent.futures as cf
+from contextlib import contextmanager
 import gc
 import hashlib
 import logging
@@ -22,6 +23,7 @@ import psutil
 from janusx.assoc.workflow_cache import _cache_lock, _is_writable_dir, _resolve_gwas_cache_dir
 from janusx.script._common.grmio import format_grm_cache_num
 from janusx.script._common.memory import (
+    bed_block_target_env as _common_bed_block_target_env,
     resolve_decode_mmap_window_mb as _common_resolve_decode_mmap_window_mb,
 )
 from janusx.script._common.genoio import (
@@ -94,6 +96,7 @@ _SPLMM_SPARSE_REML_MAX_ITER = 20
 _SPLMM_SPGRM_SINGLE_BLOCK_N_MAX = 2048
 _SPLMM_APPROX_RHAT_MARKERS_DEFAULT = 1000
 _SPLMM_META_CACHE_VERSION = 1
+_SPLMM_GRM_DECODE_WORKING_BUFFERS = 2
 _SCANMETA_CACHE_MAGIC = b"JXSMETA\0"
 _SCANMETA_CACHE_VERSION = 1
 _SCANMETA_HEADER_PREFIX = struct.Struct("<8sII")
@@ -107,6 +110,46 @@ def _current_bed_memory_mb() -> float:
     except Exception:
         return 512.0
     return mb if np.isfinite(mb) and mb > 0.0 else 512.0
+
+
+def _resolve_splmm_grm_memory_mb(memory_mb: Optional[float]) -> float:
+    """Resolve the explicit GWAS GRM decode budget, without env-only fallback."""
+    if memory_mb is None:
+        return _current_bed_memory_mb()
+    try:
+        mb = float(memory_mb)
+    except Exception as exc:
+        raise ValueError(f"SparseLMM GRM decode memory must be finite and > 0 MB, got {memory_mb}") from exc
+    if not np.isfinite(mb) or mb <= 0.0:
+        raise ValueError(
+            f"SparseLMM GRM decode memory must be finite and > 0 MB, got {memory_mb}"
+        )
+    return float(mb)
+
+
+@contextmanager
+def _splmm_grm_decode_budget_env(memory_mb: float):
+    """Apply the same bounded decode budget to BED and sparse-GRM kernels."""
+    memory_mb_use = _resolve_splmm_grm_memory_mb(memory_mb)
+    keys = ("JX_SPGRM_DECODE_TARGET_MB", "JANUSX_SPGRM_DECODE_TARGET_MB")
+    previous = {key: os.environ.get(key) for key in keys}
+    try:
+        with _common_bed_block_target_env(
+            memory_mb_use,
+            needs_copy=False,
+            buffers=int(_SPLMM_GRM_DECODE_WORKING_BUFFERS),
+        ):
+            target_mb = memory_mb_use / float(_SPLMM_GRM_DECODE_WORKING_BUFFERS)
+            target = f"{target_mb:.6g}"
+            for key in keys:
+                os.environ[key] = target
+            yield
+    finally:
+        for key, old in previous.items():
+            if old is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old
 _ALGWAS_STAGE1_EBIC_GAMMA_DEFAULT = 0.5
 
 
@@ -771,6 +814,7 @@ def _ensure_splmm_sparse_grm(
     logger: logging.Logger,
     use_spinner: bool,
     method: int = 1,
+    memory_mb: Optional[float] = None,
 ) -> str:
     threads_use = int(max(1, int(threads) if int(threads) > 0 else detect_effective_threads()))
     sample_idx_arg = None
@@ -846,6 +890,8 @@ def _ensure_splmm_sparse_grm(
             "Rebuild/install JanusX extension first."
         )
 
+    decode_memory_mb = _resolve_splmm_grm_memory_mb(memory_mb)
+
     use_dense_extract = bool(
         dense_grm_path_use is not None
         and sample_idx_arg is None
@@ -862,10 +908,15 @@ def _ensure_splmm_sparse_grm(
                 str(prefix),
                 n_samples_full,
                 n_snps_total,
-                _current_bed_memory_mb(),
+                decode_memory_mb,
                 needs_copy=False,
             )
-        except Exception:
+        except Exception as exc:
+            if memory_mb is not None:
+                raise RuntimeError(
+                    "SparseLMM cannot establish a memory-bounded BED decode window "
+                    f"for internal sparse GRM construction: {exc}"
+                ) from exc
             sparse_mmap_window_mb = None
     progress_desc = (
         "Calculating sparse GRM from dense GRM"
@@ -922,28 +973,29 @@ def _ensure_splmm_sparse_grm(
                     "Rust extension missing spgrm_bed_to_jxgrm required to build sparse GRM from genotype. "
                     "Rebuild/install JanusX extension first."
                 )
-            build_result = jxrs.spgrm_bed_to_jxgrm(
-                str(prefix),
-                out_prefix=str(out_prefix_use),
-                sample_indices=sample_idx_arg,
-                method=int(method),
-                threshold=float(cutoff),
-                abs_threshold=False,
-                maf_threshold=float(maf_threshold),
-                max_missing_rate=float(max_missing_rate),
-                het_threshold=float(het_threshold),
-                snps_only=bool(snps_only),
-                block_rows=0,
-                sample_block=0,
-                threads=int(threads_use),
-                mmap_window_mb=(
-                    None
-                    if sparse_mmap_window_mb is None
-                    else int(max(1, int(sparse_mmap_window_mb)))
-                ),
-                progress_callback=_progress_cb,
-                progress_every=1,
-            )
+            with _splmm_grm_decode_budget_env(decode_memory_mb):
+                build_result = jxrs.spgrm_bed_to_jxgrm(
+                    str(prefix),
+                    out_prefix=str(out_prefix_use),
+                    sample_indices=sample_idx_arg,
+                    method=int(method),
+                    threshold=float(cutoff),
+                    abs_threshold=False,
+                    maf_threshold=float(maf_threshold),
+                    max_missing_rate=float(max_missing_rate),
+                    het_threshold=float(het_threshold),
+                    snps_only=bool(snps_only),
+                    block_rows=0,
+                    sample_block=0,
+                    threads=int(threads_use),
+                    mmap_window_mb=(
+                        None
+                        if sparse_mmap_window_mb is None
+                        else int(max(1, int(sparse_mmap_window_mb)))
+                    ),
+                    progress_callback=_progress_cb,
+                    progress_every=1,
+                )
         build_ok = True
     finally:
         if spin_handle is not None:
@@ -1007,6 +1059,7 @@ def _ensure_splmm_sparse_grm(
             f"({', '.join(built_shape)}, "
             f"source={'dense_grm_npy' if use_dense_extract else 'bed'}, "
             f"method={'standardized' if int(method) == 2 else 'centered'}, "
+            f"decode_memory_mb={('n/a' if use_dense_extract else f'{float(decode_memory_mb):.6g}')}, "
             f"mmap_window_mb={('n/a' if use_dense_extract else (int(sparse_mmap_window_mb) if sparse_mmap_window_mb is not None else 'full'))}, "
             f"BLAS=1, Rayon={int(threads_use)}, "
             f"sample_block=auto, "

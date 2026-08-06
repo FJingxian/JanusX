@@ -1313,7 +1313,7 @@ fn prepare_splmm_assoc_inputs<'py>(
     row_missing: Option<PyReadonlyArray1<'py, f32>>,
     row_indices: Option<PyReadonlyArray1<'py, i64>>,
     model: &str,
-    _mmap_window_mb: Option<usize>,
+    mmap_window_mb: Option<usize>,
 ) -> PyResult<PreparedSplmmAssoc> {
     let gm = PackedGeneticModel::parse(model)?;
     let bed_prefix = normalize_plink_prefix_local(prefix);
@@ -1381,7 +1381,11 @@ fn prepare_splmm_assoc_inputs<'py>(
         "operator_sample_indices",
     )?
     .or_else(|| scan_sample_probe.clone());
+    let windowed_requested = mmap_window_mb.filter(|&v| v > 0).is_some();
+    let skip_resident_bed_payload = use_external_mmap_meta && windowed_requested;
     let shared_bed_mmap = if use_external_packed {
+        None
+    } else if skip_resident_bed_payload {
         None
     } else {
         let bed_path = format!("{bed_prefix}.bed");
@@ -1410,7 +1414,7 @@ fn prepare_splmm_assoc_inputs<'py>(
             row_missing,
             row_indices,
             shared_bed_mmap.as_ref().map(Arc::clone),
-            true,
+            !skip_resident_bed_payload,
         )?
     } else {
         prepare_prefix_input(
@@ -5244,30 +5248,22 @@ fn unified_input_from_splmm_prepared(
     prepared: &SplmmPreparedInput,
     mmap_window_mb: Option<usize>,
 ) -> Result<UnifiedInput<SplmmPreparedMatrixAdapter<'_>>, String> {
-    let matrix = if prepared.payload.is_some() {
-        // Prefer direct decode whenever a file-backed resident payload is
-        // available. This avoids regressing into slower windowed row/block
-        // preparation after the caller has already prepared per-trait row
-        // metadata.
-        SplmmPreparedMatrixAdapter::Direct { inner: prepared }
-    } else {
-        if let Some(window_mb) = mmap_window_mb.filter(|&v| v > 0) {
-            if let Some(prefix) = prepared.bed_prefix.as_deref() {
-                SplmmPreparedMatrixAdapter::Windowed {
-                    matrix: WindowedBedMatrix::open(prefix, window_mb)?,
-                }
-            } else {
-                return Err(
-                    "SparseLMM windowed decode requires a PLINK BED prefix when no resident payload is retained."
-                        .to_string(),
-                );
+    let matrix = if let Some(window_mb) = mmap_window_mb.filter(|&v| v > 0) {
+        if let Some(prefix) = prepared.bed_prefix.as_deref() {
+            SplmmPreparedMatrixAdapter::Windowed {
+                matrix: WindowedBedMatrix::open(prefix, window_mb)?,
             }
         } else {
+            SplmmPreparedMatrixAdapter::Direct { inner: prepared }
+        }
+    } else {
+        if prepared.payload.is_none() {
             return Err(
                 "SparseLMM direct BED scan requires a resident BED payload; provide mmap_window_mb to use windowed scanning."
                     .to_string(),
             );
         }
+        SplmmPreparedMatrixAdapter::Direct { inner: prepared }
     };
     Ok(UnifiedInput {
         matrix,
@@ -5704,6 +5700,49 @@ mod tests {
         };
         let scan_sample_idx = vec![3usize, 1usize, 0usize];
         (prepared, scan_sample_idx)
+    }
+
+    #[test]
+    fn windowed_scan_is_selected_when_memory_window_is_requested() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "janusx_splmm_windowed_route_{}_{}",
+            std::process::id(),
+            stamp
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prefix = dir.join("case");
+        std::fs::write(
+            prefix.with_extension("fam"),
+            "F1 I1 0 0 1 1\nF1 I2 0 0 1 1\nF1 I3 0 0 1 1\nF1 I4 0 0 1 1\n",
+        )
+        .unwrap();
+        std::fs::write(prefix.with_extension("bed"), [0x6c, 0x1b, 0x01, 0x00]).unwrap();
+
+        let prepared = SplmmPreparedInput {
+            bed_prefix: Some(prefix.to_string_lossy().into_owned()),
+            payload: Some(SplmmPreparedPayload::Packed(Arc::from(vec![0u8]))),
+            n_samples_full: 4,
+            bytes_per_snp: 1,
+            row_flip: Arc::from(vec![false]),
+            row_maf: Arc::from(vec![0.5_f32]),
+            row_missing: Arc::from(vec![0.0_f32]),
+            row_source_indices: Some(Arc::from(vec![0usize])),
+        };
+
+        let input = unified_input_from_splmm_prepared(&prepared, Some(1)).unwrap();
+        assert!(matches!(
+            &input.matrix,
+            SplmmPreparedMatrixAdapter::Windowed { .. }
+        ));
+
+        drop(input);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn make_test_design() -> Vec<f64> {

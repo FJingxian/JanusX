@@ -1,6 +1,7 @@
 import logging
 import os
 import sys
+import textwrap
 from typing import Any, Optional, Sequence
 
 from .pathcheck import format_path_for_display
@@ -134,6 +135,43 @@ def truncate_line(
     return s[: (max_chars - len(mark))] + mark
 
 
+def _wrap_config_value(value: object, *, width: int) -> list[str]:
+    """Wrap a config value without losing long path-like tokens.
+
+    Config values are displayed in a fixed-width value column.  ``textwrap``
+    normally keeps long words intact, which is not useful for paths and other
+    identifier-like values, so long words are deliberately split at the
+    display boundary.  Existing newlines are kept as separate visual lines.
+    """
+    max_width = max(1, int(width))
+    text = str(value)
+    raw_lines = text.splitlines()
+    if len(raw_lines) == 0:
+        raw_lines = [""]
+
+    wrapped: list[str] = []
+    for raw_line in raw_lines:
+        if raw_line == "":
+            wrapped.append("")
+            continue
+        parts = textwrap.wrap(
+            raw_line,
+            width=max_width,
+            break_long_words=True,
+            break_on_hyphens=False,
+            replace_whitespace=False,
+            drop_whitespace=True,
+        )
+        wrapped.extend(parts or [""])
+
+    # ``splitlines`` omits a trailing newline; retain the corresponding blank
+    # continuation line so an explicitly multiline value is not silently
+    # collapsed.
+    if text.endswith(("\n", "\r")):
+        wrapped.append("")
+    return wrapped
+
+
 def _is_path_like_key(key: str) -> bool:
     k = str(key).strip().lower()
     markers = (
@@ -205,17 +243,24 @@ def _render_rich_panel(
             )
             key_w = max(8, int(key_width))
             table.add_column(style=styles["key"], no_wrap=True, width=key_w, justify="left")
-            table.add_column(style=styles["value"], no_wrap=True, justify="left")
+            val_max = max(1, int(line_max_chars) - key_w - 2)
+            table.add_column(
+                style=styles["value"],
+                no_wrap=False,
+                overflow="fold",
+                max_width=val_max,
+                justify="left",
+            )
             for key, val in rows:
                 key_txt = str(key)
-                val_max = max(1, int(line_max_chars) - key_w - 2)
-                val_txt = truncate_line(val, max_chars=val_max, overflow_mark=overflow_mark)
-                table.add_row(key_txt, val_txt)
+                table.add_row(key_txt, str(val))
             return table
 
-        app_title_txt = truncate_line(app_title, max_chars=line_max_chars, overflow_mark=overflow_mark)
-        host_txt = truncate_line(f"Host: {host}", max_chars=line_max_chars, overflow_mark=overflow_mark)
-        panel_title_txt = truncate_line(config_title, max_chars=line_max_chars, overflow_mark=overflow_mark)
+        # Rich handles wrapping of these text elements itself.  Do not inject
+        # the historical ``***`` overflow marker into the visible config.
+        app_title_txt = str(app_title)
+        host_txt = f"Host: {host}"
+        panel_title_txt = str(config_title)
         parts: list[Any] = [
             Text(app_title_txt, style=styles["title"]),
             Text(host_txt),
@@ -288,12 +333,19 @@ def emit_cli_configuration(
     for k, _ in footer_norm:
         key_width = max(key_width, len(str(k)))
 
-    def _fmt_kv(key: str, val: str, *, truncate: bool) -> str:
+    def _fmt_kv(key: str, val: str, *, truncate: bool) -> list[str]:
         pad = max(1, key_width - len(key))
-        line = f"  {key}:{' ' * pad}{val}"
-        if truncate:
-            return truncate_line(line, max_chars=line_max_chars, overflow_mark=overflow_mark)
-        return line
+        prefix = f"  {key}:{' ' * pad}"
+        if not truncate:
+            return [prefix + val]
+
+        value_width = max(1, int(line_max_chars) - len(prefix))
+        value_lines = _wrap_config_value(val, width=value_width)
+        continuation_prefix = " " * len(prefix)
+        return [
+            (prefix if index == 0 else continuation_prefix) + value_line
+            for index, value_line in enumerate(value_lines)
+        ]
 
     divider_full = "*" * 60
     divider_terminal = "*" * max(1, int(line_max_chars))
@@ -304,14 +356,14 @@ def emit_cli_configuration(
         full_lines.append(f"{sec_name}:")
         terminal_lines.append(f"{sec_name}:")
         for key, val in sec_rows:
-            full_lines.append(_fmt_kv(key, val, truncate=False))
-            terminal_lines.append(_fmt_kv(key, val, truncate=True))
+            full_lines.extend(_fmt_kv(key, val, truncate=False))
+            terminal_lines.extend(_fmt_kv(key, val, truncate=True))
     if len(footer_norm) > 0:
         full_lines.append("Output:")
         terminal_lines.append("Output:")
         for key, val in footer_norm:
-            full_lines.append(_fmt_kv(key, val, truncate=False))
-            terminal_lines.append(_fmt_kv(key, val, truncate=True))
+            full_lines.extend(_fmt_kv(key, val, truncate=False))
+            terminal_lines.extend(_fmt_kv(key, val, truncate=True))
     full_lines.append(divider_full + "\n")
     terminal_lines.append(divider_terminal + "\n")
 

@@ -114,6 +114,11 @@ def _env_truthy(name: str) -> bool:
     return raw in {"1", "true", "yes", "y", "on"}
 
 
+def _resolve_garfield_xor_search(requested: bool) -> bool:
+    """Resolve the explicit XOR-search opt-in and legacy force-off override."""
+    return bool(requested) and not _env_truthy("JX_GARFIELD_DISABLE_XOR_SEARCH")
+
+
 def _garfield_rss_debug_enabled() -> bool:
     return _env_truthy("JX_GARFIELD_RSS_DEBUG")
 
@@ -2606,6 +2611,13 @@ def main() -> None:
         help=argparse.SUPPRESS,
     )
     optional_group.add_argument(
+        "--xor-search",
+        action="store_true",
+        dest="xor_search",
+        default=False,
+        help="Enable XOR logic-gate expansion during GARFIELD beam search (default: off).",
+    )
+    optional_group.add_argument(
         "-global",
         "--global",
         dest="global_stats",
@@ -2707,6 +2719,8 @@ def main() -> None:
         parser.error("the following arguments are required: -p/--pheno")
     if len(extras) > 0:
         parser.error("unrecognized arguments: " + " ".join(extras))
+    args.xor_search_requested = bool(args.xor_search)
+    args.xor_search = _resolve_garfield_xor_search(args.xor_search_requested)
     try:
         (
             args.rule_null_penalty_method_runtime,
@@ -3232,6 +3246,7 @@ def main() -> None:
                 no_clean=bool(args.no_clean),
                 raw_design=bool(args.raw_design),
                 filter_xor_substates=not bool(args.disable_xor_substate_filter),
+                xor_search=bool(args.xor_search),
                 whole_genome_dev_mode=bool(str(args.scan_mode).lower() == "wholegenome"),
                 progress_callback=progress_cb,
                 progress_every=0,
@@ -3444,6 +3459,8 @@ def main() -> None:
             "rank_score": rank_score_runtime,
             "rank_score_runtime": rank_score_runtime,
             "xor_substate_lmaf_filter": not bool(args.disable_xor_substate_filter),
+            "xor_search_requested": bool(args.xor_search_requested),
+            "xor_search_enabled": bool(args.xor_search),
             "ml_top_k": (None if ml_skipped else int(args.ml_top_k_runtime)),
             "extension": int(args.extension),
             "step": int(args.step),
@@ -3598,6 +3615,8 @@ def main() -> None:
                 "rank_score_runtime": rank_score_runtime,
                 "rank_schedule_runtime": rank_schedule_runtime,
                 "rank_schedule_source": rank_schedule_source,
+                "xor_search_requested": bool(args.xor_search_requested),
+                "xor_search_enabled": bool(args.xor_search),
                 "permutation": True,
                 "rule_null_penalty_method": str(args.rule_null_penalty_method_runtime),
                 "rule_null_quantile": float(args.rule_null_quantile_runtime),

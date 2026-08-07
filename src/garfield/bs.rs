@@ -159,14 +159,24 @@ fn beam_binary_op_code(op: BeamBinaryOp) -> u8 {
 }
 
 #[inline]
-fn beam_binary_ops_for_rule(rule: &BeamRule) -> &'static [BeamBinaryOp] {
+fn beam_binary_ops_for_rule_with_xor_policy(
+    rule: &BeamRule,
+    xor_search_enabled: bool,
+) -> &'static [BeamBinaryOp] {
     if rule_contains_xor(rule) {
         &BEAM_EXPAND_OPS_AND
     } else if rule.len() == 1 && rule.first.negated {
         &BEAM_EXPAND_OPS_AND
+    } else if !xor_search_enabled {
+        &BEAM_EXPAND_OPS_AND
     } else {
         &BEAM_EXPAND_OPS_AND_XOR
     }
+}
+
+#[inline]
+fn beam_binary_ops_for_rule(rule: &BeamRule, xor_search_enabled: bool) -> &'static [BeamBinaryOp] {
+    beam_binary_ops_for_rule_with_xor_policy(rule, xor_search_enabled)
 }
 
 #[inline]
@@ -178,8 +188,8 @@ fn child_literal_negations_for_op(op: BeamBinaryOp) -> &'static [bool] {
 }
 
 #[inline]
-fn beam_child_branch_count_for_rule(rule: &BeamRule) -> usize {
-    beam_binary_ops_for_rule(rule)
+fn beam_child_branch_count_for_rule(rule: &BeamRule, xor_search_enabled: bool) -> usize {
+    beam_binary_ops_for_rule(rule, xor_search_enabled)
         .iter()
         .map(|op| child_literal_negations_for_op(*op).len())
         .sum::<usize>()
@@ -321,6 +331,7 @@ pub struct BeamSearchParams {
     pub allow_parallel: bool,
     pub whole_genome_dev_mode: bool,
     pub filter_xor_substates: bool,
+    pub xor_search_enabled: bool,
 }
 
 impl Default for BeamSearchParams {
@@ -346,6 +357,7 @@ impl Default for BeamSearchParams {
             allow_parallel: true,
             whole_genome_dev_mode: false,
             filter_xor_substates: true,
+            xor_search_enabled: false,
         }
     }
 }
@@ -3740,7 +3752,7 @@ fn expand_beam_once_whole_genome_target_range(
                 n_train,
                 params.y_sum_lookup.as_deref(),
             );
-            for &op in beam_binary_ops_for_rule(&parent.rule).iter() {
+            for &op in beam_binary_ops_for_rule(&parent.rule, params.xor_search_enabled).iter() {
                 for &negated in child_literal_negations_for_op(op).iter() {
                     let literal = BeamLiteral {
                         row_index: cand,
@@ -3865,7 +3877,12 @@ fn expand_beam_once_whole_genome_target_parallel(
     let base_rule_raws = Arc::new(collect_known_rule_raw_scores(parents));
     let total_expand = parents
         .iter()
-        .map(|parent| n_rows.saturating_mul(beam_child_branch_count_for_rule(&parent.rule)))
+        .map(|parent| {
+            n_rows.saturating_mul(beam_child_branch_count_for_rule(
+                &parent.rule,
+                params.xor_search_enabled,
+            ))
+        })
         .sum::<usize>();
     let next = if should_parallel(total_expand, params.allow_parallel) {
         let work = whole_genome_target_work_ranges(n_rows);
@@ -4020,7 +4037,7 @@ fn expand_beam_once_parallel_deferred(
                     n_train,
                     params.y_sum_lookup.as_deref(),
                 );
-                for &op in beam_binary_ops_for_rule(&node.rule).iter() {
+                for &op in beam_binary_ops_for_rule(&node.rule, params.xor_search_enabled).iter() {
                     for &negated in child_literal_negations_for_op(op).iter() {
                         let literal = BeamLiteral {
                             row_index: cand,
@@ -4178,7 +4195,10 @@ fn expand_beam_once(
         .map(|node| {
             let (start, end) = expansion_row_bounds(&node.rule, n_rows);
             end.saturating_sub(start)
-                .saturating_mul(beam_child_branch_count_for_rule(&node.rule))
+                .saturating_mul(beam_child_branch_count_for_rule(
+                    &node.rule,
+                    params.xor_search_enabled,
+                ))
         })
         .sum::<usize>();
 
@@ -4222,7 +4242,7 @@ fn expand_beam_once(
                     n_train,
                     params.y_sum_lookup.as_deref(),
                 );
-                for &op in beam_binary_ops_for_rule(&node.rule).iter() {
+                for &op in beam_binary_ops_for_rule(&node.rule, params.xor_search_enabled).iter() {
                     for &negated in child_literal_negations_for_op(op).iter() {
                         let literal = BeamLiteral {
                             row_index: cand,
@@ -4491,7 +4511,7 @@ fn expand_states_exhaustive_parallel_deferred(
                     n_train,
                     params.y_sum_lookup.as_deref(),
                 );
-                for &op in beam_binary_ops_for_rule(&node.rule).iter() {
+                for &op in beam_binary_ops_for_rule(&node.rule, params.xor_search_enabled).iter() {
                     for &negated in child_literal_negations_for_op(op).iter() {
                         let single = literal_scores[literal_score_index(cand, negated)];
                         let Some(train) =
@@ -4622,7 +4642,10 @@ fn expand_states_exhaustive(
             let cand_start = node.rule.last_row_index() + 1;
             n_rows
                 .saturating_sub(cand_start)
-                .saturating_mul(beam_child_branch_count_for_rule(&node.rule))
+                .saturating_mul(beam_child_branch_count_for_rule(
+                    &node.rule,
+                    params.xor_search_enabled,
+                ))
         })
         .sum::<usize>();
     let base_rule_raws = Arc::new(collect_known_rule_raw_scores(frontier));
@@ -4676,7 +4699,9 @@ fn expand_states_exhaustive(
                             n_train,
                             params.y_sum_lookup.as_deref(),
                         );
-                        for &op in beam_binary_ops_for_rule(&node.rule).iter() {
+                        for &op in
+                            beam_binary_ops_for_rule(&node.rule, params.xor_search_enabled).iter()
+                        {
                             for &negated in child_literal_negations_for_op(op).iter() {
                                 let single = literal_scores[literal_score_index(cand, negated)];
                                 let Some(train) =
@@ -4817,7 +4842,7 @@ fn expand_states_exhaustive(
                     n_train,
                     params.y_sum_lookup.as_deref(),
                 );
-                for &op in beam_binary_ops_for_rule(&node.rule).iter() {
+                for &op in beam_binary_ops_for_rule(&node.rule, params.xor_search_enabled).iter() {
                     for &negated in child_literal_negations_for_op(op).iter() {
                         let single = literal_scores[literal_score_index(cand, negated)];
                         let Some(train) =
@@ -7315,7 +7340,7 @@ fn expand_fuzzy_beam_once_whole_genome_target_range(
                 n_train,
                 params,
             );
-            for &op in beam_binary_ops_for_rule(&parent.rule).iter() {
+            for &op in beam_binary_ops_for_rule(&parent.rule, params.xor_search_enabled).iter() {
                 for &negated in child_literal_negations_for_op(op).iter() {
                     garfield_layer_debug_add(
                         layer,
@@ -7486,7 +7511,12 @@ fn expand_fuzzy_beam_once_whole_genome_target_parallel(
     let base_rule_raws = Arc::new(collect_known_rule_raw_scores_fuzzy(parents));
     let total_expand = parents
         .iter()
-        .map(|parent| n_rows.saturating_mul(beam_child_branch_count_for_rule(&parent.rule)))
+        .map(|parent| {
+            n_rows.saturating_mul(beam_child_branch_count_for_rule(
+                &parent.rule,
+                params.xor_search_enabled,
+            ))
+        })
         .sum::<usize>();
     let next = if should_parallel(total_expand, params.allow_parallel) {
         let work = whole_genome_target_work_ranges(n_rows);
@@ -7662,7 +7692,7 @@ fn expand_fuzzy_beam_once(
                 n_train,
                 params,
             );
-            for &op in beam_binary_ops_for_rule(&node.rule).iter() {
+            for &op in beam_binary_ops_for_rule(&node.rule, params.xor_search_enabled).iter() {
                 for &negated in child_literal_negations_for_op(op).iter() {
                     garfield_layer_debug_add(
                         layer,
@@ -7838,7 +7868,10 @@ fn expand_fuzzy_beam_once_parallel(
         .map(|node| {
             let (start, end) = expansion_row_bounds(&node.rule, n_rows);
             end.saturating_sub(start)
-                .saturating_mul(beam_child_branch_count_for_rule(&node.rule))
+                .saturating_mul(beam_child_branch_count_for_rule(
+                    &node.rule,
+                    params.xor_search_enabled,
+                ))
         })
         .sum::<usize>();
     if !should_parallel(total_expand, params.allow_parallel) {
@@ -7908,7 +7941,7 @@ fn expand_fuzzy_beam_once_parallel(
                     n_train,
                     params,
                 );
-                for &op in beam_binary_ops_for_rule(&node.rule).iter() {
+                for &op in beam_binary_ops_for_rule(&node.rule, params.xor_search_enabled).iter() {
                     for &negated in child_literal_negations_for_op(op).iter() {
                         garfield_layer_debug_add(
                             layer,
@@ -8111,7 +8144,7 @@ fn expand_fuzzy_states_exhaustive(
                 n_train,
                 params,
             );
-            for &op in beam_binary_ops_for_rule(&node.rule).iter() {
+            for &op in beam_binary_ops_for_rule(&node.rule, params.xor_search_enabled).iter() {
                 for &negated in child_literal_negations_for_op(op).iter() {
                     garfield_layer_debug_add(
                         layer,
@@ -9782,7 +9815,7 @@ mod tests {
             rest: Vec::new(),
         };
         assert_eq!(
-            beam_binary_ops_for_rule(&singleton),
+            beam_binary_ops_for_rule(&singleton, true),
             &[BeamBinaryOp::And, BeamBinaryOp::Xor]
         );
 
@@ -9794,7 +9827,7 @@ mod tests {
             rest: Vec::new(),
         };
         assert_eq!(
-            beam_binary_ops_for_rule(&neg_singleton),
+            beam_binary_ops_for_rule(&neg_singleton, true),
             &[BeamBinaryOp::And]
         );
 
@@ -9809,7 +9842,35 @@ mod tests {
                 },
             )],
         };
-        assert_eq!(beam_binary_ops_for_rule(&xor_rule), &[BeamBinaryOp::And]);
+        assert_eq!(
+            beam_binary_ops_for_rule(&xor_rule, true),
+            &[BeamBinaryOp::And]
+        );
+    }
+
+    #[test]
+    fn test_beam_binary_ops_for_rule_can_disable_xor_search() {
+        let singleton = BeamRule {
+            first: BeamLiteral {
+                row_index: 0,
+                group_id: 0,
+                negated: false,
+            },
+            rest: Vec::new(),
+        };
+        assert_eq!(
+            beam_binary_ops_for_rule_with_xor_policy(&singleton, false),
+            &[BeamBinaryOp::And]
+        );
+        assert_eq!(
+            beam_binary_ops_for_rule_with_xor_policy(&singleton, true),
+            &[BeamBinaryOp::And, BeamBinaryOp::Xor]
+        );
+    }
+
+    #[test]
+    fn test_beam_search_params_disable_xor_search_by_default() {
+        assert!(!BeamSearchParams::default().xor_search_enabled);
     }
 
     #[test]

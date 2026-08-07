@@ -4468,38 +4468,25 @@ fn build_unit_rule_compare_record(
 }
 
 fn select_reportable_ranked_hits(
-    beam_hits: &[BeamRuleCandidate],
+    _beam_hits: &[BeamRuleCandidate],
     ranked_hits: &[(usize, f64)],
     top_rules_per_unit: usize,
-    raw_design: bool,
+    _raw_design: bool,
 ) -> Vec<(usize, f64)> {
     if ranked_hits.is_empty() {
         return Vec::new();
     }
-    let base = if raw_design {
-        ranked_hits.to_vec()
-    } else {
-        // The displayed score may include a null/bucket penalty.  That
-        // penalty is useful for ranking against the null model, but it must
-        // not decide whether a singleton or a logical combination is
-        // reportable.  Keep both rule families in one ranking and select by
-        // the unpenalized test score instead.
-        let mut raw_ranked = ranked_hits.to_vec();
-        raw_ranked.sort_by(|(a_idx, _), (b_idx, _)| {
-            score_key(beam_hits[*b_idx].test.raw_score)
-                .partial_cmp(&score_key(beam_hits[*a_idx].test.raw_score))
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| cmp_candidate(&beam_hits[*a_idx], &beam_hits[*b_idx]))
-        });
-        raw_ranked
-    };
+    // `ranked_hits` is already sorted by the final output score, i.e.
+    // raw_score - output_penalty.  Search-time gain and search penalties are
+    // applied before this function and must not be substituted here.
+    let base = ranked_hits.to_vec();
     if top_rules_per_unit == 0 || base.len() <= 1 {
         return base;
     }
     let keep = extend_keep_with_score_ties(
         base.as_slice(),
         top_rules_per_unit.min(base.len()),
-        |(idx, _)| beam_hits[*idx].test.raw_score,
+        |(_, score)| *score,
     );
     base.into_iter().take(keep).collect::<Vec<_>>()
 }
@@ -12487,6 +12474,7 @@ fn garfield_logic_search_bed_owned(
     no_clean: bool,
     raw_design: bool,
     filter_xor_substates: bool,
+    xor_search_enabled: bool,
     whole_genome_dev_mode: bool,
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
@@ -13047,6 +13035,7 @@ fn garfield_logic_search_bed_owned(
         allow_parallel: true,
         whole_genome_dev_mode,
         filter_xor_substates,
+        xor_search_enabled,
     };
     let total_units = units.len();
     let scan_unit_indices = if grouped_active_mode {
@@ -14711,6 +14700,7 @@ pub fn garfield_debug_probe_single_group_from_files(
         false,
         true,
         false,
+        false,
         None,
         0usize,
         Some(probe),
@@ -14780,6 +14770,7 @@ pub fn garfield_debug_probe_single_group_from_files(
     no_clean=false,
     raw_design=false,
     filter_xor_substates=true,
+    xor_search=false,
     whole_genome_dev_mode=false,
     progress_callback=None,
     progress_every=0
@@ -14846,6 +14837,7 @@ pub fn garfield_logic_search_bed_py<'py>(
     no_clean: bool,
     raw_design: bool,
     filter_xor_substates: bool,
+    xor_search: bool,
     whole_genome_dev_mode: bool,
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
@@ -14959,6 +14951,7 @@ pub fn garfield_logic_search_bed_py<'py>(
                 no_clean,
                 raw_design,
                 filter_xor_substates,
+                xor_search,
                 whole_genome_dev_mode,
                 progress_callback,
                 progress_every,
@@ -16850,7 +16843,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_reportable_ranked_hits_uses_highest_unpenalized_raw_score() {
+    fn test_select_reportable_ranked_hits_uses_output_score_after_penalty() {
         let mut combo = make_test_rule_candidate(&[0, 1], &[BeamBinaryOp::Xor], 12.0);
         combo.test.raw_score = 5.0;
         let mut singleton = make_test_rule_candidate(&[2], &[], 10.0);
@@ -16859,17 +16852,19 @@ mod tests {
         let ranked_hits = vec![(0usize, 12.0_f64), (1usize, 10.0_f64)];
         let selected =
             select_reportable_ranked_hits(beam_hits.as_slice(), ranked_hits.as_slice(), 1, false);
-        assert_eq!(selected, vec![(1usize, 10.0_f64)]);
+        assert_eq!(selected, vec![(0usize, 12.0_f64)]);
     }
 
     #[test]
     fn test_select_reportable_ranked_hits_applies_topk_to_singleton_only_unit() {
-        let beam_hits = vec![
+        let mut beam_hits = vec![
             make_test_rule_candidate(&[0], &[], -0.10),
             make_test_rule_candidate(&[1], &[], -0.20),
             make_test_rule_candidate(&[2], &[], -0.30),
             make_test_rule_candidate(&[3, 4], &[BeamBinaryOp::And], -0.40),
         ];
+        beam_hits[0].test.raw_score = -0.40;
+        beam_hits[1].test.raw_score = 0.40;
         let ranked_hits = vec![
             (0usize, -0.10_f64),
             (1usize, -0.20_f64),

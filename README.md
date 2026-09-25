@@ -184,14 +184,16 @@ Attribution note:
 ## Citation
 
 ```bibtex
-@article {FuJanusX,
-  title = {JanusX: an integrated and high-performance platform for scalable genome-wide association studies and genomic selection},
-  author = {Fu, Jingxian and Jia, Anqiang and Wang, Haiyang and Liu, Hai-Jun},
-  year = {2026},
-  doi = {10.64898/2026.01.20.700366},
-  publisher = {Cold Spring Harbor Laboratory},
-  URL = {https://www.biorxiv.org/content/early/2026/01/23/2026.01.20.700366},
-  journal = {bioRxiv}
+@article{FuJanusX,
+author = {Fu, Jingxian and Jia, Anqiang and Wang, Haiyang and Liu, Hai-Jun},
+title = {JanusX: an integrated and high-performance platform for scalable genome-wide association studies and genomic selection},
+journal = {The Plant Journal},
+volume = {127},
+number = {5},
+pages = {e71105},
+doi = {https://doi.org/10.1111/tpj.71105},
+url = {https://onlinelibrary.wiley.com/doi/abs/10.1111/tpj.71105},
+year = {2026}
 }
 ```
 

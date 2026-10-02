@@ -7887,17 +7887,10 @@ def parse_args(argv: Optional[list[str]] = None):
     )
     models_group.add_argument(
         "-farmcpu", "--farmcpu",
-        dest="farmcpu_raw",
-        action="store_true",
-        default=False,
-        help="Run FarmCPU (classic FEM/REM/SUPER route; default: %(default)s).",
-    )
-    models_group.add_argument(
-        "-frgwas", "--frgwas",
         dest="farmcpu",
         action="store_true",
         default=False,
-        help=argparse.SUPPRESS,
+        help="Run FarmCPU (classic FEM/REM/SUPER route; default: %(default)s).",
     )
     models_group.add_argument(
         "-algwas", "--algwas", action="store_true", default=False,
@@ -8147,10 +8140,6 @@ def parse_args(argv: Optional[list[str]] = None):
         ]
     except ValueError as e:
         parser.error(str(e))
-    if bool(getattr(args, "farmcpu", False)) and bool(getattr(args, "farmcpu_raw", False)):
-        parser.error("Only one of -farmcpu / -frgwas may be specified.")
-    if bool(getattr(args, "farmcpu_raw", False)):
-        args.farmcpu = True
     if int(args.farmcpu_iter) < 1:
         parser.error("--farmcpu-iter must be >= 1.")
     if args.farmcpu_threshold is not None and (
@@ -8770,7 +8759,7 @@ def _run_gwas_pipeline(
                     ("FarmCPU szbin", ",".join(f"{float(x):g}" for x in args.farmcpu_bin_size)),
                     (
                         "FarmCPU stage1",
-                        "raw REM/SUPER" if bool(args.farmcpu_raw) else "unified FEM/REM + staged r^2 merge",
+                        "raw REM/SUPER",
                     ),
                 ]
             )
@@ -8897,7 +8886,7 @@ def _run_gwas_pipeline(
                     ("FarmCPU SzBin", ",".join(f"{float(x):g}" for x in args.farmcpu_bin_size)),
                     (
                         "FarmCPU Stage1",
-                        "raw REM/SUPER" if bool(args.farmcpu_raw) else "unified FEM/REM + staged r^2 merge",
+                        "raw REM/SUPER",
                     ),
                 ]
             )

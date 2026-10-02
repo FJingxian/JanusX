@@ -1197,7 +1197,6 @@ def run_farmcpu_fullmem(
         farm_qtn_bound = None if farm_qtn_bound_raw is None else int(farm_qtn_bound_raw)
         farm_nbin = max(1, int(getattr(args, "farmcpu_nbin", 5)))
         farm_szbin = [float(x) for x in getattr(args, "farmcpu_bin_size", [5e5, 5e6, 5e7])]
-        farm_raw = bool(getattr(args, "farmcpu_raw", False))
         farm_stage1_pbar = _ProgressAdapter(
             total=farm_iter,
             desc="FarmCPU stage1",
@@ -1432,7 +1431,7 @@ def run_farmcpu_fullmem(
                             progress_callback=(None if skip_stage1_main_scan else _farmcpu_scan_progress),
                             pseudo_tsv=pseudo_tsv_hint,
                             bed_prefix=bed_prefix_meta,
-                            raw=bool(farm_raw),
+                            raw=True,
                             skip_main_scan=bool(skip_stage1_main_scan),
                         )
                         (
@@ -1482,7 +1481,7 @@ def run_farmcpu_fullmem(
                             progress_callback=(None if skip_stage1_main_scan else _farmcpu_scan_progress),
                             pseudo_tsv=pseudo_tsv_hint,
                             bed_prefix=bed_prefix_meta,
-                            raw=bool(farm_raw),
+                            raw=True,
                             skip_main_scan=bool(skip_stage1_main_scan),
                         )
                         (
@@ -1506,7 +1505,7 @@ def run_farmcpu_fullmem(
                             "qtn_bound": farm_qtn_bound,
                             "nbin": int(farm_nbin),
                             "szbin": [float(x) for x in farm_szbin],
-                            "raw": bool(farm_raw),
+                            "raw": True,
                             "skip_main_scan": bool(skip_stage1_main_scan),
                             "pseudo_tsv": str(pseudo_tsv_hint),
                             "stage1_progress_callback": _farmcpu_stage1_progress,

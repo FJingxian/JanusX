@@ -776,40 +776,58 @@ pub(crate) fn decode_packed_rows_to_sample_major(
     Ok(out)
 }
 
+fn rank_bin_leads(sz: i64, pvalue: &[f64], pos: &[i64]) -> Vec<usize> {
+    if pvalue.is_empty() {
+        return Vec::new();
+    }
+
+    let mut bin_slots: HashMap<i64, usize> = HashMap::new();
+    let mut bins: Vec<(i64, usize)> = Vec::new();
+    let mut previous_bin: Option<(i64, usize)> = None;
+    for idx in 0..pvalue.len() {
+        let bin = pos[idx].div_euclid(sz);
+        // Genomic rows usually stay in one bin for many consecutive markers.
+        // Reuse its slot without hashing every marker; the map also handles
+        // unsorted rows and bins revisited later in the input.
+        let slot = match previous_bin {
+            Some((last_bin, slot)) if last_bin == bin => slot,
+            _ => {
+                let slot = *bin_slots.entry(bin).or_insert_with(|| {
+                    bins.push((bin, idx));
+                    bins.len() - 1
+                });
+                previous_bin = Some((bin, slot));
+                slot
+            }
+        };
+        // Strict comparison retains the first marker for an exact total_cmp
+        // tie, matching the original stable marker sort (including NaNs/-0).
+        if pvalue[idx].total_cmp(&pvalue[bins[slot].1]).is_lt() {
+            bins[slot].1 = idx;
+        }
+    }
+
+    // The old stable lead sort received bins in ascending bin order. Preserve
+    // that secondary key explicitly, independent of hash-map iteration order.
+    bins.sort_unstable_by(|a, b| {
+        pvalue[a.1]
+            .total_cmp(&pvalue[b.1])
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    bins.into_iter().map(|(_, idx)| idx).collect()
+}
+
 pub(crate) fn select_lead_indices(
     sz: i64,
     n_lead: usize,
     pvalue: &[f64],
     pos: &[i64],
 ) -> Vec<usize> {
-    let m = pvalue.len();
-    if m == 0 || n_lead == 0 {
+    if n_lead == 0 {
         return Vec::new();
     }
-    let mut order: Vec<usize> = (0..m).collect();
-    order.sort_by(|&a, &b| {
-        let ba = pos[a].div_euclid(sz);
-        let bb = pos[b].div_euclid(sz);
-        match ba.cmp(&bb) {
-            std::cmp::Ordering::Equal => pvalue[a].total_cmp(&pvalue[b]),
-            other => other,
-        }
-    });
-
-    let mut lead: Vec<usize> = Vec::new();
-    let mut last_bin: Option<i64> = None;
-    for &idx in order.iter() {
-        let b = pos[idx].div_euclid(sz);
-        if last_bin.map_or(true, |lb| lb != b) {
-            lead.push(idx);
-            last_bin = Some(b);
-        }
-    }
-
-    lead.sort_by(|&a, &b| pvalue[a].total_cmp(&pvalue[b]));
-    if lead.len() > n_lead {
-        lead.truncate(n_lead);
-    }
+    let mut lead = rank_bin_leads(sz, pvalue, pos);
+    lead.truncate(n_lead);
     lead.sort_unstable();
     lead
 }
@@ -1989,10 +2007,28 @@ fn farmcpu_best_rem_lead_set(
     }
 
     let rem_task = || {
+        // Ranking depends on this iteration's FEM p-values and window size,
+        // not the requested number of leads. Share it across nbin candidates
+        // only within this REM search; never reuse scores across iterations.
+        let max_leads = nbin_vals.iter().copied().max().unwrap_or(0);
+        let mut ranked_by_size: HashMap<i64, Vec<usize>> = HashMap::new();
+        if max_leads > 0 {
+            for &sz in szbin_i64 {
+                ranked_by_size.entry(sz).or_insert_with(|| {
+                    let mut ranked = rank_bin_leads(sz, femp, global_pos);
+                    ranked.truncate(max_leads);
+                    ranked
+                });
+            }
+        }
         combine
             .par_iter()
             .map(|&(sz, nn)| {
-                let leadidx = select_lead_indices(sz, nn, femp, global_pos);
+                let mut leadidx = ranked_by_size
+                    .get(&sz)
+                    .map(|ranked| ranked[..ranked.len().min(nn)].to_vec())
+                    .unwrap_or_default();
+                leadidx.sort_unstable();
                 let sample_major = decode_packed_rows_to_sample_major(
                     packed_flat,
                     bytes_per_snp,

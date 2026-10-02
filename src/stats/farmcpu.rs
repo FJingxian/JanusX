@@ -1651,6 +1651,67 @@ fn student_t_p_two_sided(t: f64, df: i32) -> f64 {
     p.clamp(f64::MIN_POSITIVE, 1.0)
 }
 
+// A reduced FEM scan has one fixed residual df. Keep the legacy expression
+// order and special-value behavior, but prepare its beta constants once.
+struct PreparedStudentT {
+    df: i32,
+    v: f64,
+    a: f64,
+    b: f64,
+    ln_beta: f64,
+    split: f64,
+}
+
+impl PreparedStudentT {
+    fn new(df: i32) -> Self {
+        let v = df as f64;
+        let a = v / 2.0;
+        let b = 0.5;
+        Self {
+            df,
+            v,
+            a,
+            b,
+            ln_beta: libm::lgamma(a) + libm::lgamma(b) - libm::lgamma(a + b),
+            split: (a + 1.0) / (a + b + 2.0),
+        }
+    }
+
+    #[inline]
+    fn p_two_sided(&self, t: f64) -> f64 {
+        if self.df <= 0 {
+            return f64::NAN;
+        }
+        if !t.is_finite() {
+            return if t.is_nan() {
+                f64::NAN
+            } else {
+                f64::MIN_POSITIVE
+            };
+        }
+        let x = self.v / (self.v + t * t);
+        let a = self.a;
+        let b = self.b;
+        let mut p = if !(0.0..=1.0).contains(&x) {
+            f64::NAN
+        } else if x == 0.0 {
+            0.0
+        } else if x == 1.0 {
+            1.0
+        } else if x < self.split {
+            let front = ((a * x.ln()) + (b * (1.0 - x).ln()) - self.ln_beta).exp() / a;
+            front * betacf(a, b, x)
+        } else {
+            let front = ((b * (1.0 - x).ln()) + (a * x.ln()) - self.ln_beta).exp() / b;
+            1.0 - front * betacf(b, a, 1.0 - x)
+        };
+        if !p.is_finite() {
+            p = 1.0;
+        }
+        p.clamp(f64::MIN_POSITIVE, 1.0)
+    }
+}
+
 #[inline]
 fn xs_t_ixx_into(xs: &[f64], ixx: &[f64], q0: usize, out_b21: &mut [f64]) {
     for j in 0..q0 {
@@ -2370,6 +2431,7 @@ fn scan_packed_full_matrix_reduced(
             "n too small for reduced FarmCPU scan background: n={n}, q={q0}"
         ));
     }
+    let t_evaluator = PreparedStudentT::new(bg_df - 1);
     let mut bg_beta = vec![0.0_f64; q0];
     matvec_into(ixx_flat, q0, &xy, &mut bg_beta);
     let bg_beta_rhs = dot(&bg_beta, &xy);
@@ -2511,7 +2573,7 @@ fn scan_packed_full_matrix_reduced(
 
                             let se_marker = (ve / b22).sqrt();
                             let marker_p_raw = if se_marker.is_finite() && se_marker > 0.0 {
-                                student_t_p_two_sided(beta_marker / se_marker, df)
+                                t_evaluator.p_two_sided(beta_marker / se_marker)
                             } else {
                                 1.0_f64
                             };
@@ -2525,7 +2587,7 @@ fn scan_packed_full_matrix_reduced(
                                 if !beta_q.is_finite() || !se_q.is_finite() || se_q <= 0.0 {
                                     continue;
                                 }
-                                let p_q = student_t_p_two_sided(beta_q / se_q, df);
+                                let p_q = t_evaluator.p_two_sided(beta_q / se_q);
                                 if p_q.is_finite() && p_q.total_cmp(&local_qtn_min[slot]).is_lt() {
                                     local_qtn_min[slot] = p_q;
                                 }
@@ -2576,7 +2638,7 @@ fn scan_packed_full_matrix_reduced(
 
                         let se_marker = (ve / b22).sqrt();
                         let marker_p_raw = if se_marker.is_finite() && se_marker > 0.0 {
-                            student_t_p_two_sided(beta_marker / se_marker, df)
+                            t_evaluator.p_two_sided(beta_marker / se_marker)
                         } else {
                             1.0_f64
                         };

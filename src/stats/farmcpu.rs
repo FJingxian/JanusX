@@ -940,6 +940,7 @@ fn farmcpu_raw_prior_from_model(
     y: &[f64],
     x_qtn: &[f64],
     ixx: &[f64],
+    rank_x: usize,
     packed_flat: &[u8],
     n_samples: usize,
     row_flip: &[bool],
@@ -961,6 +962,7 @@ fn farmcpu_raw_prior_from_model(
         row_indices,
         sample_idx,
         q_base,
+        rank_x,
         threads,
     )?;
     for (j, &idx) in qtn_idx.iter().enumerate() {
@@ -1772,6 +1774,25 @@ impl GlmScratch {
     }
 }
 
+const FARMCPU_SCAN_BLOCK_MAX_ROWS: usize = 8_192;
+const FARMCPU_SCAN_BLOCK_TARGET_BYTES: usize = 128 * 1024 * 1024;
+
+#[inline]
+fn farmcpu_scan_row_block_size(n_samples: usize, n_markers: usize) -> usize {
+    if n_markers == 0 {
+        return 0;
+    }
+    let bytes_per_row = n_samples.saturating_mul(std::mem::size_of::<f64>());
+    let rows_by_memory = if bytes_per_row == 0 {
+        FARMCPU_SCAN_BLOCK_MAX_ROWS
+    } else {
+        (FARMCPU_SCAN_BLOCK_TARGET_BYTES / bytes_per_row).max(1)
+    };
+    n_markers
+        .min(FARMCPU_SCAN_BLOCK_MAX_ROWS)
+        .min(rows_by_memory)
+}
+
 struct FarmcpuScanBlock {
     row_start: usize,
     rows: usize,
@@ -1933,21 +1954,64 @@ impl FarmcpuQtnColumnCache {
 }
 
 fn pinv_xtx_with_rank(xtx: &[f64], q: usize) -> Result<(Vec<f64>, usize), String> {
+    pinv_symmetric_scaled_with_rank(xtx, q, 1.0e-12_f64, "X'X")
+}
+
+fn pinv_symmetric_scaled_with_rank(
+    matrix: &[f64],
+    q: usize,
+    rcond: f64,
+    matrix_name: &str,
+) -> Result<(Vec<f64>, usize), String> {
     if q == 0 {
         return Ok((Vec::new(), 0usize));
     }
-    let a = DMatrix::<f64>::from_row_slice(q, q, xtx);
-    let svd = a.svd(true, true);
+    if matrix.len() != q.saturating_mul(q) {
+        return Err(format!("{matrix_name} shape mismatch for pseudo-inverse"));
+    }
+    if matrix.iter().any(|value| !value.is_finite()) {
+        return Err(format!("non-finite value in {matrix_name}"));
+    }
+
+    // Normalize the symmetric Gram matrix before rank selection so units do
+    // not make a valid design dimension look like a zero column.
+    let mut column_norm = vec![0.0_f64; q];
+    for j in 0..q {
+        let diagonal = matrix[j * q + j];
+        if diagonal < 0.0 {
+            return Err(format!("negative diagonal value in {matrix_name}"));
+        }
+        if diagonal > 0.0 {
+            column_norm[j] = diagonal.sqrt();
+        }
+    }
+    let mut normalized = DMatrix::<f64>::zeros(q, q);
+    for i in 0..q {
+        if column_norm[i] == 0.0 {
+            continue;
+        }
+        for j in 0..q {
+            if column_norm[j] == 0.0 {
+                continue;
+            }
+            let value = matrix[i * q + j] / column_norm[i] / column_norm[j];
+            if !value.is_finite() {
+                return Err(format!("non-finite value while normalizing {matrix_name}"));
+            }
+            normalized[(i, j)] = value;
+        }
+    }
+
+    let svd = normalized.svd(true, true);
     let u = svd
         .u
-        .ok_or_else(|| "SVD failed to produce U for X'X pseudo-inverse".to_string())?;
+        .ok_or_else(|| format!("SVD failed to produce U for {matrix_name} pseudo-inverse"))?;
     let vt = svd
         .v_t
-        .ok_or_else(|| "SVD failed to produce V^T for X'X pseudo-inverse".to_string())?;
+        .ok_or_else(|| format!("SVD failed to produce V^T for {matrix_name} pseudo-inverse"))?;
     let mut s_inv = DMatrix::<f64>::zeros(q, q);
     let smax = svd.singular_values.iter().copied().fold(0.0_f64, f64::max);
-    let rcond = 1e-12_f64;
-    let cutoff = rcond * smax.max(1.0);
+    let cutoff = rcond * smax;
     let mut rank = 0usize;
     for i in 0..q {
         let s = svd.singular_values[i];
@@ -1957,41 +2021,29 @@ fn pinv_xtx_with_rank(xtx: &[f64], q: usize) -> Result<(Vec<f64>, usize), String
         }
     }
     let v = vt.transpose();
-    let ixx = v * s_inv * u.transpose();
+    let normalized_inverse = v * s_inv * u.transpose();
+    let mut ixx = DMatrix::<f64>::zeros(q, q);
+    for i in 0..q {
+        if column_norm[i] == 0.0 {
+            continue;
+        }
+        for j in 0..q {
+            if column_norm[j] == 0.0 {
+                continue;
+            }
+            let value = normalized_inverse[(i, j)] / column_norm[i] / column_norm[j];
+            if !value.is_finite() {
+                return Err(format!("non-finite value while rescaling ({matrix_name})"));
+            }
+            ixx[(i, j)] = value;
+        }
+    }
     Ok((ixx.as_slice().to_vec(), rank))
 }
 
-fn pinv_xtx(xtx: &[f64], q: usize) -> Result<Vec<f64>, String> {
-    let (ixx, _rank) = pinv_xtx_with_rank(xtx, q)?;
-    Ok(ixx)
-}
-
 fn pinv_square_svd(a_flat: &[f64], q: usize, rcond: f64) -> Result<Vec<f64>, String> {
-    if q == 0 {
-        return Ok(Vec::new());
-    }
-    if a_flat.len() != q.saturating_mul(q) {
-        return Err("square matrix shape mismatch for pseudo-inverse".to_string());
-    }
-    let a = DMatrix::<f64>::from_row_slice(q, q, a_flat);
-    let svd = a.svd(true, true);
-    let u = svd
-        .u
-        .ok_or_else(|| "SVD failed to produce U for square pseudo-inverse".to_string())?;
-    let vt = svd
-        .v_t
-        .ok_or_else(|| "SVD failed to produce V^T for square pseudo-inverse".to_string())?;
-    let mut s_inv = DMatrix::<f64>::zeros(q, q);
-    let smax = svd.singular_values.iter().copied().fold(0.0_f64, f64::max);
-    let cutoff = rcond * smax.max(1.0_f64);
-    for i in 0..q {
-        let s = svd.singular_values[i];
-        if s.is_finite() && s > cutoff {
-            s_inv[(i, i)] = 1.0_f64 / s;
-        }
-    }
-    let v = vt.transpose();
-    Ok((v * s_inv * u.transpose()).as_slice().to_vec())
+    let (inverse, _rank) = pinv_symmetric_scaled_with_rank(a_flat, q, rcond, "square matrix")?;
+    Ok(inverse)
 }
 
 fn pinv_for_row_major_x_with_rank(
@@ -2369,6 +2421,7 @@ fn scan_packed_full_matrix_reduced(
     row_indices: Option<&[usize]>,
     sample_idx: &[usize],
     q_base: usize,
+    rank_x: usize,
     threads: usize,
 ) -> Result<(Vec<f64>, Vec<f64>), String> {
     let n = y.len();
@@ -2400,8 +2453,13 @@ fn scan_packed_full_matrix_reduced(
     if ixx_flat.len() != q0 * q0 {
         return Err("ixx shape mismatch".to_string());
     }
-    if n <= q0 + 1 {
-        return Err(format!("n too small for LM core: n={n}, q={q0}"));
+    if rank_x == 0 || rank_x > q0 {
+        return Err(format!(
+            "invalid FarmCPU background rank: rank={rank_x}, q={q0}"
+        ));
+    }
+    if n <= rank_x + 1 {
+        return Err(format!("n too small for LM core: n={n}, rank={rank_x}"));
     }
     if q_base > q0 {
         return Err(format!(
@@ -2425,10 +2483,10 @@ fn scan_packed_full_matrix_reduced(
         }
     }
     let yy: f64 = y.iter().map(|v| v * v).sum();
-    let bg_df = (n as i32) - (q0 as i32);
+    let bg_df = (n as i32) - (rank_x as i32);
     if bg_df <= 0 {
         return Err(format!(
-            "n too small for reduced FarmCPU scan background: n={n}, q={q0}"
+            "n too small for reduced FarmCPU scan background: n={n}, rank={rank_x}"
         ));
     }
     let t_evaluator = PreparedStudentT::new(bg_df - 1);
@@ -2446,7 +2504,7 @@ fn scan_packed_full_matrix_reduced(
 
     let mut marker_p = vec![1.0_f64; m];
     let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
-    let row_block = 8192usize;
+    let row_block = farmcpu_scan_row_block_size(n, m);
     let mut qtn_min_p = vec![1.0_f64; k_qtn];
     let producer_err = std::sync::Arc::new(std::sync::OnceLock::<String>::new());
     let producer_err_bg = std::sync::Arc::clone(&producer_err);
@@ -2693,6 +2751,7 @@ fn write_farmcpu_packed_main_scan(
     pos: &[i64],
     miss_counts: &[usize],
     q_base: usize,
+    rank_x: usize,
     qtn_lookup: &HashMap<usize, usize>,
     bim_stream: &mut BimSelectedFieldStream,
 ) -> Result<(usize, usize), String> {
@@ -2732,8 +2791,13 @@ fn write_farmcpu_packed_main_scan(
     {
         return Err("row_indices out of bounds for packed rows".to_string());
     }
-    if n <= q0 + 1 {
-        return Err(format!("n too small for LM core: n={n}, q={q0}"));
+    if rank_x == 0 || rank_x > q0 {
+        return Err(format!(
+            "invalid FarmCPU background rank: rank={rank_x}, q={q0}"
+        ));
+    }
+    if n <= rank_x + 1 {
+        return Err(format!("n too small for LM core: n={n}, rank={rank_x}"));
     }
 
     let mut xy = vec![0.0_f64; q0];
@@ -2745,10 +2809,10 @@ fn write_farmcpu_packed_main_scan(
         }
     }
     let yy: f64 = y.iter().map(|v| v * v).sum();
-    let bg_df = (n as i32) - (q0 as i32);
+    let bg_df = (n as i32) - (rank_x as i32);
     if bg_df <= 0 {
         return Err(format!(
-            "n too small for FarmCPU background model: n={n}, q={q0}"
+            "n too small for FarmCPU background model: n={n}, rank={rank_x}"
         ));
     }
     let mut bg_beta = vec![0.0_f64; q0];
@@ -2775,7 +2839,7 @@ fn write_farmcpu_packed_main_scan(
     let full_sample_fast = sample_idx.iter().enumerate().all(|(i, &s)| i == s);
     let impute_major = farmcpu_raw_major_impute_enabled();
     let blas_threads = farmcpu_scan_blas_threads(threads);
-    let row_block = 8192usize;
+    let row_block = farmcpu_scan_row_block_size(n, m);
     let row_stride = 3usize;
     let mut text_buf = String::with_capacity(row_block * 128);
     let mut qtn_text_buf_opt = if qtn_writer.is_some() {
@@ -3041,6 +3105,7 @@ fn write_farmcpu_pseudo_qtn_only(
     y: &[f64],
     x_qtn: &[f64],
     ixx_flat: &[f64],
+    rank_x: usize,
     q_base: usize,
     qtn_idx: &[usize],
     chrom: &[String],
@@ -3085,10 +3150,15 @@ fn write_farmcpu_pseudo_qtn_only(
         }
     }
     let yy: f64 = y.iter().map(|v| v * v).sum();
-    let bg_df = (n as i32) - (q0 as i32);
+    if rank_x == 0 || rank_x > q0 {
+        return Err(format!(
+            "invalid FarmCPU background rank: rank={rank_x}, q={q0}"
+        ));
+    }
+    let bg_df = (n as i32) - (rank_x as i32);
     if bg_df <= 0 {
         return Err(format!(
-            "n too small for FarmCPU background model: n={n}, q={q0}"
+            "n too small for FarmCPU background model: n={n}, rank={rank_x}"
         ));
     }
     let mut bg_beta = vec![0.0_f64; q0];
@@ -3655,7 +3725,7 @@ pub fn farmcpu_packed_to_tsv(
         py.detach(|| -> PyResult<(usize, usize, usize, f64, f64)> {
         let meta_row_idx = source_row_idx.as_deref().or(row_idx.as_deref());
         let stage1_wall_t0 = Instant::now();
-        let mut final_model_cache: Option<(Vec<f64>, usize, Vec<f64>)> = None;
+        let mut final_model_cache: Option<(Vec<f64>, usize, Vec<f64>, usize)> = None;
         let mut qtn_cache = FarmcpuQtnColumnCache::new(n);
         let stage1_timing = farmcpu_stage1_timing_enabled();
         let mut stage1_timing_acc = FarmcpuStage1TimingAccum::default();
@@ -3689,7 +3759,7 @@ pub fn farmcpu_packed_to_tsv(
         }
         {
             let mut prior_p_opt: Option<Vec<f64>> = None;
-            let mut current_model_cache: Option<(Vec<f64>, usize, Vec<f64>)> = None;
+            let mut current_model_cache: Option<(Vec<f64>, usize, Vec<f64>, usize)> = None;
             for it_idx in 0..max_iter_i {
                 let iter_t0 = if stage1_timing {
                     Some(Instant::now())
@@ -3704,7 +3774,7 @@ pub fn farmcpu_packed_to_tsv(
                 let mut merge_secs = 0.0_f64;
                 let mut callback_secs = 0.0_f64;
 
-                let (x_qtn, q_total, ixx) = if let Some(cached) = current_model_cache.take() {
+                let (x_qtn, q_total, ixx, rank_x) = if let Some(cached) = current_model_cache.take() {
                     cached
                 } else {
                     let t_build = if stage1_timing {
@@ -3744,11 +3814,12 @@ pub fn farmcpu_packed_to_tsv(
                             }
                         }
                     }
-                    let ixx = pinv_xtx(&xtx, q_total).map_err(PyRuntimeError::new_err)?;
+                    let (ixx, rank_x) =
+                        pinv_xtx_with_rank(&xtx, q_total).map_err(PyRuntimeError::new_err)?;
                     if let Some(t0) = t_pinv {
                         pinv_secs += t0.elapsed().as_secs_f64();
                     }
-                    (x_qtn, q_total, ixx)
+                    (x_qtn, q_total, ixx, rank_x)
                 };
 
                 if prior_p_opt.is_none() {
@@ -3761,6 +3832,7 @@ pub fn farmcpu_packed_to_tsv(
                         y,
                         &x_qtn,
                         &ixx,
+                        rank_x,
                         &packed_flat,
                         n_samples,
                         row_flip,
@@ -3851,11 +3923,11 @@ pub fn farmcpu_packed_to_tsv(
                         );
                     }
                     if it_idx + 1 >= max_iter_i {
-                        final_model_cache = Some((x_qtn, q_total, ixx));
+                        final_model_cache = Some((x_qtn, q_total, ixx, rank_x));
                         break;
                     }
                     qtn_prev_idx = Some(qtn_idx.clone());
-                    current_model_cache = Some((x_qtn, q_total, ixx));
+                    current_model_cache = Some((x_qtn, q_total, ixx, rank_x));
                     prior_p_opt = Some(prior_p_next);
                     continue;
                 }
@@ -4054,7 +4126,7 @@ pub fn farmcpu_packed_to_tsv(
                             total_secs,
                         );
                     }
-                    final_model_cache = Some((x_qtn, q_total, ixx));
+                    final_model_cache = Some((x_qtn, q_total, ixx, rank_x));
                     break;
                 }
 
@@ -4066,7 +4138,7 @@ pub fn farmcpu_packed_to_tsv(
                 let is_done = (it_idx + 1 >= max_iter_i) || converge >= 1.0_f64 || circle;
 
                 let (next_model_cache, next_prior_p) = if qtn_next == qtn_idx {
-                    ((x_qtn, q_total, ixx), prior_p)
+                    ((x_qtn, q_total, ixx, rank_x), prior_p)
                 } else {
                     let t_build = if stage1_timing {
                         Some(Instant::now())
@@ -4105,8 +4177,9 @@ pub fn farmcpu_packed_to_tsv(
                             }
                         }
                     }
-                    let next_ixx =
-                        pinv_xtx(&next_xtx, next_q_total).map_err(PyRuntimeError::new_err)?;
+                    let (next_ixx, next_rank_x) =
+                        pinv_xtx_with_rank(&next_xtx, next_q_total)
+                            .map_err(PyRuntimeError::new_err)?;
                     if let Some(t0) = t_pinv {
                         pinv_secs += t0.elapsed().as_secs_f64();
                     }
@@ -4119,6 +4192,7 @@ pub fn farmcpu_packed_to_tsv(
                         y,
                         &next_x_qtn,
                         &next_ixx,
+                        next_rank_x,
                         &packed_flat,
                         n_samples,
                         row_flip,
@@ -4133,7 +4207,10 @@ pub fn farmcpu_packed_to_tsv(
                     if let Some(t0) = t_fem {
                         fem_secs += t0.elapsed().as_secs_f64();
                     }
-                    ((next_x_qtn, next_q_total, next_ixx), next_prior_p)
+                    (
+                        (next_x_qtn, next_q_total, next_ixx, next_rank_x),
+                        next_prior_p,
+                    )
                 };
 
                 let t_cb = if stage1_timing {
@@ -4210,7 +4287,7 @@ pub fn farmcpu_packed_to_tsv(
         let stage1_search_secs = stage1_wall_t0.elapsed().as_secs_f64();
 
         let stage2_scan_t0 = Instant::now();
-        let (x_qtn, _q_total, ixx) = if let Some(cached) = final_model_cache.take() {
+        let (x_qtn, _q_total, ixx, rank_x) = if let Some(cached) = final_model_cache.take() {
             cached
         } else {
             let (x_qtn, q_total) = build_x_with_qtn_packed(
@@ -4237,8 +4314,9 @@ pub fn farmcpu_packed_to_tsv(
                     }
                 }
             }
-            let ixx = pinv_xtx(&xtx, q_total).map_err(PyRuntimeError::new_err)?;
-            (x_qtn, q_total, ixx)
+            let (ixx, rank_x) =
+                pinv_xtx_with_rank(&xtx, q_total).map_err(PyRuntimeError::new_err)?;
+            (x_qtn, q_total, ixx, rank_x)
         };
         let k_qtn = qtn_idx.len();
         let mut qtn_lookup: HashMap<usize, usize> = HashMap::with_capacity(k_qtn);
@@ -4280,6 +4358,7 @@ pub fn farmcpu_packed_to_tsv(
                         y,
                         &x_qtn,
                         &ixx,
+                        rank_x,
                         q_base,
                         &qtn_idx,
                         &q_chrom,
@@ -4372,6 +4451,7 @@ pub fn farmcpu_packed_to_tsv(
                 &pos,
                 &miss_counts,
                 q_base,
+                rank_x,
                 &qtn_lookup,
                 &mut bim_stream,
             )
@@ -4659,7 +4739,7 @@ mod tests {
                 }
             }
         }
-        let ixx = pinv_xtx(&xtx, q0).expect("pinv_xtx should succeed");
+        let (ixx, _rank) = pinv_xtx_with_rank(&xtx, q0).expect("pinv_xtx should succeed");
 
         let packed_rows = vec![
             vec![Some(0), Some(1), None, Some(2), Some(1), Some(0), Some(2)],
@@ -4702,6 +4782,7 @@ mod tests {
             Some(&row_indices),
             &sample_idx,
             q_base,
+            q0,
             1,
         )
         .expect("reduced packed scan should succeed");

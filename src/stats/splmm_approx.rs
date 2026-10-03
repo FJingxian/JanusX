@@ -1283,6 +1283,59 @@ mod tests {
     }
 
     #[test]
+    fn gamma_selection_and_assoc_are_invariant_to_phenotype_units() {
+        let analysis = make_diag_analysis(&[1.0, 1.5, 2.0, 3.0]);
+        let x = [1.0; 4];
+        let y = [1.0, -0.25, 0.75, 1.5];
+        let lambda = 0.8;
+        let markers = [[0.0, 1.0, 2.0, 1.0]; 100]
+            .into_iter()
+            .chain([[2.0, 0.0, 1.0, 1.0]; 20])
+            .flatten()
+            .collect::<Vec<_>>();
+        let fit = build_residualized_approx_scan_null_from_lambda_and_factor(
+            analysis.factorize_k_plus_lambda_i(lambda).unwrap(),
+            &x,
+            &y,
+            lambda,
+        )
+        .unwrap();
+        let (gamma, used) = fit
+            .estimate_gamma_from_markers(&x, &markers, 120, 100)
+            .unwrap();
+        assert_eq!(used, 100);
+        let marker = [2.0, 0.0, 1.0, 1.0];
+        let assoc = fit
+            .build_scan_model(&x, gamma)
+            .unwrap()
+            .assoc_from_marker(&marker)
+            .unwrap();
+        for scale in [0.1, 10.0, -10.0] {
+            let scaled_y = y.map(|v| v * scale);
+            let scaled_fit = build_residualized_approx_scan_null_from_lambda_and_factor(
+                analysis.factorize_k_plus_lambda_i(lambda).unwrap(),
+                &x,
+                &scaled_y,
+                lambda,
+            )
+            .unwrap();
+            let (scaled_gamma, scaled_used) = scaled_fit
+                .estimate_gamma_from_markers(&x, &markers, 120, 100)
+                .unwrap();
+            assert_eq!(scaled_used, used, "scale={scale}");
+            assert!((scaled_gamma * scale * scale - gamma).abs() < 1e-12);
+            let scaled_assoc = scaled_fit
+                .build_scan_model(&x, scaled_gamma)
+                .unwrap()
+                .assoc_from_marker(&marker)
+                .unwrap();
+            assert!((scaled_assoc.0 / scale - assoc.0).abs() < 1e-12);
+            assert!((scaled_assoc.1 / scale.abs() - assoc.1).abs() < 1e-12);
+            assert!((scaled_assoc.2 - assoc.2).abs() < 1e-12);
+        }
+    }
+
+    #[test]
     fn lambda_only_scan_null_matches_component_scaled_gamma_and_assoc() {
         let analysis = make_diag_analysis(&[1.0_f64, 1.5_f64, 2.0_f64, 3.0_f64]);
         let x_design = vec![1.0_f64, 1.0_f64, 1.0_f64, 1.0_f64];

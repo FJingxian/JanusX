@@ -980,7 +980,9 @@ impl ResidualizedApproxNullFit {
             residualized_n_used += 1;
 
             let score = dot_f64(g_resid.as_slice(), self.a_vec.as_slice());
-            let chisq = (score * score) / residualized_s_v_s;
+            // a_vec uses the full inverse covariance. Apply the same variance
+            // scale to the marker quadratic form so the null filter is unit invariant.
+            let chisq = (score * score) / (residualized_s_v_s * self.gamma_scale_correction);
             if chisq.is_finite() && chisq < SPLMM_APPROX_FASTGWA_NULL_CHISQ_MAX {
                 fastgwa_ratio_sum += residualized_ratio;
                 n_used += 1;

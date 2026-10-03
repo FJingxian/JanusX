@@ -121,6 +121,9 @@ def _dense_backend_null_fit(route: str, backend_model: Any) -> dict[str, Any]:
         pve=None if pve is None else float(pve),
         ml0=None if ml0 is None else float(ml0),
         reml0=None if reml0 is None else float(reml0),
+        extras={
+            "ml0_model_selection": getattr(backend_model, "ML0_model_selection", None),
+        },
     )
 
 

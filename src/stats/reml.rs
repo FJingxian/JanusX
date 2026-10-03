@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use crate::aireml::ai_reml_null_from_spectral;
 use crate::brent::brent_minimize;
-use crate::linalg::{cholesky_inplace, cholesky_logdet};
+use crate::linalg::{cholesky_gram_inplace, cholesky_logdet, validate_fixed_effect_design};
 use crate::stats_common::get_cached_pool;
 
 #[inline]
@@ -313,16 +313,14 @@ pub(crate) fn reml_loglike(
         }
     }
 
-    let ridge = 1e-6;
     for r in 0..dim {
-        xtv_inv_x[r * dim + r] += ridge;
         for c in 0..r {
             let vrc = xtv_inv_x[r * dim + c];
             xtv_inv_x[c * dim + r] = vrc;
         }
     }
 
-    if cholesky_inplace(&mut xtv_inv_x, dim).is_none() {
+    if cholesky_gram_inplace(&mut xtv_inv_x, dim).is_none() {
         return -1e8;
     }
     let beta = cholesky_solve(&xtv_inv_x, dim, &xtv_inv_y);
@@ -422,16 +420,14 @@ pub(crate) fn ml_loglike(
         }
     }
 
-    let ridge = 1e-6;
     for r in 0..dim {
-        xtv_inv_x[r * dim + r] += ridge;
         for c in 0..r {
             let vrc = xtv_inv_x[r * dim + c];
             xtv_inv_x[c * dim + r] = vrc;
         }
     }
 
-    if cholesky_inplace(&mut xtv_inv_x, dim).is_none() {
+    if cholesky_gram_inplace(&mut xtv_inv_x, dim).is_none() {
         return -1e8;
     }
     let beta = cholesky_solve(&xtv_inv_x, dim, &xtv_inv_y);
@@ -522,16 +518,14 @@ pub(crate) fn final_beta_se(
         }
     }
 
-    let ridge = 1e-6;
     for r in 0..dim {
-        xtv_inv_x[r * dim + r] += ridge;
         for c in 0..r {
             let vrc = xtv_inv_x[r * dim + c];
             xtv_inv_x[c * dim + r] = vrc;
         }
     }
 
-    if cholesky_inplace(&mut xtv_inv_x, dim).is_none() {
+    if cholesky_gram_inplace(&mut xtv_inv_x, dim).is_none() {
         return (f64::NAN, f64::NAN, lbd);
     }
     let beta = cholesky_solve(&xtv_inv_x, dim, &xtv_inv_y);
@@ -579,6 +573,39 @@ pub fn lmm_reml_null_f32<'py>(
     max_iter: usize,
     tol: f64,
 ) -> PyResult<(f64, f64, f64)> {
+    let (lbd, ml_at_reml, reml, _) =
+        fit_lmm_null_f32(py, s, xcov, y_rot, low, high, max_iter, tol, false)?;
+    Ok((lbd, ml_at_reml, reml))
+}
+
+/// Explicit null-fit API: (REML lambda, ML at that lambda, REML, maximized ML).
+/// The legacy three-tuple retains its conditional-ML contract for fixed-lambda PLRT.
+#[pyfunction]
+#[pyo3(signature = (s, xcov, y_rot, low, high, max_iter=50, tol=1e-2))]
+pub fn lmm_null_fit_f32<'py>(
+    py: Python<'py>,
+    s: PyReadonlyArray1<'py, f64>,
+    xcov: PyReadonlyArray2<'py, f64>,
+    y_rot: PyReadonlyArray1<'py, f64>,
+    low: f64,
+    high: f64,
+    max_iter: usize,
+    tol: f64,
+) -> PyResult<(f64, f64, f64, f64)> {
+    fit_lmm_null_f32(py, s, xcov, y_rot, low, high, max_iter, tol, true)
+}
+
+fn fit_lmm_null_f32<'py>(
+    py: Python<'py>,
+    s: PyReadonlyArray1<'py, f64>,
+    xcov: PyReadonlyArray2<'py, f64>,
+    y_rot: PyReadonlyArray1<'py, f64>,
+    low: f64,
+    high: f64,
+    max_iter: usize,
+    tol: f64,
+    maximize_ml: bool,
+) -> PyResult<(f64, f64, f64, f64)> {
     let s = s.as_slice()?;
     let xcov_arr = xcov.as_array();
     let y = y_rot.as_slice()?;
@@ -591,15 +618,29 @@ pub fn lmm_reml_null_f32<'py>(
     if s.len() != n {
         return Err(PyRuntimeError::new_err("len(S) must equal len(y_rot)"));
     }
-    if low >= high {
-        return Err(PyRuntimeError::new_err("low must be < high"));
+    if !low.is_finite()
+        || !high.is_finite()
+        || low >= high
+        || max_iter == 0
+        || !tol.is_finite()
+        || tol <= 0.0
+    {
+        return Err(PyRuntimeError::new_err(
+            "invalid null-fit optimizer bounds, iterations or tolerance",
+        ));
+    }
+    if n <= p_cov || s.iter().chain(y).any(|v| !v.is_finite()) {
+        return Err(PyRuntimeError::new_err(
+            "null fit requires finite inputs and n > number of fixed effects",
+        ));
     }
 
     let xcov_flat: Cow<[f64]> = match xcov.as_slice() {
         Ok(s) => Cow::Borrowed(s),
         Err(_) => Cow::Owned(xcov_arr.iter().copied().collect()),
     };
-    let (best_log10_lbd, best_cost, ml) = py.detach(|| {
+    validate_fixed_effect_design(&xcov_flat, n, p_cov).map_err(PyRuntimeError::new_err)?;
+    let (best_log10_lbd, best_cost, ml_at_reml, ml_max) = py.detach(|| {
         let (best_log10_lbd, best_cost) = brent_minimize(
             |x| -reml_loglike(x, s, &xcov_flat, y, None, n, p_cov),
             low,
@@ -607,12 +648,37 @@ pub fn lmm_reml_null_f32<'py>(
             tol,
             max_iter,
         );
-        let ml = ml_loglike(best_log10_lbd, s, &xcov_flat, y, None, n, p_cov);
-        (best_log10_lbd, best_cost, ml)
+        let ml_at_reml = ml_loglike(best_log10_lbd, s, &xcov_flat, y, None, n, p_cov);
+        let ml_max = if maximize_ml {
+            let (_, ml_cost) = brent_minimize(
+                |x| -ml_loglike(x, s, &xcov_flat, y, None, n, p_cov),
+                low,
+                high,
+                tol,
+                max_iter,
+            );
+            -ml_cost
+        } else {
+            ml_at_reml
+        };
+        (best_log10_lbd, best_cost, ml_at_reml, ml_max)
     });
     let reml = -best_cost;
     let lbd = 10.0_f64.powf(best_log10_lbd);
-    Ok((lbd, ml, reml))
+    if !lbd.is_finite()
+        || lbd <= 0.0
+        || !reml.is_finite()
+        || reml == -1e8
+        || !ml_at_reml.is_finite()
+        || ml_at_reml == -1e8
+        || !ml_max.is_finite()
+        || ml_max == -1e8
+    {
+        return Err(PyRuntimeError::new_err(
+            "null model fit failed; check covariance and positive residual variance",
+        ));
+    }
+    Ok((lbd, ml_at_reml, reml, ml_max))
 }
 
 #[pyfunction]

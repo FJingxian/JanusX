@@ -6315,7 +6315,7 @@ def _run_mixed_trait_packed_multi_entry(
             np.asarray(y_rot_raw, dtype=np.float64).reshape(-1),
             dtype=np.float64,
         )
-        lbd0, ml0, reml0 = jxrs.lmm_reml_null_f32(
+        lbd0, ml0, reml0, ml0_model_selection = jxrs.lmm_null_fit_f32(
             s_shared64,
             x_rot_shared,
             y_rot,
@@ -6341,6 +6341,7 @@ def _run_mixed_trait_packed_multi_entry(
             "trait": trait_name,
             "null_lbd": float(lbd0),
             "ml0": float(ml0),
+            "ml0_model_selection": float(ml0_model_selection),
             "reml0": float(reml0),
             "pve": (float(pve) if pve is not None and np.isfinite(float(pve)) else None),
             "null_secs": max(time.monotonic() - null_t0, 0.0),
@@ -6358,7 +6359,7 @@ def _run_mixed_trait_packed_multi_entry(
             switch_to_lm, lrt_stat, lrt_p = _mixed_model_switch_to_lm_decision(
                 y_vec=y_vec,
                 x_cov=shared_x_cov,
-                lmm_ml0=float(ml0),
+                lmm_ml0=float(ml0_model_selection),
                 alpha=0.05,
             )
         state.update(
@@ -6888,7 +6889,7 @@ def run_lmm_packed_fullrank(
             switch_to_lm, lrt_stat, lrt_p = _mixed_model_switch_to_lm_decision(
                 y_vec=y_vec,
                 x_cov=x_cov,
-                lmm_ml0=getattr(mod, "ML0", None),
+                lmm_ml0=getattr(mod, "ML0_model_selection", None),
                 alpha=0.05,
             )
             if switch_to_lm:

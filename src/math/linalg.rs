@@ -311,6 +311,81 @@ pub(crate) fn format_chisq_value(value: f64) -> String {
     format!("{value:.4e}")
 }
 
+/// Factor a fixed-effect Gram matrix without penalizing the regression.
+/// Diagonal equilibration changes only numerical units, not the projection.
+/// Singular designs must fail rather than silently acquire a ridge prior.
+pub(crate) fn cholesky_gram_inplace(a: &mut [f64], dim: usize) -> Option<()> {
+    if a.len() != dim.checked_mul(dim)? || a.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let scales: Vec<f64> = (0..dim).map(|i| a[i * dim + i].sqrt()).collect();
+    if scales.iter().any(|s| !s.is_finite() || *s <= 0.0) {
+        return None;
+    }
+    for i in 0..dim {
+        for j in 0..=i {
+            a[i * dim + j] = (a[i * dim + j] / scales[i]) / scales[j];
+        }
+    }
+    cholesky_inplace(a, dim)?;
+    for i in 0..dim {
+        for j in 0..=i {
+            a[i * dim + j] *= scales[i];
+        }
+    }
+    Some(())
+}
+
+/// Check identifiability before null optimization, without a scale-dependent
+/// penalty or silently dropping fixed effects. Reorthogonalization avoids
+/// squaring the condition number as a Gram-only rank check would do.
+pub(crate) fn validate_fixed_effect_design(
+    x: &[f64],
+    n: usize,
+    p: usize,
+) -> Result<(), &'static str> {
+    if n == 0 || n.checked_mul(p) != Some(x.len()) {
+        return Err("invalid fixed-effect design dimensions");
+    }
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err("fixed-effect design contains non-finite values");
+    }
+    let tol = 8.0 * f64::EPSILON * n.max(p) as f64;
+    let mut basis: Vec<Vec<f64>> = Vec::with_capacity(p);
+    for col in 0..p {
+        let scale = (0..n).map(|i| x[i * p + col].abs()).fold(0.0, f64::max);
+        if scale == 0.0 {
+            return Err(
+                "fixed-effect design is rank deficient; remove zero or duplicate covariates",
+            );
+        }
+        let mut v: Vec<f64> = (0..n).map(|i| x[i * p + col] / scale).collect();
+        let norm = v.iter().map(|z| z * z).sum::<f64>().sqrt();
+        for z in &mut v {
+            *z /= norm;
+        }
+        for _ in 0..2 {
+            for q in &basis {
+                let dot: f64 = v.iter().zip(q).map(|(v, q)| v * q).sum();
+                for (v, q) in v.iter_mut().zip(q) {
+                    *v -= dot * q;
+                }
+            }
+        }
+        let norm = v.iter().map(|z| z * z).sum::<f64>().sqrt();
+        if !norm.is_finite() || norm <= tol {
+            return Err(
+                "fixed-effect design is rank deficient; remove constant or duplicate covariates",
+            );
+        }
+        for z in &mut v {
+            *z /= norm;
+        }
+        basis.push(v);
+    }
+    Ok(())
+}
+
 pub(crate) fn cholesky_inplace(a: &mut [f64], dim: usize) -> Option<()> {
     for i in 0..dim {
         for j in 0..=i {

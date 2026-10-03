@@ -215,9 +215,9 @@ use farmcpu::{
 use fast_math::fastlmm_prepare_lowrank_f64;
 use fst::{fst_bed, fst_bed_to_tsv, fst_bed_window_to_tsv};
 use fvlmm::{
-    fastlmm_assoc_chunk_f32, fastlmm_assoc_from_snp_f32, fastlmm_reml_chunk_f32,
-    fastlmm_reml_null_f32, fvlmm_assoc_bed_to_tsv_f32, fvlmm_assoc_chunk_f32,
-    fvlmm_assoc_chunk_from_snp_f32, fvlmm_assoc_chunk_from_snp_to_tsv_f32,
+    fastlmm_assoc_chunk_f32, fastlmm_assoc_from_snp_f32, fastlmm_null_fit_f32,
+    fastlmm_reml_chunk_f32, fastlmm_reml_null_f32, fvlmm_assoc_bed_to_tsv_f32,
+    fvlmm_assoc_chunk_f32, fvlmm_assoc_chunk_from_snp_f32, fvlmm_assoc_chunk_from_snp_to_tsv_f32,
     fvlmm_assoc_chunk_from_snp_with_cache_f32, fvlmm_assoc_chunk_with_cache_f32,
     fvlmm_assoc_kfile_to_tsv_f32, fvlmm_assoc_packed_f32_to_tsv, fvlmm_assoc_prepare_cache_f32,
     FvLmmAssocCache,
@@ -311,8 +311,8 @@ use packed::{
 };
 use plot::{qq_band_beta_logp_exact, qq_rank_sample_zero_based};
 use reml::{
-    ai_reml_multi_f64, ai_reml_null_f64, lmm_reml_null_f32, lmm_rotate_x_y_with_ut_f64,
-    lmm_rotate_y_with_ut_f64, ml_loglike_null_f32,
+    ai_reml_multi_f64, ai_reml_null_f64, lmm_null_fit_f32, lmm_reml_null_f32,
+    lmm_rotate_x_y_with_ut_f64, lmm_rotate_y_with_ut_f64, ml_loglike_null_f32,
 };
 use rrblup::{
     rrblup_exact_snp_fit_prepared, rrblup_exact_snp_fit_prepared_bed, rrblup_exact_snp_packed,
@@ -939,6 +939,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(gwas_lmm_lm_null_lrt_decision, m)?)?;
     m.add_function(wrap_pyfunction!(farmcpu_write_assoc_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_reml_null_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(lmm_null_fit_f32, m)?)?;
     m.add_function(wrap_pyfunction!(ml_loglike_null_f32, m)?)?;
     m.add_function(wrap_pyfunction!(ai_reml_null_f64, m)?)?;
     m.add_function(wrap_pyfunction!(ai_reml_multi_f64, m)?)?;
@@ -971,6 +972,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fastlmm_assoc_from_snp_f32, m)?)?;
     m.add_function(wrap_pyfunction!(fvlmm_assoc_packed_f32_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(fastlmm_reml_null_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(fastlmm_null_fit_f32, m)?)?;
     m.add_function(wrap_pyfunction!(fastlmm_reml_chunk_f32, m)?)?;
     m.add_function(wrap_pyfunction!(bayesa, m)?)?;
     m.add_function(wrap_pyfunction!(bayesb, m)?)?;

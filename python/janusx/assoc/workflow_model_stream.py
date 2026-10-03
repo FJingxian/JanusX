@@ -1526,7 +1526,7 @@ def run_chunked_gwas_lmm_lm(
                 switch_to_lm, lrt_stat, lrt_p = _mixed_model_switch_to_lm_decision(
                     y_vec=y_vec,
                     x_cov=X_cov,
-                    lmm_ml0=getattr(mod, "ML0", None),
+                    lmm_ml0=getattr(mod, "ML0_model_selection", None),
                     alpha=0.05,
                 )
                 null_lrt_p = float(lrt_p)
@@ -2845,7 +2845,7 @@ def run_chunked_gwas_streaming_shared(
             switch_to_lm, lrt_stat, lrt_p = _mixed_model_switch_to_lm_decision(
                 y_vec=y_vec,
                 x_cov=X_cov,
-                lmm_ml0=getattr(mod, "ML0", None),
+                lmm_ml0=getattr(mod, "ML0_model_selection", None),
                 alpha=0.05,
             )
             null_lrt_p = float(lrt_p)

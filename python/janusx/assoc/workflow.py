@@ -1019,8 +1019,9 @@ def _mixed_model_switch_to_lm_decision(
     """
     Decide whether a mixed-model null fit should collapse to LM.
 
-    This compares the null-model log-likelihood against the plain LM null
-    model under the boundary test H0: Va = 0.
+    This compares separately maximized null ML against the plain LM null
+    model under the boundary test H0: Va = 0. Do not pass ML evaluated only
+    at the REML-optimal lambda; that conditional value is for fixed-lambda PLRT.
     """
     ml0 = None
     try:

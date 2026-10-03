@@ -210,10 +210,12 @@ from janusx.janusx import (
     lm_block_assoc_f32,
     lmm_reml_chunk_f32,
     lmm_reml_null_f32,
+    lmm_null_fit_f32,
     ml_loglike_null_f32,
     lmm_assoc_chunk_f32,
     fastlmm_reml_chunk_f32,
     fastlmm_reml_null_f32,
+    fastlmm_null_fit_f32,
     fastlmm_assoc_chunk_f32,
 )
 import janusx.janusx as _jxrs
@@ -897,7 +899,9 @@ def lmm_reml_null(
         Null-model lambda (ve/vg).
 
     ml : float
-        Null ML log-likelihood (higher is better).
+        Null ML evaluated at the returned REML lambda (higher is better).
+        This legacy value is for conditional/fixed-lambda comparisons, not
+        the maximized ML needed for automatic mixed-model selection.
 
     reml : float
         Null REML log-likelihood (higher is better).
@@ -1057,7 +1061,8 @@ def fastlmm_reml_null(
         Estimated lambda (ve/vg).
 
     ml : float
-        ML log-likelihood (higher is better).
+        Null ML evaluated at the returned REML lambda (higher is better).
+        This legacy value is not the maximized ML used for model selection.
 
     reml : float
         REML log-likelihood (higher is better).
@@ -1814,13 +1819,14 @@ class LMM:
             self.u1ty = np.ascontiguousarray(np.asarray(u1ty, dtype=np.float64).reshape(-1), dtype=np.float64)
             self.u2ty = np.ascontiguousarray(np.asarray(u2ty, dtype=np.float64).reshape(-1), dtype=np.float64)
             self.y = y_vec.reshape(-1, 1)
-            lbd_null, ml0, reml = fastlmm_reml_null(
+            lbd_null, ml0, reml, ml0_model_selection = fastlmm_null_fit_f32(
                 self.S,
                 self.u1tx,
                 self.u2tx,
                 self.u1ty,
                 self.u2ty,
-                (-5, 5),
+                -5.0,
+                5.0,
                 max_iter=50,
                 tol=1e-3,
                 model="add",
@@ -1844,11 +1850,12 @@ class LMM:
             )
             self.Xcov = np.ascontiguousarray(np.asarray(xcov_rot, dtype=np.float64), dtype=np.float64)
             self.y = np.ascontiguousarray(np.asarray(y_rot, dtype=np.float64), dtype=np.float64)
-            lbd_null, ml0, reml = lmm_reml_null(
+            lbd_null, ml0, reml, ml0_model_selection = lmm_null_fit_f32(
                 self.S,
                 self.Xcov,
-                self.y,
-                (-5, 5),
+                self.y.reshape(-1),
+                -5.0,
+                5.0,
                 max_iter=50,
                 tol=1e-3,
             )
@@ -1885,6 +1892,9 @@ class LMM:
         self.pve_pheno_scale = float(self.pve)
         self.LL0 = float(reml)
         self.ML0 = float(ml0)
+        # Do not reuse ML0_model_selection in fixed-lambda PLRT: its null
+        # likelihood maximizes a different nuisance-parameter objective.
+        self.ML0_model_selection = float(ml0_model_selection)
         if self.pve > 0.95 or self.pve < 0.05 or (not np.isfinite(self.lbd_null)) or self.lbd_null <= 0.0:
             self.bounds = (-5, 5)
         else:
@@ -1910,6 +1920,7 @@ class LMM:
             "sigma_e2_null",
             "LL0",
             "ML0",
+            "ML0_model_selection",
             "bounds",
             "evd_secs",
             "n",

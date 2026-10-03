@@ -8,7 +8,7 @@ use crate::farmcpu::farmcpu_packed_to_tsv;
 use crate::fvlmm::fvlmm_assoc_packed_f32_to_tsv;
 use crate::glm::ixx_from_x_qr;
 use crate::glm::lm_block_assoc_packed_to_tsv;
-use crate::linalg::{chi2_sf_df1, cholesky_inplace, cholesky_solve_into};
+use crate::linalg::{chi2_sf_df1, cholesky_gram_inplace, cholesky_solve_into};
 use crate::lmm::lmm_reml_assoc_packed_f32_to_tsv;
 
 fn req_item<'py>(d: &Bound<'py, PyDict>, key: &str) -> PyResult<Bound<'py, PyAny>> {
@@ -86,14 +86,7 @@ fn lm_null_ml_from_y_xcov(y: &[f64], xcov: &[f64], n: usize, p_cov: usize) -> Op
     }
 
     let mut chol = xtx.clone();
-    if cholesky_inplace(&mut chol, dim).is_none() {
-        for i in 0..dim {
-            chol[i * dim + i] += 1e-8;
-        }
-        if cholesky_inplace(&mut chol, dim).is_none() {
-            return None;
-        }
-    }
+    cholesky_gram_inplace(&mut chol, dim)?;
 
     let mut beta = vec![0.0_f64; dim];
     cholesky_solve_into(&chol, dim, &xty, &mut beta);

@@ -123,6 +123,13 @@ def _dense_backend_null_fit(route: str, backend_model: Any) -> dict[str, Any]:
         reml0=None if reml0 is None else float(reml0),
         extras={
             "ml0_model_selection": getattr(backend_model, "ML0_model_selection", None),
+            "fixed_effect_rank": getattr(backend_model, "fixed_effect_rank", None),
+            "fixed_effect_dropped_columns": (
+                np.asarray(
+                    getattr(backend_model, "fixed_effect_dropped_columns", []),
+                    dtype=np.int64,
+                ).tolist()
+            ),
         },
     )
 

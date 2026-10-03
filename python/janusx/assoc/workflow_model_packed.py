@@ -67,6 +67,7 @@ from .workflow import (
     _log_model_line,
     _make_deferred_bim_metadata,
     _mixed_model_switch_to_lm_decision,
+    _rank_reduce_fixed_effect_design,
     _progress_callback_step,
     _coerce_bim_site_columns,
     latest_genotype_mtime,
@@ -6245,15 +6246,15 @@ def _run_mixed_trait_packed_multi_entry(
     dh_shared = np.ascontiguousarray(np.asarray(eigvecs.T, dtype=np.float32), dtype=np.float32)
     s_shared64 = np.ascontiguousarray(np.maximum(eigvals, 0.0), dtype=np.float64)
     shared_x_design = np.ascontiguousarray(
-        np.concatenate(
-            [
-                np.ones((int(shared_n_idv), 1), dtype=np.float64),
-                shared_x_cov,
-            ],
-            axis=1,
+        np.column_stack(
+            [np.ones(int(shared_n_idv), dtype=np.float64), shared_x_cov]
         ),
         dtype=np.float64,
     )
+    shared_x_design, _fixed_effect_kept, _fixed_effect_dropped = (
+        _rank_reduce_fixed_effect_design(shared_x_design)
+    )
+    shared_x_cov = np.ascontiguousarray(shared_x_design[:, 1:], dtype=np.float64)
     x_rot_shared_raw, _shared_zero_y = jxrs.lmm_rotate_x_y_with_ut_f64(
         dh_shared,
         shared_x_design,

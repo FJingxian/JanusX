@@ -528,6 +528,84 @@ jobs:
           print("[janusx] OpenBLAS threading self-check passed")
           PY
 
+      - name: Verify Windows numerical runtime guard
+        if: ${{ matrix.label == 'windows-x86_64' }}
+        shell: bash
+        run: |
+          PY=python
+          command -v python >/dev/null 2>&1 || PY=python3
+          "$PY" - <<'PY'
+          import os
+          import sys
+          import tempfile
+          from pathlib import Path
+          from unittest.mock import patch
+
+          # Build-time DLL hints must not leak into the clean wheel runtime.
+          for name in (
+              "OPENBLAS_BIN_DIR",
+              "OPENBLAS_LIB_DIR",
+              "LIBRARY_BIN",
+              "LIBRARY_LIB",
+              "JANUSX_ALLOW_EXTERNAL_NUMERICAL_LIBRARIES",
+          ):
+              os.environ.pop(name, None)
+          import janusx
+          import janusx.janusx as _native
+
+          print(f"[janusx] windows native module={_native.__file__}")
+
+          with tempfile.TemporaryDirectory() as tmp:
+              root = Path(tmp)
+              active = root / "active"
+              stale = root / "stale"
+              (active / "Library" / "bin").mkdir(parents=True)
+              (active / "Library" / "lib").mkdir(parents=True)
+              (stale / "Library" / "bin").mkdir(parents=True)
+              (stale / "Library" / "lib").mkdir(parents=True)
+              with (
+                  patch.object(sys, "prefix", str(active)),
+                  patch.object(sys, "base_prefix", str(active)),
+                  patch.dict(os.environ, {"CONDA_PREFIX": str(stale)}),
+              ):
+                  for name in (
+                      "OPENBLAS_BIN_DIR",
+                      "OPENBLAS_LIB_DIR",
+                      "LIBRARY_BIN",
+                      "LIBRARY_LIB",
+                  ):
+                      os.environ.pop(name, None)
+                  dirs = {path.resolve() for path in janusx._windows_dll_search_dirs()}
+                  assert (active / "Library" / "bin").resolve() in dirs
+                  assert (active / "Library" / "lib").resolve() in dirs
+                  assert (stale / "Library" / "bin").resolve() not in dirs
+                  assert (stale / "Library" / "lib").resolve() not in dirs
+
+              trusted = active / "Library" / "bin"
+              foreign = root / "foreign" / "Library" / "bin"
+              foreign.mkdir(parents=True)
+              (foreign / "libopenblas.dll").touch()
+              hints = {
+                  "OPENBLAS_BIN_DIR": str(foreign),
+                  "OPENBLAS_LIB_DIR": "",
+                  "LIBRARY_BIN": "",
+                  "LIBRARY_LIB": "",
+                  "JANUSX_ALLOW_EXTERNAL_NUMERICAL_LIBRARIES": "",
+              }
+              with patch.dict(os.environ, hints):
+                  try:
+                      janusx._validate_windows_library_environment([trusted])
+                  except RuntimeError as exc:
+                      assert "OPENBLAS_BIN_DIR" in str(exc)
+                  else:
+                      raise AssertionError("external OpenBLAS DLL directory was accepted")
+
+                  with patch.dict(os.environ, {"JANUSX_ALLOW_EXTERNAL_NUMERICAL_LIBRARIES": "1"}):
+                      janusx._validate_windows_library_environment([trusted])
+
+          print("[janusx] Windows numerical runtime guard passed")
+          PY
+
       - name: Verify KMC prebuilt in wheel (all except windows-arm64)
         if: ${{ matrix.label != 'windows-arm64' }}
         shell: bash

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import os
 import site
 import sys
@@ -11,6 +12,20 @@ from pathlib import Path
 _DLL_DIR_HANDLES: list[object] = []
 _NATIVE_EXT_PATTERNS = ("janusx*.so", "janusx*.pyd")
 _RUNTIME_CACHE_ROOT_ENV = "JANUSX_RUNTIME_CACHE_DIR"
+_ALLOW_EXTERNAL_RUNTIME_ENV = "JANUSX_ALLOW_EXTERNAL_NUMERICAL_LIBRARIES"
+_WINDOWS_NUMERICAL_RUNTIME_PATTERNS = (
+    "libopenblas*.dll",
+    "openblas*.dll",
+    "libblas*.dll",
+    "blas*.dll",
+    "liblapack*.dll",
+    "lapack*.dll",
+    "libomp*.dll",
+    "libgomp*.dll",
+    "libiomp*.dll",
+    "mkl*.dll",
+    "vcomp*.dll",
+)
 
 
 def _runtime_cache_root() -> Path:
@@ -177,50 +192,134 @@ def _extend_package_path_for_native_extension() -> None:
 _extend_package_path_for_native_extension()
 
 
-def _init_windows_dll_search_path() -> None:
-    if os.name != "nt" or not hasattr(os, "add_dll_directory"):
+def _matching_conda_prefix() -> Path | None:
+    raw = str(os.environ.get("CONDA_PREFIX", "")).strip()
+    if not raw:
+        return None
+    try:
+        conda_prefix = Path(raw).resolve()
+        runtime_prefixes = {Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve()}
+        return conda_prefix if conda_prefix in runtime_prefixes else None
+    except OSError:
+        return None
+
+
+def _is_inside_any(path: Path, roots: list[Path]) -> bool:
+    for root in roots:
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _matches_numerical_runtime(name: str, patterns: tuple[str, ...]) -> bool:
+    return any(fnmatch.fnmatchcase(name.lower(), pattern.lower()) for pattern in patterns)
+
+
+def _windows_trusted_library_dirs() -> list[Path]:
+    dirs: list[Path] = []
+    for pkg_dir in _iter_janusx_package_dirs():
+        dirs.extend([pkg_dir, pkg_dir / ".libs", pkg_dir.parent / "janusx.libs"])
+    for prefix in (Path(sys.prefix), Path(sys.base_prefix)):
+        dirs.extend(
+            [prefix / "Library" / "bin", prefix / "Library" / "lib", prefix / "DLLs", prefix / "bin"]
+        )
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for directory in dirs:
+        try:
+            resolved = directory.resolve()
+        except OSError:
+            resolved = directory
+        if resolved not in seen:
+            seen.add(resolved)
+            out.append(resolved)
+    return out
+
+
+def _validate_windows_library_environment(library_dirs: list[Path] | None = None) -> None:
+    """Reject stale explicit Windows DLL hints unless the caller opts in."""
+    if str(os.environ.get(_ALLOW_EXTERNAL_RUNTIME_ENV, "")).strip().lower() in (
+        "1", "true", "yes", "y", "on"
+    ):
         return
+
+    trusted = [path.resolve() for path in (library_dirs or _windows_trusted_library_dirs())]
+    for variable in ("OPENBLAS_BIN_DIR", "OPENBLAS_LIB_DIR", "LIBRARY_BIN", "LIBRARY_LIB"):
+        raw = str(os.environ.get(variable, "")).strip()
+        if not raw:
+            continue
+        directory = Path(raw).expanduser().resolve()
+        for pattern in _WINDOWS_NUMERICAL_RUNTIME_PATTERNS:
+            for candidate in directory.glob(pattern):
+                if candidate.is_file() and not _is_inside_any(candidate.resolve(), trusted):
+                    raise RuntimeError(
+                        f"{variable} points to an external BLAS/OpenMP DLL: {candidate.resolve()}. "
+                        f"Remove the stale override or set {_ALLOW_EXTERNAL_RUNTIME_ENV}=1 only "
+                        "when this external runtime is intentional."
+                    )
+
+
+def _windows_dll_search_dirs() -> list[Path]:
     pkg_dirs: list[Path] = []
     for raw in globals().get("__path__", [Path(__file__).resolve().parent]):
         try:
             pkg_dirs.append(Path(str(raw)))
         except Exception:
             continue
-    if len(pkg_dirs) == 0:
+    if not pkg_dirs:
         pkg_dirs = [Path(__file__).resolve().parent]
 
-    cands: list[Path] = []
+    candidates: list[Path] = []
     for pkg_dir in pkg_dirs:
-        cands.extend([
-            pkg_dir,
-            pkg_dir / ".libs",
-            pkg_dir.parent / "janusx.libs",
-        ])
+        candidates.extend([pkg_dir, pkg_dir / ".libs", pkg_dir.parent / "janusx.libs"])
 
-    # Optional external hints (useful for local editable/dev runs).
-    for var in ("OPENBLAS_BIN_DIR", "OPENBLAS_LIB_DIR", "LIBRARY_BIN", "LIBRARY_LIB"):
-        raw = str(os.environ.get(var, "")).strip()
+    # Keep explicit development overrides, then add the actual interpreter's
+    # DLL directories even when CONDA_PREFIX is absent or stale.
+    for variable in ("OPENBLAS_BIN_DIR", "OPENBLAS_LIB_DIR", "LIBRARY_BIN", "LIBRARY_LIB"):
+        raw = str(os.environ.get(variable, "")).strip()
         if raw:
-            cands.append(Path(raw))
-    conda_prefix = str(os.environ.get("CONDA_PREFIX", "")).strip()
-    if conda_prefix:
-        cp = Path(conda_prefix)
-        cands.extend([cp / "Library" / "bin", cp / "Library" / "lib", cp / "DLLs", cp / "bin"])
+            candidates.append(Path(raw))
 
-    seen: set[str] = set()
-    for d in cands:
+    prefixes: list[Path] = []
+    for prefix in (Path(sys.prefix), Path(sys.base_prefix), _matching_conda_prefix()):
+        if prefix is None:
+            continue
         try:
-            rd = d.resolve()
-        except Exception:
-            rd = d
-        key = str(rd).lower()
-        if key in seen:
+            resolved = prefix.resolve()
+        except OSError:
+            resolved = prefix
+        if resolved not in prefixes:
+            prefixes.append(resolved)
+    for prefix in prefixes:
+        candidates.extend(
+            [prefix / "Library" / "bin", prefix / "Library" / "lib", prefix / "DLLs", prefix / "bin"]
+        )
+
+    out: list[Path] = []
+    seen: set[str] = set()
+    for directory in candidates:
+        try:
+            resolved = directory.resolve()
+        except OSError:
+            resolved = directory
+        key = str(resolved).lower()
+        if key in seen or not resolved.is_dir():
             continue
         seen.add(key)
-        if not rd.exists() or not rd.is_dir():
-            continue
+        out.append(resolved)
+    return out
+
+
+def _init_windows_dll_search_path() -> None:
+    if os.name != "nt" or not hasattr(os, "add_dll_directory"):
+        return
+    _validate_windows_library_environment()
+    for directory in _windows_dll_search_dirs():
         try:
-            h = os.add_dll_directory(str(rd))
+            h = os.add_dll_directory(str(directory))
             _DLL_DIR_HANDLES.append(h)
         except Exception:
             pass

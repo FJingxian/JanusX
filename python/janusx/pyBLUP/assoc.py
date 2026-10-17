@@ -349,6 +349,7 @@ from janusx.janusx import (
     lmm_reml_chunk_f32,
     lmm_reml_null_f32,
     lmm_null_fit_f32,
+    lmm_null_pve_se_f64,
     ml_loglike_null_f32,
     lmm_assoc_chunk_f32,
     fastlmm_reml_chunk_f32,
@@ -2041,6 +2042,19 @@ class LMM:
             self.pve_vc_ratio_raw = float("nan")
             self.pve_component_ratio_raw = float("nan")
         self.pve_pheno_scale = float(self.pve)
+        self.pve_se = float("nan")
+        if not self.lowrank and np.isfinite(self.lbd_null) and self.lbd_null > 0.0:
+            self.pve_se = float(
+                lmm_null_pve_se_f64(
+                    self.S,
+                    self.Xcov,
+                    self.y.reshape(-1),
+                    float(np.log10(self.lbd_null)),
+                    float(self.trace_mean),
+                    -5.0,
+                    5.0,
+                )
+            )
         self.LL0 = float(reml)
         self.ML0 = float(ml0)
         # Do not reuse ML0_model_selection in fixed-lambda PLRT: its null
@@ -2065,6 +2079,7 @@ class LMM:
             "lbd_null",
             "pve",
             "pve_pheno_scale",
+            "pve_se",
             "pve_vc_ratio_raw",
             "pve_component_ratio_raw",
             "sigma_g2_null",

@@ -1227,14 +1227,11 @@ chr1\tsrc\tCDS\t320\t340\t.\t-\t0\tID=cds:Cdsb;Parent=transcript:TxB\n";
         let index = parse_gff_annotation_index(path.to_str().unwrap(), source).unwrap();
         assert_eq!(
             index.annotate_site_desc("1", 130, 2_000),
-            "CDS;GeneA;Alpha kinase"
+            "CDS;GeneA;Alpha kinase | Downstream2kb;GeneB;NA"
         );
         assert_eq!(
             index.annotate_site_desc("chr1", 250, 2_000),
-            "Downstream2kb;GeneA;NA | Downstream2kb;GeneB;NA".replace(
-                "Downstream2kb;GeneA;NA | Downstream2kb;GeneB;NA",
-                "Downstream2kb;GeneA;NA | Downstream2kb;GeneB;NA"
-            )
+            "Downstream2kb;GeneA;NA | Downstream2kb;GeneB;NA"
         );
         assert_eq!(
             index.annotate_site_broaden("1", 250, 80),

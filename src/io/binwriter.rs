@@ -603,6 +603,8 @@ mod tests {
         let dir = make_temp_dir("binwriter_kmer");
         let bin_path = dir.join("toy.bin");
         let bin_str = bin_path.to_str().unwrap();
+        let id_path = crate::bincore::bin01_id_sidecar_path(bin_str);
+        fs::write(&id_path, "I0\nI1\nI2\nI3\nI4\n").unwrap();
 
         let mut writer = Bin01Writer::new(bin_str, 5, Bin01SiteMode::LegacyKmerBinary).unwrap();
         let packed = [0b0001_0101u8, 0b0000_1010u8];

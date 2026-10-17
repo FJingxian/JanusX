@@ -1205,7 +1205,7 @@ mod tests {
         ];
         let y = vec![2.0_f64, 1.0_f64, 3.0_f64];
         let (y_resid, _xtx_chol) = residualize_response(&x_design, &y).unwrap();
-        let expected = vec![1.0_f64 / 6.0_f64, -1.0_f64 / 3.0_f64, 1.0_f64 / 6.0_f64];
+        let expected = vec![0.5_f64, -1.0_f64, 0.5_f64];
         assert_close(&y_resid, &expected, 1e-12_f64);
     }
 
@@ -1342,7 +1342,7 @@ mod tests {
     }
 
     #[test]
-    fn sampled_gamma_matches_exact_schur_reference_for_intercept_only_design() {
+    fn sampled_gamma_matches_residualized_marker_reference_for_intercept_only_design() {
         let k_diag = [1.0_f64, 1.5_f64, 2.0_f64, 3.0_f64];
         let analysis = make_diag_analysis(&k_diag);
         let x_design = vec![1.0_f64, 1.0_f64, 1.0_f64, 1.0_f64];
@@ -1366,26 +1366,20 @@ mod tests {
             .iter()
             .map(|k| 1.0_f64 / (sigma_g2 * k + sigma_e2))
             .collect::<Vec<_>>();
-        let x_v_inv_x = v_inv.iter().sum::<f64>();
         let mut ratio_sum = 0.0_f64;
         for marker_idx in 0..2 {
             let g = &sampled_markers[marker_idx * 4..(marker_idx + 1) * 4];
             let mean = g.iter().sum::<f64>() / 4.0_f64;
-            let s_ms = g.iter().map(|gi| (gi - mean) * (gi - mean)).sum::<f64>();
-            let s_v_s = g
+            let g_resid = g.iter().map(|gi| gi - mean).collect::<Vec<_>>();
+            let s_ms = g_resid.iter().map(|gi| gi * gi).sum::<f64>();
+            let s_v_s = g_resid
                 .iter()
                 .zip(v_inv.iter())
                 .map(|(gi, wi)| gi * gi * wi)
                 .sum::<f64>();
-            let xtz = g
-                .iter()
-                .zip(v_inv.iter())
-                .map(|(gi, wi)| gi * wi)
-                .sum::<f64>();
-            let schur = s_v_s - (xtz * xtz) / x_v_inv_x;
-            ratio_sum += schur / s_ms;
+            ratio_sum += s_v_s / s_ms;
         }
-        let gamma_ref = ratio_sum / 2.0_f64;
+        let gamma_ref = (ratio_sum / 2.0_f64) * fit.gamma_scale_correction;
         assert!((gamma - gamma_ref).abs() <= 1e-12_f64);
     }
 

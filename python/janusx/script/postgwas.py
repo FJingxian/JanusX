@@ -11080,8 +11080,8 @@ def _postgwas_should_draw_threshold_line(
     *,
     no_logtrans: bool = False,
 ) -> bool:
-    """Disable only the automatic threshold line for precomputed logP."""
-    return not (bool(no_logtrans) and explicit_threshold is None)
+    """Draw a threshold line only when the user explicitly requests one."""
+    return explicit_threshold is not None
 
 
 def _postgwas_output_format_from_path(path: str) -> str:
@@ -12582,7 +12582,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
     # ------------------------------------------------------------------
     # 2. Annotation of significant loci
     # ------------------------------------------------------------------
-    if args.anno:
+    if args.anno and args.thr is not None:
         if not status_enabled:
             logger.info(f"Annotating significant SNPs from {src}... [{format_elapsed(0.0)}]")
         with CliStatus(
@@ -12900,7 +12900,9 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
         logger.error("No valid SNPs available for merged plotting.")
         return
 
-    if needs_positional_merge and len(chrom_sets) >= 2:
+    # Local plots share explicit physical ranges, so input files need not
+    # cover the same chromosomes outside those ranges (e.g. sparse highlights).
+    if needs_positional_merge and args.bimrange_tuples is None and len(chrom_sets) >= 2:
         ref_i, ref_file, ref_chroms = chrom_sets[0]
         mismatch_items: list[tuple[int, str, int, int]] = []
         for i, file, chroms in chrom_sets[1:]:
@@ -13118,10 +13120,14 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
             x_keep = np.asarray(dfi.loc[keep, "_x"], dtype=float)
             y_keep = yy[keep]
             p_keep = pvals_i[keep]
-            sig_keep = _postgwas_significant_p_mask(
-                p_keep,
-                threshold_merge,
-                no_logtrans=no_logtrans,
+            sig_keep = (
+                _postgwas_significant_p_mask(
+                    p_keep,
+                    threshold_merge,
+                    no_logtrans=no_logtrans,
+                )
+                if args.thr is not None
+                else np.ones(p_keep.shape, dtype=bool)
             )
             nonsig_keep = ~sig_keep
             alpha_i = float(series_alphas[i])
@@ -13295,7 +13301,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
             ):
                 continue
             key = (str(chrom_norm), int(round(float(posv))))
-            is_sig = bool(
+            is_sig = args.thr is not None and bool(
                 _postgwas_significant_p_mask(
                     [pv],
                     threshold_merge,
@@ -14830,6 +14836,7 @@ def main(argv: Optional[list[str]] = None):
         "-a", "--anno", nargs="?", const="on", default=None, metavar="EXT_KB",
         help=(
             "Enable significant-variant annotation table output. "
+            "Requires an explicit --thr; otherwise annotation output is skipped. "
             "Requires one annotation source from --gff or --bed. "
             "Optionally pass EXT_KB to also append broadened annotation within that window."
         ),
@@ -14874,7 +14881,8 @@ def main(argv: Optional[list[str]] = None):
     common_group.add_argument(
         "-thr", "--thr", dest="thr", type=float, default=None,
         help=(
-            "P-value threshold; if not set, use 0.05 / nSNP. With --no-logtrans, "
+            "P-value threshold; if not set, no threshold line is drawn "
+            "and --anno output is skipped. With --no-logtrans, "
             "an explicitly supplied value is interpreted directly as -log10(p)."
         ),
     )
@@ -15037,6 +15045,12 @@ def main(argv: Optional[list[str]] = None):
     except ValueError as e:
         logger.error(str(e))
         raise SystemExit(1)
+    if args.anno and args.thr is None:
+        logger.warning(
+            "Warning: --anno requires an explicit --thr; annotation table output is skipped."
+        )
+        args.anno = False
+        args.annobroaden = None
     if thread_capped:
         logger.warning(
             f"Warning: Requested threads={requested_threads} exceeds detected available={detected_threads}; "
@@ -15536,7 +15550,7 @@ def main(argv: Optional[list[str]] = None):
         mode_text = "merge"
     else:
         mode_text = "single-file" if len(input_files) <= 1 else "multi-file"
-    threshold_text = str(args.thr if args.thr is not None else "0.05 / nSNP")
+    threshold_text = str(args.thr if args.thr is not None else "no line (annotation output skipped)")
     finemap_requested = bool(getattr(args, "finemap_requested", False))
     combined_finemap_range_work = bool(
         finemap_requested and (merge_plot_requested or single_plot_requested)

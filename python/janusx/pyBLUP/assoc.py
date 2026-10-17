@@ -1190,8 +1190,8 @@ def fastlmm_reml_null(
     tol : float
         Convergence tolerance in log10(lambda).
 
-    model : {"add", "dom", "rec", "het"}
-        Genetic effect coding mode. Passed through to Rust kernel.
+    model : {"add"}
+        The only supported genetic effect coding mode.
 
     Returns
     -------
@@ -1205,6 +1205,8 @@ def fastlmm_reml_null(
     reml : float
         REML log-likelihood (higher is better).
     """
+    if str(model).strip().lower() != "add":
+        raise ValueError("FastLMM currently supports only additive coding (model='add').")
     low, high = bounds
     S = np.ascontiguousarray(S, dtype=np.float64).ravel()
     u1tx = np.ascontiguousarray(u1tx, dtype=np.float64)
@@ -1285,8 +1287,8 @@ def fastlmm_reml(
     nullml : float, optional
         Null-model ML log-likelihood. If provided, plrt is appended.
 
-    model : {"add", "dom", "rec", "het"}
-        Genetic effect coding mode applied in Rust before projection.
+    model : {"add"}
+        The only supported genetic effect coding mode.
 
     Returns
     -------
@@ -1294,6 +1296,8 @@ def fastlmm_reml(
         Per-SNP beta, standard error, pwald.
         If nullml is provided, an extra column plrt is appended.
     """
+    if str(model).strip().lower() != "add":
+        raise ValueError("FastLMM currently supports only additive coding (model='add').")
     low, high = bounds
     S = np.ascontiguousarray(S, dtype=np.float64).ravel()
     u1tx = np.ascontiguousarray(u1tx, dtype=np.float64)

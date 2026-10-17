@@ -4,6 +4,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use crate::algwas::algwas_packed_to_tsv;
+use crate::decode::PackedGeneticModel;
 use crate::farmcpu::farmcpu_packed_to_tsv;
 use crate::fvlmm::fvlmm_assoc_packed_f32_to_tsv;
 use crate::glm::ixx_from_x_qr;
@@ -338,6 +339,12 @@ pub fn gwas_packed_unified_to_tsv<'py>(
         let job = job_any
             .cast::<PyDict>()
             .map_err(|_| PyValueError::new_err(format!("jobs[{i}] must be a dict task object")))?;
+        if let Some(value) = opt_item(&job, "genetic_model")? {
+            if !value.is_none() {
+                let genetic_model: String = value.extract()?;
+                PackedGeneticModel::parse(&genetic_model)?;
+            }
+        }
         let model: String = req_item(&job, "model")?.extract()?;
         let model_lc = model.trim().to_ascii_lowercase();
         let trait_name: String = opt_item(&job, "trait")?

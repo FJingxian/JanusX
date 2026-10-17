@@ -69,6 +69,8 @@ class AssociationConfig:
     extra: dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> None:
+        if str(self.model).strip().lower() != "add":
+            raise ValueError("GWAS currently supports only additive coding (model='add').")
         if isinstance(self.genotype, str):
             if str(self.genotype).strip() == "":
                 raise ValueError("genotype path must not be empty.")
@@ -150,18 +152,11 @@ class AssociationConfig:
         elif mk == "farmcpu":
             argv.append("-farmcpu")
         elif mk == "algwas":
-            if str(self.model).strip().lower() != "add":
-                raise ValueError("ALGWAS currently supports only additive coding (model='add').")
             argv.append("-algwas")
         elif mk == "splmm":
-            if str(self.model).strip().lower() != "add":
-                raise ValueError("SparseLMM currently supports only additive coding (model='add').")
             argv.append("-splmm")
         elif mk == "splmm2":
-            if str(self.model).strip().lower() != "add":
-                raise ValueError("SparseLMM currently supports only additive coding (model='add').")
             argv.append("-splmm-exact")
-        argv.extend(["-model", str(self.model).strip().lower()])
         argv.extend(["-maf", str(float(self.maf))])
         argv.extend(["-geno", str(float(self.geno))])
         argv.extend(["-het", str(float(self.het))])

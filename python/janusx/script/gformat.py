@@ -2161,6 +2161,13 @@ def _resolve_txt_direct_paths(file_arg: str) -> tuple[str, str, str | None]:
     return matrix_path, id_path, site_path
 
 
+def _require_additive_model(model: str) -> None:
+    if str(model).strip().lower() != "add":
+        raise ValueError(
+            "model must be 'add'; non-additive genotype coding is unsupported"
+        )
+
+
 def _iter_vcf_direct_chunks(
     vcf_path: str,
     *,
@@ -2177,9 +2184,7 @@ def _iter_vcf_direct_chunks(
     bp_max: int | None = None,
     ranges: list[tuple[str, int, int]] | None = None,
 ) -> Iterator[tuple[np.ndarray, list[SiteInfo]]]:
-    model_key = str(model).strip().lower()
-    if model_key not in {"add", "dom", "rec", "het"}:
-        raise ValueError("model must be one of: add, dom, rec, het")
+    _require_additive_model(model)
     het_val = float(het_threshold)
     if not (0.0 <= het_val <= 1.0):
         raise ValueError("het_threshold must be within [0, 1.0]")
@@ -2193,7 +2198,7 @@ def _iter_vcf_direct_chunks(
             False,
             sample_ids,
             None,
-            model_key,
+            "add",
             het_val,
             snp_sites=snp_sites,
             bim_range=bim_range,
@@ -2232,9 +2237,7 @@ def _iter_hmp_direct_chunks(
     bp_max: int | None = None,
     ranges: list[tuple[str, int, int]] | None = None,
 ) -> Iterator[tuple[np.ndarray, list[SiteInfo]]]:
-    model_key = str(model).strip().lower()
-    if model_key not in {"add", "dom", "rec", "het"}:
-        raise ValueError("model must be one of: add, dom, rec, het")
+    _require_additive_model(model)
     het_val = float(het_threshold)
     if not (0.0 <= het_val <= 1.0):
         raise ValueError("het_threshold must be within [0, 1.0]")
@@ -2248,7 +2251,7 @@ def _iter_hmp_direct_chunks(
             False,
             sample_ids,
             None,
-            model_key,
+            "add",
             het_val,
             snp_sites=snp_sites,
             bim_range=bim_range,
@@ -2289,9 +2292,7 @@ def _iter_txt_direct_chunks(
     bp_max: int | None = None,
     ranges: list[tuple[str, int, int]] | None = None,
 ) -> Iterator[tuple[np.ndarray, list[SiteInfo]]]:
-    model_key = str(model).strip().lower()
-    if model_key not in {"add", "dom", "rec", "het"}:
-        raise ValueError("model must be one of: add, dom, rec, het")
+    _require_additive_model(model)
     het_val = float(het_threshold)
     if not (0.0 <= het_val <= 1.0):
         raise ValueError("het_threshold must be within [0, 1.0]")
@@ -2313,7 +2314,7 @@ def _iter_txt_direct_chunks(
             float(maf_threshold),
             float(max_missing_rate),
             False,
-            model_key,
+            "add",
             het_val,
             chr_keys=chr_list,
             bp_min=bp_min,

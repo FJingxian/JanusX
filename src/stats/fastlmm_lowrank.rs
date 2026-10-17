@@ -1,5 +1,5 @@
 use numpy::{Element, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::Bound;
 use pyo3::BoundObject;
@@ -13,60 +13,14 @@ use crate::linalg::{
     sanitize_assoc_pvalue, validate_fixed_effect_design,
 };
 
-#[derive(Clone, Copy)]
-enum GeneticModel {
-    Add,
-    Dom,
-    Rec,
-    Het,
-}
-
-impl GeneticModel {
-    fn parse(text: &str) -> PyResult<Self> {
-        match text.to_ascii_lowercase().as_str() {
-            "add" => Ok(Self::Add),
-            "dom" => Ok(Self::Dom),
-            "rec" => Ok(Self::Rec),
-            "het" => Ok(Self::Het),
-            _ => Err(PyRuntimeError::new_err(
-                "model must be one of: add, dom, rec, het",
-            )),
-        }
-    }
-
-    #[inline]
-    fn apply(self, g: f32) -> f32 {
-        match self {
-            Self::Add => g,
-            Self::Dom => {
-                if g > 0.0 {
-                    1.0
-                } else {
-                    0.0
-                }
-            }
-            Self::Rec => {
-                if (g - 2.0).abs() < 1e-6 {
-                    1.0
-                } else {
-                    0.0
-                }
-            }
-            Self::Het => {
-                if (g - 1.0).abs() < 1e-6 {
-                    1.0
-                } else {
-                    0.0
-                }
-            }
-        }
-    }
-}
-
 #[inline]
-fn transform_snp_row(src: &[f32], model: GeneticModel, dst: &mut [f32]) {
-    for i in 0..src.len() {
-        dst[i] = model.apply(src[i]);
+fn validate_additive_model(model: &str) -> PyResult<()> {
+    if model.trim().eq_ignore_ascii_case("add") {
+        Ok(())
+    } else {
+        Err(PyValueError::new_err(
+            "FastLMM currently supports only additive coding (model='add').",
+        ))
     }
 }
 
@@ -158,7 +112,6 @@ impl FastLmmScratch {
 struct ThreadScratch {
     core: FastLmmScratch,
     u2_xtsnp: Vec<f64>,
-    snp_model: Vec<f32>,
     u1_snp: Vec<f32>,
     u2_snp: Vec<f32>,
 }
@@ -571,6 +524,7 @@ fn fit_fastlmm_null_f32<'py>(
     model: &str,
     maximize_ml: bool,
 ) -> PyResult<(f64, f64, f64, f64)> {
+    validate_additive_model(model)?;
     if !low.is_finite()
         || !high.is_finite()
         || low >= high
@@ -582,8 +536,7 @@ fn fit_fastlmm_null_f32<'py>(
             "invalid null-fit optimizer bounds, iterations or tolerance",
         ));
     }
-    // Keep API consistent with chunk function; null model has no SNP term.
-    let _gm = GeneticModel::parse(model)?;
+    // Keep the model argument accepted for API compatibility; the null fit has no SNP term.
 
     let s_cow = array1_to_cow(&s)?;
     let u1ty_cow = array1_to_cow(&u1ty)?;
@@ -718,10 +671,10 @@ pub fn fastlmm_reml_chunk_f32<'py>(
     nullml: Option<f64>,
     model: &str,
 ) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    validate_additive_model(model)?;
     if low >= high {
         return Err(PyRuntimeError::new_err("low must be < high"));
     }
-    let gm = GeneticModel::parse(model)?;
 
     let s_cow = array1_to_cow(&s)?;
     let u1ty_cow = array1_to_cow(&u1ty)?;
@@ -828,15 +781,13 @@ pub fn fastlmm_reml_chunk_f32<'py>(
                     || ThreadScratch {
                         core: FastLmmScratch::new(k, p1 + 1),
                         u2_xtsnp: vec![0.0; p1],
-                        snp_model: vec![0.0; n],
                         u1_snp: vec![0.0; k],
                         u2_snp: vec![0.0; n],
                     },
                     |scratch, idx| {
                         let raw_row = &snp_cow.as_ref()[idx * n..(idx + 1) * n];
-                        transform_snp_row(raw_row, gm, &mut scratch.snp_model);
                         project_snp_row_u1_u2(
-                            &scratch.snp_model,
+                            raw_row,
                             u1t_cow.as_ref(),
                             k,
                             n,
@@ -1052,15 +1003,13 @@ pub fn fastlmm_assoc_from_snp_f32<'py>(
                     || ThreadScratch {
                         core: FastLmmScratch::new(k, p1 + 1),
                         u2_xtsnp: vec![0.0; p1],
-                        snp_model: vec![0.0; n],
                         u1_snp: vec![0.0; k],
                         u2_snp: vec![0.0; n],
                     },
                     |scratch, (idx, out_row)| {
                         let raw_row = &snp_cow.as_ref()[idx * n..(idx + 1) * n];
-                        scratch.snp_model.copy_from_slice(raw_row);
                         project_snp_row_u1_u2(
-                            &scratch.snp_model,
+                            raw_row,
                             u1t_cow.as_ref(),
                             k,
                             n,

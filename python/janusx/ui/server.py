@@ -884,7 +884,7 @@ class WebUIState:
         if len(parts) == 0:
             return "phenotype"
         assoc_tail = {"lmm", "lm", "farmcpu", "algwas"}
-        genetic_tail = {"add", "dom", "rec", "het"}
+        genetic_tail = {"add"}
         while len(parts) > 0 and parts[-1].lower() in assoc_tail:
             parts.pop()
         while len(parts) > 0 and parts[-1].lower() in genetic_tail:

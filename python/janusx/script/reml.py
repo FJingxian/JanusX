@@ -168,12 +168,14 @@ class _Stage1GroupedProfile:
 
 @dataclass
 class _JointKernelResult:
+    """Additive and independent residual variance estimates for line-level REML."""
+
     va: float
-    vline: float
+    vresidual: float
     h2_raw: float
     beta: np.ndarray
     add_blup: np.ndarray
-    line_blup: np.ndarray
+    residual_blup: np.ndarray
     noise_mean: float
 
 
@@ -2099,7 +2101,7 @@ def _line_level_noise_diag_gxe(
     return out
 
 
-# Joint additive + line-nonadditive REML is the active dense narrow path.
+# Joint additive + independent residual REML is the active dense narrow path.
 # Sparse REML uses the same stage-1 uncertainty on the reported phenotype scale.
 def _prepare_joint_kernel_inputs(
     y_line: np.ndarray,
@@ -2147,14 +2149,14 @@ def _joint_kernel_state(
     noise_diag: np.ndarray,
     noise_mean: float,
     va: float,
-    vline: float,
+    vresidual: float,
 ) -> tuple[float, _JointKernelResult]:
     va_use = float(max(float(va), _JOINT_VAR_FLOOR))
-    vline_use = float(max(float(vline), _JOINT_VAR_FLOOR))
+    vresidual_use = float(max(float(vresidual), _JOINT_VAR_FLOOR))
     n = int(y.shape[0])
 
     v = va_use * kinship
-    v.flat[:: n + 1] += noise_diag + vline_use
+    v.flat[:: n + 1] += noise_diag + vresidual_use
     v = (v + v.T) / 2.0
 
     l = np.linalg.cholesky(v)
@@ -2176,16 +2178,16 @@ def _joint_kernel_state(
         raise ValueError("Joint REML objective became non-finite.")
 
     add_blup = va_use * (kinship @ vinvr)
-    line_blup = vline_use * vinvr
-    denom = va_use + vline_use + noise_mean
+    residual_blup = vresidual_use * vinvr
+    denom = va_use + vresidual_use + noise_mean
     h2_raw = float(va_use / denom) if denom > 0.0 else np.nan
     return nll, _JointKernelResult(
         va=va_use,
-        vline=vline_use,
+        vresidual=vresidual_use,
         h2_raw=h2_raw,
         beta=np.asarray(beta, dtype=float).reshape(-1),
         add_blup=np.asarray(add_blup, dtype=float).reshape(-1),
-        line_blup=np.asarray(line_blup, dtype=float).reshape(-1),
+        residual_blup=np.asarray(residual_blup, dtype=float).reshape(-1),
         noise_mean=float(noise_mean),
     )
 
@@ -2216,13 +2218,13 @@ def _fit_joint_line_kernel_approx(
     a = np.array([[kk, ki], [ki, ii]], dtype=float)
     b = np.array([ks, is_], dtype=float)
 
-    def _loss(va: float, vline: float) -> float:
+    def _loss(va: float, vresidual: float) -> float:
         return (
             (va * va * kk)
-            + (2.0 * va * vline * ki)
-            + (vline * vline * ii)
+            + (2.0 * va * vresidual * ki)
+            + (vresidual * vresidual * ii)
             - (2.0 * va * ks)
-            - (2.0 * vline * is_)
+            - (2.0 * vresidual * is_)
         )
 
     cand: list[tuple[float, float]] = []
@@ -2242,7 +2244,7 @@ def _fit_joint_line_kernel_approx(
             (0.0, 0.0),
         ]
     )
-    va, vline = min(cand, key=lambda vv: _loss(vv[0], vv[1]))
+    va, vresidual = min(cand, key=lambda vv: _loss(vv[0], vv[1]))
     _nll, state = _joint_kernel_state(
         y=y,
         x=x,
@@ -2250,7 +2252,7 @@ def _fit_joint_line_kernel_approx(
         noise_diag=d,
         noise_mean=d_mean,
         va=max(float(va), _JOINT_VAR_FLOOR),
-        vline=max(float(vline), _JOINT_VAR_FLOOR),
+        vresidual=max(float(vresidual), _JOINT_VAR_FLOOR),
     )
     return state
 
@@ -2283,7 +2285,7 @@ def _fit_joint_line_kernel_exact(
             noise_diag=d,
             x_fixed=x_fixed,
         )
-        starts.append((float(approx.va), float(approx.vline)))
+        starts.append((float(approx.va), float(approx.vresidual)))
     except Exception:
         pass
     starts.extend(
@@ -2297,10 +2299,10 @@ def _fit_joint_line_kernel_exact(
 
     start_unique: list[tuple[float, float]] = []
     seen_start: set[tuple[int, int]] = set()
-    for va0, vline0 in starts:
+    for va0, vresidual0 in starts:
         key = (
             int(np.round(np.log10(max(float(va0), _JOINT_VAR_FLOOR)) * 1000.0)),
-            int(np.round(np.log10(max(float(vline0), _JOINT_VAR_FLOOR)) * 1000.0)),
+            int(np.round(np.log10(max(float(vresidual0), _JOINT_VAR_FLOOR)) * 1000.0)),
         )
         if key in seen_start:
             continue
@@ -2308,7 +2310,7 @@ def _fit_joint_line_kernel_exact(
         start_unique.append(
             (
                 max(float(va0), _JOINT_VAR_FLOOR),
-                max(float(vline0), _JOINT_VAR_FLOOR),
+                max(float(vresidual0), _JOINT_VAR_FLOOR),
             )
         )
 
@@ -2323,7 +2325,7 @@ def _fit_joint_line_kernel_exact(
 
     def _objective(eta: np.ndarray) -> float:
         try:
-            va_now, vline_now = _eta_to_var(eta)
+            va_now, vresidual_now = _eta_to_var(eta)
             nll, _state = _joint_kernel_state(
                 y=y,
                 x=x,
@@ -2331,14 +2333,14 @@ def _fit_joint_line_kernel_exact(
                 noise_diag=d,
                 noise_mean=d_mean,
                 va=va_now,
-                vline=vline_now,
+                vresidual=vresidual_now,
             )
             return float(nll)
         except Exception:
             return _JOINT_OBJ_PENALTY
 
-    for va0, vline0 in start_unique:
-        eta0 = np.log(np.asarray([va0, vline0], dtype=float))
+    for va0, vresidual0 in start_unique:
+        eta0 = np.log(np.asarray([va0, vresidual0], dtype=float))
         eta0 = np.clip(eta0, _JOINT_LOG_FLOOR, _JOINT_LOG_CEIL)
         res = minimize(
             _objective,
@@ -2353,7 +2355,7 @@ def _fit_joint_line_kernel_exact(
             if (not np.isfinite(obj)) or obj >= best_fun:
                 continue
             try:
-                va_now, vline_now = _eta_to_var(eta_try)
+                va_now, vresidual_now = _eta_to_var(eta_try)
                 _nll, state = _joint_kernel_state(
                     y=y,
                     x=x,
@@ -2361,7 +2363,7 @@ def _fit_joint_line_kernel_exact(
                     noise_diag=d,
                     noise_mean=d_mean,
                     va=va_now,
-                    vline=vline_now,
+                    vresidual=vresidual_now,
                 )
             except Exception:
                 continue
@@ -3235,7 +3237,7 @@ def main(argv: list[str] | None = None) -> None:
                         "h2_narrow": np.nan,
                         "h2_narrow_vc_ratio_raw": np.nan,
                         "va_joint": np.nan,
-                        "vline_joint": np.nan,
+                        "vresidual_joint": np.nan,
                         "noise_mean_joint": np.nan,
                         "pve": np.nan,
                         "lambda": np.nan,
@@ -3473,7 +3475,7 @@ def main(argv: list[str] | None = None) -> None:
             h2_narrow = np.nan
             h2_narrow_vc_ratio_raw = np.nan
             va_joint = np.nan
-            vline_joint = np.nan
+            vresidual_joint = np.nan
             noise_mean_joint = np.nan
             missing_grm = np.nan
             narrow_lambda = np.nan
@@ -3590,22 +3592,22 @@ def main(argv: list[str] | None = None) -> None:
                                 maxiter=int(args.maxiter),
                             )
                             va_joint = float(joint_state.va)
-                            vline_joint = float(joint_state.vline)
+                            vresidual_joint = float(joint_state.vresidual)
                             noise_mean_joint = float(joint_state.noise_mean)
                             h2_narrow = float(joint_state.h2_raw)
-                            latent_denom = float(joint_state.va + joint_state.vline)
+                            latent_denom = float(joint_state.va + joint_state.vresidual)
                             h2_narrow_vc_ratio_raw = (
                                 float(joint_state.va / latent_denom)
                                 if latent_denom > 0.0
                                 else np.nan
                             )
                             narrow_method = "joint_dense_corrected_reml"
-                            if va_joint <= 1e-9 or vline_joint <= 1e-9:
+                            if va_joint <= 1e-9 or vresidual_joint <= 1e-9:
                                 logger.warning(
-                                    "Trait %s: dense line-level variance component is at/near the non-negative boundary (Va=%s, Vline=%s).",
+                                    "Trait %s: dense variance component is at/near the non-negative boundary (Va=%s, Vresidual=%s).",
                                     trait,
                                     _fmt_metric(va_joint),
-                                    _fmt_metric(vline_joint),
+                                    _fmt_metric(vresidual_joint),
                                 )
                             if np.isfinite(hsqr) and np.isfinite(h2_narrow) and (h2_narrow > hsqr * 1.02):
                                 logger.warning(
@@ -3749,7 +3751,7 @@ def main(argv: list[str] | None = None) -> None:
                 )
             if np.isfinite(va_joint):
                 logger.info(
-                    f"  joint additive={_fmt_metric(va_joint)} | joint line_nonadd={_fmt_metric(vline_joint)} | joint noise_mean={_fmt_metric(noise_mean_joint)}"
+                    f"  joint additive={_fmt_metric(va_joint)} | joint residual={_fmt_metric(vresidual_joint)} | joint noise_mean={_fmt_metric(noise_mean_joint)}"
                 )
 
             summary_rows.append(
@@ -3769,7 +3771,8 @@ def main(argv: list[str] | None = None) -> None:
                         else np.nan
                     ),
                     "va_joint": float(va_joint) if np.isfinite(va_joint) else np.nan,
-                    "vline_joint": float(vline_joint) if np.isfinite(vline_joint) else np.nan,
+                    # Renamed from the historical ``vline_joint`` field; the estimate is unchanged.
+                    "vresidual_joint": float(vresidual_joint) if np.isfinite(vresidual_joint) else np.nan,
                     "noise_mean_joint": float(noise_mean_joint) if np.isfinite(noise_mean_joint) else np.nan,
                     "pve": float(pve_line) if np.isfinite(pve_line) else np.nan,
                     "lambda": float(lbd) if np.isfinite(lbd) else np.nan,
@@ -3815,7 +3818,7 @@ def main(argv: list[str] | None = None) -> None:
                     "h2_narrow": np.nan,
                     "h2_narrow_vc_ratio_raw": np.nan,
                     "va_joint": np.nan,
-                    "vline_joint": np.nan,
+                    "vresidual_joint": np.nan,
                     "noise_mean_joint": np.nan,
                     "pve": np.nan,
                     "lambda": np.nan,

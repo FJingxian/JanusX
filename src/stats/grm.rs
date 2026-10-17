@@ -739,6 +739,11 @@ pub(crate) fn grm_packed_f64_with_stats_impl<'py>(
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
 ) -> PyResult<(Bound<'py, PyArray2<f64>>, Bound<'py, PyArray1<f64>>, f64)> {
+    if method != 1 && method != 2 {
+        return Err(PyRuntimeError::new_err(format!(
+            "unsupported method={method}; additive GRM supports 1 (centered additive) or 2 (standardized additive)"
+        )));
+    }
     if n_samples == 0 {
         return Err(PyRuntimeError::new_err("n_samples must be > 0"));
     }
@@ -3602,9 +3607,9 @@ pub fn grm_packed_f32<'py>(
     if n_samples == 0 {
         return Err(PyRuntimeError::new_err("n_samples must be > 0"));
     }
-    if method != 1 && method != 2 && method != 3 {
+    if method != 1 && method != 2 {
         return Err(PyRuntimeError::new_err(format!(
-            "unsupported method={method}; expected 1 (centered additive), 2 (standardized additive), or 3 (centered dominance)"
+            "unsupported method={method}; additive GRM supports 1 (centered additive) or 2 (standardized additive)"
         )));
     }
 
@@ -4177,9 +4182,9 @@ pub fn grm_bed_f64_from_meta<'py>(
     progress_every: usize,
     mmap_window_mb: Option<usize>,
 ) -> PyResult<Bound<'py, PyArray2<f64>>> {
-    if method != 1 && method != 2 && method != 3 {
+    if method != 1 && method != 2 {
         return Err(PyRuntimeError::new_err(format!(
-            "unsupported method={method}; expected 1 (centered additive), 2 (standardized additive), or 3 (centered dominance)"
+            "unsupported method={method}; additive GRM supports 1 (centered additive) or 2 (standardized additive)"
         )));
     }
 
@@ -4253,7 +4258,6 @@ pub fn grm_bed_f64_from_meta<'py>(
             let stream_mode = match method {
                 1 => crate::gblup::StreamKernelMode::Additive,
                 2 => crate::gblup::StreamKernelMode::StandardizedAdditive,
-                3 => crate::gblup::StreamKernelMode::Dominance,
                 _ => unreachable!(),
             };
             let (grm, _row_sum, _varsum) = crate::gblup::build_grm_from_meta_stream(

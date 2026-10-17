@@ -489,41 +489,6 @@ def load_plink_bed_payload_owned(
     return payload
 
 
-def packed_row_het_rate(packed: np.ndarray, n_samples: int) -> np.ndarray:
-    arr = np.ascontiguousarray(np.asarray(packed, dtype=np.uint8))
-    if arr.ndim != 2:
-        raise ValueError(f"packed matrix must be 2D, got shape={arr.shape}")
-    n_rows, bytes_per_row = arr.shape
-    expected = int((int(n_samples) + 3) // 4)
-    if bytes_per_row != expected:
-        raise ValueError(
-            f"packed byte-width mismatch: got {bytes_per_row}, expected {expected} for n_samples={n_samples}"
-        )
-    if n_rows == 0:
-        return np.zeros((0,), dtype=np.float32)
-
-    full = int(n_samples) // 4
-    rem = int(n_samples) % 4
-    non_missing = np.zeros((n_rows,), dtype=np.int32)
-    het = np.zeros((n_rows,), dtype=np.int32)
-    if full > 0:
-        base = arr[:, :full]
-        non_missing += _NONMISS_LUT[base].sum(axis=1, dtype=np.int64).astype(np.int32, copy=False)
-        het += _HET_LUT[base].sum(axis=1, dtype=np.int64).astype(np.int32, copy=False)
-
-    if rem > 0:
-        tail = arr[:, full]
-        for within in range(rem):
-            code = (tail >> (within * 2)) & 0b11
-            non_missing += (code != 0b01).astype(np.int32, copy=False)
-            het += (code == 0b10).astype(np.int32, copy=False)
-
-    out = np.zeros((n_rows,), dtype=np.float32)
-    ok = non_missing > 0
-    out[ok] = het[ok] / non_missing[ok]
-    return out
-
-
 def _scan_bed_2bit_packed_stats_fallback(
     prefix: str,
     *,
@@ -746,7 +711,6 @@ def _packed_meta_cache_paths(cache_prefix: str) -> dict[str, str]:
         "row_maf": f"{stem}.row_maf.npy",
         "row_flip": f"{stem}.row_flip.npy",
         "std_denom": f"{stem}.std_denom.npy",
-        "dom_af": f"{stem}.dom_af.npy",
     }
 
 
@@ -756,8 +720,6 @@ def _packed_meta_required_keys(layer: str) -> tuple[str, ...]:
         return ("site_keep", "row_missing", "row_maf", "row_flip")
     if key == "std":
         return ("site_keep", "row_missing", "row_maf", "row_flip", "std_denom")
-    if key == "dom":
-        return ("site_keep", "row_missing", "row_maf", "row_flip", "std_denom", "dom_af")
     raise ValueError(f"Unsupported packed meta layer: {layer!r}")
 
 
@@ -788,7 +750,6 @@ def _build_packed_meta_context(
     row_flip: np.ndarray,
     site_keep: np.ndarray,
     std_denom: np.ndarray | None = None,
-    dom_af: np.ndarray | None = None,
 ) -> dict[str, Any]:
     active_row_idx = np.ascontiguousarray(
         np.flatnonzero(site_keep).astype(np.int64, copy=False),
@@ -811,11 +772,6 @@ def _build_packed_meta_context(
     if std_denom is not None:
         ctx["std_denom"] = np.ascontiguousarray(
             np.asarray(std_denom, dtype=np.float32).reshape(-1),
-            dtype=np.float32,
-        )
-    if dom_af is not None:
-        ctx["dom_af"] = np.ascontiguousarray(
-            np.asarray(dom_af, dtype=np.float32).reshape(-1),
             dtype=np.float32,
         )
     return ctx
@@ -864,11 +820,6 @@ def _load_cached_packed_meta(
             if "std_denom" in required
             else None
         )
-        dom_af = (
-            _load_npy_checked(paths["dom_af"], dtype=np.float32)
-            if "dom_af" in required
-            else None
-        )
     except Exception:
         return None
 
@@ -878,7 +829,6 @@ def _load_cached_packed_meta(
         ("row_maf", row_maf),
         ("row_flip", row_flip),
         ("std_denom", std_denom),
-        ("dom_af", dom_af),
     ):
         if arr is None:
             continue
@@ -892,7 +842,6 @@ def _load_cached_packed_meta(
         row_flip=row_flip,
         site_keep=site_keep,
         std_denom=std_denom,
-        dom_af=dom_af,
     )
 
 
@@ -911,13 +860,9 @@ def _save_packed_meta_cache(
     _atomic_save_npy(paths["row_flip"], np.asarray(ctx["row_flip"], dtype=np.bool_))
     if "std_denom" in required:
         _atomic_save_npy(paths["std_denom"], np.asarray(ctx["std_denom"], dtype=np.float32))
-    if "dom_af" in required:
-        _atomic_save_npy(paths["dom_af"], np.asarray(ctx["dom_af"], dtype=np.float32))
     layer_order = ["basic"]
-    if layer in {"std", "dom"}:
+    if layer == "std":
         layer_order.append("std")
-    if layer == "dom":
-        layer_order.append("dom")
     _atomic_save_json(
         paths["json"],
         {
@@ -944,8 +889,7 @@ def _build_packed_meta_layer(
 ) -> dict[str, Any]:
     plink_prefix = normalize_plink_prefix(prefix)
     n_expected = int(sample_ids_arr.shape[0])
-    want_std = str(layer).strip().lower() in {"std", "dom"}
-    want_dom = str(layer).strip().lower() == "dom"
+    want_std = str(layer).strip().lower() == "std"
 
     if scan_bed_2bit_packed_stats is not None:
         miss_raw, maf_raw, std_raw, row_flip_raw, het_raw, packed_n = scan_bed_2bit_packed_stats(
@@ -1007,7 +951,6 @@ def _build_packed_meta_layer(
         row_flip=row_flip,
         site_keep=np.ascontiguousarray(keep, dtype=np.bool_),
         std_denom=std_arr,
-        dom_af=het_arr if want_dom else None,
     )
 
 
@@ -1257,32 +1200,6 @@ def load_or_build_packed_meta_std(
     )
 
 
-def load_or_build_packed_meta_dom(
-    prefix: str,
-    *,
-    maf: float,
-    missing_rate: float,
-    het_threshold: float = 1.0,
-    snps_only: bool = False,
-    expected_n_samples: int | None = None,
-    cache_dir: str | None = None,
-    logger: Any = None,
-    warning_collector: list[str] | None = None,
-) -> tuple[np.ndarray, dict[str, Any]]:
-    return _load_or_build_packed_meta_layer(
-        prefix,
-        maf=float(maf),
-        missing_rate=float(missing_rate),
-        het_threshold=float(het_threshold),
-        snps_only=bool(snps_only),
-        expected_n_samples=expected_n_samples,
-        layer="dom",
-        cache_dir=cache_dir,
-        logger=logger,
-        warning_collector=warning_collector,
-    )
-
-
 def prepare_packed_ctx_from_plink(
     prefix: str,
     *,
@@ -1361,13 +1278,6 @@ def prepare_packed_ctx_from_plink(
                     np.asarray(std_raw, dtype=np.float32).reshape(-1),
                     dtype=np.float32,
                 ),
-                "dom_af": np.ascontiguousarray(
-                    packed_row_het_rate(
-                        np.ascontiguousarray(np.asarray(packed_raw, dtype=np.uint8)),
-                        int(packed_n),
-                    ),
-                    dtype=np.float32,
-                ),
                 "row_flip": np.ascontiguousarray(
                     np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1),
                     dtype=np.bool_,
@@ -1395,7 +1305,7 @@ def prepare_packed_ctx_from_plink(
 
     try:
         if bool(use_cache):
-            _sample_ids_meta, meta_ctx = load_or_build_packed_meta_dom(
+            _sample_ids_meta, meta_ctx = load_or_build_packed_meta_std(
                 str(plink_prefix),
                 maf=float(maf),
                 missing_rate=float(missing_rate),
@@ -1411,7 +1321,7 @@ def prepare_packed_ctx_from_plink(
                 missing_rate=float(missing_rate),
                 het_threshold=float(het_threshold),
                 snps_only=bool(snps_only),
-                layer="dom",
+                layer="std",
             )
         site_keep = np.ascontiguousarray(
             np.asarray(meta_ctx["site_keep"], dtype=np.bool_).reshape(-1),
@@ -1500,18 +1410,13 @@ def prepare_packed_ctx_from_plink(
                     np.asarray(meta_ctx["std_denom"], dtype=np.float32).reshape(-1)[site_keep],
                     dtype=np.float32,
                 )
-            if "dom_af" in meta_ctx:
-                packed_ctx["dom_af"] = np.ascontiguousarray(
-                    np.asarray(meta_ctx["dom_af"], dtype=np.float32).reshape(-1)[site_keep],
-                    dtype=np.float32,
-                )
         packed_ctx["packed"] = packed
         packed_ctx["active_row_idx"] = keep_idx
         packed_ctx["packed_filter_mode"] = "compact"
         packed_ctx["packed_storage"] = "owned"
         return sample_ids_arr, packed_ctx
     except Exception as ex:
-        attempt_errors.append(("load_or_build_packed_meta_dom", ex))
+        attempt_errors.append(("load_or_build_packed_meta_std", ex))
         _raise_packed_prepare_error(str(plink_prefix), attempt_errors)
 
 

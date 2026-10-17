@@ -70,60 +70,6 @@ use crate::stats_common::{
 pub(crate) enum StreamKernelMode {
     Additive,
     StandardizedAdditive,
-    Dominance,
-}
-
-#[allow(clippy::too_many_arguments)]
-fn decode_subset_dom_row_from_full_scratch(
-    row: &[u8],
-    n_samples: usize,
-    sample_idx: &[usize],
-    code4_lut: &[[u8; 4]; 256],
-    full_row: &mut [f32],
-    out_row: &mut [f32],
-) -> (f64, f64) {
-    debug_assert!(full_row.len() >= n_samples);
-    debug_assert_eq!(out_row.len(), sample_idx.len());
-
-    let value_lut: [f32; 4] = [0.0_f32, -1.0_f32, 1.0_f32, 0.0_f32];
-    decode_row_centered_full_lut(
-        row,
-        n_samples,
-        code4_lut,
-        &value_lut,
-        &mut full_row[..n_samples],
-    );
-
-    let n = sample_idx.len();
-    let mut obs_n: usize = 0;
-    let mut obs_sum = 0.0_f64;
-    let mut obs_sq = 0.0_f64;
-    for (j, &sid) in sample_idx.iter().enumerate() {
-        let gv = full_row[sid];
-        out_row[j] = gv;
-        if gv >= 0.0_f32 {
-            let g = gv as f64;
-            obs_n += 1;
-            obs_sum += g;
-            obs_sq += g * g;
-        }
-    }
-
-    let (mean_g, var_centered) = if obs_n > 0 {
-        let mean = obs_sum / obs_n as f64;
-        let ss = (obs_sq - (obs_sum * obs_sum) / obs_n as f64).max(0.0);
-        let v_center = (ss / n as f64).max(0.0);
-        (mean as f32, v_center as f32)
-    } else {
-        (0.0_f32, 0.0_f32)
-    };
-
-    for v in out_row.iter_mut() {
-        let gv = if *v >= 0.0_f32 { *v } else { mean_g };
-        *v = gv - mean_g;
-    }
-    let row_sum = (mean_g as f64) * (n as f64);
-    (var_centered as f64, row_sum)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -321,24 +267,12 @@ fn decode_meta_block_f32(
                     let rel_row = packed_row_indices[local_row];
                     let row = &packed_flat[rel_row * bytes_per_snp..(rel_row + 1) * bytes_per_snp];
                     let p = row_maf[local_row].clamp(0.0_f32, 1.0_f32) as f64;
-                    let (mean_g, var, value_lut): (f64, f64, [f32; 4]) = match mode {
-                        StreamKernelMode::Additive => {
-                            let mean_g = 2.0_f64 * p;
-                            let var = 2.0_f64 * p * (1.0_f64 - p);
-                            let value_lut = if row_flip[local_row] {
-                                [2.0_f32, mean_g as f32, 1.0_f32, 0.0_f32]
-                            } else {
-                                [0.0_f32, mean_g as f32, 1.0_f32, 2.0_f32]
-                            };
-                            (mean_g, var, value_lut)
-                        }
-                        StreamKernelMode::Dominance => {
-                            let mean_g = p;
-                            let var = p * (1.0_f64 - p);
-                            let value_lut = [0.0_f32, mean_g as f32, 1.0_f32, 0.0_f32];
-                            (mean_g, var, value_lut)
-                        }
-                        StreamKernelMode::StandardizedAdditive => unreachable!(),
+                    let mean_g = 2.0_f64 * p;
+                    let var = 2.0_f64 * p * (1.0_f64 - p);
+                    let value_lut = if row_flip[local_row] {
+                        [2.0_f32, mean_g as f32, 1.0_f32, 0.0_f32]
+                    } else {
+                        [0.0_f32, mean_g as f32, 1.0_f32, 2.0_f32]
                     };
                     decode_row_centered_full_lut(row, n_samples, code4_lut, &value_lut, dst);
                     let mean_g_f32 = mean_g as f32;
@@ -360,33 +294,19 @@ fn decode_meta_block_f32(
                         let rel_row = packed_row_indices[local_row];
                         let row =
                             &packed_flat[rel_row * bytes_per_snp..(rel_row + 1) * bytes_per_snp];
-                        let (var_centered, row_sum) = match mode {
-                            StreamKernelMode::Additive => {
-                                let default_mean_g =
-                                    2.0_f32 * row_maf[local_row].clamp(0.0_f32, 1.0_f32);
-                                decode_subset_row_from_full_scratch(
-                                    row,
-                                    n_samples,
-                                    sample_idx,
-                                    row_flip[local_row],
-                                    default_mean_g,
-                                    1,
-                                    1e-12_f32,
-                                    code4_lut,
-                                    full_row.as_mut_slice(),
-                                    dst,
-                                )
-                            }
-                            StreamKernelMode::Dominance => decode_subset_dom_row_from_full_scratch(
-                                row,
-                                n_samples,
-                                sample_idx,
-                                code4_lut,
-                                full_row.as_mut_slice(),
-                                dst,
-                            ),
-                            StreamKernelMode::StandardizedAdditive => unreachable!(),
-                        };
+                        let default_mean_g = 2.0_f32 * row_maf[local_row].clamp(0.0_f32, 1.0_f32);
+                        let (var_centered, row_sum) = decode_subset_row_from_full_scratch(
+                            row,
+                            n_samples,
+                            sample_idx,
+                            row_flip[local_row],
+                            default_mean_g,
+                            1,
+                            1e-12_f32,
+                            code4_lut,
+                            full_row.as_mut_slice(),
+                            dst,
+                        );
                         *row_varsum_dst = var_centered;
                         *row_sum_dst = row_sum;
                     },
@@ -745,9 +665,9 @@ pub fn gblup_grm_from_meta_to_npy<'py>(
     progress_every: usize,
     mmap_window_mb: Option<usize>,
 ) -> PyResult<(usize, usize)> {
-    if method != 1 && method != 2 && method != 3 {
+    if method != 1 && method != 2 {
         return Err(PyRuntimeError::new_err(format!(
-            "unsupported method={method}; expected 1 (centered additive), 2 (standardized additive), or 3 (centered dominance)"
+            "unsupported method={method}; additive GBLUP supports 1 (centered additive) or 2 (standardized additive)"
         )));
     }
 
@@ -831,7 +751,6 @@ pub fn gblup_grm_from_meta_to_npy<'py>(
             let stream_mode = match method {
                 1 => StreamKernelMode::Additive,
                 2 => StreamKernelMode::StandardizedAdditive,
-                3 => StreamKernelMode::Dominance,
                 _ => unreachable!(),
             };
             let (grm, _row_sum, _varsum) = build_grm_from_meta_stream(
@@ -2823,10 +2742,9 @@ pub fn gblup_effect_from_meta_stream<'py>(
     let mode_norm = mode.trim().to_ascii_lowercase();
     let kernel_mode = match mode_norm.as_str() {
         "a" | "add" | "additive" => StreamKernelMode::Additive,
-        "d" | "dom" | "dominance" => StreamKernelMode::Dominance,
         _ => {
             return Err(PyRuntimeError::new_err(
-                "mode must be one of {'a','additive','d','dominance'}",
+                "additive GBLUP effects support only mode='a'/'additive'",
             ))
         }
     };

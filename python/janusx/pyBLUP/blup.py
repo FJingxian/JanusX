@@ -1018,14 +1018,9 @@ if __name__ == "__main__":
     chunks = load_genotype_chunks('./example/mouse_hs1940.vcf.gz',sample_ids=pheno.index.tolist())
     for chunk,site in chunks:
         gadd = chunk
-    ghet = (gadd==1).astype(np.float32)
-    
-    for test,train in kfold(ghet.shape[1],5,seed=42):
+
+    for test,train in kfold(gadd.shape[1],5,seed=42):
         Gadd = Gmatrix(gadd[:,train])
-        Ghet = Gmatrix(ghet[:,train])
-        model = BLUP(pheno.values[train],G=[Gadd,Ghet],progress=False)
-        yhat = model.predict(G=[Gmatrix(gadd)[test, :][:,train],Gmatrix(ghet)[test, :][:,train]])
-        print('ADBLUP:',np.corrcoef(pheno.values[test,0],yhat[:,0])[0,1])
         model = BLUP(pheno.values[train],G=[Gadd],progress=False)
         yhat = model.predict(G=[Gmatrix(gadd)[test, :][:,train]])
         print('ABLUP:',np.corrcoef(pheno.values[test,0],yhat[:,0])[0,1])

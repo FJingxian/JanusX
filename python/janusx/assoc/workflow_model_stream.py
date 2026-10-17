@@ -570,10 +570,7 @@ def _require_kfile_native_request(
             "can be used; Python fallback has been removed."
         )
     if str(genetic_model).strip().lower() != "add":
-        raise RuntimeError(
-            "k-file GWAS native scanners currently support only the additive model; "
-            "Python fallback has been removed."
-        )
+        raise ValueError("GWAS currently supports only additive coding (model='add').")
     model_key = str(requested[0]).strip().lower()
     symbol = _KFILE_NATIVE_SCAN_SYMBOLS.get(model_key)
     if symbol is None or not hasattr(jxrs, symbol):
@@ -741,7 +738,7 @@ def run_chunked_gwas_kfile(
         # The native scanner is deliberately selected only for the single
         # additive request validated above.  There is no Python decode path.
         native_model_key: Optional[str] = None
-        if len(requested) == 1 and str(genetic_model).strip().lower() == "add":
+        if len(requested) == 1:
             candidate = requested[0]
             try:
                 fvlmm_lbd_native = float(getattr(models[0][1], "lbd_null", np.nan))
@@ -1094,6 +1091,8 @@ def run_chunked_gwas_lmm_lm(
     Important: This function assumes pheno/ids/grm/q/cov have already been prepared
     once (no repeated "Loading phenotype" / "Loading GRM/Q" logs).
     """
+    if str(genetic_model).strip().lower() != "add":
+        raise ValueError("GWAS currently supports only additive coding (model='add').")
     model_map = {
         "lmm": LMM,
         "lmm2": LMM2,
@@ -1228,59 +1227,6 @@ def run_chunked_gwas_lmm_lm(
             logging.INFO,
             "LMM route: using streaming orchestrator (windowed BED path only).",
         )
-
-    def _apply_genetic_model(geno_chunk: np.ndarray, model: str) -> np.ndarray:
-        m = model.lower()
-        if m == "add":
-            return geno_chunk
-        if m == "dom":
-            return (
-                np.isclose(geno_chunk, 1.0, atol=1e-6)
-                | np.isclose(geno_chunk, 2.0, atol=1e-6)
-            ).astype(np.float32, copy=False)
-        if m == "rec":
-            return np.isclose(geno_chunk, 2.0, atol=1e-6).astype(np.float32, copy=False)
-        if m == "het":
-            return np.isclose(geno_chunk, 1.0, atol=1e-6).astype(np.float32, copy=False)
-        raise ValueError(f"Unsupported genetic model: {model}")
-
-    def _transform_allele_labels(
-        allele0_list: list[str], allele1_list: list[str], model: str
-    ) -> tuple[list[str], list[str]]:
-        m = model.lower()
-        if m == "add":
-            return allele0_list, allele1_list
-        out0: list[str] = []
-        out1: list[str] = []
-        for a0, a1 in zip(allele0_list, allele1_list):
-            hom0 = f"{a0}{a0}"
-            het = f"{a0}{a1}"
-            hom1 = f"{a1}{a1}"
-            if m == "dom":
-                out0.append(hom0)
-                out1.append(f"{het}/{hom1}")
-            elif m == "rec":
-                out0.append(f"{het}/{hom0}")
-                out1.append(hom1)
-            elif m == "het":
-                out0.append(f"{hom0}/{hom1}")
-                out1.append(het)
-            else:
-                raise ValueError(f"Unsupported genetic model: {model}")
-        return out0, out1
-
-    def _heter_keep_mask(geno_chunk: np.ndarray, het: float) -> np.ndarray:
-        valid = geno_chunk >= 0
-        non_missing = np.sum(valid, axis=1)
-        keep = non_missing > 0
-        if not np.any(keep):
-            return keep
-        het_count = np.sum(np.isclose(geno_chunk, 1.0, atol=1e-6) & valid, axis=1)
-        het_rate = np.zeros(geno_chunk.shape[0], dtype=np.float32)
-        idx = non_missing > 0
-        het_rate[idx] = het_count[idx] / non_missing[idx]
-        keep &= het_rate <= het
-        return keep
 
     process = psutil.Process()
     n_cores = detect_effective_threads()
@@ -1580,12 +1526,8 @@ def run_chunked_gwas_lmm_lm(
 
         done_snps = 0
         has_results = False
-        gm_tag = str(genetic_model).lower()
         pname_tag = _safe_trait_file_label(pname)
-        if gm_tag == "add":
-            out_tsv = f"{outprefix}.{pname_tag}.{effective_model_tag}.tsv"
-        else:
-            out_tsv = f"{outprefix}.{pname_tag}.{gm_tag}.{effective_model_tag}.tsv"
+        out_tsv = f"{outprefix}.{pname_tag}.{effective_model_tag}.tsv"
         tmp_tsv = _gwas_result_tmp_path(out_tsv)
         wrote_header = False
         mmap_window_mb = (
@@ -1770,10 +1712,6 @@ def run_chunked_gwas_lmm_lm(
             chroms, poss, allele0, allele1 = zip(*info_chunk)
             allele0_list = list(allele0)
             allele1_list = list(allele1)
-            if genetic_model != "add":
-                allele0_list, allele1_list = _transform_allele_labels(
-                    allele0_list, allele1_list, genetic_model
-                )
             res = np.asarray(results, dtype=np.float64)
             chisq = _chisq_from_gwas_results(res)
             _header, extra_cols, result_cols = _gwas_result_header_and_extra_cols(res)
@@ -2509,6 +2447,8 @@ def run_chunked_gwas_streaming_shared(
     Decode/filter each chunk once, then run all selected streaming models on the
     same chunk before moving to the next chunk.
     """
+    if str(genetic_model).strip().lower() != "add":
+        raise ValueError("GWAS currently supports only additive coding (model='add').")
     model_order = [str(m).lower() for m in model_names]
     model_map = {"lmm": LMM, "lmm2": LMM2, "lm": LM, "fvlmm": FvLMM}
     model_order = [m for m in model_order if m in model_map]
@@ -2574,59 +2514,6 @@ def run_chunked_gwas_streaming_shared(
             use_spinner=bool(use_spinner),
             width=60,
         )
-
-    def _apply_genetic_model(geno_chunk: np.ndarray, model: str) -> np.ndarray:
-        m = model.lower()
-        if m == "add":
-            return geno_chunk
-        if m == "dom":
-            return (
-                np.isclose(geno_chunk, 1.0, atol=1e-6)
-                | np.isclose(geno_chunk, 2.0, atol=1e-6)
-            ).astype(np.float32, copy=False)
-        if m == "rec":
-            return np.isclose(geno_chunk, 2.0, atol=1e-6).astype(np.float32, copy=False)
-        if m == "het":
-            return np.isclose(geno_chunk, 1.0, atol=1e-6).astype(np.float32, copy=False)
-        raise ValueError(f"Unsupported genetic model: {model}")
-
-    def _transform_allele_labels(
-        allele0_list: list[str], allele1_list: list[str], model: str
-    ) -> tuple[list[str], list[str]]:
-        m = model.lower()
-        if m == "add":
-            return allele0_list, allele1_list
-        out0: list[str] = []
-        out1: list[str] = []
-        for a0, a1 in zip(allele0_list, allele1_list):
-            hom0 = f"{a0}{a0}"
-            het = f"{a0}{a1}"
-            hom1 = f"{a1}{a1}"
-            if m == "dom":
-                out0.append(hom0)
-                out1.append(f"{het}/{hom1}")
-            elif m == "rec":
-                out0.append(f"{het}/{hom0}")
-                out1.append(hom1)
-            elif m == "het":
-                out0.append(f"{hom0}/{hom1}")
-                out1.append(het)
-            else:
-                raise ValueError(f"Unsupported genetic model: {model}")
-        return out0, out1
-
-    def _heter_keep_mask(geno_chunk: np.ndarray, het: float) -> np.ndarray:
-        valid = geno_chunk >= 0
-        non_missing = np.sum(valid, axis=1)
-        keep = non_missing > 0
-        if not np.any(keep):
-            return keep
-        het_count = np.sum(np.isclose(geno_chunk, 1.0, atol=1e-6) & valid, axis=1)
-        het_rate = np.zeros(geno_chunk.shape[0], dtype=np.float32)
-        idx = non_missing > 0
-        het_rate[idx] = het_count[idx] / non_missing[idx]
-        keep &= het_rate <= het
-        return keep
 
     use_rust_assoc_writer = bool(hasattr(jxrs, "GwasAssocTsvWriter"))
     if not use_rust_assoc_writer:
@@ -2698,10 +2585,6 @@ def run_chunked_gwas_streaming_shared(
         chroms, poss, allele0, allele1 = zip(*info_chunk)
         allele0_list = list(allele0)
         allele1_list = list(allele1)
-        if genetic_model != "add":
-            allele0_list, allele1_list = _transform_allele_labels(
-                allele0_list, allele1_list, genetic_model
-            )
 
         res = np.asarray(results, dtype=np.float64)
         chisq = _chisq_from_gwas_results(res)
@@ -2732,13 +2615,9 @@ def run_chunked_gwas_streaming_shared(
     model_label_map = {"lmm": "LMM", "lmm2": "LMM2", "lm": "LM", "fvlmm": "FvLMM"}
     kinship_model_keys = {"lmm", "lmm2", "fvlmm"}
     shared_lmm_model: Optional[LMM] = None
-    gm_tag = str(genetic_model).lower()
-
     def _stream_model_outbase(tag: str) -> str:
         t = str(tag).lower()
-        if gm_tag == "add":
-            return f"{outprefix}.{pname}.{t}"
-        return f"{outprefix}.{pname}.{gm_tag}.{t}"
+        return f"{outprefix}.{pname}.{t}"
 
     model_ctxs: list[dict[str, object]] = []
     for mkey in model_order:
@@ -3190,10 +3069,7 @@ def run_chunked_gwas_streaming_shared(
                     "Rust-only GWAS scan requires rust symbol BedChunkReader."
                 )
             try:
-                if (
-                    trait_prepared_meta is not None
-                    and str(genetic_model).lower() == "add"
-                ):
+                if trait_prepared_meta is not None:
                     bed_reader = _new_bed_chunk_reader_from_meta_for_stream(
                         bed_prefix=str(bed_prefix),
                         row_indices=np.asarray(trait_prepared_meta["row_indices"], dtype=np.int64),

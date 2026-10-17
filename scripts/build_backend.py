@@ -243,6 +243,18 @@ def _iter_unique_existing_dirs(paths: list[Path]) -> list[Path]:
     return out
 
 
+def _matching_conda_prefix() -> Path | None:
+    raw = str(os.environ.get("CONDA_PREFIX", "")).strip()
+    if not raw:
+        return None
+    try:
+        prefix = Path(raw).resolve()
+        runtime_prefixes = {Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve()}
+        return prefix if prefix in runtime_prefixes else None
+    except OSError:
+        return None
+
+
 def _windows_runtime_dirs() -> list[Path]:
     dirs: list[Path] = []
     for var in ("OPENBLAS_BIN_DIR", "OPENBLAS_LIB_DIR", "LIBRARY_BIN", "LIBRARY_LIB"):
@@ -250,9 +262,22 @@ def _windows_runtime_dirs() -> list[Path]:
         if raw:
             dirs.append(Path(raw))
 
-    conda_prefix = str(os.environ.get("CONDA_PREFIX", "")).strip()
-    if conda_prefix:
-        cp = Path(conda_prefix)
+    # Prefer libraries shipped with the interpreter running this build. A
+    # build frontend may invoke an environment's Python directly while
+    # inheriting a stale CONDA_PREFIX from another shell/environment.
+    for prefix in dict.fromkeys((Path(sys.prefix), Path(sys.base_prefix))):
+        dirs.extend(
+            [
+                prefix / "Library" / "bin",
+                prefix / "Library" / "lib",
+                prefix / "DLLs",
+                prefix / "bin",
+            ]
+        )
+
+    conda_prefix = _matching_conda_prefix()
+    if conda_prefix is not None:
+        cp = conda_prefix
         dirs.extend(
             [
                 cp / "Library" / "bin",
@@ -323,15 +348,20 @@ def _macos_runtime_dirs() -> list[Path]:
         else:
             dirs.append(p.parent)
 
-    conda_prefix = str(os.environ.get("CONDA_PREFIX", "")).strip()
-    if conda_prefix:
-        cp = Path(conda_prefix)
+    # Match the runtime chooser: the active build interpreter's own prefix
+    # wins over CONDA_PREFIX, which may be inherited from a different shell.
+    for prefix in dict.fromkeys((Path(sys.prefix), Path(sys.base_prefix))):
         dirs.extend(
             [
-                cp / "lib",
-                cp / "Library" / "lib",
+                prefix / "lib",
+                prefix / "Library" / "lib",
             ]
         )
+
+    conda_prefix = _matching_conda_prefix()
+    if conda_prefix is not None:
+        cp = conda_prefix
+        dirs.extend([cp / "lib", cp / "Library" / "lib"])
 
     # Common Homebrew prefixes.
     dirs.extend(

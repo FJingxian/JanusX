@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import os
 import site
 import sys
@@ -11,6 +12,41 @@ from pathlib import Path
 _DLL_DIR_HANDLES: list[object] = []
 _NATIVE_EXT_PATTERNS = ("janusx*.so", "janusx*.pyd")
 _RUNTIME_CACHE_ROOT_ENV = "JANUSX_RUNTIME_CACHE_DIR"
+_ALLOW_EXTERNAL_RUNTIME_ENV = "JANUSX_ALLOW_EXTERNAL_NUMERICAL_LIBRARIES"
+_LINUX_NUMERICAL_RUNTIME_PATTERNS = (
+    "libopenblas*.so*",
+    "libblas*.so*",
+    "liblapack*.so*",
+    "libomp*.so*",
+    "libgomp*.so*",
+    "libiomp*.so*",
+    "libmkl*.so*",
+)
+_WINDOWS_NUMERICAL_RUNTIME_PATTERNS = (
+    "libopenblas*.dll",
+    "openblas*.dll",
+    "libblas*.dll",
+    "blas*.dll",
+    "liblapack*.dll",
+    "lapack*.dll",
+    "libomp*.dll",
+    "libgomp*.dll",
+    "libiomp*.dll",
+    "mkl*.dll",
+    "vcomp*.dll",
+)
+
+
+def _matching_conda_prefix() -> Path | None:
+    raw = str(os.environ.get("CONDA_PREFIX", "")).strip()
+    if not raw:
+        return None
+    try:
+        conda_prefix = Path(raw).resolve()
+        runtime_prefixes = {Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve()}
+        return conda_prefix if conda_prefix in runtime_prefixes else None
+    except OSError:
+        return None
 
 
 def _runtime_cache_root() -> Path:
@@ -177,50 +213,248 @@ def _extend_package_path_for_native_extension() -> None:
 _extend_package_path_for_native_extension()
 
 
-def _init_windows_dll_search_path() -> None:
-    if os.name != "nt" or not hasattr(os, "add_dll_directory"):
+def _runtime_library_dirs() -> list[Path]:
+    dirs = [Path(sys.prefix) / "lib", Path(sys.base_prefix) / "lib"]
+    for pkg_dir in _iter_janusx_package_dirs():
+        dirs.extend([pkg_dir, pkg_dir / ".libs", pkg_dir.parent / "janusx.libs"])
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for directory in dirs:
+        try:
+            resolved = directory.resolve()
+        except OSError:
+            resolved = directory
+        if resolved not in seen:
+            seen.add(resolved)
+            out.append(resolved)
+    return out
+
+
+def _is_inside_any(path: Path, roots: list[Path]) -> bool:
+    for root in roots:
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _matches_numerical_runtime(name: str, patterns: tuple[str, ...]) -> bool:
+    return any(fnmatch.fnmatchcase(name.lower(), pattern.lower()) for pattern in patterns)
+
+
+def _numerical_runtime_candidates(directory: Path) -> list[Path]:
+    candidates: dict[str, Path] = {}
+    for pattern in _LINUX_NUMERICAL_RUNTIME_PATTERNS:
+        for candidate in directory.glob(pattern):
+            if candidate.is_file():
+                candidates.setdefault(candidate.name.lower(), candidate)
+    return list(candidates.values())
+
+
+def _is_trusted_runtime_library(path: Path, roots: list[Path]) -> bool:
+    try:
+        resolved = path.resolve()
+        parent = path.parent.resolve()
+    except (OSError, RuntimeError):
+        resolved = path
+        parent = path.parent
+    return _is_inside_any(resolved, roots) or _is_inside_any(parent, roots)
+
+
+def _windows_trusted_library_dirs() -> list[Path]:
+    dirs: list[Path] = []
+    for pkg_dir in _iter_janusx_package_dirs():
+        dirs.extend([pkg_dir, pkg_dir / ".libs", pkg_dir.parent / "janusx.libs"])
+    for prefix in (Path(sys.prefix), Path(sys.base_prefix)):
+        dirs.extend(
+            [prefix / "Library" / "bin", prefix / "Library" / "lib", prefix / "DLLs", prefix / "bin"]
+        )
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for directory in dirs:
+        try:
+            resolved = directory.resolve()
+        except OSError:
+            resolved = directory
+        if resolved not in seen:
+            seen.add(resolved)
+            out.append(resolved)
+    return out
+
+
+def _validate_linux_library_environment(library_dirs: list[Path] | None = None) -> None:
+    """Reject foreign BLAS/OpenMP runtimes that override the active Python."""
+    if sys.platform != "linux":
         return
+    if str(os.environ.get(_ALLOW_EXTERNAL_RUNTIME_ENV, "")).strip().lower() in (
+        "1", "true", "yes", "y", "on"
+    ):
+        return
+
+    trusted: list[Path] = []
+    for path in library_dirs or _runtime_library_dirs():
+        try:
+            trusted.append(path.resolve())
+        except (OSError, RuntimeError):
+            trusted.append(path)
+
+    # Only flag an LD_LIBRARY_PATH entry when it wins the loader's search for
+    # a SONAME that the active environment or wheel also provides.
+    trusted_names: set[str] = set()
+    for directory in trusted:
+        for candidate in _numerical_runtime_candidates(directory):
+            trusted_names.add(candidate.name.lower())
+
+    library_path_dirs: list[Path] = []
+    first_library_by_name: dict[str, Path] = {}
+    for raw in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep):
+        # glibc treats an empty path component as the current directory.
+        directory = Path(raw or os.curdir).expanduser()
+        try:
+            directory = directory.resolve()
+        except (OSError, RuntimeError):
+            pass
+        library_path_dirs.append(directory)
+        for candidate in _numerical_runtime_candidates(directory):
+            first_library_by_name.setdefault(candidate.name.lower(), candidate)
+
+    for name, candidate in first_library_by_name.items():
+        if name not in trusted_names or _is_trusted_runtime_library(candidate, trusted):
+            continue
+        try:
+            resolved = candidate.resolve()
+        except (OSError, RuntimeError):
+            resolved = candidate
+        raise RuntimeError(
+            f"LD_LIBRARY_PATH would override the active BLAS/OpenMP runtime with {resolved}. "
+            f"Keep the active environment's library directory first, remove the conflicting "
+            f"directory, or set {_ALLOW_EXTERNAL_RUNTIME_ENV}=1 only when the external runtime "
+            "is intentional."
+        )
+
+    preload = os.environ.get("LD_PRELOAD", "")
+    for token in preload.replace(":", " ").split():
+        candidate = Path(token).expanduser()
+        if candidate.is_absolute() or os.sep in token:
+            try:
+                resolved = candidate.resolve()
+            except (OSError, RuntimeError):
+                resolved = candidate
+            if not _matches_numerical_runtime(resolved.name, _LINUX_NUMERICAL_RUNTIME_PATTERNS):
+                continue
+            if not _is_trusted_runtime_library(resolved, trusted):
+                raise RuntimeError(
+                    f"LD_PRELOAD injects an external BLAS/OpenMP runtime: {resolved}. "
+                    f"Remove it or set {_ALLOW_EXTERNAL_RUNTIME_ENV}=1 only when intentional."
+                )
+            continue
+
+        if not _matches_numerical_runtime(candidate.name, _LINUX_NUMERICAL_RUNTIME_PATTERNS):
+            continue
+        # A bare LD_PRELOAD name is resolved through the loader cache when it
+        # is absent from LD_LIBRARY_PATH. We cannot prove which copy that
+        # cache selects, so only accept it when the active copy is explicit in
+        # LD_LIBRARY_PATH; otherwise fail closed.
+        matches = [
+            directory / token
+            for directory in library_path_dirs
+            if (directory / token).is_file()
+        ]
+        if not matches or not _is_trusted_runtime_library(matches[0], trusted):
+            try:
+                resolved_label = str(matches[0].resolve()) if matches else token
+            except (OSError, RuntimeError):
+                resolved_label = str(matches[0])
+            raise RuntimeError(
+                f"LD_PRELOAD names an external or unresolved BLAS/OpenMP runtime: {resolved_label}. "
+                f"Use a library from the active Python environment or set "
+                f"{_ALLOW_EXTERNAL_RUNTIME_ENV}=1 only when intentional."
+            )
+
+
+def _validate_windows_library_environment(library_dirs: list[Path] | None = None) -> None:
+    """Reject stale explicit Windows DLL hints unless the caller opts in."""
+    if str(os.environ.get(_ALLOW_EXTERNAL_RUNTIME_ENV, "")).strip().lower() in (
+        "1", "true", "yes", "y", "on"
+    ):
+        return
+
+    trusted = [path.resolve() for path in (library_dirs or _windows_trusted_library_dirs())]
+    for variable in ("OPENBLAS_BIN_DIR", "OPENBLAS_LIB_DIR", "LIBRARY_BIN", "LIBRARY_LIB"):
+        raw = str(os.environ.get(variable, "")).strip()
+        if not raw:
+            continue
+        directory = Path(raw).expanduser().resolve()
+        for pattern in _WINDOWS_NUMERICAL_RUNTIME_PATTERNS:
+            for candidate in directory.glob(pattern):
+                if candidate.is_file() and not _is_inside_any(candidate.resolve(), trusted):
+                    raise RuntimeError(
+                        f"{variable} points to an external BLAS/OpenMP DLL: {candidate.resolve()}. "
+                        f"Remove the stale override or set {_ALLOW_EXTERNAL_RUNTIME_ENV}=1 only "
+                        "when this external runtime is intentional."
+                    )
+
+
+def _windows_dll_search_dirs() -> list[Path]:
     pkg_dirs: list[Path] = []
     for raw in globals().get("__path__", [Path(__file__).resolve().parent]):
         try:
             pkg_dirs.append(Path(str(raw)))
         except Exception:
             continue
-    if len(pkg_dirs) == 0:
+    if not pkg_dirs:
         pkg_dirs = [Path(__file__).resolve().parent]
 
-    cands: list[Path] = []
+    candidates: list[Path] = []
     for pkg_dir in pkg_dirs:
-        cands.extend([
-            pkg_dir,
-            pkg_dir / ".libs",
-            pkg_dir.parent / "janusx.libs",
-        ])
+        candidates.extend([pkg_dir, pkg_dir / ".libs", pkg_dir.parent / "janusx.libs"])
 
-    # Optional external hints (useful for local editable/dev runs).
-    for var in ("OPENBLAS_BIN_DIR", "OPENBLAS_LIB_DIR", "LIBRARY_BIN", "LIBRARY_LIB"):
-        raw = str(os.environ.get(var, "")).strip()
+    # Keep explicit development overrides, then add the actual interpreter's
+    # DLL directories even when CONDA_PREFIX is absent or stale.
+    for variable in ("OPENBLAS_BIN_DIR", "OPENBLAS_LIB_DIR", "LIBRARY_BIN", "LIBRARY_LIB"):
+        raw = str(os.environ.get(variable, "")).strip()
         if raw:
-            cands.append(Path(raw))
-    conda_prefix = str(os.environ.get("CONDA_PREFIX", "")).strip()
-    if conda_prefix:
-        cp = Path(conda_prefix)
-        cands.extend([cp / "Library" / "bin", cp / "Library" / "lib", cp / "DLLs", cp / "bin"])
+            candidates.append(Path(raw))
 
-    seen: set[str] = set()
-    for d in cands:
+    prefixes: list[Path] = []
+    for prefix in (Path(sys.prefix), Path(sys.base_prefix), _matching_conda_prefix()):
+        if prefix is None:
+            continue
         try:
-            rd = d.resolve()
-        except Exception:
-            rd = d
-        key = str(rd).lower()
-        if key in seen:
+            resolved = prefix.resolve()
+        except OSError:
+            resolved = prefix
+        if resolved not in prefixes:
+            prefixes.append(resolved)
+    for prefix in prefixes:
+        candidates.extend(
+            [prefix / "Library" / "bin", prefix / "Library" / "lib", prefix / "DLLs", prefix / "bin"]
+        )
+
+    out: list[Path] = []
+    seen: set[str] = set()
+    for directory in candidates:
+        try:
+            resolved = directory.resolve()
+        except OSError:
+            resolved = directory
+        key = str(resolved).lower()
+        if key in seen or not resolved.is_dir():
             continue
         seen.add(key)
-        if not rd.exists() or not rd.is_dir():
-            continue
+        out.append(resolved)
+    return out
+
+
+def _init_windows_dll_search_path() -> None:
+    if os.name != "nt" or not hasattr(os, "add_dll_directory"):
+        return
+    _validate_windows_library_environment()
+    for directory in _windows_dll_search_dirs():
         try:
-            h = os.add_dll_directory(str(rd))
+            h = os.add_dll_directory(str(directory))
             _DLL_DIR_HANDLES.append(h)
         except Exception:
             pass
@@ -229,13 +463,98 @@ def _init_windows_dll_search_path() -> None:
 _init_windows_dll_search_path()
 
 
+def _validate_macos_library_environment(library_dirs: list[Path]) -> None:
+    """Reject loader overrides that can replace our BLAS/OpenMP runtime."""
+    trusted = [directory.resolve() for directory in library_dirs]
+    for variable in ("DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH"):
+        for raw in os.environ.get(variable, "").split(os.pathsep):
+            if not raw:
+                continue
+            directory = Path(raw).expanduser().resolve()
+            for pattern in (
+                "libomp*.dylib", "libgomp*.dylib", "libiomp*.dylib",
+                "libopenblas*.dylib", "libblas*.dylib", "liblapack*.dylib",
+            ):
+                for candidate in directory.glob(pattern):
+                    if candidate.is_file() and not any(
+                        candidate.resolve().is_relative_to(root) for root in trusted
+                    ):
+                        raise RuntimeError(
+                            f"{variable} introduces an external BLAS/OpenMP runtime: {candidate}. "
+                            f"Remove this directory from {variable} and restart Python/jx."
+                        )
+    for raw in os.environ.get("DYLD_INSERT_LIBRARIES", "").split(os.pathsep):
+        if not raw:
+            continue
+        candidate = Path(raw).expanduser().resolve()
+        if candidate.name.lower().startswith(("libomp", "libgomp", "libiomp", "libopenblas")) and not any(
+            candidate.is_relative_to(root) for root in trusted
+        ):
+            raise RuntimeError(
+                f"DYLD_INSERT_LIBRARIES preloads an external numerical runtime: {candidate}. "
+                "Remove this entry and restart Python/jx."
+            )
+
+
+def _validate_macos_openblas_override(raw: str, library_dirs: list[Path]) -> None:
+    # Inspect dependencies without dlopen(): a conflicting libomp can crash
+    # before an exception handler gets control. Only explicit overrides need
+    # this probe; ordinary environment/wheel selection has no subprocess cost.
+    import subprocess
+
+    path = Path(raw).expanduser().resolve()
+    if path.is_dir():
+        candidates = sorted(path.glob("libopenblas*.dylib"))
+        if not candidates:
+            raise RuntimeError(f"No OpenBLAS dylib found in override directory: {path}")
+    elif path.is_file():
+        candidates = [path]
+    else:
+        raise RuntimeError(f"OpenBLAS override does not exist: {path}")
+    trusted = [directory.resolve() for directory in library_dirs]
+    if all(any(candidate.resolve().is_relative_to(root) for root in trusted) for candidate in candidates):
+        # Environment and wheel runtimes must also work on machines without
+        # Xcode command-line tools. Inspect only external overrides.
+        return
+    visited: set[Path] = set()
+    queue = list(candidates)
+    while queue:
+        current = queue.pop().resolve()
+        if current in visited:
+            continue
+        visited.add(current)
+        try:
+            result = subprocess.run(
+                ["/usr/bin/otool", "-L", str(current)],
+                capture_output=True, text=True, check=True, timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(f"Cannot inspect OpenBLAS override {current}: {exc}") from exc
+        for line in result.stdout.splitlines()[1:]:
+            dep = line.strip().split(" (", 1)[0]
+            if not dep or dep.startswith(("/usr/lib/", "/System/Library/")):
+                continue
+            if dep.startswith("@loader_path/"):
+                resolved = current.parent / dep[len("@loader_path/"):]
+            elif dep.startswith("@rpath/"):
+                # An external rpath dependency cannot be assumed to resolve
+                # to the active environment's runtime.
+                resolved = current.parent / dep[len("@rpath/"):]
+            else:
+                resolved = Path(dep)
+            is_openmp = resolved.name.lower().startswith(("libomp", "libgomp", "libiomp"))
+            if is_openmp and not any(resolved.resolve().is_relative_to(root) for root in trusted):
+                raise RuntimeError(
+                    f"OpenBLAS override {path} depends on an external OpenMP runtime ({dep}). "
+                    "Unset JX_OPENBLAS_LIB_PATH/OPENBLAS_LIB_PATH to use the current environment "
+                    "or wheel runtime, then restart Python/jx."
+                )
+            if resolved.is_file() and resolved.resolve() not in visited:
+                queue.append(resolved)
+
+
 def _init_macos_openblas_path() -> None:
     if sys.platform != "darwin":
-        return
-
-    # Honor explicit user override first.
-    explicit = str(os.environ.get("JX_OPENBLAS_LIB_PATH", "")).strip()
-    if explicit:
         return
 
     def _preferred_candidate(cands: list[Path]) -> Path | None:
@@ -260,28 +579,49 @@ def _init_macos_openblas_path() -> None:
     if len(pkg_dirs) == 0:
         pkg_dirs = [Path(__file__).resolve().parent]
 
+    library_dirs = [Path(sys.prefix) / "lib", Path(sys.base_prefix) / "lib"]
+    for pkg_dir in pkg_dirs:
+        library_dirs.extend([pkg_dir / ".dylibs", pkg_dir / ".libs", pkg_dir.parent / "janusx.libs"])
+    _validate_macos_library_environment(library_dirs)
+    backend = str(os.environ.get(
+        "JX_RUST_EIGH_LAPACK_BACKEND", os.environ.get("JX_RUST_LAPACK_BACKEND", "auto")
+    )).strip().lower()
+    if backend in ("accelerate", "veclib"):
+        return
+    for key in ("JX_OPENBLAS_LIB_PATH", "OPENBLAS_LIB_PATH"):
+        explicit = str(os.environ.get(key, "")).strip()
+        if explicit:
+            _validate_macos_openblas_override(explicit, library_dirs)
+            # Pin the validated override so Rust's two aliases agree.
+            os.environ["JX_OPENBLAS_LIB_PATH"] = str(Path(explicit).expanduser().resolve())
+            return
+
     # On macOS + conda, prefer the environment's own OpenBLAS runtime so JanusX
     # reuses the same BLAS/OpenMP stack as SciPy/scikit-learn instead of
     # forcing a wheel-local copy into the process.
     candidate_groups: list[list[Path]] = []
-    conda_prefix = str(os.environ.get("CONDA_PREFIX", "")).strip()
-    if conda_prefix:
-        candidate_groups.append(
-            sorted((Path(conda_prefix) / "lib").glob("libopenblas*.dylib"))
-        )
+    # A console script can invoke a conda Python without activating its
+    # environment. CONDA_PREFIX can then be absent (or refer to another
+    # environment). Use the running interpreter first: prewarming a foreign
+    # OpenBLAS here can load a second libomp before SciPy loads its own,
+    # causing an OpenMP abort or a native crash during threaded BLAS calls.
+    runtime_prefixes = [sys.prefix, sys.base_prefix]
+    conda_prefix = _matching_conda_prefix()
+    if conda_prefix is not None:
+        runtime_prefixes.append(conda_prefix)
+    seen_prefixes: set[Path] = set()
+    for prefix in runtime_prefixes:
+        lib_dir = Path(prefix).resolve() / "lib"
+        if lib_dir in seen_prefixes:
+            continue
+        seen_prefixes.add(lib_dir)
+        candidate_groups.append(sorted(lib_dir.glob("libopenblas*.dylib")))
     wheel_local_cands: list[Path] = []
     for pkg_dir in pkg_dirs:
         wheel_local_cands.extend(sorted((pkg_dir / ".dylibs").glob("libopenblas*.dylib")))
         wheel_local_cands.extend(sorted((pkg_dir.parent / "janusx.libs").glob("libopenblas*.dylib")))
         wheel_local_cands.extend(sorted((pkg_dir / ".libs").glob("libopenblas*.dylib")))
     candidate_groups.append(wheel_local_cands)
-    system_cands: list[Path] = []
-    for root in (
-        Path("/opt/homebrew/opt/openblas/lib"),
-        Path("/usr/local/opt/openblas/lib"),
-    ):
-        system_cands.extend(sorted(root.glob("libopenblas*.dylib")))
-    candidate_groups.append(system_cands)
 
     picked: Path | None = None
     for group in candidate_groups:
@@ -289,12 +629,19 @@ def _init_macos_openblas_path() -> None:
         if picked is not None:
             break
     if picked is None:
+        if backend == "openblas":
+            raise RuntimeError(
+                "OpenBLAS LAPACK was requested, but no runtime exists in the current Python "
+                "environment or wheel. Install a compatible OpenBLAS runtime, set a validated "
+                "JX_OPENBLAS_LIB_PATH, or use JX_RUST_EIGH_LAPACK_BACKEND=accelerate."
+            )
         return
 
     os.environ.setdefault("JX_OPENBLAS_LIB_PATH", str(picked))
 
 
 _init_macos_openblas_path()
+_validate_linux_library_environment()
 
 
 def _should_prewarm_macos_native_eigh_backend() -> bool:

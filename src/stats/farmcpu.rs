@@ -3093,14 +3093,14 @@ fn write_farmcpu_packed_main_scan(
             let chisq_txt = format_chisq_value(chisq);
             let _ = write!(
                 text_buf,
-                "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\n",
+                "{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t{:.4e}\n",
                 chrom[i],
                 pos[i],
                 snp_block[local_idx],
                 allele0_block[local_idx],
                 allele1_block[local_idx],
                 row_maf[i],
-                miss_counts[i],
+                miss_counts[i] as f64 / n as f64,
                 beta,
                 se,
                 chisq_txt,
@@ -3111,14 +3111,14 @@ fn write_farmcpu_packed_main_scan(
                     qtn_rows_written += 1;
                     let _ = write!(
                         qtn_text_buf,
-                        "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{}\n",
+                        "{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{}\n",
                         chrom[i],
                         pos[i],
                         snp_block[local_idx],
                         allele0_block[local_idx],
                         allele1_block[local_idx],
                         row_maf[i],
-                        miss_counts[i],
+                        miss_counts[i] as f64 / n as f64,
                         beta,
                         se,
                         chisq_txt,
@@ -3260,14 +3260,14 @@ fn write_farmcpu_pseudo_qtn_only(
         let chisq_txt = format_chisq_value(chisq);
         let _ = write!(
             text_buf,
-            "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{}\n",
             chrom[j],
             pos[j],
             snp[j],
             allele0[j],
             allele1[j],
             row_maf[j],
-            miss_counts[j],
+            miss_counts[j] as f64 / n as f64,
             beta,
             se,
             chisq_txt,
@@ -4637,7 +4637,10 @@ pub fn farmcpu_write_assoc_tsv(
         )));
     }
 
-    let _ = (n_obs, df);
+    let _ = df;
+    if n_obs == 0 {
+        return Err(PyValueError::new_err("n_obs must be > 0"));
+    }
 
     let writer = AsyncTsvWriter::with_config(
         out_tsv,
@@ -4656,14 +4659,14 @@ pub fn farmcpu_write_assoc_tsv(
         let pwald_txt = sanitize_assoc_pvalue(b, s, pwald[i]);
         writeln!(
             text_buf,
-            "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}",
+            "{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t{:.4e}",
             chrom[i],
             pos[i],
             snp[i],
             allele0[i],
             allele1[i],
             maf[i],
-            row_missing[i].round() as i64,
+            row_missing[i] as f64 / n_obs as f64,
             b,
             s,
             chisq_txt,
@@ -4718,14 +4721,14 @@ pub fn farmcpu_write_assoc_tsv(
                 let pwald_txt = sanitize_assoc_pvalue(b, s, pwald[idx]);
                 writeln!(
                     q_text_buf,
-                    "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}",
+                    "{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t{:.4e}",
                     chrom[idx],
                     pos[idx],
                     snp[idx],
                     allele0[idx],
                     allele1[idx],
                     maf[idx],
-                    row_missing[idx].round() as i64,
+                    row_missing[idx] as f64 / n_obs as f64,
                     b,
                     s,
                     chisq_txt,

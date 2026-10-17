@@ -334,11 +334,13 @@ fn append_lm2_row_text(
     allele1: &str,
     maf: f32,
     miss_count: usize,
+    n_samples: usize,
     fit: &Lm2FitResult,
 ) {
     let _ = write!(
         text_buf,
-        "{chrom}\t{pos}\t{snp}\t{allele0}\t{allele1}\t{maf:.4}\t{miss_count}\t{:.4}\t{:.4}\t{}\t{:.4e}",
+        "{chrom}\t{pos}\t{snp}\t{allele0}\t{allele1}\t{maf:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t{:.4e}",
+        miss_count as f64 / n_samples as f64,
         fit.snp_stat.beta,
         fit.snp_stat.se,
         format_chisq_value(fit.snp_stat.chisq),
@@ -767,6 +769,7 @@ pub fn lm2_stream_bed_to_tsv(
                                     site.alt_allele.as_str(),
                                     maf,
                                     missing_count,
+                                    n,
                                     &fit,
                                 );
                                 Ok(Some(std::mem::take(&mut state.row_text)))
@@ -832,6 +835,7 @@ pub fn lm2_stream_bed_to_tsv(
                         site.alt_allele.as_str(),
                         *maf,
                         *missing_count,
+                        n,
                         &fit,
                     );
                     chunk_kept = chunk_kept.saturating_add(1);

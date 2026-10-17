@@ -3144,7 +3144,7 @@ def _write_splmm_assoc_tsv(
                 chunk_text.append(
                     f"{chrom}\t{int(pos)}\t{snp}\t{allele0}\t{allele1}\t"
                     f"{float(maf_arr[idx]):.4f}\t{float(miss_arr[idx]):.4f}\t"
-                    f"{beta:.4f}\t{se:.4f}\t{chisq:.6g}\t{pwald:.4e}\n"
+                    f"{beta:.4f}\t{se:.4f}\t{chisq:.4e}\t{pwald:.4e}\n"
                 )
             fh.write("".join(chunk_text))
             written += end - start
@@ -4979,13 +4979,7 @@ def run_lm_stream_bed_single_entry(
                     dtype=np.bool_,
                 )
                 prepared_row_missing = np.ascontiguousarray(
-                    np.asarray(
-                        trait_prepared_meta.get(
-                            "missing_count",
-                            trait_prepared_meta["missing_rate"],
-                        ),
-                        dtype=np.float32,
-                    ).reshape(-1),
+                    np.asarray(trait_prepared_meta["missing_rate"], dtype=np.float32).reshape(-1),
                     dtype=np.float32,
                 )
                 prepared_row_maf = np.ascontiguousarray(
@@ -5434,7 +5428,7 @@ def run_lm_trait_bed_multi_entry(
             trait_prepared_meta_by_trait.get(label) is meta0
             for label in trait_labels_direct
         ):
-            row_missing_src = meta0.get("missing_count", meta0.get("missing_rate"))
+            row_missing_src = meta0.get("missing_rate")
             if row_missing_src is not None:
                 direct_matrix_meta = (
                     trait_labels_direct,
@@ -5740,7 +5734,7 @@ def run_lm_trait_bed_multi_entry(
         meta_key = id(meta)
         cached_meta = meta_array_cache.get(meta_key)
         if cached_meta is None:
-            row_missing_src = meta.get("missing_count", meta.get("missing_rate"))
+            row_missing_src = meta.get("missing_rate")
             if row_missing_src is None:
                 raise RuntimeError(
                     f"Trait prepared metadata missing row_missing for trait {pname}."

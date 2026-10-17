@@ -59,9 +59,43 @@ impl AssocResultCols {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum AssocMissBlock<'a> {
-    CountI64(&'a [i64]),
-    CountUsize(&'a [usize]),
+    CountI64 {
+        values: &'a [i64],
+        n_samples: usize,
+    },
+    CountUsize {
+        values: &'a [usize],
+        n_samples: usize,
+    },
     Rate(&'a [f32]),
+}
+
+impl AssocMissBlock<'_> {
+    #[inline]
+    fn len(self) -> usize {
+        match self {
+            Self::CountI64 { values, .. } => values.len(),
+            Self::CountUsize { values, .. } => values.len(),
+            Self::Rate(values) => values.len(),
+        }
+    }
+
+    #[inline]
+    fn has_valid_denominator(self) -> bool {
+        match self {
+            Self::CountI64 { n_samples, .. } | Self::CountUsize { n_samples, .. } => n_samples > 0,
+            Self::Rate(_) => true,
+        }
+    }
+
+    #[inline]
+    fn rate_at(self, index: usize) -> f64 {
+        match self {
+            Self::CountI64 { values, n_samples } => values[index] as f64 / n_samples as f64,
+            Self::CountUsize { values, n_samples } => values[index] as f64 / n_samples as f64,
+            Self::Rate(values) => values[index] as f64,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -105,12 +139,6 @@ impl AssocResultLayout {
             Self::PrecomputedChisqBasic3 { row_stride, .. } => row_stride,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum AssocMissValue {
-    Count(i64),
-    Rate(f32),
 }
 
 pub(crate) fn resolve_assoc_tsv_metadata(
@@ -416,7 +444,7 @@ fn append_assoc_row_from_fields(
     allele0: &str,
     allele1: &str,
     maf: f32,
-    miss: AssocMissValue,
+    miss_rate: f64,
     row: &[f64],
 ) {
     let _ = model_key;
@@ -429,40 +457,15 @@ fn append_assoc_row_from_fields(
             let pwald = sanitize_assoc_pvalue(beta, se, row[2]);
             let chisq_txt =
                 format_chisq_value(chisq_from_beta_se_and_optional_plrt(beta, se, None));
-            match (schema, miss) {
-                (AssocResultCols::Basic3, AssocMissValue::Count(miss_count)) => {
-                    let _ = writeln!(
-                        text_buf,
-                        "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}",
-                        chrom, pos, snp_name, a0, a1, maf, miss_count, beta, se, chisq_txt, pwald,
-                    );
-                }
-                (AssocResultCols::Basic3, AssocMissValue::Rate(miss_rate)) => {
+            match schema {
+                AssocResultCols::Basic3 => {
                     let _ = writeln!(
                         text_buf,
                         "{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t{:.4e}",
                         chrom, pos, snp_name, a0, a1, maf, miss_rate, beta, se, chisq_txt, pwald,
                     );
                 }
-                (AssocResultCols::Plrt4, AssocMissValue::Count(miss_count)) => {
-                    let _ = writeln!(
-                        text_buf,
-                        "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}",
-                        chrom,
-                        pos,
-                        snp_name,
-                        a0,
-                        a1,
-                        maf,
-                        miss_count,
-                        beta,
-                        se,
-                        chisq_txt,
-                        pwald,
-                        row[3],
-                    );
-                }
-                (AssocResultCols::Plrt4, AssocMissValue::Rate(miss_rate)) => {
+                AssocResultCols::Plrt4 => {
                     let _ = writeln!(
                         text_buf,
                         "{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.4e}",
@@ -480,14 +483,7 @@ fn append_assoc_row_from_fields(
                         row[3],
                     );
                 }
-                (AssocResultCols::Lmm2_6, AssocMissValue::Count(miss_count)) => {
-                    let _ = writeln!(
-                        text_buf,
-                        "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.6e}\t{:.6e}\t{:.4e}",
-                        chrom, pos, snp_name, a0, a1, maf, miss_count, beta, se, chisq_txt, pwald, row[3], row[4], row[5],
-                    );
-                }
-                (AssocResultCols::Lmm2_6, AssocMissValue::Rate(miss_rate)) => {
+                AssocResultCols::Lmm2_6 => {
                     let _ = writeln!(
                         text_buf,
                         "{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{:.6e}\t{:.6e}\t{:.4e}",
@@ -507,22 +503,11 @@ fn append_assoc_row_from_fields(
             let se = row[se_col];
             let pwald = sanitize_assoc_pvalue(beta, se, row[raw_p_col]);
             let chisq_txt = format_chisq_value(row[chisq_col]);
-            match miss {
-                AssocMissValue::Count(miss_count) => {
-                    let _ = writeln!(
-                        text_buf,
-                        "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}",
-                        chrom, pos, snp_name, a0, a1, maf, miss_count, beta, se, chisq_txt, pwald,
-                    );
-                }
-                AssocMissValue::Rate(miss_rate) => {
-                    let _ = writeln!(
-                        text_buf,
-                        "{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t{:.4e}",
-                        chrom, pos, snp_name, a0, a1, maf, miss_rate, beta, se, chisq_txt, pwald,
-                    );
-                }
-            }
+            let _ = writeln!(
+                text_buf,
+                "{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t{:.4e}",
+                chrom, pos, snp_name, a0, a1, maf, miss_rate, beta, se, chisq_txt, pwald,
+            );
         }
     }
 }
@@ -545,15 +530,14 @@ fn validate_assoc_arrays_block(meta: AssocArraysBlock<'_>, rows: usize) -> Resul
             meta.maf.len(),
         ));
     }
-    let miss_len = match meta.miss {
-        AssocMissBlock::CountI64(v) => v.len(),
-        AssocMissBlock::CountUsize(v) => v.len(),
-        AssocMissBlock::Rate(v) => v.len(),
-    };
+    let miss_len = meta.miss.len();
     if miss_len != rows {
         return Err(format!(
             "assoc TSV miss length mismatch: rows={rows}, miss={miss_len}"
         ));
+    }
+    if !meta.miss.has_valid_denominator() {
+        return Err("assoc TSV miss count requires n_samples > 0".to_string());
     }
     Ok(())
 }
@@ -569,15 +553,14 @@ fn validate_assoc_core_sites_block(
             meta.maf.len(),
         ));
     }
-    let miss_len = match meta.miss {
-        AssocMissBlock::CountI64(v) => v.len(),
-        AssocMissBlock::CountUsize(v) => v.len(),
-        AssocMissBlock::Rate(v) => v.len(),
-    };
+    let miss_len = meta.miss.len();
     if miss_len != rows {
         return Err(format!(
             "assoc TSV miss length mismatch: rows={rows}, miss={miss_len}"
         ));
+    }
+    if !meta.miss.has_valid_denominator() {
+        return Err("assoc TSV miss count requires n_samples > 0".to_string());
     }
     Ok(())
 }
@@ -598,61 +581,21 @@ pub(crate) fn append_assoc_block_from_arrays(
     }
     let rows = results.len() / row_stride;
     validate_assoc_arrays_block(meta, rows)?;
-    match meta.miss {
-        AssocMissBlock::CountI64(miss) => {
-            for row_idx in 0..rows {
-                let base = row_idx * row_stride;
-                append_assoc_row_from_fields(
-                    text_buf,
-                    layout,
-                    model_key,
-                    meta.chrom[row_idx].as_str(),
-                    meta.pos[row_idx],
-                    meta.snp[row_idx].as_str(),
-                    meta.allele0[row_idx].as_str(),
-                    meta.allele1[row_idx].as_str(),
-                    meta.maf[row_idx],
-                    AssocMissValue::Count(miss[row_idx]),
-                    &results[base..base + row_stride],
-                );
-            }
-        }
-        AssocMissBlock::CountUsize(miss) => {
-            for row_idx in 0..rows {
-                let base = row_idx * row_stride;
-                append_assoc_row_from_fields(
-                    text_buf,
-                    layout,
-                    model_key,
-                    meta.chrom[row_idx].as_str(),
-                    meta.pos[row_idx],
-                    meta.snp[row_idx].as_str(),
-                    meta.allele0[row_idx].as_str(),
-                    meta.allele1[row_idx].as_str(),
-                    meta.maf[row_idx],
-                    AssocMissValue::Count(miss[row_idx] as i64),
-                    &results[base..base + row_stride],
-                );
-            }
-        }
-        AssocMissBlock::Rate(miss) => {
-            for row_idx in 0..rows {
-                let base = row_idx * row_stride;
-                append_assoc_row_from_fields(
-                    text_buf,
-                    layout,
-                    model_key,
-                    meta.chrom[row_idx].as_str(),
-                    meta.pos[row_idx],
-                    meta.snp[row_idx].as_str(),
-                    meta.allele0[row_idx].as_str(),
-                    meta.allele1[row_idx].as_str(),
-                    meta.maf[row_idx],
-                    AssocMissValue::Rate(miss[row_idx]),
-                    &results[base..base + row_stride],
-                );
-            }
-        }
+    for row_idx in 0..rows {
+        let base = row_idx * row_stride;
+        append_assoc_row_from_fields(
+            text_buf,
+            layout,
+            model_key,
+            meta.chrom[row_idx].as_str(),
+            meta.pos[row_idx],
+            meta.snp[row_idx].as_str(),
+            meta.allele0[row_idx].as_str(),
+            meta.allele1[row_idx].as_str(),
+            meta.maf[row_idx],
+            meta.miss.rate_at(row_idx),
+            &results[base..base + row_stride],
+        );
     }
     Ok(())
 }
@@ -673,64 +616,22 @@ pub(crate) fn append_assoc_block_from_core_sites(
     }
     let rows = results.len() / row_stride;
     validate_assoc_core_sites_block(meta, rows)?;
-    match meta.miss {
-        AssocMissBlock::CountI64(miss) => {
-            for row_idx in 0..rows {
-                let base = row_idx * row_stride;
-                let site = &meta.sites[row_idx];
-                append_assoc_row_from_fields(
-                    text_buf,
-                    layout,
-                    model_key,
-                    site.chrom.as_str(),
-                    site.pos as i64,
-                    site.snp.as_str(),
-                    site.ref_allele.as_str(),
-                    site.alt_allele.as_str(),
-                    meta.maf[row_idx],
-                    AssocMissValue::Count(miss[row_idx]),
-                    &results[base..base + row_stride],
-                );
-            }
-        }
-        AssocMissBlock::CountUsize(miss) => {
-            for row_idx in 0..rows {
-                let base = row_idx * row_stride;
-                let site = &meta.sites[row_idx];
-                append_assoc_row_from_fields(
-                    text_buf,
-                    layout,
-                    model_key,
-                    site.chrom.as_str(),
-                    site.pos as i64,
-                    site.snp.as_str(),
-                    site.ref_allele.as_str(),
-                    site.alt_allele.as_str(),
-                    meta.maf[row_idx],
-                    AssocMissValue::Count(miss[row_idx] as i64),
-                    &results[base..base + row_stride],
-                );
-            }
-        }
-        AssocMissBlock::Rate(miss) => {
-            for row_idx in 0..rows {
-                let base = row_idx * row_stride;
-                let site = &meta.sites[row_idx];
-                append_assoc_row_from_fields(
-                    text_buf,
-                    layout,
-                    model_key,
-                    site.chrom.as_str(),
-                    site.pos as i64,
-                    site.snp.as_str(),
-                    site.ref_allele.as_str(),
-                    site.alt_allele.as_str(),
-                    meta.maf[row_idx],
-                    AssocMissValue::Rate(miss[row_idx]),
-                    &results[base..base + row_stride],
-                );
-            }
-        }
+    for row_idx in 0..rows {
+        let base = row_idx * row_stride;
+        let site = &meta.sites[row_idx];
+        append_assoc_row_from_fields(
+            text_buf,
+            layout,
+            model_key,
+            site.chrom.as_str(),
+            site.pos as i64,
+            site.snp.as_str(),
+            site.ref_allele.as_str(),
+            site.alt_allele.as_str(),
+            meta.maf[row_idx],
+            meta.miss.rate_at(row_idx),
+            &results[base..base + row_stride],
+        );
     }
     Ok(())
 }
@@ -869,5 +770,107 @@ impl GwasAssocTsvWriter {
     #[getter]
     fn rows_written(&self) -> usize {
         self.sink.rows_written()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn format_one_row(miss: AssocMissBlock<'_>) -> String {
+        let chrom = vec!["1".to_string()];
+        let pos = [100_i64];
+        let snp = vec!["rs1".to_string()];
+        let allele0 = vec!["A".to_string()];
+        let allele1 = vec!["G".to_string()];
+        let maf = [0.25_f32];
+        let results = [0.5_f64, 0.25_f64, 0.0455_f64];
+        let mut text = String::new();
+        append_assoc_block_from_arrays(
+            &mut text,
+            AssocResultLayout::ResultCols {
+                schema: AssocResultCols::Basic3,
+                row_stride: 3,
+            },
+            "lm",
+            AssocArraysBlock {
+                chrom: &chrom,
+                pos: &pos,
+                snp: &snp,
+                allele0: &allele0,
+                allele1: &allele1,
+                maf: &maf,
+                miss,
+            },
+            &results,
+        )
+        .unwrap();
+        text
+    }
+
+    #[test]
+    fn missing_count_is_written_as_rate() {
+        let missing_count = [1_usize];
+        let missing_count_i64 = [1_i64];
+        let miss_rate = [0.0125_f32];
+        let count_row = format_one_row(AssocMissBlock::CountUsize {
+            values: &missing_count,
+            n_samples: 80,
+        });
+        let count_i64_row = format_one_row(AssocMissBlock::CountI64 {
+            values: &missing_count_i64,
+            n_samples: 80,
+        });
+        let rate_row = format_one_row(AssocMissBlock::Rate(&miss_rate));
+
+        assert_eq!(count_row.split('\t').nth(6), Some("0.0125"));
+        assert_eq!(count_i64_row.split('\t').nth(6), Some("0.0125"));
+        assert_eq!(rate_row.split('\t').nth(6), Some("0.0125"));
+    }
+
+    #[test]
+    fn lmm2_columns_use_canonical_precision() {
+        let chrom = vec!["1".to_string()];
+        let pos = [100_i64];
+        let snp = vec!["rs1".to_string()];
+        let allele0 = vec!["A".to_string()];
+        let allele1 = vec!["G".to_string()];
+        let maf = [0.25_f32];
+        let miss = [0.0125_f32];
+        let results = [1.23456_f64, 0.012345_f64, 1e-20, 0.123456, 1.234567, 1e-30];
+        let mut text = String::new();
+        append_assoc_block_from_arrays(
+            &mut text,
+            AssocResultLayout::ResultCols {
+                schema: AssocResultCols::Lmm2_6,
+                row_stride: 6,
+            },
+            "lmm2",
+            AssocArraysBlock {
+                chrom: &chrom,
+                pos: &pos,
+                snp: &snp,
+                allele0: &allele0,
+                allele1: &allele1,
+                maf: &maf,
+                miss: AssocMissBlock::Rate(&miss),
+            },
+            &results,
+        )
+        .unwrap();
+
+        let fields: Vec<_> = text.trim_end().split('\t').collect();
+        assert_eq!(fields[5], "0.2500");
+        assert_eq!(fields[6], "0.0125");
+        assert_eq!(fields[7], "1.2346");
+        assert_eq!(fields[8], "0.0123");
+        assert_eq!(
+            fields[9],
+            format!("{:.4e}", (results[0] / results[1]).powi(2))
+        );
+        assert_eq!(fields[10], "1.0000e-20");
+        assert_eq!(fields[11], "1.234560e-1");
+        assert_eq!(fields[12], "1.234567e0");
+        assert_eq!(fields[13], "1.0000e-30");
     }
 }

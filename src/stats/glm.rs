@@ -1504,7 +1504,10 @@ pub(crate) fn lm_stream_bed_additive_windowed_unified(
                         allele0: &chunk.a0[..write_rows],
                         allele1: &chunk.a1[..write_rows],
                         maf: &chunk.maf[..write_rows],
-                        miss: AssocMissBlock::CountUsize(&chunk.miss_block[..write_rows]),
+                        miss: AssocMissBlock::CountUsize {
+                            values: &chunk.miss_block[..write_rows],
+                            n_samples: n,
+                        },
                     },
                     &chunk.out_block[..write_rows * 5],
                 )?;
@@ -1950,7 +1953,10 @@ fn lm_stream_bed_segments_compact_windowed_unified(
                         allele0: &chunk.a0[..write_rows],
                         allele1: &chunk.a1[..write_rows],
                         maf: &chunk.maf[..write_rows],
-                        miss: AssocMissBlock::CountUsize(&chunk.miss_block[..write_rows]),
+                        miss: AssocMissBlock::CountUsize {
+                            values: &chunk.miss_block[..write_rows],
+                            n_samples: n,
+                        },
                     },
                     &chunk.out_block[..write_rows * 5],
                 )?;
@@ -2232,16 +2238,6 @@ pub(crate) fn lm_stream_bed_additive_prepared_unified(
             .unwrap_or(rows_here);
         if write_rows > 0 {
             text.clear();
-            let miss_counts: Vec<i64> = row_missing_batch[..write_rows]
-                .iter()
-                .map(|&v| {
-                    if v.is_finite() && v > 0.0 {
-                        ((v as f64 * n as f64).round().min(n as f64)) as i64
-                    } else {
-                        0
-                    }
-                })
-                .collect();
             append_assoc_block_from_core_sites(
                 &mut text,
                 AssocResultLayout::PrecomputedChisqBasic3 {
@@ -2255,7 +2251,7 @@ pub(crate) fn lm_stream_bed_additive_prepared_unified(
                 AssocCoreSitesBlock {
                     sites: &chunk_sites[..write_rows],
                     maf: &row_maf_batch[..write_rows],
-                    miss: AssocMissBlock::CountI64(miss_counts.as_slice()),
+                    miss: AssocMissBlock::Rate(&row_missing_batch[..write_rows]),
                 },
                 &out_slice[..write_rows * 5],
             )?;
@@ -2715,12 +2711,6 @@ pub fn lm_stream_bed_to_tsv(
                     .unwrap_or(rows_here);
                 if write_rows > 0 {
                     text.clear();
-                    let miss_counts: Vec<i64> = (0..write_rows)
-                        .map(|local_idx| {
-                            let row_idx = row_start + local_idx;
-                            (prepared.missing_rate[row_idx] as f64 * n as f64).round() as i64
-                        })
-                        .collect();
                     append_assoc_block_from_core_sites(
                         &mut text,
                         AssocResultLayout::PrecomputedChisqBasic3 {
@@ -2734,7 +2724,9 @@ pub fn lm_stream_bed_to_tsv(
                         AssocCoreSitesBlock {
                             sites: &prepared.sites[row_start..row_start + write_rows],
                             maf: &prepared.maf[row_start..row_start + write_rows],
-                            miss: AssocMissBlock::CountI64(miss_counts.as_slice()),
+                            miss: AssocMissBlock::Rate(
+                                &prepared.missing_rate[row_start..row_start + write_rows],
+                            ),
                         },
                         &out_slice[..write_rows * 5],
                     )
@@ -3040,7 +3032,10 @@ pub fn lm_stream_bed_to_tsv(
                     AssocCoreSitesBlock {
                         sites: &chunk_sites[..write_rows],
                         maf: &chunk_maf[..write_rows],
-                        miss: AssocMissBlock::CountI64(miss_counts.as_slice()),
+                        miss: AssocMissBlock::CountI64 {
+                            values: miss_counts.as_slice(),
+                            n_samples: n,
+                        },
                     },
                     &out[..write_rows * 5],
                 )
@@ -4035,7 +4030,6 @@ pub fn lm_block_assoc_packed_to_tsv<'py>(
                 // ---- V = ixx @ U, per-SNP corrections in f64 ----
                 text_buf.clear();
                 let mut out_block = vec![0.0_f64; rows * 5];
-                let mut miss_counts = vec![0_i64; rows];
                 for j in 0..rows {
                     let mut uj = vec![0.0_f64; q0];
                     for k in 0..q0 {
@@ -4074,7 +4068,6 @@ pub fn lm_block_assoc_packed_to_tsv<'py>(
                         }
                     };
 
-                    let fi = start + j;
                     let chisq = if beta_j.is_finite() && se_j.is_finite() && se_j > 0.0 {
                         let t = beta_j / se_j;
                         t * t
@@ -4083,7 +4076,6 @@ pub fn lm_block_assoc_packed_to_tsv<'py>(
                     };
                     let pwald = sanitize_assoc_pvalue(beta_j, se_j, pwald);
                     let _ = plrt;
-                    miss_counts[j] = (row_missing[fi] * n_samples as f32) as i64;
                     let base = j * 5;
                     out_block[base] = beta_j;
                     out_block[base + 1] = se_j;
@@ -4109,7 +4101,7 @@ pub fn lm_block_assoc_packed_to_tsv<'py>(
                         allele0: &allele0[start..start + rows],
                         allele1: &allele1[start..start + rows],
                         maf: &row_maf[start..start + rows],
-                        miss: AssocMissBlock::CountI64(miss_counts.as_slice()),
+                        miss: AssocMissBlock::Rate(&row_missing[start..start + rows]),
                     },
                     out_block.as_slice(),
                 )

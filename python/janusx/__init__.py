@@ -309,7 +309,11 @@ def _validate_linux_library_environment(library_dirs: list[Path] | None = None) 
 
     library_path_dirs: list[Path] = []
     first_library_by_name: dict[str, Path] = {}
-    for raw in os.environ.get("LD_LIBRARY_PATH", "").split(os.pathsep):
+    raw_library_path = os.environ.get("LD_LIBRARY_PATH")
+    library_path_entries = (
+        raw_library_path.split(os.pathsep) if raw_library_path is not None else []
+    )
+    for raw in library_path_entries:
         # glibc treats an empty path component as the current directory.
         directory = Path(raw or os.curdir).expanduser()
         try:

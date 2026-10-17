@@ -165,7 +165,6 @@ from janusx.script._common.memory import (
     resolve_decode_block_rows as _common_resolve_decode_block_rows,
 )
 from janusx.script._common.progress import (
-    ProgressAdapter,
     SpinnerStatusAdapter,
     build_rich_progress,
     rich_progress_available,
@@ -173,13 +172,15 @@ from janusx.script._common.progress import (
     failed_status_text,
     failure_symbol,
     finished_status_text,
-    log_success,
-    print_success,
     print_failure,
     print_skipped,
     format_elapsed,
     stdout_is_tty,
     success_symbol,
+)
+from janusx.gs.progress import (
+    GSProgressAdapter as ProgressAdapter, GSProgressLog, log_success, print_success,
+    trace_preparation,
 )
 from janusx.script._common.genocache import configure_genotype_cache_from_out
 from janusx.script._common.threads import (
@@ -252,510 +253,6 @@ _ML_METHOD_MAP: dict[str, str] = {
     "PLS": "pls",
     "KRR": "krr",
 }
-
-
-# Experimental nested GARFIELD->GBLUP path.  This is deliberately kept out of
-# the normal model list unless the hidden ``-GARFIELD`` development option is
-# requested.  Rules are learned on each training fold and then evaluated on
-# both sides of that fold.
-_GARFIELD_METHOD = "GARFIELD"
-_GARFIELD_EXTENSION_BP = 50_000
-_GARFIELD_STEP_BP = 25_000
-_GARFIELD_BEAM_WIDTH = 100
-_GARFIELD_LAYER = 5
-_GARFIELD_ML_TOP_K = 150
-
-
-def _split_garfield_rule_expression(expression: str) -> tuple[list[str], list[str]]:
-    """Split GARFIELD's compact rule display into literals and operators."""
-    text = str(expression).strip()
-    if text == "":
-        raise ValueError("GARFIELD rule expression is empty.")
-    parts = re.split(r"([&|^*])", text)
-    literals: list[str] = []
-    operators: list[str] = []
-    expect_literal = True
-    for part in parts:
-        token = str(part).strip()
-        if token == "":
-            continue
-        if expect_literal:
-            if token in {"&", "|", "^", "*"}:
-                raise ValueError(f"GARFIELD rule has an operator without a literal: {expression!r}")
-            literals.append(token)
-            expect_literal = False
-        else:
-            if token not in {"&", "|", "^", "*"}:
-                raise ValueError(f"GARFIELD rule has a literal without an operator: {expression!r}")
-            operators.append("&" if token == "*" else token)
-            expect_literal = True
-    if expect_literal or len(literals) == 0 or len(operators) != len(literals) - 1:
-        raise ValueError(f"Malformed GARFIELD rule expression: {expression!r}")
-    return literals, operators
-
-
-def _evaluate_garfield_rule_expression(
-    expression: str,
-    literal_masks: typing.Mapping[str, np.ndarray],
-) -> np.ndarray:
-    """Evaluate a compact GARFIELD rule over already-decoded BIN literals."""
-    literals, operators = _split_garfield_rule_expression(expression)
-
-    def _lookup(token: str) -> np.ndarray:
-        negated = str(token).startswith("!")
-        key = str(token)[1:] if negated else str(token)
-        if key not in literal_masks:
-            raise KeyError(f"GARFIELD literal is missing from decoded masks: {key!r}")
-        value = np.asarray(literal_masks[key], dtype=bool)
-        return np.logical_not(value) if negated else value
-
-    result = np.array(_lookup(literals[0]), dtype=bool, copy=True)
-    for op, token in zip(operators, literals[1:]):
-        rhs = _lookup(token)
-        if op == "&":
-            result &= rhs
-        elif op == "|":
-            result |= rhs
-        elif op == "^":
-            result ^= rhs
-        else:  # pragma: no cover - parser normalizes all supported operators
-            raise ValueError(f"Unsupported GARFIELD rule operator: {op!r}")
-    return np.ascontiguousarray(result, dtype=bool)
-
-
-_GARFIELD_LITERAL_RE = re.compile(r"^!?(.+)_([0-9]+)\[([^\]]+)\]$")
-
-
-def _read_garfield_bim_metadata(
-    prefix: str,
-) -> tuple[dict[tuple[str, int], list[tuple[int, str, str]]], int]:
-    """Read source BED metadata needed to materialize selected rule literals."""
-    prefix_text = str(prefix)
-    bim_path = (
-        f"{prefix_text[:-4]}.bim"
-        if prefix_text.lower().endswith(".bed")
-        else f"{prefix_text}.bim"
-    )
-    lookup: dict[tuple[str, int], list[tuple[int, str, str]]] = {}
-    n_rows = 0
-    with open(bim_path, "r", encoding="utf-8", errors="replace") as handle:
-        for line_no, raw in enumerate(handle, start=1):
-            parts = str(raw).strip().split()
-            if len(parts) < 6:
-                raise ValueError(f"Malformed GARFIELD source BIM row at {bim_path}:{line_no}")
-            chrom = str(parts[0]).strip()
-            try:
-                pos = int(float(parts[3]))
-            except Exception as exc:
-                raise ValueError(f"Invalid GARFIELD source BIM position at {bim_path}:{line_no}") from exc
-            lookup.setdefault((chrom, pos), []).append(
-                (int(n_rows), str(parts[4]).strip().upper(), str(parts[5]).strip().upper())
-            )
-            n_rows += 1
-    return lookup, int(n_rows)
-
-
-def _parse_garfield_literal_token(
-    token: str,
-) -> tuple[str, int, str, bool]:
-    negated = str(token).startswith("!")
-    text = str(token)[1:] if negated else str(token)
-    match = _GARFIELD_LITERAL_RE.match(text.strip())
-    if match is None:
-        raise ValueError(f"Unsupported GARFIELD literal token: {token!r}")
-    chrom = str(match.group(1)).strip()
-    pos = int(match.group(2))
-    allele = str(match.group(3)).strip().upper()
-    if chrom == "" or allele == "":
-        raise ValueError(f"Malformed GARFIELD literal token: {token!r}")
-    return chrom, pos, allele, bool(negated)
-
-
-def _materialize_garfield_pseudo_features(
-    genotype_prefix: str,
-    expressions: typing.Iterable[str],
-    train_sample_indices: np.ndarray,
-    eval_sample_indices: np.ndarray,
-    *,
-    n_samples: int,
-) -> tuple[np.ndarray, np.ndarray, list[str], dict[str, int]]:
-    """Materialize one BIN pseudo feature per unique GARFIELD rule.
-
-    The mode used for heterozygous/missing calls is learned from the training
-    samples only and then applied unchanged to the evaluation samples.  This
-    mirrors GARFIELD's BIN encoder while keeping the CV boundary explicit.
-    """
-    train_idx = np.ascontiguousarray(np.asarray(train_sample_indices, dtype=np.int64).reshape(-1))
-    eval_idx = np.ascontiguousarray(np.asarray(eval_sample_indices, dtype=np.int64).reshape(-1))
-    if train_idx.size == 0:
-        raise ValueError("GARFIELD pseudo-feature materialization requires non-empty training samples.")
-    if np.any(train_idx < 0) or np.any(train_idx >= int(n_samples)):
-        raise ValueError("GARFIELD training sample indices are out of range.")
-    if np.any(eval_idx < 0) or np.any(eval_idx >= int(n_samples)):
-        raise ValueError("GARFIELD evaluation sample indices are out of range.")
-
-    unique_expr: list[str] = []
-    seen_expr: set[str] = set()
-    for raw in expressions:
-        expr = str(raw).strip()
-        if expr == "" or expr in seen_expr:
-            continue
-        # Validate syntax before touching the BED payload.
-        _split_garfield_rule_expression(expr)
-        seen_expr.add(expr)
-        unique_expr.append(expr)
-    if len(unique_expr) == 0:
-        empty_train = np.zeros((0, int(train_idx.size)), dtype=np.float32)
-        empty_eval = np.zeros((0, int(eval_idx.size)), dtype=np.float32)
-        return empty_train, empty_eval, [], {"rules_seen": 0, "rules_used": 0, "rules_constant": 0}
-
-    bim_lookup, n_snps = _read_garfield_bim_metadata(str(genotype_prefix))
-    payload = open_plink_bed_payload_memmap(
-        str(genotype_prefix),
-        n_samples=int(n_samples),
-        n_snps=int(n_snps),
-    )
-    all_idx = np.concatenate([train_idx, eval_idx]).astype(np.int64, copy=False)
-    literal_tokens: list[str] = []
-    seen_literals: set[str] = set()
-    for expr in unique_expr:
-        literals, _ops = _split_garfield_rule_expression(expr)
-        for token in literals:
-            key = str(token)
-            if key.startswith("!"):
-                key = key[1:]
-            if key not in seen_literals:
-                seen_literals.add(key)
-                literal_tokens.append(key)
-
-    literal_masks: dict[str, np.ndarray] = {}
-    for token in literal_tokens:
-        chrom, pos, target_allele, _negated = _parse_garfield_literal_token(token)
-        candidates = bim_lookup.get((chrom, int(pos)), [])
-        chosen: tuple[int, str, str] | None = None
-        for candidate in candidates:
-            if target_allele in {candidate[1], candidate[2]}:
-                chosen = candidate
-                break
-        if chosen is None:
-            raise ValueError(
-                f"GARFIELD literal {token!r} was not found in source BIM or has incompatible alleles."
-            )
-        row_idx, allele0, allele1 = chosen
-        codes = np.asarray(
-            (payload[int(row_idx), all_idx // 4] >> ((all_idx & 3) * 2)) & 0b11,
-            dtype=np.uint8,
-        )
-        known0 = codes == 0b00
-        known2 = codes == 0b11
-        if target_allele == allele1:
-            hits = known2.copy()
-        elif target_allele == allele0:
-            hits = known0.copy()
-        else:  # pragma: no cover - guarded by candidate selection
-            raise ValueError(f"GARFIELD target allele mismatch for {token!r}")
-        train_known = known0[: int(train_idx.size)] | known2[: int(train_idx.size)]
-        train_hits = hits[: int(train_idx.size)]
-        mode_is_hit = bool(int(np.sum(train_hits & train_known)) > int(np.sum((~train_hits) & train_known)))
-        hits[~(known0 | known2)] = mode_is_hit
-        literal_masks[token] = np.ascontiguousarray(hits, dtype=bool)
-
-    train_rows: list[np.ndarray] = []
-    eval_rows: list[np.ndarray] = []
-    used_names: list[str] = []
-    n_constant = 0
-    n_train = int(train_idx.size)
-    for expr in unique_expr:
-        mask = _evaluate_garfield_rule_expression(expr, literal_masks)
-        train_mask = np.ascontiguousarray(mask[:n_train], dtype=bool)
-        eval_mask = np.ascontiguousarray(mask[n_train:], dtype=bool)
-        if int(np.unique(train_mask).size) < 2:
-            n_constant += 1
-            continue
-        train_rows.append(np.asarray(train_mask, dtype=np.float32) * 2.0)
-        eval_rows.append(np.asarray(eval_mask, dtype=np.float32) * 2.0)
-        used_names.append(expr)
-
-    if len(train_rows) == 0:
-        train_out = np.zeros((0, n_train), dtype=np.float32)
-        eval_out = np.zeros((0, int(eval_idx.size)), dtype=np.float32)
-    else:
-        train_out = np.ascontiguousarray(np.vstack(train_rows), dtype=np.float32)
-        eval_out = np.ascontiguousarray(np.vstack(eval_rows), dtype=np.float32)
-    return train_out, eval_out, used_names, {
-        "rules_seen": int(len(unique_expr)),
-        "rules_used": int(len(used_names)),
-        "rules_constant": int(n_constant),
-    }
-
-
-def _run_garfield_nested_cv(
-    *,
-    genotype_prefix: str,
-    sample_ids: np.ndarray,
-    train_pheno: np.ndarray,
-    train_sample_indices: np.ndarray,
-    test_sample_indices: np.ndarray,
-    cv_splits: list[tuple[np.ndarray, np.ndarray]],
-    outprefix: str,
-    trait_name: str,
-    n_jobs: int,
-    seed: int,
-    maf: float,
-    missing_rate: float,
-    het_threshold: float,
-    logger: logging.Logger | None = None,
-) -> dict[str, typing.Any]:
-    """Run fold-local GARFIELD rule search followed by pseudo-feature GBLUP.
-
-    Every fold searches rules using only its training individuals.  The final
-    prediction model is then refit once on all observed phenotypes, which is
-    valid for an external genotype test set because those phenotypes are not
-    used during rule search.  This routine intentionally does not call the
-    ordinary GS method dispatcher: GARFIELD is an experimental, dedicated
-    nested-CV mode.
-    """
-    if _jxrs is None or not hasattr(_jxrs, "garfield_logic_search_bed"):
-        raise RuntimeError("Rust backend is unavailable: GARFIELD nested GS requires garfield_logic_search_bed.")
-    train_y = np.ascontiguousarray(np.asarray(train_pheno, dtype=np.float64).reshape(-1, 1))
-    train_abs = np.ascontiguousarray(np.asarray(train_sample_indices, dtype=np.int64).reshape(-1))
-    test_abs = np.ascontiguousarray(np.asarray(test_sample_indices, dtype=np.int64).reshape(-1))
-    source_ids = np.asarray(sample_ids, dtype=str).reshape(-1)
-    if int(train_y.shape[0]) != int(train_abs.size):
-        raise ValueError("GARFIELD nested GS phenotype/sample index lengths do not match.")
-    if int(source_ids.size) == 0:
-        raise ValueError("GARFIELD nested GS received no source genotype samples.")
-
-    def _search_rules(abs_indices: np.ndarray, y_values: np.ndarray, fold_label: str):
-        abs_idx = np.ascontiguousarray(np.asarray(abs_indices, dtype=np.int64).reshape(-1))
-        y_vec = np.ascontiguousarray(np.asarray(y_values, dtype=np.float64).reshape(-1))
-        if int(abs_idx.size) != int(y_vec.size) or int(abs_idx.size) < 2:
-            raise ValueError(f"GARFIELD {fold_label} requires at least two aligned training samples.")
-        t0 = time.monotonic()
-        result = _jxrs.garfield_logic_search_bed(
-            str(genotype_prefix),
-            y_vec,
-            grm=None,
-            x_cov=None,
-            sample_indices=abs_idx.tolist(),
-            site_keep=None,
-            unit_kind="window",
-            groups=None,
-            null_groups=None,
-            group_names=None,
-            extension=int(_GARFIELD_EXTENSION_BP),
-            step=int(_GARFIELD_STEP_BP),
-            scan_bimranges=None,
-            bin_mode="bin",
-            ml_method="corr",
-            ml_importance="imp",
-            ml_top_k=int(_GARFIELD_ML_TOP_K),
-            ml_top_frac=0.0,
-            permutation_repeats=0,
-            permutation_scoring="auto",
-            rule_null_penalty_method="gev",
-            rule_null_quantile=0.99,
-            rule_null_report_pvalue=False,
-            n_estimators=100,
-            max_depth=5,
-            min_samples_leaf=1,
-            min_samples_split=2,
-            bootstrap=True,
-            feature_subsample=0.0,
-            seed=int(seed),
-            max_pick=5,
-            exhaustive_depth=1,
-            beam_width=int(_GARFIELD_BEAM_WIDTH),
-            rank_score="gain_from_layer:1",
-            maf_threshold=float(maf),
-            logic_maf_threshold=float(maf),
-            max_missing_rate=float(missing_rate),
-            het_threshold=float(het_threshold),
-            snps_only=False,
-            block_cols=65536,
-            threads=max(1, int(n_jobs)),
-            low=-5.0,
-            high=5.0,
-            max_iter=50,
-            tol=1e-3,
-            add_intercept=True,
-            exact_n_max=15000,
-            require_lapack=False,
-            out_prefix=None,
-            simbench_path=None,
-            top_rules_per_unit=1,
-            max_output_rules=0,
-            max_output_ratio=0.0,
-            rule_permutation=False,
-            prior_len=None,
-            no_clean=False,
-            raw_design=False,
-            filter_xor_substates=True,
-            xor_search=False,
-            whole_genome_dev_mode=False,
-            progress_callback=None,
-            progress_every=0,
-            logic_mem_budget_bytes=0,
-            diagnostics=False,
-        )
-        # ``expressions`` is the native design syntax (e.g. ``BIN(rs1)``),
-        # whereas ``snp_names`` is the coordinate/allele display syntax that
-        # can be decoded against the source BIM (e.g. ``1_100[G]``).
-        expressions_raw = result.get("snp_names", None)
-        if expressions_raw is None or len(list(expressions_raw)) == 0:
-            expressions_raw = result.get("expressions", [])
-        expressions = [str(x).strip() for x in list(expressions_raw or []) if str(x).strip() != ""]
-        scores_raw = result.get("scores", [])
-        scores = list(scores_raw) if scores_raw is not None else []
-        elapsed = float(time.monotonic() - t0)
-        if logger is not None:
-            logger.info(
-                "GARFIELD %s: searched %d samples, selected %d rules in %.2fs",
-                str(fold_label), int(abs_idx.size), int(len(expressions)), elapsed,
-            )
-        return expressions, scores, elapsed, result
-
-    def _write_rules(path: str, expressions: list[str], scores: list[typing.Any]) -> None:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write("rule\tscore\n")
-            for i, expression in enumerate(expressions):
-                score = scores[i] if i < len(scores) else ""
-                handle.write(f"{expression}\t{score}\n")
-
-    fold_rows: list[tuple[str, int, float, float, float, float, float, float, float]] = []
-    oof_pred = np.full((int(train_y.shape[0]),), np.nan, dtype=np.float64)
-    best_test = None
-    best_train = None
-    best_r2 = -np.inf
-    fold_rule_counts: list[dict[str, typing.Any]] = []
-    cv_started = time.monotonic()
-    for fold_id, (test_local, train_local) in enumerate(cv_splits, start=1):
-        fold_test_local = np.asarray(test_local, dtype=np.int64).reshape(-1)
-        fold_train_local = np.asarray(train_local, dtype=np.int64).reshape(-1)
-        fold_train_abs = train_abs[fold_train_local]
-        fold_test_abs = train_abs[fold_test_local]
-        expressions, scores, search_elapsed, _search_result = _search_rules(
-            fold_train_abs,
-            train_y[fold_train_local, 0],
-            f"fold {fold_id}/{len(cv_splits)}",
-        )
-        fold_train_x, fold_test_x, used_names, counts = _materialize_garfield_pseudo_features(
-            str(genotype_prefix),
-            expressions,
-            fold_train_abs,
-            fold_test_abs,
-            n_samples=int(source_ids.size),
-        )
-        if len(used_names) == 0:
-            raise RuntimeError(f"GARFIELD fold {fold_id} produced no non-constant pseudo features.")
-        t_fit = time.monotonic()
-        _yhat_train, yhat_test, pve = GSapi(
-            train_y[fold_train_local],
-            fold_train_x,
-            fold_test_x,
-            method="GBLUP",
-            PCAdec=False,
-            n_jobs=max(1, int(n_jobs)),
-            seed=int(seed + fold_id),
-            force_fast=False,
-            need_train_pred=False,
-        )
-        metric = _regression_metric_pack(train_y[fold_test_local, 0], np.asarray(yhat_test).reshape(-1))
-        pred_fold = np.asarray(yhat_test, dtype=np.float64).reshape(-1)
-        oof_pred[fold_test_local] = pred_fold
-        elapsed = float(search_elapsed + (time.monotonic() - t_fit))
-        row = (
-            _GARFIELD_METHOD,
-            int(fold_id),
-            float(metric.get("pearson", np.nan)),
-            float(metric.get("spearman", np.nan)),
-            float(metric.get("r2", np.nan)),
-            float(pve),
-            elapsed,
-            float(metric.get("mse", np.nan)),
-            float(metric.get("mae", np.nan)),
-        )
-        fold_rows.append(row)
-        fold_rule_counts.append({"fold": int(fold_id), **counts, "search_sec": float(search_elapsed)})
-        rule_path = f"{outprefix}.{trait_name}.garfield.cv{int(fold_id)}.rules.tsv"
-        _write_rules(rule_path, used_names, scores[: len(used_names)])
-        ttest = np.column_stack((train_y[fold_test_local, 0], pred_fold))
-        ttrain = np.zeros((0, 2), dtype=np.float64)
-        if float(row[4]) > best_r2:
-            best_r2 = float(row[4])
-            best_test = ttest
-            best_train = ttrain
-
-    cv_elapsed = float(time.monotonic() - cv_started)
-    full_search_started = time.monotonic()
-    full_expressions, full_scores, full_search_elapsed, _full_result = _search_rules(
-        train_abs,
-        train_y[:, 0],
-        "final full-training fit",
-    )
-    full_train_x, full_test_x, full_used_names, full_counts = _materialize_garfield_pseudo_features(
-        str(genotype_prefix),
-        full_expressions,
-        train_abs,
-        test_abs,
-        n_samples=int(source_ids.size),
-    )
-    if len(full_used_names) == 0:
-        raise RuntimeError("GARFIELD final search produced no non-constant pseudo features.")
-    _yhat_train_final, yhat_test_final, pve_final = GSapi(
-        train_y,
-        full_train_x,
-        full_test_x,
-        method="GBLUP",
-        PCAdec=False,
-        n_jobs=max(1, int(n_jobs)),
-        seed=int(seed),
-        force_fast=False,
-        need_train_pred=False,
-    )
-    final_elapsed = float(time.monotonic() - full_search_started)
-    final_rule_path = f"{outprefix}.{trait_name}.garfield.final.rules.tsv"
-    _write_rules(final_rule_path, full_used_names, full_scores[: len(full_used_names)])
-    if logger is not None:
-        logger.info(
-            "GARFIELD final: selected %d/%d rules, %d pseudo features, %.2fs",
-            int(len(full_used_names)), int(full_counts.get("rules_seen", 0)),
-            int(full_train_x.shape[0]), final_elapsed,
-        )
-    oof_metrics = _regression_metric_pack(train_y[:, 0], oof_pred)
-    return {
-        "method": _GARFIELD_METHOD,
-        "method_display": _method_display_name(_GARFIELD_METHOD),
-        "fold_rows": fold_rows,
-        "best_test": best_test,
-        "best_train": best_train,
-        "oof_pred": oof_pred.reshape(-1, 1),
-        "oof_truth": train_y.reshape(-1, 1),
-        "oof_sample_ids": source_ids[train_abs],
-        "test_pred": np.asarray(yhat_test_final, dtype=np.float64).reshape(-1, 1),
-        "pve_final": float(pve_final),
-        "cv_mode": "nested_garfield_cv",
-        "cv_skipped": False,
-        "final_fit_skipped": False,
-        "final_predict_skipped": int(test_abs.size) == 0,
-        "elapsed_cv_sec": cv_elapsed,
-        "elapsed_fit_sec": float(full_search_elapsed),
-        "elapsed_predict_sec": float(max(0.0, final_elapsed - full_search_elapsed)),
-        "elapsed_total_sec": float(cv_elapsed + final_elapsed),
-        "garfield_nested": {
-            "fold_rule_counts": fold_rule_counts,
-            "final_rule_counts": dict(full_counts),
-            "final_pseudo_features": int(full_train_x.shape[0]),
-            "oof_metrics": oof_metrics,
-            "final_rules_file": final_rule_path,
-        },
-        "model_state": None,
-        "gblup_final_state": None,
-        "rrblup_final_state": None,
-        "rrblup_final_cfg": None,
-        "rrblup_pve_final": None,
-    }
 
 
 @dataclass(frozen=True)
@@ -1767,8 +1264,6 @@ def _method_display_name(method: str) -> str:
         return BLUP_METHOD
     if _is_gblup_method(m):
         return _gblup_method_display(m)
-    if m == _GARFIELD_METHOD:
-        return "GARFIELD-GBLUP"
     return m
 
 
@@ -11466,7 +10961,6 @@ def _run_method_task(
         "BayesB",
         "BayesC",
         "BayesR",
-        _GARFIELD_METHOD,
     }
     bayes_methods = {"BayesA", "BayesB", "BayesC", "BayesR"}
     bayes_cfg_base = dict(bayes_auto_r2_cfg or {})
@@ -14354,21 +13848,29 @@ def _run_gs_model_only_prediction(
             row_mean=dosage_mean,
             row_inv_sd=row_inv,
         )
-        pred = _predict_from_loaded_model_state(
-            method=str(item["method"]),
-            model_state=typing.cast(dict[str, typing.Any], item["state"]),
-            dense_matrix=dense_matrix,
-            packed_ctx=None,
-            packed_sample_indices=None,
-            thread_limit=max(1, int(args.thread)),
-        )
-        pred = np.asarray(pred, dtype=np.float64).reshape(-1)
-        if int(pred.size) != int(sample_ids.size):
-            raise RuntimeError(
-                f"Prediction length mismatch for model {model_file}: "
-                f"got {pred.size}, expected {sample_ids.size}."
+        telemetry = GSProgressLog(logger, str(item["method_display"]), str(item["trait"]), 0)
+        telemetry.update("Predict", status="started")
+        try:
+            pred = _predict_from_loaded_model_state(
+                method=str(item["method"]),
+                model_state=typing.cast(dict[str, typing.Any], item["state"]),
+                dense_matrix=dense_matrix,
+                packed_ctx=None,
+                packed_sample_indices=None,
+                thread_limit=max(1, int(args.thread)),
             )
+            pred = np.asarray(pred, dtype=np.float64).reshape(-1)
+            if int(pred.size) != int(sample_ids.size):
+                raise RuntimeError(
+                    f"Prediction length mismatch for model {model_file}: "
+                    f"got {pred.size}, expected {sample_ids.size}."
+                )
+        except Exception:
+            telemetry.finish(failed=True)
+            raise
         predictions.append({**item, "prediction": pred})
+        telemetry.update("Predict", status="finished")
+        telemetry.finish()
 
     grouped: OrderedDict[str, list[dict[str, typing.Any]]] = OrderedDict()
     for item in predictions:
@@ -14506,6 +14008,8 @@ def _run_methods_parallel(
     emit_method_summary: bool = True,
     on_method_start: typing.Callable[[str], None] | None = None,
     on_method_complete: typing.Callable[[str, dict[str, typing.Any]], None] | None = None,
+    progress_logger: logging.Logger | None = None,
+    progress_trait: str = "",
 ) -> list[dict[str, typing.Any]]:
     if len(methods) == 0:
         return []
@@ -15317,9 +14821,13 @@ def _run_methods_parallel(
             for m in methods
         }
         animate_method_progress = bool(
-            show_method_progress or any(rrblup_progress_enabled_by_method.values())
+            show_method_progress
+            or any(rrblup_progress_enabled_by_method.values())
+            or any(m in _ML_METHOD_MAP for m in methods)
         )
-        if animate_method_progress and rich_progress_available():
+        # The adapter selects Rich, tqdm, or plain operation itself. Keep the
+        # same callbacks and stage lifecycle in interactive and batch runs.
+        if animate_method_progress:
             for m in methods:
                 m_disp = _method_display(str(m))
                 if on_method_start is not None:
@@ -15328,6 +14836,7 @@ def _run_methods_parallel(
                     except Exception:
                         pass
                 cv_total = int(max(1, fold_total_map.get(m, 1)))
+                telemetry = GSProgressLog(progress_logger, m_disp, progress_trait, len(cv_splits or []))
                 has_search_stage = bool((m in _ML_METHOD_MAP) and (not strict_cv))
                 has_rrblup_iter_progress = bool(
                     rrblup_progress_enabled_by_method.get(str(m), False)
@@ -15342,6 +14851,7 @@ def _run_methods_parallel(
                 search_done = 0
                 search_total = 0
                 search_total_fixed = False
+                search_stage = "Search"
                 rr_progress_done = 0
                 rr_progress_total = 0
                 rr_progress_stage = "fit"
@@ -15357,7 +14867,7 @@ def _run_methods_parallel(
                 rr_subprogress_seen = False
                 res: dict[str, typing.Any] | None = None
                 t0 = time.monotonic()
-                cv_units_per_fold = 100
+                cv_units_per_fold = 1
                 cv_total_units = int(max(1, cv_total * cv_units_per_fold))
                 cv_done_folds = 0
                 cv_done_units = 0
@@ -15377,18 +14887,18 @@ def _run_methods_parallel(
                     if search_bar is None:
                         search_bar = ProgressAdapter(
                             total=total,
-                            desc=f"{m_disp} search",
+                            desc=search_stage,
                             show_spinner=True,
                             show_postfix=True,
                             keep_display=False,
-                            show_remaining=False,
+                            show_remaining=search_total_fixed,
                             emit_done=False,
                             force_animate=True,
                         )
                         search_bar.set_postfix(step=f"{search_done}/{search_total}")
                         return
                     search_bar.set_total(total)
-                    search_bar.set_description(f"{m_disp} search")
+                    search_bar.set_description(search_stage)
                     search_bar.set_postfix(step=f"{search_done}/{search_total}")
 
                 def _ensure_cv_bar() -> None:
@@ -15471,7 +14981,7 @@ def _run_methods_parallel(
                             cv_bar = None
                             msg = "CV ...Finished"
                             if cv_elapsed is not None:
-                                msg = f"{msg} [{format_elapsed(cv_elapsed)}]"
+                                msg = f"{msg} [{cv_total}/{cv_total} folds | {format_elapsed(cv_elapsed)}]"
                             print_success(msg, force_color=True)
                             cv_line_emitted = True
                     cv_stage_closed = True
@@ -15481,7 +14991,7 @@ def _run_methods_parallel(
                     if fit_status is not None:
                         return
                     fit_status = SpinnerStatusAdapter(
-                        "Fitting",
+                        "Fit",
                         enabled=True,
                         force_animate=True,
                     )
@@ -15507,18 +15017,16 @@ def _run_methods_parallel(
                         msg = "Fitting ...Skipped" if skipped else "Fitting ...Finished"
                         if elapsed_parts is not None:
                             msg = f"{msg} [{format_elapsed(float(elapsed_payload))}]"
-                        if skipped:
-                            print_skipped(msg, force_color=True)
-                        else:
-                            print_success(msg, force_color=True)
+                        print_success(msg, force_color=True)
                         stage_lines_emitted = True
                         return
                     if fit_status is None:
                         return
-                    fit_status.finish(
-                        message=("Fitting ...Skipped" if skipped else None),
-                        elapsed_parts=elapsed_parts,
-                    )
+                    fit_status.close(show_done=False)
+                    msg = "Fit ...Skipped" if skipped else "Fit ...Finished"
+                    if elapsed_parts is not None:
+                        msg += f" [{format_elapsed(float(elapsed_payload))}]"
+                    print_success(msg, force_color=True)
                     fit_status = None
                     stage_lines_emitted = True
 
@@ -15527,7 +15035,7 @@ def _run_methods_parallel(
                     if pred_status is not None:
                         return
                     pred_status = SpinnerStatusAdapter(
-                        "Predicting",
+                        "Predict",
                         enabled=True,
                         force_animate=True,
                     )
@@ -15553,18 +15061,16 @@ def _run_methods_parallel(
                         msg = "Predicting ...Skipped" if skipped else "Predicting ...Finished"
                         if elapsed_parts is not None:
                             msg = f"{msg} [{format_elapsed(float(elapsed_payload))}]"
-                        if skipped:
-                            print_skipped(msg, force_color=True)
-                        else:
-                            print_success(msg, force_color=True)
+                        print_success(msg, force_color=True)
                         stage_lines_emitted = True
                         return
                     if pred_status is None:
                         return
-                    pred_status.finish(
-                        message=("Predicting ...Skipped" if skipped else None),
-                        elapsed_parts=elapsed_parts,
-                    )
+                    pred_status.close(show_done=False)
+                    msg = "Predict ...Skipped" if skipped else "Predict ...Finished"
+                    if elapsed_parts is not None:
+                        msg += f" [{format_elapsed(float(elapsed_payload))}]"
+                    print_success(msg, force_color=True)
                     pred_status = None
                     stage_lines_emitted = True
 
@@ -15611,6 +15117,7 @@ def _run_methods_parallel(
                 def _stage_hook(event: str, payload: dict[str, typing.Any]) -> None:
                     ev = str(event)
                     if ev == "cv_start":
+                        _close_search_bar()
                         _ensure_cv_bar()
                         return
                     if ev == "cv_end":
@@ -15699,6 +15206,8 @@ def _run_methods_parallel(
                         rr_bar = ProgressAdapter(
                             total=target_total,
                             desc=str(desc),
+                            show_bar=(str(desc) != "PCG"),
+                            show_percentage=(str(desc) != "PCG"),
                             show_spinner=True,
                             show_postfix=True,
                             keep_display=False,
@@ -15710,7 +15219,10 @@ def _run_methods_parallel(
                         rr_bar_total = target_total
                         rr_bar_done = 0
                     if rr_bar is not None:
-                        rr_bar.set_postfix(step=f"{target_done}/{target_total}")
+                        if str(desc) == "PCG":
+                            rr_bar.set_postfix(iter=f"{target_done} (limit {target_total})")
+                        else:
+                            rr_bar.set_postfix(step=f"{target_done}/{target_total}")
                         delta = int(max(0, target_done - rr_bar_done))
                         if delta > 0:
                             rr_bar.update(delta)
@@ -15730,32 +15242,25 @@ def _run_methods_parallel(
                     *,
                     units_within_fold: int,
                 ) -> None:
-                    fold_raw = payload.get("fold", None)
-                    if fold_raw is None:
-                        return
-                    fold_no = int(max(1, int(fold_raw)))
-                    target_units = ((fold_no - 1) * cv_units_per_fold) + int(units_within_fold)
-                    _advance_cv_units(target_units)
+                    # Overall CV advances only on completed-fold callbacks.
+                    return
 
                 def _search_hook(event: str, payload: dict[str, typing.Any]) -> None:
-                    nonlocal search_done, search_total, search_total_fixed
+                    nonlocal search_done, search_total, search_total_fixed, search_stage
                     ev = str(event)
                     if ev == "search_total":
-                        count = int(max(0, int(payload.get("count", 0))))
-                        if count <= 0:
-                            return
-                        search_total = int(count)
-                        search_total_fixed = True
-                        _ensure_search_bar()
+                        # This is a planned ceiling; phase plans below contain
+                        # the actual number of deduplicated candidates.
                         return
                     if ev == "search_plan":
                         count = int(max(0, int(payload.get("count", 0))))
                         if count <= 0:
                             return
-                        if not search_total_fixed:
-                            search_total += count
-                        if search_total <= 0:
-                            search_total = count
+                        _close_search_bar()
+                        search_done = 0
+                        search_total = count
+                        search_total_fixed = True
+                        search_stage = "Search " + str(payload.get("stage", "configs"))
                         _ensure_search_bar()
                         return
                     if ev == "search_advance":
@@ -15992,9 +15497,9 @@ def _run_methods_parallel(
                         test_sample_indices=test_sample_indices,
                         train_sample_ids=train_sample_ids,
                         progress_queue=None,
-                        progress_hook=_cv_hook,
-                        search_progress_hook=_search_hook,
-                        rrblup_progress_hook=(
+                        progress_hook=telemetry.wrap_cv(_cv_hook),
+                        search_progress_hook=telemetry.wrap_search(_search_hook),
+                        rrblup_progress_hook=telemetry.wrap_iterations(
                             _rrblup_progress_hook
                             if (has_rrblup_iter_progress and use_rrblup_subprogress)
                             else None
@@ -16013,7 +15518,7 @@ def _run_methods_parallel(
                         bayes_burnin=bayes_burnin,
                         bayes_posterior=bayes_posterior,
                         save_model_artifact=save_model_artifact,
-                        stage_hook=_stage_hook,
+                        stage_hook=telemetry.wrap_stage(_stage_hook),
                     )
                     res = _finalize_method_result(
                         str(m),
@@ -16022,6 +15527,7 @@ def _run_methods_parallel(
                         call_method=str(method_call),
                     )
                 except Exception:
+                    telemetry.finish(failed=True)
                     _close_search_bar()
                     _close_rr_phase(fail=True)
                     _fail_fit_stage()
@@ -16059,6 +15565,7 @@ def _run_methods_parallel(
 
                 if res is None:
                     continue
+                telemetry.finish()
                 _attach_method_detail_rows(str(m), res)
                 out.append(res)
                 if on_method_complete is not None:
@@ -16077,6 +15584,7 @@ def _run_methods_parallel(
                 except Exception:
                     pass
             cv_total = int(max(1, fold_total_map.get(m, 1)))
+            telemetry = GSProgressLog(progress_logger, m_disp, progress_trait, len(cv_splits or []))
             has_search_stage = bool((m in _ML_METHOD_MAP) and (not strict_cv))
             has_rrblup_iter_progress = bool(
                 rrblup_progress_enabled_by_method.get(str(m), False)
@@ -16112,7 +15620,7 @@ def _run_methods_parallel(
             stage_lines_emitted = False
             cv_line_emitted = bool(enable_tqdm_progress and show_method_progress)
             rr_subprogress_seen = False
-            cv_units_per_fold = 100
+            cv_units_per_fold = 1
             cv_total_units = int(max(1, cv_total * cv_units_per_fold))
             cv_done_folds = 0
             cv_done_units = 0
@@ -16332,10 +15840,10 @@ def _run_methods_parallel(
                 if not stdout_is_tty():
                     return
                 fit_status = CliStatus(
-                    "Computing Fitting...",
+                    "Fit",
                     enabled=True,
                     use_process=True,
-                    show_elapsed=False,
+                    show_elapsed=True,
                 )
                 fit_status.__enter__()
 
@@ -16359,20 +15867,18 @@ def _run_methods_parallel(
                     msg = "Fitting ...Skipped" if skipped else "Fitting ...Finished"
                     if elapsed_parts is not None:
                         msg = f"{msg} [{format_elapsed(float(elapsed))}]"
-                    if skipped:
-                        print_skipped(msg, force_color=True)
-                    else:
-                        print_success(msg, force_color=True)
+                    print_success(msg, force_color=True)
                     stage_lines_emitted = True
                     return
                 if fit_status is None:
                     return
                 msg = "Fitting ...Skipped" if skipped else "Fitting ...Finished"
-                if elapsed_parts is not None and (not bool(getattr(fit_status, "show_elapsed", False))):
+                if elapsed_parts is not None:
                     msg = f"{msg} [{format_elapsed(float(elapsed))}]"
                     elapsed_parts = None
-                fit_status.complete(msg, elapsed_parts=elapsed_parts)
+                fit_status.close(show_done=False)
                 fit_status.__exit__(None, None, None)
+                print_success(msg, force_color=True)
                 fit_status = None
                 stage_lines_emitted = True
 
@@ -16391,10 +15897,10 @@ def _run_methods_parallel(
                 if not stdout_is_tty():
                     return
                 pred_status = CliStatus(
-                    "Computing Predicting...",
+                    "Predict",
                     enabled=True,
                     use_process=True,
-                    show_elapsed=False,
+                    show_elapsed=True,
                 )
                 pred_status.__enter__()
 
@@ -16417,11 +15923,12 @@ def _run_methods_parallel(
                 if pred_status is None:
                     return
                 msg = "Predicting ...Skipped" if skipped else "Predicting ...Finished"
-                if elapsed_parts is not None and (not bool(getattr(pred_status, "show_elapsed", False))):
+                if elapsed_parts is not None:
                     msg = f"{msg} [{format_elapsed(float(elapsed))}]"
                     elapsed_parts = None
-                pred_status.complete(msg, elapsed_parts=elapsed_parts)
+                pred_status.close(show_done=False)
                 pred_status.__exit__(None, None, None)
+                print_success(msg, force_color=True)
                 pred_status = None
                 stage_lines_emitted = True
 
@@ -16460,12 +15967,8 @@ def _run_methods_parallel(
                 *,
                 units_within_fold: int,
             ) -> None:
-                fold_raw = payload.get("fold", None)
-                if fold_raw is None:
-                    return
-                fold_no = int(max(1, int(fold_raw)))
-                target_units = ((fold_no - 1) * cv_units_per_fold) + int(units_within_fold)
-                _advance_cv_units(target_units)
+                # Overall CV advances only on completed-fold callbacks.
+                return
 
             def _mark_rr_subprogress() -> None:
                 nonlocal fit_status, rr_subprogress_seen
@@ -16829,9 +16332,9 @@ def _run_methods_parallel(
                         test_sample_indices=test_sample_indices,
                         train_sample_ids=train_sample_ids,
                         progress_queue=None,
-                        progress_hook=(_cv_hook if enable_tqdm_progress else None),
-                        search_progress_hook=(_search_hook if enable_tqdm_progress else None),
-                        rrblup_progress_hook=(
+                        progress_hook=telemetry.wrap_cv(_cv_hook if enable_tqdm_progress else None),
+                        search_progress_hook=telemetry.wrap_search(_search_hook if enable_tqdm_progress else None),
+                        rrblup_progress_hook=telemetry.wrap_iterations(
                             _rrblup_progress_hook
                             if (has_rrblup_iter_progress and enable_tqdm_progress)
                             else None
@@ -16850,7 +16353,7 @@ def _run_methods_parallel(
                         bayes_burnin=bayes_burnin,
                         bayes_posterior=bayes_posterior,
                         save_model_artifact=save_model_artifact,
-                        stage_hook=_stage_hook,
+                        stage_hook=telemetry.wrap_stage(_stage_hook),
                     )
                     res = _finalize_method_result(
                         str(m),
@@ -16859,6 +16362,7 @@ def _run_methods_parallel(
                         call_method=str(method_call),
                     )
                 except Exception:
+                    telemetry.finish(failed=True)
                     _close_search_bar()
                     _close_rrblup_bar()
                     _close_lambda_bar()
@@ -16896,6 +16400,7 @@ def _run_methods_parallel(
                     res["__cv_line_emitted"] = True
                 _attach_method_detail_rows(str(m), res)
                 out.append(res)
+                telemetry.finish()
                 if on_method_complete is not None:
                     try:
                         on_method_complete(str(m), res)
@@ -17804,6 +17309,7 @@ def _apply_packed_ld_prune_for_gs_external_plink(
     return packed_ctx
 
 
+@trace_preparation("LD prune")
 def _apply_packed_ld_prune_for_gs(
     *,
     packed_ctx: dict[str, typing.Any],
@@ -17918,6 +17424,7 @@ def _apply_packed_ld_prune_for_gs(
     return packed_ctx
 
 
+@trace_preparation("Hash", counted=True)
 def _hash_packed_for_gs(
     *,
     packed_ctx: dict[str, typing.Any],
@@ -18015,6 +17522,7 @@ def _hash_packed_for_gs(
     return z, float(scale_raw), int(kept_raw)
 
 
+@trace_preparation("Hash", counted=True)
 def _hash_packed_kernels_for_gblup(
     *,
     packed_ctx: dict[str, typing.Any],
@@ -18126,6 +17634,7 @@ def _hash_packed_kernels_for_gblup(
     return train_grm, cross, int(kept_raw)
 
 
+@trace_preparation("Hash", counted=True)
 def _hash_packed_ztz_stats_for_gblup(
     *,
     packed_ctx: dict[str, typing.Any],
@@ -18513,9 +18022,9 @@ def _run_hash_job_with_progress_bar(
     pbar = ProgressAdapter(
         total=total,
         desc=str(desc),
-        show_spinner=False,
+        show_spinner=True,
         show_postfix=False,
-        show_remaining=False,
+        show_remaining=True,
         keep_display=False,
         emit_done=False,
         force_animate=True,
@@ -18579,57 +18088,13 @@ def _run_indeterminate_task_with_progress_bar(
     desc: str,
     enabled: bool,
     runner: typing.Callable[[], typing.Any],
-    interval_s: float = 0.2,
-    total_ticks: int = 80,
-    cap_ratio: float = 0.95,
 ) -> typing.Any:
     if not bool(enabled):
         return runner()
-    total = max(20, int(total_ticks))
-    cap = max(1, min(total - 1, int(round(total * float(cap_ratio)))))
-    pbar = ProgressAdapter(
-        total=total,
-        desc=str(desc),
-        show_spinner=False,
-        show_postfix=False,
-        show_remaining=False,
-        keep_display=False,
-        emit_done=False,
-        force_animate=True,
-    )
-    ticked = {"n": 0}
-    stop_evt = threading.Event()
-
-    def _ticker() -> None:
-        wait_s = max(0.05, float(interval_s))
-        while not stop_evt.wait(wait_s):
-            if ticked["n"] < cap:
-                pbar.update(1)
-                ticked["n"] += 1
-
-    th = threading.Thread(target=_ticker, daemon=True)
-    th.start()
-    try:
-        out = runner()
-    except Exception:
-        stop_evt.set()
-        try:
-            th.join(timeout=0.6)
-        except Exception:
-            pass
-        pbar.close()
-        raise
-
-    stop_evt.set()
-    try:
-        th.join(timeout=0.6)
-    except Exception:
-        pass
-    if ticked["n"] < total:
-        pbar.update(total - ticked["n"])
-    pbar.finish()
-    pbar.close()
-    return out
+    # This runner has no measurable work total. Keep elapsed time visible
+    # without inventing a percentage or an estimated completion time.
+    with CliStatus(str(desc), enabled=True, show_elapsed=True):
+        return runner()
 
 
 def _fit_gblup_reml_from_hash_ztz_stats(
@@ -18914,16 +18379,6 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         action="store_true",
         default=False,
         help="Use the four-component BayesR mixture model with default pi/gamma priors.",
-    )
-    model_group.add_argument(
-        "-GARFIELD", "--GARFIELD",
-        action="store_true",
-        default=False,
-        help=(
-            "Experimental nested GARFIELD window search followed by pseudo-feature GBLUP; "
-            "requires a PLINK -bfile and -cv >= 2."
-            if show_dev_help else argparse.SUPPRESS
-        ),
     )
     model_group.add_argument(
         "-RF", "--RF",
@@ -19458,7 +18913,6 @@ def parse_args(argv: typing.Optional[list[str]] = None):
             args.BayesB,
             args.BayesC,
             args.BayesR,
-            args.GARFIELD,
             args.RF,
             args.ET,
             args.GBDT,
@@ -19470,36 +18924,6 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         )
         if any(bool(value) for value in training_flags):
             parser.error("model-only prediction cannot be combined with a training model flag")
-    if bool(args.GARFIELD):
-        if args.cv is None or int(args.cv) < 2:
-            parser.error("-GARFIELD requires -cv >= 2 for nested fold-local rule search.")
-        if not args.bfile or not _is_plink_prefix(str(args.bfile)):
-            parser.error("-GARFIELD currently requires a PLINK -bfile prefix with .bed/.bim/.fam files.")
-        if args.model is not None:
-            parser.error("-GARFIELD cannot be combined with --model; it must learn rules within each CV fold.")
-        other_models = any(
-            bool(value)
-            for value in (
-                args.GBLUP,
-                args.adBLUP,
-                args.rrBLUP,
-                args.BLUP,
-                args.BayesA,
-                args.BayesB,
-                args.BayesC,
-                args.BayesR,
-                args.RF,
-                args.ET,
-                args.GBDT,
-                args.XGB,
-                args.SVM,
-                args.ENET,
-                args.PLS,
-                args.KRR,
-            )
-        )
-        if other_models:
-            parser.error("-GARFIELD is a dedicated development mode and cannot be combined with another GS model.")
     if (args.GBLUP is not None) or bool(args.rrBLUP) or bool(args.adBLUP):
         parser.error(
             "-GBLUP/--GBLUP, -rrBLUP/--rrBLUP, and -adBLUP/--adBLUP have been retired. "
@@ -19881,9 +19305,8 @@ def _run_gs_pipeline_impl(
         or bayes_c_enabled
         or bayes_r_enabled
     ) and (not model_mode)
-    garfield_requested = bool(getattr(args, "GARFIELD", False)) and (not model_mode)
     packed_model_requested = bool(
-        blup_requested or bayes_requested or garfield_requested
+        blup_requested or bayes_requested
     )
     if file_memmap_preferred and rr_solver_mode == "pcg" and (not packed_model_requested):
         rrblup_solver = "auto"
@@ -20009,8 +19432,6 @@ def _run_gs_pipeline_impl(
         methods.append("BayesC")
     if bayes_r_enabled:
         methods.append("BayesR")
-    if bool(getattr(args, "GARFIELD", False)):
-        methods.append(_GARFIELD_METHOD)
     if args.RF:
         methods.append("RF")
     if args.ET:
@@ -20893,6 +20314,7 @@ def _run_gs_pipeline_impl(
                         desc="LD prune",
                         enabled=True,
                         runner=lambda: _apply_packed_ld_prune_for_gs(
+                            progress_logger=logger,
                             packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
                             genotype_prefix=str(gfile),
                             spec=ldprune_spec,
@@ -20912,6 +20334,7 @@ def _run_gs_pipeline_impl(
                 with CliStatus("Applying LD prune...", enabled=use_spinner) as task:
                     try:
                         packed_lmm_ctx = _apply_packed_ld_prune_for_gs(
+                            progress_logger=logger,
                             packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
                             genotype_prefix=str(gfile),
                             spec=ldprune_spec,
@@ -20965,6 +20388,7 @@ def _run_gs_pipeline_impl(
                         pe: int,
                     ) -> tuple[np.ndarray, float, int]:
                         return _hash_packed_for_gs(
+                            progress_logger=logger,
                             packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
                             hash_dim=hash_dim,
                             hash_seed=int(args.hash_seed),
@@ -20997,6 +20421,7 @@ def _run_gs_pipeline_impl(
                     ) as task:
                         try:
                             geno_h, hash_scale, hash_kept = _hash_packed_for_gs(
+                                progress_logger=logger,
                                 packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
                                 hash_dim=hash_dim,
                                 hash_seed=int(args.hash_seed),
@@ -21078,6 +20503,7 @@ def _run_gs_pipeline_impl(
                         desc="LD prune",
                         enabled=True,
                         runner=lambda: _apply_packed_ld_prune_for_gs(
+                            progress_logger=logger,
                             packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
                             genotype_prefix=str(gfile),
                             spec=_spec,
@@ -21097,6 +20523,7 @@ def _run_gs_pipeline_impl(
                 with CliStatus("Applying LD prune...", enabled=use_spinner) as task:
                     try:
                         packed_lmm_ctx = _apply_packed_ld_prune_for_gs(
+                            progress_logger=logger,
                             packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
                             genotype_prefix=str(gfile),
                             spec=_spec,
@@ -21141,6 +20568,7 @@ def _run_gs_pipeline_impl(
                 pe: int,
             ) -> tuple[np.ndarray, float, int]:
                 return _hash_packed_for_gs(
+                    progress_logger=logger,
                     packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
                     hash_dim=hash_dim,
                     hash_seed=int(args.hash_seed),
@@ -21173,6 +20601,7 @@ def _run_gs_pipeline_impl(
             ) as task:
                 try:
                     geno_h, hash_scale, hash_kept = _hash_packed_for_gs(
+                        progress_logger=logger,
                         packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
                         hash_dim=hash_dim,
                         hash_seed=int(args.hash_seed),
@@ -21251,6 +20680,7 @@ def _run_gs_pipeline_impl(
                     desc="LD prune",
                     enabled=True,
                     runner=lambda: _apply_packed_ld_prune_for_gs(
+                        progress_logger=logger,
                         packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
                         genotype_prefix=str(gfile),
                         spec=_spec,
@@ -21270,6 +20700,7 @@ def _run_gs_pipeline_impl(
             with CliStatus("Applying LD prune...", enabled=use_spinner) as task:
                 try:
                     packed_lmm_ctx = _apply_packed_ld_prune_for_gs(
+                        progress_logger=logger,
                         packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
                         genotype_prefix=str(gfile),
                         spec=_spec,
@@ -21543,6 +20974,7 @@ def _run_gs_pipeline_impl(
                             pe: int,
                         ) -> tuple[np.ndarray, np.ndarray, int]:
                             return _hash_packed_kernels_for_gblup(
+                                progress_logger=logger,
                                 packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
                                 hash_dim=hash_dim,
                                 hash_seed=int(args.hash_seed),
@@ -21577,6 +21009,7 @@ def _run_gs_pipeline_impl(
                         ) as task:
                             try:
                                 train_grm_c, test_train_grm_c, hash_kept_c = _hash_packed_kernels_for_gblup(
+                                    progress_logger=logger,
                                     packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
                                     hash_dim=hash_dim,
                                     hash_seed=int(args.hash_seed),
@@ -21918,6 +21351,7 @@ def _run_gs_pipeline_impl(
                                 pe: int,
                             ) -> tuple[np.ndarray, np.ndarray, int]:
                                 return _hash_packed_kernels_for_gblup(
+                                    progress_logger=logger,
                                     packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
                                     hash_dim=hash_dim,
                                     hash_seed=int(args.hash_seed),
@@ -21955,6 +21389,7 @@ def _run_gs_pipeline_impl(
                             ) as task:
                                 try:
                                     train_grm, test_train_grm, hash_kept = _hash_packed_kernels_for_gblup(
+                                        progress_logger=logger,
                                         packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
                                         hash_dim=hash_dim,
                                         hash_seed=int(args.hash_seed),
@@ -21994,6 +21429,7 @@ def _run_gs_pipeline_impl(
                             pe: int,
                         ) -> tuple[np.ndarray, float, int]:
                             return _hash_packed_for_gs(
+                                progress_logger=logger,
                                 packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
                                 hash_dim=hash_dim,
                                 hash_seed=int(args.hash_seed),
@@ -22009,6 +21445,7 @@ def _run_gs_pipeline_impl(
                             pe: int,
                         ) -> tuple[np.ndarray, float, int]:
                             return _hash_packed_for_gs(
+                                progress_logger=logger,
                                 packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
                                 hash_dim=hash_dim,
                                 hash_seed=int(args.hash_seed),
@@ -22054,6 +21491,7 @@ def _run_gs_pipeline_impl(
                         ) as task:
                             try:
                                 z_train, hash_scale, hash_kept = _hash_packed_for_gs(
+                                    progress_logger=logger,
                                     packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
                                     hash_dim=hash_dim,
                                     hash_seed=int(args.hash_seed),
@@ -22063,6 +21501,7 @@ def _run_gs_pipeline_impl(
                                 )
                                 if int(test_sample_idx.shape[0]) > 0:
                                     z_test, _scale_t, _kept_t = _hash_packed_for_gs(
+                                        progress_logger=logger,
                                         packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
                                         hash_dim=hash_dim,
                                         hash_seed=int(args.hash_seed),
@@ -22141,6 +21580,7 @@ def _run_gs_pipeline_impl(
                             pe: int,
                         ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, int]:
                             return _hash_packed_ztz_stats_for_gblup(
+                                progress_logger=logger,
                                 packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
                                 hash_dim=hash_dim,
                                 hash_seed=int(args.hash_seed),
@@ -22179,6 +21619,7 @@ def _run_gs_pipeline_impl(
                             try:
                                 gram, row_sum, row_sq_sum, zy_vec, hash_scale, hash_kept = (
                                     _hash_packed_ztz_stats_for_gblup(
+                                        progress_logger=logger,
                                         packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
                                         hash_dim=hash_dim,
                                         hash_seed=int(args.hash_seed),
@@ -22247,6 +21688,7 @@ def _run_gs_pipeline_impl(
                             pe: int,
                         ) -> tuple[np.ndarray, float, int]:
                             return _hash_packed_for_gs(
+                                progress_logger=logger,
                                 packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
                                 hash_dim=hash_dim,
                                 hash_seed=int(args.hash_seed),
@@ -22262,6 +21704,7 @@ def _run_gs_pipeline_impl(
                             pe: int,
                         ) -> tuple[np.ndarray, float, int]:
                             return _hash_packed_for_gs(
+                                progress_logger=logger,
                                 packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
                                 hash_dim=hash_dim,
                                 hash_seed=int(args.hash_seed),
@@ -22307,6 +21750,7 @@ def _run_gs_pipeline_impl(
                         ) as task:
                             try:
                                 z_train, hash_scale, hash_kept = _hash_packed_for_gs(
+                                    progress_logger=logger,
                                     packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
                                     hash_dim=hash_dim,
                                     hash_seed=int(args.hash_seed),
@@ -22316,6 +21760,7 @@ def _run_gs_pipeline_impl(
                                 )
                                 if int(test_sample_idx.shape[0]) > 0:
                                     z_test, _scale_t, _kept_t = _hash_packed_for_gs(
+                                        progress_logger=logger,
                                         packed_ctx=typing.cast(dict[str, typing.Any], packed_lmm_ctx),
                                         hash_dim=hash_dim,
                                         hash_seed=int(args.hash_seed),
@@ -22403,7 +21848,11 @@ def _run_gs_pipeline_impl(
             gblup_backend_m = int(train_snp.shape[0])
             gblup_backend_label = "ZTZ" if gblup_backend_n > gblup_backend_m else "kinship"
 
-        sep_w = max(40, min(60, _terminal_columns()))
+        sep_w = (
+            _gs_terminal_rule_width(80, logger=terminal_logger)
+            if terminal_rich
+            else max(40, min(60, _terminal_columns()))
+        )
         gs_output.emit_trait_header(
             terminal_logger if terminal_rich else logger,
             trait_name=str(trait_name),
@@ -22415,6 +21864,7 @@ def _run_gs_pipeline_impl(
             gblup_backend_label=gblup_backend_label,
             gblup_backend_n=gblup_backend_n,
             gblup_backend_m=gblup_backend_m,
+            tty_style=bool(terminal_rich),
         )
         bundle_mode = bool(
             model_mode
@@ -22465,7 +21915,11 @@ def _run_gs_pipeline_impl(
         def _emit_method_header(method_key: str) -> None:
             m_key = str(method_key)
             m_disp = method_display_map.get(m_key, _method_display_name(m_key))
-            gs_output.emit_method_header(logger, m_disp)
+            gs_output.emit_method_header(
+                logger,
+                m_disp,
+                terminal_logger=terminal_logger if terminal_rich else None,
+            )
 
         def _method_detail_rows_for_emit(
             method_key: str,
@@ -22507,30 +21961,6 @@ def _run_gs_pipeline_impl(
                         rows.append(("route", route_label))
                     if eff_method != "":
                         rows.extend(_rows_for(eff_method))
-                    return rows
-
-                if m == _GARFIELD_METHOD:
-                    nested = dict(
-                        typing.cast(
-                            dict[str, typing.Any] | None,
-                            res_obj.get("garfield_nested"),
-                        )
-                        or {}
-                    )
-                    fold_counts = list(nested.get("fold_rule_counts", []) or [])
-                    if len(fold_counts) > 0:
-                        rows.append(("search", "fold-local GARFIELD -> GBLUP"))
-                        rows.append(("folds", str(len(fold_counts))))
-                        rows.append(
-                            (
-                                "rules/fold",
-                                ",".join(str(int(x.get("rules_used", 0))) for x in fold_counts),
-                            )
-                        )
-                    rows.append(("pseudo_features", str(int(nested.get("final_pseudo_features", 0) or 0))))
-                    final_counts = dict(nested.get("final_rule_counts", {}) or {})
-                    if len(final_counts) > 0:
-                        rows.append(("final_rules", str(int(final_counts.get("rules_used", 0) or 0))))
                     return rows
 
                 if _is_gblup_method(m):
@@ -22871,20 +22301,18 @@ def _run_gs_pipeline_impl(
             cv_line_emitted = bool(res_obj.get("__cv_line_emitted", False))
             gs_output.emit_method_stage_lines(
                 logger,
-                cv_folds=(
-                    (int(len(cv_splits)) if cv_splits is not None else None)
-                    if (not cv_line_emitted)
-                    else None
-                ),
+                cv_folds=(int(len(cv_splits)) if cv_splits is not None else None),
                 cv_elapsed_sec=float(cv_sec),
-                cv_skipped=bool(res_obj.get("cv_skipped", False)) and (not cv_line_emitted),
+                cv_skipped=bool(res_obj.get("cv_skipped", False)),
                 fit_elapsed_sec=float(fit_sec),
                 fit_skipped=bool(res_obj.get("final_fit_skipped", False)),
                 predict_elapsed_sec=float(pred_sec),
                 predict_skipped=bool(res_obj.get("final_predict_skipped", False)),
                 total_elapsed_sec=_detail_float_or_nan(res_obj.get("elapsed_total_sec", np.nan)),
-                include_fit=bool((args.model is None) and (not stage_lines_emitted)),
-                include_predict=bool(not stage_lines_emitted),
+                include_fit=bool(args.model is None),
+                include_predict=True,
+                cv_terminal_emitted=cv_line_emitted,
+                stages_terminal_emitted=stage_lines_emitted,
                 terminal_columns=int(_terminal_columns()),
                 format_elapsed=format_elapsed,
                 log_success=log_success,
@@ -23421,29 +22849,6 @@ def _run_gs_pipeline_impl(
                 method_results.append(res)
                 _emit_method_header(str(m))
                 _emit_method_block_and_artifacts(str(m), res)
-        elif _GARFIELD_METHOD in trait_methods:
-            if cv_splits is None or len(cv_splits) < 2:
-                raise RuntimeError("GARFIELD nested GS requires at least two CV folds.")
-            method_results = []
-            garfield_res = _run_garfield_nested_cv(
-                genotype_prefix=str(gfile),
-                sample_ids=np.asarray(samples, dtype=str).reshape(-1),
-                train_pheno=np.asarray(train_pheno, dtype=np.float64),
-                train_sample_indices=method_train_sample_idx,
-                test_sample_indices=method_test_sample_idx,
-                cv_splits=cv_splits,
-                outprefix=str(outprefix),
-                trait_name=str(trait_name),
-                n_jobs=max(1, int(args.thread)),
-                seed=int(args.seed),
-                maf=float(args.maf),
-                missing_rate=float(args.geno),
-                het_threshold=float(args.het),
-                logger=logger,
-            )
-            method_results.append(garfield_res)
-            _emit_method_header(_GARFIELD_METHOD)
-            _emit_method_block_and_artifacts(_GARFIELD_METHOD, garfield_res)
         else:
             method_results = _run_methods_parallel(
                 methods=trait_methods,
@@ -23479,6 +22884,8 @@ def _run_gs_pipeline_impl(
                 emit_method_summary=False,
                 on_method_start=_emit_method_header,
                 on_method_complete=_emit_method_block_and_artifacts,
+                progress_logger=logger,
+                progress_trait=str(trait_name),
             )
         if _GS_DEBUG_STAGE:
             logger.info(

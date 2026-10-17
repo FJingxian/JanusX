@@ -1517,7 +1517,11 @@ def main(log: bool = True):
                 )
                 with CliStatus(
                     genotype_load_status_open(load_src_disp),
+                    # GRM construction owns a detailed ProgressAdapter. Keep
+                    # its live renderer as the only TTY writer; otherwise the
+                    # outer process spinner races the progress-bar redraws.
                     enabled=use_spinner,
+                    animate=False,
                     use_process=True,
                 ) as task:
                     try:
@@ -1641,7 +1645,10 @@ def main(log: bool = True):
         else:
             with CliStatus(
                 genotype_load_status_open(load_src_disp),
+                # build_grm_streaming_for_pca renders its own live progress
+                # bar in a TTY, so avoid a second concurrent status renderer.
                 enabled=use_spinner,
+                animate=False,
                 use_process=True,
             ) as task:
                 try:

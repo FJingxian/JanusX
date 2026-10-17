@@ -656,7 +656,7 @@ def trait_selector_help_text() -> str:
     return (
         "Phenotype column(s), accepted as zero-based index (excluding sample ID), "
         "column name, comma list (e.g. 0,2 or TraitA,TraitB), "
-        "or numeric range (e.g. 0:2). "
+        "or inclusive numeric range (e.g. 0:2, 11: to the last trait, :5, or : for all). "
         "Repeat this flag for multiple traits."
     )
 
@@ -779,6 +779,7 @@ def parse_trait_selector_specs(
     Supported forms:
       - zero-based column index: 0
       - inclusive numeric range: 0:3 / 0-3
+      - open inclusive range: 11: / :5 / : (resolved after loading columns)
       - column name: TraitA
       - mixed use across repeated flags / comma-separated tokens
     """
@@ -879,6 +880,19 @@ def resolve_trait_selectors(
     invalid: list[str] = []
     seen: set[int] = set()
     for spec in selectors:
+        if isinstance(spec, str):
+            open_range = re.fullmatch(r"\s*(\d*)\s*:\s*(\d*)\s*", spec)
+            if open_range and (not open_range.group(1) or not open_range.group(2)):
+                start = int(open_range.group(1)) if open_range.group(1) else 0
+                stop = int(open_range.group(2)) if open_range.group(2) else len(cols) - 1
+                if not (0 <= start <= stop < len(cols)):
+                    invalid.append(spec)
+                    continue
+                for idx in range(start, stop + 1):
+                    if idx not in seen:
+                        selected.append(idx)
+                        seen.add(idx)
+                continue
         local_idx: int | None = None
         if isinstance(spec, int):
             idx = int(spec)

@@ -30,14 +30,16 @@ from janusx.script._common.threads import runtime_thread_stage
 
 
 _GWAS_PROGRESS_BAR_WIDTH = 30
-_GWAS_LOG_PROGRESS_MIN_INTERVAL_SEC = 2.0
+_GWAS_LOG_PROGRESS_MIN_INTERVAL_SEC = 10.0
 _GWAS_MODEL_LINE_WIDTH = 80
 _GWAS_MODEL_DONE_RE = re.compile(
     r"^(?P<label>[A-Za-z][A-Za-z0-9]*(?:\([^)]*\))?)\s+\.\.\.(?P<body>.*?)(?:\s+\[(?P<times>[^\]]+)\])?$"
 )
 _GWAS_MODEL_LABELS = {
     "LM",
+    "LM2",
     "LMM",
+    "LMM2",
     "FvLMM",
     "SparseLMM",
     "ALGWAS",
@@ -154,9 +156,62 @@ def _logger_flag(logger: Optional[logging.Logger], name: str, default: bool = Fa
 
 
 def _gwas_progress_enabled(logger: Optional[logging.Logger]) -> bool:
-    env_raw = str(os.environ.get("JX_GWAS_PROGRESS", "0")).strip().lower()
+    env_raw = str(os.environ.get("JX_GWAS_PROGRESS", "1")).strip().lower()
     env_enabled = env_raw in {"1", "true", "yes", "y", "on"}
     return bool(_logger_flag(logger, "_janusx_gwas_progress_enabled", env_enabled))
+
+
+class _GwasProgressLog:
+    """Plain progress snapshots shared by animated and non-interactive scans."""
+
+    def __init__(self, logger, model: str, total: int, *, trait: str = "", unit: str = "SNP"):
+        self.logger = logger
+        self.model = " ".join(str(model).split())
+        self.trait = " ".join(str(trait).split())
+        self.total = max(0, int(total))
+        self.unit = str(unit)
+        self.started = time.monotonic()
+        self.last_emit = self.started
+        self.finished = False
+        self.update(0, force=True)
+
+    def update(self, done: int, *, total=None, memory: str = "", force: bool = False):
+        if self.finished or self.logger is None:
+            return
+        if total is not None:
+            self.total = max(0, int(total))
+        done = max(0, int(done))
+        if self.total:
+            done = min(done, self.total)
+        complete = self.total > 0 and done == self.total
+        now = time.monotonic()
+        if not force and not complete:
+            if not _gwas_progress_enabled(self.logger):
+                return
+            if now - self.last_emit < _GWAS_LOG_PROGRESS_MIN_INTERVAL_SEC:
+                return
+        elapsed = max(0.0, now - self.started)
+        percent = 100.0 * done / self.total if self.total else 0.0
+        eta = "--"
+        if complete:
+            eta = "0s"
+        elif done > 0 and self.total > done and elapsed >= 1.0:
+            eta = format_elapsed(elapsed * (self.total - done) / done)
+        trait = f" [{self.trait}]" if self.trait else ""
+        rss = f" RSS={memory}" if memory else ""
+        line = (
+            f"GWAS{trait} {self.model:<8} {percent:5.1f}%"
+            f" | {self.unit}s={done:,}/{self.total:,}"
+            f" | elapsed={format_elapsed(elapsed)} ETA={eta}{rss}"
+        )
+        if stdout_is_tty():
+            _log_file_only(self.logger, logging.INFO, line)
+        else:
+            self.logger.info(line)
+        for handler in self.logger.handlers:
+            handler.flush()
+        self.last_emit = now
+        self.finished = complete
 
 
 def _gwas_verbose_enabled(logger: Optional[logging.Logger]) -> bool:
@@ -177,13 +232,14 @@ def _format_gwas_model_completion_line(message: object) -> Optional[str]:
     body = str(m.group("body") or "").strip()
     if body == "":
         body = "Finished"
-    if body.lower().startswith("pve "):
-        body = f"PVE={body[4:].strip()}"
-    times = str(m.group("times") or "").strip()
-    prefix = f"  > {label:<14}: "
+    pve_match = re.match(r"^pve(?:\(pheno\))?\s+(.+)$", body, re.IGNORECASE)
+    if pve_match is not None:
+        body = f"Finished; PVE={pve_match.group(1).strip()}"
+    times = str(m.group("times") or "").strip().replace("/", " | ")
+    prefix = f"  > {label:<10}: "
     suffix = f"[ {times} ]" if times != "" else ""
     if suffix != "":
-        dots = max(2, _GWAS_MODEL_LINE_WIDTH - len(prefix) - len(body) - len(suffix) - 1)
+        dots = max(2, _GWAS_MODEL_LINE_WIDTH - len(prefix) - len(body) - len(suffix) - 2)
         return f"{prefix}{body} {'.' * dots} {suffix}"
     return f"{prefix}{body}"
 
@@ -339,18 +395,13 @@ class _ProgressAdapter(_BaseProgressAdapter):
         force_animate: bool = False,
         logger: Optional[logging.Logger] = None,
         log_unit: str = "SNP",
+        trait: str = "",
+        progress_log: Optional[_GwasProgressLog] = None,
     ) -> None:
-        self._log_progress_enabled = _gwas_progress_enabled(logger)
-        self._logger = logger
-        self._log_unit = str(log_unit).strip() or "item"
         self._done = 0
         self._tick = 0
         self._memory_text = ""
         self._memory_until_tick = 0
-        self._log_last_cells = -1
-        self._log_last_desc = str(desc)
-        self._log_last_memory = ""
-        self._log_last_emit_ts = 0.0
         self._log_finished = False
         super().__init__(
             total=total,
@@ -364,63 +415,23 @@ class _ProgressAdapter(_BaseProgressAdapter):
             force_animate=force_animate,
             logger=logger,
             log_unit=log_unit,
+            description_template="[green]{task.description:<10}",
         )
-        self._emit_log_progress(force=True)
+        self._progress_log = progress_log or _GwasProgressLog(
+            logger, desc, total, trait=trait, unit=log_unit,
+        )
 
     def _active_memory_text(self) -> str:
         if self._memory_text and self._tick <= self._memory_until_tick:
             return str(self._memory_text).strip()
         return ""
 
-    def _emit_progress_log_line(self, line: str) -> None:
-        if self._logger is None:
-            return
-        if stdout_is_tty():
-            _log_file_only(self._logger, logging.INFO, str(line))
-        else:
-            self._logger.info(str(line))
-
     def _emit_log_progress(self, *, force: bool = False) -> None:
-        if (not self._log_progress_enabled) or self._logger is None:
-            return
-        total = int(max(1, self.total))
-        done = int(max(0, min(self._done, total)))
-        frac = float(done) / float(total) if total > 0 else 0.0
-        width = int(max(8, _GWAS_PROGRESS_BAR_WIDTH))
-        filled = width if done >= total else int(frac * float(width))
-        filled = max(0, min(width, filled))
-        mem_text = self._active_memory_text()
-        now = time.monotonic()
-        if not force:
-            if (
-                filled == self._log_last_cells
-                and self.desc == self._log_last_desc
-                and mem_text == self._log_last_memory
-                and (now - self._log_last_emit_ts) < _GWAS_LOG_PROGRESS_MIN_INTERVAL_SEC
-            ):
-                return
-        elif (
-            done == total
-            and self._log_finished
-            and filled == self._log_last_cells
-            and self.desc == self._log_last_desc
-            and mem_text == self._log_last_memory
-        ):
-            return
-        bar = "*" * filled
-        unit = str(self._log_unit).strip() or "item"
-        if done == total and total > 0:
-            self._log_finished = True
-        elapsed = format_elapsed(now - self._start_ts)
-        details = [f"{done:,}/{total:,} {unit}", elapsed]
-        if mem_text != "":
-            details.append(f"RSS={mem_text}")
-        line = f"{self.desc} progress [{bar}] [{', '.join(details)}]"
-        self._emit_progress_log_line(line)
-        self._log_last_cells = filled
-        self._log_last_desc = self.desc
-        self._log_last_memory = mem_text
-        self._log_last_emit_ts = now
+        self._progress_log.model = self.desc
+        self._progress_log.update(
+            self._done, total=self.total, memory=self._active_memory_text(), force=force,
+        )
+        self._log_finished = self._progress_log.finished
 
     def update(self, step: int = 1) -> None:
         if self._finished:

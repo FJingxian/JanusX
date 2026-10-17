@@ -34,7 +34,6 @@ from .workflow import (
     _display_path,
     _emit_trait_header,
     _finalize_gwas_result_tsv,
-    _format_progress_metric,
     _cleanup_gwas_result_tmp,
     _progress_callback_step,
     _mixed_model_switch_to_lm_decision,
@@ -68,6 +67,7 @@ from .null_model_sidecar import (
     build_fvlmm_sidecar,
     emit_sidecar_to_file_log,
 )
+from .workflow_ui import _GwasProgressLog
 
 _WARNED_BED_MMAP_LIMIT_LEGACY = False
 _WARNED_BED_PREPARED_SNPS_ONLY_LEGACY = False
@@ -740,6 +740,7 @@ def run_chunked_gwas_kfile(
             desc=progress_desc,
             force_animate=True,
             logger=logger,
+            trait=str(trait_name),
         )
         # The native scanner is deliberately selected only for the single
         # additive request validated above.  There is no Python decode path.
@@ -1020,10 +1021,10 @@ def run_chunked_gwas_kfile(
             )
             time_parts: list[str] = []
             if init_secs > 0.0:
-                time_parts.append(format_elapsed(init_secs))
-            time_parts.append(format_elapsed(scan_secs))
+                time_parts.append(f"Init {format_elapsed(init_secs)}")
+            time_parts.append(f"Scan {format_elapsed(scan_secs)}")
             if bool(plot):
-                time_parts.append(format_elapsed(viz_secs))
+                time_parts.append(f"Plot {format_elapsed(viz_secs)}")
             if (
                 pve_now is not None
                 and np.isfinite(float(pve_now))
@@ -1608,6 +1609,7 @@ def run_chunked_gwas_lmm_lm(
                 desc=pbar_desc,
                 force_animate=True,
                 logger=logger,
+                trait=str(pname),
             )
         pbar_last_done = 0
         scan_warmup_task: Optional[CliStatus] = None
@@ -1806,6 +1808,7 @@ def run_chunked_gwas_lmm_lm(
                         desc=pbar_desc,
                         force_animate=True,
                         logger=logger,
+                        trait=str(pname),
                     )
                 pbar.update(int(m_chunk))
 
@@ -1837,6 +1840,7 @@ def run_chunked_gwas_lmm_lm(
                     desc=pbar_desc,
                     force_animate=True,
                     logger=logger,
+                    trait=str(pname),
                 )
                 pbar_last_done = 0
             elif total_use != pbar_total and pbar_last_done == 0:
@@ -1850,6 +1854,7 @@ def run_chunked_gwas_lmm_lm(
                     desc=pbar_desc,
                     force_animate=True,
                     logger=logger,
+                    trait=str(pname),
                 )
                 pbar_last_done = 0
             d = int(max(0, min(d, pbar_total)))
@@ -2414,10 +2419,10 @@ def run_chunked_gwas_lmm_lm(
         )
         time_parts: list[str] = []
         if evd_secs > 0:
-            time_parts.append(format_elapsed(evd_secs))
-        time_parts.append(format_elapsed(scan_secs))
+            time_parts.append(f"EVD {format_elapsed(evd_secs)}")
+        time_parts.append(f"Scan {format_elapsed(scan_secs)}")
         if plot:
-            time_parts.append(format_elapsed(viz_secs))
+            time_parts.append(f"Plot {format_elapsed(viz_secs)}")
         if (
             header_pve is not None
             and np.isfinite(float(header_pve))
@@ -2859,6 +2864,10 @@ def run_chunked_gwas_streaming_shared(
         model_ctxs.append(ctx)
 
     pbar_total = int(eff_snp_by_trait.get(pname, n_snps))
+    for ctx in model_ctxs:
+        ctx["progress_log"] = _GwasProgressLog(
+            logger, str(ctx["model_label"]), pbar_total, trait=pname,
+        )
     use_rich_multi = bool(
         use_spinner
         and should_animate_status("Loading shared GWAS model progress...")
@@ -2895,9 +2904,9 @@ def run_chunked_gwas_streaming_shared(
             shared_warmup_active = False
         if use_rich_multi:
             rich_progress = build_rich_progress(
-                description_template="[green]{task.description:<8}",
-                show_remaining=False,
-                show_percentage=False,
+                description_template="[green]{task.description:<10}",
+                show_percentage=True,
+                show_remaining=True,
                 field_templates=["{task.fields[metric]}"],
                 bar_width=_GWAS_PROGRESS_BAR_WIDTH,
                 finished_text=" ",
@@ -2909,9 +2918,10 @@ def run_chunked_gwas_streaming_shared(
                     tid = rich_progress.add_task(
                         str(ctx["model_label"]),
                         total=pbar_total,
-                        metric=_format_progress_metric(0, pbar_total, None),
+                        metric="",
                     )
                     ctx["task_id"] = int(tid)
+                    rich_progress.tasks[-1].start_time = ctx["progress_log"].started
             else:
                 use_rich_multi = False
 
@@ -2923,6 +2933,8 @@ def run_chunked_gwas_streaming_shared(
                         desc=str(ctx["model_label"]),
                         force_animate=True,
                         logger=logger,
+                        trait=pname,
+                        progress_log=ctx["progress_log"],
                     )
         progress_started = True
 
@@ -2933,11 +2945,7 @@ def run_chunked_gwas_streaming_shared(
             and int(ctx.get("tick", 0)) <= int(ctx.get("memory_until_tick", 0))
         ):
             mem_text = str(ctx.get("memory_text", "")).strip()
-        return _format_progress_metric(
-            int(ctx.get("done_snps", 0)),
-            int(pbar_total),
-            mem_text if mem_text else None,
-        )
+        return f"memory={mem_text}" if mem_text else ""
 
     def _advance_ctx(ctx: dict[str, object], m_chunk: int, mem_text: Union[str, None]) -> None:
         done = int(ctx.get("done_snps", 0)) + int(m_chunk)
@@ -2955,6 +2963,7 @@ def run_chunked_gwas_streaming_shared(
                 advance=int(m_chunk),
                 metric=metric,
             )
+            ctx["progress_log"].update(done, memory=str(mem_text or ""))
         else:
             pbar_obj = ctx.get("pbar")
             if pbar_obj is not None:
@@ -3180,6 +3189,7 @@ def run_chunked_gwas_streaming_shared(
                             completed=pbar_total,
                             metric=_metric_text(ctx),
                         )
+                        ctx["progress_log"].update(pbar_total)
                     else:
                         pbar_obj = ctx.get("pbar")
                         if pbar_obj is not None:
@@ -3341,10 +3351,10 @@ def run_chunked_gwas_streaming_shared(
 
         time_parts: list[str] = []
         if evd_secs > 0:
-            time_parts.append(format_elapsed(evd_secs))
-        time_parts.append(format_elapsed(scan_secs))
+            time_parts.append(f"EVD {format_elapsed(evd_secs)}")
+        time_parts.append(f"Scan {format_elapsed(scan_secs)}")
         if plot and has_results:
-            time_parts.append(format_elapsed(viz_secs))
+            time_parts.append(f"Plot {format_elapsed(viz_secs)}")
         if (
             ctx_pve is not None
             and np.isfinite(float(ctx_pve))

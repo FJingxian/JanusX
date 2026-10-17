@@ -980,7 +980,9 @@ impl ResidualizedApproxNullFit {
             residualized_n_used += 1;
 
             let score = dot_f64(g_resid.as_slice(), self.a_vec.as_slice());
-            let chisq = (score * score) / residualized_s_v_s;
+            // a_vec uses the full inverse covariance. Apply the same variance
+            // scale to the marker quadratic form so the null filter is unit invariant.
+            let chisq = (score * score) / (residualized_s_v_s * self.gamma_scale_correction);
             if chisq.is_finite() && chisq < SPLMM_APPROX_FASTGWA_NULL_CHISQ_MAX {
                 fastgwa_ratio_sum += residualized_ratio;
                 n_used += 1;
@@ -1278,6 +1280,59 @@ mod tests {
         assert!((fit.lambda - 0.5_f64).abs() <= 1e-12_f64);
         let expected_a = fit.factor.solve_vec(fit.y_resid.as_slice()).unwrap();
         assert_close(&fit.a_vec, &expected_a, 1e-12_f64);
+    }
+
+    #[test]
+    fn gamma_selection_and_assoc_are_invariant_to_phenotype_units() {
+        let analysis = make_diag_analysis(&[1.0, 1.5, 2.0, 3.0]);
+        let x = [1.0; 4];
+        let y = [1.0, -0.25, 0.75, 1.5];
+        let lambda = 0.8;
+        let markers = [[0.0, 1.0, 2.0, 1.0]; 100]
+            .into_iter()
+            .chain([[2.0, 0.0, 1.0, 1.0]; 20])
+            .flatten()
+            .collect::<Vec<_>>();
+        let fit = build_residualized_approx_scan_null_from_lambda_and_factor(
+            analysis.factorize_k_plus_lambda_i(lambda).unwrap(),
+            &x,
+            &y,
+            lambda,
+        )
+        .unwrap();
+        let (gamma, used) = fit
+            .estimate_gamma_from_markers(&x, &markers, 120, 100)
+            .unwrap();
+        assert_eq!(used, 100);
+        let marker = [2.0, 0.0, 1.0, 1.0];
+        let assoc = fit
+            .build_scan_model(&x, gamma)
+            .unwrap()
+            .assoc_from_marker(&marker)
+            .unwrap();
+        for scale in [0.1, 10.0, -10.0] {
+            let scaled_y = y.map(|v| v * scale);
+            let scaled_fit = build_residualized_approx_scan_null_from_lambda_and_factor(
+                analysis.factorize_k_plus_lambda_i(lambda).unwrap(),
+                &x,
+                &scaled_y,
+                lambda,
+            )
+            .unwrap();
+            let (scaled_gamma, scaled_used) = scaled_fit
+                .estimate_gamma_from_markers(&x, &markers, 120, 100)
+                .unwrap();
+            assert_eq!(scaled_used, used, "scale={scale}");
+            assert!((scaled_gamma * scale * scale - gamma).abs() < 1e-12);
+            let scaled_assoc = scaled_fit
+                .build_scan_model(&x, scaled_gamma)
+                .unwrap()
+                .assoc_from_marker(&marker)
+                .unwrap();
+            assert!((scaled_assoc.0 / scale - assoc.0).abs() < 1e-12);
+            assert!((scaled_assoc.1 / scale.abs() - assoc.1).abs() < 1e-12);
+            assert!((scaled_assoc.2 - assoc.2).abs() < 1e-12);
+        }
     }
 
     #[test]

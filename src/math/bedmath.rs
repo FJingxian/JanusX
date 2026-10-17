@@ -722,6 +722,40 @@ fn decode_subset_plan_row_f32(
     }
 }
 
+/// Decode one additive BED row with the same f32 mean imputation as the
+/// block decoder, reusing a precomputed sample-subset plan and caller scratch.
+pub(crate) fn decode_mean_imputed_additive_packed_row_f32(
+    row: &[u8],
+    n_samples_full: usize,
+    alt_freq: f32,
+    sample_idx: &[usize],
+    sample_identity: bool,
+    subset_plan: Option<&SubsetDecodePlan>,
+    code4_lut: &[[u8; 4]; 256],
+    full_row_scratch: &mut [f32],
+    out_row: &mut [f32],
+) -> Result<(), String> {
+    if out_row.len() != sample_idx.len() {
+        return Err(format!(
+            "single-row additive decode output length mismatch: got {}, expected {}",
+            out_row.len(),
+            sample_idx.len()
+        ));
+    }
+    let mean_g = (2.0_f32 * alt_freq).clamp(0.0_f32, 2.0_f32);
+    let value_lut = [0.0_f32, mean_g, 1.0_f32, 2.0_f32];
+    if sample_identity {
+        if sample_idx.len() != n_samples_full {
+            return Err("identity additive decode sample count mismatch".to_string());
+        }
+        decode_row_centered_full_lut(row, n_samples_full, code4_lut, &value_lut, out_row);
+        return Ok(());
+    }
+    let plan = subset_plan.ok_or_else(|| "subset additive decode plan is missing".to_string())?;
+    decode_subset_plan_row_f32(row, plan, code4_lut, &value_lut, full_row_scratch, out_row);
+    Ok(())
+}
+
 #[inline]
 fn decode_subset_with_plan_f64(
     row: &[u8],
@@ -1570,6 +1604,46 @@ mod tests {
         );
 
         assert_eq!(out_near_full, out_gather);
+    }
+
+    #[test]
+    fn single_row_additive_decode_matches_block_decode_with_missing_samples() {
+        let codes = [0u8, 2, 3, 1, 0, 3, 2, 0];
+        let packed = pack_codes(&codes);
+        let sample_idx = [7usize, 2, 5, 0, 3];
+        let af = 0.375_f32;
+        let plan = SubsetDecodePlan::from_sample_idx_with_n_samples(&sample_idx, codes.len());
+        let mut one = vec![0.0_f32; sample_idx.len()];
+        let mut scratch = vec![0.0_f32; codes.len()];
+        decode_mean_imputed_additive_packed_row_f32(
+            &packed,
+            codes.len(),
+            af,
+            &sample_idx,
+            false,
+            Some(&plan),
+            &packed_byte_lut().code4,
+            &mut scratch,
+            &mut one,
+        )
+        .unwrap();
+        let mut block = vec![0.0_f32; sample_idx.len()];
+        decode_mean_imputed_additive_packed_block_rows_f32(
+            &packed,
+            packed.len(),
+            codes.len(),
+            &[false],
+            &[af],
+            &sample_idx,
+            false,
+            None,
+            0,
+            &mut block,
+            &packed_byte_lut().code4,
+            None,
+        )
+        .unwrap();
+        assert_eq!(one, block);
     }
 
     #[test]

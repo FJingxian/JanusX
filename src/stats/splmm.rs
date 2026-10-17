@@ -14,6 +14,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::Bound;
 use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
 use rand::Rng;
 use rand::SeedableRng;
 use rayon::prelude::*;
@@ -30,7 +31,10 @@ use crate::assoc2tsv::{
     AssocCoreSitesBlock, AssocMissBlock, AssocResultCols, AssocResultLayout,
 };
 use crate::bedmath::adaptive_grm_block_rows;
-use crate::bedmath::{decode_mean_imputed_additive_packed_block_rows_f32, packed_byte_lut};
+use crate::bedmath::{
+    decode_mean_imputed_additive_packed_block_rows_f32,
+    decode_mean_imputed_additive_packed_row_f32, packed_byte_lut,
+};
 use crate::blas::{cblas_dgemm_dispatch, CblasInt, CBLAS_COL_MAJOR, CBLAS_NO_TRANS, CBLAS_TRANS};
 use crate::cholesky::{
     sparse_cholesky_analyze_subset_jxgrm_path_cached_with_progress, sparse_jxgrm_header_n_samples,
@@ -43,12 +47,17 @@ use crate::decode::{
 };
 use crate::gfcore::{read_fam, BimChunkReader};
 use crate::gfreader::{
-    count_packed_row_counts, count_packed_row_counts_selected_with_excluded,
-    prepare_bed_logic_meta_owned_for_stats_samples,
-    prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window,
+    count_packed_row_counts, count_packed_row_counts_selected_prevalidated,
+    count_packed_row_counts_selected_with_excluded, evaluate_packed_snp_qc, is_simple_snp_allele,
+    precompute_excluded_sample_indices, prepare_bed_logic_meta_owned_for_stats_samples,
+    prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window, sample_indices_are_identity,
 };
-use crate::gload::{GenotypeMatrix, GlobalStats, UnifiedInput, WindowedBedMatrix};
-use crate::he::row_major_block_mul_mat_f32;
+use crate::gload::{
+    GenotypeMatrix, GlobalStats, PackedBedSourceReader, UnifiedInput, WindowedBedMatrix,
+};
+use crate::he::{
+    dot_sum_intercept_f32_row, row_major_block_mul_mat_f32, row_major_block_mul_vec_intercept_f32,
+};
 use crate::kmer::{KfileAssocPrefetch, KfileAssocSource};
 use crate::linalg::{chi2_sf_df1, cholesky_inplace, cholesky_solve_into};
 use crate::pcg::{
@@ -58,7 +67,7 @@ use crate::spgrm::resolve_sparse_grm_input_path;
 use crate::splmm_approx::{
     build_residualized_approx_scan_null_from_lambda_and_factor,
     estimate_residualized_approx_scan_sparse, estimate_residualized_approx_scan_to_tsv_sparse,
-    fit_sparse_reml_on_residualized_response,
+    fit_sparse_reml_on_residualized_response, ResidualizedApproxNullFit,
 };
 use crate::stats_common::{env_truthy, get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
 
@@ -261,7 +270,11 @@ fn emit_splmm_packed_scan_timing(
         rows,
         n,
         p,
-        if threads > 0 { threads } else { rayon::current_num_threads() },
+        if threads > 0 {
+            threads
+        } else {
+            rayon::current_num_threads()
+        },
     );
 }
 
@@ -1017,6 +1030,811 @@ fn build_splmm_tsv_meta_input(
         allele0,
         allele1,
     })
+}
+
+#[derive(Clone, Debug)]
+struct SplmmRawBimRange {
+    chrom: String,
+    start: i64,
+    end: i64,
+}
+
+struct SplmmRawBedAssocBlock {
+    source_rows: Vec<usize>,
+    alt_freq: Vec<f32>,
+    missing_rate: Vec<f32>,
+    results: Vec<f64>,
+}
+
+struct SplmmRawGammaInfo {
+    gamma: f64,
+    n_requested: usize,
+    n_used: usize,
+    n_static: usize,
+    n_candidates: usize,
+    n_qc_valid: usize,
+    n_attempts: usize,
+}
+
+fn splmm_raw_gamma_error(error: String) -> String {
+    if error.contains("found no valid sampled markers") {
+        format!("SPLMM_FUSED_FALLBACK: {error}")
+    } else {
+        error
+    }
+}
+
+#[inline]
+fn splmm_raw_bim_chrom_norm(chrom: &str) -> String {
+    let mut out = chrom.trim().to_ascii_uppercase();
+    if out.starts_with("CHR") {
+        out.drain(..3);
+    }
+    out
+}
+
+#[inline]
+fn splmm_raw_bim_static_eligible(
+    site: &crate::gfcore::SiteInfo,
+    snps_only: bool,
+    ranges: &[SplmmRawBimRange],
+) -> bool {
+    if snps_only
+        && (!is_simple_snp_allele(&site.ref_allele) || !is_simple_snp_allele(&site.alt_allele))
+    {
+        return false;
+    }
+    ranges.is_empty()
+        || ranges.iter().any(|range| {
+            splmm_raw_bim_chrom_norm(&site.chrom) == range.chrom
+                && (range.start..=range.end).contains(&(site.pos as i64))
+        })
+}
+
+/// Sample a bounded, deterministic reservoir from rows passing static BIM
+/// filters. With no static filters, sample BED rows directly without scanning
+/// the BIM. Genotype QC is deferred to the selected rows.
+fn splmm_raw_static_candidate_rows(
+    prefix: &str,
+    n_snps: usize,
+    capacity: usize,
+    seed: u64,
+    snps_only: bool,
+    ranges: &[SplmmRawBimRange],
+) -> Result<(Vec<usize>, usize), String> {
+    if !snps_only && ranges.is_empty() {
+        let sample_count = capacity.min(n_snps);
+        let mut rng = StdRng::seed_from_u64(seed);
+        if sample_count == n_snps {
+            let mut rows = (0..n_snps).collect::<Vec<_>>();
+            rows.shuffle(&mut rng);
+            return Ok((rows, n_snps));
+        }
+        let mut selected = std::collections::HashSet::<usize>::with_capacity(sample_count);
+        let mut rows = Vec::<usize>::with_capacity(sample_count);
+        for upper in n_snps.saturating_sub(sample_count)..n_snps {
+            let candidate = rng.random_range(0..=upper);
+            let row = if !selected.insert(candidate) {
+                selected.insert(upper);
+                upper
+            } else {
+                candidate
+            };
+            rows.push(row);
+        }
+        rows.shuffle(&mut rng);
+        return Ok((rows, n_snps));
+    }
+
+    let mut reader = BimChunkReader::open(prefix)?;
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rows = Vec::<usize>::with_capacity(capacity.min(n_snps));
+    let mut n_static = 0usize;
+    let chunk_rows = 65_536usize;
+    let mut base = 0usize;
+    while base < n_snps {
+        let end = (base + chunk_rows).min(n_snps);
+        for (offset, site) in reader.read_range(base, end)?.into_iter().enumerate() {
+            if !splmm_raw_bim_static_eligible(&site, snps_only, ranges) {
+                continue;
+            }
+            let row = base + offset;
+            n_static = n_static.saturating_add(1);
+            if rows.len() < capacity {
+                rows.push(row);
+            } else if capacity > 0 {
+                let slot = rng.random_range(0..n_static);
+                if slot < capacity {
+                    rows[slot] = row;
+                }
+            }
+        }
+        base = end;
+    }
+    reader.ensure_exhausted(n_snps)?;
+    rows.shuffle(&mut rng);
+    Ok((rows, n_static))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn splmm_raw_estimate_gamma(
+    reader: &mut PackedBedSourceReader,
+    prefix: &str,
+    fit: &ResidualizedApproxNullFit,
+    x_design: &[f64],
+    sample_indices: &[usize],
+    sample_identity: bool,
+    excluded_sample_indices: Option<&[usize]>,
+    n_selected: usize,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    rhat_markers: usize,
+    seed: u64,
+    snps_only: bool,
+    ranges: &[SplmmRawBimRange],
+) -> Result<SplmmRawGammaInfo, String> {
+    if rhat_markers == 0 {
+        return Err("SPLMM_FUSED_FALLBACK: rhat_markers must be > 0".to_string());
+    }
+    let target = rhat_markers.min(reader.n_snps());
+    let attempt_cap = reader
+        .n_snps()
+        .min(1024usize.max(rhat_markers.saturating_mul(32)));
+    let (candidates, n_static) = splmm_raw_static_candidate_rows(
+        prefix,
+        reader.n_snps(),
+        attempt_cap,
+        seed,
+        snps_only,
+        ranges,
+    )?;
+    let qc_target = target.min(n_static);
+    if qc_target < rhat_markers {
+        return Err(format!(
+            "SPLMM_FUSED_FALLBACK: only {n_static} statically eligible BIM rows for requested rhat_markers={rhat_markers}"
+        ));
+    }
+    let n = sample_indices.len();
+    let decode_plan =
+        AdditiveDecodePlan::from_sample_indices(reader.n_samples_full(), sample_indices);
+    let mut row = vec![0u8; reader.bytes_per_snp()];
+    let mut marker = vec![0.0_f64; n];
+    let mut markers_col_major = Vec::<f64>::with_capacity(n.saturating_mul(qc_target));
+    let mut qc_valid = 0usize;
+    let mut attempts = 0usize;
+    for source_row in candidates.iter().copied() {
+        if qc_valid >= qc_target {
+            break;
+        }
+        attempts += 1;
+        if reader.read_source_block(source_row, 1, &mut row)? != 1 {
+            return Err(format!(
+                "BED ended while reading Gamma candidate source row {source_row}"
+            ));
+        }
+        let (missing, het, hom_alt) = count_packed_row_counts_selected_prevalidated(
+            &row,
+            reader.n_samples_full(),
+            sample_indices,
+            excluded_sample_indices,
+            sample_identity,
+        );
+        let qc = evaluate_packed_snp_qc(
+            missing,
+            het,
+            hom_alt,
+            n_selected,
+            maf_threshold,
+            max_missing_rate,
+            het_threshold,
+        );
+        if !qc.keep {
+            continue;
+        }
+        decode_packed_row_model_enum_into_f64(
+            &row,
+            qc.row_flip,
+            qc.alt_freq,
+            n,
+            PackedGeneticModel::Add,
+            sample_identity,
+            decode_plan.sample_byte_idx(),
+            decode_plan.sample_bit_shift(),
+            &mut marker,
+        );
+        markers_col_major.extend_from_slice(&marker);
+        qc_valid += 1;
+    }
+    if qc_valid < qc_target {
+        return Err(format!(
+            "SPLMM_FUSED_FALLBACK: Gamma candidates passed QC {qc_valid}/{qc_target} after {attempts}/{} bounded attempts",
+            candidates.len()
+        ));
+    }
+    let (gamma, n_used) = fit
+        .estimate_gamma_from_markers(x_design, &markers_col_major, qc_valid, rhat_markers)
+        .map_err(splmm_raw_gamma_error)?;
+    Ok(SplmmRawGammaInfo {
+        gamma,
+        n_requested: rhat_markers,
+        n_used,
+        n_static,
+        n_candidates: candidates.len(),
+        n_qc_valid: qc_valid,
+        n_attempts: attempts,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn splmm_raw_process_assoc_block_single_buffer(
+    packed_block: &[u8],
+    source_start: usize,
+    rows_here: usize,
+    n_samples_full: usize,
+    sample_indices: &[usize],
+    sample_identity: bool,
+    excluded_sample_indices: Option<&[usize]>,
+    n_selected: usize,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
+    ranges: &[SplmmRawBimRange],
+    block_sites: Option<&[crate::gfcore::SiteInfo]>,
+    model: &crate::splmm_approx::ResidualizedApproxScanModel,
+    score_f32: &[f32],
+    x_design_f32: Option<&[f32]>,
+    code4_lut: &[[u8; 4]; 256],
+    decode_plan: &AdditiveDecodePlan,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Result<SplmmRawBedAssocBlock, String> {
+    let bytes_per_snp = n_samples_full.div_ceil(4);
+    if packed_block.len() < rows_here.saturating_mul(bytes_per_snp) {
+        return Err("fused SparseLMM BED block is shorter than its row count".to_string());
+    }
+    if (snps_only || !ranges.is_empty())
+        && block_sites.map_or(true, |sites| sites.len() != rows_here)
+    {
+        return Err("fused SparseLMM BIM metadata block length mismatch".to_string());
+    }
+    let mut packed_rel_rows = Vec::<usize>::with_capacity(rows_here);
+    let mut source_rows = Vec::<usize>::with_capacity(rows_here);
+    let mut alt_freq = Vec::<f32>::with_capacity(rows_here);
+    let mut missing_rate = Vec::<f32>::with_capacity(rows_here);
+    for local_row in 0..rows_here {
+        if let Some(sites) = block_sites {
+            if !splmm_raw_bim_static_eligible(&sites[local_row], snps_only, ranges) {
+                continue;
+            }
+        }
+        let packed_row = &packed_block[local_row * bytes_per_snp..(local_row + 1) * bytes_per_snp];
+        let (missing, het, hom_alt) = count_packed_row_counts_selected_prevalidated(
+            packed_row,
+            n_samples_full,
+            sample_indices,
+            excluded_sample_indices,
+            sample_identity,
+        );
+        let qc = evaluate_packed_snp_qc(
+            missing,
+            het,
+            hom_alt,
+            n_selected,
+            maf_threshold,
+            max_missing_rate,
+            het_threshold,
+        );
+        if !qc.keep {
+            continue;
+        }
+        packed_rel_rows.push(local_row);
+        source_rows.push(source_start + local_row);
+        alt_freq.push(qc.alt_freq);
+        missing_rate.push(qc.missing_rate);
+    }
+
+    let n = sample_indices.len();
+    let p = model.design_cols();
+    if p == 0 || score_f32.len() != n {
+        return Err("fused approx SparseLMM design and score dimensions do not match".to_string());
+    }
+    let rhs_cols = p
+        .checked_add(1)
+        .ok_or_else(|| "fused approx SparseLMM RHS column overflow".to_string())?;
+    if p > 1 && x_design_f32.map_or(true, |design| design.len() != n.saturating_mul(p)) {
+        return Err("fused approx SparseLMM covariate design dimensions do not match".to_string());
+    }
+    let xtx00_inv = if p == 1 {
+        Some(
+            scalar_spd_inv_from_chol(model.xtx_chol(), 1).ok_or_else(|| {
+                "fused SparseLMM intercept design has invalid X'X factor".to_string()
+            })?,
+        )
+    } else {
+        None
+    };
+    let mut results = vec![0.0_f64; source_rows.len().saturating_mul(3)];
+    let mut run = || {
+        results.par_chunks_mut(3).enumerate().for_each_init(
+            || {
+                (
+                    vec![0.0_f32; n],
+                    vec![0.0_f32; n_samples_full],
+                    vec![0.0_f32; rhs_cols],
+                    vec![0.0_f64; p],
+                    vec![0.0_f64; p],
+                )
+            },
+            |(genotype, full_scratch, rhs_products, xtg, alpha), (kept_idx, out)| {
+                let local_row = packed_rel_rows[kept_idx];
+                let packed_row =
+                    &packed_block[local_row * bytes_per_snp..(local_row + 1) * bytes_per_snp];
+                decode_mean_imputed_additive_packed_row_f32(
+                    packed_row,
+                    n_samples_full,
+                    alt_freq[kept_idx],
+                    sample_indices,
+                    sample_identity,
+                    decode_plan.subset_decode_plan(),
+                    code4_lut,
+                    full_scratch,
+                    genotype,
+                )
+                .expect("prevalidated fused BED row must decode");
+                let sumsq = additive_row_sumsq_f64(genotype);
+                let (score, residual_sumsq) = if let Some(xtx00_inv) = xtx00_inv {
+                    let (score, sum_g) = dot_sum_intercept_f32_row(genotype, score_f32);
+                    (
+                        score as f64,
+                        residualized_sumsq_scalar(xtx00_inv, sum_g as f64, sumsq),
+                    )
+                } else {
+                    let x_design = x_design_f32
+                        .expect("covariate design was validated before fused approx scan");
+                    rhs_products.fill(0.0_f32);
+                    for (sample, &g) in genotype.iter().enumerate() {
+                        if g == 0.0_f32 {
+                            continue;
+                        }
+                        rhs_products[0] += g * score_f32[sample];
+                        let x_row = &x_design[sample * p..(sample + 1) * p];
+                        for (product, &value) in rhs_products[1..].iter_mut().zip(x_row.iter()) {
+                            *product += g * value;
+                        }
+                    }
+                    for (dst, &value) in xtg.iter_mut().zip(rhs_products[1..].iter()) {
+                        *dst = value as f64;
+                    }
+                    let residual_sumsq =
+                        residualized_sumsq_from_xtx_chol(model.xtx_chol(), p, xtg, alpha, sumsq);
+                    (rhs_products[0] as f64, residual_sumsq)
+                };
+                if splmm_residual_sumsq_is_effectively_zero(residual_sumsq, sumsq) {
+                    out[0] = f64::NAN;
+                    out[1] = f64::NAN;
+                    out[2] = 1.0_f64;
+                } else if let Some((beta, se, pwald)) =
+                    splmm_wald_from_score_denom(score, model.gamma() * residual_sumsq, 1.0_f64)
+                {
+                    out[0] = beta;
+                    out[1] = se;
+                    out[2] = pwald;
+                } else {
+                    out[0] = f64::NAN;
+                    out[1] = f64::NAN;
+                    out[2] = 1.0_f64;
+                }
+            },
+        );
+    };
+    if let Some(pool) = pool {
+        pool.install(run);
+    } else {
+        run();
+    }
+    Ok(SplmmRawBedAssocBlock {
+        source_rows,
+        alt_freq,
+        missing_rate,
+        results,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn splmm_raw_scan_exact_block_single_buffer(
+    factor: &SparseJxgrmCholesky,
+    exact_workspace: &mut ExactScanBlockWorkspace,
+    solve_workspace: &mut SparseJxgrmSolveWorkspace,
+    x_design: &[f64],
+    x_design_col_major: &[f64],
+    score_vec: &[f64],
+    score_f32: &[f32],
+    ypy: f64,
+    df: f64,
+    xt_w_x_chol: &[f64],
+    packed_block: &[u8],
+    source_start: usize,
+    rows_here: usize,
+    n_samples_full: usize,
+    sample_indices: &[usize],
+    sample_identity: bool,
+    excluded_sample_indices: Option<&[usize]>,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
+    ranges: &[SplmmRawBimRange],
+    block_sites: Option<&[crate::gfcore::SiteInfo]>,
+    decode_plan: &AdditiveDecodePlan,
+    threads: usize,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    sink: &mut dyn FnMut(SplmmRawTsvBlockPayload) -> Result<(), String>,
+) -> Result<usize, String> {
+    let bytes_per_snp = n_samples_full.div_ceil(4);
+    if packed_block.len() < rows_here.saturating_mul(bytes_per_snp) {
+        return Err("fused SparseLMM BED block is shorter than its row count".to_string());
+    }
+    if (snps_only || !ranges.is_empty())
+        && block_sites.map_or(true, |sites| sites.len() != rows_here)
+    {
+        return Err("fused SparseLMM BIM metadata block length mismatch".to_string());
+    }
+    if sample_indices.len() != score_vec.len() || score_f32.len() != score_vec.len() {
+        return Err("fused exact SparseLMM sample and score dimensions do not match".to_string());
+    }
+    if !(ypy.is_finite() && ypy > 0.0 && df.is_finite() && df > 0.0) {
+        return Err("fused exact SparseLMM requires finite positive yPy and df".to_string());
+    }
+    if exact_workspace.n != score_vec.len()
+        || exact_workspace.capacity_rows == 0
+        || x_design.len() != exact_workspace.n.saturating_mul(exact_workspace.p)
+        || x_design_col_major.len() != x_design.len()
+        || xt_w_x_chol.len() != exact_workspace.p.saturating_mul(exact_workspace.p)
+    {
+        return Err("fused exact SparseLMM model dimensions do not match workspace".to_string());
+    }
+
+    let mut packed_rel_rows = Vec::<usize>::with_capacity(rows_here);
+    let mut source_rows = Vec::<usize>::with_capacity(rows_here);
+    let mut alt_freq = Vec::<f32>::with_capacity(rows_here);
+    let mut missing_rate = Vec::<f32>::with_capacity(rows_here);
+    for local_row in 0..rows_here {
+        if let Some(sites) = block_sites {
+            if !splmm_raw_bim_static_eligible(&sites[local_row], snps_only, ranges) {
+                continue;
+            }
+        }
+        let packed_row = &packed_block[local_row * bytes_per_snp..(local_row + 1) * bytes_per_snp];
+        let (missing, het, hom_alt) = count_packed_row_counts_selected_prevalidated(
+            packed_row,
+            n_samples_full,
+            sample_indices,
+            excluded_sample_indices,
+            sample_identity,
+        );
+        let qc = evaluate_packed_snp_qc(
+            missing,
+            het,
+            hom_alt,
+            sample_indices.len(),
+            maf_threshold,
+            max_missing_rate,
+            het_threshold,
+        );
+        if !qc.keep {
+            continue;
+        }
+        packed_rel_rows.push(local_row);
+        source_rows.push(source_start + local_row);
+        alt_freq.push(qc.alt_freq);
+        missing_rate.push(qc.missing_rate);
+    }
+
+    let sigma2 = ypy / df;
+    let mut scan_timing = SplmmPackedScanTiming::default();
+    let mut total_kept = 0usize;
+    for batch_start in (0..packed_rel_rows.len()).step_by(exact_workspace.capacity_rows) {
+        let batch_end = (batch_start + exact_workspace.capacity_rows).min(packed_rel_rows.len());
+        let batch_rows = batch_end - batch_start;
+        let batch_genotypes = &mut exact_workspace.block[..batch_rows * score_vec.len()];
+        let mut run = || {
+            batch_genotypes
+                .par_chunks_mut(score_vec.len())
+                .enumerate()
+                .for_each_init(
+                    || vec![0.0_f32; n_samples_full],
+                    |full_scratch, (batch_idx, genotype)| {
+                        let kept_idx = batch_start + batch_idx;
+                        let local_row = packed_rel_rows[kept_idx];
+                        let packed_row = &packed_block
+                            [local_row * bytes_per_snp..(local_row + 1) * bytes_per_snp];
+                        decode_mean_imputed_additive_packed_row_f32(
+                            packed_row,
+                            n_samples_full,
+                            alt_freq[kept_idx],
+                            sample_indices,
+                            sample_identity,
+                            decode_plan.subset_decode_plan(),
+                            &packed_byte_lut().code4,
+                            full_scratch,
+                            genotype,
+                        )
+                        .expect("QC-validated BED row must decode");
+                    },
+                );
+        };
+        if let Some(pool) = pool {
+            pool.install(run);
+        } else {
+            run();
+        }
+        exact_workspace.scan_decoded_block(
+            factor,
+            x_design,
+            x_design_col_major,
+            score_f32,
+            sigma2,
+            xt_w_x_chol,
+            batch_rows,
+            solve_workspace,
+            pool,
+            threads,
+            &mut scan_timing,
+            false,
+        )?;
+        let payload = SplmmRawTsvBlockPayload {
+            source_rows: source_rows[batch_start..batch_end].to_vec(),
+            alt_freq: alt_freq[batch_start..batch_end].to_vec(),
+            missing_rate: missing_rate[batch_start..batch_end].to_vec(),
+            results: exact_workspace.out_block[..batch_rows * 3].to_vec(),
+        };
+        sink(payload)?;
+        total_kept = total_kept.saturating_add(batch_rows);
+    }
+    Ok(total_kept)
+}
+
+struct SplmmRawTsvBlockPayload {
+    source_rows: Vec<usize>,
+    alt_freq: Vec<f32>,
+    missing_rate: Vec<f32>,
+    results: Vec<f64>,
+}
+
+struct SplmmRawPrefetchedBedBlock {
+    source_start: usize,
+    rows: usize,
+    packed: Vec<u8>,
+}
+
+/// Read source-ordered BED blocks on a producer thread using exactly two
+/// reusable packed buffers. The consumer returns a buffer only after its QC,
+/// decode, association and writer handoff are complete.
+fn run_splmm_raw_bed_prefetch<F>(
+    mut reader: PackedBedSourceReader,
+    n_snps: usize,
+    block_rows: usize,
+    bytes_per_snp: usize,
+    mut consume: F,
+) -> Result<usize, String>
+where
+    F: FnMut(usize, usize, &[u8]) -> Result<(), String>,
+{
+    let buffer_bytes = block_rows.max(1).saturating_mul(bytes_per_snp);
+    let first_buffer = vec![0u8; buffer_bytes];
+    let second_buffer = vec![0u8; buffer_bytes];
+    std::thread::scope(|scope| {
+        let (ready_tx, ready_rx) = sync_channel::<Result<SplmmRawPrefetchedBedBlock, String>>(1);
+        let (recycle_tx, recycle_rx) = sync_channel::<Vec<u8>>(1);
+        let worker = scope.spawn(move || -> Result<(), String> {
+            let mut source_start = 0usize;
+            let mut next_buffer = Some(first_buffer);
+            let mut spare_buffer = Some(second_buffer);
+            while source_start < n_snps {
+                let mut packed = if let Some(buffer) = next_buffer.take() {
+                    buffer
+                } else if let Some(buffer) = spare_buffer.take() {
+                    buffer
+                } else {
+                    match recycle_rx.recv() {
+                        Ok(buffer) => buffer,
+                        Err(_) => return Ok(()),
+                    }
+                };
+                let rows = block_rows.min(n_snps - source_start);
+                match reader.read_source_block(source_start, rows, &mut packed) {
+                    Ok(got) if got == rows => {}
+                    Ok(got) => {
+                        let error =
+                            format!("BED source block length mismatch: got {got}, expected {rows}");
+                        let _ = ready_tx.send(Err(error));
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error));
+                        return Ok(());
+                    }
+                }
+                let block_start = source_start;
+                source_start = source_start.saturating_add(rows);
+                if ready_tx
+                    .send(Ok(SplmmRawPrefetchedBedBlock {
+                        source_start: block_start,
+                        rows,
+                        packed,
+                    }))
+                    .is_err()
+                {
+                    return Ok(());
+                }
+                if source_start < n_snps && next_buffer.is_none() {
+                    if let Some(buffer) = spare_buffer.take() {
+                        next_buffer = Some(buffer);
+                    } else {
+                        match recycle_rx.recv() {
+                            Ok(buffer) => next_buffer = Some(buffer),
+                            Err(_) => return Ok(()),
+                        }
+                    }
+                }
+            }
+            Ok(())
+        });
+
+        let mut scanned = 0usize;
+        loop {
+            let block = match ready_rx.recv() {
+                Ok(Ok(block)) => block,
+                Ok(Err(error)) => return Err(error),
+                Err(_) => break,
+            };
+            if block.source_start != scanned {
+                return Err(format!(
+                    "BED prefetch source order mismatch: got {}, expected {scanned}",
+                    block.source_start
+                ));
+            }
+            consume(block.source_start, block.rows, &block.packed)?;
+            scanned = scanned.saturating_add(block.rows);
+            if scanned < n_snps {
+                // The producer can already have queued the final block and
+                // exited while this block was being consumed. In that case
+                // recycling is unnecessary; the queued final block remains
+                // available to the consumer.
+                let _ = recycle_tx.send(block.packed);
+            }
+        }
+        worker
+            .join()
+            .map_err(|_| "BED prefetch worker panicked".to_string())??;
+        if scanned != n_snps {
+            return Err(format!(
+                "BED prefetch ended after {scanned} source rows, expected {n_snps}"
+            ));
+        }
+        Ok(scanned)
+    })
+}
+
+fn run_splmm_raw_bed_tsv_writer<R, F>(
+    out_tsv: &str,
+    bed_prefix: &str,
+    gm: PackedGeneticModel,
+    run_scan: F,
+) -> Result<(R, usize, SplmmTsvTiming), String>
+where
+    F: FnOnce(&mut dyn FnMut(SplmmRawTsvBlockPayload) -> Result<(), String>) -> Result<R, String>,
+{
+    const HEADER: &[u8] = b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n";
+    const WRITER_CAPACITY: usize = 8 * 1024 * 1024;
+    let start_t0 = Instant::now();
+    let (scan_result, writer_result) = std::thread::scope(|scope| {
+        let (tx, rx) = sync_channel::<SplmmRawTsvBlockPayload>(1);
+        let out_tsv = out_tsv.to_string();
+        let bed_prefix = bed_prefix.to_string();
+        let writer = scope.spawn(move || -> Result<(usize, SplmmTsvTiming), String> {
+            let output = File::create(&out_tsv)
+                .map_err(|e| format!("create {out_tsv}: {e}"))?;
+            let mut writer = BufWriter::with_capacity(WRITER_CAPACITY, output);
+            let mut bim = BimChunkReader::open(&bed_prefix)?;
+            let mut timing = SplmmTsvTiming {
+                format_threads: 1,
+                ..SplmmTsvTiming::default()
+            };
+            writer
+                .write_all(HEADER)
+                .map_err(|e| format!("write header {out_tsv}: {e}"))?;
+            let mut rows_written = 0usize;
+            let mut last_source_row = None::<usize>;
+            let model_key = splmm_model_key(gm);
+            for payload in rx {
+                let n_rows = payload.source_rows.len();
+                if n_rows == 0 {
+                    return Err("raw SparseLMM TSV payload must not be empty".to_string());
+                }
+                if payload.alt_freq.len() != n_rows
+                    || payload.missing_rate.len() != n_rows
+                    || payload.results.len() != n_rows.saturating_mul(3)
+                {
+                    return Err(format!(
+                        "raw SparseLMM TSV payload length mismatch: rows={n_rows}, af={}, miss={}, results={}",
+                        payload.alt_freq.len(),
+                        payload.missing_rate.len(),
+                        payload.results.len()
+                    ));
+                }
+                if payload.source_rows.windows(2).any(|pair| pair[0] >= pair[1])
+                    || last_source_row.is_some_and(|last| payload.source_rows[0] <= last)
+                {
+                    return Err("raw SparseLMM TSV source rows must be strictly increasing".to_string());
+                }
+                let sites = bim.read_selected_rows(payload.source_rows.as_slice())?;
+                if sites.len() != n_rows {
+                    return Err(format!(
+                        "BIM selected row count mismatch: got {}, expected {n_rows}",
+                        sites.len()
+                    ));
+                }
+                let format_t0 = Instant::now();
+                let mut text = String::with_capacity(n_rows.saturating_mul(96));
+                append_assoc_block_from_core_sites(
+                    &mut text,
+                    AssocResultLayout::ResultCols {
+                        schema: AssocResultCols::Basic3,
+                        row_stride: 3,
+                    },
+                    model_key,
+                    AssocCoreSitesBlock {
+                        sites: &sites,
+                        maf: &payload.alt_freq,
+                        miss: AssocMissBlock::Rate(&payload.missing_rate),
+                    },
+                    &payload.results,
+                )?;
+                timing.format_secs += format_t0.elapsed().as_secs_f64();
+                let write_t0 = Instant::now();
+                writer
+                    .write_all(text.as_bytes())
+                    .map_err(|e| format!("write {out_tsv}: {e}"))?;
+                timing.write_secs += write_t0.elapsed().as_secs_f64();
+                timing.bytes = timing.bytes.saturating_add(text.len());
+                timing.blocks = timing.blocks.saturating_add(1);
+                rows_written = rows_written.saturating_add(n_rows);
+                last_source_row = payload.source_rows.last().copied();
+            }
+            let write_t0 = Instant::now();
+            writer
+                .flush()
+                .map_err(|e| format!("flush {out_tsv}: {e}"))?;
+            timing.write_secs += write_t0.elapsed().as_secs_f64();
+            Ok((rows_written, timing))
+        });
+        let mut sink = |payload| {
+            tx.send(payload)
+                .map_err(|e| format!("send raw SparseLMM TSV block: {e}"))?;
+            Ok(())
+        };
+        let scan_result = run_scan(&mut sink);
+        drop(tx);
+        let writer_result = match writer.join() {
+            Ok(result) => result,
+            Err(_) => Err("raw SparseLMM TSV writer thread panicked".to_string()),
+        };
+        (scan_result, writer_result)
+    });
+    let mut timing = writer_result
+        .as_ref()
+        .map(|(_, timing)| *timing)
+        .unwrap_or_default();
+    timing.finish_secs = start_t0.elapsed().as_secs_f64();
+    let rows_written = writer_result?.0;
+    if rows_written == 0 {
+        return Err(
+            "SPLMM_FUSED_FALLBACK: no SNPs left after fused SparseLMM BED filtering.".to_string(),
+        );
+    }
+    Ok((scan_result?, rows_written, timing))
 }
 
 fn filter_meta_with_site_keep(
@@ -1802,6 +2620,46 @@ fn pack_score_design_rhs_f32(
     Ok(rhs)
 }
 
+#[inline]
+fn additive_row_sumsq_f64(row: &[f32]) -> f64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::aarch64::*;
+        // Widen before multiplication, as in the scalar reference. No FMA or
+        // fast-math; only the reduction order changes for imputed values.
+        unsafe {
+            let mut low = vdupq_n_f64(0.0);
+            let mut high = vdupq_n_f64(0.0);
+            let mut c = 0;
+            while c + 4 <= row.len() {
+                let g = vld1q_f32(row.as_ptr().add(c));
+                let lo = vcvt_f64_f32(vget_low_f32(g));
+                let hi = vcvt_f64_f32(vget_high_f32(g));
+                low = vaddq_f64(low, vmulq_f64(lo, lo));
+                high = vaddq_f64(high, vmulq_f64(hi, hi));
+                c += 4;
+            }
+            let mut lanes = [0.0_f64; 2];
+            vst1q_f64(lanes.as_mut_ptr(), vaddq_f64(low, high));
+            let mut ss = lanes[0] + lanes[1];
+            for &value in &row[c..] {
+                let vf = value as f64;
+                ss += vf * vf;
+            }
+            ss
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let mut ss = 0.0_f64;
+        for &value in row {
+            let vf = value as f64;
+            ss += vf * vf;
+        }
+        ss
+    }
+}
+
 fn row_major_block_sumsq_f64(
     block: &[f32],
     rows: usize,
@@ -1817,12 +2675,7 @@ fn row_major_block_sumsq_f64(
         let mut run = || {
             out.par_iter_mut().enumerate().for_each(|(r, dst)| {
                 let row = &block[r * cols..(r + 1) * cols];
-                let mut ss = 0.0_f64;
-                for &value in row {
-                    let vf = value as f64;
-                    ss += vf * vf;
-                }
-                *dst = ss;
+                *dst = additive_row_sumsq_f64(row);
             });
         };
         if let Some(tp) = pool {
@@ -1834,12 +2687,7 @@ fn row_major_block_sumsq_f64(
     }
     for r in 0..rows {
         let row = &block[r * cols..(r + 1) * cols];
-        let mut ss = 0.0_f64;
-        for &value in row {
-            let vf = value as f64;
-            ss += vf * vf;
-        }
-        out[r] = ss;
+        out[r] = additive_row_sumsq_f64(row);
     }
 }
 
@@ -2620,6 +3468,211 @@ fn sparse_solve_rhs_tiled(
 //   Var(beta_hat) = sigma2 / (g'P0g)
 // and avoids SNP-specific sigma2 shrinkage that would make strong signals
 // systematically over-significant.
+struct ExactScanBlockWorkspace {
+    capacity_rows: usize,
+    n: usize,
+    p: usize,
+    block: Vec<f32>,
+    spy_block: Vec<f32>,
+    z_col_major: Vec<f64>,
+    sv_block: Vec<f64>,
+    exact_scalar_p1: Option<f64>,
+    c_block: Vec<f64>,
+    alpha: Vec<f64>,
+    out_block: Vec<f64>,
+    tiled_workspaces: Vec<SparseJxgrmSolveWorkspace>,
+}
+
+impl ExactScanBlockWorkspace {
+    fn new(
+        factor: &SparseJxgrmCholesky,
+        n: usize,
+        p: usize,
+        capacity_rows: usize,
+        threads: usize,
+        xt_w_x_chol: &[f64],
+    ) -> Result<Self, String> {
+        if n == 0 || p == 0 || capacity_rows == 0 {
+            return Err("SparseLMM exact block workspace dimensions must be positive".to_string());
+        }
+        if xt_w_x_chol.len() != p.saturating_mul(p) {
+            return Err(format!(
+                "SparseLMM exact block workspace XtWX chol length mismatch: got {}, expected {}",
+                xt_w_x_chol.len(),
+                p.saturating_mul(p)
+            ));
+        }
+        let exact_scalar_p1 = scalar_spd_inv_from_chol(xt_w_x_chol, p);
+        const MIN_TILE_COLS: usize = 32;
+        let solve_tiles = if threads > 1 && capacity_rows >= MIN_TILE_COLS {
+            threads.min(capacity_rows.div_ceil(MIN_TILE_COLS).max(1))
+        } else {
+            1
+        };
+        let tile_cols_capacity = capacity_rows.div_ceil(solve_tiles);
+        let tiled_workspaces = (0..solve_tiles)
+            .map(|_| factor.make_solve_workspace(tile_cols_capacity.max(1)))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            capacity_rows,
+            n,
+            p,
+            block: vec![0.0_f32; capacity_rows.saturating_mul(n)],
+            spy_block: vec![0.0_f32; capacity_rows],
+            z_col_major: vec![0.0_f64; capacity_rows.saturating_mul(n)],
+            sv_block: vec![0.0_f64; capacity_rows],
+            exact_scalar_p1,
+            c_block: vec![0.0_f64; capacity_rows.saturating_mul(p)],
+            alpha: if exact_scalar_p1.is_some() {
+                Vec::new()
+            } else {
+                vec![0.0_f64; p]
+            },
+            out_block: vec![0.0_f64; capacity_rows.saturating_mul(3)],
+            tiled_workspaces,
+        })
+    }
+
+    fn scan_decoded_block(
+        &mut self,
+        factor: &SparseJxgrmCholesky,
+        x_design: &[f64],
+        x_design_col_major: &[f64],
+        score_f32: &[f32],
+        sigma2: f64,
+        xt_w_x_chol: &[f64],
+        rows_here: usize,
+        solve_workspace: &mut SparseJxgrmSolveWorkspace,
+        pool: Option<&Arc<rayon::ThreadPool>>,
+        threads: usize,
+        timing: &mut SplmmPackedScanTiming,
+        stage_timing: bool,
+    ) -> Result<(), String> {
+        if rows_here == 0 || rows_here > self.capacity_rows {
+            return Err(format!(
+                "SparseLMM exact block rows out of range: rows={rows_here}, capacity={}",
+                self.capacity_rows
+            ));
+        }
+        if x_design.len() != self.n.saturating_mul(self.p)
+            || x_design_col_major.len() != self.n.saturating_mul(self.p)
+            || score_f32.len() != self.n
+        {
+            return Err(
+                "SparseLMM exact block model dimensions do not match workspace".to_string(),
+            );
+        }
+        let n = self.n;
+        let p = self.p;
+        let block_slice = &self.block[..rows_here * n];
+        let spy_slice = &mut self.spy_block[..rows_here];
+        let sv_slice = &mut self.sv_block[..rows_here];
+
+        let t0 = stage_timing.then(Instant::now);
+        row_major_block_mul_mat_f32(block_slice, rows_here, n, score_f32, 1, spy_slice, pool);
+        if let Some(t0) = t0 {
+            timing.gpy_secs += t0.elapsed().as_secs_f64();
+        }
+
+        let z_slice = &mut self.z_col_major[..rows_here * n];
+        let t0 = stage_timing.then(Instant::now);
+        row_major_snp_block_f32_to_col_major_f64(block_slice, rows_here, n, z_slice, pool);
+        if let Some(t0) = t0 {
+            timing.repack_secs += t0.elapsed().as_secs_f64();
+        }
+
+        let t0 = stage_timing.then(Instant::now);
+        sparse_solve_rhs_tiled(
+            factor,
+            z_slice,
+            rows_here,
+            solve_workspace,
+            &mut self.tiled_workspaces,
+            pool.map(Arc::as_ref),
+            threads.max(1),
+        )?;
+        if let Some(t0) = t0 {
+            timing.solve_secs += t0.elapsed().as_secs_f64();
+        }
+
+        let c_slice = &mut self.c_block[..rows_here * p];
+        let t0 = stage_timing.then(Instant::now);
+        if self.exact_scalar_p1.is_some() {
+            fused_block_sv_xtz_scalar_p1(
+                block_slice,
+                z_slice,
+                &x_design[..n],
+                rows_here,
+                n,
+                sv_slice,
+                &mut c_slice[..rows_here],
+                pool,
+            );
+        } else {
+            xt_mat_rhs_block(
+                x_design,
+                Some(x_design_col_major),
+                z_slice,
+                n,
+                p,
+                rows_here,
+                c_slice,
+                pool,
+            );
+        }
+        if let Some(t0) = t0 {
+            timing.xtz_secs += t0.elapsed().as_secs_f64();
+        }
+
+        if self.exact_scalar_p1.is_none() {
+            let t0 = stage_timing.then(Instant::now);
+            pairwise_block_dot_f32_f64(block_slice, z_slice, rows_here, n, sv_slice, pool);
+            if let Some(t0) = t0 {
+                timing.denom_secs += t0.elapsed().as_secs_f64();
+            }
+        }
+
+        let out_slice = &mut self.out_block[..rows_here * 3];
+        let t0 = stage_timing.then(Instant::now);
+        if let Some(xtden00_inv) = self.exact_scalar_p1 {
+            for local_idx in 0..rows_here {
+                let schur = (sv_slice[local_idx]
+                    - c_slice[local_idx] * c_slice[local_idx] * xtden00_inv)
+                    .max(0.0);
+                let score = spy_slice[local_idx] as f64;
+                let out_row = &mut out_slice[local_idx * 3..(local_idx + 1) * 3];
+                if let Some((beta, se, pwald)) = splmm_wald_from_score_denom(score, schur, sigma2) {
+                    out_row.copy_from_slice(&[beta, se, pwald]);
+                } else {
+                    out_row.copy_from_slice(&[f64::NAN, f64::NAN, 1.0]);
+                }
+            }
+        } else {
+            for local_idx in 0..rows_here {
+                let c_j = &c_slice[local_idx * p..(local_idx + 1) * p];
+                cholesky_solve_into(xt_w_x_chol, p, c_j, &mut self.alpha);
+                let x_quad = c_j
+                    .iter()
+                    .zip(self.alpha.iter())
+                    .map(|(a, b)| a * b)
+                    .sum::<f64>();
+                let schur = (sv_slice[local_idx] - x_quad).max(0.0);
+                let score = spy_slice[local_idx] as f64;
+                let out_row = &mut out_slice[local_idx * 3..(local_idx + 1) * 3];
+                if let Some((beta, se, pwald)) = splmm_wald_from_score_denom(score, schur, sigma2) {
+                    out_row.copy_from_slice(&[beta, se, pwald]);
+                } else {
+                    out_row.copy_from_slice(&[f64::NAN, f64::NAN, 1.0]);
+                }
+            }
+        }
+        if let Some(t0) = t0 {
+            timing.denom_secs += t0.elapsed().as_secs_f64();
+        }
+        Ok(())
+    }
+}
+
 fn exact_scan_blocks_core<G: GenotypeMatrix>(
     factor: &SparseJxgrmCholesky,
     input: &mut UnifiedInput<G>,
@@ -2724,39 +3777,15 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
         n,
     );
     let score_f32 = cast_f64_slice_to_f32(score_vec)?;
-
-    let mut block = vec![0.0_f32; scan_block_rows * n];
-    let mut spy_block = vec![0.0_f32; scan_block_rows];
-    let mut z_col_major = vec![0.0_f64; scan_block_rows * n];
-    let mut sv_block = vec![0.0_f64; scan_block_rows];
-    let exact_scalar_p1 = scalar_spd_inv_from_chol(xt_w_x_chol, p);
-    let mut c_block = vec![0.0_f64; scan_block_rows * p];
-    let mut alpha = if exact_scalar_p1.is_some() {
-        Vec::new()
-    } else {
-        vec![0.0_f64; p]
-    };
-    let mut out_block = vec![0.0_f64; scan_block_rows * 3];
-
-    const MIN_TILE_COLS: usize = 32;
-    let solve_tiles = if threads > 1 && scan_block_rows >= MIN_TILE_COLS {
-        threads.min(scan_block_rows.div_ceil(MIN_TILE_COLS).max(1))
-    } else {
-        1
-    };
-    let tile_cols_capacity = scan_block_rows.div_ceil(solve_tiles);
-    let mut tiled_workspaces: Vec<SparseJxgrmSolveWorkspace> = (0..solve_tiles)
-        .map(|_| factor.make_solve_workspace(tile_cols_capacity.max(1)))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut workspace =
+        ExactScanBlockWorkspace::new(factor, n, p, scan_block_rows, threads, xt_w_x_chol)?;
 
     let mut row_start = 0usize;
     let mut next_progress_done = progress_done_offset.saturating_add(progress_step);
     while row_start < m {
         let row_end = (row_start + scan_block_rows).min(m);
         let rows_here = row_end - row_start;
-        let block_slice = &mut block[..rows_here * n];
-        let spy_slice = &mut spy_block[..rows_here];
-        let sv_slice = &mut sv_block[..rows_here];
+        let block_slice = &mut workspace.block[..rows_here * n];
 
         // Step 1: decode genotype block via UnifiedInput
         let t0 = stage_timing.then(Instant::now);
@@ -2772,134 +3801,28 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
             timing.decode_secs += t0.elapsed().as_secs_f64();
         }
 
-        // Step 2: numerator = G_block * Py
-        let t0 = stage_timing.then(Instant::now);
-        row_major_block_mul_mat_f32(
-            block_slice,
-            rows_here,
-            n,
-            score_f32.as_slice(),
-            1,
-            spy_slice,
-            pool.as_ref(),
-        );
-        if let Some(t0) = t0 {
-            timing.gpy_secs += t0.elapsed().as_secs_f64();
-        }
-        // Step 3: widen decode block directly into the sparse-solve buffer
-        let z_slice = &mut z_col_major[..rows_here * n];
-        let t0 = stage_timing.then(Instant::now);
-        row_major_snp_block_f32_to_col_major_f64(block_slice, rows_here, n, z_slice, pool.as_ref());
-        if let Some(t0) = t0 {
-            timing.repack_secs += t0.elapsed().as_secs_f64();
-        }
-
-        // Step 4: solve V * Z_block = G_block (tiled, in-place)
-        let t0 = stage_timing.then(Instant::now);
-        sparse_solve_rhs_tiled(
+        workspace.scan_decoded_block(
             factor,
-            z_slice,
+            x_design,
+            x_design_col_major,
+            score_f32.as_slice(),
+            sigma2,
+            xt_w_x_chol,
             rows_here,
             _solve_workspace,
-            &mut tiled_workspaces,
-            pool.as_deref(),
-            threads.max(1),
+            pool.as_ref(),
+            threads,
+            &mut timing,
+            stage_timing,
         )?;
-        if let Some(t0) = t0 {
-            timing.solve_secs += t0.elapsed().as_secs_f64();
-        }
-
-        // Step 5: C_block = X^T Z_block; for p=1 also fuse g'Z here.
-        let c_slice = &mut c_block[..rows_here * p];
-        let t0 = stage_timing.then(Instant::now);
-        if exact_scalar_p1.is_some() {
-            let x0 = &x_design[..n];
-            fused_block_sv_xtz_scalar_p1(
-                block_slice,
-                z_slice,
-                x0,
-                rows_here,
-                n,
-                sv_slice,
-                &mut c_slice[..rows_here],
-                pool.as_ref(),
-            );
-        } else {
-            xt_mat_rhs_block(
-                x_design,
-                Some(x_design_col_major),
-                z_slice,
-                n,
-                p,
-                rows_here,
-                c_slice,
-                pool.as_ref(),
-            );
-        }
-        if let Some(t0) = t0 {
-            timing.xtz_secs += t0.elapsed().as_secs_f64();
-        }
-
-        // Step 6: batch g'Z for the generic p>1 path.
-        if exact_scalar_p1.is_none() {
-            let t0 = stage_timing.then(Instant::now);
-            pairwise_block_dot_f32_f64(block_slice, z_slice, rows_here, n, sv_slice, pool.as_ref());
-            if let Some(t0) = t0 {
-                timing.denom_secs += t0.elapsed().as_secs_f64();
-            }
-        }
-
-        // Steps 7-8: per-SNP denominator and output
-        let out_slice = &mut out_block[..rows_here * 3];
-        let t0 = stage_timing.then(Instant::now);
-        if let Some(xtden00_inv) = exact_scalar_p1 {
-            for local_idx in 0..rows_here {
-                let s_v_s = sv_slice[local_idx];
-                let xtz0 = c_slice[local_idx];
-                let x_quad = xtz0 * xtz0 * xtden00_inv;
-                let schur = (s_v_s - x_quad).max(0.0);
-                let score = spy_slice[local_idx] as f64;
-                let out_row = &mut out_slice[local_idx * 3..(local_idx + 1) * 3];
-                if let Some((beta, se, pwald)) = splmm_wald_from_score_denom(score, schur, sigma2) {
-                    out_row[0] = beta;
-                    out_row[1] = se;
-                    out_row[2] = pwald;
-                } else {
-                    out_row[0] = f64::NAN;
-                    out_row[1] = f64::NAN;
-                    out_row[2] = 1.0_f64;
-                }
-            }
-        } else {
-            for local_idx in 0..rows_here {
-                let s_v_s = sv_slice[local_idx];
-                let c_j = &c_slice[local_idx * p..(local_idx + 1) * p];
-                cholesky_solve_into(xt_w_x_chol, p, c_j, &mut alpha);
-                let x_quad = c_j
-                    .iter()
-                    .zip(alpha.iter())
-                    .map(|(a, b)| a * b)
-                    .sum::<f64>();
-                let schur = (s_v_s - x_quad).max(0.0);
-                let score = spy_slice[local_idx] as f64;
-                let out_row = &mut out_slice[local_idx * 3..(local_idx + 1) * 3];
-                if let Some((beta, se, pwald)) = splmm_wald_from_score_denom(score, schur, sigma2) {
-                    out_row[0] = beta;
-                    out_row[1] = se;
-                    out_row[2] = pwald;
-                } else {
-                    out_row[0] = f64::NAN;
-                    out_row[1] = f64::NAN;
-                    out_row[2] = 1.0_f64;
-                }
-            }
-        }
-        if let Some(t0) = t0 {
-            timing.denom_secs += t0.elapsed().as_secs_f64();
-        }
         let t0 = stage_timing.then(Instant::now);
         let block_maf = input.matrix.block_maf(rows_here);
-        sink(row_start, rows_here, out_slice, block_maf)?;
+        sink(
+            row_start,
+            rows_here,
+            &workspace.out_block[..rows_here * 3],
+            block_maf,
+        )?;
         if let Some(t0) = t0 {
             timing.sink_secs += t0.elapsed().as_secs_f64();
         }
@@ -3084,7 +4007,17 @@ fn grammar_scan_blocks_core<G: GenotypeMatrix>(
     let mut next_progress_done = progress_done_offset.saturating_add(progress_step);
 
     if matches!(gm, PackedGeneticModel::Add) {
-        let rhs_f32 = pack_score_design_rhs_f32(score_vec, x_design, p)?;
+        let intercept_only = p == 1 && x_design.iter().all(|&value| value == 1.0_f64);
+        let score_f32 = if intercept_only {
+            Some(cast_f64_slice_to_f32(score_vec)?)
+        } else {
+            None
+        };
+        let rhs_f32 = if intercept_only {
+            None
+        } else {
+            Some(pack_score_design_rhs_f32(score_vec, x_design, p)?)
+        };
         let rhs_cols = p + 1;
         let mut block = vec![0.0_f32; scan_block_rows * n];
         let mut row_ss = vec![0.0_f64; scan_block_rows];
@@ -3131,16 +4064,31 @@ fn grammar_scan_blocks_core<G: GenotypeMatrix>(
             }
             let dot_slice = &mut dot_block[..rows_here * rhs_cols];
             let t0 = stage_timing.then(Instant::now);
-            // Compute g'Py and X'g for the whole decoded block in one pass.
-            row_major_block_mul_mat_f32(
-                block_slice,
-                rows_here,
-                n,
-                rhs_f32.as_slice(),
-                rhs_cols,
-                dot_slice,
-                pool.as_ref(),
-            );
+            // The intercept-only route avoids packing [Py, 1] and uses
+            // independent accumulators for g'Py and g'1. Other designs keep
+            // the generic matrix-vector kernel.
+            if let Some(score) = score_f32.as_deref() {
+                row_major_block_mul_vec_intercept_f32(
+                    block_slice,
+                    rows_here,
+                    n,
+                    score,
+                    dot_slice,
+                    pool.as_ref(),
+                );
+            } else {
+                row_major_block_mul_mat_f32(
+                    block_slice,
+                    rows_here,
+                    n,
+                    rhs_f32
+                        .as_deref()
+                        .expect("non-intercept scan must have packed RHS"),
+                    rhs_cols,
+                    dot_slice,
+                    pool.as_ref(),
+                );
+            }
             if let Some(t0) = t0 {
                 timing.gx_secs += t0.elapsed().as_secs_f64();
             }
@@ -4283,6 +5231,132 @@ pub fn splmm_sparse_null_model_debug<'py>(
 
 #[pyfunction]
 #[pyo3(signature = (
+    prefix,
+    y,
+    lbd,
+    out_tsv,
+    sample_indices,
+    sparse_jxgrm_path,
+    sparse_sample_indices=None,
+    x_cov=None,
+    maf_threshold=0.0,
+    max_missing_rate=1.0,
+    het_threshold=1.0,
+    snps_only=false,
+    bimranges=Vec::new(),
+    threads=0,
+    block_rows=4096,
+    stage1_progress_callback=None,
+    scan_progress_callback=None,
+    progress_every=0
+))]
+#[allow(clippy::too_many_arguments)]
+pub fn splmm_assoc_pcg_bed_to_tsv_fused_exact<'py>(
+    py: Python<'py>,
+    prefix: String,
+    y: PyReadonlyArray1<'py, f64>,
+    lbd: f64,
+    out_tsv: String,
+    sample_indices: PyReadonlyArray1<'py, i64>,
+    sparse_jxgrm_path: String,
+    sparse_sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    x_cov: Option<PyReadonlyArray2<'py, f64>>,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
+    bimranges: Vec<(String, i64, i64)>,
+    threads: usize,
+    block_rows: usize,
+    stage1_progress_callback: Option<Py<PyAny>>,
+    scan_progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+) -> PyResult<(
+    f64,
+    bool,
+    usize,
+    f64,
+    bool,
+    usize,
+    f64,
+    usize,
+    usize,
+    usize,
+    (f64, f64, f64, f64, f64, f64, f64),
+    usize,
+)> {
+    if !(lbd.is_finite() && lbd >= 0.0) {
+        return Err(PyRuntimeError::new_err("lbd must be finite and >= 0"));
+    }
+    let bed_prefix = normalize_plink_prefix_local(&prefix);
+    let n_samples_full = read_fam(&bed_prefix)
+        .map_err(PyRuntimeError::new_err)?
+        .len();
+    let scan_sample_idx =
+        parse_index_vec_i64(sample_indices.as_slice()?, n_samples_full, "sample_indices")?;
+    let sparse_sample_idx = if let Some(indices) = sparse_sample_indices {
+        parse_index_vec_i64(indices.as_slice()?, n_samples_full, "sparse_sample_indices")?
+    } else {
+        scan_sample_idx.clone()
+    };
+    let y_vec = y.as_slice()?.to_vec();
+    let (x_cov_owned, p_cov) = if let Some(x_cov) = x_cov {
+        let x_arr = x_cov.as_array();
+        if x_arr.ndim() != 2 {
+            return Err(PyRuntimeError::new_err("x_cov must be 2D (n, p_cov)"));
+        }
+        let (xn, xp) = (x_arr.shape()[0], x_arr.shape()[1]);
+        if xn != y_vec.len() {
+            return Err(PyRuntimeError::new_err(format!(
+                "x_cov row count mismatch: got {xn}, expected {}",
+                y_vec.len()
+            )));
+        }
+        let owned = match crate::stats_common::array_standard_slice(&x_cov) {
+            Ok(slice) => slice.to_vec(),
+            Err(_) => crate::stats_common::copy_array_standard_layout(&x_arr),
+        };
+        (Some(owned), xp)
+    } else {
+        (None, 0usize)
+    };
+    let regions = bimranges
+        .into_iter()
+        .map(|(chrom, start, end)| SplmmRawBimRange {
+            chrom: splmm_raw_bim_chrom_norm(&chrom),
+            start,
+            end,
+        })
+        .collect::<Vec<_>>();
+    let threads = threads.max(1);
+    py.detach(move || {
+        splmm_fused_exact_assoc_to_tsv(
+            bed_prefix,
+            y_vec,
+            x_cov_owned,
+            p_cov,
+            lbd,
+            out_tsv,
+            scan_sample_idx,
+            sparse_sample_idx,
+            sparse_jxgrm_path,
+            maf_threshold,
+            max_missing_rate,
+            het_threshold,
+            snps_only,
+            regions,
+            threads,
+            block_rows,
+            stage1_progress_callback,
+            scan_progress_callback,
+            progress_every,
+        )
+    })
+    .map_err(PyRuntimeError::new_err)
+}
+
+#[pyfunction]
+#[pyo3(signature = (
     jxgrm_path,
     y,
     x_cov=None,
@@ -5084,6 +6158,712 @@ pub fn splmm_assoc_pcg_bed_to_tsv<'py>(
         ),
         factor_nnz,
     ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn splmm_fused_approx_assoc_to_tsv(
+    prefix: String,
+    y_vec: Vec<f64>,
+    x_cov: Option<Vec<f64>>,
+    p_cov: usize,
+    lbd: f64,
+    out_tsv: String,
+    scan_sample_idx: Vec<usize>,
+    sparse_sample_idx: Vec<usize>,
+    sparse_jxgrm_path: String,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
+    bimranges: Vec<SplmmRawBimRange>,
+    threads: usize,
+    block_rows: usize,
+    rhat_markers: usize,
+    rhat_seed: u64,
+    stage1_progress_callback: Option<Py<PyAny>>,
+    scan_progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+) -> Result<
+    (
+        f64,
+        bool,
+        usize,
+        f64,
+        bool,
+        usize,
+        f64,
+        usize,
+        usize,
+        usize,
+        (f64, f64, f64, f64, f64, f64, f64),
+        usize,
+    ),
+    String,
+> {
+    let total_t0 = Instant::now();
+    let bed_prefix = normalize_plink_prefix_local(&prefix);
+    if y_vec.is_empty() {
+        return Err("SparseLMM fused approx requires non-empty phenotype".to_string());
+    }
+    if scan_sample_idx.len() != y_vec.len() || sparse_sample_idx.len() != y_vec.len() {
+        return Err(format!(
+            "SparseLMM fused approx sample alignment mismatch: y={}, scan={}, sparse={}",
+            y_vec.len(),
+            scan_sample_idx.len(),
+            sparse_sample_idx.len()
+        ));
+    }
+    if scan_sample_idx
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        != scan_sample_idx.len()
+        || sparse_sample_idx
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            != sparse_sample_idx.len()
+    {
+        return Err("SparseLMM fused approx sample indices must be unique".to_string());
+    }
+    if !(lbd.is_finite() && lbd >= 0.0) {
+        return Err("SparseLMM fused approx lambda must be finite and >= 0".to_string());
+    }
+    if x_cov
+        .as_ref()
+        .is_some_and(|values| values.len() != y_vec.len().saturating_mul(p_cov))
+    {
+        return Err(
+            "SparseLMM fused approx covariate dimensions do not match phenotype".to_string(),
+        );
+    }
+    if !(0.0..=0.5).contains(&maf_threshold)
+        || !(0.0..=1.0).contains(&max_missing_rate)
+        || !(0.0..=1.0).contains(&het_threshold)
+    {
+        return Err("SparseLMM fused approx QC thresholds are out of range".to_string());
+    }
+    if bimranges.iter().any(|range| range.start > range.end) {
+        return Err("SparseLMM fused approx BIM range has start > end".to_string());
+    }
+    let samples = read_fam(&bed_prefix).map_err(|e| e.to_string())?;
+    if samples.is_empty() {
+        return Err("No samples found in BED input.".to_string());
+    }
+    let n_samples_full = samples.len();
+    if scan_sample_idx.iter().any(|&idx| idx >= n_samples_full)
+        || sparse_sample_idx.iter().any(|&idx| idx >= n_samples_full)
+    {
+        return Err("SparseLMM fused approx sample index is outside FAM order".to_string());
+    }
+    let sample_identity =
+        scan_sample_idx.len() == n_samples_full && sample_indices_are_identity(&scan_sample_idx);
+    let excluded_sample_indices = if sample_identity {
+        None
+    } else {
+        precompute_excluded_sample_indices(n_samples_full, &scan_sample_idx)
+    };
+    let input_prepare_secs = total_t0.elapsed().as_secs_f64();
+    emit_progress_callback(stage1_progress_callback.as_ref(), 0, 0, 1)?;
+
+    let mut reader = PackedBedSourceReader::open(&bed_prefix, n_samples_full)?;
+    let factor_t0 = Instant::now();
+    let factor = sparse_splmm_load_factor(
+        &bed_prefix,
+        Some(&sparse_jxgrm_path),
+        sparse_sample_idx.len(),
+        &sparse_sample_idx,
+        lbd,
+        threads,
+        stage1_progress_callback.as_ref(),
+    )?;
+    let factor_load_secs = factor_t0.elapsed().as_secs_f64();
+    let factor_nnz = factor.factor_nnz();
+    let n = y_vec.len();
+    let x_design = build_design_with_intercept(x_cov.as_deref(), n, p_cov);
+    let scan_prepare_t0 = Instant::now();
+    let fit =
+        build_residualized_approx_scan_null_from_lambda_and_factor(factor, &x_design, &y_vec, lbd)?;
+    let gamma_info = splmm_raw_estimate_gamma(
+        &mut reader,
+        &bed_prefix,
+        &fit,
+        &x_design,
+        &scan_sample_idx,
+        sample_identity,
+        excluded_sample_indices.as_deref(),
+        n,
+        maf_threshold,
+        max_missing_rate,
+        het_threshold,
+        rhat_markers,
+        rhat_seed,
+        snps_only,
+        &bimranges,
+    )?;
+    let model = fit.build_scan_model(&x_design, gamma_info.gamma)?;
+    let score_f32 = cast_f64_slice_to_f32(model.score_vec())?;
+    let p = model.design_cols();
+    let x_design_f32 = if p > 1 {
+        Some(cast_f64_slice_to_f32(&x_design)?)
+    } else {
+        None
+    };
+    let decode_plan = AdditiveDecodePlan::from_sample_indices(n_samples_full, &scan_sample_idx);
+    let scan_prepare_secs = scan_prepare_t0.elapsed().as_secs_f64();
+    eprintln!(
+        "SparseLMM fused approx gamma: gamma={:.9e}, requested={}, used={}, static={}, candidates={}, QC-valid={}, attempts={}, branch={}",
+        gamma_info.gamma,
+        gamma_info.n_requested,
+        gamma_info.n_used,
+        gamma_info.n_static,
+        gamma_info.n_candidates,
+        gamma_info.n_qc_valid,
+        gamma_info.n_attempts,
+        if gamma_info.n_used >= 100 {
+            "null-filtered"
+        } else {
+            "all-valid-residualized"
+        },
+    );
+    emit_progress_callback(
+        stage1_progress_callback.as_ref(),
+        8,
+        gamma_info.n_qc_valid,
+        gamma_info.n_qc_valid.max(1),
+    )?;
+
+    let n_snps = reader.n_snps();
+    let block_rows = block_rows.max(1).min(n_snps.max(1));
+    let bytes_per_snp = reader.bytes_per_snp();
+    let n_samples_full = reader.n_samples_full();
+    let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
+    let mut source_bim = if snps_only || !bimranges.is_empty() {
+        Some(BimChunkReader::open(&bed_prefix)?)
+    } else {
+        None
+    };
+    let scan_exec_t0 = Instant::now();
+    let (_n_scanned, written_rows, tsv_timing) =
+        run_splmm_raw_bed_tsv_writer(&out_tsv, &bed_prefix, PackedGeneticModel::Add, |sink| {
+            let progress_step = if progress_every == 0 {
+                (n_snps / 200).max(1)
+            } else {
+                progress_every.max(1)
+            };
+            let mut next_progress = progress_step;
+            run_splmm_raw_bed_prefetch(
+                reader,
+                n_snps,
+                block_rows,
+                bytes_per_snp,
+                |source_start, rows_here, packed_block| {
+                    let block_sites = source_bim
+                        .as_mut()
+                        .map(|bim| bim.read_range(source_start, source_start + rows_here))
+                        .transpose()?;
+                    let block = splmm_raw_process_assoc_block_single_buffer(
+                        packed_block,
+                        source_start,
+                        rows_here,
+                        n_samples_full,
+                        &scan_sample_idx,
+                        sample_identity,
+                        excluded_sample_indices.as_deref(),
+                        n,
+                        maf_threshold,
+                        max_missing_rate,
+                        het_threshold,
+                        snps_only,
+                        &bimranges,
+                        block_sites.as_deref(),
+                        &model,
+                        &score_f32,
+                        x_design_f32.as_deref(),
+                        &packed_byte_lut().code4,
+                        &decode_plan,
+                        pool.as_ref(),
+                    )?;
+                    if !block.source_rows.is_empty() {
+                        sink(SplmmRawTsvBlockPayload {
+                            source_rows: block.source_rows,
+                            alt_freq: block.alt_freq,
+                            missing_rate: block.missing_rate,
+                            results: block.results,
+                        })?;
+                    }
+                    let source_end = source_start.saturating_add(rows_here);
+                    if scan_progress_callback.is_some()
+                        && (source_end == n_snps || source_end >= next_progress)
+                    {
+                        emit_progress_callback(
+                            scan_progress_callback.as_ref(),
+                            9,
+                            source_end,
+                            n_snps.max(1),
+                        )?;
+                        while next_progress <= source_end {
+                            next_progress = next_progress.saturating_add(progress_step);
+                            if next_progress == usize::MAX {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(())
+                },
+            )?;
+            if let Some(bim) = source_bim.as_mut() {
+                bim.ensure_exhausted(n_snps)?;
+            }
+            Ok(n_snps)
+        })?;
+    let scan_exec_secs = scan_exec_t0.elapsed().as_secs_f64();
+    if splmm_top_level_timing_enabled() {
+        emit_splmm_null_scan_core_timing(
+            "approx-fused",
+            factor_load_secs,
+            scan_prepare_secs,
+            scan_exec_secs,
+            tsv_timing.finish_secs,
+            written_rows,
+            n,
+            p,
+            threads.max(1),
+        );
+    }
+    let total_secs = total_t0.elapsed().as_secs_f64();
+    let accounted = input_prepare_secs
+        + factor_load_secs
+        + scan_prepare_secs
+        + scan_exec_secs
+        + tsv_timing.finish_secs;
+    Ok((
+        gamma_info.gamma,
+        true,
+        0,
+        0.0,
+        true,
+        0,
+        0.0,
+        gamma_info.n_requested,
+        gamma_info.n_used,
+        written_rows,
+        (
+            input_prepare_secs,
+            0.0,
+            factor_load_secs + scan_prepare_secs + scan_exec_secs,
+            tsv_timing.finish_secs,
+            0.0,
+            (total_secs - accounted).max(0.0),
+            total_secs,
+        ),
+        factor_nnz,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn splmm_fused_exact_assoc_to_tsv(
+    prefix: String,
+    y_vec: Vec<f64>,
+    x_cov: Option<Vec<f64>>,
+    p_cov: usize,
+    lbd: f64,
+    out_tsv: String,
+    scan_sample_idx: Vec<usize>,
+    sparse_sample_idx: Vec<usize>,
+    sparse_jxgrm_path: String,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
+    bimranges: Vec<SplmmRawBimRange>,
+    threads: usize,
+    block_rows: usize,
+    stage1_progress_callback: Option<Py<PyAny>>,
+    scan_progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+) -> Result<
+    (
+        f64,
+        bool,
+        usize,
+        f64,
+        bool,
+        usize,
+        f64,
+        usize,
+        usize,
+        usize,
+        (f64, f64, f64, f64, f64, f64, f64),
+        usize,
+    ),
+    String,
+> {
+    let total_t0 = Instant::now();
+    let bed_prefix = normalize_plink_prefix_local(&prefix);
+    let n = y_vec.len();
+    if n == 0 {
+        return Err("SparseLMM fused exact requires non-empty phenotype".to_string());
+    }
+    if scan_sample_idx.len() != n || sparse_sample_idx.len() != n {
+        return Err(format!(
+            "SparseLMM fused exact sample alignment mismatch: y={}, scan={}, sparse={}",
+            n,
+            scan_sample_idx.len(),
+            sparse_sample_idx.len()
+        ));
+    }
+    if scan_sample_idx
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        != n
+        || sparse_sample_idx
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            != n
+    {
+        return Err("SparseLMM fused exact sample indices must be unique".to_string());
+    }
+    if !(lbd.is_finite() && lbd >= 0.0) {
+        return Err("SparseLMM fused exact lambda must be finite and >= 0".to_string());
+    }
+    if !(0.0..=0.5).contains(&maf_threshold)
+        || !(0.0..=1.0).contains(&max_missing_rate)
+        || !(0.0..=1.0).contains(&het_threshold)
+    {
+        return Err("SparseLMM fused exact QC thresholds are out of range".to_string());
+    }
+    if bimranges.iter().any(|range| range.start > range.end) {
+        return Err("SparseLMM fused exact BIM range has start > end".to_string());
+    }
+    if x_cov
+        .as_ref()
+        .is_some_and(|values| values.len() != n.saturating_mul(p_cov))
+    {
+        return Err(
+            "SparseLMM fused exact covariate dimensions do not match phenotype".to_string(),
+        );
+    }
+    let samples = read_fam(&bed_prefix).map_err(|e| e.to_string())?;
+    if samples.is_empty() {
+        return Err("No samples found in BED input.".to_string());
+    }
+    let n_samples_full = samples.len();
+    if scan_sample_idx.iter().any(|&idx| idx >= n_samples_full)
+        || sparse_sample_idx.iter().any(|&idx| idx >= n_samples_full)
+    {
+        return Err("SparseLMM fused exact sample index is outside FAM order".to_string());
+    }
+    let p = p_cov + 1;
+    if n <= p {
+        return Err(format!(
+            "SparseLMM fused exact null model requires n > p, got n={n}, p={p}"
+        ));
+    }
+    let x_design = build_design_with_intercept(x_cov.as_deref(), n, p_cov);
+    let scan_sample_identity =
+        scan_sample_idx.len() == n_samples_full && sample_indices_are_identity(&scan_sample_idx);
+    let excluded_sample_indices = if scan_sample_identity {
+        None
+    } else {
+        precompute_excluded_sample_indices(n_samples_full, &scan_sample_idx)
+    };
+    let input_prepare_secs = total_t0.elapsed().as_secs_f64();
+    emit_progress_callback(stage1_progress_callback.as_ref(), 0, 0, 1)?;
+
+    let reader = PackedBedSourceReader::open(&bed_prefix, n_samples_full)?;
+    let n_snps = reader.n_snps();
+    if n_snps == 0 {
+        return Err("no SNP sites found in PLINK BED input".to_string());
+    }
+    let bytes_per_snp = reader.bytes_per_snp();
+    let factor_t0 = Instant::now();
+    let factor = sparse_splmm_load_factor(
+        &bed_prefix,
+        Some(&sparse_jxgrm_path),
+        sparse_sample_idx.len(),
+        &sparse_sample_idx,
+        lbd,
+        threads,
+        stage1_progress_callback.as_ref(),
+    )?;
+    let factor_load_secs = factor_t0.elapsed().as_secs_f64();
+    let factor_nnz = factor.factor_nnz();
+
+    let (scan_block_hint, progress_step) =
+        splmm_scan_block_hint_and_progress_step(block_rows, progress_every);
+    let exact_capacity = adaptive_exact_block_rows(
+        adaptive_grm_block_rows(scan_block_hint, n_snps, n, 0usize, threads).max(1),
+        n,
+    );
+    let mut solve_workspace = factor.make_solve_workspace(exact_capacity.max(p).max(1))?;
+    let null_state = build_sparse_splmm_null_state(
+        &factor,
+        &x_design,
+        &y_vec,
+        &mut solve_workspace,
+        stage1_progress_callback.as_ref(),
+    )?;
+    let score_f32 = cast_f64_slice_to_f32(&null_state.null_model.py)?;
+    let mut exact_workspace = ExactScanBlockWorkspace::new(
+        &factor,
+        n,
+        p,
+        exact_capacity,
+        threads,
+        &null_state.null_model.xt_w_x_chol,
+    )?;
+    let decode_plan = AdditiveDecodePlan::from_sample_indices(n_samples_full, &scan_sample_idx);
+    let scan_prepare_secs =
+        total_t0.elapsed().as_secs_f64() - input_prepare_secs - factor_load_secs;
+    let raw_block_rows = block_rows.max(1).min(n_snps);
+    let mut source_bim = if snps_only || !bimranges.is_empty() {
+        Some(BimChunkReader::open(&bed_prefix)?)
+    } else {
+        None
+    };
+    let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
+    let scan_exec_t0 = Instant::now();
+    let (_n_scanned, written_rows, tsv_timing) =
+        run_splmm_raw_bed_tsv_writer(&out_tsv, &bed_prefix, PackedGeneticModel::Add, |sink| {
+            let mut next_progress = progress_step.max(1);
+            run_splmm_raw_bed_prefetch(
+                reader,
+                n_snps,
+                raw_block_rows,
+                bytes_per_snp,
+                |source_start, rows_here, packed_block| {
+                    let block_sites = source_bim
+                        .as_mut()
+                        .map(|bim| bim.read_range(source_start, source_start + rows_here))
+                        .transpose()?;
+                    splmm_raw_scan_exact_block_single_buffer(
+                        &factor,
+                        &mut exact_workspace,
+                        &mut solve_workspace,
+                        &x_design,
+                        &null_state.x_design_col_major,
+                        &null_state.null_model.py,
+                        &score_f32,
+                        null_state.null_model.ypy,
+                        null_state.null_model.df,
+                        &null_state.null_model.xt_w_x_chol,
+                        packed_block,
+                        source_start,
+                        rows_here,
+                        n_samples_full,
+                        &scan_sample_idx,
+                        scan_sample_identity,
+                        excluded_sample_indices.as_deref(),
+                        maf_threshold,
+                        max_missing_rate,
+                        het_threshold,
+                        snps_only,
+                        &bimranges,
+                        block_sites.as_deref(),
+                        &decode_plan,
+                        threads,
+                        pool.as_ref(),
+                        sink,
+                    )?;
+                    let source_end = source_start.saturating_add(rows_here);
+                    if scan_progress_callback.is_some()
+                        && (source_end == n_snps || source_end >= next_progress)
+                    {
+                        emit_progress_callback(
+                            scan_progress_callback.as_ref(),
+                            9,
+                            source_end,
+                            n_snps.max(1),
+                        )?;
+                        while next_progress <= source_end {
+                            next_progress = next_progress.saturating_add(progress_step.max(1));
+                            if next_progress == usize::MAX {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(())
+                },
+            )?;
+            if let Some(bim) = source_bim.as_mut() {
+                bim.ensure_exhausted(n_snps)?;
+            }
+            Ok(n_snps)
+        })?;
+    let scan_exec_secs = scan_exec_t0.elapsed().as_secs_f64();
+    if splmm_top_level_timing_enabled() {
+        emit_splmm_null_scan_core_timing(
+            "exact-fused",
+            factor_load_secs,
+            scan_prepare_secs,
+            scan_exec_secs,
+            tsv_timing.finish_secs,
+            written_rows,
+            n,
+            p,
+            threads.max(1),
+        );
+    }
+    let total_secs = total_t0.elapsed().as_secs_f64();
+    let null_scan_core_secs = factor_load_secs + scan_prepare_secs + scan_exec_secs;
+    Ok((
+        f64::NAN,
+        null_state.null_info.v_inv_y.converged,
+        null_state.null_info.v_inv_y.iters,
+        null_state.null_info.v_inv_y.rel_res,
+        null_state.null_info.v_inv_x.converged_all,
+        null_state.null_info.v_inv_x.max_iters,
+        null_state.null_info.v_inv_x.max_rel_res,
+        0,
+        0,
+        written_rows,
+        (
+            input_prepare_secs,
+            0.0,
+            null_scan_core_secs,
+            tsv_timing.finish_secs,
+            0.0,
+            0.0,
+            total_secs,
+        ),
+        factor_nnz,
+    ))
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    prefix,
+    y,
+    lbd,
+    out_tsv,
+    sample_indices,
+    sparse_jxgrm_path,
+    sparse_sample_indices=None,
+    maf_threshold=0.0,
+    max_missing_rate=1.0,
+    het_threshold=1.0,
+    snps_only=false,
+    bimranges=Vec::new(),
+    threads=0,
+    block_rows=4096,
+    rhat_markers=SPLMM_DEFAULT_RHAT_MARKERS,
+    rhat_seed=SPLMM_DEFAULT_RHAT_SEED,
+    stage1_progress_callback=None,
+    scan_progress_callback=None,
+    progress_every=0,
+    x_cov=None
+))]
+#[allow(clippy::too_many_arguments)]
+pub fn splmm_assoc_pcg_bed_to_tsv_fused_approx<'py>(
+    py: Python<'py>,
+    prefix: String,
+    y: PyReadonlyArray1<'py, f64>,
+    lbd: f64,
+    out_tsv: String,
+    sample_indices: PyReadonlyArray1<'py, i64>,
+    sparse_jxgrm_path: String,
+    sparse_sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
+    bimranges: Vec<(String, i64, i64)>,
+    threads: usize,
+    block_rows: usize,
+    rhat_markers: usize,
+    rhat_seed: u64,
+    stage1_progress_callback: Option<Py<PyAny>>,
+    scan_progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+    x_cov: Option<PyReadonlyArray2<'py, f64>>,
+) -> PyResult<(
+    f64,
+    bool,
+    usize,
+    f64,
+    bool,
+    usize,
+    f64,
+    usize,
+    usize,
+    usize,
+    (f64, f64, f64, f64, f64, f64, f64),
+    usize,
+)> {
+    if !(lbd.is_finite() && lbd >= 0.0) {
+        return Err(PyRuntimeError::new_err("lbd must be finite and >= 0"));
+    }
+    let bed_prefix = normalize_plink_prefix_local(&prefix);
+    let n_samples_full = read_fam(&bed_prefix)
+        .map_err(PyRuntimeError::new_err)?
+        .len();
+    let scan_sample_idx =
+        parse_index_vec_i64(sample_indices.as_slice()?, n_samples_full, "sample_indices")?;
+    let sparse_sample_idx = if let Some(indices) = sparse_sample_indices {
+        parse_index_vec_i64(indices.as_slice()?, n_samples_full, "sparse_sample_indices")?
+    } else {
+        scan_sample_idx.clone()
+    };
+    let y_vec = y.as_slice()?.to_vec();
+    let (x_cov_owned, p_cov) = if let Some(x_cov) = x_cov {
+        let x_arr = x_cov.as_array();
+        let (xn, xp) = (x_arr.shape()[0], x_arr.shape()[1]);
+        if xn != y_vec.len() {
+            return Err(PyRuntimeError::new_err(format!(
+                "x_cov row count mismatch: got {xn}, expected {}",
+                y_vec.len()
+            )));
+        }
+        let owned = match crate::stats_common::array_standard_slice(&x_cov) {
+            Ok(slice) => slice.to_vec(),
+            Err(_) => crate::stats_common::copy_array_standard_layout(&x_arr),
+        };
+        (Some(owned), xp)
+    } else {
+        (None, 0usize)
+    };
+    let regions = bimranges
+        .into_iter()
+        .map(|(chrom, start, end)| SplmmRawBimRange {
+            chrom: splmm_raw_bim_chrom_norm(&chrom),
+            start,
+            end,
+        })
+        .collect::<Vec<_>>();
+    let threads = threads.max(1);
+    py.detach(move || {
+        splmm_fused_approx_assoc_to_tsv(
+            bed_prefix,
+            y_vec,
+            x_cov_owned,
+            p_cov,
+            lbd,
+            out_tsv,
+            scan_sample_idx,
+            sparse_sample_idx,
+            sparse_jxgrm_path,
+            maf_threshold,
+            max_missing_rate,
+            het_threshold,
+            snps_only,
+            regions,
+            threads,
+            block_rows,
+            rhat_markers,
+            rhat_seed,
+            stage1_progress_callback,
+            scan_progress_callback,
+            progress_every,
+        )
+    })
+    .map_err(PyRuntimeError::new_err)
 }
 
 fn run_kfile_splmm_tsv_writer<F>(out_tsv: &str, run_scan: F) -> Result<(usize, f64), String>
@@ -6343,6 +8123,686 @@ mod tests {
         row
     }
 
+    #[test]
+    fn raw_candidate_sampling_skips_bim_and_is_deterministic_without_static_filters() {
+        let first =
+            splmm_raw_static_candidate_rows("missing-prefix", 100, 20, 17, false, &[]).unwrap();
+        let second =
+            splmm_raw_static_candidate_rows("missing-prefix", 100, 20, 17, false, &[]).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.1, 100);
+        assert_eq!(first.0.len(), 20);
+        assert!(first.0.iter().all(|&row| row < 100));
+        assert_eq!(
+            first
+                .0
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            20
+        );
+    }
+
+    #[test]
+    fn raw_gamma_no_valid_markers_requests_legacy_fallback() {
+        let error = "SparseLMM residualized approx gamma estimation found no valid sampled markers";
+        assert_eq!(
+            splmm_raw_gamma_error(error.to_string()),
+            format!("SPLMM_FUSED_FALLBACK: {error}")
+        );
+        assert_eq!(
+            splmm_raw_gamma_error("marker matrix length mismatch".to_string()),
+            "marker matrix length mismatch"
+        );
+    }
+
+    #[test]
+    fn fused_approx_assoc_block_matches_residualized_reference() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "janusx_splmm_fused_assoc_{}_{}",
+            std::process::id(),
+            stamp
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prefix = dir.join("tiny");
+        std::fs::write(
+            prefix.with_extension("fam"),
+            "F1 I1 0 0 1 1\nF1 I2 0 0 1 1\nF1 I3 0 0 1 1\nF1 I4 0 0 1 1\n",
+        )
+        .unwrap();
+        let codes = [
+            [0b00, 0b10, 0b11, 0b00],
+            [0b10, 0b10, 0b00, 0b11],
+            [0b01, 0b01, 0b11, 0b00],
+            [0b00, 0b10, 0b11, 0b00],
+        ];
+        let packed_rows = codes.map(|row| pack_plink_codes(&row));
+        let mut bed = vec![0x6c, 0x1b, 0x01];
+        for row in packed_rows.iter() {
+            bed.extend_from_slice(row);
+        }
+        std::fs::write(prefix.with_extension("bed"), bed).unwrap();
+
+        let reader = PackedBedSourceReader::open(prefix.to_str().unwrap(), 4).unwrap();
+        let sample_indices = [0usize, 1, 2, 3];
+        let x_design = [1.0_f64; 4];
+        let a_vec = [0.6_f64, -0.4, 0.1, -0.3];
+        let model = ResidualizedApproxScanModel::from_a_vec(&x_design, &a_vec, 0.85).unwrap();
+        let score_f32 = cast_f64_slice_to_f32(model.score_vec()).unwrap();
+        let decode_plan = AdditiveDecodePlan::from_sample_indices(4, &sample_indices);
+        let block = splmm_raw_process_assoc_block_single_buffer(
+            &packed_rows.concat(),
+            0,
+            packed_rows.len(),
+            4,
+            &sample_indices,
+            true,
+            None,
+            sample_indices.len(),
+            0.1,
+            0.25,
+            1.0,
+            false,
+            &[],
+            None,
+            &model,
+            &score_f32,
+            None,
+            &packed_byte_lut().code4,
+            &decode_plan,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(block.source_rows, vec![0, 1, 3]);
+        let mut expected_results = Vec::new();
+        let mut expected_af = Vec::new();
+        let mut expected_missing = Vec::new();
+        for source_idx in block.source_rows.iter().copied() {
+            let (missing, het, hom_alt) = count_packed_row_counts(&packed_rows[source_idx], 4);
+            let qc = evaluate_packed_snp_qc(missing, het, hom_alt, 4, 0.1, 0.25, 1.0);
+            assert!(qc.keep);
+            expected_af.push(qc.alt_freq);
+            expected_missing.push(qc.missing_rate);
+            let mut genotype = vec![0.0_f64; 4];
+            decode_packed_row_model_enum_into_f64(
+                &packed_rows[source_idx],
+                qc.row_flip,
+                qc.alt_freq,
+                4,
+                PackedGeneticModel::Add,
+                true,
+                None,
+                None,
+                &mut genotype,
+            );
+            let expected = model.assoc_from_marker(&genotype).unwrap();
+            expected_results.extend_from_slice(&[expected.0, expected.1, expected.2]);
+        }
+        assert_eq!(block.alt_freq, expected_af);
+        assert_eq!(block.missing_rate, expected_missing);
+        assert_close(&block.results, &expected_results, 2e-6);
+
+        let x_design_cov = vec![
+            1.0_f64, -1.0, // sample 0
+            1.0, 0.0, // sample 1
+            1.0, 1.0, // sample 2
+            1.0, 2.0, // sample 3
+        ];
+        let model_cov =
+            ResidualizedApproxScanModel::from_a_vec(&x_design_cov, &a_vec, 0.85).unwrap();
+        let score_cov_f32 = cast_f64_slice_to_f32(model_cov.score_vec()).unwrap();
+        let x_design_cov_f32 = cast_f64_slice_to_f32(&x_design_cov).unwrap();
+        let cov_block = splmm_raw_process_assoc_block_single_buffer(
+            &packed_rows.concat(),
+            0,
+            packed_rows.len(),
+            4,
+            &sample_indices,
+            true,
+            None,
+            sample_indices.len(),
+            0.1,
+            0.25,
+            1.0,
+            false,
+            &[],
+            None,
+            &model_cov,
+            &score_cov_f32,
+            Some(&x_design_cov_f32),
+            &packed_byte_lut().code4,
+            &decode_plan,
+            None,
+        )
+        .unwrap();
+        assert_eq!(cov_block.source_rows, block.source_rows);
+        assert_eq!(cov_block.alt_freq, block.alt_freq);
+        assert_eq!(cov_block.missing_rate, block.missing_rate);
+        let mut expected_cov_results = Vec::new();
+        for source_idx in cov_block.source_rows.iter().copied() {
+            let (missing, het, hom_alt) = count_packed_row_counts(&packed_rows[source_idx], 4);
+            let qc = evaluate_packed_snp_qc(missing, het, hom_alt, 4, 0.1, 0.25, 1.0);
+            assert!(qc.keep);
+            let mut genotype = vec![0.0_f64; 4];
+            decode_packed_row_model_enum_into_f64(
+                &packed_rows[source_idx],
+                qc.row_flip,
+                qc.alt_freq,
+                4,
+                PackedGeneticModel::Add,
+                true,
+                None,
+                None,
+                &mut genotype,
+            );
+            let expected = model_cov.assoc_from_marker(&genotype).unwrap();
+            expected_cov_results.extend_from_slice(&[expected.0, expected.1, expected.2]);
+        }
+        assert_close(&cov_block.results, &expected_cov_results, 2e-6);
+
+        drop(reader);
+        let prefetched_reader = PackedBedSourceReader::open(prefix.to_str().unwrap(), 4).unwrap();
+        let mut observed_blocks = Vec::<(usize, usize, Vec<u8>)>::new();
+        let scanned = run_splmm_raw_bed_prefetch(
+            prefetched_reader,
+            packed_rows.len(),
+            3,
+            1,
+            |source_start, rows, packed| {
+                observed_blocks.push((source_start, rows, packed[..rows].to_vec()));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(scanned, packed_rows.len());
+        assert_eq!(
+            observed_blocks
+                .iter()
+                .map(|(source_start, rows, _)| (*source_start, *rows))
+                .collect::<Vec<_>>(),
+            vec![(0, 3), (3, 1)]
+        );
+        let observed_bed = observed_blocks
+            .into_iter()
+            .flat_map(|(_, _, packed)| packed)
+            .collect::<Vec<_>>();
+        assert_eq!(observed_bed, packed_rows.concat());
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn fused_exact_assoc_block_matches_exact_reference_with_subset_and_qc_boundaries() {
+        let codes = [
+            [0b00, 0b10, 0b11, 0b00, 0b10],
+            [0b00, 0b11, 0b00, 0b10, 0b11],
+            [0b01, 0b01, 0b11, 0b00, 0b00],
+            [0b00, 0b00, 0b00, 0b00, 0b00],
+            [0b01, 0b10, 0b01, 0b01, 0b00],
+        ];
+        let packed_rows = codes.map(|row| pack_plink_codes(&row));
+        let packed_block = packed_rows.concat();
+        let sample_indices = [0usize, 2, 3, 4];
+        let excluded = precompute_excluded_sample_indices(5, &sample_indices);
+        let decode_plan = AdditiveDecodePlan::from_sample_indices(5, &sample_indices);
+        let n = sample_indices.len();
+        let x_design = vec![
+            1.0_f64, -1.0, // sample 0
+            1.0, 0.5, // sample 2
+            1.0, 1.5, // sample 3
+            1.0, 2.0, // sample 4
+        ];
+        let p = 2usize;
+        let x_design_col_major = row_major_to_col_major_f64(&x_design, n, p).unwrap();
+        let py = [0.4_f64, -0.7, 0.2, 0.8];
+        let ypy = 2.3_f64;
+        let df = 2.0_f64;
+        let factor = make_diag_factor(&[1.0_f64, 1.5, 2.0, 3.0]);
+        let xt_w_x_chol = compute_xt_v_inv_x_chol(&factor, &x_design, n, p);
+        let score_f32 = cast_f64_slice_to_f32(&py).unwrap();
+        let mut solve_workspace = factor.make_solve_workspace(2).unwrap();
+        let mut exact_workspace =
+            ExactScanBlockWorkspace::new(&factor, n, p, 2, 1, &xt_w_x_chol).unwrap();
+        let mut payloads = Vec::<SplmmRawTsvBlockPayload>::new();
+        let mut sink = |payload| {
+            payloads.push(payload);
+            Ok(())
+        };
+
+        let kept = splmm_raw_scan_exact_block_single_buffer(
+            &factor,
+            &mut exact_workspace,
+            &mut solve_workspace,
+            &x_design,
+            &x_design_col_major,
+            &py,
+            &score_f32,
+            ypy,
+            df,
+            &xt_w_x_chol,
+            &packed_block,
+            0,
+            codes.len(),
+            5,
+            &sample_indices,
+            false,
+            excluded.as_deref(),
+            0.1,
+            0.25,
+            1.0,
+            false,
+            &[],
+            None,
+            &decode_plan,
+            1,
+            None,
+            &mut sink,
+        )
+        .unwrap();
+
+        let observed_source_rows = payloads
+            .iter()
+            .flat_map(|payload| payload.source_rows.iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(kept, 3);
+        assert_eq!(observed_source_rows, vec![0, 1, 2]);
+        assert_eq!(
+            payloads
+                .iter()
+                .flat_map(|payload| payload.missing_rate.iter().copied())
+                .collect::<Vec<_>>(),
+            vec![0.0_f32, 0.0, 0.25]
+        );
+
+        let mut expected = Vec::<f64>::new();
+        for source_row in [0usize, 1, 2] {
+            let packed = &packed_rows[source_row];
+            let (missing, het, hom_alt) = count_packed_row_counts_selected_prevalidated(
+                packed,
+                5,
+                &sample_indices,
+                excluded.as_deref(),
+                false,
+            );
+            let qc = evaluate_packed_snp_qc(missing, het, hom_alt, n, 0.1, 0.25, 1.0);
+            assert!(qc.keep);
+            let (identity, sample_byte_idx, sample_bit_shift) = sample_mapping(&sample_indices);
+            let mut genotype = vec![0.0_f64; n];
+            decode_packed_row_model_enum_into_f64(
+                packed,
+                qc.row_flip,
+                qc.alt_freq,
+                n,
+                PackedGeneticModel::Add,
+                identity,
+                sample_byte_idx.as_deref(),
+                sample_bit_shift.as_deref(),
+                &mut genotype,
+            );
+            let z = factor.solve_vec(&genotype).unwrap();
+            let score = genotype
+                .iter()
+                .zip(py.iter())
+                .map(|(g, py)| g * py)
+                .sum::<f64>();
+            let s_v_s = genotype
+                .iter()
+                .zip(z.iter())
+                .map(|(g, z)| g * z)
+                .sum::<f64>();
+            let mut c = vec![0.0_f64; p];
+            xt_vec_row_major(&x_design, n, p, &z, &mut c);
+            let mut alpha = vec![0.0_f64; p];
+            cholesky_solve_into(&xt_w_x_chol, p, &c, &mut alpha);
+            let x_quad = c.iter().zip(alpha.iter()).map(|(a, b)| a * b).sum::<f64>();
+            let denom = (s_v_s - x_quad).max(0.0);
+            let (beta, se, pwald) = splmm_wald_from_score_denom(score, denom, ypy / df).unwrap();
+            expected.extend_from_slice(&[beta, se, pwald]);
+        }
+        let observed = payloads
+            .iter()
+            .flat_map(|payload| payload.results.iter().copied())
+            .collect::<Vec<_>>();
+        assert_close(&observed, &expected, 2e-6);
+    }
+
+    #[test]
+    fn fused_approx_tsv_runs_end_to_end_with_fused_qc_and_gamma() {
+        use crate::spgrm::{write_sparse_grm_csc, SparseGrmCsc};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "janusx_splmm_fused_tsv_{}_{}",
+            std::process::id(),
+            stamp
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prefix = dir.join("tiny");
+        std::fs::write(
+            prefix.with_extension("fam"),
+            "F1 I1 0 0 1 1\nF1 I2 0 0 1 1\nF1 I3 0 0 1 1\nF1 I4 0 0 1 1\n",
+        )
+        .unwrap();
+        let codes = [
+            [0b00, 0b10, 0b11, 0b00],
+            [0b10, 0b10, 0b00, 0b11],
+            [0b01, 0b01, 0b11, 0b00],
+            [0b00, 0b10, 0b11, 0b00],
+        ];
+        let packed_rows = codes.map(|row| pack_plink_codes(&row));
+        let mut bed = vec![0x6c, 0x1b, 0x01];
+        for row in packed_rows.iter() {
+            bed.extend_from_slice(row);
+        }
+        std::fs::write(prefix.with_extension("bed"), bed).unwrap();
+        std::fs::write(
+            prefix.with_extension("bim"),
+            (0..codes.len())
+                .map(|idx| format!("1 rs{idx} 0 {} A G\n", idx + 1))
+                .collect::<String>(),
+        )
+        .unwrap();
+
+        let grm_path = dir.join("tiny.jxgrm");
+        let grm = SparseGrmCsc {
+            n_samples: 4,
+            nnz: 4,
+            col_ptr: vec![0, 1, 2, 3, 4],
+            row_indices: vec![0, 1, 2, 3],
+            values: vec![1.0; 4],
+        };
+        write_sparse_grm_csc(grm_path.to_str().unwrap(), &grm).unwrap();
+
+        let out_tsv = dir.join("fused.tsv");
+        let baseline_tsv = dir.join("fused_intercept.tsv");
+        let y = vec![1.0, -0.5, 0.25, 2.0];
+        let x_cov = vec![0.0_f64, 0.5, 1.0, 1.5];
+        let result = splmm_fused_approx_assoc_to_tsv(
+            prefix.to_string_lossy().into_owned(),
+            y.clone(),
+            Some(x_cov),
+            1,
+            1.0,
+            out_tsv.to_string_lossy().into_owned(),
+            vec![0, 1, 2, 3],
+            vec![0, 1, 2, 3],
+            grm_path.to_string_lossy().into_owned(),
+            0.1,
+            0.25,
+            1.0,
+            false,
+            Vec::new(),
+            1,
+            2,
+            2,
+            20261004,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        assert_eq!(result.9, 3);
+        let tsv = std::fs::read_to_string(&out_tsv).unwrap();
+        let lines = tsv.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 4);
+        assert!(lines[0].starts_with("chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\t"));
+        assert!(lines[1].contains("\trs0\t"));
+        assert!(lines[2].contains("\trs1\t"));
+        assert!(lines[3].contains("\trs3\t"));
+
+        let baseline = splmm_fused_approx_assoc_to_tsv(
+            prefix.to_string_lossy().into_owned(),
+            y,
+            None,
+            0,
+            1.0,
+            baseline_tsv.to_string_lossy().into_owned(),
+            vec![0, 1, 2, 3],
+            vec![0, 1, 2, 3],
+            grm_path.to_string_lossy().into_owned(),
+            0.1,
+            0.25,
+            1.0,
+            false,
+            Vec::new(),
+            1,
+            2,
+            2,
+            20261004,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        assert_eq!(baseline.9, 3);
+        let baseline_lines = std::fs::read_to_string(&baseline_tsv)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let observed = lines[1..]
+            .iter()
+            .flat_map(|line| {
+                line.split('\t')
+                    .skip(7)
+                    .take(4)
+                    .map(|value| value.parse::<f64>().unwrap())
+            })
+            .collect::<Vec<_>>();
+        let baseline_values = baseline_lines[1..]
+            .iter()
+            .flat_map(|line| {
+                line.split('\t')
+                    .skip(7)
+                    .take(4)
+                    .map(|value| value.parse::<f64>().unwrap())
+            })
+            .collect::<Vec<_>>();
+        assert!(observed
+            .iter()
+            .zip(baseline_values.iter())
+            .any(|(with_cov, intercept)| (with_cov - intercept).abs() > 1e-6));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn fused_exact_tsv_matches_legacy_precomputed_qc_exact_scan() {
+        use crate::gfreader::prepare_bed_logic_meta_owned_for_stats_samples;
+        use crate::spgrm::{write_sparse_grm_csc, SparseGrmCsc};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "janusx_splmm_fused_exact_tsv_{}_{}",
+            std::process::id(),
+            stamp
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prefix = dir.join("tiny");
+        let prefix_str = prefix.to_string_lossy().into_owned();
+        std::fs::write(
+            prefix.with_extension("fam"),
+            "F1 I1 0 0 1 1\nF1 I2 0 0 1 1\nF1 I3 0 0 1 1\nF1 I4 0 0 1 1\n",
+        )
+        .unwrap();
+        let codes = [
+            [0b00, 0b10, 0b11, 0b00],
+            [0b00, 0b11, 0b00, 0b10],
+            [0b01, 0b11, 0b00, 0b00],
+            [0b00, 0b00, 0b00, 0b00],
+            [0b01, 0b01, 0b01, 0b00],
+        ];
+        let packed_rows = codes.map(|row| pack_plink_codes(&row));
+        let mut bed = vec![0x6c, 0x1b, 0x01];
+        for row in packed_rows.iter() {
+            bed.extend_from_slice(row);
+        }
+        std::fs::write(prefix.with_extension("bed"), bed).unwrap();
+        std::fs::write(
+            prefix.with_extension("bim"),
+            (0..codes.len())
+                .map(|idx| format!("1 rs{idx} 0 {} A G\n", idx + 1))
+                .collect::<String>(),
+        )
+        .unwrap();
+
+        let grm_path = dir.join("tiny.jxgrm");
+        let grm = SparseGrmCsc {
+            n_samples: 4,
+            nnz: 4,
+            col_ptr: vec![0, 1, 2, 3, 4],
+            row_indices: vec![0, 1, 2, 3],
+            values: vec![1.0; 4],
+        };
+        write_sparse_grm_csc(grm_path.to_str().unwrap(), &grm).unwrap();
+        let y = vec![1.0_f64, -0.5, 0.25, 2.0];
+        let x_cov = vec![0.0_f64, 1.0, 0.0, 2.0];
+        let x_design = build_design_with_intercept(Some(&x_cov), 4, 1);
+        let sample_idx = vec![0usize, 1, 2, 3];
+        let maf_threshold = 0.1_f32;
+        let max_missing_rate = 0.25_f32;
+        let het_threshold = 1.0_f32;
+        let meta = prepare_bed_logic_meta_owned_for_stats_samples(
+            &prefix_str,
+            maf_threshold,
+            max_missing_rate,
+            het_threshold,
+            false,
+            Some(&sample_idx),
+            false,
+        )
+        .unwrap();
+        assert_eq!(meta.row_source_indices, vec![0, 1, 2]);
+        let bed_file = File::open(prefix.with_extension("bed")).unwrap();
+        let bed_mmap = Arc::new(unsafe { Mmap::map(&bed_file) }.unwrap());
+        let scan_prepared = SplmmPreparedInput {
+            bed_prefix: Some(prefix_str.clone()),
+            payload: Some(SplmmPreparedPayload::Mmap(bed_mmap)),
+            n_samples_full: 4,
+            bytes_per_snp: meta.bytes_per_snp,
+            row_flip: Arc::from(meta.row_flip),
+            row_maf: Arc::from(meta.maf),
+            row_missing: Arc::from(meta.missing_rate),
+            row_source_indices: Some(Arc::from(meta.row_source_indices)),
+        };
+        let factor = sparse_splmm_load_factor(
+            &prefix_str,
+            Some(grm_path.to_str().unwrap()),
+            4,
+            &sample_idx,
+            0.7,
+            1,
+            None,
+        )
+        .unwrap();
+        let mut state = prepare_splmm_scan_state(
+            factor,
+            &scan_prepared,
+            &x_design,
+            &y,
+            1,
+            2,
+            None,
+            SplmmScanMode::Exact,
+        )
+        .unwrap();
+        let expected = scan_with_py_and_exact_p_sparse(
+            &state.factor,
+            &scan_prepared,
+            &x_design,
+            &state.x_design_col_major,
+            &state.null_model.py,
+            state.null_model.ypy,
+            state.null_model.df,
+            &state.null_model.xt_w_x_chol,
+            &sample_idx,
+            PackedGeneticModel::Add,
+            1,
+            2,
+            None,
+            0,
+            9,
+            0,
+            0,
+            None,
+            &mut state.solve_workspace,
+        )
+        .unwrap();
+
+        let out_tsv = dir.join("fused.tsv");
+        let fused = splmm_fused_exact_assoc_to_tsv(
+            prefix_str,
+            y,
+            Some(x_cov),
+            1,
+            0.7,
+            out_tsv.to_string_lossy().into_owned(),
+            sample_idx.clone(),
+            sample_idx,
+            grm_path.to_string_lossy().into_owned(),
+            maf_threshold,
+            max_missing_rate,
+            het_threshold,
+            false,
+            Vec::new(),
+            1,
+            2,
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        assert_eq!(fused.9, 3);
+        let tsv = std::fs::read_to_string(&out_tsv).unwrap();
+        let lines = tsv.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), 4);
+        let source_snps = lines[1..]
+            .iter()
+            .map(|line| line.split('\t').nth(2).unwrap().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(source_snps, vec!["rs0", "rs1", "rs2"]);
+        let observed = lines[1..]
+            .iter()
+            .flat_map(|line| {
+                let cols = line.split('\t').collect::<Vec<_>>();
+                [
+                    cols[7].parse::<f64>().unwrap(),
+                    cols[8].parse::<f64>().unwrap(),
+                    cols[10].parse::<f64>().unwrap(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let expected_tsv = expected
+            .chunks_exact(3)
+            .flat_map(|row| {
+                [
+                    format!("{:.4}", row[0]).parse::<f64>().unwrap(),
+                    format!("{:.4}", row[1]).parse::<f64>().unwrap(),
+                    format!("{:.4e}", row[2]).parse::<f64>().unwrap(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        assert_close(&observed, &expected_tsv, 1e-12);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn make_test_scan_prepared() -> (SplmmPreparedInput, Vec<usize>) {
         let source_rows = [
             pack_plink_codes(&[0b00, 0b10, 0b11, 0b01]),
@@ -6645,6 +9105,25 @@ mod tests {
             out,
             vec![1.0_f64, 2.0_f64, 3.0_f64, 4.0_f64, 5.0_f64, 6.0_f64]
         );
+    }
+
+    #[test]
+    fn intercept_only_rhs_dot_preserves_small_terms_across_cancellation() {
+        let cols = 2_000usize;
+        let block = vec![1.0_f32; cols];
+        let mut rhs = vec![1.0_f32; cols * 2];
+        for c in 0..cols {
+            rhs[c * 2] = 1.0_f32;
+            rhs[c * 2 + 1] = 1.0_f32;
+        }
+        rhs[0] = 100_000_000.0_f32;
+        rhs[8] = -100_000_000.0_f32;
+
+        let mut out = vec![0.0_f32; 2];
+        crate::he::row_major_block_mul_mat_f32_small_rhs(&block, 1, cols, &rhs, 2, &mut out, None);
+
+        // The exact dot is 1e8 + 3 + (-1e8) + 1,995 = 1,998.
+        assert_eq!(out, vec![1_998.0_f32, 2_000.0_f32]);
     }
 
     #[test]

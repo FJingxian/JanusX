@@ -905,6 +905,195 @@ fn splitmix64(mut x: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// Keep the four scalar accumulation lanes and their final reduction order.
+/// Separate multiply/add instructions avoid changing rounding through FMA.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn dot_sum_intercept_f32_neon(row: &[f32], score: &[f32]) -> (f32, f32) {
+    use std::arch::aarch64::*;
+    debug_assert_eq!(row.len(), score.len());
+    // AArch64 guarantees NEON. Each load stays within the complete four-value
+    // prefix; the tail is accumulated into its original scalar lane.
+    unsafe {
+        let zero = vdupq_n_f32(0.0);
+        let mut dots = zero;
+        let mut sums = zero;
+        let mut c = 0;
+        while c + 4 <= row.len() {
+            let g = vld1q_f32(row.as_ptr().add(c));
+            let y = vld1q_f32(score.as_ptr().add(c));
+            // Preserve the scalar zero-skip behavior even for non-finite RHS.
+            let product = vbslq_f32(vceqq_f32(g, zero), zero, vmulq_f32(g, y));
+            dots = vaddq_f32(dots, product);
+            sums = vaddq_f32(sums, g);
+            c += 4;
+        }
+        let mut dot_lanes = [0.0_f32; 4];
+        let mut sum_lanes = [0.0_f32; 4];
+        vst1q_f32(dot_lanes.as_mut_ptr(), dots);
+        vst1q_f32(sum_lanes.as_mut_ptr(), sums);
+        while c < row.len() {
+            let g = row[c];
+            if g != 0.0 {
+                dot_lanes[c & 3] += g * score[c];
+                sum_lanes[c & 3] += g;
+            }
+            c += 1;
+        }
+        (
+            (dot_lanes[0] + dot_lanes[1]) + (dot_lanes[2] + dot_lanes[3]),
+            (sum_lanes[0] + sum_lanes[1]) + (sum_lanes[2] + sum_lanes[3]),
+        )
+    }
+}
+
+#[inline]
+pub(crate) fn dot_sum_intercept_f32_row(row: &[f32], score: &[f32]) -> (f32, f32) {
+    debug_assert_eq!(row.len(), score.len());
+    #[cfg(target_arch = "aarch64")]
+    {
+        dot_sum_intercept_f32_neon(row, score)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let mut dot_lanes = [0.0_f32; 4];
+        let mut sum_lanes = [0.0_f32; 4];
+        for (idx, (&g, &y)) in row.iter().zip(score.iter()).enumerate() {
+            if g != 0.0 {
+                dot_lanes[idx & 3] += g * y;
+                sum_lanes[idx & 3] += g;
+            }
+        }
+        (
+            (dot_lanes[0] + dot_lanes[1]) + (dot_lanes[2] + dot_lanes[3]),
+            (sum_lanes[0] + sum_lanes[1]) + (sum_lanes[2] + sum_lanes[3]),
+        )
+    }
+}
+
+#[inline]
+fn row_major_block_mul_intercept_rhs_f32(
+    block: &[f32],
+    rows: usize,
+    cols: usize,
+    score_rhs: &[f32],
+    score_stride: usize,
+    out: &mut [f32], // row-major (rows, [g'Py, g'1])
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) {
+    debug_assert_eq!(block.len(), rows.saturating_mul(cols));
+    debug_assert_eq!(out.len(), rows.saturating_mul(2));
+    debug_assert!(score_stride > 0);
+    debug_assert!(cols == 0 || score_rhs.len() >= (cols - 1) * score_stride + 1);
+    if rows == 0 {
+        return;
+    }
+    if cols == 0 {
+        out.fill(0.0_f32);
+        return;
+    }
+
+    let row_block = SMALL_RHS_PAR_ROW_BLOCK.max(1);
+    let mut run = || {
+        out.par_chunks_mut(2 * row_block)
+            .enumerate()
+            .for_each(|(chunk_id, out_chunk)| {
+                out_chunk.fill(0.0_f32);
+                let row_start = chunk_id * row_block;
+                let rows_here = out_chunk.len() / 2;
+                for local_r in 0..rows_here {
+                    let r = row_start + local_r;
+                    let row = &block[r * cols..(r + 1) * cols];
+                    #[cfg(target_arch = "aarch64")]
+                    if score_stride == 1 {
+                        let (dot, sum) = dot_sum_intercept_f32_neon(row, &score_rhs[..cols]);
+                        out_chunk[local_r * 2] = dot;
+                        out_chunk[local_r * 2 + 1] = sum;
+                        continue;
+                    }
+                    let mut score0 = 0.0_f32;
+                    let mut score1 = 0.0_f32;
+                    let mut score2 = 0.0_f32;
+                    let mut score3 = 0.0_f32;
+                    let mut sum0 = 0.0_f32;
+                    let mut sum1 = 0.0_f32;
+                    let mut sum2 = 0.0_f32;
+                    let mut sum3 = 0.0_f32;
+                    let mut c = 0usize;
+                    while c + 4 <= cols {
+                        let a0 = row[c];
+                        if a0 != 0.0_f32 {
+                            score0 += a0 * score_rhs[c * score_stride];
+                            sum0 += a0;
+                        }
+                        let a1 = row[c + 1];
+                        if a1 != 0.0_f32 {
+                            score1 += a1 * score_rhs[(c + 1) * score_stride];
+                            sum1 += a1;
+                        }
+                        let a2 = row[c + 2];
+                        if a2 != 0.0_f32 {
+                            score2 += a2 * score_rhs[(c + 2) * score_stride];
+                            sum2 += a2;
+                        }
+                        let a3 = row[c + 3];
+                        if a3 != 0.0_f32 {
+                            score3 += a3 * score_rhs[(c + 3) * score_stride];
+                            sum3 += a3;
+                        }
+                        c += 4;
+                    }
+                    while c < cols {
+                        let a = row[c];
+                        if a != 0.0_f32 {
+                            let score = a * score_rhs[c * score_stride];
+                            match c & 3 {
+                                0 => {
+                                    score0 += score;
+                                    sum0 += a;
+                                }
+                                1 => {
+                                    score1 += score;
+                                    sum1 += a;
+                                }
+                                2 => {
+                                    score2 += score;
+                                    sum2 += a;
+                                }
+                                _ => {
+                                    score3 += score;
+                                    sum3 += a;
+                                }
+                            }
+                        }
+                        c += 1;
+                    }
+                    let out_row = &mut out_chunk[local_r * 2..local_r * 2 + 2];
+                    out_row[0] = (score0 + score1) + (score2 + score3);
+                    out_row[1] = (sum0 + sum1) + (sum2 + sum3);
+                }
+            });
+    };
+    if let Some(tp) = pool {
+        tp.install(run);
+    } else {
+        run();
+    }
+}
+
+#[inline]
+pub(crate) fn row_major_block_mul_vec_intercept_f32(
+    block: &[f32],
+    rows: usize,
+    cols: usize,
+    score: &[f32],
+    out: &mut [f32], // row-major (rows, [g'Py, g'1])
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) {
+    debug_assert_eq!(score.len(), cols);
+    row_major_block_mul_intercept_rhs_f32(block, rows, cols, score, 1, out, pool);
+}
+
 #[inline]
 pub(crate) fn row_major_block_mul_mat_f32_small_rhs(
     block: &[f32],
@@ -919,6 +1108,10 @@ pub(crate) fn row_major_block_mul_mat_f32_small_rhs(
     debug_assert_eq!(rhs.len(), cols.saturating_mul(n_rhs));
     debug_assert_eq!(out.len(), rows.saturating_mul(n_rhs));
     if n_rhs == 0 {
+        return;
+    }
+    if n_rhs == 2 && rhs.chunks_exact(2).all(|rhs_row| rhs_row[1] == 1.0_f32) {
+        row_major_block_mul_intercept_rhs_f32(block, rows, cols, rhs, 2, out, pool);
         return;
     }
     let row_block = SMALL_RHS_PAR_ROW_BLOCK.max(1);

@@ -79,6 +79,8 @@ from .workflow import (
     _run_fastplot_from_tsv_with_status,
     _run_result_write_with_status,
     _safe_trait_file_label,
+    _splmm_fused_qc_opted_in,
+    _filter_trait_prepared_meta_by_bimranges,
     _site_tuple_parts,
     _subset_square_matrix_identity_aware,
     _trait_single_column_frame,
@@ -7731,6 +7733,7 @@ def run_splmm_windowed_fullrank(
     null_objective_mode: Optional[str] = None,
     result_stem: str = "splmm",
     model_label: str = "SparseLMM",
+    bimranges: Optional[list[tuple[str, int, int]]] = None,
 ) -> None:
     if str(genetic_model).lower() != "add":
         raise ValueError("SparseLMM windowed BED route supports additive coding only.")
@@ -7739,6 +7742,7 @@ def run_splmm_windowed_fullrank(
             "Rust extension missing splmm_assoc_pcg_bed. Rebuild/install JanusX extension first."
         )
     scan_mode_norm = str(scan_mode).strip().lower()
+    scan_bimranges = list(bimranges or [])
     if scan_mode_norm not in {"approx", "exact"}:
         raise ValueError(f"Unsupported SparseLMM scan mode: {scan_mode}")
     null_objective_mode_norm = (
@@ -7995,6 +7999,24 @@ def run_splmm_windowed_fullrank(
                 method=int(splmm_sparse_method),
             )
             sparse_kinship_cache[sparse_cache_key] = str(trait_sparse_kinship_path)
+        fused_qc_raw_requested = bool(
+            _splmm_fused_qc_opted_in()
+            and scan_mode_norm in {"approx", "exact"}
+            and not packed_preload_is_ready(preloaded_packed)
+            and shared_sparse_kinship_path is not None
+            and str(genetic_model).strip().lower() == "add"
+            and (
+                (
+                    scan_mode_norm == "approx"
+                    and hasattr(jxrs, "splmm_assoc_pcg_bed_to_tsv_fused_approx")
+                )
+                or (
+                    scan_mode_norm == "exact"
+                    and hasattr(jxrs, "splmm_assoc_pcg_bed_to_tsv_fused_exact")
+                )
+            )
+            and os.path.exists(f"{str(prefix)}.bed")
+        )
         prepare_handle = (
             _start_indeterminate_progress_bar(
                 f"Prepare for {model_label_norm}...",
@@ -8092,13 +8114,15 @@ def run_splmm_windowed_fullrank(
 
         if not bool(use_preloaded_scan_meta):
             with cf.ThreadPoolExecutor(max_workers=2, thread_name_prefix="jx-splmm-prepare") as ex:
-                future_map: dict[cf.Future, str] = {
-                    ex.submit(_run_sparse_scan_meta_task): "scan_meta",
+                future_map: dict[cf.Future, str] = {}
+                if not fused_qc_raw_requested:
+                    future_map[ex.submit(_run_sparse_scan_meta_task)] = "scan_meta"
+                future_map[
                     ex.submit(
                         _run_sparse_null_fit_task,
                         residualized_approx=bool(scan_mode_norm == "approx"),
-                    ): "null_fit",
-                }
+                    )
+                ] = "null_fit"
                 future_results: dict[str, tuple[object, float]] = {}
                 try:
                     for fut in cf.as_completed(future_map):
@@ -8107,7 +8131,8 @@ def run_splmm_windowed_fullrank(
                     for fut in future_map:
                         fut.cancel()
                     raise
-            scan_meta, scan_meta_secs = future_results["scan_meta"]
+            if not fused_qc_raw_requested:
+                scan_meta, scan_meta_secs = future_results["scan_meta"]
             null_fit_obj, null_fit_secs = future_results["null_fit"]
             null_fit = dict(null_fit_obj)
         else:
@@ -8118,7 +8143,12 @@ def run_splmm_windowed_fullrank(
         null_secs = max(time.monotonic() - null_prepare_t0, 0.0)
         _stop_prepare_handle(show_done=False)
         peak_rss = max(peak_rss, process.memory_info().rss)
-        if bool(use_preloaded_scan_meta):
+        if fused_qc_raw_requested:
+            n_scan_sites_hint = _plink_bed_n_snps_from_prefix(
+                str(prefix),
+                len(full_geno_ids),
+            )
+        elif bool(use_preloaded_scan_meta):
             n_scan_sites_hint = int(np.asarray(scan_row_idx, dtype=np.int64).reshape(-1).shape[0])
         else:
             if scan_meta is None:
@@ -8129,6 +8159,7 @@ def run_splmm_windowed_fullrank(
         effective_scan_mode = str(scan_mode_norm)
         if (
             effective_scan_mode == "approx"
+            and not fused_qc_raw_requested
             and int(n_scan_sites_hint) < int(_SPLMM_APPROX_RHAT_MARKERS_DEFAULT)
         ):
             _emit_warning_line(
@@ -8187,6 +8218,45 @@ def run_splmm_windowed_fullrank(
         null_backend = str(null_fit.get("backend", "unknown"))
         null_strategy = str(null_fit.get("strategy", "unknown"))
         null_objective_label = str(null_objective_mode_norm)
+
+        def _refresh_null_fit_scalars() -> None:
+            nonlocal sigma_g2, sigma_e2, null_pve, null_lbd
+            nonlocal null_mean_diag_k, null_n_samples_k, null_nnz_k
+            nonlocal null_offdiag_density_k, null_lambda_boundary
+            nonlocal sigma_sum_profile, rss_reml, df_reml
+            nonlocal resid_var_reml, resid_var_mx_reml, ypy_reml
+            nonlocal sigma2_profile_reml, sigma2_mx_reml
+            nonlocal sigma_scale_p0_to_mx, sigma_scale_reml
+            nonlocal residualized_approx_null, scan_lbd_arg
+            nonlocal null_backend, null_strategy
+            sigma_g2 = float(null_fit["sigma_g2"])
+            sigma_e2 = float(null_fit["sigma_e2"])
+            null_pve = float(null_fit.get("pve", float("nan")))
+            null_lbd = float(null_fit.get("lambda", float("nan")))
+            null_mean_diag_k = float(null_fit.get("mean_diag_k", float("nan")))
+            null_n_samples_k = int(null_fit.get("n_samples_k", 0) or 0)
+            null_nnz_k = int(null_fit.get("nnz_k", 0) or 0)
+            null_offdiag_density_k = float(null_fit.get("offdiag_density_k", float("nan")))
+            null_lambda_boundary = null_fit.get("lambda_boundary", None)
+            sigma_sum_profile = float(null_fit.get("sigma_sum_profile", sigma_g2 + sigma_e2))
+            rss_reml = float(null_fit.get("rss_reml", float("nan")))
+            df_reml = float(null_fit.get("df_reml", float("nan")))
+            resid_var_reml = float(null_fit.get("resid_var_reml", float("nan")))
+            resid_var_mx_reml = float(null_fit.get("resid_var_mx_reml", float("nan")))
+            ypy_reml = float(null_fit.get("ypy_reml", float("nan")))
+            sigma2_profile_reml = float(null_fit.get("sigma2_profile_reml", resid_var_reml))
+            sigma2_mx_reml = float(null_fit.get("sigma2_mx_reml", resid_var_mx_reml))
+            sigma_scale_p0_to_mx = float(null_fit.get("sigma_scale_p0_to_mx", float("nan")))
+            sigma_scale_reml = float(null_fit.get("sigma_scale_reml", float("nan")))
+            residualized_approx_null = bool(
+                effective_scan_mode == "approx"
+                and str(null_fit.get("strategy", "")).strip().lower()
+                == "residualized_sparse_reml_brent"
+            )
+            scan_lbd_arg = float(null_lbd)
+            null_backend = str(null_fit.get("backend", "unknown"))
+            null_strategy = str(null_fit.get("strategy", "unknown"))
+
         _null_fit_msg = (
             f"{null_strategy} null fit objective={null_objective_label}, h2~{float(null_pve):.3f}, "
             f"mean_diag(K)={null_mean_diag_k:.4g}, "
@@ -8494,7 +8564,14 @@ def run_splmm_windowed_fullrank(
 
             return (_progress if bool(use_spinner) else None), _finish
 
-        if bool(use_preloaded_scan_meta):
+        use_fused_raw_scan = bool(fused_qc_raw_requested)
+        if use_fused_raw_scan:
+            trait_row_idx = np.empty(0, dtype=np.int64)
+            trait_scan_maf = np.empty(0, dtype=np.float32)
+            trait_scan_miss = np.empty(0, dtype=np.float32)
+            trait_scan_row_flip = np.empty(0, dtype=np.bool_)
+            trait_site_keep = None
+        elif bool(use_preloaded_scan_meta):
             trait_row_idx = np.ascontiguousarray(np.asarray(scan_row_idx, dtype=np.int64).reshape(-1), dtype=np.int64)
             trait_scan_maf = np.ascontiguousarray(np.asarray(scan_maf, dtype=np.float32).reshape(-1), dtype=np.float32)
             trait_scan_miss = np.ascontiguousarray(np.asarray(scan_miss, dtype=np.float32).reshape(-1), dtype=np.float32)
@@ -8514,12 +8591,16 @@ def run_splmm_windowed_fullrank(
                 else None
             )
         n_trait_sites = int(trait_row_idx.shape[0])
-        mmap_window_mb = _common_resolve_decode_mmap_window_mb(
-            genofile,
-            len(ids),
-            n_trait_sites,
-            _current_bed_memory_mb(),
-            needs_copy=False,
+        mmap_window_mb = (
+            None
+            if use_fused_raw_scan
+            else _common_resolve_decode_mmap_window_mb(
+                genofile,
+                len(ids),
+                n_trait_sites,
+                _current_bed_memory_mb(),
+                needs_copy=False,
+            )
         )
         supports_direct_tsv = bool(hasattr(jxrs, "splmm_assoc_pcg_bed_to_tsv"))
         # BIM metadata (chrom/pos/snp/alleles) is now read inside the Rust
@@ -8553,9 +8634,13 @@ def run_splmm_windowed_fullrank(
         arr = None
         wrote_direct_tsv = False
         scan_route_desc = (
-            "sparse Cholesky scan (memmap; preloaded row stats)"
-            if bool(use_preloaded_scan_meta)
-            else "sparse Cholesky scan (memmap)"
+            f"sparse Cholesky {effective_scan_mode} scan (fused BED QC+association; double-buffered)"
+            if use_fused_raw_scan
+            else (
+                "sparse Cholesky scan (memmap; preloaded row stats)"
+                if bool(use_preloaded_scan_meta)
+                else "sparse Cholesky scan (memmap)"
+            )
         )
         sparse_progress, sparse_finish = _make_splmm_scan_progress()
         pname_tag = _safe_trait_file_label(pname)
@@ -8563,7 +8648,137 @@ def run_splmm_windowed_fullrank(
         tmp_tsv = _gwas_result_tmp_path(out_tsv)
         try:
             with _gwas_scan_stage_ctx(max(1, int(threads))):
-                if supports_direct_tsv:
+                if use_fused_raw_scan:
+                    wrote_direct_tsv = True
+                    try:
+                        fused_scan_fn = (
+                            jxrs.splmm_assoc_pcg_bed_to_tsv_fused_exact
+                            if effective_scan_mode == "exact"
+                            else jxrs.splmm_assoc_pcg_bed_to_tsv_fused_approx
+                        )
+                        fused_scan_kwargs = dict(
+                            prefix=str(kinship_prefix),
+                            y=y_vec,
+                            lbd=float(scan_lbd_arg),
+                            out_tsv=str(tmp_tsv),
+                            sample_indices=scan_sample_idx_trait,
+                            sparse_jxgrm_path=str(trait_sparse_kinship_path),
+                            sparse_sample_indices=kinship_sample_idx_trait,
+                            maf_threshold=float(maf_threshold),
+                            max_missing_rate=float(max_missing_rate),
+                            het_threshold=float(het_threshold),
+                            snps_only=bool(snps_only),
+                            bimranges=[
+                                (str(chrom), int(start), int(end))
+                                for chrom, start, end in scan_bimranges
+                            ],
+                            threads=int(threads),
+                            block_rows=int(block_rows_use),
+                            stage1_progress_callback=None,
+                            scan_progress_callback=sparse_progress,
+                            progress_every=int(max(512, min(int(block_rows_use), 4096))),
+                        )
+                        fused_scan_kwargs["x_cov"] = x_arg
+                        if effective_scan_mode == "approx":
+                            fused_scan_kwargs["rhat_markers"] = int(
+                                _SPLMM_APPROX_RHAT_MARKERS_DEFAULT
+                            )
+                            fused_scan_kwargs["rhat_seed"] = 20260527
+                        splmm_out = fused_scan_fn(
+                            **fused_scan_kwargs
+                        )
+                        scan_route_desc = (
+                            f"sparse Cholesky {effective_scan_mode} scan "
+                            "(fused BED QC+association; double-buffered); "
+                            "Rust TSV writer"
+                        )
+                    except Exception as fused_error:
+                        error_text = str(fused_error)
+                        if "SPLMM_FUSED_FALLBACK:" not in error_text:
+                            raise
+                        wrote_direct_tsv = False
+                        _cleanup_gwas_result_tmp(tmp_tsv)
+                        _emit_warning_line(
+                            logger,
+                            (
+                                "SparseLMM fused BED scan could not complete; reverting to the "
+                                "established QC metadata "
+                                f"scan. reason={error_text.split('SPLMM_FUSED_FALLBACK:', 1)[-1].strip()}"
+                            ),
+                            use_spinner=bool(use_spinner),
+                        )
+                        scan_meta, scan_meta_secs = _run_sparse_scan_meta_task()
+                        scan_meta = _filter_trait_prepared_meta_by_bimranges(
+                            scan_meta,
+                            prefix=str(kinship_prefix),
+                            bimranges=scan_bimranges,
+                            logger=logger,
+                            route_label="SparseLMM",
+                        )
+                        trait_row_idx = np.ascontiguousarray(
+                            np.asarray(scan_meta["row_indices"], dtype=np.int64).reshape(-1),
+                            dtype=np.int64,
+                        )
+                        trait_scan_maf = np.ascontiguousarray(
+                            np.asarray(scan_meta["maf"], dtype=np.float32).reshape(-1),
+                            dtype=np.float32,
+                        )
+                        trait_scan_miss = np.ascontiguousarray(
+                            np.asarray(scan_meta["missing_rate"], dtype=np.float32).reshape(-1),
+                            dtype=np.float32,
+                        )
+                        trait_scan_row_flip = np.ascontiguousarray(
+                            np.asarray(scan_meta["row_flip"], dtype=np.bool_).reshape(-1),
+                            dtype=np.bool_,
+                        )
+                        scan_site_keep = scan_meta.get("site_keep", None)
+                        trait_site_keep = (
+                            np.ascontiguousarray(
+                                np.asarray(scan_site_keep, dtype=np.bool_).reshape(-1),
+                                dtype=np.bool_,
+                            )
+                            if scan_site_keep is not None
+                            else None
+                        )
+                        n_trait_sites = int(trait_row_idx.shape[0])
+                        n_scan_sites_hint = int(n_trait_sites)
+                        mmap_window_mb = _common_resolve_decode_mmap_window_mb(
+                            genofile,
+                            len(ids),
+                            n_trait_sites,
+                            _current_bed_memory_mb(),
+                            needs_copy=False,
+                        )
+                        if int(n_trait_sites) < int(_SPLMM_APPROX_RHAT_MARKERS_DEFAULT):
+                            _emit_warning_line(
+                                logger,
+                                (
+                                    "SparseLMM approx scan has fewer filtered markers than the "
+                                    f"default gamma sample size ({int(n_trait_sites)} < "
+                                    f"{int(_SPLMM_APPROX_RHAT_MARKERS_DEFAULT)}); "
+                                    "falling back to splmm-exact for this trait."
+                                ),
+                                use_spinner=bool(use_spinner),
+                            )
+                            null_fit_obj, null_fit_secs = _run_sparse_null_fit_task(
+                                residualized_approx=False,
+                            )
+                            null_fit = dict(null_fit_obj)
+                            for _buf_key in ("grm", "eigvals", "eigvecs"):
+                                null_fit.pop(_buf_key, None)
+                            effective_scan_mode = "exact"
+                            null_secs = max(time.monotonic() - null_prepare_t0, 0.0)
+                            _refresh_null_fit_scalars()
+                            if not _splmm_null_components_valid(sigma_g2, sigma_e2):
+                                raise RuntimeError(
+                                    "SparseLMM exact fallback null fit returned invalid "
+                                    f"variance components for trait {pname}."
+                                )
+                        use_fused_raw_scan = False
+                        scan_route_desc = (
+                            "sparse Cholesky scan (memmap; bounded fused-QC fallback)"
+                        )
+                if supports_direct_tsv and not use_fused_raw_scan:
                     wrote_direct_tsv = True
                     scan_route_desc = f"{scan_route_desc}; Rust async TSV writer"
                     splmm_out = jxrs.splmm_assoc_pcg_bed_to_tsv(
@@ -8603,7 +8818,7 @@ def run_splmm_windowed_fullrank(
                         scan_mode=effective_scan_mode,
                         mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
                     )
-                else:
+                elif not use_fused_raw_scan:
                     splmm_out = jxrs.splmm_assoc_pcg_bed(
                         str(kinship_prefix),
                         y_vec,
@@ -8669,6 +8884,8 @@ def run_splmm_windowed_fullrank(
             arr = np.ascontiguousarray(np.asarray(splmm_t[9], dtype=np.float64), dtype=np.float64)
             if len(splmm_t) >= 11:
                 factor_nnz = int(splmm_t[10])
+        if use_fused_raw_scan:
+            n_trait_sites = int(written_rows)
 
         scan_secs = max(time.monotonic() - scan_t0, 0.0)
         peak_rss = max(peak_rss, process.memory_info().rss)

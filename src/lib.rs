@@ -332,7 +332,8 @@ use spgrm::{
     spgrm_packed_to_jxgrm,
 };
 use splmm::{
-    splmm_assoc_pcg_bed, splmm_assoc_pcg_bed_to_tsv, splmm_assoc_pcg_dense_f32,
+    splmm_assoc_pcg_bed, splmm_assoc_pcg_bed_to_tsv, splmm_assoc_pcg_bed_to_tsv_fused_approx,
+    splmm_assoc_pcg_bed_to_tsv_fused_exact, splmm_assoc_pcg_dense_f32,
     splmm_assoc_pcg_kfile_to_tsv, splmm_load_sparse_grm_subset_dense,
     splmm_residualized_approx_null_fit_from_jxgrm,
     splmm_residualized_approx_sample_state_from_jxgrm,
@@ -851,6 +852,11 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(prepare_sparse_onehot_blup_cache, m)?)?;
     m.add_function(wrap_pyfunction!(splmm_assoc_pcg_bed, m)?)?;
     m.add_function(wrap_pyfunction!(splmm_assoc_pcg_bed_to_tsv, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        splmm_assoc_pcg_bed_to_tsv_fused_approx,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(splmm_assoc_pcg_bed_to_tsv_fused_exact, m)?)?;
     m.add_function(wrap_pyfunction!(splmm_assoc_pcg_dense_f32, m)?)?;
     m.add_function(wrap_pyfunction!(splmm_assoc_pcg_kfile_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(splmm_scan_grammar_packed, m)?)?;

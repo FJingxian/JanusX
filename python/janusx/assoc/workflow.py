@@ -257,6 +257,12 @@ from janusx.assoc.workflow_cache import (
 )
 
 
+def _splmm_fused_qc_opted_in() -> bool:
+    """Return whether the experimental one-pass SparseLMM QC route is enabled."""
+    value = str(os.environ.get("JANUSX_SPLMM_FUSED_QC", "")).strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
 def _write_pca_cache_with_ids(path: str, sample_ids: np.ndarray, qmatrix: np.ndarray) -> None:
     sid = np.asarray(sample_ids, dtype=str).reshape(-1)
     q = np.asarray(qmatrix, dtype=np.float32)
@@ -9926,6 +9932,7 @@ def _run_gwas_pipeline(
                             ),
                             result_stem=str(run_cfg.get("result_stem", "splmm") or "splmm"),
                             model_label=str(run_cfg.get("model_label", "SparseLMM") or "SparseLMM"),
+                            bimranges=scan_bimranges,
                         )
 
                     def _run_route_fvlmm_stream(
@@ -10352,13 +10359,48 @@ def _run_gwas_pipeline(
                         except KeyError:
                             return None
 
+                    def _splmm_fused_qc_bypasses_prepared_meta(
+                        route_name: str,
+                        model_token: Optional[str],
+                    ) -> bool:
+                        route_key = str(route_name).lower().strip()
+                        model_key = str(model_token or "").lower().strip()
+                        cfg = splmm_prepared_run_cfgs.get(model_key)
+                        scan_mode = (
+                            str(cfg.get("scan_mode", "exact")).lower().strip()
+                            if cfg is not None
+                            else ""
+                        )
+                        fused_binding_available = (
+                            hasattr(jxrs, "splmm_assoc_pcg_bed_to_tsv_fused_exact")
+                            if scan_mode == "exact"
+                            else hasattr(jxrs, "splmm_assoc_pcg_bed_to_tsv_fused_approx")
+                        )
+                        fused_model_eligible = scan_mode in {"exact", "approx"}
+                        return bool(
+                            _splmm_fused_qc_opted_in()
+                            and route_key == "splmm"
+                            and cfg is not None
+                            and fused_binding_available
+                            and fused_model_eligible
+                            and cfg.get("sparse_jxgrm_path", None) is not None
+                            and prefix_meta is not None
+                            and str(args.model).lower() == "add"
+                        )
+
                     def _trait_prepared_meta_needs_build(
                         trait_token: str,
                         trait_name: object,
                         route_name: str,
+                        model_token: Optional[str] = None,
                     ) -> tuple[bool, Union[np.ndarray, None]]:
                         route_key = str(route_name).lower().strip()
                         if (
+                            _splmm_fused_qc_bypasses_prepared_meta(
+                                route_key,
+                                model_token,
+                            )
+                            or
                             route_key not in meta_capable_routes
                             or prefix_meta is None
                             or (
@@ -10381,10 +10423,16 @@ def _run_gwas_pipeline(
                         trait_name: object,
                         route_name: str,
                         sample_idx_meta_prefetched: Union[np.ndarray, None] = None,
+                        model_token: Optional[str] = None,
                     ) -> Union[dict[str, object], None]:
                         nonlocal global_trait_meta_shared
                         route_key = str(route_name).lower().strip()
                         if (
+                            _splmm_fused_qc_bypasses_prepared_meta(
+                                route_key,
+                                model_token,
+                            )
+                            or
                             route_key not in meta_capable_routes
                             or prefix_meta is None
                             or (
@@ -10991,6 +11039,7 @@ def _run_gwas_pipeline(
                                     trait_token_use,
                                     trait_name_use,
                                     route,
+                                    model_token=mk,
                                 )
                             )
                             if meta_build_needed:
@@ -11008,6 +11057,7 @@ def _run_gwas_pipeline(
                             trait_name_use,
                             route,
                             sample_idx_meta_prefetched=prefetched_trait_meta_indices,
+                            model_token=mk,
                         )
 
                         if route in stream_group_routes and mk != "lm2":

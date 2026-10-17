@@ -1127,6 +1127,11 @@ impl ResidualizedApproxScanModel {
     }
 
     #[inline]
+    pub(crate) fn design_cols(&self) -> usize {
+        self.p
+    }
+
+    #[inline]
     pub(crate) fn gamma(&self) -> f64 {
         self.gamma
     }

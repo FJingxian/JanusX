@@ -1529,6 +1529,32 @@ pub(crate) fn count_packed_row_counts_selected_with_excluded(
     count_packed_row_counts_scalar_indices(row, sample_indices)
 }
 
+/// Count a previously validated sample subset without rechecking identity or
+/// rebuilding subset strategy for each marker in a sequential scan.
+#[inline]
+pub(crate) fn count_packed_row_counts_selected_prevalidated(
+    row: &[u8],
+    n_samples: usize,
+    sample_indices: &[usize],
+    excluded_sample_indices: Option<&[usize]>,
+    sample_identity: bool,
+) -> (usize, usize, usize) {
+    if sample_identity {
+        return count_packed_row_counts(row, n_samples);
+    }
+    if let Some(excluded) = excluded_sample_indices {
+        let (missing, het, hom_alt) = count_packed_row_counts(row, n_samples);
+        let (missing_ex, het_ex, hom_alt_ex) =
+            count_packed_row_counts_scalar_indices(row, excluded);
+        return (
+            missing.saturating_sub(missing_ex),
+            het.saturating_sub(het_ex),
+            hom_alt.saturating_sub(hom_alt_ex),
+        );
+    }
+    count_packed_row_counts_scalar_indices(row, sample_indices)
+}
+
 #[inline]
 #[allow(dead_code)]
 pub(crate) fn count_packed_row_counts_selected(
@@ -1929,6 +1955,63 @@ pub(crate) fn packed_row_stats_from_counts(
     let d = (2.0_f64 * p * (1.0_f64 - p)).sqrt() as f32;
     let std = if d.is_finite() { d } else { 0.0_f32 };
     (miss, maf, std)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PackedSnpQc {
+    pub(crate) keep: bool,
+    pub(crate) missing_rate: f32,
+    pub(crate) alt_freq: f32,
+    pub(crate) row_flip: bool,
+}
+
+/// Apply the selected-cohort BED QC comparisons used by the metadata builder.
+/// BIM allele eligibility is static metadata and is intentionally checked by
+/// the caller after this numeric decision.
+#[inline]
+pub(crate) fn evaluate_packed_snp_qc(
+    missing: usize,
+    het: usize,
+    hom_alt: usize,
+    n_selected: usize,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+) -> PackedSnpQc {
+    if n_selected == 0 {
+        return PackedSnpQc {
+            keep: false,
+            missing_rate: 0.0,
+            alt_freq: 0.0,
+            row_flip: false,
+        };
+    }
+    let non_missing = n_selected.saturating_sub(missing);
+    let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
+    let (missing_rate, _maf, _std) = packed_row_stats_from_counts(n_selected, non_missing, alt_sum);
+    let alt_freq = if non_missing > 0 {
+        (alt_sum as f32) / (2.0_f32 * non_missing as f32)
+    } else {
+        0.0_f32
+    };
+    let apply_het_filter = het_threshold > 0.0_f32;
+    let keep = if missing_rate > max_missing_rate {
+        false
+    } else if non_missing == 0 {
+        maf_threshold <= 0.0_f32
+    } else if apply_het_filter && ((het as f64) / (non_missing as f64)) > (het_threshold as f64) {
+        false
+    } else {
+        alt_freq.min(1.0_f32 - alt_freq) >= maf_threshold
+    };
+    PackedSnpQc {
+        keep,
+        missing_rate,
+        alt_freq,
+        // The selected metadata builder stores BED A2 frequency and does not
+        // flip the row; preserve that orientation for this route.
+        row_flip: false,
+    }
 }
 
 const PURE_LINE_FILTER_KEEP: u8 = 0;
@@ -3664,7 +3747,7 @@ impl BedChunkReader {
             _ => {
                 return Err(pyo3::exceptions::PyValueError::new_err(
                     "coding must be one of: add, dom, rec, het",
-                ))
+                ));
             }
         };
         let additive_mode = matches!(coding_mode, BedPreparedCodingMode::Add);
@@ -8886,10 +8969,11 @@ mod tests {
         count_packed_row_pure_line_counts_selected_with_excluded,
         count_packed_row_pure_line_counts_selected_with_excluded_fast,
         count_packed_row_pure_line_counts_selected_with_excluded_lut,
-        evaluate_packed_row_keep_and_flip, format_zero_sites_pure_line_error,
-        precompute_excluded_sample_indices,
+        evaluate_packed_row_keep_and_flip, evaluate_packed_snp_qc,
+        format_zero_sites_pure_line_error, precompute_excluded_sample_indices,
         prepare_bed_logic_meta_owned_for_stats_samples_pure_line_intervals,
         prepare_bed_logic_meta_owned_for_stats_samples_pure_line_with_mmap_window,
+        prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window,
         pure_line_filter_status_from_counts, pure_line_filter_status_reason,
         PURE_LINE_FILTER_FAIL_MISSING, PURE_LINE_FILTER_KEEP,
     };
@@ -8900,6 +8984,92 @@ mod tests {
             out[i >> 2] |= (code & 0b11) << ((i & 3) * 2);
         }
         out
+    }
+
+    #[test]
+    fn selected_bed_snp_qc_matches_metadata_builder() {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        pyo3::Python::initialize();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("janusx_selected_qc_{stamp}"));
+        fs::create_dir_all(&dir).expect("create temporary BED directory");
+        let prefix = dir.join("tiny");
+        fs::write(
+            prefix.with_extension("fam"),
+            "f1 s1 0 0 1 -9\nf2 s2 0 0 1 -9\nf3 s3 0 0 1 -9\nf4 s4 0 0 1 -9\n",
+        )
+        .expect("write FAM");
+        fs::write(
+            prefix.with_extension("bim"),
+            "1 rs1 0 10 A G\n1 rs2 0 20 C T\n1 rs3 0 30 G A\n1 rs4 0 40 T C\n",
+        )
+        .expect("write BIM");
+        let codes = [
+            [0b00u8, 0b10, 0b01, 0b11],
+            [0b00u8, 0b00, 0b00, 0b00],
+            [0b01u8, 0b01, 0b11, 0b00],
+            [0b11u8, 0b11, 0b11, 0b11],
+        ];
+        let mut bed = vec![0x6c, 0x1b, 0x01];
+        for row in &codes {
+            bed.extend(pack_plink_codes(row));
+        }
+        fs::write(prefix.with_extension("bed"), bed).expect("write BED");
+
+        let thresholds = (0.0_f32, 0.25_f32, 0.4_f32);
+        for sample_indices in [None, Some(&[3usize, 2, 0][..])] {
+            let prepared = prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window(
+                prefix.to_str().unwrap(),
+                thresholds.0,
+                thresholds.1,
+                thresholds.2,
+                false,
+                sample_indices,
+                true,
+                Some(1),
+                1,
+            )
+            .expect("prepare selected metadata reference");
+            let n_selected = sample_indices.map_or(4, <[usize]>::len);
+            let mut reader = crate::gload::PackedBedSourceReader::open(prefix.to_str().unwrap(), 4)
+                .expect("open packed BED source");
+            let mut block = vec![0u8; 4];
+            assert_eq!(reader.read_source_block(0, 4, &mut block).unwrap(), 4);
+            for source_row in 0..4 {
+                let row = &block[source_row..source_row + 1];
+                let (missing, het, hom_alt) = if let Some(indices) = sample_indices {
+                    count_packed_row_counts_selected_with_excluded(row, 4, indices, None)
+                } else {
+                    count_packed_row_counts(row, 4)
+                };
+                let observed = evaluate_packed_snp_qc(
+                    missing,
+                    het,
+                    hom_alt,
+                    n_selected,
+                    thresholds.0,
+                    thresholds.1,
+                    thresholds.2,
+                );
+                let expected_idx = prepared
+                    .row_source_indices
+                    .iter()
+                    .position(|&row_idx| row_idx == source_row);
+                assert_eq!(observed.keep, expected_idx.is_some());
+                if let Some(expected_idx) = expected_idx {
+                    assert_eq!(observed.missing_rate, prepared.missing_rate[expected_idx]);
+                    assert_eq!(observed.alt_freq, prepared.maf[expected_idx]);
+                    assert_eq!(observed.row_flip, prepared.row_flip[expected_idx]);
+                }
+            }
+        }
+
+        fs::remove_dir_all(dir).expect("remove temporary BED directory");
     }
 
     #[test]

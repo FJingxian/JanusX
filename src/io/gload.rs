@@ -383,6 +383,78 @@ pub trait GenotypeMatrix: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
+/// Direct source-order BED reader with a caller-owned packed destination.
+/// It validates the file header and row shape once, then reads only requested
+/// source rows into the supplied buffer.
+pub(crate) struct PackedBedSourceReader {
+    file: File,
+    n_samples_full: usize,
+    bytes_per_snp: usize,
+    n_snps: usize,
+}
+
+impl PackedBedSourceReader {
+    pub(crate) fn open(prefix: &str, n_samples_full: usize) -> Result<Self, String> {
+        let bed_prefix = normalize_plink_prefix(prefix);
+        let bed_path = format!("{bed_prefix}.bed");
+        let info = read_plink_bed_header_info(Path::new(&bed_path), n_samples_full)?;
+        if info.n_snps_total == 0 {
+            return Err("no SNP sites found in PLINK BED input".to_string());
+        }
+        let file = File::open(&bed_path).map_err(|e| format!("open {bed_path}: {e}"))?;
+        Ok(Self {
+            file,
+            n_samples_full,
+            bytes_per_snp: info.bytes_per_snp,
+            n_snps: info.n_snps_total,
+        })
+    }
+
+    #[inline]
+    pub(crate) fn n_samples_full(&self) -> usize {
+        self.n_samples_full
+    }
+
+    #[inline]
+    pub(crate) fn bytes_per_snp(&self) -> usize {
+        self.bytes_per_snp
+    }
+
+    #[inline]
+    pub(crate) fn n_snps(&self) -> usize {
+        self.n_snps
+    }
+
+    pub(crate) fn read_source_block(
+        &mut self,
+        source_start: usize,
+        requested_rows: usize,
+        out: &mut [u8],
+    ) -> Result<usize, String> {
+        if source_start > self.n_snps {
+            return Err(format!(
+                "BED source row {source_start} exceeds marker count {}",
+                self.n_snps
+            ));
+        }
+        let rows = requested_rows.min(self.n_snps - source_start);
+        let byte_len = rows.saturating_mul(self.bytes_per_snp);
+        if out.len() < byte_len {
+            return Err(format!(
+                "packed BED destination is too small: got {}, need {byte_len}",
+                out.len()
+            ));
+        }
+        if rows > 0 {
+            let offset = (BED_HEADER_LEN as u64)
+                .saturating_add((source_start.saturating_mul(self.bytes_per_snp)) as u64);
+            read_file_exact_at(&self.file, &mut out[..byte_len], offset)
+                .map_err(|e| format!("read BED source rows [{source_start}..): {e}"))?;
+        }
+        Ok(rows)
+    }
+}
+
 // StreamingBedMatrix — chunked file I/O, no mmap
 // ---------------------------------------------------------------------------
 
@@ -524,6 +596,44 @@ impl GenotypeMatrix for StreamingBedMatrix {
             code4_lut,
             pool,
         )
+    }
+}
+
+#[cfg(test)]
+mod packed_source_tests {
+    use super::PackedBedSourceReader;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn windowed_bed_source_block_preserves_raw_bim_order() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("janusx_packed_source_{stamp}"));
+        fs::create_dir_all(&dir).expect("create temporary BED directory");
+        let prefix = dir.join("tiny");
+        fs::write(
+            prefix.with_extension("bed"),
+            [0x6c, 0x1b, 0x01, 0x31, 0x72, 0xB4, 0xA5],
+        )
+        .expect("write BED fixture");
+
+        let mut reader = PackedBedSourceReader::open(prefix.to_str().unwrap(), 4)
+            .expect("open direct packed BED source");
+        assert_eq!(reader.n_snps(), 4);
+        let mut out = vec![0u8; 3];
+        assert_eq!(reader.read_source_block(1, 3, &mut out).unwrap(), 3);
+        assert_eq!(out, [0x72, 0xB4, 0xA5]);
+
+        let mut short = vec![0u8; 3];
+        assert_eq!(reader.read_source_block(3, 3, &mut short).unwrap(), 1);
+        assert_eq!(short[0], 0xA5);
+        assert_eq!(reader.read_source_block(4, 1, &mut short).unwrap(), 0);
+        assert!(reader.read_source_block(5, 1, &mut short).is_err());
+
+        fs::remove_dir_all(dir).expect("remove temporary BED directory");
     }
 }
 

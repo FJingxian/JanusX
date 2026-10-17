@@ -641,7 +641,7 @@ pub fn gwas_packed_unified_to_tsv<'py>(
                     opt_item(&job, "pseudo_tsv")?.and_then(|v| v.extract().ok());
                 let raw: bool = opt_item(&job, "raw")?
                     .and_then(|v| v.extract().ok())
-                    .unwrap_or(false);
+                    .unwrap_or(true);
                 let skip_main_scan: bool = opt_item(&job, "skip_main_scan")?
                     .and_then(|v| v.extract().ok())
                     .unwrap_or(false);

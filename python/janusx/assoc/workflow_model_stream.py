@@ -118,6 +118,24 @@ def _finite_optional_float(value: object) -> Optional[float]:
     return out if np.isfinite(out) else None
 
 
+def _missing_rate_chunk(
+    missing: np.ndarray,
+    n_samples: int,
+    *,
+    already_rate: bool = False,
+) -> np.ndarray:
+    """Normalize BED chunk missing metadata to per-site rates.
+
+    BedChunkReader returns missing counts; BedChunkReaderFromMeta returns the
+    cached missing rates directly.
+    """
+    n = int(n_samples)
+    if n <= 0:
+        raise ValueError("BED chunk has no selected samples.")
+    values = np.asarray(missing, dtype=np.float64)
+    return values if already_rate else values / float(n)
+
+
 def _emit_fvlmm_sidecar_after_publication(
     *,
     context: Optional[GwasSidecarRunContext],
@@ -400,7 +418,7 @@ def _gwas_result_header_and_extra_cols(res: np.ndarray) -> tuple[str, list[np.nd
     if result_cols == 6:
         header += "\tlambda\tml\tplrt"
         extras = [
-            np.char.mod("%.6g", arr[:, 3]),
+            np.char.mod("%.6e", arr[:, 3]),
             np.char.mod("%.6e", arr[:, 4]),
             np.char.mod("%.4e", arr[:, 5]),
         ]
@@ -1745,8 +1763,8 @@ def run_chunked_gwas_lmm_lm(
                 np.asarray(allele1_list, dtype=object),
                 np.char.mod("%.4f", np.asarray(maf_chunk, dtype=np.float64)),
                 np.char.mod(
-                    "%d",
-                    np.rint(np.asarray(miss_chunk, dtype=np.float64)).astype(np.int64),
+                    "%.4f",
+                    np.asarray(miss_chunk, dtype=np.float64),
                 ),
                 np.char.mod("%.4f", res[:, 0]),
                 np.char.mod("%.4f", res[:, 1]),
@@ -2220,6 +2238,8 @@ def run_chunked_gwas_lmm_lm(
                         if len(sites) == 0:
                             continue
                         snp_chunk = _resolve_stream_chunk_snp_names(list(sites))
+                        n_used = int(geno_center.shape[1])
+                        miss_rate_chunk = _missing_rate_chunk(miss_chunk, n_used)
                         meta_chunk: object
                         if use_rust_assoc_writer:
                             meta_chunk = sites
@@ -2246,7 +2266,7 @@ def run_chunked_gwas_lmm_lm(
                                 allele0s,
                                 allele1s,
                                 np.asarray(maf_chunk, dtype=np.float32).ravel().tolist(),
-                                np.asarray(miss_chunk, dtype=np.float32).ravel().tolist(),
+                                np.asarray(miss_rate_chunk, dtype=np.float32).ravel().tolist(),
                                 threads=scan_threads,
                                 nullml=None,
                             )
@@ -2276,7 +2296,7 @@ def run_chunked_gwas_lmm_lm(
                                 meta_chunk,
                                 snp_chunk,
                                 maf_chunk,
-                                miss_chunk,
+                                miss_rate_chunk,
                             )
                             chunk_seq += 1
 
@@ -2624,8 +2644,8 @@ def run_chunked_gwas_streaming_shared(
             np.asarray(allele1_list, dtype=object),
             np.char.mod("%.4f", np.asarray(maf_chunk, dtype=np.float64)),
             np.char.mod(
-                "%d",
-                np.rint(np.asarray(miss_chunk, dtype=np.float64)).astype(np.int64),
+                "%.4f",
+                np.asarray(miss_chunk, dtype=np.float64),
             ),
             np.char.mod("%.4f", res[:, 0]),
             np.char.mod("%.4f", res[:, 1]),
@@ -3023,6 +3043,12 @@ def run_chunked_gwas_streaming_shared(
             return
         if len(sites) == 0:
             return
+        n_used = int(np.asarray(geno_center).shape[1])
+        miss_rate_chunk = _missing_rate_chunk(
+            miss_chunk,
+            n_used,
+            already_rate=trait_prepared_meta is not None,
+        )
         snp_chunk = _resolve_stream_chunk_snp_names(list(sites))
 
         for ctx in model_ctxs:
@@ -3046,7 +3072,7 @@ def run_chunked_gwas_streaming_shared(
                     sites,
                     snp_chunk,
                     np.asarray(maf_chunk, dtype=np.float32),
-                    np.asarray(miss_chunk, dtype=np.float32),
+                    np.asarray(miss_rate_chunk, dtype=np.float32),
                     np.ascontiguousarray(results, dtype=np.float64),
                 )
             else:
@@ -3061,7 +3087,7 @@ def run_chunked_gwas_streaming_shared(
                     info_chunk,
                     snp_chunk,
                     maf_chunk,
-                    miss_chunk,
+                    miss_rate_chunk,
                 )
                 writer.append(chunk_text, result_cols=result_cols, rows=m_chunk)
             ctx["has_results"] = True

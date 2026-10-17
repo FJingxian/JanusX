@@ -6193,7 +6193,7 @@ def _expand_compact_kfile_gwas_tsv(
                 fout.write(
                     f"{chrom}\t{int(pos)}\t{snp}\t{allele0}\t{allele1}\t"
                     f"{maf:.4f}\t0.0000\t{beta:.4f}\t{se:.4f}\t"
-                    f"{chisq:.6g}\t{pwald:.4e}\n"
+                    f"{chisq:.4e}\t{pwald:.4e}\n"
                 )
                 rows_written += 1
 

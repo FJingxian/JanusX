@@ -6194,14 +6194,6 @@ fn compute_background_model(
     Ok((beta, ixx, rss, (n as i32) - (q as i32)))
 }
 
-fn row_missing_count_from_float(v: f32) -> usize {
-    if !v.is_finite() || v <= 0.0_f32 {
-        0usize
-    } else {
-        v.round().max(0.0_f32) as usize
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn write_stage2_tsv(
     y: &[f64],
@@ -6529,17 +6521,17 @@ fn write_stage2_tsv(
                 };
                 (beta, se, pwald, chisq)
             };
-            let miss = row_missing_count_from_float(row_missing[idx]);
+            let miss_rate = row_missing[idx] as f64;
             let _ = write!(
                 text_buf,
-                "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\n",
+                "{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t{:.4e}\n",
                 chrom[idx],
                 pos[idx],
                 snp[idx],
                 allele0[idx],
                 allele1[idx],
                 row_maf[idx],
-                miss,
+                miss_rate,
                 beta,
                 se,
                 format_chisq_value(chisq),
@@ -6548,14 +6540,14 @@ fn write_stage2_tsv(
             if qtn_lookup.contains_key(&idx) {
                 let _ = write!(
                     pseudo_text_buf,
-                    "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{:.4}\t{:.4}\t{}\t{:.4e}\n",
+                    "{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t{:.4e}\n",
                     chrom[idx],
                     pos[idx],
                     snp[idx],
                     allele0[idx],
                     allele1[idx],
                     row_maf[idx],
-                    miss,
+                    miss_rate,
                     beta,
                     se,
                     format_chisq_value(chisq),

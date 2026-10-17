@@ -61,12 +61,6 @@ struct TraitResult {
     rows_text: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RowMissingMode {
-    Rate,
-    Count,
-}
-
 const LM_TRAIT_AGG_HEADER: &str =
     "chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tphenotype\n";
 const LM_TRAIT_TEXT_FLUSH_BYTES: usize = 8 * 1024 * 1024;
@@ -231,63 +225,34 @@ fn jobs_support_shared_fast_path(jobs: &[TraitJob]) -> bool {
     })
 }
 
-fn infer_row_missing_mode(row_missing: &[f32]) -> RowMissingMode {
-    if row_missing
-        .iter()
-        .all(|&v| v.is_finite() && (-1.0e-6_f32..=1.0_f32 + 1.0e-6_f32).contains(&v))
-    {
-        RowMissingMode::Rate
-    } else {
-        RowMissingMode::Count
-    }
-}
-
 fn build_site_prefixes(
     sites: &[SiteInfo],
     maf: &[f32],
-    row_missing: &[f32],
-    miss_mode: RowMissingMode,
+    missing_rate: &[f32],
 ) -> Result<Vec<String>, String> {
     let rows = sites.len();
-    if maf.len() != rows || row_missing.len() != rows {
+    if maf.len() != rows || missing_rate.len() != rows {
         return Err(format!(
             "site prefix metadata length mismatch: rows={rows}, maf={}, miss={}",
             maf.len(),
-            row_missing.len()
+            missing_rate.len()
         ));
     }
     let mut out = Vec::with_capacity(rows);
     for row_idx in 0..rows {
         let site = &sites[row_idx];
         let mut text = String::with_capacity(96);
-        match miss_mode {
-            RowMissingMode::Rate => {
-                let _ = write!(
-                    &mut text,
-                    "{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t",
-                    site.chrom,
-                    site.pos,
-                    site.snp,
-                    site.ref_allele,
-                    site.alt_allele,
-                    maf[row_idx],
-                    row_missing[row_idx],
-                );
-            }
-            RowMissingMode::Count => {
-                let _ = write!(
-                    &mut text,
-                    "{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t",
-                    site.chrom,
-                    site.pos,
-                    site.snp,
-                    site.ref_allele,
-                    site.alt_allele,
-                    maf[row_idx],
-                    row_missing[row_idx].round() as i64,
-                );
-            }
-        }
+        let _ = write!(
+            &mut text,
+            "{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t",
+            site.chrom,
+            site.pos,
+            site.snp,
+            site.ref_allele,
+            site.alt_allele,
+            maf[row_idx],
+            missing_rate[row_idx],
+        );
         out.push(text);
     }
     Ok(out)
@@ -563,12 +528,10 @@ fn lm_trait_assoc_bed_to_tsv_shared_fast(
         gg_resid[row_idx] = ss - q_quad;
     }
 
-    let miss_mode = infer_row_missing_mode(reference.prepared.row_missing.as_slice());
     let site_prefixes = build_site_prefixes(
         sites.as_slice(),
         reference.prepared.row_maf.as_slice(),
         reference.prepared.row_missing.as_slice(),
-        miss_mode,
     )?;
     let writer = AsyncTsvWriter::with_config(
         out_tsv,
@@ -784,12 +747,10 @@ fn lm_trait_assoc_bed_matrix_shared_fast(
         gg_resid[row_idx] = ss - q_quad;
     }
 
-    let miss_mode = infer_row_missing_mode(prepared.row_missing.as_slice());
     let site_prefixes = build_site_prefixes(
         sites.as_slice(),
         prepared.row_maf.as_slice(),
         prepared.row_missing.as_slice(),
-        miss_mode,
     )?;
     let writer = AsyncTsvWriter::with_config(
         out_tsv,

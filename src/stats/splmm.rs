@@ -22,7 +22,7 @@ use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::Path;
-use std::sync::mpsc::sync_channel;
+use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -56,7 +56,8 @@ use crate::gload::{
     GenotypeMatrix, GlobalStats, PackedBedSourceReader, UnifiedInput, WindowedBedMatrix,
 };
 use crate::he::{
-    dot_sum_intercept_f32_row, row_major_block_mul_mat_f32, row_major_block_mul_vec_intercept_f32,
+    dot_sum_sumsq_intercept_f32_row, row_major_block_mul_mat_f32,
+    row_major_block_mul_vec_intercept_f32,
 };
 use crate::kmer::{KfileAssocPrefetch, KfileAssocSource};
 use crate::linalg::{chi2_sf_df1, cholesky_inplace, cholesky_solve_into};
@@ -84,6 +85,7 @@ const SPLMM_DEFAULT_RHAT_SEED: u64 = 20260527;
 const SPLMM_DEFAULT_SPARSE_CHOLESKY_MAX_L_NNZ: usize = 100_000_000;
 #[derive(Clone, Copy, Debug, Default)]
 struct SplmmPackedScanTiming {
+    qc_secs: f64,
     decode_secs: f64,
     gpy_secs: f64,
     gx_secs: f64,
@@ -98,13 +100,40 @@ struct SplmmPackedScanTiming {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct SplmmTsvTiming {
+    pub(crate) bim_secs: f64,
     pub(crate) format_secs: f64,
     pub(crate) write_secs: f64,
     pub(crate) send_secs: f64,
     pub(crate) finish_secs: f64,
+    pub(crate) producer_secs: f64,
+    pub(crate) total_wall_secs: f64,
     pub(crate) blocks: usize,
     pub(crate) bytes: usize,
     pub(crate) format_threads: usize,
+}
+
+impl SplmmTsvTiming {
+    #[inline]
+    pub(crate) fn scan_compute_secs(&self) -> f64 {
+        (self.producer_secs - self.send_secs).max(0.0)
+    }
+
+    #[inline]
+    pub(crate) fn writer_wait_secs(&self) -> f64 {
+        self.send_secs + self.finish_secs
+    }
+}
+
+fn send_tsv_payload_with_wait<T>(tx: &SyncSender<T>, payload: T) -> Result<f64, ()> {
+    match tx.try_send(payload) {
+        Ok(()) => Ok(0.0),
+        Err(TrySendError::Full(payload)) => {
+            let wait_t0 = Instant::now();
+            tx.send(payload).map_err(|_| ())?;
+            Ok(wait_t0.elapsed().as_secs_f64())
+        }
+        Err(TrySendError::Disconnected(_)) => Err(()),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -224,7 +253,8 @@ fn emit_splmm_packed_scan_timing(
     p: usize,
     threads: usize,
 ) {
-    let accounted_secs = timing.decode_secs
+    let accounted_secs = timing.qc_secs
+        + timing.decode_secs
         + timing.gpy_secs
         + timing.gx_secs
         + timing.assoc_secs
@@ -243,7 +273,9 @@ fn emit_splmm_packed_scan_timing(
         }
     };
     eprintln!(
-        "SparseLMM packed timing mode={mode}: decode={:.3}s ({:.1}%), gpy={:.3}s ({:.1}%), gx={:.3}s ({:.1}%), assoc={:.3}s ({:.1}%), row_sumsq={:.3}s ({:.1}%), repack={:.3}s ({:.1}%), solve={:.3}s ({:.1}%), xtz={:.3}s ({:.1}%), denom={:.3}s ({:.1}%), sink={:.3}s ({:.1}%), other={:.3}s ({:.1}%), total={:.3}s, rows={}, n={}, p={}, threads={}",
+        "SparseLMM packed timing mode={mode}: qc={:.3}s ({:.1}%), decode={:.3}s ({:.1}%), gpy={:.3}s ({:.1}%), gx={:.3}s ({:.1}%), assoc={:.3}s ({:.1}%), row_sumsq={:.3}s ({:.1}%), repack={:.3}s ({:.1}%), solve={:.3}s ({:.1}%), xtz={:.3}s ({:.1}%), denom={:.3}s ({:.1}%), sink={:.3}s ({:.1}%), other={:.3}s ({:.1}%), total={:.3}s, rows={}, n={}, p={}, threads={}",
+        timing.qc_secs,
+        to_pct(timing.qc_secs),
         timing.decode_secs,
         to_pct(timing.decode_secs),
         timing.gpy_secs,
@@ -360,27 +392,16 @@ fn emit_splmm_prepare_timing(
 }
 
 fn emit_splmm_tsv_timing(mode: &str, timing: &SplmmTsvTiming, rows: usize) {
-    let worker_total_secs = timing.format_secs + timing.write_secs;
-    let accounted_secs = worker_total_secs + timing.send_secs + timing.finish_secs;
-    let to_pct = |x: f64| -> f64 {
-        if accounted_secs > 0.0 {
-            x * 100.0 / accounted_secs
-        } else {
-            0.0
-        }
-    };
     eprintln!(
-        "SparseLMM TSV timing mode={mode}: format={:.3}s ({:.1}%), write={:.3}s ({:.1}%), send={:.3}s ({:.1}%), finish_wait={:.3}s ({:.1}%), worker_total={:.3}s, accounted={:.3}s, rows={}, blocks={}, bytes={}, format_threads={}",
-        timing.format_secs,
-        to_pct(timing.format_secs),
-        timing.write_secs,
-        to_pct(timing.write_secs),
+        "SparseLMM TSV timing mode={mode}: scan_compute={:.3}s, send_wait={:.3}s, writer_tail_wait={:.3}s, producer_wall={:.3}s, bim_read_wall={:.3}s, format_wall={:.3}s, write_wall={:.3}s, total_wall={:.3}s, rows={}, blocks={}, bytes={}, format_threads={}",
+        timing.scan_compute_secs(),
         timing.send_secs,
-        to_pct(timing.send_secs),
         timing.finish_secs,
-        to_pct(timing.finish_secs),
-        worker_total_secs,
-        accounted_secs,
+        timing.producer_secs,
+        timing.bim_secs,
+        timing.format_secs,
+        timing.write_secs,
+        timing.total_wall_secs,
         rows,
         timing.blocks,
         timing.bytes,
@@ -429,14 +450,14 @@ pub(crate) fn emit_splmm_null_scan_core_timing(
     mode: &str,
     factor_load_secs: f64,
     scan_prepare_secs: f64,
-    scan_exec_secs: f64,
-    writer_wait_secs: f64,
+    tsv_timing: &SplmmTsvTiming,
     rows: usize,
     n: usize,
     p: usize,
     threads: usize,
 ) {
-    let total_secs = factor_load_secs + scan_prepare_secs + scan_exec_secs + writer_wait_secs;
+    let scan_exec_secs = tsv_timing.scan_compute_secs();
+    let total_secs = factor_load_secs + scan_prepare_secs + tsv_timing.total_wall_secs;
     let to_pct = |x: f64| -> f64 {
         if total_secs > 0.0 {
             x * 100.0 / total_secs
@@ -445,15 +466,23 @@ pub(crate) fn emit_splmm_null_scan_core_timing(
         }
     };
     eprintln!(
-        "SparseLMM null-scan-core timing mode={mode}: factor_load={:.3}s ({:.1}%), scan_prepare={:.3}s ({:.1}%), scan_exec={:.3}s ({:.1}%), writer_wait={:.3}s ({:.1}%), total={:.3}s, rows={}, n={}, p={}, threads={}",
+        "SparseLMM null-scan-core timing mode={mode}: factor_load={:.3}s ({:.1}%), scan_prepare={:.3}s ({:.1}%), scan_compute={:.3}s ({:.1}%), writer_send_wait={:.3}s ({:.1}%), writer_tail_wait={:.3}s ({:.1}%), writer_bim_read={:.3}s, writer_format={:.3}s, writer_write={:.3}s, writer_format_threads={}, writer_blocks={}, scan_wall={:.3}s, total={:.3}s, rows={}, n={}, p={}, threads={}",
         factor_load_secs,
         to_pct(factor_load_secs),
         scan_prepare_secs,
         to_pct(scan_prepare_secs),
         scan_exec_secs,
         to_pct(scan_exec_secs),
-        writer_wait_secs,
-        to_pct(writer_wait_secs),
+        tsv_timing.send_secs,
+        to_pct(tsv_timing.send_secs),
+        tsv_timing.finish_secs,
+        to_pct(tsv_timing.finish_secs),
+        tsv_timing.bim_secs,
+        tsv_timing.format_secs,
+        tsv_timing.write_secs,
+        tsv_timing.format_threads,
+        tsv_timing.blocks,
+        tsv_timing.total_wall_secs,
         total_secs,
         rows,
         n,
@@ -478,6 +507,22 @@ fn splmm_tsv_format_threads(scan_threads: usize) -> usize {
     }
 }
 
+#[inline]
+fn splmm_raw_tsv_format_threads(scan_threads: usize) -> usize {
+    if let Ok(raw) = std::env::var("JX_SPLMM_TSV_THREADS") {
+        if let Ok(val) = raw.trim().parse::<usize>() {
+            if val > 0 {
+                return val.min(scan_threads.max(1));
+            }
+        }
+    }
+    if scan_threads > 1 {
+        scan_threads.min(4)
+    } else {
+        1
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_splmm_async_tsv_writer<R, F>(
     out_tsv: &str,
@@ -496,6 +541,7 @@ where
         &mut dyn FnMut(usize, usize, &[f64], Option<&[f32]>) -> Result<(), String>,
     ) -> Result<R, String>,
 {
+    let stage_timing = stage_timing || splmm_top_level_timing_enabled();
     const HEADER: &[u8] = b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n";
     const WRITER_CAPACITY: usize = 64 * 1024 * 1024;
     const QUEUE_DEPTH_HINT: usize = 4;
@@ -509,8 +555,9 @@ where
         .clamp(MIN_QUEUE_DEPTH, MAX_QUEUE_DEPTH);
     let rows_total = meta_input.n_rows();
     let format_threads = splmm_tsv_format_threads(scan_threads.max(1));
+    let total_t0 = Instant::now();
 
-    let (scan_out, tsv_timing) = std::thread::scope(
+    let (scan_out, mut tsv_timing) = std::thread::scope(
         |scope| -> Result<(R, SplmmTsvTiming), String> {
             let (tx, rx) = sync_channel::<SplmmTsvBlockPayload>(queue_depth_eff);
             let handle = scope.spawn(move || -> Result<SplmmTsvTiming, String> {
@@ -773,33 +820,35 @@ where
             let mut send_secs = 0.0_f64;
             let mut sink =
                 |row_start: usize, rows_here: usize, block: &[f64], _block_maf: Option<&[f32]>| {
-                    let t0 = stage_timing.then(Instant::now);
-                    tx.send(SplmmTsvBlockPayload {
-                        row_start,
-                        rows_here,
-                        results: block.to_vec(),
-                    })
-                    .map_err(|e| format!("send {out_tsv}: {e}"))?;
-                    if let Some(t0) = t0 {
-                        send_secs += t0.elapsed().as_secs_f64();
-                    }
+                    let send_wait_secs = send_tsv_payload_with_wait(
+                        &tx,
+                        SplmmTsvBlockPayload {
+                            row_start,
+                            rows_here,
+                            results: block.to_vec(),
+                        },
+                    )
+                    .map_err(|_| format!("send {out_tsv}: writer receiver disconnected"))?;
+                    send_secs += send_wait_secs;
                     Ok(())
                 };
 
+            let producer_t0 = Instant::now();
             let run_res = run_scan(&mut sink);
+            let producer_secs = producer_t0.elapsed().as_secs_f64();
             drop(tx);
-            let t0 = stage_timing.then(Instant::now);
+            let finish_t0 = Instant::now();
             let mut timing = handle
                 .join()
                 .map_err(|_| format!("writer thread panicked for {out_tsv}"))??;
-            if let Some(t0) = t0 {
-                timing.finish_secs += t0.elapsed().as_secs_f64();
-            }
+            timing.finish_secs = finish_t0.elapsed().as_secs_f64();
             timing.send_secs = send_secs;
+            timing.producer_secs = producer_secs;
             let out = run_res?;
             Ok((out, timing))
         },
     )?;
+    tsv_timing.total_wall_secs = total_t0.elapsed().as_secs_f64();
 
     if stage_timing {
         emit_splmm_tsv_timing(mode, &tsv_timing, rows_total);
@@ -1169,6 +1218,8 @@ fn splmm_raw_estimate_gamma(
     seed: u64,
     snps_only: bool,
     ranges: &[SplmmRawBimRange],
+    threads: usize,
+    pool: Option<&rayon::ThreadPool>,
 ) -> Result<SplmmRawGammaInfo, String> {
     if rhat_markers == 0 {
         return Err("SPLMM_FUSED_FALLBACK: rhat_markers must be > 0".to_string());
@@ -1177,6 +1228,7 @@ fn splmm_raw_estimate_gamma(
     let attempt_cap = reader
         .n_snps()
         .min(1024usize.max(rhat_markers.saturating_mul(32)));
+    let static_t0 = Instant::now();
     let (candidates, n_static) = splmm_raw_static_candidate_rows(
         prefix,
         reader.n_snps(),
@@ -1191,6 +1243,7 @@ fn splmm_raw_estimate_gamma(
             "SPLMM_FUSED_FALLBACK: only {n_static} statically eligible BIM rows for requested rhat_markers={rhat_markers}"
         ));
     }
+    let static_select_secs = static_t0.elapsed().as_secs_f64();
     let n = sample_indices.len();
     let decode_plan =
         AdditiveDecodePlan::from_sample_indices(reader.n_samples_full(), sample_indices);
@@ -1199,6 +1252,7 @@ fn splmm_raw_estimate_gamma(
     let mut markers_col_major = Vec::<f64>::with_capacity(n.saturating_mul(qc_target));
     let mut qc_valid = 0usize;
     let mut attempts = 0usize;
+    let qc_t0 = Instant::now();
     for source_row in candidates.iter().copied() {
         if qc_valid >= qc_target {
             break;
@@ -1248,9 +1302,30 @@ fn splmm_raw_estimate_gamma(
             candidates.len()
         ));
     }
+    let candidate_qc_secs = qc_t0.elapsed().as_secs_f64();
+    let gamma_fit_t0 = Instant::now();
     let (gamma, n_used) = fit
-        .estimate_gamma_from_markers(x_design, &markers_col_major, qc_valid, rhat_markers)
+        .estimate_gamma_from_markers_with_parallelism(
+            x_design,
+            &markers_col_major,
+            qc_valid,
+            rhat_markers,
+            threads,
+            pool,
+        )
         .map_err(splmm_raw_gamma_error)?;
+    if splmm_top_level_timing_enabled() {
+        eprintln!(
+            "SparseLMM approx gamma timing: static_select={:.3}s, candidate_qc_decode={:.3}s, sparse_solve_reduce={:.3}s, requested={}, candidates={}, qc_valid={}, used={}",
+            static_select_secs,
+            candidate_qc_secs,
+            gamma_fit_t0.elapsed().as_secs_f64(),
+            rhat_markers,
+            candidates.len(),
+            qc_valid,
+            n_used,
+        );
+    }
     Ok(SplmmRawGammaInfo {
         gamma,
         n_requested: rhat_markers,
@@ -1284,6 +1359,8 @@ fn splmm_raw_process_assoc_block_single_buffer(
     code4_lut: &[[u8; 4]; 256],
     decode_plan: &AdditiveDecodePlan,
     pool: Option<&Arc<rayon::ThreadPool>>,
+    timing: &mut SplmmPackedScanTiming,
+    stage_timing: bool,
 ) -> Result<SplmmRawBedAssocBlock, String> {
     let bytes_per_snp = n_samples_full.div_ceil(4);
     if packed_block.len() < rows_here.saturating_mul(bytes_per_snp) {
@@ -1294,6 +1371,7 @@ fn splmm_raw_process_assoc_block_single_buffer(
     {
         return Err("fused SparseLMM BIM metadata block length mismatch".to_string());
     }
+    let qc_t0 = stage_timing.then(Instant::now);
     let mut packed_rel_rows = Vec::<usize>::with_capacity(rows_here);
     let mut source_rows = Vec::<usize>::with_capacity(rows_here);
     let mut alt_freq = Vec::<f32>::with_capacity(rows_here);
@@ -1329,6 +1407,9 @@ fn splmm_raw_process_assoc_block_single_buffer(
         alt_freq.push(qc.alt_freq);
         missing_rate.push(qc.missing_rate);
     }
+    if let Some(t0) = qc_t0 {
+        timing.qc_secs += t0.elapsed().as_secs_f64();
+    }
 
     let n = sample_indices.len();
     let p = model.design_cols();
@@ -1351,6 +1432,7 @@ fn splmm_raw_process_assoc_block_single_buffer(
         None
     };
     let mut results = vec![0.0_f64; source_rows.len().saturating_mul(3)];
+    let assoc_t0 = stage_timing.then(Instant::now);
     let mut run = || {
         results.par_chunks_mut(3).enumerate().for_each_init(
             || {
@@ -1378,14 +1460,16 @@ fn splmm_raw_process_assoc_block_single_buffer(
                     genotype,
                 )
                 .expect("prevalidated fused BED row must decode");
-                let sumsq = additive_row_sumsq_f64(genotype);
-                let (score, residual_sumsq) = if let Some(xtx00_inv) = xtx00_inv {
-                    let (score, sum_g) = dot_sum_intercept_f32_row(genotype, score_f32);
+                let (score, residual_sumsq, sumsq) = if let Some(xtx00_inv) = xtx00_inv {
+                    let (score, sum_g, sumsq) =
+                        dot_sum_sumsq_intercept_f32_row(genotype, score_f32);
                     (
                         score as f64,
                         residualized_sumsq_scalar(xtx00_inv, sum_g as f64, sumsq),
+                        sumsq,
                     )
                 } else {
+                    let sumsq = additive_row_sumsq_f64(genotype);
                     let x_design = x_design_f32
                         .expect("covariate design was validated before fused approx scan");
                     rhs_products.fill(0.0_f32);
@@ -1404,7 +1488,7 @@ fn splmm_raw_process_assoc_block_single_buffer(
                     }
                     let residual_sumsq =
                         residualized_sumsq_from_xtx_chol(model.xtx_chol(), p, xtg, alpha, sumsq);
-                    (rhs_products[0] as f64, residual_sumsq)
+                    (rhs_products[0] as f64, residual_sumsq, sumsq)
                 };
                 if splmm_residual_sumsq_is_effectively_zero(residual_sumsq, sumsq) {
                     out[0] = f64::NAN;
@@ -1428,6 +1512,9 @@ fn splmm_raw_process_assoc_block_single_buffer(
         pool.install(run);
     } else {
         run();
+    }
+    if let Some(t0) = assoc_t0 {
+        timing.assoc_secs += t0.elapsed().as_secs_f64();
     }
     Ok(SplmmRawBedAssocBlock {
         source_rows,
@@ -1465,6 +1552,8 @@ fn splmm_raw_scan_exact_block_single_buffer(
     decode_plan: &AdditiveDecodePlan,
     threads: usize,
     pool: Option<&Arc<rayon::ThreadPool>>,
+    timing: &mut SplmmPackedScanTiming,
+    stage_timing: bool,
     sink: &mut dyn FnMut(SplmmRawTsvBlockPayload) -> Result<(), String>,
 ) -> Result<usize, String> {
     let bytes_per_snp = n_samples_full.div_ceil(4);
@@ -1491,6 +1580,7 @@ fn splmm_raw_scan_exact_block_single_buffer(
         return Err("fused exact SparseLMM model dimensions do not match workspace".to_string());
     }
 
+    let qc_t0 = stage_timing.then(Instant::now);
     let mut packed_rel_rows = Vec::<usize>::with_capacity(rows_here);
     let mut source_rows = Vec::<usize>::with_capacity(rows_here);
     let mut alt_freq = Vec::<f32>::with_capacity(rows_here);
@@ -1526,14 +1616,17 @@ fn splmm_raw_scan_exact_block_single_buffer(
         alt_freq.push(qc.alt_freq);
         missing_rate.push(qc.missing_rate);
     }
+    if let Some(t0) = qc_t0 {
+        timing.qc_secs += t0.elapsed().as_secs_f64();
+    }
 
     let sigma2 = ypy / df;
-    let mut scan_timing = SplmmPackedScanTiming::default();
     let mut total_kept = 0usize;
     for batch_start in (0..packed_rel_rows.len()).step_by(exact_workspace.capacity_rows) {
         let batch_end = (batch_start + exact_workspace.capacity_rows).min(packed_rel_rows.len());
         let batch_rows = batch_end - batch_start;
         let batch_genotypes = &mut exact_workspace.block[..batch_rows * score_vec.len()];
+        let decode_t0 = stage_timing.then(Instant::now);
         let mut run = || {
             batch_genotypes
                 .par_chunks_mut(score_vec.len())
@@ -1565,6 +1658,9 @@ fn splmm_raw_scan_exact_block_single_buffer(
         } else {
             run();
         }
+        if let Some(t0) = decode_t0 {
+            timing.decode_secs += t0.elapsed().as_secs_f64();
+        }
         exact_workspace.scan_decoded_block(
             factor,
             x_design,
@@ -1576,9 +1672,10 @@ fn splmm_raw_scan_exact_block_single_buffer(
             solve_workspace,
             pool,
             threads,
-            &mut scan_timing,
-            false,
+            timing,
+            stage_timing,
         )?;
+        let sink_t0 = stage_timing.then(Instant::now);
         let payload = SplmmRawTsvBlockPayload {
             source_rows: source_rows[batch_start..batch_end].to_vec(),
             alt_freq: alt_freq[batch_start..batch_end].to_vec(),
@@ -1586,6 +1683,9 @@ fn splmm_raw_scan_exact_block_single_buffer(
             results: exact_workspace.out_block[..batch_rows * 3].to_vec(),
         };
         sink(payload)?;
+        if let Some(t0) = sink_t0 {
+            timing.sink_secs += t0.elapsed().as_secs_f64();
+        }
         total_kept = total_kept.saturating_add(batch_rows);
     }
     Ok(total_kept)
@@ -1713,10 +1813,77 @@ where
     })
 }
 
+fn format_splmm_raw_tsv_block(
+    sites: &[crate::gfcore::SiteInfo],
+    alt_freq: &[f32],
+    missing_rate: &[f32],
+    results: &[f64],
+    model_key: &'static str,
+    format_threads: usize,
+    format_pool: Option<&rayon::ThreadPool>,
+) -> Result<Vec<String>, String> {
+    let rows = sites.len();
+    if alt_freq.len() != rows
+        || missing_rate.len() != rows
+        || results.len() != rows.saturating_mul(3)
+    {
+        return Err(format!(
+            "raw SparseLMM TSV formatting length mismatch: sites={rows}, af={}, miss={}, results={}",
+            alt_freq.len(),
+            missing_rate.len(),
+            results.len()
+        ));
+    }
+    if rows == 0 {
+        return Ok(Vec::new());
+    }
+
+    let format_range = |start: usize, end: usize| -> Result<String, String> {
+        let mut text = String::with_capacity((end - start).saturating_mul(96));
+        append_assoc_block_from_core_sites(
+            &mut text,
+            AssocResultLayout::ResultCols {
+                schema: AssocResultCols::Basic3,
+                row_stride: 3,
+            },
+            model_key,
+            AssocCoreSitesBlock {
+                sites: &sites[start..end],
+                maf: &alt_freq[start..end],
+                miss: AssocMissBlock::Rate(&missing_rate[start..end]),
+            },
+            &results[start * 3..end * 3],
+        )?;
+        Ok(text)
+    };
+
+    let n_chunks = format_threads.max(1).min(rows);
+    if n_chunks <= 1 || rows < 1024 {
+        return Ok(vec![format_range(0, rows)?]);
+    }
+    let Some(format_pool) = format_pool else {
+        return Ok(vec![format_range(0, rows)?]);
+    };
+    let rows_per_chunk = rows.div_ceil(n_chunks);
+    let n_chunks = rows.div_ceil(rows_per_chunk);
+    format_pool.install(|| {
+        (0..n_chunks)
+            .into_par_iter()
+            .map(|chunk_idx| {
+                let start = chunk_idx * rows_per_chunk;
+                let end = (start + rows_per_chunk).min(rows);
+                format_range(start, end)
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })
+}
+
 fn run_splmm_raw_bed_tsv_writer<R, F>(
     out_tsv: &str,
     bed_prefix: &str,
     gm: PackedGeneticModel,
+    format_pool: Option<Arc<rayon::ThreadPool>>,
+    format_threads: usize,
     run_scan: F,
 ) -> Result<(R, usize, SplmmTsvTiming), String>
 where
@@ -1725,19 +1892,27 @@ where
     const HEADER: &[u8] = b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n";
     const WRITER_CAPACITY: usize = 8 * 1024 * 1024;
     let start_t0 = Instant::now();
-    let (scan_result, writer_result) = std::thread::scope(|scope| {
-        let (tx, rx) = sync_channel::<SplmmRawTsvBlockPayload>(1);
-        let out_tsv = out_tsv.to_string();
-        let bed_prefix = bed_prefix.to_string();
-        let writer = scope.spawn(move || -> Result<(usize, SplmmTsvTiming), String> {
+    let format_threads = format_threads.max(1).min(
+        format_pool
+            .as_ref()
+            .map_or(1, |pool| pool.current_num_threads()),
+    );
+    let (scan_result, writer_result, producer_secs, send_secs, finish_secs) = std::thread::scope(
+        |scope| {
+            let (tx, rx) = sync_channel::<SplmmRawTsvBlockPayload>(1);
+            let out_tsv = out_tsv.to_string();
+            let bed_prefix = bed_prefix.to_string();
+            let writer = scope.spawn(move || -> Result<(usize, SplmmTsvTiming), String> {
             let output = File::create(&out_tsv)
                 .map_err(|e| format!("create {out_tsv}: {e}"))?;
             let mut writer = BufWriter::with_capacity(WRITER_CAPACITY, output);
-            let mut bim = BimChunkReader::open(&bed_prefix)?;
             let mut timing = SplmmTsvTiming {
-                format_threads: 1,
+                format_threads,
                 ..SplmmTsvTiming::default()
             };
+            let bim_t0 = Instant::now();
+            let mut bim = BimChunkReader::open(&bed_prefix)?;
+            timing.bim_secs += bim_t0.elapsed().as_secs_f64();
             writer
                 .write_all(HEADER)
                 .map_err(|e| format!("write header {out_tsv}: {e}"))?;
@@ -1765,7 +1940,9 @@ where
                 {
                     return Err("raw SparseLMM TSV source rows must be strictly increasing".to_string());
                 }
+                let bim_t0 = Instant::now();
                 let sites = bim.read_selected_rows(payload.source_rows.as_slice())?;
+                timing.bim_secs += bim_t0.elapsed().as_secs_f64();
                 if sites.len() != n_rows {
                     return Err(format!(
                         "BIM selected row count mismatch: got {}, expected {n_rows}",
@@ -1773,28 +1950,25 @@ where
                     ));
                 }
                 let format_t0 = Instant::now();
-                let mut text = String::with_capacity(n_rows.saturating_mul(96));
-                append_assoc_block_from_core_sites(
-                    &mut text,
-                    AssocResultLayout::ResultCols {
-                        schema: AssocResultCols::Basic3,
-                        row_stride: 3,
-                    },
-                    model_key,
-                    AssocCoreSitesBlock {
-                        sites: &sites,
-                        maf: &payload.alt_freq,
-                        miss: AssocMissBlock::Rate(&payload.missing_rate),
-                    },
+                let formatted_blocks = format_splmm_raw_tsv_block(
+                    &sites,
+                    &payload.alt_freq,
+                    &payload.missing_rate,
                     &payload.results,
+                    model_key,
+                    format_threads,
+                    format_pool.as_deref(),
                 )?;
                 timing.format_secs += format_t0.elapsed().as_secs_f64();
                 let write_t0 = Instant::now();
-                writer
-                    .write_all(text.as_bytes())
-                    .map_err(|e| format!("write {out_tsv}: {e}"))?;
+                let bytes_now = formatted_blocks.iter().try_fold(0usize, |bytes, text| {
+                    writer
+                        .write_all(text.as_bytes())
+                        .map_err(|e| format!("write {out_tsv}: {e}"))?;
+                    Ok::<usize, String>(bytes.saturating_add(text.len()))
+                })?;
                 timing.write_secs += write_t0.elapsed().as_secs_f64();
-                timing.bytes = timing.bytes.saturating_add(text.len());
+                timing.bytes = timing.bytes.saturating_add(bytes_now);
                 timing.blocks = timing.blocks.saturating_add(1);
                 rows_written = rows_written.saturating_add(n_rows);
                 last_source_row = payload.source_rows.last().copied();
@@ -1806,24 +1980,40 @@ where
             timing.write_secs += write_t0.elapsed().as_secs_f64();
             Ok((rows_written, timing))
         });
-        let mut sink = |payload| {
-            tx.send(payload)
-                .map_err(|e| format!("send raw SparseLMM TSV block: {e}"))?;
-            Ok(())
-        };
-        let scan_result = run_scan(&mut sink);
-        drop(tx);
-        let writer_result = match writer.join() {
-            Ok(result) => result,
-            Err(_) => Err("raw SparseLMM TSV writer thread panicked".to_string()),
-        };
-        (scan_result, writer_result)
-    });
+            let mut send_secs = 0.0_f64;
+            let mut sink = |payload| {
+                send_secs += send_tsv_payload_with_wait(&tx, payload)
+                    .map_err(|_| "send raw SparseLMM TSV block: writer receiver disconnected")?;
+                Ok(())
+            };
+            let producer_t0 = Instant::now();
+            let scan_result = run_scan(&mut sink);
+            let producer_secs = producer_t0.elapsed().as_secs_f64();
+            drop(sink);
+            drop(tx);
+            let finish_t0 = Instant::now();
+            let writer_result = match writer.join() {
+                Ok(result) => result,
+                Err(_) => Err("raw SparseLMM TSV writer thread panicked".to_string()),
+            };
+            let finish_secs = finish_t0.elapsed().as_secs_f64();
+            (
+                scan_result,
+                writer_result,
+                producer_secs,
+                send_secs,
+                finish_secs,
+            )
+        },
+    );
     let mut timing = writer_result
         .as_ref()
         .map(|(_, timing)| *timing)
         .unwrap_or_default();
-    timing.finish_secs = start_t0.elapsed().as_secs_f64();
+    timing.producer_secs = producer_secs;
+    timing.send_secs = send_secs;
+    timing.finish_secs = finish_secs;
+    timing.total_wall_secs = start_t0.elapsed().as_secs_f64();
     let rows_written = writer_result?.0;
     if rows_written == 0 {
         return Err(
@@ -4976,7 +5166,6 @@ fn estimate_rhat_and_scan_to_tsv(
         );
     }
     let total_rows = scan_prepared.n_rows();
-    let scan_exec_t0 = Instant::now();
     let (written_rows, tsv_timing) = scan_to_tsv_with_py_and_exact_p_sparse(
         &state.factor,
         &scan_prepared,
@@ -4998,14 +5187,13 @@ fn estimate_rhat_and_scan_to_tsv(
         mmap_window_mb,
         &mut state.solve_workspace,
     )?;
-    let scan_exec_secs = (scan_exec_t0.elapsed().as_secs_f64() - tsv_timing.finish_secs).max(0.0);
+    let scan_exec_secs = tsv_timing.scan_compute_secs();
     if splmm_top_level_timing_enabled() {
         emit_splmm_null_scan_core_timing(
             scan_mode.as_str(),
             factor_load_secs,
             scan_prepare_secs,
-            scan_exec_secs,
-            tsv_timing.finish_secs,
+            &tsv_timing,
             total_rows,
             y_vec.len(),
             x_design.len() / y_vec.len(),
@@ -5021,7 +5209,7 @@ fn estimate_rhat_and_scan_to_tsv(
         factor_load_secs,
         scan_prepare_secs,
         scan_exec_secs,
-        writer_wait_secs: tsv_timing.finish_secs,
+        writer_wait_secs: tsv_timing.writer_wait_secs(),
     })
 }
 
@@ -6282,6 +6470,7 @@ fn splmm_fused_approx_assoc_to_tsv(
     let scan_prepare_t0 = Instant::now();
     let fit =
         build_residualized_approx_scan_null_from_lambda_and_factor(factor, &x_design, &y_vec, lbd)?;
+    let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
     let gamma_info = splmm_raw_estimate_gamma(
         &mut reader,
         &bed_prefix,
@@ -6298,6 +6487,8 @@ fn splmm_fused_approx_assoc_to_tsv(
         rhat_seed,
         snps_only,
         &bimranges,
+        threads,
+        pool.as_deref(),
     )?;
     let model = fit.build_scan_model(&x_design, gamma_info.gamma)?;
     let score_f32 = cast_f64_slice_to_f32(model.score_vec())?;
@@ -6337,15 +6528,20 @@ fn splmm_fused_approx_assoc_to_tsv(
     let block_rows = block_rows.max(1).min(n_snps.max(1));
     let bytes_per_snp = reader.bytes_per_snp();
     let n_samples_full = reader.n_samples_full();
-    let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
+    let packed_stage_timing = splmm_packed_stage_timing_enabled();
+    let mut raw_scan_timing = SplmmPackedScanTiming::default();
     let mut source_bim = if snps_only || !bimranges.is_empty() {
         Some(BimChunkReader::open(&bed_prefix)?)
     } else {
         None
     };
-    let scan_exec_t0 = Instant::now();
-    let (_n_scanned, written_rows, tsv_timing) =
-        run_splmm_raw_bed_tsv_writer(&out_tsv, &bed_prefix, PackedGeneticModel::Add, |sink| {
+    let (_n_scanned, written_rows, tsv_timing) = run_splmm_raw_bed_tsv_writer(
+        &out_tsv,
+        &bed_prefix,
+        PackedGeneticModel::Add,
+        pool.clone(),
+        splmm_raw_tsv_format_threads(threads.max(1)),
+        |sink| {
             let progress_step = if progress_every == 0 {
                 (n_snps / 200).max(1)
             } else {
@@ -6383,14 +6579,20 @@ fn splmm_fused_approx_assoc_to_tsv(
                         &packed_byte_lut().code4,
                         &decode_plan,
                         pool.as_ref(),
+                        &mut raw_scan_timing,
+                        packed_stage_timing,
                     )?;
                     if !block.source_rows.is_empty() {
+                        let sink_t0 = packed_stage_timing.then(Instant::now);
                         sink(SplmmRawTsvBlockPayload {
                             source_rows: block.source_rows,
                             alt_freq: block.alt_freq,
                             missing_rate: block.missing_rate,
                             results: block.results,
                         })?;
+                        if let Some(t0) = sink_t0 {
+                            raw_scan_timing.sink_secs += t0.elapsed().as_secs_f64();
+                        }
                     }
                     let source_end = source_start.saturating_add(rows_here);
                     if scan_progress_callback.is_some()
@@ -6416,15 +6618,27 @@ fn splmm_fused_approx_assoc_to_tsv(
                 bim.ensure_exhausted(n_snps)?;
             }
             Ok(n_snps)
-        })?;
-    let scan_exec_secs = scan_exec_t0.elapsed().as_secs_f64();
+        },
+    )?;
+    let scan_exec_secs = tsv_timing.scan_compute_secs();
+    let writer_wait_secs = tsv_timing.writer_wait_secs();
+    if packed_stage_timing {
+        emit_splmm_packed_scan_timing(
+            "approx-fused",
+            &raw_scan_timing,
+            scan_exec_secs,
+            written_rows,
+            n,
+            p,
+            threads.max(1),
+        );
+    }
     if splmm_top_level_timing_enabled() {
         emit_splmm_null_scan_core_timing(
             "approx-fused",
             factor_load_secs,
             scan_prepare_secs,
-            scan_exec_secs,
-            tsv_timing.finish_secs,
+            &tsv_timing,
             written_rows,
             n,
             p,
@@ -6436,7 +6650,7 @@ fn splmm_fused_approx_assoc_to_tsv(
         + factor_load_secs
         + scan_prepare_secs
         + scan_exec_secs
-        + tsv_timing.finish_secs;
+        + writer_wait_secs;
     Ok((
         gamma_info.gamma,
         true,
@@ -6452,7 +6666,7 @@ fn splmm_fused_approx_assoc_to_tsv(
             input_prepare_secs,
             0.0,
             factor_load_secs + scan_prepare_secs + scan_exec_secs,
-            tsv_timing.finish_secs,
+            writer_wait_secs,
             0.0,
             (total_secs - accounted).max(0.0),
             total_secs,
@@ -6627,9 +6841,15 @@ fn splmm_fused_exact_assoc_to_tsv(
         None
     };
     let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
-    let scan_exec_t0 = Instant::now();
-    let (_n_scanned, written_rows, tsv_timing) =
-        run_splmm_raw_bed_tsv_writer(&out_tsv, &bed_prefix, PackedGeneticModel::Add, |sink| {
+    let packed_stage_timing = splmm_packed_stage_timing_enabled();
+    let mut raw_scan_timing = SplmmPackedScanTiming::default();
+    let (_n_scanned, written_rows, tsv_timing) = run_splmm_raw_bed_tsv_writer(
+        &out_tsv,
+        &bed_prefix,
+        PackedGeneticModel::Add,
+        pool.clone(),
+        1,
+        |sink| {
             let mut next_progress = progress_step.max(1);
             run_splmm_raw_bed_prefetch(
                 reader,
@@ -6668,6 +6888,8 @@ fn splmm_fused_exact_assoc_to_tsv(
                         &decode_plan,
                         threads,
                         pool.as_ref(),
+                        &mut raw_scan_timing,
+                        packed_stage_timing,
                         sink,
                     )?;
                     let source_end = source_start.saturating_add(rows_here);
@@ -6694,15 +6916,27 @@ fn splmm_fused_exact_assoc_to_tsv(
                 bim.ensure_exhausted(n_snps)?;
             }
             Ok(n_snps)
-        })?;
-    let scan_exec_secs = scan_exec_t0.elapsed().as_secs_f64();
+        },
+    )?;
+    let scan_exec_secs = tsv_timing.scan_compute_secs();
+    let writer_wait_secs = tsv_timing.writer_wait_secs();
+    if packed_stage_timing {
+        emit_splmm_packed_scan_timing(
+            "exact-fused",
+            &raw_scan_timing,
+            scan_exec_secs,
+            written_rows,
+            n,
+            p,
+            threads.max(1),
+        );
+    }
     if splmm_top_level_timing_enabled() {
         emit_splmm_null_scan_core_timing(
             "exact-fused",
             factor_load_secs,
             scan_prepare_secs,
-            scan_exec_secs,
-            tsv_timing.finish_secs,
+            &tsv_timing,
             written_rows,
             n,
             p,
@@ -6726,7 +6960,7 @@ fn splmm_fused_exact_assoc_to_tsv(
             input_prepare_secs,
             0.0,
             null_scan_core_secs,
-            tsv_timing.finish_secs,
+            writer_wait_secs,
             0.0,
             0.0,
             total_secs,
@@ -8113,12 +8347,130 @@ mod tests {
         }
     }
 
+    #[test]
+    fn raw_tsv_parallel_formatting_preserves_serial_bytes_and_row_order() {
+        let rows = 1201usize;
+        let sites = (0..rows)
+            .map(|row| crate::gfcore::SiteInfo {
+                chrom: "1".to_string(),
+                pos: row as i32 + 1,
+                snp: format!("rs{row}"),
+                ref_allele: "A".to_string(),
+                alt_allele: "G".to_string(),
+            })
+            .collect::<Vec<_>>();
+        let alt_freq = (0..rows)
+            .map(|row| 0.1_f32 + (row % 401) as f32 / 1000.0)
+            .collect::<Vec<_>>();
+        let missing_rate = (0..rows)
+            .map(|row| (row % 17) as f32 / 1000.0)
+            .collect::<Vec<_>>();
+        let results = (0..rows)
+            .flat_map(|row| {
+                let value = row as f64 / 1000.0;
+                [value, value + 0.25, value + 0.5]
+            })
+            .collect::<Vec<_>>();
+
+        let serial = format_splmm_raw_tsv_block(
+            &sites,
+            &alt_freq,
+            &missing_rate,
+            &results,
+            splmm_model_key(PackedGeneticModel::Add),
+            1,
+            None,
+        )
+        .expect("format raw TSV block serially")
+        .concat();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(3)
+            .build()
+            .expect("build test TSV formatter pool");
+        let parallel = format_splmm_raw_tsv_block(
+            &sites,
+            &alt_freq,
+            &missing_rate,
+            &results,
+            splmm_model_key(PackedGeneticModel::Add),
+            3,
+            Some(&pool),
+        )
+        .expect("format raw TSV block in parallel")
+        .concat();
+
+        assert_eq!(parallel, serial);
+        assert_eq!(parallel.lines().count(), rows);
+        assert!(parallel.lines().next().unwrap().contains("\trs0\t"));
+        assert!(parallel
+            .lines()
+            .last()
+            .unwrap()
+            .contains(&format!("\trs{}\t", rows - 1)));
+    }
+
     fn pack_plink_codes(codes: &[u8]) -> Vec<u8> {
         let mut row = vec![0u8; codes.len().div_ceil(4)];
         for (sample_idx, &code) in codes.iter().enumerate() {
             row[sample_idx >> 2] |= (code & 0b11) << ((sample_idx & 3) * 2);
         }
         row
+    }
+
+    #[test]
+    fn raw_writer_finish_timing_excludes_scan_producer_time() {
+        use std::fs;
+        use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("janusx_splmm_writer_timing_{stamp}"));
+        fs::create_dir_all(&dir).expect("create temporary output directory");
+        let prefix = dir.join("tiny");
+        fs::write(prefix.with_extension("bim"), "1 rs1 0 10 A G\n").expect("write BIM");
+        fs::write(
+            prefix.with_extension("fam"),
+            "f1 s1 0 0 1 -9\nf2 s2 0 0 1 -9\nf3 s3 0 0 1 -9\nf4 s4 0 0 1 -9\n",
+        )
+        .expect("write FAM");
+        let mut bed = vec![0x6c, 0x1b, 0x01];
+        bed.extend(pack_plink_codes(&[0b00, 0b10, 0b01, 0b11]));
+        fs::write(prefix.with_extension("bed"), bed).expect("write BED");
+
+        let output = dir.join("assoc.tsv");
+        let (_, rows, timing) = run_splmm_raw_bed_tsv_writer(
+            output.to_str().unwrap(),
+            prefix.to_str().unwrap(),
+            PackedGeneticModel::Add,
+            None,
+            1,
+            |sink| {
+                std::thread::sleep(Duration::from_millis(80));
+                sink(SplmmRawTsvBlockPayload {
+                    source_rows: vec![0],
+                    alt_freq: vec![0.5],
+                    missing_rate: vec![0.0],
+                    results: vec![0.1, 0.2, 0.4],
+                })?;
+                Ok(1usize)
+            },
+        )
+        .expect("write raw TSV and capture phase timings");
+
+        assert_eq!(rows, 1);
+        assert!(
+            timing.finish_secs + 0.05 < timing.producer_secs,
+            "finish_secs should measure only the writer tail after the producer: {timing:?}"
+        );
+        assert!(
+            timing.producer_secs >= 0.07,
+            "producer timing lost its delay: {timing:?}"
+        );
+        assert!(timing.total_wall_secs >= timing.producer_secs);
+        assert!(timing.scan_compute_secs() >= 0.07);
+        fs::remove_dir_all(dir).expect("remove temporary output directory");
     }
 
     #[test]
@@ -8216,6 +8568,8 @@ mod tests {
             &packed_byte_lut().code4,
             &decode_plan,
             None,
+            &mut SplmmPackedScanTiming::default(),
+            false,
         )
         .unwrap();
 
@@ -8279,6 +8633,8 @@ mod tests {
             &packed_byte_lut().code4,
             &decode_plan,
             None,
+            &mut SplmmPackedScanTiming::default(),
+            false,
         )
         .unwrap();
         assert_eq!(cov_block.source_rows, block.source_rows);
@@ -8335,6 +8691,31 @@ mod tests {
         assert_eq!(observed_bed, packed_rows.concat());
 
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn fused_intercept_dot_sum_sumsq_matches_separate_reductions() {
+        for n in [0usize, 1, 3, 4, 5, 8, 9, 17] {
+            let genotype = (0..n)
+                .map(|idx| match idx % 6 {
+                    0 => 0.0_f32,
+                    1 => 1.0_f32,
+                    2 => 2.0_f32,
+                    3 => 0.6666667_f32,
+                    4 => 1.3333333_f32,
+                    _ => 0.0_f32,
+                })
+                .collect::<Vec<_>>();
+            let score = (0..n)
+                .map(|idx| (idx as f32 * 0.17_f32).sin())
+                .collect::<Vec<_>>();
+            let expected_dot = crate::he::dot_sum_intercept_f32_row(&genotype, &score);
+            let expected_sumsq = additive_row_sumsq_f64(&genotype);
+            let observed = crate::he::dot_sum_sumsq_intercept_f32_row(&genotype, &score);
+            assert_eq!(observed.0.to_bits(), expected_dot.0.to_bits(), "n={n}");
+            assert_eq!(observed.1.to_bits(), expected_dot.1.to_bits(), "n={n}");
+            assert_eq!(observed.2.to_bits(), expected_sumsq.to_bits(), "n={n}");
+        }
     }
 
     #[test]
@@ -8402,6 +8783,8 @@ mod tests {
             &decode_plan,
             1,
             None,
+            &mut SplmmPackedScanTiming::default(),
+            false,
             &mut sink,
         )
         .unwrap();

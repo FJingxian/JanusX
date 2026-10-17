@@ -867,7 +867,6 @@ pub(crate) fn estimate_residualized_approx_scan_to_tsv_sparse(
         &model,
     )?;
     let scan_prepare_secs = prepare_t0.elapsed().as_secs_f64();
-    let scan_exec_t0 = Instant::now();
     let (written_rows, tsv_timing) = scan_to_tsv_with_py_and_rhat(
         &scan_prepared,
         x_design.as_slice(),
@@ -885,14 +884,14 @@ pub(crate) fn estimate_residualized_approx_scan_to_tsv_sparse(
         9,
         mmap_window_mb,
     )?;
-    let scan_exec_secs = (scan_exec_t0.elapsed().as_secs_f64() - tsv_timing.finish_secs).max(0.0);
+    let scan_exec_secs = tsv_timing.scan_compute_secs();
+    let writer_wait_secs = tsv_timing.writer_wait_secs();
     if splmm_top_level_timing_enabled() {
         emit_splmm_null_scan_core_timing(
             "approx",
             factor_load_secs,
             scan_prepare_secs,
-            scan_exec_secs,
-            tsv_timing.finish_secs,
+            &tsv_timing,
             scan_prepared.n_rows(),
             n,
             p,
@@ -908,7 +907,7 @@ pub(crate) fn estimate_residualized_approx_scan_to_tsv_sparse(
         factor_load_secs,
         scan_prepare_secs,
         scan_exec_secs,
-        writer_wait_secs: tsv_timing.finish_secs,
+        writer_wait_secs,
     })
 }
 
@@ -924,6 +923,64 @@ impl ResidualizedApproxNullFit {
         markers_col_major: &[f64],
         n_markers: usize,
         soft_cap_markers: usize,
+    ) -> Result<(f64, usize), String> {
+        self.estimate_gamma_from_markers_with_batch_size(
+            x_design,
+            markers_col_major,
+            n_markers,
+            soft_cap_markers,
+            32,
+        )
+    }
+
+    pub(crate) fn estimate_gamma_from_markers_with_parallelism(
+        &self,
+        x_design: &[f64],
+        markers_col_major: &[f64],
+        n_markers: usize,
+        soft_cap_markers: usize,
+        threads: usize,
+        pool: Option<&rayon::ThreadPool>,
+    ) -> Result<(f64, usize), String> {
+        self.estimate_gamma_from_markers_with_parallelism_and_batch_size(
+            x_design,
+            markers_col_major,
+            n_markers,
+            soft_cap_markers,
+            256,
+            threads,
+            pool,
+        )
+    }
+
+    fn estimate_gamma_from_markers_with_batch_size(
+        &self,
+        x_design: &[f64],
+        markers_col_major: &[f64],
+        n_markers: usize,
+        soft_cap_markers: usize,
+        solve_batch_markers: usize,
+    ) -> Result<(f64, usize), String> {
+        self.estimate_gamma_from_markers_with_parallelism_and_batch_size(
+            x_design,
+            markers_col_major,
+            n_markers,
+            soft_cap_markers,
+            solve_batch_markers,
+            1,
+            None,
+        )
+    }
+
+    fn estimate_gamma_from_markers_with_parallelism_and_batch_size(
+        &self,
+        x_design: &[f64],
+        markers_col_major: &[f64],
+        n_markers: usize,
+        soft_cap_markers: usize,
+        solve_batch_markers: usize,
+        threads: usize,
+        pool: Option<&rayon::ThreadPool>,
     ) -> Result<(f64, usize), String> {
         let (n, p) = validate_design_and_response(x_design, self.y_resid.as_slice())?;
         if markers_col_major.len() != n.saturating_mul(n_markers) {
@@ -945,6 +1002,25 @@ impl ResidualizedApproxNullFit {
         let mut xtz = vec![0.0_f64; p];
         let mut alpha = vec![0.0_f64; p];
         let mut g_resid = vec![0.0_f64; n];
+        let batch_capacity = solve_batch_markers.max(1).min(n_markers.max(1));
+        let solve_threads = pool
+            .map(|thread_pool| thread_pool.current_num_threads())
+            .unwrap_or(threads)
+            .max(1);
+        let solve_tiles = if solve_threads > 1 && batch_capacity >= 32 {
+            solve_threads.min(batch_capacity.div_ceil(32)).max(1)
+        } else {
+            1
+        };
+        let tile_rhs_capacity = batch_capacity.div_ceil(solve_tiles);
+        let mut solve_workspaces = (0..solve_tiles)
+            .map(|_| self.factor.make_solve_workspace(tile_rhs_capacity.max(1)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut rhs_batch = Vec::<f64>::with_capacity(n.saturating_mul(batch_capacity));
+        let mut original_rhs_batch = Vec::<f64>::with_capacity(n.saturating_mul(batch_capacity));
+        let mut batch_marker_indices = Vec::<usize>::with_capacity(batch_capacity);
+        let mut batch_s_ms = Vec::<f64>::with_capacity(batch_capacity);
+        let mut batch_scores = Vec::<f64>::with_capacity(batch_capacity);
         let mut fastgwa_ratio_sum = 0.0_f64;
         let mut residualized_ratio_sum = 0.0_f64;
         let mut schur_sum = 0.0_f64;
@@ -952,64 +1028,103 @@ impl ResidualizedApproxNullFit {
         let mut exact_ratio_sum = 0.0_f64;
         let mut residualized_n_used = 0usize;
         let mut n_used = 0usize;
-        for marker_idx in 0..n_markers {
-            let g = &markers_col_major[marker_idx * n..(marker_idx + 1) * n];
-            let g_sq = dot_f64(g, g);
-            residualize_vector_with_chol(
-                x_design,
-                xtx_chol.as_slice(),
-                g,
-                &mut g_resid,
-                &mut xtg,
-                &mut alpha,
-            )?;
-            let s_ms = dot_f64(g_resid.as_slice(), g_resid.as_slice());
-            if splmm_residual_sumsq_is_effectively_zero(s_ms, g_sq) {
-                continue;
-            }
-            let residualized_v_inv_g = self.factor.solve_vec(g_resid.as_slice())?;
-            let residualized_s_v_s = dot_f64(g_resid.as_slice(), residualized_v_inv_g.as_slice());
-            if !residualized_s_v_s.is_finite() || residualized_s_v_s <= SPLMM_APPROX_TINY {
-                continue;
-            }
-            let residualized_ratio = residualized_s_v_s / s_ms;
-            if !residualized_ratio.is_finite() || residualized_ratio <= 0.0 {
-                continue;
-            }
-            residualized_ratio_sum += residualized_ratio;
-            residualized_n_used += 1;
-
-            let score = dot_f64(g_resid.as_slice(), self.a_vec.as_slice());
-            // a_vec uses the full inverse covariance. Apply the same variance
-            // scale to the marker quadratic form so the null filter is unit invariant.
-            let chisq = (score * score) / (residualized_s_v_s * self.gamma_scale_correction);
-            if chisq.is_finite() && chisq < SPLMM_APPROX_FASTGWA_NULL_CHISQ_MAX {
-                fastgwa_ratio_sum += residualized_ratio;
-                n_used += 1;
+        let mut marker_start = 0usize;
+        let mut stop_after_batch = false;
+        while marker_start < n_markers && !stop_after_batch {
+            let marker_end = marker_start.saturating_add(batch_capacity).min(n_markers);
+            rhs_batch.clear();
+            original_rhs_batch.clear();
+            batch_marker_indices.clear();
+            batch_s_ms.clear();
+            batch_scores.clear();
+            for marker_idx in marker_start..marker_end {
+                let g = &markers_col_major[marker_idx * n..(marker_idx + 1) * n];
+                let g_sq = dot_f64(g, g);
+                residualize_vector_with_chol(
+                    x_design,
+                    xtx_chol.as_slice(),
+                    g,
+                    &mut g_resid,
+                    &mut xtg,
+                    &mut alpha,
+                )?;
+                let s_ms = dot_f64(g_resid.as_slice(), g_resid.as_slice());
+                if splmm_residual_sumsq_is_effectively_zero(s_ms, g_sq) {
+                    continue;
+                }
+                batch_scores.push(dot_f64(g_resid.as_slice(), self.a_vec.as_slice()));
+                batch_marker_indices.push(marker_idx);
+                batch_s_ms.push(s_ms);
+                original_rhs_batch.extend_from_slice(g_resid.as_slice());
+                rhs_batch.extend_from_slice(g_resid.as_slice());
             }
 
-            if gamma_debug {
-                let v_inv_g = self.factor.solve_vec(g)?;
-                let s_v_s = dot_f64(g, v_inv_g.as_slice());
-                if s_v_s.is_finite() && s_v_s > SPLMM_APPROX_TINY {
-                    xt_vec_row_major(x_design, n, p, v_inv_g.as_slice(), &mut xtz);
-                    cholesky_solve_into(xt_v_inv_x_chol.as_slice(), p, xtz.as_slice(), &mut alpha);
-                    let x_quad = xtz
-                        .iter()
-                        .zip(alpha.iter())
-                        .map(|(a, b)| a * b)
-                        .sum::<f64>();
-                    let schur = (s_v_s - x_quad).max(0.0_f64);
-                    if schur.is_finite() && schur > SPLMM_APPROX_TINY {
-                        exact_ratio_sum += schur / s_ms;
-                        schur_sum += schur;
-                        s_ms_sum += s_ms;
+            let n_rhs = batch_marker_indices.len();
+            if n_rhs > 0 {
+                self.factor.solve_in_place_tiled(
+                    rhs_batch.as_mut_slice(),
+                    n_rhs,
+                    &mut solve_workspaces,
+                    pool,
+                )?;
+                for batch_idx in 0..n_rhs {
+                    let marker_idx = batch_marker_indices[batch_idx];
+                    let g = &markers_col_major[marker_idx * n..(marker_idx + 1) * n];
+                    let g_resid = &original_rhs_batch[batch_idx * n..(batch_idx + 1) * n];
+                    let v_inv_g = &rhs_batch[batch_idx * n..(batch_idx + 1) * n];
+                    let s_ms = batch_s_ms[batch_idx];
+                    let residualized_s_v_s = dot_f64(g_resid, v_inv_g);
+                    if !residualized_s_v_s.is_finite() || residualized_s_v_s <= SPLMM_APPROX_TINY {
+                        continue;
+                    }
+                    let residualized_ratio = residualized_s_v_s / s_ms;
+                    if !residualized_ratio.is_finite() || residualized_ratio <= 0.0 {
+                        continue;
+                    }
+                    residualized_ratio_sum += residualized_ratio;
+                    residualized_n_used += 1;
+
+                    let score = batch_scores[batch_idx];
+                    // a_vec uses the full inverse covariance. Apply the same variance
+                    // scale to the marker quadratic form so the null filter is unit invariant.
+                    let chisq =
+                        (score * score) / (residualized_s_v_s * self.gamma_scale_correction);
+                    if chisq.is_finite() && chisq < SPLMM_APPROX_FASTGWA_NULL_CHISQ_MAX {
+                        fastgwa_ratio_sum += residualized_ratio;
+                        n_used += 1;
+                    }
+
+                    if gamma_debug {
+                        let v_inv_g = self.factor.solve_vec(g)?;
+                        let s_v_s = dot_f64(g, v_inv_g.as_slice());
+                        if s_v_s.is_finite() && s_v_s > SPLMM_APPROX_TINY {
+                            xt_vec_row_major(x_design, n, p, v_inv_g.as_slice(), &mut xtz);
+                            cholesky_solve_into(
+                                xt_v_inv_x_chol.as_slice(),
+                                p,
+                                xtz.as_slice(),
+                                &mut alpha,
+                            );
+                            let x_quad = xtz
+                                .iter()
+                                .zip(alpha.iter())
+                                .map(|(a, b)| a * b)
+                                .sum::<f64>();
+                            let schur = (s_v_s - x_quad).max(0.0_f64);
+                            if schur.is_finite() && schur > SPLMM_APPROX_TINY {
+                                exact_ratio_sum += schur / s_ms;
+                                schur_sum += schur;
+                                s_ms_sum += s_ms;
+                            }
+                        }
+                    }
+                    if marker_idx + 1 >= soft_cap_markers && n_used >= 100 {
+                        stop_after_batch = true;
+                        break;
                     }
                 }
             }
-            if marker_idx + 1 >= soft_cap_markers && n_used >= 100 {
-                break;
-            }
+            marker_start = marker_end;
         }
         if n_used == 0 && residualized_n_used == 0 {
             return Err(
@@ -1203,6 +1318,74 @@ mod tests {
         sparse_cholesky_analyze_jxgrm_csc(&csc).unwrap()
     }
 
+    fn estimate_gamma_scalar_reference(
+        fit: &ResidualizedApproxNullFit,
+        x_design: &[f64],
+        markers_col_major: &[f64],
+        n_markers: usize,
+        soft_cap_markers: usize,
+    ) -> Result<(f64, usize), String> {
+        let (n, p) = validate_design_and_response(x_design, fit.y_resid.as_slice())?;
+        let xtx_chol = xtx_chol_from_design(x_design, n, p)?;
+        let mut xtg = vec![0.0_f64; p];
+        let mut alpha = vec![0.0_f64; p];
+        let mut g_resid = vec![0.0_f64; n];
+        let mut fastgwa_ratio_sum = 0.0_f64;
+        let mut residualized_ratio_sum = 0.0_f64;
+        let mut residualized_n_used = 0usize;
+        let mut n_used = 0usize;
+        for marker_idx in 0..n_markers {
+            let g = &markers_col_major[marker_idx * n..(marker_idx + 1) * n];
+            let g_sq = dot_f64(g, g);
+            residualize_vector_with_chol(
+                x_design,
+                xtx_chol.as_slice(),
+                g,
+                &mut g_resid,
+                &mut xtg,
+                &mut alpha,
+            )?;
+            let s_ms = dot_f64(g_resid.as_slice(), g_resid.as_slice());
+            if splmm_residual_sumsq_is_effectively_zero(s_ms, g_sq) {
+                continue;
+            }
+            let v_inv_g = fit.factor.solve_vec(g_resid.as_slice())?;
+            let v_inv_quad = dot_f64(g_resid.as_slice(), v_inv_g.as_slice());
+            if !v_inv_quad.is_finite() || v_inv_quad <= SPLMM_APPROX_TINY {
+                continue;
+            }
+            let ratio = v_inv_quad / s_ms;
+            if !ratio.is_finite() || ratio <= 0.0 {
+                continue;
+            }
+            residualized_ratio_sum += ratio;
+            residualized_n_used += 1;
+            let score = dot_f64(g_resid.as_slice(), fit.a_vec.as_slice());
+            let chisq = (score * score) / (v_inv_quad * fit.gamma_scale_correction);
+            if chisq.is_finite() && chisq < SPLMM_APPROX_FASTGWA_NULL_CHISQ_MAX {
+                fastgwa_ratio_sum += ratio;
+                n_used += 1;
+            }
+            if marker_idx + 1 >= soft_cap_markers && n_used >= 100 {
+                break;
+            }
+        }
+        if n_used == 0 && residualized_n_used == 0 {
+            return Err("no scalar reference gamma markers were valid".to_string());
+        }
+        if n_used >= 100 {
+            Ok((
+                fastgwa_ratio_sum / n_used as f64 * fit.gamma_scale_correction,
+                n_used,
+            ))
+        } else {
+            Ok((
+                residualized_ratio_sum / residualized_n_used as f64 * fit.gamma_scale_correction,
+                residualized_n_used,
+            ))
+        }
+    }
+
     #[test]
     fn residualize_response_matches_manual_projection() {
         let x_design = vec![
@@ -1338,6 +1521,105 @@ mod tests {
             assert!((scaled_assoc.1 / scale.abs() - assoc.1).abs() < 1e-12);
             assert!((scaled_assoc.2 - assoc.2).abs() < 1e-12);
         }
+    }
+
+    #[test]
+    fn batched_gamma_rhs_matches_scalar_reference_across_soft_cap_boundary() {
+        let n = 64usize;
+        let analysis = make_diag_analysis(
+            &(0..n)
+                .map(|i| 1.0_f64 + (i % 11) as f64 / 7.0)
+                .collect::<Vec<_>>(),
+        );
+        let x_design = (0..n)
+            .flat_map(|i| [1.0_f64, i as f64 / n as f64])
+            .collect::<Vec<_>>();
+        let y = (0..n)
+            .map(|i| ((i * 37 % 97) as f64 / 31.0) - 1.5)
+            .collect::<Vec<_>>();
+        let fit = build_residualized_approx_scan_null_from_lambda_and_factor(
+            analysis.factorize_k_plus_lambda_i(0.7).unwrap(),
+            &x_design,
+            &y,
+            0.7,
+        )
+        .unwrap();
+        let n_markers = 160usize;
+        let markers = (0..n_markers)
+            .flat_map(|marker| {
+                (0..n).map(move |sample| {
+                    if marker % 19 == 0 {
+                        1.0
+                    } else {
+                        ((sample * 17 + marker * 31) % 5) as f64
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let expected = estimate_gamma_scalar_reference(&fit, &x_design, &markers, n_markers, 100)
+            .expect("scalar gamma reference");
+        assert!(expected.1 >= 100 && expected.1 < n_markers);
+        let expected_assoc = fit
+            .build_scan_model(&x_design, expected.0)
+            .unwrap()
+            .assoc_from_marker(&markers[(n_markers - 1) * n..n_markers * n])
+            .unwrap();
+        for batch_size in [0, 1, 7, 32, 64, 160, 256] {
+            let observed = fit
+                .estimate_gamma_from_markers_with_batch_size(
+                    &x_design, &markers, n_markers, 100, batch_size,
+                )
+                .expect("batched gamma estimate");
+
+            assert_eq!(observed.1, expected.1, "batch_size={batch_size}");
+            assert!(
+                (observed.0 - expected.0).abs() <= 1e-12,
+                "batch_size={batch_size}"
+            );
+            let observed_assoc = fit
+                .build_scan_model(&x_design, observed.0)
+                .unwrap()
+                .assoc_from_marker(&markers[(n_markers - 1) * n..n_markers * n])
+                .unwrap();
+            assert!(
+                (observed_assoc.0 - expected_assoc.0).abs() <= 1e-12,
+                "batch_size={batch_size}"
+            );
+            assert!(
+                (observed_assoc.1 - expected_assoc.1).abs() <= 1e-12,
+                "batch_size={batch_size}"
+            );
+            assert!(
+                (observed_assoc.2 - expected_assoc.2).abs() <= 1e-12,
+                "batch_size={batch_size}"
+            );
+        }
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let parallel = fit
+            .estimate_gamma_from_markers_with_parallelism_and_batch_size(
+                &x_design,
+                &markers,
+                n_markers,
+                100,
+                256,
+                4,
+                Some(&pool),
+            )
+            .expect("parallel batched gamma estimate");
+        assert_eq!(parallel.1, expected.1);
+        assert!((parallel.0 - expected.0).abs() <= 1e-12);
+        let parallel_assoc = fit
+            .build_scan_model(&x_design, parallel.0)
+            .unwrap()
+            .assoc_from_marker(&markers[(n_markers - 1) * n..n_markers * n])
+            .unwrap();
+        assert!((parallel_assoc.0 - expected_assoc.0).abs() <= 1e-12);
+        assert!((parallel_assoc.1 - expected_assoc.1).abs() <= 1e-12);
+        assert!((parallel_assoc.2 - expected_assoc.2).abs() <= 1e-12);
     }
 
     #[test]

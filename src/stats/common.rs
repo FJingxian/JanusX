@@ -1,3 +1,5 @@
+use numpy::ndarray::{ArrayView, Dimension};
+use numpy::{Element, PyReadonlyArray};
 use pyo3::exceptions::PyKeyboardInterrupt;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::exceptions::PyValueError;
@@ -12,6 +14,40 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+
+/// Copy an ndarray view in logical standard (row-major) order.
+///
+/// Native kernels index flat buffers as row-major. ndarray iteration follows
+/// logical row order regardless of the physical layout, including strided views.
+#[inline]
+pub(crate) fn copy_array_standard_layout<T: Copy, D: Dimension>(
+    view: &ArrayView<'_, T, D>,
+) -> Vec<T> {
+    view.iter().copied().collect()
+}
+
+/// Borrow only standard-layout NumPy buffers, never column-major storage.
+/// NumPy's `as_slice()` accepts both C- and Fortran-contiguous arrays.
+#[inline]
+pub(crate) fn array_standard_slice<'a, T: Element, D: Dimension>(
+    array: &'a PyReadonlyArray<'_, T, D>,
+) -> Result<&'a [T], numpy::NotContiguousError> {
+    if array.as_array().is_standard_layout() {
+        array.as_slice()
+    } else {
+        Err(numpy::NotContiguousError)
+    }
+}
+
+#[inline]
+pub(crate) fn array_standard_cow<'a, T: Element + Copy, D: Dimension>(
+    array: &'a PyReadonlyArray<'_, T, D>,
+) -> std::borrow::Cow<'a, [T]> {
+    match array_standard_slice(array) {
+        Ok(slice) => std::borrow::Cow::Borrowed(slice),
+        Err(_) => std::borrow::Cow::Owned(copy_array_standard_layout(&array.as_array())),
+    }
+}
 
 pub(crate) const INTERRUPTED_MSG: &str = "Interrupted by user (Ctrl+C).";
 static INTERRUPT_REQUESTED: AtomicBool = AtomicBool::new(false);

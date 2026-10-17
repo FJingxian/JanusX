@@ -2218,9 +2218,9 @@ pub fn he_pcg_bed<'py>(
             )));
         }
 
-        let maf_full: Vec<f32> = match maf_ro.as_slice() {
+        let maf_full: Vec<f32> = match crate::stats_common::array_standard_slice(&maf_ro) {
             Ok(s) => s.to_vec(),
-            Err(_) => maf_ro.as_array().iter().copied().collect(),
+            Err(_) => crate::stats_common::copy_array_standard_layout(&maf_ro.as_array()),
         };
         if maf_full.len() != m_total {
             return Err(PyRuntimeError::new_err(format!(
@@ -2228,9 +2228,10 @@ pub fn he_pcg_bed<'py>(
                 maf_full.len()
             )));
         }
-        let row_flip_full: Vec<bool> = match row_flip_ro.as_slice() {
+        let row_flip_full: Vec<bool> = match crate::stats_common::array_standard_slice(&row_flip_ro)
+        {
             Ok(s) => s.to_vec(),
-            Err(_) => row_flip_ro.as_array().iter().copied().collect(),
+            Err(_) => crate::stats_common::copy_array_standard_layout(&row_flip_ro.as_array()),
         };
         if row_flip_full.len() != m_total {
             return Err(PyRuntimeError::new_err(format!(
@@ -2241,9 +2242,9 @@ pub fn he_pcg_bed<'py>(
 
         eff_m = m_total;
         if let Some(mask) = site_keep {
-            let mask_vec: Vec<bool> = match mask.as_slice() {
+            let mask_vec: Vec<bool> = match crate::stats_common::array_standard_slice(&mask) {
                 Ok(s) => s.to_vec(),
-                Err(_) => mask.as_array().iter().copied().collect(),
+                Err(_) => crate::stats_common::copy_array_standard_layout(&mask.as_array()),
             };
             if mask_vec.len() != m_total {
                 return Err(PyRuntimeError::new_err(format!(
@@ -2300,10 +2301,13 @@ pub fn he_pcg_bed<'py>(
         let row_source_ro = row_source_indices
             .as_ref()
             .expect("row_source_indices must exist for metadata stream path");
-        let row_source_vec_i64: Vec<i64> = match row_source_ro.as_slice() {
-            Ok(s) => s.to_vec(),
-            Err(_) => row_source_ro.as_array().iter().copied().collect(),
-        };
+        let row_source_vec_i64: Vec<i64> =
+            match crate::stats_common::array_standard_slice(&row_source_ro) {
+                Ok(s) => s.to_vec(),
+                Err(_) => {
+                    crate::stats_common::copy_array_standard_layout(&row_source_ro.as_array())
+                }
+            };
         if row_source_vec_i64.is_empty() {
             return Err(PyRuntimeError::new_err(
                 "row_source_indices must not be empty for metadata streaming path.",
@@ -2327,13 +2331,14 @@ pub fn he_pcg_bed<'py>(
                 "he_pcg_bed: metadata streaming path requires `row_flip` argument.",
             )
         })?;
-        let maf_vec: Vec<f32> = match maf_ro.as_slice() {
+        let maf_vec: Vec<f32> = match crate::stats_common::array_standard_slice(&maf_ro) {
             Ok(s) => s.to_vec(),
-            Err(_) => maf_ro.as_array().iter().copied().collect(),
+            Err(_) => crate::stats_common::copy_array_standard_layout(&maf_ro.as_array()),
         };
-        let row_flip_vec: Vec<bool> = match row_flip_ro.as_slice() {
+        let row_flip_vec: Vec<bool> = match crate::stats_common::array_standard_slice(&row_flip_ro)
+        {
             Ok(s) => s.to_vec(),
-            Err(_) => row_flip_ro.as_array().iter().copied().collect(),
+            Err(_) => crate::stats_common::copy_array_standard_layout(&row_flip_ro.as_array()),
         };
         if maf_vec.len() != row_source_vec.len() || row_flip_vec.len() != row_source_vec.len() {
             return Err(PyRuntimeError::new_err(format!(
@@ -2418,9 +2423,9 @@ pub fn he_pcg_bed<'py>(
 
         eff_m = m_total;
         if let Some(mask) = site_keep {
-            let mask_vec: Vec<bool> = match mask.as_slice() {
+            let mask_vec: Vec<bool> = match crate::stats_common::array_standard_slice(&mask) {
                 Ok(s) => s.to_vec(),
-                Err(_) => mask.as_array().iter().copied().collect(),
+                Err(_) => crate::stats_common::copy_array_standard_layout(&mask.as_array()),
             };
             if mask_vec.len() != m_total {
                 return Err(PyRuntimeError::new_err(format!(
@@ -2473,9 +2478,9 @@ pub fn he_pcg_bed<'py>(
             "train_sample_indices must not be empty.",
         ));
     }
-    let y_vec_f64: Vec<f64> = match y_train.as_slice() {
+    let y_vec_f64: Vec<f64> = match crate::stats_common::array_standard_slice(&y_train) {
         Ok(s) => s.to_vec(),
-        Err(_) => y_train.as_array().iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&y_train.as_array()),
     };
     if y_vec_f64.len() != train_idx.len() {
         return Err(PyRuntimeError::new_err(format!(
@@ -2502,9 +2507,9 @@ pub fn he_pcg_bed<'py>(
                 "x_cov must have at least one column",
             ));
         }
-        let x_flat: Cow<[f64]> = match x_cov_ro.as_slice() {
+        let x_flat: Cow<[f64]> = match crate::stats_common::array_standard_slice(&x_cov_ro) {
             Ok(s) => Cow::Borrowed(s),
-            Err(_) => Cow::Owned(x_arr.iter().copied().collect()),
+            Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&x_arr)),
         };
         if rows == n_samples {
             let mut out = vec![0.0_f64; train_idx.len() * p];
@@ -2575,10 +2580,13 @@ pub fn he_pcg_bed<'py>(
             .take()
             .expect("packed payload must exist");
         let packed_view = resident_packed_ro.as_array();
-        let packed_flat: Cow<[u8]> = match resident_packed_ro.as_slice() {
-            Ok(s) => Cow::Borrowed(s),
-            Err(_) => Cow::Owned(packed_view.iter().copied().collect()),
-        };
+        let packed_flat: Cow<[u8]> =
+            match crate::stats_common::array_standard_slice(&resident_packed_ro) {
+                Ok(s) => Cow::Borrowed(s),
+                Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+                    &packed_view,
+                )),
+            };
         let maf_keep = resident_maf_full.take().expect("maf metadata must exist");
         let row_flip_keep = resident_row_flip_full
             .take()

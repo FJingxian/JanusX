@@ -6112,9 +6112,9 @@ pub fn spgrm_packed_to_jxgrm<'py>(
             "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps}"
         )));
     }
-    let packed_flat: Vec<u8> = match packed.as_slice() {
+    let packed_flat: Vec<u8> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s) => s.to_vec(),
-        Err(_) => packed_arr.iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&packed_arr),
     };
     let row_flip_vec = row_flip.as_slice()?.to_vec();
     let row_maf_vec = row_maf.as_slice()?.to_vec();
@@ -6296,13 +6296,13 @@ pub fn spgrm_bed_to_jxgrm_from_meta<'py>(
             }
         })
         .collect::<PyResult<Vec<_>>>()?;
-    let row_flip_vec: Vec<bool> = match row_flip.as_slice() {
+    let row_flip_vec: Vec<bool> = match crate::stats_common::array_standard_slice(&row_flip) {
         Ok(s) => s.to_vec(),
-        Err(_) => row_flip.as_array().iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&row_flip.as_array()),
     };
-    let row_maf_vec: Vec<f32> = match row_maf.as_slice() {
+    let row_maf_vec: Vec<f32> = match crate::stats_common::array_standard_slice(&row_maf) {
         Ok(s) => s.to_vec(),
-        Err(_) => row_maf.as_array().iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&row_maf.as_array()),
     };
     if row_source_vec.is_empty() {
         return Err(PyRuntimeError::new_err(
@@ -6432,13 +6432,13 @@ pub fn grm_bed_f32_row_band_from_meta<'py>(
             }
         })
         .collect::<PyResult<Vec<_>>>()?;
-    let row_flip_vec: Vec<bool> = match row_flip.as_slice() {
+    let row_flip_vec: Vec<bool> = match crate::stats_common::array_standard_slice(&row_flip) {
         Ok(s) => s.to_vec(),
-        Err(_) => row_flip.as_array().iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&row_flip.as_array()),
     };
-    let row_maf_vec: Vec<f32> = match row_maf.as_slice() {
+    let row_maf_vec: Vec<f32> = match crate::stats_common::array_standard_slice(&row_maf) {
         Ok(s) => s.to_vec(),
-        Err(_) => row_maf.as_array().iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&row_maf.as_array()),
     };
     if row_source_vec.is_empty() {
         return Err(PyRuntimeError::new_err(
@@ -6581,13 +6581,13 @@ pub fn grm_bed_f32_row_band_from_meta_to_npy<'py>(
             }
         })
         .collect::<PyResult<Vec<_>>>()?;
-    let row_flip_vec: Vec<bool> = match row_flip.as_slice() {
+    let row_flip_vec: Vec<bool> = match crate::stats_common::array_standard_slice(&row_flip) {
         Ok(s) => s.to_vec(),
-        Err(_) => row_flip.as_array().iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&row_flip.as_array()),
     };
-    let row_maf_vec: Vec<f32> = match row_maf.as_slice() {
+    let row_maf_vec: Vec<f32> = match crate::stats_common::array_standard_slice(&row_maf) {
         Ok(s) => s.to_vec(),
-        Err(_) => row_maf.as_array().iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&row_maf.as_array()),
     };
     if row_source_vec.is_empty() {
         return Err(PyRuntimeError::new_err(
@@ -6722,13 +6722,13 @@ pub fn grm_bed_f32_tiled_from_meta_to_npy<'py>(
             }
         })
         .collect::<PyResult<Vec<_>>>()?;
-    let row_flip_vec: Vec<bool> = match row_flip.as_slice() {
+    let row_flip_vec: Vec<bool> = match crate::stats_common::array_standard_slice(&row_flip) {
         Ok(s) => s.to_vec(),
-        Err(_) => row_flip.as_array().iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&row_flip.as_array()),
     };
-    let row_maf_vec: Vec<f32> = match row_maf.as_slice() {
+    let row_maf_vec: Vec<f32> = match crate::stats_common::array_standard_slice(&row_maf) {
         Ok(s) => s.to_vec(),
-        Err(_) => row_maf.as_array().iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&row_maf.as_array()),
     };
     if row_source_vec.is_empty() {
         return Err(PyRuntimeError::new_err(
@@ -6818,9 +6818,9 @@ pub fn spgrm_dense_f32_to_jxgrm<'py>(
         )));
     }
     let n_samples = shape[0];
-    let grm_flat: Vec<f32> = match grm.as_slice() {
+    let grm_flat: Vec<f32> = match crate::stats_common::array_standard_slice(&grm) {
         Ok(s) => s.to_vec(),
-        Err(_) => grm_arr.iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&grm_arr),
     };
     py.detach(move || {
         spgrm_dense_f32_to_jxgrm_core(

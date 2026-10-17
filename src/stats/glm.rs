@@ -2428,9 +2428,9 @@ pub fn lm_stream_bed_to_tsv(
         )));
     }
 
-    let x_flat: Cow<[f64]> = match x.as_slice() {
+    let x_flat: Cow<[f64]> = match crate::stats_common::array_standard_slice(&x) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(x_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&x_arr)),
     };
     if let Some(ixx_in) = ixx {
         let ixx_arr = ixx_in.as_array();
@@ -2461,17 +2461,17 @@ pub fn lm_stream_bed_to_tsv(
         (None, None, None, None) => None,
         (Some(row_idx), Some(row_flip), Some(row_missing), Some(row_maf)) => {
             let row_idx_vec = row_idx.as_slice()?.to_vec();
-            let row_flip_vec = match row_flip.as_slice() {
+            let row_flip_vec = match crate::stats_common::array_standard_slice(&row_flip) {
                 Ok(slc) => slc.to_vec(),
-                Err(_) => row_flip.as_array().iter().copied().collect(),
+                Err(_) => crate::stats_common::copy_array_standard_layout(&row_flip.as_array()),
             };
-            let row_missing_vec = match row_missing.as_slice() {
+            let row_missing_vec = match crate::stats_common::array_standard_slice(&row_missing) {
                 Ok(slc) => slc.to_vec(),
-                Err(_) => row_missing.as_array().iter().copied().collect(),
+                Err(_) => crate::stats_common::copy_array_standard_layout(&row_missing.as_array()),
             };
-            let row_maf_vec = match row_maf.as_slice() {
+            let row_maf_vec = match crate::stats_common::array_standard_slice(&row_maf) {
                 Ok(slc) => slc.to_vec(),
-                Err(_) => row_maf.as_array().iter().copied().collect(),
+                Err(_) => crate::stats_common::copy_array_standard_layout(&row_maf.as_array()),
             };
             Some((row_idx_vec, row_flip_vec, row_missing_vec, row_maf_vec))
         }
@@ -3392,13 +3392,13 @@ pub fn lm_stream_bed_segments_compact_to_tsv<'py>(
         ));
     }
 
-    let x_base_flat: Cow<[f64]> = match x_base.as_slice() {
+    let x_base_flat: Cow<[f64]> = match crate::stats_common::array_standard_slice(&x_base) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(x_base_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&x_base_arr)),
     };
-    let qtn_flat: Cow<[f64]> = match qtn_cov.as_slice() {
+    let qtn_flat: Cow<[f64]> = match crate::stats_common::array_standard_slice(&qtn_cov) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(qtn_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&qtn_arr)),
     };
     let context_exclude = parse_lm_context_exclude_qtn(context_exclude_qtn, qtn_cols)?;
     if context_exclude.is_empty() {
@@ -3630,17 +3630,17 @@ pub fn lm_block_assoc_packed<'py>(
     }
     let df = (n as i32) - (q0 as i32) - 1;
 
-    let x_flat: Cow<[f64]> = match x.as_slice() {
+    let x_flat: Cow<[f64]> = match crate::stats_common::array_standard_slice(&x) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(x_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&x_arr)),
     };
-    let ixx_flat: Cow<[f64]> = match ixx.as_slice() {
+    let ixx_flat: Cow<[f64]> = match crate::stats_common::array_standard_slice(&ixx) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(ixx_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&ixx_arr)),
     };
-    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+    let packed_flat: Cow<[u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&packed_arr)),
     };
 
     // ---- Precompute r_y = M_X y = y - X @ C @ (X^T @ y) ----
@@ -4017,17 +4017,17 @@ pub fn lm_block_assoc_packed_to_tsv<'py>(
     }
     let df = (n as i32) - (q0 as i32) - 1;
 
-    let x_flat: Cow<[f64]> = match x.as_slice() {
+    let x_flat: Cow<[f64]> = match crate::stats_common::array_standard_slice(&x) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(x_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&x_arr)),
     };
-    let ixx_flat: Cow<[f64]> = match ixx.as_slice() {
+    let ixx_flat: Cow<[f64]> = match crate::stats_common::array_standard_slice(&ixx) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(ixx_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&ixx_arr)),
     };
-    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+    let packed_flat: Cow<[u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&packed_arr)),
     };
 
     // ---- Precompute r_y = M_X y = y - X @ ixx @ (X^T @ y) ----
@@ -4375,9 +4375,9 @@ pub fn lm_assoc_kfile_to_tsv_f32<'py>(
             sample_indices_vec.len()
         )));
     }
-    let x_flat: Cow<[f64]> = match x.as_slice() {
+    let x_flat: Cow<[f64]> = match crate::stats_common::array_standard_slice(&x) {
         Ok(values) => Cow::Borrowed(values),
-        Err(_) => Cow::Owned(x_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&x_arr)),
     };
     let qr_ctx = LmQrProjection::from_design(x_flat.as_ref(), y_slice, n, q0)
         .map_err(PyRuntimeError::new_err)?;
@@ -4543,13 +4543,13 @@ pub fn lm_block_assoc_f32<'py>(
     let m = g_arr.shape()[0];
     let df = (n as i32) - (q0 as i32) - 1;
 
-    let x_flat: Cow<[f64]> = match x.as_slice() {
+    let x_flat: Cow<[f64]> = match crate::stats_common::array_standard_slice(&x) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(x_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&x_arr)),
     };
-    let ixx_flat: Cow<[f64]> = match ixx.as_slice() {
+    let ixx_flat: Cow<[f64]> = match crate::stats_common::array_standard_slice(&ixx) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(ixx_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&ixx_arr)),
     };
 
     let mut xy = vec![0.0_f64; q0];
@@ -4584,7 +4584,7 @@ pub fn lm_block_assoc_f32<'py>(
 
     let x_f32: Vec<f32> = x_flat.iter().map(|&v| v as f32).collect();
     let ry_f32: Vec<f32> = ry.iter().map(|&v| v as f32).collect();
-    let g_slice_opt = g.as_slice().ok();
+    let g_slice_opt = crate::stats_common::array_standard_slice(&g).ok();
 
     let out = PyArray2::<f64>::zeros(py, [m, 4], false).into_bound();
     let out_slice: &mut [f64] = unsafe {

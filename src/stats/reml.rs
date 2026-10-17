@@ -140,13 +140,13 @@ pub fn lmm_rotate_x_y_with_ut_f64<'py>(
         ));
     }
 
-    let ut_flat: Cow<[f32]> = match u_t.as_slice() {
+    let ut_flat: Cow<[f32]> = match crate::stats_common::array_standard_slice(&u_t) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(ut_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&ut_arr)),
     };
-    let x_flat: Cow<[f64]> = match x.as_slice() {
+    let x_flat: Cow<[f64]> = match crate::stats_common::array_standard_slice(&x) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(x_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&x_arr)),
     };
 
     let pool = get_cached_pool(threads)?;
@@ -221,9 +221,9 @@ pub fn lmm_rotate_y_with_ut_f64<'py>(
         ));
     }
 
-    let ut_flat: Cow<[f32]> = match u_t.as_slice() {
+    let ut_flat: Cow<[f32]> = match crate::stats_common::array_standard_slice(&u_t) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(ut_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&ut_arr)),
     };
     let pool = get_cached_pool(threads)?;
     let y_rot = py.detach(|| {
@@ -635,9 +635,9 @@ fn fit_lmm_null_f32<'py>(
         ));
     }
 
-    let xcov_flat: Cow<[f64]> = match xcov.as_slice() {
+    let xcov_flat: Cow<[f64]> = match crate::stats_common::array_standard_slice(&xcov) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(xcov_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&xcov_arr)),
     };
     validate_fixed_effect_design(&xcov_flat, n, p_cov).map_err(PyRuntimeError::new_err)?;
     let (best_log10_lbd, best_cost, ml_at_reml, ml_max) = py.detach(|| {
@@ -703,9 +703,9 @@ pub fn ml_loglike_null_f32<'py>(
         return Err(PyRuntimeError::new_err("len(S) must equal len(y_rot)"));
     }
 
-    let xcov_flat: Cow<[f64]> = match xcov.as_slice() {
+    let xcov_flat: Cow<[f64]> = match crate::stats_common::array_standard_slice(&xcov) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(xcov_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&xcov_arr)),
     };
     let ml = ml_loglike(log10_lbd, s, &xcov_flat, y, None, n, p_cov);
     Ok(ml)
@@ -734,9 +734,9 @@ pub fn ai_reml_null_f64<'py>(
     if s.len() != n {
         return Err(PyRuntimeError::new_err("len(S) must equal len(y_rot)"));
     }
-    let xcov_flat: Cow<[f64]> = match xcov.as_slice() {
+    let xcov_flat: Cow<[f64]> = match crate::stats_common::array_standard_slice(&xcov) {
         Ok(v) => Cow::Borrowed(v),
-        Err(_) => Cow::Owned(xcov_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&xcov_arr)),
     };
 
     let out = ai_reml_null_from_spectral(s, &xcov_flat, y, n, p_cov, max_iter, tol, min_var)
@@ -826,16 +826,16 @@ pub fn ai_reml_multi_f64<'py>(
         1e-6
     };
 
-    let x_flat: Cow<[f64]> = match xcov.as_slice() {
+    let x_flat: Cow<[f64]> = match crate::stats_common::array_standard_slice(&xcov) {
         Ok(v) => Cow::Borrowed(v),
-        Err(_) => Cow::Owned(x_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&x_arr)),
     };
     let x_mat = DMatrix::<f64>::from_row_slice(n, p, &x_flat);
     let x_t = x_mat.transpose();
     let y_vec = DVector::<f64>::from_row_slice(y_slice);
 
     let mut kmats: Vec<DMatrix<f64>> = Vec::with_capacity(q);
-    if let Ok(ks) = k_stack.as_slice() {
+    if let Ok(ks) = crate::stats_common::array_standard_slice(&k_stack) {
         for qi in 0..q {
             let off = qi * n * n;
             let mut km = DMatrix::<f64>::from_row_slice(n, n, &ks[off..off + n * n]);

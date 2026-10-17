@@ -102,7 +102,7 @@ fn project_snp_row_u1_u2(
 fn array1_to_cow<'py, T: Copy + Element>(
     arr: &'py PyReadonlyArray1<'py, T>,
 ) -> PyResult<Cow<'py, [T]>> {
-    if let Ok(slice) = arr.as_slice() {
+    if let Ok(slice) = crate::stats_common::array_standard_slice(arr) {
         return Ok(Cow::Borrowed(slice));
     }
     Ok(Cow::Owned(arr.as_array().iter().cloned().collect()))
@@ -113,7 +113,7 @@ fn array2_to_cow<'py, T: Copy + Element>(
 ) -> PyResult<(Cow<'py, [T]>, usize, usize)> {
     let view = arr.as_array();
     let (rows, cols) = (view.shape()[0], view.shape()[1]);
-    if let Ok(slice) = arr.as_slice() {
+    if let Ok(slice) = crate::stats_common::array_standard_slice(arr) {
         return Ok((Cow::Borrowed(slice), rows, cols));
     }
     let vec: Vec<T> = view.iter().cloned().collect();

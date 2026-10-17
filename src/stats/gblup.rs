@@ -776,13 +776,13 @@ pub fn gblup_grm_from_meta_to_npy<'py>(
         .as_slice()
         .map_err(|_| PyRuntimeError::new_err("row_source_indices must be contiguous int64"))?
         .to_vec();
-    let row_flip_vec = match row_flip.as_slice() {
+    let row_flip_vec = match crate::stats_common::array_standard_slice(&row_flip) {
         Ok(s) => s.to_vec(),
-        Err(_) => row_flip.as_array().iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&row_flip.as_array()),
     };
-    let row_maf_vec = match row_maf.as_slice() {
+    let row_maf_vec = match crate::stats_common::array_standard_slice(&row_maf) {
         Ok(s) => s.to_vec(),
-        Err(_) => row_maf.as_array().iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&row_maf.as_array()),
     };
     if row_idx64.is_empty() {
         return Err(PyRuntimeError::new_err(
@@ -1316,9 +1316,9 @@ pub fn gblup_reml_npy_grm<'py>(
         train_idx.push(idx as usize);
     }
 
-    let y_vec: Vec<f64> = match y_train.as_slice() {
+    let y_vec: Vec<f64> = match crate::stats_common::array_standard_slice(&y_train) {
         Ok(s) => s.to_vec(),
-        Err(_) => y_train.as_array().iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&y_train.as_array()),
     };
     if y_vec.len() != train_idx.len() {
         return Err(PyRuntimeError::new_err(format!(
@@ -1591,10 +1591,13 @@ pub fn gblup_reml_packed_bed<'py>(
     if let (Some(row_source_indices), Some(row_flip), Some(row_maf)) =
         (row_source_indices, row_flip, row_maf)
     {
-        let row_source_vec_i64: Vec<i64> = match row_source_indices.as_slice() {
-            Ok(s) => s.to_vec(),
-            Err(_) => row_source_indices.as_array().iter().copied().collect(),
-        };
+        let row_source_vec_i64: Vec<i64> =
+            match crate::stats_common::array_standard_slice(&row_source_indices) {
+                Ok(s) => s.to_vec(),
+                Err(_) => {
+                    crate::stats_common::copy_array_standard_layout(&row_source_indices.as_array())
+                }
+            };
         if row_source_vec_i64.is_empty() {
             return Err(PyRuntimeError::new_err(
                 "row_source_indices must not be empty for metadata streaming path.",
@@ -1609,13 +1612,13 @@ pub fn gblup_reml_packed_bed<'py>(
             }
             row_source_vec.push(idx as usize);
         }
-        let row_flip_vec: Vec<bool> = match row_flip.as_slice() {
+        let row_flip_vec: Vec<bool> = match crate::stats_common::array_standard_slice(&row_flip) {
             Ok(s) => s.to_vec(),
-            Err(_) => row_flip.as_array().iter().copied().collect(),
+            Err(_) => crate::stats_common::copy_array_standard_layout(&row_flip.as_array()),
         };
-        let row_maf_vec: Vec<f32> = match row_maf.as_slice() {
+        let row_maf_vec: Vec<f32> = match crate::stats_common::array_standard_slice(&row_maf) {
             Ok(s) => s.to_vec(),
-            Err(_) => row_maf.as_array().iter().copied().collect(),
+            Err(_) => crate::stats_common::copy_array_standard_layout(&row_maf.as_array()),
         };
         if row_flip_vec.len() != row_source_vec.len() || row_maf_vec.len() != row_source_vec.len() {
             return Err(PyRuntimeError::new_err(format!(
@@ -1642,9 +1645,9 @@ pub fn gblup_reml_packed_bed<'py>(
                 "train_sample_indices must not be empty.",
             ));
         }
-        let y_vec: Vec<f64> = match y_train.as_slice() {
+        let y_vec: Vec<f64> = match crate::stats_common::array_standard_slice(&y_train) {
             Ok(s) => s.to_vec(),
-            Err(_) => y_train.as_array().iter().copied().collect(),
+            Err(_) => crate::stats_common::copy_array_standard_layout(&y_train.as_array()),
         };
         if y_vec.len() != train_idx.len() {
             return Err(PyRuntimeError::new_err(format!(
@@ -1984,9 +1987,9 @@ pub fn gblup_reml_packed_bed<'py>(
     }
 
     let site_keep_vec: Option<Vec<bool>> = if let Some(mask) = site_keep {
-        Some(match mask.as_slice() {
+        Some(match crate::stats_common::array_standard_slice(&mask) {
             Ok(s) => s.to_vec(),
-            Err(_) => mask.as_array().iter().copied().collect(),
+            Err(_) => crate::stats_common::copy_array_standard_layout(&mask.as_array()),
         })
     } else {
         None
@@ -2117,9 +2120,9 @@ pub fn gblup_reml_packed_bed<'py>(
             "train_sample_indices must not be empty.",
         ));
     }
-    let y_vec: Vec<f64> = match y_train.as_slice() {
+    let y_vec: Vec<f64> = match crate::stats_common::array_standard_slice(&y_train) {
         Ok(s) => s.to_vec(),
-        Err(_) => y_train.as_array().iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&y_train.as_array()),
     };
     if y_vec.len() != train_idx.len() {
         return Err(PyRuntimeError::new_err(format!(
@@ -2162,10 +2165,12 @@ pub fn gblup_reml_packed_bed<'py>(
                 .expect("packed array must exist for marker-fast path")
                 .readonly();
             let packed_view = packed_ro.as_array();
-            Cow::Owned(match packed_ro.as_slice() {
-                Ok(s) => s.to_vec(),
-                Err(_) => packed_view.iter().copied().collect(),
-            })
+            Cow::Owned(
+                match crate::stats_common::array_standard_slice(&packed_ro) {
+                    Ok(s) => s.to_vec(),
+                    Err(_) => crate::stats_common::copy_array_standard_layout(&packed_view),
+                },
+            )
         } else {
             Cow::Borrowed(
                 subset_packed_keep
@@ -2179,9 +2184,9 @@ pub fn gblup_reml_packed_bed<'py>(
                 .as_ref()
                 .expect("maf array must exist for marker-fast path")
                 .readonly();
-            Cow::Owned(match maf_ro.as_slice() {
+            Cow::Owned(match crate::stats_common::array_standard_slice(&maf_ro) {
                 Ok(s) => s.to_vec(),
-                Err(_) => maf_ro.as_array().iter().copied().collect(),
+                Err(_) => crate::stats_common::copy_array_standard_layout(&maf_ro.as_array()),
             })
         } else {
             Cow::Borrowed(
@@ -2196,10 +2201,14 @@ pub fn gblup_reml_packed_bed<'py>(
                 .as_ref()
                 .expect("row_flip array must exist for marker-fast path")
                 .readonly();
-            Cow::Owned(match row_flip_ro.as_slice() {
-                Ok(s) => s.to_vec(),
-                Err(_) => row_flip_ro.as_array().iter().copied().collect(),
-            })
+            Cow::Owned(
+                match crate::stats_common::array_standard_slice(&row_flip_ro) {
+                    Ok(s) => s.to_vec(),
+                    Err(_) => {
+                        crate::stats_common::copy_array_standard_layout(&row_flip_ro.as_array())
+                    }
+                },
+            )
         } else {
             Cow::Borrowed(
                 subset_row_flip_keep
@@ -2828,9 +2837,9 @@ pub fn gblup_effect_from_meta_stream<'py>(
         return Err(PyRuntimeError::new_err("No samples found in BED input."));
     }
     let sample_idx = parse_index_vec_i64(sample_indices.as_slice()?, n_samples, "sample_indices")?;
-    let alpha_vec: Vec<f64> = match alpha.as_slice() {
+    let alpha_vec: Vec<f64> = match crate::stats_common::array_standard_slice(&alpha) {
         Ok(s) => s.to_vec(),
-        Err(_) => alpha.as_array().iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&alpha.as_array()),
     };
     if sample_idx.len() != alpha_vec.len() {
         return Err(PyRuntimeError::new_err(format!(
@@ -2840,10 +2849,13 @@ pub fn gblup_effect_from_meta_stream<'py>(
         )));
     }
 
-    let row_source_vec_i64: Vec<i64> = match row_source_indices.as_slice() {
-        Ok(s) => s.to_vec(),
-        Err(_) => row_source_indices.as_array().iter().copied().collect(),
-    };
+    let row_source_vec_i64: Vec<i64> =
+        match crate::stats_common::array_standard_slice(&row_source_indices) {
+            Ok(s) => s.to_vec(),
+            Err(_) => {
+                crate::stats_common::copy_array_standard_layout(&row_source_indices.as_array())
+            }
+        };
     if row_source_vec_i64.is_empty() {
         return Err(PyRuntimeError::new_err(
             "row_source_indices must not be empty.",
@@ -2858,13 +2870,13 @@ pub fn gblup_effect_from_meta_stream<'py>(
         }
         row_source_vec.push(idx as usize);
     }
-    let row_flip_vec: Vec<bool> = match row_flip.as_slice() {
+    let row_flip_vec: Vec<bool> = match crate::stats_common::array_standard_slice(&row_flip) {
         Ok(s) => s.to_vec(),
-        Err(_) => row_flip.as_array().iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&row_flip.as_array()),
     };
-    let row_maf_vec: Vec<f32> = match row_maf.as_slice() {
+    let row_maf_vec: Vec<f32> = match crate::stats_common::array_standard_slice(&row_maf) {
         Ok(s) => s.to_vec(),
-        Err(_) => row_maf.as_array().iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&row_maf.as_array()),
     };
     if row_flip_vec.len() != row_source_vec.len() || row_maf_vec.len() != row_source_vec.len() {
         return Err(PyRuntimeError::new_err(format!(
@@ -2984,13 +2996,17 @@ pub fn packed_mtm_f64<'py>(
         )));
     }
 
-    let row_flip_vec: Cow<[bool]> = match row_flip.as_slice() {
+    let row_flip_vec: Cow<[bool]> = match crate::stats_common::array_standard_slice(&row_flip) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_flip.as_array(),
+        )),
     };
-    let row_maf_vec: Cow<[f32]> = match row_maf.as_slice() {
+    let row_maf_vec: Cow<[f32]> = match crate::stats_common::array_standard_slice(&row_maf) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_maf.as_array(),
+        )),
     };
     if row_flip_vec.len() != m {
         return Err(PyRuntimeError::new_err(format!(
@@ -3016,9 +3032,9 @@ pub fn packed_mtm_f64<'py>(
     }
     let full_sample_fast = is_identity_indices(&sample_idx, n_samples);
 
-    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+    let packed_flat: Cow<[u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&packed_arr)),
     };
     let pool = get_cached_pool(threads)?;
     let row_step = adaptive_grm_block_rows(

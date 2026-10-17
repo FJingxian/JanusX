@@ -63,9 +63,9 @@ pub struct PermutationConfig {
 }
 
 pub fn readonly_f64_to_vec(arr: &PyReadonlyArray1<'_, f64>) -> Vec<f64> {
-    match arr.as_slice() {
+    match crate::stats_common::array_standard_slice(&arr) {
         Ok(s) => s.to_vec(),
-        Err(_) => arr.as_array().iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&arr.as_array()),
     }
 }
 

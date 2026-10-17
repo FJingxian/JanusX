@@ -88,9 +88,11 @@ fn array1_f64(obj: Bound<'_, PyAny>, label: &str) -> PyResult<Vec<f64>> {
     let arr = obj
         .extract::<PyReadonlyArray1<'_, f64>>()
         .map_err(|_| PyValueError::new_err(format!("{label} must be a 1D float64 numpy array")))?;
-    match arr.as_slice() {
+    match crate::stats_common::array_standard_slice(&arr) {
         Ok(slc) => Ok(slc.to_vec()),
-        Err(_) => Ok(arr.as_array().iter().copied().collect()),
+        Err(_) => Ok(crate::stats_common::copy_array_standard_layout(
+            &arr.as_array(),
+        )),
     }
 }
 
@@ -101,9 +103,9 @@ fn array2_f64(obj: Bound<'_, PyAny>, label: &str) -> PyResult<(Vec<f64>, usize, 
     let view = arr.as_array();
     let rows = view.shape()[0];
     let cols = view.shape()[1];
-    let flat = match arr.as_slice() {
+    let flat = match crate::stats_common::array_standard_slice(&arr) {
         Ok(slc) => slc.to_vec(),
-        Err(_) => view.iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&view),
     };
     Ok((flat, rows, cols))
 }
@@ -112,9 +114,11 @@ fn array1_i64(obj: Bound<'_, PyAny>, label: &str) -> PyResult<Vec<i64>> {
     let arr = obj
         .extract::<PyReadonlyArray1<'_, i64>>()
         .map_err(|_| PyValueError::new_err(format!("{label} must be a 1D int64 numpy array")))?;
-    match arr.as_slice() {
+    match crate::stats_common::array_standard_slice(&arr) {
         Ok(slc) => Ok(slc.to_vec()),
-        Err(_) => Ok(arr.as_array().iter().copied().collect()),
+        Err(_) => Ok(crate::stats_common::copy_array_standard_layout(
+            &arr.as_array(),
+        )),
     }
 }
 
@@ -122,9 +126,11 @@ fn array1_bool(obj: Bound<'_, PyAny>, label: &str) -> PyResult<Vec<bool>> {
     let arr = obj
         .extract::<PyReadonlyArray1<'_, bool>>()
         .map_err(|_| PyValueError::new_err(format!("{label} must be a 1D bool numpy array")))?;
-    match arr.as_slice() {
+    match crate::stats_common::array_standard_slice(&arr) {
         Ok(slc) => Ok(slc.to_vec()),
-        Err(_) => Ok(arr.as_array().iter().copied().collect()),
+        Err(_) => Ok(crate::stats_common::copy_array_standard_layout(
+            &arr.as_array(),
+        )),
     }
 }
 
@@ -132,9 +138,11 @@ fn array1_f32(obj: Bound<'_, PyAny>, label: &str) -> PyResult<Vec<f32>> {
     let arr = obj
         .extract::<PyReadonlyArray1<'_, f32>>()
         .map_err(|_| PyValueError::new_err(format!("{label} must be a 1D float32 numpy array")))?;
-    match arr.as_slice() {
+    match crate::stats_common::array_standard_slice(&arr) {
         Ok(slc) => Ok(slc.to_vec()),
-        Err(_) => Ok(arr.as_array().iter().copied().collect()),
+        Err(_) => Ok(crate::stats_common::copy_array_standard_layout(
+            &arr.as_array(),
+        )),
     }
 }
 

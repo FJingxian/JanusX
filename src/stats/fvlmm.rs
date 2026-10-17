@@ -1835,9 +1835,8 @@ pub fn fvlmm_assoc_prepare_cache_f32<'py>(
         return Err(PyRuntimeError::new_err("invalid log10_lbd"));
     }
 
-    let xcov_slice: &[f64] = xcov
-        .as_slice()
-        .map_err(|_| PyRuntimeError::new_err("xcov must be contiguous (C-order)"))?;
+    let xcov_slice_storage = crate::stats_common::array_standard_cow(&xcov);
+    let xcov_slice: &[f64] = &*xcov_slice_storage;
     let p = p_cov;
     let cache = prepare_fixed_lambda_assoc_cache_f32(s, xcov_slice, y, n, p, lbd)?;
     Ok(FvLmmAssocCache {
@@ -1873,9 +1872,9 @@ fn fvlmm_assoc_chunk_with_cache_impl<'py>(
             .map_err(|_| PyRuntimeError::new_err("out not contiguous"))?
     };
 
-    let g_flat: Cow<[f32]> = match g_rot_chunk.as_slice() {
+    let g_flat: Cow<[f32]> = match crate::stats_common::array_standard_slice(&g_rot_chunk) {
         Ok(slc) => Cow::Borrowed(slc),
-        Err(_) => Cow::Owned(g_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&g_arr)),
     };
     let assoc_threads = stage_assoc_threads_or(threads, threads);
     let pool = get_cached_pool(assoc_threads)?;
@@ -1972,9 +1971,8 @@ pub fn fvlmm_assoc_chunk_f32<'py>(
         return Err(PyRuntimeError::new_err("invalid log10_lbd"));
     }
 
-    let xcov_slice: &[f64] = xcov
-        .as_slice()
-        .map_err(|_| PyRuntimeError::new_err("xcov must be contiguous (C-order)"))?;
+    let xcov_slice_storage = crate::stats_common::array_standard_cow(&xcov);
+    let xcov_slice: &[f64] = &*xcov_slice_storage;
     let p = p_cov;
     let prep_t0 = Instant::now();
     let cache = Arc::new(prepare_fixed_lambda_assoc_cache_f32(
@@ -2028,13 +2026,13 @@ pub fn fvlmm_assoc_chunk_from_snp_with_cache_f32<'py>(
             .map_err(|_| PyRuntimeError::new_err("out not contiguous"))?
     };
 
-    let snp_flat: Cow<[f32]> = match snp_chunk.as_slice() {
+    let snp_flat: Cow<[f32]> = match crate::stats_common::array_standard_slice(&snp_chunk) {
         Ok(slc) => Cow::Borrowed(slc),
-        Err(_) => Cow::Owned(snp_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&snp_arr)),
     };
-    let ut_flat: Cow<[f32]> = match u_t.as_slice() {
+    let ut_flat: Cow<[f32]> = match crate::stats_common::array_standard_slice(&u_t) {
         Ok(slc) => Cow::Borrowed(slc),
-        Err(_) => Cow::Owned(ut_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&ut_arr)),
     };
 
     let proj_threads = stage_proj_threads_or(threads);
@@ -2166,16 +2164,15 @@ pub fn fvlmm_assoc_chunk_from_snp_f32<'py>(
             .map_err(|_| PyRuntimeError::new_err("out not contiguous"))?
     };
 
-    let xcov_slice: &[f64] = xcov
-        .as_slice()
-        .map_err(|_| PyRuntimeError::new_err("xcov must be contiguous (C-order)"))?;
-    let snp_flat: Cow<[f32]> = match snp_chunk.as_slice() {
+    let xcov_slice_storage = crate::stats_common::array_standard_cow(&xcov);
+    let xcov_slice: &[f64] = &*xcov_slice_storage;
+    let snp_flat: Cow<[f32]> = match crate::stats_common::array_standard_slice(&snp_chunk) {
         Ok(slc) => Cow::Borrowed(slc),
-        Err(_) => Cow::Owned(snp_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&snp_arr)),
     };
-    let ut_flat: Cow<[f32]> = match u_t.as_slice() {
+    let ut_flat: Cow<[f32]> = match crate::stats_common::array_standard_slice(&u_t) {
         Ok(slc) => Cow::Borrowed(slc),
-        Err(_) => Cow::Owned(ut_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&ut_arr)),
     };
     let p = p_cov;
     let prep_t0 = Instant::now();
@@ -2342,16 +2339,15 @@ pub fn fvlmm_assoc_chunk_from_snp_to_tsv_f32<'py>(
     let with_plrt = nullml.is_some();
     let out_cols = if with_plrt { 4 } else { 3 };
 
-    let xcov_slice: &[f64] = xcov
-        .as_slice()
-        .map_err(|_| PyRuntimeError::new_err("xcov must be contiguous (C-order)"))?;
-    let snp_flat: Cow<[f32]> = match snp_chunk.as_slice() {
+    let xcov_slice_storage = crate::stats_common::array_standard_cow(&xcov);
+    let xcov_slice: &[f64] = &*xcov_slice_storage;
+    let snp_flat: Cow<[f32]> = match crate::stats_common::array_standard_slice(&snp_chunk) {
         Ok(slc) => Cow::Borrowed(slc),
-        Err(_) => Cow::Owned(snp_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&snp_arr)),
     };
-    let ut_flat: Cow<[f32]> = match u_t.as_slice() {
+    let ut_flat: Cow<[f32]> = match crate::stats_common::array_standard_slice(&u_t) {
         Ok(slc) => Cow::Borrowed(slc),
-        Err(_) => Cow::Owned(ut_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&ut_arr)),
     };
     let p = p_cov;
     let cache = prepare_fixed_lambda_assoc_cache_f32(s_slice, xcov_slice, y, n, p, lbd)?;
@@ -2555,12 +2551,11 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
     let with_plrt = nullml.is_some();
     let out_cols = if with_plrt { 4 } else { 3 };
 
-    let xcov_slice: &[f64] = xcov
-        .as_slice()
-        .map_err(|_| PyRuntimeError::new_err("xcov must be contiguous (C-order)"))?;
-    let ut_flat: Cow<[f32]> = match u_t.as_slice() {
+    let xcov_slice_storage = crate::stats_common::array_standard_cow(&xcov);
+    let xcov_slice: &[f64] = &*xcov_slice_storage;
+    let ut_flat: Cow<[f32]> = match crate::stats_common::array_standard_slice(&u_t) {
         Ok(slc) => Cow::Borrowed(slc),
-        Err(_) => Cow::Owned(ut_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&ut_arr)),
     };
     let prepared_row_indices = match row_indices {
         Some(arr) => Some(
@@ -3254,14 +3249,8 @@ pub fn fvlmm_assoc_kfile_to_tsv_f32<'py>(
     if ut_arr.shape()[0] != n || ut_arr.shape()[1] != n {
         return Err(PyRuntimeError::new_err("u_t must be (n, n) row-major U^T"));
     }
-    let xcov_owned = xcov
-        .as_slice()
-        .map_err(|_| PyRuntimeError::new_err("xcov must be contiguous (C-order)"))?
-        .to_vec();
-    let ut_owned = u_t
-        .as_slice()
-        .map_err(|_| PyRuntimeError::new_err("u_t must be contiguous (C-order)"))?
-        .to_vec();
+    let xcov_owned = crate::stats_common::array_standard_cow(&xcov).into_owned();
+    let ut_owned = crate::stats_common::array_standard_cow(&u_t).into_owned();
     let sample_idx = sample_indices
         .iter()
         .enumerate()
@@ -3543,18 +3532,14 @@ pub fn fastlmm_assoc_chunk_f32<'py>(
         return Err(PyRuntimeError::new_err("n must be > p+1"));
     }
 
-    let u1tx_slice: &[f64] = u1tx
-        .as_slice()
-        .map_err(|_| PyRuntimeError::new_err("u1tx must be contiguous (C-order)"))?;
-    let u2tx_slice: &[f64] = u2tx
-        .as_slice()
-        .map_err(|_| PyRuntimeError::new_err("u2tx must be contiguous (C-order)"))?;
-    let u1tsnp_slice: &[f32] = u1tsnp_chunk
-        .as_slice()
-        .map_err(|_| PyRuntimeError::new_err("u1tsnp_chunk must be contiguous (C-order)"))?;
-    let u2tsnp_slice: &[f32] = u2tsnp_chunk
-        .as_slice()
-        .map_err(|_| PyRuntimeError::new_err("u2tsnp_chunk must be contiguous (C-order)"))?;
+    let u1tx_slice_storage = crate::stats_common::array_standard_cow(&u1tx);
+    let u1tx_slice: &[f64] = &*u1tx_slice_storage;
+    let u2tx_slice_storage = crate::stats_common::array_standard_cow(&u2tx);
+    let u2tx_slice: &[f64] = &*u2tx_slice_storage;
+    let u1tsnp_slice_storage = crate::stats_common::array_standard_cow(&u1tsnp_chunk);
+    let u1tsnp_slice: &[f32] = &*u1tsnp_slice_storage;
+    let u2tsnp_slice_storage = crate::stats_common::array_standard_cow(&u2tsnp_chunk);
+    let u2tsnp_slice: &[f32] = &*u2tsnp_slice_storage;
 
     let with_plrt = nullml.is_some();
     let nullml_val = nullml.unwrap_or(0.0);
@@ -4152,20 +4137,14 @@ pub fn fastlmm_assoc_packed_f32<'py>(
         )));
     }
 
-    let u_slice: &[f32] = u
-        .as_slice()
-        .map_err(|_| PyRuntimeError::new_err("u must be contiguous (C-order)"))?;
-    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+    let u_slice_storage = crate::stats_common::array_standard_cow(&u);
+    let u_slice: &[f32] = &*u_slice_storage;
+    let packed_flat: Cow<[u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s0) => Cow::Borrowed(s0),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&packed_arr)),
     };
-    let x_slice_opt: Option<&[f64]> = match &x {
-        Some(xarr) => Some(
-            xarr.as_slice()
-                .map_err(|_| PyRuntimeError::new_err("x must be contiguous (C-order)"))?,
-        ),
-        None => None,
-    };
+    let x_storage = x.as_ref().map(crate::stats_common::array_standard_cow);
+    let x_slice_opt = x_storage.as_deref();
 
     let mut x_full = vec![0.0_f64; n * p];
     for i in 0..n {
@@ -4717,20 +4696,14 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
         )));
     }
 
-    let u_slice: &[f32] = u
-        .as_slice()
-        .map_err(|_| PyRuntimeError::new_err("u must be contiguous (C-order)"))?;
-    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+    let u_slice_storage = crate::stats_common::array_standard_cow(&u);
+    let u_slice: &[f32] = &*u_slice_storage;
+    let packed_flat: Cow<[u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s0) => Cow::Borrowed(s0),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&packed_arr)),
     };
-    let x_slice_opt: Option<&[f64]> = match &x {
-        Some(xarr) => Some(
-            xarr.as_slice()
-                .map_err(|_| PyRuntimeError::new_err("x must be contiguous (C-order)"))?,
-        ),
-        None => None,
-    };
+    let x_storage = x.as_ref().map(crate::stats_common::array_standard_cow);
+    let x_slice_opt = x_storage.as_deref();
 
     let mut x_full = vec![0.0_f64; n * p];
     for i in 0..n {
@@ -5355,20 +5328,14 @@ pub fn fvlmm_assoc_packed_f32_to_tsv<'py>(
         )));
     }
 
-    let u_slice: &[f32] = u
-        .as_slice()
-        .map_err(|_| PyRuntimeError::new_err("u must be contiguous (C-order)"))?;
-    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+    let u_slice_storage = crate::stats_common::array_standard_cow(&u);
+    let u_slice: &[f32] = &*u_slice_storage;
+    let packed_flat: Cow<[u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s0) => Cow::Borrowed(s0),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&packed_arr)),
     };
-    let x_slice_opt: Option<&[f64]> = match &x {
-        Some(xarr) => Some(
-            xarr.as_slice()
-                .map_err(|_| PyRuntimeError::new_err("x must be contiguous (C-order)"))?,
-        ),
-        None => None,
-    };
+    let x_storage = x.as_ref().map(crate::stats_common::array_standard_cow);
+    let x_slice_opt = x_storage.as_deref();
 
     let mut x_full = vec![0.0_f64; n * p];
     for i in 0..n {

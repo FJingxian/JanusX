@@ -1633,9 +1633,11 @@ pub fn bitnot_masked(words: &mut [u64], n_valid_bits: usize) {
 
 #[inline]
 fn readonly_u64_to_cow<'a>(arr: &'a PyReadonlyArray1<'a, u64>) -> Cow<'a, [u64]> {
-    match arr.as_slice() {
+    match crate::stats_common::array_standard_slice(&arr) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(arr.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &arr.as_array(),
+        )),
     }
 }
 

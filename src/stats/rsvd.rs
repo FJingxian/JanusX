@@ -1725,9 +1725,9 @@ pub fn py_rsvd_packed_subset<'py>(
         return Err(PyRuntimeError::new_err("sample_indices must not be empty"));
     }
 
-    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+    let packed_flat: Cow<[u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s0) => Cow::Borrowed(s0),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&packed_arr)),
     };
 
     let tile_cols = rsvd_tile_cols_env();

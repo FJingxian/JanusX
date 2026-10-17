@@ -5575,9 +5575,9 @@ pub fn g2p_simulate_py<'py>(
             ));
         }
         let n = mat.shape()[0];
-        let vec = match arr.as_slice() {
+        let vec = match crate::stats_common::array_standard_slice(&arr) {
             Ok(s) => s.to_vec(),
-            Err(_) => mat.iter().copied().collect(),
+            Err(_) => crate::stats_common::copy_array_standard_layout(&mat),
         };
         (Some(vec), Some(n))
     } else {

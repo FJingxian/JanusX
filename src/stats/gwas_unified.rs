@@ -141,9 +141,9 @@ pub fn gwas_lmm_lm_null_lrt_decision<'py>(
             "insufficient samples: require n > p_cov + 1",
         ));
     }
-    let x_slice: Vec<f64> = match x_cov.as_slice() {
+    let x_slice: Vec<f64> = match crate::stats_common::array_standard_slice(&x_cov) {
         Ok(v) => v.to_vec(),
-        Err(_) => x_arr.iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&x_arr),
     };
 
     let lm_ml0 = lm_null_ml_from_y_xcov(y_slice, &x_slice, n, p_cov)
@@ -400,14 +400,14 @@ pub fn gwas_packed_unified_to_tsv<'py>(
                     if ixx_arr.shape()[0] != q0 || ixx_arr.shape()[1] != q0 {
                         return Err(PyRuntimeError::new_err("ixx must be (q0,q0)"));
                     }
-                    match ixx_in.as_slice() {
+                    match crate::stats_common::array_standard_slice(&ixx_in) {
                         Ok(s) => s.to_vec(),
-                        Err(_) => ixx_arr.iter().copied().collect(),
+                        Err(_) => crate::stats_common::copy_array_standard_layout(&ixx_arr),
                     }
                 } else {
-                    let x_flat: Vec<f64> = match x.as_slice() {
+                    let x_flat: Vec<f64> = match crate::stats_common::array_standard_slice(&x) {
                         Ok(s) => s.to_vec(),
-                        Err(_) => x_arr.iter().copied().collect(),
+                        Err(_) => crate::stats_common::copy_array_standard_layout(&x_arr),
                     };
                     ixx_from_x_qr(x_flat.as_slice(), y_slice.len(), q0)
                         .map_err(PyRuntimeError::new_err)?

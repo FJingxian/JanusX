@@ -24,6 +24,7 @@ from janusx.assoc.workflow_cache import _cache_lock, _is_writable_dir, _resolve_
 from janusx.script._common.grmio import format_grm_cache_num
 from janusx.script._common.memory import (
     bed_block_target_env as _common_bed_block_target_env,
+    resolve_decode_block_rows as _common_resolve_decode_block_rows,
     resolve_decode_mmap_window_mb as _common_resolve_decode_mmap_window_mb,
 )
 from janusx.script._common.genoio import (
@@ -246,7 +247,7 @@ def _splmm_sparse_meta_path(sparse_path: str) -> str:
     return f"{sparse_path}.meta.json"
 
 
-_SPLMM_SPARSE_GRM_BUILD_REV = "f64_accum_v2"
+_SPLMM_SPARSE_GRM_BUILD_REV = "fused_bed_stream_v1"
 
 
 def _splmm_normalize_sparse_grm_path(path_or_prefix: str) -> str:
@@ -312,6 +313,34 @@ def _splmm_sparse_out_prefix_for_gwas(
     if desired_base == "":
         desired_base = os.path.basename(str(prefix).rstrip("/\\")) or "sparse_grm"
     return os.path.join(fallback_root, desired_base).replace("\\", "/")
+
+
+def _splmm_sparse_fused_stream_eligible(
+    *,
+    dense_grm_path: Optional[str],
+    sample_indices: Union[np.ndarray, None],
+    n_samples: int,
+    method: int,
+    het_threshold: float,
+    snps_only: bool,
+    memory_mb: Optional[float],
+) -> bool:
+    """Whether GWAS can use the bounded, single-pass BED-to-sparse route."""
+    if dense_grm_path is not None or sample_indices is not None:
+        return False
+    try:
+        from janusx.script.grm import _sparse_fused_stream_eligible
+    except ImportError:
+        return False
+    return bool(
+        _sparse_fused_stream_eligible(
+            n_samples=int(n_samples),
+            method=int(method),
+            het_threshold=float(het_threshold),
+            snps_only=bool(snps_only),
+            block_target_mb=memory_mb,
+        )
+    )
 
 
 def _splmm_meta_cache_tag(
@@ -879,7 +908,11 @@ def _ensure_splmm_sparse_grm(
         if layout_reason is not None:
             reason = layout_reason
         else:
-            reason = "missing metadata" if existing_spec is None else "cutoff or filter settings changed"
+            reason = (
+                "missing metadata"
+                if existing_spec is None
+                else "builder, cutoff, or filter settings changed"
+            )
         _emit_warning_line(
             logger,
             f"Rebuilding sparse GRM for SparseLMM: {os.path.basename(str(sparse_path))} ({reason})",
@@ -907,6 +940,8 @@ def _ensure_splmm_sparse_grm(
         and os.path.exists(dense_grm_path_use)
         and have_dense_npy_sparse
     )
+    n_samples_full: Optional[int] = None
+    n_snps_total: Optional[int] = None
     sparse_mmap_window_mb: Optional[int] = None
     if not use_dense_extract:
         try:
@@ -918,6 +953,7 @@ def _ensure_splmm_sparse_grm(
                 n_snps_total,
                 decode_memory_mb,
                 needs_copy=False,
+                buffers=2,
             )
         except Exception as exc:
             if memory_mb is not None:
@@ -926,13 +962,42 @@ def _ensure_splmm_sparse_grm(
                     f"for internal sparse GRM construction: {exc}"
                 ) from exc
             sparse_mmap_window_mb = None
+    use_fused_stream = bool(
+        not use_dense_extract
+        and n_samples_full is not None
+        and n_snps_total is not None
+        and _splmm_sparse_fused_stream_eligible(
+            dense_grm_path=dense_grm_path_use,
+            sample_indices=sample_idx_arg,
+            n_samples=int(n_samples_full),
+            method=int(method),
+            het_threshold=float(het_threshold),
+            snps_only=bool(snps_only),
+            memory_mb=float(decode_memory_mb),
+        )
+    )
+    if use_fused_stream:
+        _log_file_only(
+            logger,
+            logging.INFO,
+            (
+                "SparseLMM sparse GRM backend selected: fused BED QC + GRM scan "
+                f"(n={int(n_samples_full)}, m={int(n_snps_total)}, "
+                f"estimated dense working set="
+                f"{(int(n_samples_full) ** 2 * 16) / (1024.0 ** 3):.3g} GiB)."
+            ),
+        )
     progress_desc = (
         "Calculating sparse GRM from dense GRM"
         if use_dense_extract
         else f"Calculating sparse GRM from {os.path.basename(str(prefix))}..."
     )
     pbar: Optional[_ProgressAdapter] = None
-    spin_handle = _start_indeterminate_progress_bar(progress_desc) if bool(use_spinner) else None
+    spin_handle = (
+        _start_indeterminate_progress_bar(progress_desc)
+        if bool(use_spinner) and not use_fused_stream
+        else None
+    )
     last_done = 0
     last_total = 1
 
@@ -975,6 +1040,39 @@ def _ensure_splmm_sparse_grm(
                 progress_callback=_progress_cb,
                 progress_every=1,
             )
+        elif use_fused_stream:
+            from janusx.script.grm import (
+                build_sparse_grm_fused_stream_bed,
+            )
+
+            if n_samples_full is None or n_snps_total is None:
+                raise RuntimeError("Fused SparseLMM route lost BED dimensions.")
+            block_rows = _common_resolve_decode_block_rows(
+                int(n_samples_full),
+                float(decode_memory_mb),
+                max_rows=max(1, int(n_snps_total)),
+                buffers=2,
+            )
+            with _splmm_grm_decode_budget_env(decode_memory_mb):
+                build_result = build_sparse_grm_fused_stream_bed(
+                    genofile=str(prefix),
+                    out_prefix=str(out_prefix_use),
+                    n_samples=int(n_samples_full),
+                    n_snps=int(n_snps_total),
+                    method=int(method),
+                    kinship_cutoff=float(cutoff),
+                    maf_threshold=float(maf_threshold),
+                    max_missing_rate=float(max_missing_rate),
+                    het_threshold=float(het_threshold),
+                    snps_only=bool(snps_only),
+                    chunk_size=int(block_rows),
+                    mmap_window_mb=sparse_mmap_window_mb,
+                    threads=int(threads_use),
+                    block_target_mb=float(decode_memory_mb),
+                    stage_timing=False,
+                    verbose=False,
+                    logger=logger,
+                )
         else:
             if not have_bed_sparse:
                 raise RuntimeError(
@@ -1069,6 +1167,7 @@ def _ensure_splmm_sparse_grm(
             f"method={'standardized' if int(method) == 2 else 'centered'}, "
             f"decode_memory_mb={('n/a' if use_dense_extract else f'{float(decode_memory_mb):.6g}')}, "
             f"mmap_window_mb={('n/a' if use_dense_extract else (int(sparse_mmap_window_mb) if sparse_mmap_window_mb is not None else 'full'))}, "
+            f"backend={'fused-bed-stream' if use_fused_stream else ('dense-grm-npy' if use_dense_extract else 'stream-bed')}, "
             f"BLAS=1, Rayon={int(threads_use)}, "
             f"sample_block=auto, "
             f"time={format_elapsed(build_secs)})"

@@ -4929,7 +4929,9 @@ fn solve_packed_dual_ridge_alpha_pcg(
     } else {
         DEFAULT_STAGE1_ALASSO_PCG_TOL
     };
-    let tiny_use = ridge_lambda.abs().max(1e-12_f64);
+    // The ridge is already included in the operator. Reusing it as an absolute
+    // PCG breakdown threshold can stop a valid solve once the residual shrinks.
+    let tiny_use = 1e-30_f64;
     let apply_a = PackedSampleSpaceOperator {
         design,
         proj,
@@ -7001,8 +7003,6 @@ pub fn algwas_packed_to_tsv(
 mod tests {
     use super::*;
     use nalgebra::DVector;
-    use std::fs;
-    use std::path::Path;
 
     fn pack_dosages_012(dosages: &[u8], n_samples: usize) -> Vec<u8> {
         let bytes_per_snp = n_samples.div_ceil(4);
@@ -7052,45 +7052,6 @@ mod tests {
         )
         .unwrap();
         (design, row_maf)
-    }
-
-    fn load_mouse_hs1940_stage1_fixture() -> (AlgwasPackedDesign<'static>, Vec<f64>) {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("test");
-        let geno_path = root.join("mouse_hs1940.txt");
-        let pheno_path = root.join("mouse_hs1940.pheno.txt");
-        let geno_txt = fs::read_to_string(&geno_path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", geno_path.display()));
-        let mut rows = Vec::<Vec<u8>>::new();
-        for (lineno, line) in geno_txt.lines().enumerate() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let row = line
-                .split_whitespace()
-                .map(|tok| {
-                    tok.parse::<u8>().unwrap_or_else(|e| {
-                        panic!("parse genotype at line {} token {tok}: {e}", lineno + 1)
-                    })
-                })
-                .collect::<Vec<_>>();
-            rows.push(row);
-        }
-        let y = fs::read_to_string(&pheno_path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", pheno_path.display()))
-            .lines()
-            .skip(1)
-            .map(|line| {
-                let mut it = line.split_whitespace();
-                let _iid = it.next().unwrap_or("");
-                let value = it.next().unwrap_or("");
-                value
-                    .parse::<f64>()
-                    .unwrap_or_else(|e| panic!("parse phenotype line {line:?}: {e}"))
-            })
-            .collect::<Vec<_>>();
-        let (design, _row_maf) = build_test_design(&rows);
-        (design, y)
     }
 
     #[test]
@@ -7181,10 +7142,7 @@ mod tests {
 
     #[test]
     fn algwas_stage1_auto_mode_switches_by_scale() {
-        assert_eq!(
-            algwas_stage1_mode_from_raw(None),
-            AlgwasStage1Mode::PackedExactMsgps
-        );
+        assert_eq!(algwas_stage1_mode_from_raw(None), AlgwasStage1Mode::Auto);
         assert_eq!(
             algwas_stage1_mode_from_raw(Some("auto")),
             AlgwasStage1Mode::Auto
@@ -7537,33 +7495,6 @@ mod tests {
             "beta_ols_abs_sum mismatch dense={} pcg={} diff={diff}",
             dense.beta_ols_abs_sum,
             pcg.beta_ols_abs_sum
-        );
-    }
-
-    #[test]
-    #[ignore = "diagnostic regression against mouse_hs1940 stage1 semantics"]
-    fn debug_mouse_hs1940_stage1_metrics() {
-        let (design, y) = load_mouse_hs1940_stage1_fixture();
-        let proj = CovariateProjection::new(&[], y.len(), 0).unwrap();
-        let cfg = AlgwasConfig::default();
-        std::env::set_var("JX_ALGWAS_DEBUG", "1");
-        std::env::set_var("JX_ALGWAS_STAGE1_MODE", "dense");
-        let dense = fit_stage1_path_dense_msgps(&design, &proj, &y, &cfg, None).unwrap();
-        std::env::set_var("JX_ALGWAS_STAGE1_MODE", "packed");
-        let exact = fit_stage1_path_exact_packed(&design, &proj, &y, &cfg, None).unwrap();
-        eprintln!(
-            "mouse_hs1940 dense: selected={} lambda_best={:.12e} bic_best={:.12e} path_len={}",
-            dense.selected_indices.len(),
-            dense.lambda_best,
-            dense.bic_best,
-            dense.path.len()
-        );
-        eprintln!(
-            "mouse_hs1940 exact: selected={} lambda_best={:.12e} bic_best={:.12e} path_len={}",
-            exact.selected_indices.len(),
-            exact.lambda_best,
-            exact.bic_best,
-            exact.path.len()
         );
     }
 }

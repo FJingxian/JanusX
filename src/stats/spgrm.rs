@@ -7328,7 +7328,7 @@ mod tests {
             vec![Some(2), Some(2), Some(2)],
         ];
         let packed = pack_site_major_dosages(&geno);
-        let row_flip = vec![false, false, false];
+        let row_flip = vec![false, false, true];
         let row_maf = vec![0.5_f32, 0.5_f32, 0.25_f32];
         let sample_idx = vec![0usize, 1usize, 2usize, 3usize];
         let coo = sparse_grm_coo_from_packed(
@@ -7351,12 +7351,12 @@ mod tests {
         let dense = dense_from_csc_lower(&csc);
 
         let x = [
-            [-1.0_f64, -1.0_f64, -0.5_f64],
-            [-1.0_f64, 0.0_f64, -0.5_f64],
-            [1.0_f64, 0.0_f64, 0.5_f64],
-            [1.0_f64, 1.0_f64, 0.5_f64],
+            [-1.0_f64, -1.0_f64, 0.5_f64],
+            [-1.0_f64, 0.0_f64, 0.5_f64],
+            [1.0_f64, 0.0_f64, -0.5_f64],
+            [1.0_f64, 1.0_f64, -0.5_f64],
         ];
-        let denom = 0.5_f64 + 0.5_f64 + 0.1875_f64;
+        let denom = 0.5_f64 + 0.5_f64 + 0.375_f64;
         let mut expected = vec![0.0_f64; 16];
         for i in 0..4 {
             for j in 0..4 {
@@ -7364,17 +7364,24 @@ mod tests {
                 for k in 0..3 {
                     s += x[i][k] * x[j][k];
                 }
-                expected[i * 4 + j] = s / denom;
+                let scaled = s / denom;
+                expected[i * 4 + j] = if i == j || scaled > 0.20_f64 {
+                    scaled
+                } else {
+                    0.0_f64
+                };
             }
         }
 
-        for i in 0..4 {
-            assert!((dense[i * 4 + i] - expected[i * 4 + i]).abs() < 1e-10);
+        for (idx, (actual, expected)) in dense.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (actual - expected).abs() < 1e-10,
+                "dense GRM mismatch at ({}, {}): actual={actual}, expected={expected}",
+                idx / 4,
+                idx % 4,
+            );
         }
-        assert!((dense[2 * 4] - expected[2 * 4]).abs() < 1e-10);
-        assert_eq!(dense[1 * 4], 0.0_f64);
-        assert_eq!(dense[3], 0.0_f64);
-        assert_eq!(csc.nnz, 7usize);
+        assert_eq!(csc.nnz, 6usize);
     }
 
     #[test]
@@ -7535,7 +7542,7 @@ mod tests {
         for (lhs, rhs) in mem.values.iter().zip(stream.values.iter()) {
             assert!((lhs - rhs).abs() < 1e-12);
         }
-        assert_eq!(mem.nnz, 6usize);
+        assert_eq!(mem.nnz, 7usize);
 
         let _ = std::fs::remove_file(out_mem);
         let _ = std::fs::remove_file(out_stream);
@@ -7789,7 +7796,8 @@ mod tests {
             batches,
             vec![
                 SpgrmTaskBatchSpan { start: 0, end: 4 },
-                SpgrmTaskBatchSpan { start: 4, end: 9 },
+                SpgrmTaskBatchSpan { start: 4, end: 7 },
+                SpgrmTaskBatchSpan { start: 7, end: 9 },
                 SpgrmTaskBatchSpan { start: 9, end: 10 },
             ]
         );

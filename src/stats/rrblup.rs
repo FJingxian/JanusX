@@ -4136,15 +4136,6 @@ pub fn rrblup_pcg_bed<'py>(
 mod tests {
     use super::*;
 
-    #[derive(Clone, Copy)]
-    struct XtMulBenchCase {
-        name: &'static str,
-        rows: usize,
-        cols: usize,
-        threads: usize,
-        expect: XtMulKernelStrategy,
-    }
-
     fn make_xtmul_inputs(rows: usize, cols: usize) -> (Vec<f32>, Vec<f32>) {
         let mut block = vec![0.0_f32; rows.saturating_mul(cols)];
         for r in 0..rows {
@@ -4167,16 +4158,6 @@ mod tests {
             .zip(b.iter())
             .map(|(x, y)| (x - y).abs())
             .fold(0.0_f32, f32::max)
-    }
-
-    fn best_of_n_secs(mut f: impl FnMut()) -> f64 {
-        let mut best = f64::INFINITY;
-        for _ in 0..3 {
-            let t0 = Instant::now();
-            f();
-            best = best.min(t0.elapsed().as_secs_f64());
-        }
-        best
     }
 
     #[test]
@@ -4235,111 +4216,5 @@ mod tests {
         assert!(max_abs_diff(&b_serial, &b_parallel) <= 1e-6_f32);
         assert!(max_abs_diff(&diag_serial, &diag_parallel) <= 1e-6_f32);
         assert!(max_abs_diff(&mean_serial, &mean_parallel) <= 1e-6_f32);
-    }
-
-    #[test]
-    #[ignore]
-    fn compare_pcg_xtmul_strategies() {
-        std::env::set_var("JX_ROWMAJOR_F32_KERNEL", "rayon");
-
-        let cases = [
-            XtMulBenchCase {
-                name: "front_half_wide",
-                rows: 768,
-                cols: 262_144,
-                threads: 8,
-                expect: XtMulKernelStrategy::ColChunk,
-            },
-            XtMulBenchCase {
-                name: "row_reduce_friendly",
-                rows: 3_072,
-                cols: 16_384,
-                threads: 4,
-                expect: XtMulKernelStrategy::RowReduce,
-            },
-            XtMulBenchCase {
-                name: "row_reduce_fallback_window",
-                rows: 1_024,
-                cols: 32_768,
-                threads: 16,
-                expect: XtMulKernelStrategy::ColChunk,
-            },
-        ];
-
-        for case in cases {
-            let pool = Some(Arc::new(
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(case.threads)
-                    .build()
-                    .expect("build rayon pool"),
-            ));
-            let pool_ref = pool.as_ref();
-            let picked = choose_xtmul_kernel_strategy(case.rows, case.cols, pool_ref);
-            let row_chunk = xtmul_row_chunk(case.rows);
-            let row_tasks = case.rows.div_ceil(row_chunk);
-            let col_chunk = xtmul_col_chunk(case.cols, case.threads);
-            let col_tasks = case.cols.div_ceil(col_chunk);
-            assert_eq!(picked, case.expect, "unexpected strategy for {}", case.name);
-
-            let (block, weights) = make_xtmul_inputs(case.rows, case.cols);
-            let _blas_guard = OpenBlasThreadGuard::enter(1);
-
-            let mut out_legacy = vec![0.0_f32; case.cols];
-            row_major_block_t_mul_vec_accum_f32_row_reduce(
-                &block,
-                case.rows,
-                case.cols,
-                &weights,
-                &mut out_legacy,
-                pool_ref,
-            );
-
-            let mut out_adaptive = vec![0.0_f32; case.cols];
-            row_major_block_t_mul_vec_accum_f32(
-                &block,
-                case.rows,
-                case.cols,
-                &weights,
-                &mut out_adaptive,
-                pool_ref,
-            );
-
-            let diff = max_abs_diff(&out_legacy, &out_adaptive);
-            assert!(
-                diff <= 5e-3_f32,
-                "strategy output drift too large for {}: diff={diff}",
-                case.name
-            );
-
-            let legacy_secs = best_of_n_secs(|| {
-                let mut out = vec![0.0_f32; case.cols];
-                row_major_block_t_mul_vec_accum_f32_row_reduce(
-                    &block, case.rows, case.cols, &weights, &mut out, pool_ref,
-                );
-            });
-            let adaptive_secs = best_of_n_secs(|| {
-                let mut out = vec![0.0_f32; case.cols];
-                row_major_block_t_mul_vec_accum_f32(
-                    &block, case.rows, case.cols, &weights, &mut out, pool_ref,
-                );
-            });
-            let speedup = legacy_secs / adaptive_secs.max(1e-12_f64);
-
-            eprintln!(
-                "pcg_xtmul case={} rows={} cols={} threads={} strategy={:?} row_chunk={} row_tasks={} col_chunk={} col_tasks={} legacy={:.6}s adaptive={:.6}s speedup={:.2}x",
-                case.name,
-                case.rows,
-                case.cols,
-                case.threads,
-                picked,
-                row_chunk,
-                row_tasks,
-                col_chunk,
-                col_tasks,
-                legacy_secs,
-                adaptive_secs,
-                speedup,
-            );
-        }
     }
 }

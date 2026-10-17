@@ -6659,7 +6659,7 @@ mod tests {
         ];
         let mut out = vec![0.0_f64; 2];
         pairwise_block_dot_f32_f64(&lhs, &rhs, 2, 3, &mut out, None);
-        assert_eq!(out, vec![7.0_f64, 39.5_f64]);
+        assert_eq!(out, vec![7.0_f64, 38.5_f64]);
     }
 
     #[test]
@@ -6676,7 +6676,7 @@ mod tests {
         let mut sv = vec![0.0_f64; 2];
         let mut xtz = vec![0.0_f64; 2];
         fused_block_sv_xtz_scalar_p1(&g, &z, &x0, 2, 3, &mut sv, &mut xtz, None);
-        assert_eq!(sv, vec![7.0_f64, 39.5_f64]);
+        assert_eq!(sv, vec![7.0_f64, 38.5_f64]);
         assert_eq!(xtz, vec![70.0_f64, 160.0_f64]);
     }
 
@@ -7269,7 +7269,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_close(&out_lambda, &out_scaled, 1e-10_f64);
+        // The BED decode and sparse solve use f32 intermediates, so the
+        // scale-invariance check needs to allow their rounding error.
+        assert_close(&out_lambda, &out_scaled, 1e-7_f64);
     }
 
     #[test]

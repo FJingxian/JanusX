@@ -333,9 +333,11 @@ jobs:
           brew list --versions openblas >/dev/null 2>&1 || brew install openblas
           command -v pkg-config >/dev/null 2>&1 || brew install pkgconf
           OPENBLAS_PREFIX="$(brew --prefix openblas)"
-          echo "OPENBLAS_LIB_DIR=${OPENBLAS_PREFIX}/lib" >> "$GITHUB_ENV"
-          echo "OPENBLAS_INCLUDE_DIR=${OPENBLAS_PREFIX}/include" >> "$GITHUB_ENV"
-          echo "PKG_CONFIG_PATH=${OPENBLAS_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
+          {
+            echo "OPENBLAS_LIB_DIR=${OPENBLAS_PREFIX}/lib"
+            echo "OPENBLAS_INCLUDE_DIR=${OPENBLAS_PREFIX}/include"
+            echo "PKG_CONFIG_PATH=${OPENBLAS_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          } >> "$GITHUB_ENV"
 
       - name: Install OpenBLAS (Windows x86_64, conda-forge threaded)
         if: ${{ matrix.label == 'windows-x86_64' }}

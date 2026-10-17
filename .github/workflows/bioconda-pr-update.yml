@@ -84,9 +84,11 @@ jobs:
             echo "Invalid release_tag: '$RAW' (expected vX.Y.Z or X.Y.Z)"
             exit 1
           fi
-          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
-          echo "BIOCONDA_BRANCH=update-janusx-v${VERSION}" >> "$GITHUB_ENV"
-          echo "BIOCONDA_FORK=${{ inputs.bioconda_fork }}" >> "$GITHUB_ENV"
+          {
+            echo "VERSION=${VERSION}"
+            echo "BIOCONDA_BRANCH=update-janusx-v${VERSION}"
+            echo "BIOCONDA_FORK=${{ inputs.bioconda_fork }}"
+          } >> "$GITHUB_ENV"
 
       - name: Checkout bioconda fork
         if: ${{ steps.bioconda_gate.outputs.enabled == 'true' }}

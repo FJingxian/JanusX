@@ -3106,13 +3106,13 @@ fn write_farmcpu_packed_main_scan(
 
         if !text_buf.is_empty() {
             out_writer
-                .send(text_buf.as_bytes().to_vec())
+                .send_text(&mut text_buf)
                 .map_err(|e| e.to_string())?;
         }
         if let (Some(q_writer), Some(qtn_text_buf)) = (qtn_writer, qtn_text_buf_opt.as_mut()) {
             if !qtn_text_buf.is_empty() {
                 q_writer
-                    .send(qtn_text_buf.as_bytes().to_vec())
+                    .send_text(qtn_text_buf)
                     .map_err(|e| format!("{qtn_path_for_err}: {e}"))?;
             }
         }
@@ -4646,14 +4646,14 @@ pub fn farmcpu_write_assoc_tsv(
         .map_err(|e| PyRuntimeError::new_err(format!("format row {i} for {out_tsv}: {e}")))?;
         if (i + 1) % 8192 == 0 {
             writer
-                .send(text_buf.as_bytes().to_vec())
+                .send_text(&mut text_buf)
                 .map_err(PyRuntimeError::new_err)?;
             text_buf.clear();
         }
     }
     if !text_buf.is_empty() {
         writer
-            .send(text_buf.as_bytes().to_vec())
+            .send_text(&mut text_buf)
             .map_err(PyRuntimeError::new_err)?;
     }
     writer.finish().map_err(PyRuntimeError::new_err)?;
@@ -4710,14 +4710,14 @@ pub fn farmcpu_write_assoc_tsv(
                 })?;
                 if q_text_buf.len() >= 512 * 1024 {
                     q_writer
-                        .send(q_text_buf.as_bytes().to_vec())
+                        .send_text(&mut q_text_buf)
                         .map_err(PyRuntimeError::new_err)?;
                     q_text_buf.clear();
                 }
             }
             if !q_text_buf.is_empty() {
                 q_writer
-                    .send(q_text_buf.as_bytes().to_vec())
+                    .send_text(&mut q_text_buf)
                     .map_err(PyRuntimeError::new_err)?;
             }
             q_writer.finish().map_err(PyRuntimeError::new_err)?;

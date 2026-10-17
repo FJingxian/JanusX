@@ -6517,13 +6517,11 @@ def _resolve_fvlmm_scan_stage_mode() -> str:
         return "full"
     if raw in {"generic", "scan", "blas_1_rayon_t"}:
         return "generic"
-    # Backend-aware default:
-    # - OpenBLAS keeps the outer scan stage conservative; the Rust kernel still
-    #   applies its own backend-specific inner scheduling.
-    # - Accelerate and other backends keep the legacy full mode by default.
-    if str(detect_rust_blas_backend()).strip().lower() == "openblas":
-        return "generic"
-    return "full"
+    # Dense FvLMM projection is the dominant BLAS workload. Give it the
+    # requested thread budget and keep association single-threaded on every
+    # backend; explicit modes above retain the legacy scheduling alternatives.
+    # Accelerate controls single/multi-thread mode, not an exact core cap.
+    return "blas_t_rayon_1"
 
 
 @contextmanager
@@ -6532,8 +6530,8 @@ def _gwas_fvlmm_scan_stage_ctx(threads: int):
     FvLMM scan stage.
 
     Modes:
-    - `full` (legacy default): BLAS=t, Rayon=t
-    - `blas_t_rayon_1`: BLAS=t, Rayon=1
+    - `full` (legacy opt-in): BLAS=t, Rayon=t
+    - `blas_t_rayon_1` (default): BLAS=t, Rayon=1
     - `generic`: reuse the generic GWAS scan stage (BLAS=1, Rayon=t)
 
     The Rust projection/association budgets are exported separately through

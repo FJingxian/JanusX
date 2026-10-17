@@ -12,7 +12,7 @@ use std::io::{BufWriter, Write};
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 /// Copy an ndarray view in logical standard (row-major) order.
@@ -445,9 +445,57 @@ pub(crate) fn parse_index_vec_i64_result(
     parse_index_vec_i64_impl(indices, upper_bound, label)
 }
 
+#[derive(Default)]
+struct WriterBuffers {
+    in_flight: usize,
+    closed: bool,
+    recycled: Option<Vec<u8>>,
+}
+
+struct WriterBudget {
+    buffers: Mutex<WriterBuffers>,
+    ready: Condvar,
+    limit: usize,
+}
+
+struct WriterBlock {
+    bytes: Vec<u8>,
+    budget: Arc<WriterBudget>,
+}
+
+impl Drop for WriterBlock {
+    fn drop(&mut self) {
+        let mut state = self
+            .budget
+            .buffers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        state.in_flight -= self.bytes.capacity();
+        // One reusable allocation, independently bounded to a quarter of the
+        // in-flight budget. Large one-shot blocks are freed, not retained.
+        if !state.closed && self.bytes.capacity() <= self.budget.limit / 4 {
+            self.bytes.clear();
+            state.recycled = Some(std::mem::take(&mut self.bytes));
+        }
+        self.budget.ready.notify_all();
+    }
+}
+
+struct WriterExit(Arc<WriterBudget>);
+
+impl Drop for WriterExit {
+    fn drop(&mut self) {
+        let mut state = self.0.buffers.lock().unwrap_or_else(|e| e.into_inner());
+        state.closed = true;
+        state.recycled = None;
+        self.0.ready.notify_all();
+    }
+}
+
 pub(crate) struct AsyncTsvWriter {
     path: String,
-    tx: Option<SyncSender<Vec<u8>>>,
+    tx: Option<SyncSender<WriterBlock>>,
+    budget: Arc<WriterBudget>,
     handle: Option<JoinHandle<Result<(), String>>>,
 }
 
@@ -460,17 +508,22 @@ impl AsyncTsvWriter {
     ) -> Result<Self, String> {
         const MIN_FLUSH_BYTES: usize = 8 * 1024 * 1024;
         const MAX_FLUSH_BYTES: usize = 64 * 1024 * 1024;
-        const MIN_QUEUE_DEPTH: usize = 16;
         const MAX_QUEUE_DEPTH: usize = 64;
         let path_owned = path.to_string();
         let header_owned = header.to_vec();
-        let queue_depth_eff = queue_depth
-            .max((writer_capacity / (4 * 1024 * 1024)).max(1))
-            .clamp(MIN_QUEUE_DEPTH, MAX_QUEUE_DEPTH);
-        let (tx, rx) = sync_channel::<Vec<u8>>(queue_depth_eff);
+        let queue_depth_eff = queue_depth.clamp(1, MAX_QUEUE_DEPTH);
+        let (tx, rx) = sync_channel::<WriterBlock>(queue_depth_eff);
         let path_for_writer = path_owned.clone();
         let flush_threshold = writer_capacity.clamp(MIN_FLUSH_BYTES, MAX_FLUSH_BYTES);
+        let budget = Arc::new(WriterBudget {
+            buffers: Mutex::new(WriterBuffers::default()),
+            ready: Condvar::new(),
+            limit: flush_threshold,
+        });
+        let writer_budget = Arc::clone(&budget);
         let handle = std::thread::spawn(move || -> Result<(), String> {
+            // Wake blocked producers on every exit, including I/O error/panic.
+            let _exit = WriterExit(writer_budget);
             let out_file = File::create(&path_for_writer)
                 .map_err(|e| format!("create {path_for_writer}: {e}"))?;
             let mut writer = BufWriter::with_capacity(writer_capacity.max(1), out_file);
@@ -482,11 +535,11 @@ impl AsyncTsvWriter {
                 .map_err(|e| format!("flush header {path_for_writer}: {e}"))?;
             let mut pending_bytes = 0usize;
             for block in rx {
-                if !block.is_empty() {
+                if !block.bytes.is_empty() {
                     writer
-                        .write_all(&block)
+                        .write_all(&block.bytes)
                         .map_err(|e| format!("write {path_for_writer}: {e}"))?;
-                    pending_bytes = pending_bytes.saturating_add(block.len());
+                    pending_bytes = pending_bytes.saturating_add(block.bytes.len());
                     if pending_bytes >= flush_threshold {
                         writer
                             .flush()
@@ -503,6 +556,7 @@ impl AsyncTsvWriter {
         Ok(Self {
             path: path_owned,
             tx: Some(tx),
+            budget,
             handle: Some(handle),
         })
     }
@@ -512,11 +566,58 @@ impl AsyncTsvWriter {
         if block.is_empty() {
             return Ok(());
         }
+        let capacity = block.capacity();
+        let mut state = self
+            .budget
+            .buffers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // A single oversized caller-owned block is allowed only when the
+        // writer has no other in-flight blocks. Never enqueue several of them.
+        while !state.closed
+            && state.in_flight != 0
+            && capacity > self.budget.limit.saturating_sub(state.in_flight)
+        {
+            state = self
+                .budget
+                .ready
+                .wait(state)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        if state.closed {
+            return Err(format!("writer closed for {}", self.path));
+        }
+        state.in_flight += capacity;
+        drop(state);
+        let message = WriterBlock {
+            bytes: block,
+            budget: Arc::clone(&self.budget),
+        };
         self.tx
             .as_ref()
             .ok_or_else(|| format!("writer channel already closed for {}", self.path))?
-            .send(block)
+            .send(message)
             .map_err(|e| format!("send {}: {e}", self.path))
+    }
+
+    /// Transfer formatted UTF-8 bytes without a copy and reclaim an empty
+    /// buffer from the preceding write when available.
+    pub(crate) fn send_text(&self, text: &mut String) -> Result<(), String> {
+        if text.is_empty() {
+            return Ok(());
+        }
+        self.send(std::mem::take(text).into_bytes())?;
+        let recycled = self
+            .budget
+            .buffers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .recycled
+            .take();
+        if let Some(bytes) = recycled {
+            *text = String::from_utf8(bytes).expect("recycled writer buffer is empty UTF-8");
+        }
+        Ok(())
     }
 
     pub(crate) fn finish(mut self) -> Result<(), String> {

@@ -1086,10 +1086,20 @@ where
                 meta.miss_counts.len(),
             ));
         }
-        let source_rows = parse_index_vec_i64(meta.row_indices.as_slice(), n_snps, "row_indices")
-            .map_err(|e| e.to_string())?;
+        // Validate the caller-owned index table once, but do not duplicate it
+        // as a marker-sized usize table. Conversion is bounded to each chunk.
+        let source_rows = meta.row_indices.as_slice();
         let mut prev_src: Option<usize> = None;
-        for &src_row in source_rows.iter() {
+        for (i, &index) in source_rows.iter().enumerate() {
+            if index < 0 {
+                return Err(format!("row_indices[{i}] must be >= 0, got {index}"));
+            }
+            if index as usize >= n_snps {
+                return Err(format!(
+                    "row_indices[{i}] out of range: {index} >= {n_snps}"
+                ));
+            }
+            let src_row = index as usize;
             if let Some(prev) = prev_src {
                 if src_row < prev {
                     return Err(
@@ -1138,6 +1148,12 @@ where
 
     let mut chunk_start = 0usize;
     let mut rel_row_indices: Vec<usize> = Vec::with_capacity(scan_chunk_snps);
+    let mut prepared_chunk_rows: Vec<usize> =
+        Vec::with_capacity(if prepared_source_rows.is_some() {
+            scan_chunk_snps
+        } else {
+            0
+        });
     let producer_err = Arc::new(OnceLock::<String>::new());
     let producer_err_bg = Arc::clone(&producer_err);
     let producer = |chunk: &mut StreamingChunk| -> bool {
@@ -1152,7 +1168,15 @@ where
                 .zip(prepared_meta)
                 .map(|(source_rows_all, meta)| {
                     (
-                        &source_rows_all[chunk_start..chunk_end],
+                        {
+                            prepared_chunk_rows.clear();
+                            prepared_chunk_rows.extend(
+                                source_rows_all[chunk_start..chunk_end]
+                                    .iter()
+                                    .map(|&i| i as usize),
+                            );
+                            prepared_chunk_rows.as_slice()
+                        },
                         &meta.row_flip[chunk_start..chunk_end],
                         &meta.row_maf[chunk_start..chunk_end],
                         &meta.miss_counts[chunk_start..chunk_end],
@@ -1409,8 +1433,7 @@ where
                 text_buf.reserve(rows * text_capacity_per_row - text_buf.capacity());
             }
             format_rows(&mut text_buf, chunk, rows);
-            let payload = std::mem::take(&mut text_buf).into_bytes();
-            writer.send(payload)?;
+            writer.send_text(&mut text_buf)?;
             record_elapsed_nanos(&tsv_nanos, tsv_t0);
         }
 
@@ -2920,7 +2943,7 @@ pub fn lmm_reml_assoc_kfile_to_tsv_f32<'py>(
                 );
             }
             writer
-                .send(text.as_bytes().to_vec())
+                .send_text(&mut text)
                 .map_err(|error| error.to_string())?;
             text.clear();
             done = row_start.saturating_add(rows);

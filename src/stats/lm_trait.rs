@@ -347,7 +347,7 @@ fn flush_trait_text(writer: &AsyncTsvWriter, text: &mut String) -> Result<(), St
     if text.is_empty() {
         return Ok(());
     }
-    writer.send(std::mem::take(text).into_bytes())?;
+    writer.send_text(text)?;
     text.reserve(LM_TRAIT_TEXT_FLUSH_BYTES);
     Ok(())
 }

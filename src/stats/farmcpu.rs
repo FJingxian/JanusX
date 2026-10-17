@@ -3340,9 +3340,9 @@ pub fn farmcpu_rem_packed(
         return Err(PyRuntimeError::new_err("X.n_rows must equal len(y)"));
     }
     let p = x_arr.shape()[1];
-    let x_flat: Cow<[f64]> = match x.as_slice() {
+    let x_flat: Cow<[f64]> = match crate::stats_common::array_standard_slice(&x) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(x_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&x_arr)),
     };
 
     let sample_idx: Vec<usize> = if let Some(sidx) = sample_indices {
@@ -3359,7 +3359,7 @@ pub fn farmcpu_rem_packed(
 
     let leadidx = select_lead_indices(sz, n_lead, pvalue, pos);
     let k = leadidx.len();
-    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+    let packed_flat: Cow<[u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s) => {
             farmcpu_emit_mem_debug(
                 "farmcpu_rem_packed/packed_slice",
@@ -3479,9 +3479,9 @@ pub fn farmcpu_super_packed<'py>(
     let n = sample_idx.len();
     let k = ridx.len();
 
-    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+    let packed_flat: Cow<[u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&packed_arr)),
     };
     let keep = py.detach(|| -> PyResult<Vec<bool>> {
         let sample_major = decode_packed_rows_to_sample_major(
@@ -3664,7 +3664,7 @@ pub fn farmcpu_packed_to_tsv(
             row_missing.len(),
         )));
     }
-    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+    let packed_flat: Cow<[u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s) => {
             farmcpu_emit_mem_debug(
                 "farmcpu_packed_to_tsv/packed_slice",
@@ -3697,9 +3697,9 @@ pub fn farmcpu_packed_to_tsv(
         return Err(PyRuntimeError::new_err("invalid packed flattened length"));
     }
 
-    let x_cov_flat: Cow<[f64]> = match x_cov.as_slice() {
+    let x_cov_flat: Cow<[f64]> = match crate::stats_common::array_standard_slice(&x_cov) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(x_cov_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&x_cov_arr)),
     };
     let mut base_x = vec![0.0_f64; n * q_base];
     for i in 0..n {

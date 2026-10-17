@@ -209,23 +209,29 @@ fn combine_observed_pair_factor(
 }
 
 fn extract_i64_array_to_vec(arr: PyReadonlyArray1<'_, i64>) -> PyResult<Vec<i64>> {
-    match arr.as_slice() {
+    match crate::stats_common::array_standard_slice(&arr) {
         Ok(slice) => Ok(slice.to_vec()),
-        Err(_) => Ok(arr.as_array().iter().copied().collect()),
+        Err(_) => Ok(crate::stats_common::copy_array_standard_layout(
+            &arr.as_array(),
+        )),
     }
 }
 
 fn extract_f64_array1_to_vec(arr: PyReadonlyArray1<'_, f64>) -> PyResult<Vec<f64>> {
-    match arr.as_slice() {
+    match crate::stats_common::array_standard_slice(&arr) {
         Ok(slice) => Ok(slice.to_vec()),
-        Err(_) => Ok(arr.as_array().iter().copied().collect()),
+        Err(_) => Ok(crate::stats_common::copy_array_standard_layout(
+            &arr.as_array(),
+        )),
     }
 }
 
 fn extract_f64_array2_row_major(arr: PyReadonlyArray2<'_, f64>) -> PyResult<Vec<f64>> {
-    match arr.as_slice() {
+    match crate::stats_common::array_standard_slice(&arr) {
         Ok(slice) => Ok(slice.to_vec()),
-        Err(_) => Ok(arr.as_array().iter().copied().collect()),
+        Err(_) => Ok(crate::stats_common::copy_array_standard_layout(
+            &arr.as_array(),
+        )),
     }
 }
 

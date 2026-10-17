@@ -6866,9 +6866,9 @@ pub fn algwas_packed_to_tsv(
     if x_cov_arr.shape()[0] != n {
         return Err(PyRuntimeError::new_err("x_cov rows must equal len(y)"));
     }
-    let x_cov_flat: Cow<[f64]> = match x_cov.as_slice() {
+    let x_cov_flat: Cow<[f64]> = match crate::stats_common::array_standard_slice(&x_cov) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(x_cov_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&x_cov_arr)),
     };
 
     let sample_idx: Vec<usize> = if let Some(sidx) = sample_indices {
@@ -6922,9 +6922,9 @@ pub fn algwas_packed_to_tsv(
         m,
     )
     .map_err(PyRuntimeError::new_err)?;
-    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+    let packed_flat: Cow<[u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&packed_arr)),
     };
     if packed_flat.len() != m_packed * bytes_per_snp {
         return Err(PyRuntimeError::new_err("invalid packed flattened length"));

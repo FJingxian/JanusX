@@ -129,7 +129,7 @@ pub(crate) fn array2_to_f32_input<'py>(
     if let Ok(arr) = obj.extract::<PyReadonlyArray2<'py, f32>>() {
         let view = arr.as_array();
         let (rows, cols) = view.dim();
-        if arr.as_slice().is_ok() {
+        if crate::stats_common::array_standard_slice(&arr).is_ok() {
             return Ok(DenseF32Input::Borrowed {
                 array: arr,
                 rows,
@@ -7095,7 +7095,7 @@ pub fn bayesa(
                 return Err(PyValueError::new_err("X rows must match len(y)"));
             }
             let q = x_shape[1];
-            let xv = match arr.as_slice() {
+            let xv = match crate::stats_common::array_standard_slice(arr) {
                 Ok(s) => Cow::Borrowed(s),
                 Err(_) => Cow::Owned(array2_to_vec(arr)),
             };
@@ -7263,7 +7263,7 @@ pub fn bayesb(
                 return Err(PyValueError::new_err("X rows must match len(y)"));
             }
             let q = x_shape[1];
-            let xv = match arr.as_slice() {
+            let xv = match crate::stats_common::array_standard_slice(arr) {
                 Ok(s) => Cow::Borrowed(s),
                 Err(_) => Cow::Owned(array2_to_vec(arr)),
             };
@@ -7436,7 +7436,7 @@ pub fn bayesc(
                 return Err(PyValueError::new_err("X rows must match len(y)"));
             }
             let q = x_shape[1];
-            let xv = match arr.as_slice() {
+            let xv = match crate::stats_common::array_standard_slice(arr) {
                 Ok(s) => Cow::Borrowed(s),
                 Err(_) => Cow::Owned(array2_to_vec(arr)),
             };
@@ -7611,22 +7611,31 @@ pub fn bayesa_packed(
         )));
     }
 
-    let row_flip_vec: Cow<'_, [bool]> = match row_flip.as_slice() {
+    let row_flip_vec: Cow<'_, [bool]> = match crate::stats_common::array_standard_slice(&row_flip) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_flip.as_array(),
+        )),
     };
-    let row_maf_vec: Cow<'_, [f32]> = match row_maf.as_slice() {
+    let row_maf_vec: Cow<'_, [f32]> = match crate::stats_common::array_standard_slice(&row_maf) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_maf.as_array(),
+        )),
     };
-    let row_mean_vec: Cow<'_, [f32]> = match row_mean.as_slice() {
+    let row_mean_vec: Cow<'_, [f32]> = match crate::stats_common::array_standard_slice(&row_mean) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_mean.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_mean.as_array(),
+        )),
     };
-    let row_inv_sd_vec: Cow<'_, [f32]> = match row_inv_sd.as_slice() {
-        Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_inv_sd.as_array().iter().copied().collect()),
-    };
+    let row_inv_sd_vec: Cow<'_, [f32]> =
+        match crate::stats_common::array_standard_slice(&row_inv_sd) {
+            Ok(s) => Cow::Borrowed(s),
+            Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+                &row_inv_sd.as_array(),
+            )),
+        };
     if row_flip_vec.len() != p
         || row_maf_vec.len() != p
         || row_mean_vec.len() != p
@@ -7658,7 +7667,7 @@ pub fn bayesa_packed(
                 return Err(PyValueError::new_err("X rows must match len(y)"));
             }
             let q = x_shape[1];
-            let xv = match arr.as_slice() {
+            let xv = match crate::stats_common::array_standard_slice(arr) {
                 Ok(s) => Cow::Borrowed(s),
                 Err(_) => Cow::Owned(array2_to_vec(arr)),
             };
@@ -7667,9 +7676,9 @@ pub fn bayesa_packed(
         None => (Cow::Owned(vec![1.0; n]), 1usize),
     };
 
-    let packed_flat: Cow<'_, [u8]> = match packed.as_slice() {
+    let packed_flat: Cow<'_, [u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&packed_arr)),
     };
     let pool_owned = get_cached_pool(threads)?;
     let pool_ref = pool_owned.as_ref();
@@ -7857,22 +7866,31 @@ pub fn bayesb_packed(
         )));
     }
 
-    let row_flip_vec: Cow<'_, [bool]> = match row_flip.as_slice() {
+    let row_flip_vec: Cow<'_, [bool]> = match crate::stats_common::array_standard_slice(&row_flip) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_flip.as_array(),
+        )),
     };
-    let row_maf_vec: Cow<'_, [f32]> = match row_maf.as_slice() {
+    let row_maf_vec: Cow<'_, [f32]> = match crate::stats_common::array_standard_slice(&row_maf) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_maf.as_array(),
+        )),
     };
-    let row_mean_vec: Cow<'_, [f32]> = match row_mean.as_slice() {
+    let row_mean_vec: Cow<'_, [f32]> = match crate::stats_common::array_standard_slice(&row_mean) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_mean.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_mean.as_array(),
+        )),
     };
-    let row_inv_sd_vec: Cow<'_, [f32]> = match row_inv_sd.as_slice() {
-        Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_inv_sd.as_array().iter().copied().collect()),
-    };
+    let row_inv_sd_vec: Cow<'_, [f32]> =
+        match crate::stats_common::array_standard_slice(&row_inv_sd) {
+            Ok(s) => Cow::Borrowed(s),
+            Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+                &row_inv_sd.as_array(),
+            )),
+        };
     if row_flip_vec.len() != p
         || row_maf_vec.len() != p
         || row_mean_vec.len() != p
@@ -7904,7 +7922,7 @@ pub fn bayesb_packed(
                 return Err(PyValueError::new_err("X rows must match len(y)"));
             }
             let q = x_shape[1];
-            let xv = match arr.as_slice() {
+            let xv = match crate::stats_common::array_standard_slice(arr) {
                 Ok(s) => Cow::Borrowed(s),
                 Err(_) => Cow::Owned(array2_to_vec(arr)),
             };
@@ -7913,9 +7931,9 @@ pub fn bayesb_packed(
         None => (Cow::Owned(vec![1.0; n]), 1usize),
     };
 
-    let packed_flat: Cow<'_, [u8]> = match packed.as_slice() {
+    let packed_flat: Cow<'_, [u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&packed_arr)),
     };
     let pool_owned = get_cached_pool(threads)?;
     let pool_ref = pool_owned.as_ref();
@@ -8110,22 +8128,31 @@ pub fn bayesc_packed(
         )));
     }
 
-    let row_flip_vec: Cow<'_, [bool]> = match row_flip.as_slice() {
+    let row_flip_vec: Cow<'_, [bool]> = match crate::stats_common::array_standard_slice(&row_flip) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_flip.as_array(),
+        )),
     };
-    let row_maf_vec: Cow<'_, [f32]> = match row_maf.as_slice() {
+    let row_maf_vec: Cow<'_, [f32]> = match crate::stats_common::array_standard_slice(&row_maf) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_maf.as_array(),
+        )),
     };
-    let row_mean_vec: Cow<'_, [f32]> = match row_mean.as_slice() {
+    let row_mean_vec: Cow<'_, [f32]> = match crate::stats_common::array_standard_slice(&row_mean) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_mean.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_mean.as_array(),
+        )),
     };
-    let row_inv_sd_vec: Cow<'_, [f32]> = match row_inv_sd.as_slice() {
-        Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_inv_sd.as_array().iter().copied().collect()),
-    };
+    let row_inv_sd_vec: Cow<'_, [f32]> =
+        match crate::stats_common::array_standard_slice(&row_inv_sd) {
+            Ok(s) => Cow::Borrowed(s),
+            Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+                &row_inv_sd.as_array(),
+            )),
+        };
     if row_flip_vec.len() != p
         || row_maf_vec.len() != p
         || row_mean_vec.len() != p
@@ -8157,7 +8184,7 @@ pub fn bayesc_packed(
                 return Err(PyValueError::new_err("X rows must match len(y)"));
             }
             let q = x_shape[1];
-            let xv = match arr.as_slice() {
+            let xv = match crate::stats_common::array_standard_slice(arr) {
                 Ok(s) => Cow::Borrowed(s),
                 Err(_) => Cow::Owned(array2_to_vec(arr)),
             };
@@ -8166,9 +8193,9 @@ pub fn bayesc_packed(
         None => (Cow::Owned(vec![1.0; n]), 1usize),
     };
 
-    let packed_flat: Cow<'_, [u8]> = match packed.as_slice() {
+    let packed_flat: Cow<'_, [u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&packed_arr)),
     };
     let pool_owned = get_cached_pool(threads)?;
     let pool_ref = pool_owned.as_ref();
@@ -8347,22 +8374,31 @@ pub fn bayesa_stream_bed(
     if p == 0 {
         return Err(PyValueError::new_err("row_indices must not be empty"));
     }
-    let row_flip_vec: Cow<'_, [bool]> = match row_flip.as_slice() {
+    let row_flip_vec: Cow<'_, [bool]> = match crate::stats_common::array_standard_slice(&row_flip) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_flip.as_array(),
+        )),
     };
-    let row_maf_vec: Cow<'_, [f32]> = match row_maf.as_slice() {
+    let row_maf_vec: Cow<'_, [f32]> = match crate::stats_common::array_standard_slice(&row_maf) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_maf.as_array(),
+        )),
     };
-    let row_mean_vec: Cow<'_, [f32]> = match row_mean.as_slice() {
+    let row_mean_vec: Cow<'_, [f32]> = match crate::stats_common::array_standard_slice(&row_mean) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_mean.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_mean.as_array(),
+        )),
     };
-    let row_inv_sd_vec: Cow<'_, [f32]> = match row_inv_sd.as_slice() {
-        Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_inv_sd.as_array().iter().copied().collect()),
-    };
+    let row_inv_sd_vec: Cow<'_, [f32]> =
+        match crate::stats_common::array_standard_slice(&row_inv_sd) {
+            Ok(s) => Cow::Borrowed(s),
+            Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+                &row_inv_sd.as_array(),
+            )),
+        };
     if row_flip_vec.len() != p
         || row_maf_vec.len() != p
         || row_mean_vec.len() != p
@@ -8393,7 +8429,7 @@ pub fn bayesa_stream_bed(
                 return Err(PyValueError::new_err("X rows must match len(y)"));
             }
             let q = x_shape[1];
-            let xv = match arr.as_slice() {
+            let xv = match crate::stats_common::array_standard_slice(arr) {
                 Ok(s) => Cow::Borrowed(s),
                 Err(_) => Cow::Owned(array2_to_vec(arr)),
             };
@@ -8587,22 +8623,31 @@ pub fn bayesb_stream_bed(
     if p == 0 {
         return Err(PyValueError::new_err("row_indices must not be empty"));
     }
-    let row_flip_vec: Cow<'_, [bool]> = match row_flip.as_slice() {
+    let row_flip_vec: Cow<'_, [bool]> = match crate::stats_common::array_standard_slice(&row_flip) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_flip.as_array(),
+        )),
     };
-    let row_maf_vec: Cow<'_, [f32]> = match row_maf.as_slice() {
+    let row_maf_vec: Cow<'_, [f32]> = match crate::stats_common::array_standard_slice(&row_maf) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_maf.as_array(),
+        )),
     };
-    let row_mean_vec: Cow<'_, [f32]> = match row_mean.as_slice() {
+    let row_mean_vec: Cow<'_, [f32]> = match crate::stats_common::array_standard_slice(&row_mean) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_mean.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_mean.as_array(),
+        )),
     };
-    let row_inv_sd_vec: Cow<'_, [f32]> = match row_inv_sd.as_slice() {
-        Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_inv_sd.as_array().iter().copied().collect()),
-    };
+    let row_inv_sd_vec: Cow<'_, [f32]> =
+        match crate::stats_common::array_standard_slice(&row_inv_sd) {
+            Ok(s) => Cow::Borrowed(s),
+            Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+                &row_inv_sd.as_array(),
+            )),
+        };
     if row_flip_vec.len() != p
         || row_maf_vec.len() != p
         || row_mean_vec.len() != p
@@ -8633,7 +8678,7 @@ pub fn bayesb_stream_bed(
                 return Err(PyValueError::new_err("X rows must match len(y)"));
             }
             let q = x_shape[1];
-            let xv = match arr.as_slice() {
+            let xv = match crate::stats_common::array_standard_slice(arr) {
                 Ok(s) => Cow::Borrowed(s),
                 Err(_) => Cow::Owned(array2_to_vec(arr)),
             };
@@ -8834,22 +8879,31 @@ pub fn bayesc_stream_bed(
     if p == 0 {
         return Err(PyValueError::new_err("row_indices must not be empty"));
     }
-    let row_flip_vec: Cow<'_, [bool]> = match row_flip.as_slice() {
+    let row_flip_vec: Cow<'_, [bool]> = match crate::stats_common::array_standard_slice(&row_flip) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_flip.as_array(),
+        )),
     };
-    let row_maf_vec: Cow<'_, [f32]> = match row_maf.as_slice() {
+    let row_maf_vec: Cow<'_, [f32]> = match crate::stats_common::array_standard_slice(&row_maf) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_maf.as_array(),
+        )),
     };
-    let row_mean_vec: Cow<'_, [f32]> = match row_mean.as_slice() {
+    let row_mean_vec: Cow<'_, [f32]> = match crate::stats_common::array_standard_slice(&row_mean) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_mean.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_mean.as_array(),
+        )),
     };
-    let row_inv_sd_vec: Cow<'_, [f32]> = match row_inv_sd.as_slice() {
-        Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_inv_sd.as_array().iter().copied().collect()),
-    };
+    let row_inv_sd_vec: Cow<'_, [f32]> =
+        match crate::stats_common::array_standard_slice(&row_inv_sd) {
+            Ok(s) => Cow::Borrowed(s),
+            Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+                &row_inv_sd.as_array(),
+            )),
+        };
     if row_flip_vec.len() != p
         || row_maf_vec.len() != p
         || row_mean_vec.len() != p
@@ -8880,7 +8934,7 @@ pub fn bayesc_stream_bed(
                 return Err(PyValueError::new_err("X rows must match len(y)"));
             }
             let q = x_shape[1];
-            let xv = match arr.as_slice() {
+            let xv = match crate::stats_common::array_standard_slice(arr) {
                 Ok(s) => Cow::Borrowed(s),
                 Err(_) => Cow::Owned(array2_to_vec(arr)),
             };
@@ -10060,22 +10114,31 @@ pub fn bayesa_packed_trace<'py>(
         )));
     }
 
-    let row_flip_vec: Cow<'_, [bool]> = match row_flip.as_slice() {
+    let row_flip_vec: Cow<'_, [bool]> = match crate::stats_common::array_standard_slice(&row_flip) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_flip.as_array(),
+        )),
     };
-    let row_maf_vec: Cow<'_, [f32]> = match row_maf.as_slice() {
+    let row_maf_vec: Cow<'_, [f32]> = match crate::stats_common::array_standard_slice(&row_maf) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_maf.as_array(),
+        )),
     };
-    let row_mean_vec: Cow<'_, [f32]> = match row_mean.as_slice() {
+    let row_mean_vec: Cow<'_, [f32]> = match crate::stats_common::array_standard_slice(&row_mean) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_mean.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_mean.as_array(),
+        )),
     };
-    let row_inv_sd_vec: Cow<'_, [f32]> = match row_inv_sd.as_slice() {
-        Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_inv_sd.as_array().iter().copied().collect()),
-    };
+    let row_inv_sd_vec: Cow<'_, [f32]> =
+        match crate::stats_common::array_standard_slice(&row_inv_sd) {
+            Ok(s) => Cow::Borrowed(s),
+            Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+                &row_inv_sd.as_array(),
+            )),
+        };
     if row_flip_vec.len() != p
         || row_maf_vec.len() != p
         || row_mean_vec.len() != p
@@ -10109,7 +10172,7 @@ pub fn bayesa_packed_trace<'py>(
                 return Err(PyValueError::new_err("X rows must match len(y)"));
             }
             let q = x_shape[1];
-            let xv = match arr.as_slice() {
+            let xv = match crate::stats_common::array_standard_slice(arr) {
                 Ok(s) => Cow::Borrowed(s),
                 Err(_) => Cow::Owned(array2_to_vec(arr)),
             };
@@ -10118,9 +10181,9 @@ pub fn bayesa_packed_trace<'py>(
         None => (Cow::Owned(vec![1.0; n]), 1usize),
     };
 
-    let packed_flat: Cow<'_, [u8]> = match packed.as_slice() {
+    let packed_flat: Cow<'_, [u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&packed_arr)),
     };
     let pool_owned = get_cached_pool(threads)?;
     let pool_ref = pool_owned.as_ref();
@@ -10261,22 +10324,31 @@ pub fn bayesb_packed_trace<'py>(
         )));
     }
 
-    let row_flip_vec: Cow<'_, [bool]> = match row_flip.as_slice() {
+    let row_flip_vec: Cow<'_, [bool]> = match crate::stats_common::array_standard_slice(&row_flip) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_flip.as_array(),
+        )),
     };
-    let row_maf_vec: Cow<'_, [f32]> = match row_maf.as_slice() {
+    let row_maf_vec: Cow<'_, [f32]> = match crate::stats_common::array_standard_slice(&row_maf) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_maf.as_array(),
+        )),
     };
-    let row_mean_vec: Cow<'_, [f32]> = match row_mean.as_slice() {
+    let row_mean_vec: Cow<'_, [f32]> = match crate::stats_common::array_standard_slice(&row_mean) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_mean.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_mean.as_array(),
+        )),
     };
-    let row_inv_sd_vec: Cow<'_, [f32]> = match row_inv_sd.as_slice() {
-        Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_inv_sd.as_array().iter().copied().collect()),
-    };
+    let row_inv_sd_vec: Cow<'_, [f32]> =
+        match crate::stats_common::array_standard_slice(&row_inv_sd) {
+            Ok(s) => Cow::Borrowed(s),
+            Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+                &row_inv_sd.as_array(),
+            )),
+        };
     if row_flip_vec.len() != p
         || row_maf_vec.len() != p
         || row_mean_vec.len() != p
@@ -10310,7 +10382,7 @@ pub fn bayesb_packed_trace<'py>(
                 return Err(PyValueError::new_err("X rows must match len(y)"));
             }
             let q = x_shape[1];
-            let xv = match arr.as_slice() {
+            let xv = match crate::stats_common::array_standard_slice(arr) {
                 Ok(s) => Cow::Borrowed(s),
                 Err(_) => Cow::Owned(array2_to_vec(arr)),
             };
@@ -10319,9 +10391,9 @@ pub fn bayesb_packed_trace<'py>(
         None => (Cow::Owned(vec![1.0; n]), 1usize),
     };
 
-    let packed_flat: Cow<'_, [u8]> = match packed.as_slice() {
+    let packed_flat: Cow<'_, [u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&packed_arr)),
     };
     let pool_owned = get_cached_pool(threads)?;
     let pool_ref = pool_owned.as_ref();
@@ -10466,22 +10538,31 @@ pub fn bayesc_packed_trace<'py>(
         )));
     }
 
-    let row_flip_vec: Cow<'_, [bool]> = match row_flip.as_slice() {
+    let row_flip_vec: Cow<'_, [bool]> = match crate::stats_common::array_standard_slice(&row_flip) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_flip.as_array(),
+        )),
     };
-    let row_maf_vec: Cow<'_, [f32]> = match row_maf.as_slice() {
+    let row_maf_vec: Cow<'_, [f32]> = match crate::stats_common::array_standard_slice(&row_maf) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_maf.as_array(),
+        )),
     };
-    let row_mean_vec: Cow<'_, [f32]> = match row_mean.as_slice() {
+    let row_mean_vec: Cow<'_, [f32]> = match crate::stats_common::array_standard_slice(&row_mean) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_mean.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_mean.as_array(),
+        )),
     };
-    let row_inv_sd_vec: Cow<'_, [f32]> = match row_inv_sd.as_slice() {
-        Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_inv_sd.as_array().iter().copied().collect()),
-    };
+    let row_inv_sd_vec: Cow<'_, [f32]> =
+        match crate::stats_common::array_standard_slice(&row_inv_sd) {
+            Ok(s) => Cow::Borrowed(s),
+            Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+                &row_inv_sd.as_array(),
+            )),
+        };
     if row_flip_vec.len() != p
         || row_maf_vec.len() != p
         || row_mean_vec.len() != p
@@ -10515,7 +10596,7 @@ pub fn bayesc_packed_trace<'py>(
                 return Err(PyValueError::new_err("X rows must match len(y)"));
             }
             let q = x_shape[1];
-            let xv = match arr.as_slice() {
+            let xv = match crate::stats_common::array_standard_slice(arr) {
                 Ok(s) => Cow::Borrowed(s),
                 Err(_) => Cow::Owned(array2_to_vec(arr)),
             };
@@ -10524,9 +10605,9 @@ pub fn bayesc_packed_trace<'py>(
         None => (Cow::Owned(vec![1.0; n]), 1usize),
     };
 
-    let packed_flat: Cow<'_, [u8]> = match packed.as_slice() {
+    let packed_flat: Cow<'_, [u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&packed_arr)),
     };
     let pool_owned = get_cached_pool(threads)?;
     let pool_ref = pool_owned.as_ref();

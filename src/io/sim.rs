@@ -446,19 +446,7 @@ impl SimTraitAccumulator {
                 .as_slice()
                 .ok_or_else(|| PyValueError::new_err("g must be C-contiguous or castable"))?
         } else {
-            let (raw, offset) = g_view.to_owned().into_raw_vec_and_offset();
-            let total = m.saturating_mul(n);
-            let start = offset.unwrap_or(0);
-            let end = start.saturating_add(total);
-            if end > raw.len() {
-                return Err(PyValueError::new_err(format!(
-                    "g copy layout error: start={}, total={}, raw_len={}",
-                    start,
-                    total,
-                    raw.len()
-                )));
-            }
-            g_owned = raw[start..end].to_vec();
+            g_owned = crate::stats_common::copy_array_standard_layout(&g_view);
             &g_owned
         };
 
@@ -665,19 +653,7 @@ pub fn sim_trait_accumulate_i8_f32<'py>(
             .as_slice()
             .ok_or_else(|| PyValueError::new_err("g must be C-contiguous or castable"))?
     } else {
-        let (raw, offset) = g_view.to_owned().into_raw_vec_and_offset();
-        let total = m.saturating_mul(n);
-        let start = offset.unwrap_or(0);
-        let end = start.saturating_add(total);
-        if end > raw.len() {
-            return Err(PyValueError::new_err(format!(
-                "g copy layout error: start={}, total={}, raw_len={}",
-                start,
-                total,
-                raw.len()
-            )));
-        }
-        g_owned = raw[start..end].to_vec();
+        g_owned = crate::stats_common::copy_array_standard_layout(&g_view);
         &g_owned
     };
 

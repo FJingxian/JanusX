@@ -574,9 +574,8 @@ pub fn susie_rss_f64<'py>(
     prior_tol: f64,
     threads: usize,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let z_slice = z
-        .as_slice()
-        .map_err(|_| PyValueError::new_err("z must be a C-contiguous float64 vector"))?;
+    let z_slice_storage = crate::stats_common::array_standard_cow(&z);
+    let z_slice = &*z_slice_storage;
     let r_shape = r.shape();
     if r_shape.len() != 2 || r_shape[0] != r_shape[1] {
         return Err(PyValueError::new_err(format!(
@@ -584,9 +583,8 @@ pub fn susie_rss_f64<'py>(
             r_shape
         )));
     }
-    let r_slice = r
-        .as_slice()
-        .map_err(|_| PyValueError::new_err("R must be a C-contiguous float64 matrix"))?;
+    let r_slice_storage = crate::stats_common::array_standard_cow(&r);
+    let r_slice = &*r_slice_storage;
     let prior_slice = match prior_weights.as_ref() {
         Some(weights) => Some(weights.as_slice().map_err(|_| {
             PyValueError::new_err("prior_weights must be a C-contiguous float64 vector")

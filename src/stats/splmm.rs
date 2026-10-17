@@ -1121,18 +1121,18 @@ fn prepare_external_packed_input<'py>(
         .as_ref()
         .map(|v| v.len())
         .unwrap_or(m_packed);
-    let row_maf = match maf_ro.as_slice() {
+    let row_maf = match crate::stats_common::array_standard_slice(&maf_ro) {
         Ok(s) => s.to_vec(),
-        Err(_) => maf_ro.as_array().iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&maf_ro.as_array()),
     };
-    let row_flip = match row_flip_ro.as_slice() {
+    let row_flip = match crate::stats_common::array_standard_slice(&row_flip_ro) {
         Ok(s) => s.to_vec(),
-        Err(_) => row_flip_ro.as_array().iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&row_flip_ro.as_array()),
     };
     let row_missing = if let Some(row_missing_ro) = row_missing {
-        match row_missing_ro.as_slice() {
+        match crate::stats_common::array_standard_slice(&row_missing_ro) {
             Ok(s) => s.to_vec(),
-            Err(_) => row_missing_ro.as_array().iter().copied().collect(),
+            Err(_) => crate::stats_common::copy_array_standard_layout(&row_missing_ro.as_array()),
         }
     } else {
         vec![f32::NAN; m]
@@ -1149,6 +1149,7 @@ fn prepare_external_packed_input<'py>(
         Ok(s) => Arc::from(s),
         Err(_) => Arc::from(
             packed_arr
+                .as_standard_layout()
                 .iter()
                 .copied()
                 .collect::<Vec<u8>>()
@@ -1220,18 +1221,18 @@ fn prepare_prefix_input_from_external_meta<'py>(
     let row_source_indices =
         parse_index_vec_i64(row_indices_ro.as_slice()?, n_snps_bed, "row_indices")?;
     let m = row_source_indices.len();
-    let row_maf = match maf_ro.as_slice() {
+    let row_maf = match crate::stats_common::array_standard_slice(&maf_ro) {
         Ok(s) => s.to_vec(),
-        Err(_) => maf_ro.as_array().iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&maf_ro.as_array()),
     };
-    let row_flip = match row_flip_ro.as_slice() {
+    let row_flip = match crate::stats_common::array_standard_slice(&row_flip_ro) {
         Ok(s) => s.to_vec(),
-        Err(_) => row_flip_ro.as_array().iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&row_flip_ro.as_array()),
     };
     let row_missing = if let Some(row_missing_ro) = row_missing {
-        match row_missing_ro.as_slice() {
+        match crate::stats_common::array_standard_slice(&row_missing_ro) {
             Ok(s) => s.to_vec(),
-            Err(_) => row_missing_ro.as_array().iter().copied().collect(),
+            Err(_) => crate::stats_common::copy_array_standard_layout(&row_missing_ro.as_array()),
         }
     } else {
         vec![f32::NAN; m]
@@ -1381,9 +1382,9 @@ fn prepare_splmm_assoc_inputs<'py>(
                 "x_cov row count mismatch: got {xn}, expected {n}"
             )));
         }
-        let owned = match x_cov.as_slice() {
+        let owned = match crate::stats_common::array_standard_slice(&x_cov) {
             Ok(s) => s.to_vec(),
-            Err(_) => x_arr.iter().copied().collect(),
+            Err(_) => crate::stats_common::copy_array_standard_layout(&x_arr),
         };
         (Some(owned), xp)
     } else {
@@ -1401,10 +1402,12 @@ fn prepare_splmm_assoc_inputs<'py>(
     let use_external_mmap_meta = !use_external_packed
         && (maf.is_some() || row_flip.is_some() || row_missing.is_some() || row_indices.is_some());
     let site_keep_full = if let Some(site_keep) = site_keep {
-        Some(match site_keep.as_slice() {
-            Ok(s) => s.to_vec(),
-            Err(_) => site_keep.as_array().iter().copied().collect(),
-        })
+        Some(
+            match crate::stats_common::array_standard_slice(&site_keep) {
+                Ok(s) => s.to_vec(),
+                Err(_) => crate::stats_common::copy_array_standard_layout(&site_keep.as_array()),
+            },
+        )
     } else {
         None
     };
@@ -4217,9 +4220,9 @@ pub fn splmm_sparse_null_model_debug<'py>(
                 "x_cov row count mismatch: got {xn}, expected {n}"
             )));
         }
-        let owned = match x_cov.as_slice() {
+        let owned = match crate::stats_common::array_standard_slice(&x_cov) {
             Ok(s) => s.to_vec(),
-            Err(_) => x_arr.iter().copied().collect(),
+            Err(_) => crate::stats_common::copy_array_standard_layout(&x_arr),
         };
         (Some(owned), xp)
     } else {
@@ -4339,9 +4342,9 @@ pub fn splmm_residualized_approx_null_fit_from_jxgrm<'py>(
                 "x_cov row count mismatch: got {xn}, expected {n}"
             )));
         }
-        let owned = match x_cov.as_slice() {
+        let owned = match crate::stats_common::array_standard_slice(&x_cov) {
             Ok(s) => s.to_vec(),
-            Err(_) => x_arr.iter().copied().collect(),
+            Err(_) => crate::stats_common::copy_array_standard_layout(&x_arr),
         };
         (Some(owned), xp)
     } else {
@@ -4461,9 +4464,9 @@ pub fn splmm_residualized_approx_sample_state_from_jxgrm<'py>(
                 "x_cov row count mismatch: got {xn}, expected {n}"
             )));
         }
-        let owned = match x_cov.as_slice() {
+        let owned = match crate::stats_common::array_standard_slice(&x_cov) {
             Ok(s) => s.to_vec(),
-            Err(_) => x_arr.iter().copied().collect(),
+            Err(_) => crate::stats_common::copy_array_standard_layout(&x_arr),
         };
         (Some(owned), xp)
     } else {
@@ -4596,9 +4599,9 @@ pub fn splmm_residualized_approx_sample_state_from_jxgrm_lambda<'py>(
                 "x_cov row count mismatch: got {xn}, expected {n}"
             )));
         }
-        let owned = match x_cov.as_slice() {
+        let owned = match crate::stats_common::array_standard_slice(&x_cov) {
             Ok(s) => s.to_vec(),
-            Err(_) => x_arr.iter().copied().collect(),
+            Err(_) => crate::stats_common::copy_array_standard_layout(&x_arr),
         };
         (Some(owned), xp)
     } else {
@@ -5251,10 +5254,7 @@ pub fn splmm_assoc_pcg_kfile_to_tsv<'py>(
                 x_arr.shape()
             )));
         }
-        let owned = x_cov
-            .as_slice()
-            .map_err(|_| PyRuntimeError::new_err("x_cov must be contiguous (C-order)"))?
-            .to_vec();
+        let owned = crate::stats_common::array_standard_cow(&x_cov).into_owned();
         (Some(owned), x_arr.shape()[1])
     } else {
         (None, 0usize)
@@ -5585,9 +5585,9 @@ pub fn splmm_scan_grammar_packed<'py>(
                 "x_cov row count mismatch: got {xn}, expected {n}"
             )));
         }
-        let owned = match x_cov.as_slice() {
+        let owned = match crate::stats_common::array_standard_slice(&x_cov) {
             Ok(s) => s.to_vec(),
-            Err(_) => x_arr.iter().copied().collect(),
+            Err(_) => crate::stats_common::copy_array_standard_layout(&x_arr),
         };
         (Some(owned), xp)
     } else {
@@ -6182,9 +6182,9 @@ pub fn splmm_assoc_pcg_dense_f32<'py>(
                 "x_cov row count mismatch: got {xn}, expected {n}"
             )));
         }
-        let owned = match x_cov.as_slice() {
+        let owned = match crate::stats_common::array_standard_slice(&x_cov) {
             Ok(s) => s.to_vec(),
-            Err(_) => x_arr.iter().copied().collect(),
+            Err(_) => crate::stats_common::copy_array_standard_layout(&x_arr),
         };
         (Some(owned), xp)
     } else {
@@ -6198,9 +6198,9 @@ pub fn splmm_assoc_pcg_dense_f32<'py>(
         )));
     }
 
-    let g_owned = match g.as_slice() {
+    let g_owned = match crate::stats_common::array_standard_slice(&g) {
         Ok(s) => s.to_vec(),
-        Err(_) => g_arr.iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&g_arr),
     };
 
     let sparse_n =

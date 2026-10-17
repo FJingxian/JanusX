@@ -4435,13 +4435,17 @@ pub fn bed_packed_ld_prune_maf_priority<'py>(
             "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps} for n_samples={n_samples}"
         )));
     }
-    let chrom_vec: Cow<[i32]> = match chrom_codes.as_slice() {
+    let chrom_vec: Cow<[i32]> = match crate::stats_common::array_standard_slice(&chrom_codes) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(chrom_codes.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &chrom_codes.as_array(),
+        )),
     };
-    let pos_vec: Cow<[i64]> = match positions.as_slice() {
+    let pos_vec: Cow<[i64]> = match crate::stats_common::array_standard_slice(&positions) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(positions.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &positions.as_array(),
+        )),
     };
     if chrom_vec.len() != m {
         return Err(PyRuntimeError::new_err(format!(
@@ -4456,9 +4460,9 @@ pub fn bed_packed_ld_prune_maf_priority<'py>(
         )));
     }
 
-    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+    let packed_flat: Cow<[u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&packed_arr)),
     };
 
     let keep = py
@@ -4528,9 +4532,11 @@ pub fn bed_prune_mask_to_plink_rust<'py>(
     validate_ld_prune_args(window_bp, window_variants, step_variants, r2_threshold)
         .map_err(map_err_string_to_py)?;
 
-    let keep_slice: Cow<[bool]> = match keep_mask.as_slice() {
+    let keep_slice: Cow<[bool]> = match crate::stats_common::array_standard_slice(&keep_mask) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(keep_mask.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &keep_mask.as_array(),
+        )),
     };
     if keep_slice.is_empty() {
         return Err(PyRuntimeError::new_err("keep_mask is empty"));
@@ -4654,10 +4660,13 @@ pub fn bed_prune_selected_to_plink_rust<'py>(
     validate_ld_prune_args(window_bp, window_variants, step_variants, r2_threshold)
         .map_err(map_err_string_to_py)?;
 
-    let idx_slice: Cow<[i64]> = match selected_snp_indices.as_slice() {
-        Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(selected_snp_indices.as_array().iter().copied().collect()),
-    };
+    let idx_slice: Cow<[i64]> =
+        match crate::stats_common::array_standard_slice(&selected_snp_indices) {
+            Ok(s) => Cow::Borrowed(s),
+            Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+                &selected_snp_indices.as_array(),
+            )),
+        };
     if idx_slice.is_empty() {
         return Err(PyRuntimeError::new_err("selected_snp_indices is empty"));
     }

@@ -472,9 +472,9 @@ pub fn lm2_stream_bed_to_tsv(
         )));
     }
 
-    let x_flat: Cow<[f64]> = match x.as_slice() {
+    let x_flat: Cow<[f64]> = match crate::stats_common::array_standard_slice(&x) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(x_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&x_arr)),
     };
     let base_cache = lm2_precompute_base_cache(x_flat.as_ref(), y, n, q_base, n_interactions)
         .map_err(PyRuntimeError::new_err)?;
@@ -488,17 +488,17 @@ pub fn lm2_stream_bed_to_tsv(
         (None, None, None, None) => None,
         (Some(row_idx), Some(row_flip), Some(row_missing), Some(row_maf)) => {
             let row_idx_vec = row_idx.as_slice()?.to_vec();
-            let row_flip_vec = match row_flip.as_slice() {
+            let row_flip_vec = match crate::stats_common::array_standard_slice(&row_flip) {
                 Ok(slc) => slc.to_vec(),
-                Err(_) => row_flip.as_array().iter().copied().collect(),
+                Err(_) => crate::stats_common::copy_array_standard_layout(&row_flip.as_array()),
             };
-            let row_missing_vec = match row_missing.as_slice() {
+            let row_missing_vec = match crate::stats_common::array_standard_slice(&row_missing) {
                 Ok(slc) => slc.to_vec(),
-                Err(_) => row_missing.as_array().iter().copied().collect(),
+                Err(_) => crate::stats_common::copy_array_standard_layout(&row_missing.as_array()),
             };
-            let row_maf_vec = match row_maf.as_slice() {
+            let row_maf_vec = match crate::stats_common::array_standard_slice(&row_maf) {
                 Ok(slc) => slc.to_vec(),
-                Err(_) => row_maf.as_array().iter().copied().collect(),
+                Err(_) => crate::stats_common::copy_array_standard_layout(&row_maf.as_array()),
             };
             Some((row_idx_vec, row_flip_vec, row_missing_vec, row_maf_vec))
         }

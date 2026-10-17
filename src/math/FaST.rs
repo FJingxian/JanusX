@@ -70,13 +70,13 @@ pub fn fastlmm_prepare_lowrank_f64<'py>(
     }
 
     let p = x_arr.shape()[1];
-    let x_slice: Cow<[f64]> = match x.as_slice() {
+    let x_slice: Cow<[f64]> = match crate::stats_common::array_standard_slice(&x) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(x_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&x_arr)),
     };
-    let u_slice: Cow<[f64]> = match eigvecs.as_slice() {
+    let u_slice: Cow<[f64]> = match crate::stats_common::array_standard_slice(&eigvecs) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(u_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&u_arr)),
     };
 
     let lambda_max = evals

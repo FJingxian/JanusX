@@ -647,13 +647,17 @@ pub(crate) fn grm_packed_f32_with_stats_impl<'py>(
             "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps} for n_samples={n_samples}"
         )));
     }
-    let row_flip_vec: Cow<[bool]> = match row_flip.as_slice() {
+    let row_flip_vec: Cow<[bool]> = match crate::stats_common::array_standard_slice(&row_flip) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_flip.as_array(),
+        )),
     };
-    let row_maf_vec: Cow<[f32]> = match row_maf.as_slice() {
+    let row_maf_vec: Cow<[f32]> = match crate::stats_common::array_standard_slice(&row_maf) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_maf.as_array(),
+        )),
     };
     if row_flip_vec.len() != m {
         return Err(PyRuntimeError::new_err(format!(
@@ -676,9 +680,9 @@ pub(crate) fn grm_packed_f32_with_stats_impl<'py>(
     if n == 0 {
         return Err(PyRuntimeError::new_err("sample_indices must not be empty"));
     }
-    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+    let packed_flat: Cow<[u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&packed_arr)),
     };
 
     let (grm_vec, row_sum_vec, varsum_ret) = py
@@ -757,13 +761,17 @@ pub(crate) fn grm_packed_f64_with_stats_impl<'py>(
             "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps} for n_samples={n_samples}"
         )));
     }
-    let row_flip_vec: Cow<[bool]> = match row_flip.as_slice() {
+    let row_flip_vec: Cow<[bool]> = match crate::stats_common::array_standard_slice(&row_flip) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_flip.as_array(),
+        )),
     };
-    let row_maf_vec: Cow<[f32]> = match row_maf.as_slice() {
+    let row_maf_vec: Cow<[f32]> = match crate::stats_common::array_standard_slice(&row_maf) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_maf.as_array(),
+        )),
     };
     if row_flip_vec.len() != m {
         return Err(PyRuntimeError::new_err(format!(
@@ -786,9 +794,9 @@ pub(crate) fn grm_packed_f64_with_stats_impl<'py>(
     if n == 0 {
         return Err(PyRuntimeError::new_err("sample_indices must not be empty"));
     }
-    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+    let packed_flat: Cow<[u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&packed_arr)),
     };
 
     let (grm_vec, row_sum_vec, varsum_ret) = py
@@ -3620,13 +3628,17 @@ pub fn grm_packed_f32<'py>(
         )));
     }
 
-    let row_flip_vec: Cow<[bool]> = match row_flip.as_slice() {
+    let row_flip_vec: Cow<[bool]> = match crate::stats_common::array_standard_slice(&row_flip) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_flip.as_array(),
+        )),
     };
-    let row_maf_vec: Cow<[f32]> = match row_maf.as_slice() {
+    let row_maf_vec: Cow<[f32]> = match crate::stats_common::array_standard_slice(&row_maf) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_maf.as_array(),
+        )),
     };
     if row_flip_vec.len() != m {
         return Err(PyRuntimeError::new_err(format!(
@@ -3671,9 +3683,9 @@ pub fn grm_packed_f32<'py>(
         0.0_f64
     };
 
-    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+    let packed_flat: Cow<[u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&packed_arr)),
     };
     let total_threads = effective_threads(threads);
     let row_step = adaptive_grm_block_rows(
@@ -4191,13 +4203,13 @@ pub fn grm_bed_f64_from_meta<'py>(
         .as_slice()
         .map_err(|_| PyRuntimeError::new_err("row_indices must be contiguous int64"))?
         .to_vec();
-    let row_flip_vec = match row_flip.as_slice() {
+    let row_flip_vec = match crate::stats_common::array_standard_slice(&row_flip) {
         Ok(s) => s.to_vec(),
-        Err(_) => row_flip.as_array().iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&row_flip.as_array()),
     };
-    let row_maf_vec = match row_maf.as_slice() {
+    let row_maf_vec = match crate::stats_common::array_standard_slice(&row_maf) {
         Ok(s) => s.to_vec(),
-        Err(_) => row_maf.as_array().iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&row_maf.as_array()),
     };
     if row_idx64.is_empty() {
         return Err(PyRuntimeError::new_err("row_indices must not be empty"));

@@ -2567,9 +2567,9 @@ pub fn rrblupc_exact_snp_fit_prepared<'py>(
             "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps}"
         )));
     }
-    let y_vec_f64: Vec<f64> = match y_train.as_slice() {
+    let y_vec_f64: Vec<f64> = match crate::stats_common::array_standard_slice(&y_train) {
         Ok(s) => s.to_vec(),
-        Err(_) => y_train.as_array().iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&y_train.as_array()),
     };
     let test_idx = if let Some(sidx) = test_sample_indices {
         parse_index_vec_i64(sidx.as_slice()?, n_samples, "test_sample_indices")?
@@ -2585,9 +2585,9 @@ pub fn rrblupc_exact_snp_fit_prepared<'py>(
     } else {
         None
     };
-    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+    let packed_flat: Cow<[u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&packed_arr)),
     };
     let cache_inner = Arc::clone(&cache.inner);
     let row_mean_ret = cache_inner.row_mean.clone();
@@ -2721,13 +2721,13 @@ pub fn rrblupc_exact_snp_prepare_bed_from_meta<'py>(
             "rrblup_exact_snp_prepare_bed_from_meta received zero active markers.",
         ));
     }
-    let maf_keep: Vec<f32> = match maf.as_slice() {
+    let maf_keep: Vec<f32> = match crate::stats_common::array_standard_slice(&maf) {
         Ok(s) => s.to_vec(),
-        Err(_) => maf.as_array().iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&maf.as_array()),
     };
-    let row_flip_keep: Vec<bool> = match row_flip.as_slice() {
+    let row_flip_keep: Vec<bool> = match crate::stats_common::array_standard_slice(&row_flip) {
         Ok(s) => s.to_vec(),
-        Err(_) => row_flip.as_array().iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&row_flip.as_array()),
     };
     if maf_keep.len() != eff_m {
         return Err(PyRuntimeError::new_err(format!(
@@ -2742,18 +2742,24 @@ pub fn rrblupc_exact_snp_prepare_bed_from_meta<'py>(
         )));
     }
     let row_mean_external: Option<Vec<f32>> = if let Some(row_mean_ro) = row_mean {
-        Some(match row_mean_ro.as_slice() {
-            Ok(s) => s.to_vec(),
-            Err(_) => row_mean_ro.as_array().iter().copied().collect(),
-        })
+        Some(
+            match crate::stats_common::array_standard_slice(&row_mean_ro) {
+                Ok(s) => s.to_vec(),
+                Err(_) => crate::stats_common::copy_array_standard_layout(&row_mean_ro.as_array()),
+            },
+        )
     } else {
         None
     };
     let row_inv_sd_external: Option<Vec<f32>> = if let Some(row_inv_sd_ro) = row_inv_sd {
-        Some(match row_inv_sd_ro.as_slice() {
-            Ok(s) => s.to_vec(),
-            Err(_) => row_inv_sd_ro.as_array().iter().copied().collect(),
-        })
+        Some(
+            match crate::stats_common::array_standard_slice(&row_inv_sd_ro) {
+                Ok(s) => s.to_vec(),
+                Err(_) => {
+                    crate::stats_common::copy_array_standard_layout(&row_inv_sd_ro.as_array())
+                }
+            },
+        )
     } else {
         None
     };
@@ -2886,9 +2892,9 @@ pub fn rrblupc_exact_snp_fit_prepared_bed<'py>(
             cache.inner.n_samples
         )));
     }
-    let y_vec_f64: Vec<f64> = match y_train.as_slice() {
+    let y_vec_f64: Vec<f64> = match crate::stats_common::array_standard_slice(&y_train) {
         Ok(s) => s.to_vec(),
-        Err(_) => y_train.as_array().iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&y_train.as_array()),
     };
     let test_idx = if let Some(sidx) = test_sample_indices {
         parse_index_vec_i64(sidx.as_slice()?, n_samples, "test_sample_indices")?
@@ -3069,13 +3075,13 @@ pub fn rrblupc_exact_snp_packed<'py>(
     let row_flip_ro = row_flip.ok_or_else(|| {
         PyRuntimeError::new_err("rrblup_exact_snp_packed requires `row_flip` argument.")
     })?;
-    let maf_full: Vec<f32> = match maf_ro.as_slice() {
+    let maf_full: Vec<f32> = match crate::stats_common::array_standard_slice(&maf_ro) {
         Ok(s) => s.to_vec(),
-        Err(_) => maf_ro.as_array().iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&maf_ro.as_array()),
     };
-    let row_flip_full: Vec<bool> = match row_flip_ro.as_slice() {
+    let row_flip_full: Vec<bool> = match crate::stats_common::array_standard_slice(&row_flip_ro) {
         Ok(s) => s.to_vec(),
-        Err(_) => row_flip_ro.as_array().iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&row_flip_ro.as_array()),
     };
     if maf_full.len() != m_total {
         return Err(PyRuntimeError::new_err(format!(
@@ -3095,9 +3101,9 @@ pub fn rrblupc_exact_snp_packed<'py>(
     let mut row_flip_keep: Cow<[bool]> = Cow::Borrowed(row_flip_full.as_slice());
     let mut packed_row_indices: Option<Vec<usize>> = None;
     if let Some(mask) = site_keep {
-        let mask_vec: Vec<bool> = match mask.as_slice() {
+        let mask_vec: Vec<bool> = match crate::stats_common::array_standard_slice(&mask) {
             Ok(s) => s.to_vec(),
-            Err(_) => mask.as_array().iter().copied().collect(),
+            Err(_) => crate::stats_common::copy_array_standard_layout(&mask.as_array()),
         };
         if mask_vec.len() != m_total {
             return Err(PyRuntimeError::new_err(format!(
@@ -3150,9 +3156,9 @@ pub fn rrblupc_exact_snp_packed<'py>(
             "rrblup_exact_snp_packed requires at least two training samples.",
         ));
     }
-    let y_vec_f64: Vec<f64> = match y_train.as_slice() {
+    let y_vec_f64: Vec<f64> = match crate::stats_common::array_standard_slice(&y_train) {
         Ok(s) => s.to_vec(),
-        Err(_) => y_train.as_array().iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&y_train.as_array()),
     };
     if y_vec_f64.len() != n_train {
         return Err(PyRuntimeError::new_err(format!(
@@ -3202,9 +3208,9 @@ pub fn rrblupc_exact_snp_packed<'py>(
         ));
     }
 
-    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+    let packed_flat: Cow<[u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&packed_arr)),
     };
     let packed_flat_fit = packed_flat.clone();
     let sample_block_use = sample_block.max(1).min(n_train.max(1));
@@ -3431,10 +3437,14 @@ pub fn rrblupc_pcg_bed<'py>(
                 "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps}"
             )));
         }
-        resident_packed_flat = Some(match external_packed_ro_ref.as_slice() {
-            Ok(s) => Cow::Borrowed(s),
-            Err(_) => Cow::Owned(packed_view.iter().copied().collect()),
-        });
+        resident_packed_flat = Some(
+            match crate::stats_common::array_standard_slice(&external_packed_ro_ref) {
+                Ok(s) => Cow::Borrowed(s),
+                Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+                    &packed_view,
+                )),
+            },
+        );
     } else if use_external_stats {
         external_maf_ro = Some(maf.ok_or_else(|| {
             PyRuntimeError::new_err("rrblup_pcg_bed: streaming stats path requires `maf` argument.")
@@ -3519,28 +3529,32 @@ pub fn rrblupc_pcg_bed<'py>(
                 "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps}"
             )));
         }
-        resident_packed_flat = Some(match loaded_packed_ro_ref.as_slice() {
-            Ok(s) => Cow::Borrowed(s),
-            Err(_) => Cow::Owned(packed_view.iter().copied().collect()),
-        });
+        resident_packed_flat = Some(
+            match crate::stats_common::array_standard_slice(&loaded_packed_ro_ref) {
+                Ok(s) => Cow::Borrowed(s),
+                Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+                    &packed_view,
+                )),
+            },
+        );
     }
 
     let maf_full: Vec<f32> = if use_external_packed || use_external_stats {
         let maf_ro = external_maf_ro
             .as_ref()
             .expect("external maf must exist for external stats path");
-        match maf_ro.as_slice() {
+        match crate::stats_common::array_standard_slice(&maf_ro) {
             Ok(s) => s.to_vec(),
-            Err(_) => maf_ro.as_array().iter().copied().collect(),
+            Err(_) => crate::stats_common::copy_array_standard_layout(&maf_ro.as_array()),
         }
     } else {
         let maf_ro = loaded_maf_arr
             .as_ref()
             .expect("maf array must exist")
             .readonly();
-        match maf_ro.as_slice() {
+        match crate::stats_common::array_standard_slice(&maf_ro) {
             Ok(s) => s.to_vec(),
-            Err(_) => maf_ro.as_array().iter().copied().collect(),
+            Err(_) => crate::stats_common::copy_array_standard_layout(&maf_ro.as_array()),
         }
     };
     if maf_full.len() != m_total {
@@ -3554,9 +3568,9 @@ pub fn rrblupc_pcg_bed<'py>(
         let row_flip_ro = external_row_flip_ro
             .as_ref()
             .expect("external row_flip must exist for external stats path");
-        match row_flip_ro.as_slice() {
+        match crate::stats_common::array_standard_slice(&row_flip_ro) {
             Ok(s) => s.to_vec(),
-            Err(_) => row_flip_ro.as_array().iter().copied().collect(),
+            Err(_) => crate::stats_common::copy_array_standard_layout(&row_flip_ro.as_array()),
         }
     } else {
         let row_flip_full_arr = bed_packed_row_flip_mask(
@@ -3589,9 +3603,9 @@ pub fn rrblupc_pcg_bed<'py>(
     let mut row_flip_keep: Cow<[bool]> = Cow::Borrowed(row_flip_full.as_slice());
     let mut packed_row_indices: Option<Vec<usize>> = external_row_source_indices;
     if let Some(mask) = site_keep {
-        let mask_vec: Vec<bool> = match mask.as_slice() {
+        let mask_vec: Vec<bool> = match crate::stats_common::array_standard_slice(&mask) {
             Ok(s) => s.to_vec(),
-            Err(_) => mask.as_array().iter().copied().collect(),
+            Err(_) => crate::stats_common::copy_array_standard_layout(&mask.as_array()),
         };
         if mask_vec.len() != m_total {
             return Err(PyRuntimeError::new_err(format!(
@@ -3638,9 +3652,9 @@ pub fn rrblupc_pcg_bed<'py>(
             "train_sample_indices must not be empty.",
         ));
     }
-    let y_vec_f64: Vec<f64> = match y_train.as_slice() {
+    let y_vec_f64: Vec<f64> = match crate::stats_common::array_standard_slice(&y_train) {
         Ok(s) => s.to_vec(),
-        Err(_) => y_train.as_array().iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&y_train.as_array()),
     };
     if y_vec_f64.len() != train_idx.len() {
         return Err(PyRuntimeError::new_err(format!(

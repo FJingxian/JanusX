@@ -1365,7 +1365,7 @@ fn parse_covariates(x: Option<&PyReadonlyArray2<f64>>, n: usize) -> PyResult<(Ve
                     "BayesR X must be a non-empty matrix with rows matching len(y)",
                 ));
             }
-            let values = if let Ok(slice) = arr.as_slice() {
+            let values = if let Ok(slice) = crate::stats_common::array_standard_slice(arr) {
                 slice.to_vec()
             } else {
                 array2_to_vec(arr)
@@ -1703,9 +1703,9 @@ pub fn bayesr_packed<'py>(
     let pi_vec = parse_bayesr_prior(pi.as_ref(), &BAYESR_DEFAULT_PI, "pi")?;
     let gamma_vec = parse_bayesr_prior(gamma.as_ref(), &BAYESR_DEFAULT_GAMMA, "gamma")?;
     let sampling = BayesSamplingOptions::new(burnin, adaptive_burnin, posterior_samples);
-    let packed_flat: Cow<'_, [u8]> = match packed.as_slice() {
+    let packed_flat: Cow<'_, [u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(slice) => Cow::Borrowed(slice),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&packed_arr)),
     };
     let pool_owned = get_cached_pool(threads)?;
     let pool = pool_owned.as_ref();

@@ -99,21 +99,21 @@ pub fn fvlmm2_assoc_chunk_f32<'py>(
         )));
     }
 
-    let xcov_flat: Cow<[f64]> = match xcov.as_slice() {
+    let xcov_flat: Cow<[f64]> = match crate::stats_common::array_standard_slice(&xcov) {
         Ok(v) => Cow::Borrowed(v),
-        Err(_) => Cow::Owned(xcov_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&xcov_arr)),
     };
-    let g1_flat: Cow<[f32]> = match snp1_chunk.as_slice() {
+    let g1_flat: Cow<[f32]> = match crate::stats_common::array_standard_slice(&snp1_chunk) {
         Ok(v) => Cow::Borrowed(v),
-        Err(_) => Cow::Owned(g1_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&g1_arr)),
     };
-    let g2_flat: Cow<[f32]> = match snp2_chunk.as_slice() {
+    let g2_flat: Cow<[f32]> = match crate::stats_common::array_standard_slice(&snp2_chunk) {
         Ok(v) => Cow::Borrowed(v),
-        Err(_) => Cow::Owned(g2_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&g2_arr)),
     };
-    let gc_flat: Cow<[f32]> = match combo_chunk.as_slice() {
+    let gc_flat: Cow<[f32]> = match crate::stats_common::array_standard_slice(&combo_chunk) {
         Ok(v) => Cow::Borrowed(v),
-        Err(_) => Cow::Owned(gc_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&gc_arr)),
     };
 
     let mut vinv = vec![0.0_f64; n];

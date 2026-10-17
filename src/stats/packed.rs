@@ -64,9 +64,9 @@ pub fn bed_packed_row_flip_mask<'py>(
             "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps} for n_samples={n_samples}"
         )));
     }
-    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+    let packed_flat: Cow<[u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&packed_arr)),
     };
     let byte_lut = packed_byte_lut();
     let full_bytes = n_samples / 4;
@@ -197,9 +197,11 @@ pub fn bed_packed_empirical_stats_f64<'py>(
             "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps} for n_samples={n_samples}"
         )));
     }
-    let row_flip_vec: Cow<[bool]> = match row_flip.as_slice() {
+    let row_flip_vec: Cow<[bool]> = match crate::stats_common::array_standard_slice(&row_flip) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_flip.as_array(),
+        )),
     };
     if row_flip_vec.len() != m {
         return Err(PyRuntimeError::new_err(format!(
@@ -207,9 +209,9 @@ pub fn bed_packed_empirical_stats_f64<'py>(
             row_flip_vec.len()
         )));
     }
-    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+    let packed_flat: Cow<[u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&packed_arr)),
     };
     let pool = get_cached_pool(threads)?;
     let (sum_rows, sq_sum_rows) = py
@@ -282,9 +284,11 @@ pub fn bed_packed_empirical_stats_subset_f64<'py>(
             "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps} for n_samples={n_samples}"
         )));
     }
-    let row_flip_vec: Cow<[bool]> = match row_flip.as_slice() {
+    let row_flip_vec: Cow<[bool]> = match crate::stats_common::array_standard_slice(&row_flip) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_flip.as_array(),
+        )),
     };
     if row_flip_vec.len() != m {
         return Err(PyRuntimeError::new_err(format!(
@@ -296,9 +300,9 @@ pub fn bed_packed_empirical_stats_subset_f64<'py>(
     if sample_idx.is_empty() {
         return Err(PyRuntimeError::new_err("sample_indices must not be empty"));
     }
-    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+    let packed_flat: Cow<[u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&packed_arr)),
     };
     let pool = get_cached_pool(threads)?;
     let (sum_rows, sq_sum_rows) = py
@@ -382,9 +386,11 @@ pub fn bed_stream_empirical_stats_f64<'py>(
             "row_source_indices must not be empty",
         ));
     }
-    let row_flip_vec: Cow<[bool]> = match row_flip.as_slice() {
+    let row_flip_vec: Cow<[bool]> = match crate::stats_common::array_standard_slice(&row_flip) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_flip.as_array(),
+        )),
     };
     if row_flip_vec.len() != eff_m {
         return Err(PyRuntimeError::new_err(format!(
@@ -502,9 +508,11 @@ pub fn bed_stream_empirical_stats_subset_f64<'py>(
             "row_source_indices must not be empty",
         ));
     }
-    let row_flip_vec: Cow<[bool]> = match row_flip.as_slice() {
+    let row_flip_vec: Cow<[bool]> = match crate::stats_common::array_standard_slice(&row_flip) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_flip.as_array(),
+        )),
     };
     if row_flip_vec.len() != eff_m {
         return Err(PyRuntimeError::new_err(format!(
@@ -635,9 +643,9 @@ pub fn bed_packed_decode_rows_f32<'py>(
         return Ok(PyArray2::<f32>::zeros(py, [row_idx.len(), 0], false).into_bound());
     }
 
-    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+    let packed_flat: Cow<[u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&packed_arr)),
     };
 
     let mut out = vec![0.0_f32; row_idx.len() * n_out];
@@ -693,13 +701,13 @@ pub fn bed_decode_rows_f32_from_meta<'py>(
     mmap_window_mb: Option<usize>,
 ) -> PyResult<Bound<'py, PyArray2<f32>>> {
     let row_idx_raw = row_indices.as_slice()?.to_vec();
-    let row_flip_vec: Vec<bool> = match row_flip.as_slice() {
+    let row_flip_vec: Vec<bool> = match crate::stats_common::array_standard_slice(&row_flip) {
         Ok(s) => s.to_vec(),
-        Err(_) => row_flip.as_array().iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&row_flip.as_array()),
     };
-    let row_maf_vec: Vec<f32> = match row_maf.as_slice() {
+    let row_maf_vec: Vec<f32> = match crate::stats_common::array_standard_slice(&row_maf) {
         Ok(s) => s.to_vec(),
-        Err(_) => row_maf.as_array().iter().copied().collect(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&row_maf.as_array()),
     };
     if row_idx_raw.is_empty() {
         return Ok(PyArray2::<f32>::zeros(py, [0, 0], false).into_bound());
@@ -865,13 +873,17 @@ pub fn bed_packed_signed_hash_f32<'py>(
             "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps} for n_samples={n_samples}"
         )));
     }
-    let row_flip_vec: Cow<[bool]> = match row_flip.as_slice() {
+    let row_flip_vec: Cow<[bool]> = match crate::stats_common::array_standard_slice(&row_flip) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_flip.as_array(),
+        )),
     };
-    let row_maf_vec: Cow<[f32]> = match row_maf.as_slice() {
+    let row_maf_vec: Cow<[f32]> = match crate::stats_common::array_standard_slice(&row_maf) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_maf.as_array(),
+        )),
     };
     if row_flip_vec.len() != m {
         return Err(PyRuntimeError::new_err(format!(
@@ -887,9 +899,9 @@ pub fn bed_packed_signed_hash_f32<'py>(
     }
     let row_missing_vec: Option<Vec<f32>> = match row_missing {
         Some(arr) => {
-            let v: Vec<f32> = match arr.as_slice() {
+            let v: Vec<f32> = match crate::stats_common::array_standard_slice(&arr) {
                 Ok(s) => s.to_vec(),
-                Err(_) => arr.as_array().iter().copied().collect(),
+                Err(_) => crate::stats_common::copy_array_standard_layout(&arr.as_array()),
             };
             if v.len() != m {
                 return Err(PyRuntimeError::new_err(format!(
@@ -916,9 +928,9 @@ pub fn bed_packed_signed_hash_f32<'py>(
         .map(|&s| (s >> 2, ((s & 3) * 2) as u8))
         .collect();
 
-    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+    let packed_flat: Cow<[u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&packed_arr)),
     };
     let out_len = n_buckets
         .checked_mul(n_out)
@@ -1157,13 +1169,17 @@ pub fn bed_packed_signed_hash_ztz_stats_f64<'py>(
         )));
     }
 
-    let row_flip_vec: Cow<[bool]> = match row_flip.as_slice() {
+    let row_flip_vec: Cow<[bool]> = match crate::stats_common::array_standard_slice(&row_flip) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_flip.as_array(),
+        )),
     };
-    let row_maf_vec: Cow<[f32]> = match row_maf.as_slice() {
+    let row_maf_vec: Cow<[f32]> = match crate::stats_common::array_standard_slice(&row_maf) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_maf.as_array(),
+        )),
     };
     if row_flip_vec.len() != m {
         return Err(PyRuntimeError::new_err(format!(
@@ -1179,9 +1195,9 @@ pub fn bed_packed_signed_hash_ztz_stats_f64<'py>(
     }
     let row_missing_vec: Option<Vec<f32>> = match row_missing {
         Some(arr) => {
-            let v: Vec<f32> = match arr.as_slice() {
+            let v: Vec<f32> = match crate::stats_common::array_standard_slice(&arr) {
                 Ok(s) => s.to_vec(),
-                Err(_) => arr.as_array().iter().copied().collect(),
+                Err(_) => crate::stats_common::copy_array_standard_layout(&arr.as_array()),
             };
             if v.len() != m {
                 return Err(PyRuntimeError::new_err(format!(
@@ -1205,9 +1221,11 @@ pub fn bed_packed_signed_hash_ztz_stats_f64<'py>(
         ));
     }
     let n_train = train_idx.len();
-    let y_vec: Cow<[f64]> = match y_train.as_slice() {
+    let y_vec: Cow<[f64]> = match crate::stats_common::array_standard_slice(&y_train) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(y_train.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &y_train.as_array(),
+        )),
     };
     if y_vec.len() != n_train {
         return Err(PyRuntimeError::new_err(format!(
@@ -1221,9 +1239,9 @@ pub fn bed_packed_signed_hash_ztz_stats_f64<'py>(
         .map(|&s| (s >> 2, ((s & 3) * 2) as u8))
         .collect();
 
-    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+    let packed_flat: Cow<[u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&packed_arr)),
     };
     let pool = get_cached_pool(threads)?;
 
@@ -1539,13 +1557,17 @@ pub fn bed_packed_signed_hash_kernels_f64<'py>(
         )));
     }
 
-    let row_flip_vec: Cow<[bool]> = match row_flip.as_slice() {
+    let row_flip_vec: Cow<[bool]> = match crate::stats_common::array_standard_slice(&row_flip) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_flip.as_array(),
+        )),
     };
-    let row_maf_vec: Cow<[f32]> = match row_maf.as_slice() {
+    let row_maf_vec: Cow<[f32]> = match crate::stats_common::array_standard_slice(&row_maf) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_maf.as_array(),
+        )),
     };
     if row_flip_vec.len() != m {
         return Err(PyRuntimeError::new_err(format!(
@@ -1561,9 +1583,9 @@ pub fn bed_packed_signed_hash_kernels_f64<'py>(
     }
     let row_missing_vec: Option<Vec<f32>> = match row_missing {
         Some(arr) => {
-            let v: Vec<f32> = match arr.as_slice() {
+            let v: Vec<f32> = match crate::stats_common::array_standard_slice(&arr) {
                 Ok(s) => s.to_vec(),
-                Err(_) => arr.as_array().iter().copied().collect(),
+                Err(_) => crate::stats_common::copy_array_standard_layout(&arr.as_array()),
             };
             if v.len() != m {
                 return Err(PyRuntimeError::new_err(format!(
@@ -1602,9 +1624,9 @@ pub fn bed_packed_signed_hash_kernels_f64<'py>(
         .map(|&s| (s >> 2, ((s & 3) * 2) as u8))
         .collect();
 
-    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+    let packed_flat: Cow<[u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&packed_arr)),
     };
     let pool = get_cached_pool(threads)?;
 
@@ -1969,13 +1991,17 @@ pub fn bed_packed_decode_stats_f64<'py>(
         )));
     }
 
-    let row_flip_vec: Cow<[bool]> = match row_flip.as_slice() {
+    let row_flip_vec: Cow<[bool]> = match crate::stats_common::array_standard_slice(&row_flip) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_flip.as_array(),
+        )),
     };
-    let row_maf_vec: Cow<[f32]> = match row_maf.as_slice() {
+    let row_maf_vec: Cow<[f32]> = match crate::stats_common::array_standard_slice(&row_maf) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_maf.as_array(),
+        )),
     };
     if row_flip_vec.len() != m {
         return Err(PyRuntimeError::new_err(format!(
@@ -1995,9 +2021,9 @@ pub fn bed_packed_decode_stats_f64<'py>(
         return Err(PyRuntimeError::new_err("sample_indices must not be empty"));
     }
 
-    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+    let packed_flat: Cow<[u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&packed_arr)),
     };
     let pool = get_cached_pool(threads)?;
 
@@ -2123,13 +2149,17 @@ pub fn cross_grm_times_alpha_packed_f64<'py>(
         )));
     }
 
-    let row_flip_vec: Cow<[bool]> = match row_flip.as_slice() {
+    let row_flip_vec: Cow<[bool]> = match crate::stats_common::array_standard_slice(&row_flip) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_flip.as_array(),
+        )),
     };
-    let row_maf_vec: Cow<[f32]> = match row_maf.as_slice() {
+    let row_maf_vec: Cow<[f32]> = match crate::stats_common::array_standard_slice(&row_maf) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_maf.as_array(),
+        )),
     };
     if row_flip_vec.len() != m {
         return Err(PyRuntimeError::new_err(format!(
@@ -2144,13 +2174,17 @@ pub fn cross_grm_times_alpha_packed_f64<'py>(
         )));
     }
 
-    let m_alpha_vec: Cow<[f64]> = match m_alpha.as_slice() {
+    let m_alpha_vec: Cow<[f64]> = match crate::stats_common::array_standard_slice(&m_alpha) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(m_alpha.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &m_alpha.as_array(),
+        )),
     };
-    let m_mean_vec: Cow<[f64]> = match m_mean.as_slice() {
+    let m_mean_vec: Cow<[f64]> = match crate::stats_common::array_standard_slice(&m_mean) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(m_mean.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &m_mean.as_array(),
+        )),
     };
     if m_alpha_vec.len() != m {
         return Err(PyRuntimeError::new_err(format!(
@@ -2172,9 +2206,9 @@ pub fn cross_grm_times_alpha_packed_f64<'py>(
     }
     let full_sample_fast = is_identity_indices(&sample_idx, n_samples);
 
-    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+    let packed_flat: Cow<[u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&packed_arr)),
     };
     let pool = get_cached_pool(threads)?;
 
@@ -2396,13 +2430,17 @@ pub fn packed_malpha_f64<'py>(
         )));
     }
 
-    let row_flip_vec: Cow<[bool]> = match row_flip.as_slice() {
+    let row_flip_vec: Cow<[bool]> = match crate::stats_common::array_standard_slice(&row_flip) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_flip.as_array(),
+        )),
     };
-    let row_maf_vec: Cow<[f32]> = match row_maf.as_slice() {
+    let row_maf_vec: Cow<[f32]> = match crate::stats_common::array_standard_slice(&row_maf) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_maf.as_array(),
+        )),
     };
     if row_flip_vec.len() != m {
         return Err(PyRuntimeError::new_err(format!(
@@ -2422,9 +2460,11 @@ pub fn packed_malpha_f64<'py>(
     if n_out == 0 {
         return Err(PyRuntimeError::new_err("sample_indices must not be empty"));
     }
-    let alpha_vec: Cow<[f64]> = match alpha.as_slice() {
+    let alpha_vec: Cow<[f64]> = match crate::stats_common::array_standard_slice(&alpha) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(alpha.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &alpha.as_array(),
+        )),
     };
     if alpha_vec.len() != n_out {
         return Err(PyRuntimeError::new_err(format!(
@@ -2435,9 +2475,9 @@ pub fn packed_malpha_f64<'py>(
     }
     let full_sample_fast = is_identity_indices(&sample_idx, n_samples);
 
-    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+    let packed_flat: Cow<[u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&packed_arr)),
     };
     let pool = get_cached_pool(threads)?;
     let row_step = block_rows.max(1).min(m.max(1));
@@ -2696,13 +2736,17 @@ pub fn packed_malpha_mode_f64<'py>(
         )));
     }
 
-    let row_flip_vec: Cow<[bool]> = match row_flip.as_slice() {
+    let row_flip_vec: Cow<[bool]> = match crate::stats_common::array_standard_slice(&row_flip) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_flip.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_flip.as_array(),
+        )),
     };
-    let row_maf_vec: Cow<[f32]> = match row_maf.as_slice() {
+    let row_maf_vec: Cow<[f32]> = match crate::stats_common::array_standard_slice(&row_maf) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(row_maf.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &row_maf.as_array(),
+        )),
     };
     if row_flip_vec.len() != m {
         return Err(PyRuntimeError::new_err(format!(
@@ -2722,9 +2766,11 @@ pub fn packed_malpha_mode_f64<'py>(
     if n_out == 0 {
         return Err(PyRuntimeError::new_err("sample_indices must not be empty"));
     }
-    let alpha_vec: Cow<[f64]> = match alpha.as_slice() {
+    let alpha_vec: Cow<[f64]> = match crate::stats_common::array_standard_slice(&alpha) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(alpha.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &alpha.as_array(),
+        )),
     };
     if alpha_vec.len() != n_out {
         return Err(PyRuntimeError::new_err(format!(
@@ -2735,9 +2781,9 @@ pub fn packed_malpha_mode_f64<'py>(
     }
     let full_sample_fast = is_identity_indices(&sample_idx, n_samples);
 
-    let packed_flat: Cow<[u8]> = match packed.as_slice() {
+    let packed_flat: Cow<[u8]> = match crate::stats_common::array_standard_slice(&packed) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(packed_arr.iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&packed_arr)),
     };
     let pool = get_cached_pool(threads)?;
     let row_step = block_rows.max(1).min(m.max(1));

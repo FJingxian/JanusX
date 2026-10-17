@@ -49,7 +49,8 @@ use crate::gfcore::BedSnpIter;
 use crate::gfcore::BimChunkReader;
 use crate::gfreader::{
     build_sample_selection, count_packed_row_counts,
-    count_packed_row_counts_selected_with_excluded, prepare_bed_logic_meta_owned_for_stats_samples,
+    count_packed_row_counts_selected_with_excluded, evaluate_packed_snp_qc,
+    prepare_bed_logic_meta_owned_for_stats_samples,
 };
 use crate::gload::WindowedBedMatrix;
 use crate::he::{row_major_block_mul_mat_f32, row_major_block_mul_mat_f32_small_rhs};
@@ -1361,40 +1362,22 @@ pub(crate) fn lm_stream_bed_additive_windowed_unified(
                 } else {
                     count_packed_row_counts(row, n_samples_full)
                 };
-                let non_missing = n.saturating_sub(missing);
-                let miss_rate = if n > 0 {
-                    missing as f32 / n as f32
-                } else {
-                    1.0_f32
-                };
-                if miss_rate > max_missing_rate {
-                    return None;
-                }
-                if non_missing == 0 {
-                    return if maf_threshold > 0.0 {
-                        None
-                    } else {
-                        Some(LmUnifiedSnpCounts {
-                            maf: 0.0_f32,
-                            missing_count: missing,
-                        })
-                    };
-                }
-
-                if het as f32 / non_missing as f32 > het_threshold {
-                    return None;
-                }
-
-                let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
-                let alt_freq = alt_sum as f32 / (2.0_f32 * non_missing as f32);
-                let maf = alt_freq.min(1.0_f32 - alt_freq);
-                if maf < maf_threshold {
+                let qc = evaluate_packed_snp_qc(
+                    missing,
+                    het,
+                    hom_alt,
+                    n,
+                    maf_threshold,
+                    max_missing_rate,
+                    het_threshold,
+                );
+                if !qc.keep {
                     return None;
                 }
 
                 Some(LmUnifiedSnpCounts {
-                    maf: alt_freq,
-                    missing_count: missing,
+                    maf: qc.alt_freq,
+                    missing_count: qc.missing_count,
                 })
             })
             .collect();
@@ -2251,7 +2234,13 @@ pub(crate) fn lm_stream_bed_additive_prepared_unified(
             text.clear();
             let miss_counts: Vec<i64> = row_missing_batch[..write_rows]
                 .iter()
-                .map(|&v| v.round() as i64)
+                .map(|&v| {
+                    if v.is_finite() && v > 0.0 {
+                        ((v as f64 * n as f64).round().min(n as f64)) as i64
+                    } else {
+                        0
+                    }
+                })
                 .collect();
             append_assoc_block_from_core_sites(
                 &mut text,
@@ -2337,6 +2326,7 @@ pub(crate) fn lm_stream_bed_additive_prepared_unified(
     progress_callback=None,
     progress_every=0,
     mmap_window_mb=None,
+    fused_qc=false,
 ))]
 pub fn lm_stream_bed_to_tsv(
     py: Python<'_>,
@@ -2360,6 +2350,7 @@ pub fn lm_stream_bed_to_tsv(
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
     mmap_window_mb: Option<usize>,
+    fused_qc: bool,
 ) -> PyResult<(usize, usize)> {
     if chunk_size == 0 {
         return Err(PyValueError::new_err("chunk_size must be > 0"));
@@ -2385,7 +2376,11 @@ pub fn lm_stream_bed_to_tsv(
             "GWAS currently supports only additive coding (genetic_model='add').",
         ));
     }
-    if let Some(window_mb) = mmap_window_mb {
+    // An eligible fused call must reach the raw block scanner even when the
+    // CLI did not request an explicit mmap window. Keep the established
+    // 512 MiB default used by the LM2 and unified mixed-model BED scanners.
+    let raw_scan_window_mb = mmap_window_mb.or(if fused_qc { Some(512usize) } else { None });
+    if let Some(window_mb) = raw_scan_window_mb {
         if window_mb == 0 {
             return Err(PyValueError::new_err("mmap_window_mb must be > 0"));
         }
@@ -2475,7 +2470,7 @@ pub fn lm_stream_bed_to_tsv(
             .map_err(PyRuntimeError::new_err)
         });
     }
-    if let Some(window_mb) = mmap_window_mb {
+    if let Some(window_mb) = raw_scan_window_mb {
         let samples = gfcore::read_fam(&norm_prefix).map_err(PyRuntimeError::new_err)?;
         let (sample_indices, _sample_ids_ordered) =
             build_sample_selection(&samples, sample_ids, None).map_err(PyRuntimeError::new_err)?;

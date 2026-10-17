@@ -438,6 +438,7 @@ def _new_bed_chunk_reader_for_stream(
     model: str,
     het_threshold: float,
     mmap_window_mb: Union[int, None],
+    bimranges: Optional[list[tuple[str, int, int]]],
     logger: logging.Logger,
 ) -> object:
     """
@@ -460,6 +461,11 @@ def _new_bed_chunk_reader_for_stream(
     )
     if mmap_window_mb is not None:
         base_kwargs["mmap_window_mb"] = int(max(1, int(mmap_window_mb)))
+    if bimranges:
+        base_kwargs["ranges"] = [
+            (str(chrom), int(start), int(end))
+            for chrom, start, end in bimranges
+        ]
 
     try:
         return jxrs.BedChunkReader(**base_kwargs)
@@ -1083,6 +1089,8 @@ def run_chunked_gwas_lmm_lm(
     force_model: bool = False,
     lm2_covariate_indices: Union[np.ndarray, None] = None,
     trait_prepared_meta: Optional[dict[str, object]] = None,
+    fused_qc: bool = False,
+    bimranges: Optional[list[tuple[str, int, int]]] = None,
     null_sidecar_context: Optional[GwasSidecarRunContext] = None,
 ) -> None:
     """
@@ -1134,6 +1142,7 @@ def run_chunked_gwas_lmm_lm(
         can_single_entry = (
             _as_plink_prefix(genofile) is not None
             and hasattr(jxrs, "lm_stream_bed_to_tsv")
+            and not bool(bimranges)
         )
         if can_single_entry:
             _log_file_only(
@@ -1168,6 +1177,7 @@ def run_chunked_gwas_lmm_lm(
                 chunk_size_user_set=bool(chunk_size_user_set),
                 mmap_limit=bool(mmap_limit),
                 trait_prepared_meta=trait_prepared_meta,
+                fused_qc=bool(fused_qc),
             )
             return
         _log_file_only(
@@ -1179,6 +1189,7 @@ def run_chunked_gwas_lmm_lm(
         can_single_entry = (
             _as_plink_prefix(genofile) is not None
             and hasattr(jxrs, "lm2_stream_bed_to_tsv")
+            and not bool(bimranges)
         )
         if can_single_entry:
             _log_file_only(
@@ -1250,16 +1261,19 @@ def run_chunked_gwas_lmm_lm(
     )
     lmm_has_dedicated_bed_fastpath = bool(
         bed_prefix is not None
+        and not bool(bimranges)
         and hasattr(jxrs, "lmm_reml_assoc_bed_to_tsv_f32")
         and os.environ.get("JX_DISABLE_LMM_UNIFIED") != "1"
     )
     lmm2_has_dedicated_bed_fastpath = bool(
         bed_prefix is not None
+        and not bool(bimranges)
         and hasattr(jxrs, "lmm_reml_lmm2_assoc_bed_to_tsv_f32")
         and os.environ.get("JX_DISABLE_LMM2_UNIFIED") != "1"
     )
     fvlmm_has_dedicated_bed_fastpath = bool(
         bed_prefix is not None
+        and not bool(bimranges)
         and (
             (
                 hasattr(jxrs, "fvlmm_assoc_chunk_from_snp_to_tsv_f32")
@@ -1320,6 +1334,7 @@ def run_chunked_gwas_lmm_lm(
                 force_model=bool(force_model),
                 emit_trait_header=bool(emit_trait_header),
                 trait_prepared_meta=trait_prepared_meta,
+                bimranges=bimranges,
                 null_sidecar_context=null_sidecar_context,
             )
             if multi_trait_mode and trait_idx < len(trait_iter) - 1:
@@ -1572,6 +1587,7 @@ def run_chunked_gwas_lmm_lm(
         # immediately instead of a "Waiting ..." warmup spinner.
         prestart_unified_lmm_pbar = bool(
             use_spinner
+            and not bool(bimranges)
             and (
                 (
                     str(effective_model_key).lower() == "lmm"
@@ -1673,6 +1689,7 @@ def run_chunked_gwas_lmm_lm(
 
         _use_fvlmm_tsv_fastpath = (
             str(effective_model_key).lower() == "fvlmm"
+            and not bool(bimranges)
             and hasattr(jxrs, "fvlmm_assoc_chunk_from_snp_to_tsv_f32")
             and use_rust_assoc_writer
             and hasattr(writer, "append_text")
@@ -1681,16 +1698,19 @@ def run_chunked_gwas_lmm_lm(
 
         _use_fvlmm_unified = (
             str(effective_model_key).lower() == "fvlmm"
+            and not bool(bimranges)
             and hasattr(jxrs, "fvlmm_assoc_bed_to_tsv_f32")
             and os.environ.get("JX_DISABLE_FVLMM_UNIFIED") != "1"
         )
         _use_lmm_unified = (
             str(effective_model_key).lower() == "lmm"
+            and not bool(bimranges)
             and hasattr(jxrs, "lmm_reml_assoc_bed_to_tsv_f32")
             and os.environ.get("JX_DISABLE_LMM_UNIFIED") != "1"
         )
         _use_lmm2_unified = (
             str(effective_model_key).lower() == "lmm2"
+            and not bool(bimranges)
             and hasattr(jxrs, "lmm_reml_lmm2_assoc_bed_to_tsv_f32")
             and os.environ.get("JX_DISABLE_LMM2_UNIFIED") != "1"
         )
@@ -1997,11 +2017,11 @@ def run_chunked_gwas_lmm_lm(
                     row_maf=prepared_row_maf,
                     low=float(lmm_low),
                     high=float(lmm_high),
-                    # Match LMM.gwas()/lmm_reml_from_snp legacy scan defaults.
-                    # The unified BED path should only change IO/RSS behavior,
-                    # not make every per-SNP REML optimizer run longer.
+                    # Match LMM.gwas()/lmm_reml_from_snp optimizer accuracy.
+                    # Use a fixed null-model seed for each SNP; the Rust route
+                    # deliberately does not carry lambda estimates across SNPs.
                     max_iter=30,
-                    tol=1e-2,
+                    tol=1e-4,
                     threads=int(scan_threads),
                     nullml=None,
                     init_log10_lbd=init_log10_lbd,
@@ -2156,6 +2176,7 @@ def run_chunked_gwas_lmm_lm(
                         model=str(genetic_model),
                         het_threshold=float(het_threshold),
                         mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
+                        bimranges=(bimranges if trait_prepared_meta is None else None),
                         logger=logger,
                     )
                     if not hasattr(bed_reader, "next_chunk_prepared"):
@@ -2439,6 +2460,7 @@ def run_chunked_gwas_streaming_shared(
     force_model: bool = False,
     emit_trait_header: bool = True,
     trait_prepared_meta: Optional[dict[str, object]] = None,
+    bimranges: Optional[list[tuple[str, int, int]]] = None,
     null_sidecar_context: Optional[GwasSidecarRunContext] = None,
 ) -> None:
     """
@@ -3091,6 +3113,7 @@ def run_chunked_gwas_streaming_shared(
                         model=str(genetic_model),
                         het_threshold=float(het_threshold),
                         mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
+                        bimranges=(bimranges if trait_prepared_meta is None else None),
                         logger=logger,
                     )
             except Exception as ex:

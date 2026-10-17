@@ -39,9 +39,7 @@ use crate::decode::{
 };
 use crate::gfcore;
 use crate::gfcore::BimChunkReader;
-use crate::gfreader::{
-    count_packed_row_counts, count_packed_row_counts_selected_with_excluded, is_simple_snp_allele,
-};
+use crate::gfreader::{evaluate_packed_bed_row_qc, is_simple_snp_allele};
 use crate::gload::WindowedBedMatrix;
 use crate::kmer::KfileAssocSource;
 use crate::linalg::{chi2_sf_df1, cholesky_gram_inplace, cholesky_solve_into, normal_sf};
@@ -58,8 +56,6 @@ struct RotatedRemlAssocState {
 
 struct RotatedLmm2AssocState {
     snp_vec: Vec<f64>,
-    last_log10_lbd_reml: Option<f64>,
-    last_log10_lbd_ml: Option<f64>,
 }
 
 #[inline]
@@ -91,6 +87,13 @@ fn fill_invalid_rotated_lmm2_row(out_row: &mut [f64]) {
     out_row[3] = f64::NAN;
     out_row[4] = f64::NAN;
     out_row[5] = 1.0;
+}
+
+#[inline]
+fn unified_lmm_reml_start_policy(no_warm_start: bool) -> (bool, bool) {
+    // A fixed null-model seed is deterministic per SNP. Carrying a previous SNP's
+    // optimum makes results depend on Rayon worker scheduling and block layout.
+    (!no_warm_start, false)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -216,7 +219,6 @@ fn run_rotated_lmm2_assoc_block_f32(
     max_iter: usize,
     init_log10_lbd_reml: Option<f64>,
     init_log10_lbd_ml: Option<f64>,
-    use_warm_start: bool,
     nullml: f64,
     out: &mut [f64],
     out_cols: usize,
@@ -231,8 +233,6 @@ fn run_rotated_lmm2_assoc_block_f32(
         pool,
         || RotatedLmm2AssocState {
             snp_vec: vec![0.0_f64; n],
-            last_log10_lbd_reml: None,
-            last_log10_lbd_ml: None,
         },
         |_, row, state, out_row| {
             let snp_ssq = copy_rotated_snp_row_to_f64(row, &mut state.snp_vec);
@@ -241,14 +241,7 @@ fn run_rotated_lmm2_assoc_block_f32(
                 return;
             }
 
-            let reml_init_guess = if use_warm_start {
-                state
-                    .last_log10_lbd_reml
-                    .or(init_log10_lbd_reml)
-                    .or(init_log10_lbd_ml)
-            } else {
-                init_log10_lbd_reml.or(init_log10_lbd_ml)
-            };
+            let reml_init_guess = init_log10_lbd_reml.or(init_log10_lbd_ml);
             let (best_log10_lbd_reml, _best_reml_cost) = brent_minimize_with_init(
                 |x| -reml_loglike(x, s, xcov_flat, y, Some(&state.snp_vec[..]), n, p_cov),
                 low,
@@ -257,10 +250,6 @@ fn run_rotated_lmm2_assoc_block_f32(
                 max_iter,
                 reml_init_guess,
             );
-            if use_warm_start {
-                state.last_log10_lbd_reml = Some(best_log10_lbd_reml);
-            }
-
             let (beta, se, lambda_reml) = final_beta_se(
                 best_log10_lbd_reml,
                 s,
@@ -278,17 +267,10 @@ fn run_rotated_lmm2_assoc_block_f32(
                 return;
             };
 
-            let ml_init_guess = if use_warm_start {
-                state
-                    .last_log10_lbd_ml
-                    .or(Some(best_log10_lbd_reml))
-                    .or(init_log10_lbd_ml)
-                    .or(init_log10_lbd_reml)
-            } else {
-                Some(best_log10_lbd_reml)
-                    .or(init_log10_lbd_ml)
-                    .or(init_log10_lbd_reml)
-            };
+            // ML optimization starts from this SNP's REML optimum. Do not
+            // carry an optimum across SNPs: Rayon scheduling must not affect
+            // the per-marker result.
+            let ml_init_guess = Some(best_log10_lbd_reml);
             let (best_log10_lbd_ml, best_ml_cost) = brent_minimize_with_init(
                 |x| -ml_loglike(x, s, xcov_flat, y, Some(&state.snp_vec[..]), n, p_cov),
                 low,
@@ -297,10 +279,6 @@ fn run_rotated_lmm2_assoc_block_f32(
                 max_iter,
                 ml_init_guess,
             );
-            if use_warm_start {
-                state.last_log10_lbd_ml = Some(best_log10_lbd_ml);
-            }
-
             let mut ml_alt = -best_ml_cost;
             if !ml_alt.is_finite() {
                 ml_alt = ml_loglike(
@@ -1292,59 +1270,32 @@ where
                     let local_idx = snp_idx - chunk_start;
                     let row =
                         &chunk_packed[local_idx * bytes_per_snp..(local_idx + 1) * bytes_per_snp];
-                    let (missing, het, hom_alt) = if use_selected {
-                        count_packed_row_counts_selected_with_excluded(
-                            row,
-                            n_samples_full,
-                            &sample_idx,
-                            selected_excluded_sample_indices,
-                        )
-                    } else {
-                        count_packed_row_counts(row, n_samples_full)
-                    };
-                    let non_missing = n.saturating_sub(missing);
-
-                    let miss_rate = if n > 0 {
-                        missing as f32 / n as f32
-                    } else {
-                        1.0_f32
-                    };
-                    if miss_rate > miss_thr {
-                        return None;
-                    }
-
-                    if non_missing == 0 {
-                        return if maf_thr > 0.0 {
-                            None
+                    let qc = evaluate_packed_bed_row_qc(
+                        row,
+                        n_samples_full,
+                        if use_selected {
+                            Some(sample_idx.as_slice())
                         } else {
-                            Some(SnpCounts {
-                                flip: false,
-                                maf: 0.0_f32,
-                                miss_rate,
-                                missing_count: missing,
-                            })
-                        };
-                    }
-
-                    if het_thr > 0.0 {
-                        let het_rate = het as f32 / non_missing as f32;
-                        if het_rate > het_thr {
-                            return None;
-                        }
-                    }
-
-                    let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
-                    let alt_freq = alt_sum as f32 / (2.0_f32 * non_missing as f32);
-                    let maf_v = alt_freq.min(1.0_f32 - alt_freq);
-                    if maf_v < maf_thr {
+                            None
+                        },
+                        if use_selected {
+                            selected_excluded_sample_indices
+                        } else {
+                            None
+                        },
+                        n,
+                        maf_thr,
+                        miss_thr,
+                        het_thr,
+                    );
+                    if !qc.keep {
                         return None;
                     }
-
                     Some(SnpCounts {
-                        flip: false,
-                        maf: alt_freq,
-                        miss_rate,
-                        missing_count: missing,
+                        flip: qc.row_flip,
+                        maf: qc.alt_freq,
+                        miss_rate: qc.missing_rate,
+                        missing_count: qc.missing_count,
                     })
                 })
                 .collect();
@@ -1753,7 +1704,6 @@ pub fn lmm_reml_lmm2_chunk_from_snp_f32<'py>(
                 max_iter,
                 None,
                 None,
-                false,
                 nullml,
                 out_block,
                 out_cols,
@@ -2644,7 +2594,8 @@ pub fn lmm_reml_assoc_bed_to_tsv_f32<'py>(
     let bed_prefix_owned = bed_prefix.to_string();
     let out_tsv_owned = out_tsv.to_string();
     let stage_timing = env_truthy("JX_LMM_UNIFIED_STAGE_TIMING");
-    let use_warm_start = !env_truthy("JX_LMM_UNIFIED_NO_WARM_START");
+    let (seed_with_null_lambda, carry_snp_lambda) =
+        unified_lmm_reml_start_policy(env_truthy("JX_LMM_UNIFIED_NO_WARM_START"));
 
     py.detach(move || -> Result<usize, String> {
         let assoc_threads = stage_assoc_threads_or(threads, threads);
@@ -2689,8 +2640,8 @@ pub fn lmm_reml_assoc_bed_to_tsv_f32<'py>(
                     tol,
                     max_iter,
                     init_log10_lbd,
-                    use_warm_start,
-                    use_warm_start,
+                    seed_with_null_lambda,
+                    carry_snp_lambda,
                     if with_plrt { Some(nullml_val) } else { None },
                     out_block,
                     out_cols,
@@ -3129,9 +3080,6 @@ pub fn lmm_reml_lmm2_assoc_bed_to_tsv_f32<'py>(
     let out_tsv_owned = out_tsv.to_string();
     let stage_timing =
         env_truthy("JX_LMM2_UNIFIED_STAGE_TIMING") || env_truthy("JX_LMM_UNIFIED_STAGE_TIMING");
-    let use_warm_start = !(env_truthy("JX_LMM2_UNIFIED_NO_WARM_START")
-        || env_truthy("JX_LMM_UNIFIED_NO_WARM_START"));
-
     py.detach(move || -> Result<usize, String> {
         let null_opt_t0 = Instant::now();
         let nullml_val = if let Some(v) = nullml {
@@ -3200,7 +3148,6 @@ pub fn lmm_reml_lmm2_assoc_bed_to_tsv_f32<'py>(
                     max_iter,
                     init_log10_lbd_reml,
                     init_log10_lbd_ml,
-                    use_warm_start,
                     nullml_val,
                     out_block,
                     out_cols,
@@ -4024,4 +3971,71 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
     })?;
 
     Ok(m)
+}
+#[cfg(test)]
+mod tests {
+    use super::{run_rotated_lmm2_assoc_block_f32, unified_lmm_reml_start_policy};
+
+    #[test]
+    fn unified_lmm_uses_fixed_null_seed_without_cross_snp_carry() {
+        assert_eq!(unified_lmm_reml_start_policy(false), (true, false));
+        assert_eq!(unified_lmm_reml_start_policy(true), (false, false));
+    }
+
+    #[test]
+    fn lmm2_per_snp_results_do_not_depend_on_neighbor_markers() {
+        let n = 6usize;
+        let s = [0.2_f64, 0.4, 0.8, 1.1, 1.7, 2.3];
+        let xcov = [1.0_f64; 6];
+        let y = [1.0_f64, 2.0, 1.0, 3.0, 0.0, 2.0];
+        let genotypes = [
+            0.0_f32, 1.0, 2.0, 1.0, 0.0, 2.0, // marker 1
+            2.0_f32, 2.0, 0.0, 0.0, 1.0, 1.0, // marker 2
+            0.0_f32, 0.0, 1.0, 2.0, 2.0, 1.0, // marker 3
+        ];
+        let mut together = [0.0_f64; 18];
+        run_rotated_lmm2_assoc_block_f32(
+            &genotypes,
+            3,
+            n,
+            &s,
+            &xcov,
+            &y,
+            1,
+            -5.0,
+            5.0,
+            1e-4,
+            30,
+            Some(-0.4),
+            Some(0.1),
+            -10.0,
+            &mut together,
+            6,
+            None,
+        );
+
+        for marker in 0..3 {
+            let mut alone = [0.0_f64; 6];
+            run_rotated_lmm2_assoc_block_f32(
+                &genotypes[marker * n..(marker + 1) * n],
+                1,
+                n,
+                &s,
+                &xcov,
+                &y,
+                1,
+                -5.0,
+                5.0,
+                1e-4,
+                30,
+                Some(-0.4),
+                Some(0.1),
+                -10.0,
+                &mut alone,
+                6,
+                None,
+            );
+            assert_eq!(&together[marker * 6..(marker + 1) * 6], &alone);
+        }
+    }
 }

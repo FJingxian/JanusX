@@ -1798,6 +1798,9 @@ def _prepare_packed_bed_once_for_gwas(
     status_label: str = "Loading packed BED genotype",
     trait_prepared_meta: Union[dict[str, object], None] = None,
     emit_status: bool = True,
+    fused_qc_load: bool = False,
+    stats_sample_indices: Union[np.ndarray, None] = None,
+    bimranges: Optional[list[tuple[str, int, int]]] = None,
 ) -> tuple[str, np.ndarray, dict[str, object], Union[_BimSiteColumns, None]]:
     """
     Resolve packed BED context for GWAS full-rust routes.
@@ -1819,6 +1822,126 @@ def _prepare_packed_bed_once_for_gwas(
             "Packed BED preload is disabled for this run. "
             f"reason={reason or 'unknown'}"
         )
+
+    if bool(fused_qc_load):
+        if not hasattr(jxrs, "prepare_bed_fused_qc_packed"):
+            raise RuntimeError(
+                "Rust extension missing prepare_bed_fused_qc_packed required by "
+                "FarmCPU/ALGWAS fused QC loading. Rebuild/install JanusX extension first."
+            )
+        if packed_preload_is_ready(preloaded_packed):
+            raise ValueError(
+                "Fused QC loading requires a fresh BED input; a preloaded packed context was provided."
+            )
+        if not bool(emit_status):
+            fused_result = jxrs.prepare_bed_fused_qc_packed(
+                str(prefix),
+                sample_indices=(
+                    None
+                    if stats_sample_indices is None
+                    else np.ascontiguousarray(
+                        np.asarray(stats_sample_indices, dtype=np.int64).reshape(-1),
+                        dtype=np.int64,
+                    )
+                ),
+                maf_threshold=float(maf_threshold),
+                max_missing_rate=float(max_missing_rate),
+                het_threshold=float(het_threshold),
+                snps_only=bool(snps_only),
+                bimranges=[
+                    (str(chrom), int(start), int(end))
+                    for chrom, start, end in list(bimranges or [])
+                ],
+            )
+        else:
+            with CliStatus(f"{status_label} (fused QC)...", enabled=bool(use_spinner)) as task:
+                try:
+                    fused_result = jxrs.prepare_bed_fused_qc_packed(
+                        str(prefix),
+                        sample_indices=(
+                            None
+                            if stats_sample_indices is None
+                            else np.ascontiguousarray(
+                                np.asarray(stats_sample_indices, dtype=np.int64).reshape(-1),
+                                dtype=np.int64,
+                            )
+                        ),
+                        maf_threshold=float(maf_threshold),
+                        max_missing_rate=float(max_missing_rate),
+                        het_threshold=float(het_threshold),
+                        snps_only=bool(snps_only),
+                        bimranges=[
+                            (str(chrom), int(start), int(end))
+                            for chrom, start, end in list(bimranges or [])
+                        ],
+                    )
+                except Exception:
+                    task.fail(f"{status_label} (fused QC) ...Failed")
+                    raise
+                task.complete(f"{status_label} (fused QC) ...Finished")
+        packed_raw, row_idx_raw, miss_raw, maf_raw, row_flip_raw, n_samples_raw, n_snps_raw = fused_result
+        full_ids = _read_bed_fam_iids(str(normalize_plink_prefix(prefix)))
+        packed_payload = np.asarray(packed_raw, dtype=np.uint8)
+        source_row_idx = np.ascontiguousarray(
+            np.asarray(row_idx_raw, dtype=np.int64).reshape(-1), dtype=np.int64
+        )
+        miss_rate = np.ascontiguousarray(np.asarray(miss_raw, dtype=np.float32).reshape(-1), dtype=np.float32)
+        maf = np.ascontiguousarray(np.asarray(maf_raw, dtype=np.float32).reshape(-1), dtype=np.float32)
+        row_flip = np.ascontiguousarray(np.asarray(row_flip_raw, dtype=np.bool_).reshape(-1), dtype=np.bool_)
+        n_samples = int(n_samples_raw)
+        n_snps = int(n_snps_raw)
+        if int(full_ids.shape[0]) != n_samples:
+            raise ValueError(
+                "Fused packed BED sample count disagrees with FAM metadata: "
+                f"samples={n_samples}/{int(full_ids.shape[0])}."
+            )
+        if packed_payload.shape != (int(source_row_idx.size), (n_samples + 3) // 4):
+            raise ValueError(
+                "Fused packed BED payload has invalid shape: "
+                "got="
+                f"{packed_payload.shape}, expected={(int(source_row_idx.size), (n_samples + 3) // 4)}."
+            )
+        if source_row_idx.size == 0 or not (
+            source_row_idx.size == miss_rate.size == maf.size == row_flip.size
+        ):
+            raise ValueError(
+                "Fused packed BED QC metadata has inconsistent lengths: "
+                f"rows={source_row_idx.size}, missing={miss_rate.size}, "
+                f"maf={maf.size}, flip={row_flip.size}."
+            )
+        if int(source_row_idx.min()) < 0 or int(source_row_idx.max()) >= n_snps:
+            raise ValueError("Fused packed BED QC metadata contains an invalid source row index.")
+        row_idx = np.arange(int(source_row_idx.size), dtype=np.int64)
+        packed_ctx: dict[str, object] = {
+            "packed": packed_payload,
+            "missing_rate": miss_rate,
+            "af": maf,
+            "maf": maf,
+            "row_flip": row_flip,
+            "active_row_idx": row_idx,
+            "row_indices": row_idx,
+            "source_row_indices": source_row_idx,
+            "packed_filter_mode": "compact",
+            "packed_storage": "owned",
+            "n_samples": n_samples,
+            "n_total_sites": n_snps,
+            "n_active_sites": int(row_idx.shape[0]),
+            "source_prefix": str(prefix),
+        }
+        if not load_site_meta:
+            site_meta = _make_deferred_bim_metadata(
+                str(prefix), source_row_idx, n_markers=int(source_row_idx.shape[0])
+            )
+            return str(prefix), full_ids, packed_ctx, site_meta
+        site_meta = _resolve_bim_site_columns_meta(
+            _make_deferred_bim_metadata(
+                str(prefix), source_row_idx, n_markers=int(source_row_idx.shape[0])
+            ),
+            prefix=str(prefix),
+            row_indices=source_row_idx,
+            expected_rows=int(source_row_idx.shape[0]),
+        )
+        return str(prefix), full_ids, packed_ctx, site_meta
 
     prepared_scan_meta = _coerce_trait_prepared_scan_meta(trait_prepared_meta)
     if prepared_scan_meta is not None:
@@ -1938,6 +2061,12 @@ def _prepare_packed_bed_once_for_gwas(
             np.asarray(active_row_idx_obj, dtype=np.int64).reshape(-1),
             dtype=np.int64,
         )
+        source_row_idx_obj = packed_ctx_obj.get("source_row_indices")
+        if source_row_idx_obj is not None:
+            packed_ctx["source_row_indices"] = np.ascontiguousarray(
+                np.asarray(source_row_idx_obj, dtype=np.int64).reshape(-1),
+                dtype=np.int64,
+            )
         packed_storage = packed_ctx_obj.get("packed_storage", None)
         if packed_storage is not None:
             packed_ctx["packed_storage"] = str(packed_storage)
@@ -4575,6 +4704,7 @@ def run_lm_stream_bed_single_entry(
     trait_prepared_meta: Union[dict[str, object], None] = None,
     model_key: str = "lm",
     lm2_covariate_indices: Union[np.ndarray, None] = None,
+    fused_qc: bool = False,
 ) -> None:
     if str(genetic_model).strip().lower() != "add":
         raise ValueError("GWAS currently supports only additive coding (model='add').")
@@ -4796,6 +4926,8 @@ def run_lm_stream_bed_single_entry(
                     lm_base_kwargs["row_flip"] = prepared_row_flip
                     lm_base_kwargs["row_missing"] = prepared_row_missing
                     lm_base_kwargs["row_maf"] = prepared_row_maf
+                if model_key_norm == "lm" and bool(fused_qc):
+                    lm_base_kwargs["fused_qc"] = True
 
                 def _call_lm_stream(ixx_opt: object) -> tuple[int, int]:
                     global _WARNED_LM_STREAM_MMAP_LEGACY
@@ -7211,6 +7343,9 @@ def run_algwas_packed_fullrank(
     preloaded_packed: Union[dict[str, object], None] = None,
     qtn_preloaded_packed: Union[dict[str, object], None] = None,
     trait_prepared_meta: Union[dict[str, object], None] = None,
+    fused_qc_load: bool = False,
+    fused_qc_sample_indices: Union[np.ndarray, None] = None,
+    bimranges: Optional[list[tuple[str, int, int]]] = None,
 ) -> None:
     if str(genetic_model).lower() != "add":
         raise ValueError("ALGWAS full-rust packed route supports additive coding only.")
@@ -7247,6 +7382,9 @@ def run_algwas_packed_fullrank(
             load_site_meta=False,
             status_label="Loading BED genotype of trait-subset",
             trait_prepared_meta=trait_prepared_meta,
+            fused_qc_load=bool(fused_qc_load),
+            stats_sample_indices=fused_qc_sample_indices,
+            bimranges=bimranges,
         )
     id_to_idx = {sid: i for i, sid in enumerate(full_ids)}
     try:
@@ -7259,6 +7397,14 @@ def run_algwas_packed_fullrank(
 
     packed, packed_n, packed_row_idx, maf, miss, row_flip = _packed_ctx_active_view_for_gwas(
         packed_ctx
+    )
+    source_row_idx_obj = packed_ctx.get("source_row_indices")
+    source_row_idx_for_assoc = (
+        None
+        if source_row_idx_obj is None
+        else np.ascontiguousarray(
+            np.asarray(source_row_idx_obj, dtype=np.int64).reshape(-1), dtype=np.int64
+        )
     )
     if packed_n <= 0:
         raise ValueError("Packed BED reported invalid sample count.")
@@ -7497,6 +7643,7 @@ def run_algwas_packed_fullrank(
                             int(max(1, int(chunk_size))),
                             row_indices=packed_row_idx,
                             bed_prefix=str(prefix),
+                            source_row_indices=source_row_idx_for_assoc,
                         )
                         r0 = _res[0]
                         qtn_count = int(r0.get("qtn_count", 0))
@@ -7536,6 +7683,7 @@ def run_algwas_packed_fullrank(
                         pseudo_tsv=str(pseudo_tsv_hint),
                         row_indices=packed_row_idx,
                         bed_prefix=str(prefix),
+                        source_row_indices=source_row_idx_for_assoc,
                     )
                 stage1_kernel_elapsed = max(time.monotonic() - stage1_kernel_t0, 0.0)
                 stage1_kernel_end = stage1_kernel_t0 + stage1_kernel_elapsed
@@ -8364,6 +8512,7 @@ def run_splmm_windowed_fullrank(
                 emit_trait_header=False,
                 chunk_size_user_set=True,
                 force_model=bool(force_model),
+                bimranges=bimranges,
             )
             if multi_trait_mode:
                 logger.info("")

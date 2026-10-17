@@ -14,7 +14,8 @@ use crate::decode::{
 };
 use crate::gfcore::{self, BimChunkReader};
 use crate::gfreader::{
-    build_sample_selection, count_packed_row_counts, count_packed_row_counts_selected_with_excluded,
+    build_sample_selection, count_packed_row_counts,
+    count_packed_row_counts_selected_with_excluded, evaluate_packed_snp_qc,
 };
 use crate::glm::{
     is_simple_snp_allele, lm_resolve_snp_name, normalize_plink_prefix_local, student_t_p_two_sided,
@@ -568,10 +569,10 @@ pub fn lm2_stream_bed_to_tsv(
                 let miss_counts: Vec<usize> = row_missing_vec
                     .iter()
                     .map(|&v| {
-                        if !v.is_finite() || v < 0.0_f32 {
-                            0usize
+                        if !v.is_finite() || v <= 0.0_f32 {
+                            0
                         } else {
-                            v.round() as usize
+                            ((v as f64 * n as f64).round().min(n as f64)) as usize
                         }
                     })
                     .collect();
@@ -658,25 +659,19 @@ pub fn lm2_stream_bed_to_tsv(
                                     selected_excluded_sample_indices,
                                 )
                             };
-                            let non_missing = n.saturating_sub(missing);
-                            let miss_rate = if n > 0 {
-                                missing as f32 / n as f32
-                            } else {
-                                1.0
-                            };
-                            if miss_rate > max_missing_rate {
+                            let qc = evaluate_packed_snp_qc(
+                                missing,
+                                het,
+                                hom_alt,
+                                n,
+                                maf_threshold,
+                                max_missing_rate,
+                                het_threshold,
+                            );
+                            if !qc.keep {
                                 return None;
                             }
-                            if non_missing == 0 {
-                                return None;
-                            }
-                            let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
-                            let alt_freq = alt_sum as f32 / (2.0_f32 * non_missing as f32);
-                            let maf = alt_freq.min(1.0_f32 - alt_freq);
-                            if maf < maf_threshold {
-                                return None;
-                            }
-                            Some((alt_freq, missing))
+                            Some((qc.alt_freq, qc.missing_count))
                         })
                         .collect()
                 })
@@ -696,22 +691,19 @@ pub fn lm2_stream_bed_to_tsv(
                                 selected_excluded_sample_indices,
                             )
                         };
-                        let non_missing = n.saturating_sub(missing);
-                        let miss_rate = if n > 0 {
-                            missing as f32 / n as f32
-                        } else {
-                            1.0
-                        };
-                        if miss_rate > max_missing_rate || non_missing == 0 {
+                        let qc = evaluate_packed_snp_qc(
+                            missing,
+                            het,
+                            hom_alt,
+                            n,
+                            maf_threshold,
+                            max_missing_rate,
+                            het_threshold,
+                        );
+                        if !qc.keep {
                             return None;
                         }
-                        let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
-                        let alt_freq = alt_sum as f32 / (2.0_f32 * non_missing as f32);
-                        let maf = alt_freq.min(1.0_f32 - alt_freq);
-                        if maf < maf_threshold {
-                            return None;
-                        }
-                        Some((alt_freq, missing))
+                        Some((qc.alt_freq, qc.missing_count))
                     })
                     .collect()
             };

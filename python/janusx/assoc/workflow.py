@@ -304,6 +304,114 @@ def _splmm_fused_qc_eligible(
     )
 
 
+def _kinship_fused_qc_eligible(
+    *,
+    model_token: str,
+    route_name: str,
+    genetic_model: str,
+    row_stat_mode: str,
+    bed_exists: bool,
+    prepared_meta_ready: bool,
+    fused_binding_available: bool,
+) -> bool:
+    """Decide whether a unified BED route can fuse strict-train QC."""
+    model_key = str(model_token).strip().lower()
+    route_key = str(route_name).strip().lower()
+    env_key_by_model = {
+        "lm": "JANUSX_LM_FUSED_QC",
+        "lm2": "JANUSX_LM2_FUSED_QC",
+        "lmm": "JANUSX_LMM_FUSED_QC",
+        "lmm2": "JANUSX_LMM2_FUSED_QC",
+        "fvlmm": "JANUSX_FVLMM_FUSED_QC",
+    }
+    if model_key not in env_key_by_model or route_key != f"{model_key}_stream":
+        return False
+
+    env_key = env_key_by_model[model_key]
+    raw_value = os.environ.get(env_key)
+    if raw_value is None or str(raw_value).strip() == "":
+        enabled = True
+    else:
+        value = str(raw_value).strip().lower()
+        if value in {"1", "true", "yes", "on"}:
+            enabled = True
+        elif value in {"0", "false", "no", "off"}:
+            enabled = False
+        else:
+            raise ValueError(
+                f"Invalid {env_key} value {raw_value!r}; expected "
+                "1/true/yes/on or 0/false/no/off."
+            )
+
+    return bool(
+        enabled
+        and str(genetic_model).strip().lower() == "add"
+        and str(row_stat_mode).strip().lower() == "strict-train"
+        and bool(bed_exists)
+        and not bool(prepared_meta_ready)
+        and bool(fused_binding_available)
+    )
+
+
+def _packed_model_fused_qc_eligible(
+    *,
+    model_token: str,
+    route_name: str,
+    genetic_model: str,
+    row_stat_mode: str,
+    bed_prefix: Union[str, None],
+    packed_preload_ready: bool,
+    fused_binding_available: bool,
+    memory_budget_mb: Union[float, None],
+    snps_only: bool,
+) -> bool:
+    """Gate one-pass full packed loads for the packed FarmCPU/ALGWAS routes."""
+    model_key = str(model_token).strip().lower()
+    route_key = str(route_name).strip().lower()
+    env_key = {
+        "farmcpu": "JANUSX_FARMCPU_FUSED_QC",
+        "algwas": "JANUSX_ALGWAS_FUSED_QC",
+    }.get(model_key)
+    if env_key is None or route_key != model_key:
+        return False
+    raw_value = os.environ.get(env_key)
+    if raw_value is not None and str(raw_value).strip() != "":
+        value = str(raw_value).strip().lower()
+        if value in {"0", "false", "no", "off"}:
+            return False
+        if value not in {"1", "true", "yes", "on"}:
+            raise ValueError(
+                f"Invalid {env_key} value {raw_value!r}; expected "
+                "1/true/yes/on or 0/false/no/off."
+            )
+    if (
+        not bool(fused_binding_available)
+        or str(genetic_model).strip().lower() != "add"
+        or str(row_stat_mode).strip().lower() not in {"strict-train", "global"}
+        or not bed_prefix
+        or not os.path.isfile(f"{str(bed_prefix)}.bed")
+        or bool(packed_preload_ready)
+    ):
+        return False
+
+    try:
+        budget_mb = float(memory_budget_mb)
+        if not np.isfinite(budget_mb) or budget_mb <= 0.0:
+            return False
+        bed_bytes = max(0, int(os.path.getsize(f"{str(bed_prefix)}.bed")) - 3)
+        required_bytes = int(np.ceil(float(bed_bytes) * 1.06))
+        if bool(snps_only):
+            bim_bytes = int(os.path.getsize(f"{str(bed_prefix)}.bim"))
+            required_bytes += int(np.ceil(float(bim_bytes) * 1.5))
+        budget_bytes = budget_mb * 1024.0 * 1024.0
+    except (OSError, TypeError, ValueError, OverflowError):
+        return False
+    # Reserve one quarter of the configured genotype memory for QC metadata,
+    # model workspaces, and the BED mapping while the owned packed copy is built.
+    # This budget governs packed loads in mixed stream/packed commands too.
+    return bool(float(required_bytes) <= budget_bytes * 0.75)
+
+
 def _write_pca_cache_with_ids(path: str, sample_ids: np.ndarray, qmatrix: np.ndarray) -> None:
     sid = np.asarray(sample_ids, dtype=str).reshape(-1)
     q = np.asarray(qmatrix, dtype=np.float32)
@@ -9505,6 +9613,10 @@ def _run_gwas_pipeline(
                     prewarm_global_scanmeta=bool(
                         gwas_row_stat_mode == "global"
                         and str(args.model).lower() == "add"
+                        and any(
+                            str(model).strip().lower() != "algwas"
+                            for model in requested_stream_models
+                        )
                     ),
                     scanmeta_outprefix=str(outprefix),
                     inverse_normal=bool(getattr(args, "intrans", False)),
@@ -9853,6 +9965,8 @@ def _run_gwas_pipeline(
                         trait_one: list[str],
                         emit_trait_header_model: bool,
                         trait_prepared_meta: Union[dict[str, object], None] = None,
+                        fused_qc_load: bool = False,
+                        fused_qc_sample_indices: Union[np.ndarray, None] = None,
                     ) -> None:
                         run_algwas_packed_fullrank(
                             genofile=genofile_stream,
@@ -9879,6 +9993,9 @@ def _run_gwas_pipeline(
                             preloaded_packed=preloaded_packed,
                             qtn_preloaded_packed=qtn_preloaded_packed,
                             trait_prepared_meta=trait_prepared_meta,
+                            fused_qc_load=bool(fused_qc_load),
+                            fused_qc_sample_indices=fused_qc_sample_indices,
+                            bimranges=scan_bimranges,
                         )
 
                     def _run_route_splmm_windowed(
@@ -9972,12 +10089,14 @@ def _run_gwas_pipeline(
                             force_model=bool(args.force_model),
                             trait_prepared_meta=trait_prepared_meta,
                             null_sidecar_context=null_sidecar_context,
+                            bimranges=scan_bimranges,
                         )
 
                     def _run_route_lm_stream(
                         trait_one: list[str],
                         emit_trait_header_model: bool,
                         trait_prepared_meta: Union[dict[str, object], None] = None,
+                        fused_qc: bool = False,
                     ) -> None:
                         run_chunked_gwas_lmm_lm(
                             model_name="lm",
@@ -10011,6 +10130,8 @@ def _run_gwas_pipeline(
                             ),
                             force_model=bool(args.force_model),
                             trait_prepared_meta=trait_prepared_meta,
+                            fused_qc=bool(fused_qc),
+                            bimranges=scan_bimranges,
                         )
 
                     def _run_route_lm2_stream(
@@ -10051,6 +10172,7 @@ def _run_gwas_pipeline(
                             force_model=bool(args.force_model),
                             lm2_covariate_indices=getattr(args, "_lm2_cov_idx", None),
                             trait_prepared_meta=trait_prepared_meta,
+                            bimranges=scan_bimranges,
                         )
 
                     def _run_route_lmm_stream(
@@ -10090,6 +10212,7 @@ def _run_gwas_pipeline(
                             ),
                             force_model=bool(args.force_model),
                             trait_prepared_meta=trait_prepared_meta,
+                            bimranges=scan_bimranges,
                         )
 
                     def _run_route_lmm2_stream(
@@ -10129,12 +10252,15 @@ def _run_gwas_pipeline(
                             ),
                             force_model=bool(args.force_model),
                             trait_prepared_meta=trait_prepared_meta,
+                            bimranges=scan_bimranges,
                         )
 
                     def _run_route_farmcpu(
                         trait_one: list[str],
                         emit_trait_header_model: bool,
                         trait_prepared_meta: Union[dict[str, object], None] = None,
+                        fused_qc_load: bool = False,
+                        fused_qc_sample_indices: Union[np.ndarray, None] = None,
                     ) -> None:
                         nonlocal farmcpu_cache_runtime, farmcpu_handled_in_trait_loop
                         farmcpu_cache_runtime = run_farmcpu_fullmem(
@@ -10157,6 +10283,8 @@ def _run_gwas_pipeline(
                             preloaded_packed=preloaded_packed,
                             qtn_preloaded_packed=qtn_preloaded_packed,
                             trait_prepared_meta=trait_prepared_meta,
+                            fused_qc_load=bool(fused_qc_load),
+                            fused_qc_sample_indices=fused_qc_sample_indices,
                         )
                         farmcpu_handled_in_trait_loop = True
 
@@ -10407,6 +10535,94 @@ def _run_gwas_pipeline(
                             fused_binding_available=fused_binding_available,
                         )
 
+                    def _kinship_fused_qc_bypasses_prepared_meta(
+                        route_name: str,
+                        model_token: Optional[str],
+                        trait_token: str,
+                    ) -> bool:
+                        route_key = str(route_name).lower().strip()
+                        model_key = str(model_token or "").lower().strip()
+                        if model_key == "lm":
+                            binding_available = hasattr(jxrs, "lm_stream_bed_to_tsv")
+                        elif model_key == "lm2":
+                            binding_available = hasattr(jxrs, "lm2_stream_bed_to_tsv")
+                        elif model_key == "lmm":
+                            binding_available = bool(
+                                hasattr(jxrs, "lmm_reml_assoc_bed_to_tsv_f32")
+                                and os.environ.get("JX_DISABLE_LMM_UNIFIED") != "1"
+                            )
+                        elif model_key == "lmm2":
+                            binding_available = bool(
+                                hasattr(jxrs, "lmm_reml_lmm2_assoc_bed_to_tsv_f32")
+                                and os.environ.get("JX_DISABLE_LMM2_UNIFIED") != "1"
+                            )
+                        elif model_key == "fvlmm":
+                            binding_available = bool(
+                                hasattr(jxrs, "fvlmm_assoc_bed_to_tsv_f32")
+                                and os.environ.get("JX_DISABLE_FVLMM_UNIFIED") != "1"
+                            )
+                        else:
+                            binding_available = False
+                        return _kinship_fused_qc_eligible(
+                            model_token=model_key,
+                            route_name=route_key,
+                            genetic_model=str(args.model),
+                            row_stat_mode=gwas_row_stat_mode,
+                            bed_exists=bool(
+                                prefix_meta is not None
+                                and os.path.exists(f"{str(prefix_meta)}.bed")
+                            ),
+                            prepared_meta_ready=(
+                                str(trait_token) in trait_shared_meta_cache
+                            ),
+                            fused_binding_available=binding_available,
+                        )
+
+                    fused_qc_sample_indices_by_trait: dict[str, np.ndarray] = {}
+
+                    def _packed_model_fused_qc_bypasses_prepared_meta(
+                        route_name: str,
+                        model_token: Optional[str],
+                        trait_token: str,
+                        trait_name: object,
+                    ) -> bool:
+                        route_key = str(route_name).lower().strip()
+                        model_key = str(model_token or "").lower().strip()
+                        if model_key not in {"farmcpu", "algwas"}:
+                            return False
+                        eligible = _packed_model_fused_qc_eligible(
+                            model_token=model_key,
+                            route_name=route_key,
+                            genetic_model=str(args.model),
+                            row_stat_mode=gwas_row_stat_mode,
+                            bed_prefix=(
+                                str(prefix_meta) if prefix_meta is not None else None
+                            ),
+                            packed_preload_ready=bool(
+                                packed_preload_is_ready(preloaded_packed)
+                                or packed_preload_is_ready(qtn_preloaded_packed)
+                            ),
+                            fused_binding_available=hasattr(
+                                jxrs, "prepare_bed_fused_qc_packed"
+                            ),
+                            memory_budget_mb=getattr(args, "_memory_mb", None),
+                            snps_only=bool(args.snps_only),
+                        )
+                        if not eligible:
+                            return False
+                        if gwas_row_stat_mode == "strict-train":
+                            sample_indices = fused_qc_sample_indices_by_trait.get(
+                                str(trait_token)
+                            )
+                            if sample_indices is None:
+                                sample_indices = _build_trait_sample_indices(trait_name)
+                                if sample_indices is None:
+                                    return False
+                                fused_qc_sample_indices_by_trait[str(trait_token)] = (
+                                    sample_indices
+                                )
+                        return True
+
                     def _trait_prepared_meta_needs_build(
                         trait_token: str,
                         trait_name: object,
@@ -10416,6 +10632,17 @@ def _run_gwas_pipeline(
                         route_key = str(route_name).lower().strip()
                         if (
                             _splmm_fused_qc_bypasses_prepared_meta(
+                                route_key,
+                                model_token,
+                                trait_token,
+                            )
+                            or _packed_model_fused_qc_bypasses_prepared_meta(
+                                route_key,
+                                model_token,
+                                trait_token,
+                                trait_name,
+                            )
+                            or _kinship_fused_qc_bypasses_prepared_meta(
                                 route_key,
                                 model_token,
                                 trait_token,
@@ -10449,6 +10676,17 @@ def _run_gwas_pipeline(
                         route_key = str(route_name).lower().strip()
                         if (
                             _splmm_fused_qc_bypasses_prepared_meta(
+                                route_key,
+                                model_token,
+                                trait_token,
+                            )
+                            or _packed_model_fused_qc_bypasses_prepared_meta(
+                                route_key,
+                                model_token,
+                                trait_token,
+                                trait_name,
+                            )
+                            or _kinship_fused_qc_bypasses_prepared_meta(
                                 route_key,
                                 model_token,
                                 trait_token,
@@ -10578,6 +10816,7 @@ def _run_gwas_pipeline(
                         trait_level_shared_route_eligible = bool(
                             prefix_meta is not None
                             and str(args.model).lower() == "add"
+                            and len(scan_bimranges) == 0
                             and (not bool(args.plot))
                             and len(unique_trait_tasks) > 1
                             and trait_level_same_model
@@ -11129,6 +11368,7 @@ def _run_gwas_pipeline(
                                     force_model=bool(args.force_model),
                                     emit_trait_header=bool(emit_trait_header_model),
                                     trait_prepared_meta=trait_meta_shared,
+                                    bimranges=scan_bimranges,
                                     null_sidecar_context=null_sidecar_context,
                                 )
                                 next_idx = group_end
@@ -11166,16 +11406,48 @@ def _run_gwas_pipeline(
                                     trait_prepared_meta=trait_meta_shared,
                                 )
                             elif route in stream_group_routes:
-                                route_handler(
-                                    trait_one,
-                                    bool(emit_trait_header_model),
-                                    trait_prepared_meta=trait_meta_shared,
-                                )
+                                if mk == "lm":
+                                    route_handler(
+                                        trait_one,
+                                        bool(emit_trait_header_model),
+                                        trait_prepared_meta=trait_meta_shared,
+                                        fused_qc=_kinship_fused_qc_bypasses_prepared_meta(
+                                            route,
+                                            mk,
+                                            trait_token_use,
+                                        ),
+                                    )
+                                else:
+                                    route_handler(
+                                        trait_one,
+                                        bool(emit_trait_header_model),
+                                        trait_prepared_meta=trait_meta_shared,
+                                    )
                             elif route in {"algwas", "farmcpu"}:
+                                fused_qc_load = (
+                                    _packed_model_fused_qc_bypasses_prepared_meta(
+                                        route,
+                                        mk,
+                                        trait_token_use,
+                                        trait_name_use,
+                                    )
+                                )
+                                fused_qc_sample_indices = (
+                                    fused_qc_sample_indices_by_trait.get(
+                                        trait_token_use
+                                    )
+                                    if (
+                                        fused_qc_load
+                                        and gwas_row_stat_mode == "strict-train"
+                                    )
+                                    else None
+                                )
                                 route_handler(
                                     trait_one,
                                     bool(emit_trait_header_model),
                                     trait_prepared_meta=trait_meta_shared,
+                                    fused_qc_load=bool(fused_qc_load),
+                                    fused_qc_sample_indices=fused_qc_sample_indices,
                                 )
                             else:
                                 route_handler(trait_one, bool(emit_trait_header_model))
@@ -11317,6 +11589,7 @@ def _run_gwas_pipeline(
             strict_ids_arr_meta = None
             strict_id_to_full_meta = None
             global_trait_meta_single: Union[dict[str, object], None] = None
+            global_fused_qc_load = False
             if (
                 gwas_row_stat_mode == "strict-train"
                 and str(args.model).lower() == "add"
@@ -11347,24 +11620,44 @@ def _run_gwas_pipeline(
                 )
             ):
                 global_prefix_meta = _as_plink_prefix(genofile_stream)
-                if global_prefix_meta is not None:
-                    global_trait_meta_single = _gwas_logic_meta_global_cached(
-                        str(global_prefix_meta),
-                        maf_threshold=float(maf_threshold_scan),
-                        max_missing_rate=float(max_missing_rate_scan),
-                        het_threshold=float(het_threshold_scan),
+                global_fused_qc_load = bool(
+                    global_prefix_meta is not None
+                    and _packed_model_fused_qc_eligible(
+                        model_token="farmcpu",
+                        route_name="farmcpu",
+                        genetic_model=str(args.model),
+                        row_stat_mode=gwas_row_stat_mode,
+                        bed_prefix=str(global_prefix_meta),
+                        packed_preload_ready=bool(
+                            packed_preload_is_ready(preloaded_packed)
+                            or packed_preload_is_ready(qtn_preloaded_packed)
+                        ),
+                        fused_binding_available=hasattr(
+                            jxrs, "prepare_bed_fused_qc_packed"
+                        ),
+                        memory_budget_mb=getattr(args, "_memory_mb", None),
                         snps_only=bool(args.snps_only),
-                        outprefix=str(outprefix),
-                        logger=logger,
-                        use_spinner=False,
                     )
-                    global_trait_meta_single = _filter_trait_prepared_meta_by_bimranges(
-                        global_trait_meta_single,
-                        prefix=str(global_prefix_meta),
-                        bimranges=scan_bimranges,
-                        logger=logger,
-                        route_label="FARMCPU",
-                    )
+                )
+                if global_prefix_meta is not None:
+                    if not global_fused_qc_load:
+                        global_trait_meta_single = _gwas_logic_meta_global_cached(
+                            str(global_prefix_meta),
+                            maf_threshold=float(maf_threshold_scan),
+                            max_missing_rate=float(max_missing_rate_scan),
+                            het_threshold=float(het_threshold_scan),
+                            snps_only=bool(args.snps_only),
+                            outprefix=str(outprefix),
+                            logger=logger,
+                            use_spinner=False,
+                        )
+                        global_trait_meta_single = _filter_trait_prepared_meta_by_bimranges(
+                            global_trait_meta_single,
+                            prefix=str(global_prefix_meta),
+                            bimranges=scan_bimranges,
+                            logger=logger,
+                            route_label="FARMCPU",
+                        )
             if bool(strict_trait_meta_ready) and len(trait_names_seq) > 0:
                 gwas_meta_window_mb = int(
                     max(
@@ -11374,6 +11667,8 @@ def _run_gwas_pipeline(
                 )
                 for trait_idx_use, trait_name_use in enumerate(trait_names_seq):
                     trait_meta_single: Union[dict[str, object], None] = None
+                    fused_qc_load_single = False
+                    fused_qc_sample_indices_single: Union[np.ndarray, None] = None
                     emit_trait_header_now = bool(emit_farmcpu_trait_header)
                     trait_summary_start = len(gwas_summary_rows)
                     sample_idx_meta = None
@@ -11401,6 +11696,27 @@ def _run_gwas_pipeline(
                     except Exception:
                         sample_idx_meta = None
                     if sample_idx_meta is not None and int(sample_idx_meta.shape[0]) > 0:
+                        fused_qc_load_single = bool(
+                            strict_prefix_meta is not None
+                            and _packed_model_fused_qc_eligible(
+                                model_token="farmcpu",
+                                route_name="farmcpu",
+                                genetic_model=str(args.model),
+                                row_stat_mode=gwas_row_stat_mode,
+                                bed_prefix=str(strict_prefix_meta),
+                                packed_preload_ready=bool(
+                                    packed_preload_is_ready(preloaded_packed)
+                                    or packed_preload_is_ready(qtn_preloaded_packed)
+                                ),
+                                fused_binding_available=hasattr(
+                                    jxrs, "prepare_bed_fused_qc_packed"
+                                ),
+                                memory_budget_mb=getattr(args, "_memory_mb", None),
+                                snps_only=bool(args.snps_only),
+                            )
+                        )
+                        if fused_qc_load_single:
+                            fused_qc_sample_indices_single = sample_idx_meta
                         if emit_trait_header_now:
                             _emit_trait_header(
                                 logger,
@@ -11411,40 +11727,41 @@ def _run_gwas_pipeline(
                                 width=60,
                             )
                             emit_trait_header_now = False
-                        with CliStatus(
-                            "Computing trait-subset row statistics...",
-                            enabled=bool(use_spinner),
-                            use_process=True,
-                        ) as task:
-                            try:
-                                trait_meta_single = _gwas_logic_meta_selected_cached(
-                                    str(strict_prefix_meta),
-                                    sample_indices=sample_idx_meta,
-                                    maf_threshold=float(maf_threshold_scan),
-                                    max_missing_rate=float(max_missing_rate_scan),
-                                    het_threshold=float(het_threshold_scan),
-                                    snps_only=bool(args.snps_only),
-                                    mmap_window_mb=int(gwas_meta_window_mb),
-                                    outprefix=str(outprefix),
-                                    logger=logger,
-                                    threads=int(args.thread),
-                                    use_cache=False,
+                        if not fused_qc_load_single:
+                            with CliStatus(
+                                "Computing trait-subset row statistics...",
+                                enabled=bool(use_spinner),
+                                use_process=True,
+                            ) as task:
+                                try:
+                                    trait_meta_single = _gwas_logic_meta_selected_cached(
+                                        str(strict_prefix_meta),
+                                        sample_indices=sample_idx_meta,
+                                        maf_threshold=float(maf_threshold_scan),
+                                        max_missing_rate=float(max_missing_rate_scan),
+                                        het_threshold=float(het_threshold_scan),
+                                        snps_only=bool(args.snps_only),
+                                        mmap_window_mb=int(gwas_meta_window_mb),
+                                        outprefix=str(outprefix),
+                                        logger=logger,
+                                        threads=int(args.thread),
+                                        use_cache=False,
+                                    )
+                                except Exception:
+                                    task.fail(
+                                        "Computing trait-subset row statistics ...Failed"
+                                    )
+                                    raise
+                                task.complete(
+                                    "Computing trait-subset row statistics ...Finished"
                                 )
-                            except Exception:
-                                task.fail(
-                                    "Computing trait-subset row statistics ...Failed"
-                                )
-                                raise
-                            task.complete(
-                                "Computing trait-subset row statistics ...Finished"
+                            trait_meta_single = _filter_trait_prepared_meta_by_bimranges(
+                                trait_meta_single,
+                                prefix=str(strict_prefix_meta),
+                                bimranges=scan_bimranges,
+                                logger=logger,
+                                route_label="FARMCPU",
                             )
-                        trait_meta_single = _filter_trait_prepared_meta_by_bimranges(
-                            trait_meta_single,
-                            prefix=str(strict_prefix_meta),
-                            bimranges=scan_bimranges,
-                            logger=logger,
-                            route_label="FARMCPU",
-                        )
                     farmcpu_cache_runtime = _force_farmcpu_trait_prepared_deferred_load(
                         farmcpu_cache_runtime,
                     )
@@ -11468,6 +11785,8 @@ def _run_gwas_pipeline(
                         preloaded_packed=preloaded_packed,
                         qtn_preloaded_packed=qtn_preloaded_packed,
                         trait_prepared_meta=trait_meta_single,
+                        fused_qc_load=bool(fused_qc_load_single),
+                        fused_qc_sample_indices=fused_qc_sample_indices_single,
                     )
                     _emit_gwas_trait_summary(
                         logger,
@@ -11476,7 +11795,7 @@ def _run_gwas_pipeline(
                     if trait_idx_use < (len(trait_names_seq) - 1):
                         logger.info("")
             else:
-                if global_trait_meta_single is not None:
+                if global_trait_meta_single is not None or bool(global_fused_qc_load):
                     farmcpu_cache_runtime = _force_farmcpu_trait_prepared_deferred_load(
                         farmcpu_cache_runtime,
                     )
@@ -11503,6 +11822,8 @@ def _run_gwas_pipeline(
                         preloaded_packed=preloaded_packed,
                         qtn_preloaded_packed=qtn_preloaded_packed,
                         trait_prepared_meta=global_trait_meta_single,
+                        fused_qc_load=bool(global_fused_qc_load),
+                        fused_qc_sample_indices=None,
                     )
                     _emit_gwas_trait_summary(
                         logger,

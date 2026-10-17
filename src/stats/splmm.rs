@@ -5128,7 +5128,7 @@ where
             )
             .map_err(|e| format!("format k-file SparseLMM result: {e}"))?;
         }
-        writer.send(text_buf.as_bytes().to_vec())?;
+        writer.send_text(&mut text_buf)?;
         rows_written = rows_written.saturating_add(rows_here);
         Ok(())
     };

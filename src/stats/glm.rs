@@ -4265,7 +4265,7 @@ pub fn lm_block_assoc_packed_to_tsv<'py>(
                 )
                 .expect("LM packed TSV formatting should be length-consistent");
                 writer
-                    .send(std::mem::take(&mut text_buf).into_bytes())
+                    .send_text(&mut text_buf)
                     .expect("lm block tsv writer send");
                 kept_total += rows;
 
@@ -4463,7 +4463,7 @@ pub fn lm_assoc_kfile_to_tsv_f32<'py>(
                 );
             }
             writer
-                .send(text.as_bytes().to_vec())
+                .send_text(&mut text)
                 .map_err(|error| error.to_string())?;
             text.clear();
             done = row_start.saturating_add(rows);

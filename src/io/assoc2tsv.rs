@@ -759,7 +759,7 @@ pub(crate) fn send_text_buf(writer: &AsyncTsvWriter, text_buf: &mut String) -> R
     if text_buf.is_empty() {
         return Ok(());
     }
-    writer.send(std::mem::take(text_buf).into_bytes())
+    writer.send_text(text_buf)
 }
 
 #[pyclass]

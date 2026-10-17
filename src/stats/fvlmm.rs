@@ -3360,7 +3360,7 @@ pub fn fvlmm_assoc_kfile_to_tsv_f32<'py>(
                 )
                 .map_err(|e| format!("format k-file FvLMM result: {e}"))?;
             }
-            writer.send(text_buf.as_bytes().to_vec())?;
+            writer.send_text(&mut text_buf)?;
             done = row_start.saturating_add(rows);
             if let Some(cb) = progress_cb.as_ref() {
                 if done >= next_progress || done >= marker_count {

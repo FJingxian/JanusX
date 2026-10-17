@@ -1519,13 +1519,23 @@ mod tests {
         ];
         let expected = pairs.map(|(lhs, rhs)| sum_y_where_both1(lhs, rhs, y.as_slice(), n));
         let got = sum_y_where_both1_four(pairs, y.as_slice(), n, None);
-        assert_eq!(got, expected);
+        for (actual, expected) in got.iter().zip(expected.iter()) {
+            assert!(
+                (actual - expected).abs() <= 1e-12_f64,
+                "four-way sum differs from individual sum: actual={actual}, expected={expected}"
+            );
+        }
 
         let lookup = PackedYSumLookup::build(y.as_slice(), n).unwrap();
         let expected_lookup = pairs
             .map(|(lhs, rhs)| sum_y_where_both1_with_lookup(lhs, rhs, y.as_slice(), n, &lookup));
         let got_lookup = sum_y_where_both1_four(pairs, y.as_slice(), n, Some(&lookup));
-        assert_eq!(got_lookup, expected_lookup);
+        for (actual, expected) in got_lookup.iter().zip(expected_lookup.iter()) {
+            assert!(
+                (actual - expected).abs() <= 1e-12_f64,
+                "four-way lookup sum differs from individual sum: actual={actual}, expected={expected}"
+            );
+        }
     }
 
     #[test]

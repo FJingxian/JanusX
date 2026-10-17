@@ -35,6 +35,7 @@ webapp/media/
 # Rust build artifacts
 target
 *.lock
+!Cargo.lock
 *.pyd
 
 # External binaries

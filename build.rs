@@ -253,6 +253,70 @@ fn maybe_link_blas_family_from_dir(lib_dir_s: &str, source_label: &str) {
     }
 }
 
+fn python_prefix_from_executable(raw: &str) -> Option<PathBuf> {
+    let executable = Path::new(raw);
+    let bin_dir = executable.parent()?;
+    let dir_name = bin_dir.file_name()?.to_string_lossy().to_ascii_lowercase();
+    if matches!(dir_name.as_str(), "bin" | "scripts") {
+        Some(bin_dir.parent()?.to_path_buf())
+    } else {
+        // Windows conda Python is commonly <prefix>/python.exe, while venv
+        // Python can be <prefix>/Scripts/python.exe.
+        Some(bin_dir.to_path_buf())
+    }
+}
+
+fn configure_openblas_from_python_env() -> bool {
+    for variable in ["PYO3_PYTHON", "PYTHON_SYS_EXECUTABLE"] {
+        let Some(raw) = env_value(variable) else {
+            continue;
+        };
+        let Some(prefix) = python_prefix_from_executable(&raw) else {
+            continue;
+        };
+        let lib_dir = prefix.join("lib");
+        let lib_dir_s = lib_dir.to_string_lossy().to_string();
+        if configure_openblas_from_dir(&lib_dir_s, variable) {
+            let include_dir = prefix.join("include");
+            if include_dir.exists() {
+                println!("cargo:include={}", include_dir.to_string_lossy());
+            }
+            return true;
+        }
+    }
+    false
+}
+
+fn build_python_prefixes() -> Vec<PathBuf> {
+    let mut prefixes = Vec::<PathBuf>::new();
+    for variable in ["PYO3_PYTHON", "PYTHON_SYS_EXECUTABLE"] {
+        let Some(raw) = env_value(variable) else {
+            continue;
+        };
+        let Some(prefix) = python_prefix_from_executable(&raw) else {
+            continue;
+        };
+        let resolved = fs::canonicalize(&prefix).unwrap_or(prefix);
+        if !prefixes.iter().any(|candidate| candidate == &resolved) {
+            prefixes.push(resolved);
+        }
+    }
+    prefixes
+}
+
+fn conda_prefix_matches_build_python(prefix: &Path) -> bool {
+    let python_prefixes = build_python_prefixes();
+    if python_prefixes.is_empty() {
+        // Plain Cargo/conda builds may not have a PyO3 interpreter variable;
+        // in that case CONDA_PREFIX is the only available build environment.
+        return true;
+    }
+    let resolved = fs::canonicalize(prefix).unwrap_or_else(|_| prefix.to_path_buf());
+    python_prefixes
+        .iter()
+        .any(|candidate| candidate == &resolved)
+}
+
 fn resolve_kmc_source_dir() -> PathBuf {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
     if let Some(raw) = env_value("JANUSX_KMC_SRC") {
@@ -811,7 +875,6 @@ fn linux_openmp_runtime_artifacts(
 
 fn windows_runtime_probe_dirs(compiler: &Path) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
-    out.extend(path_env_dirs(&["PATH"]));
     if let Some(dir) = env::var_os("JANUSX_FASTTREE_OPENMP_LIB_DIR").map(PathBuf::from) {
         if dir.is_dir() {
             out.push(dir);
@@ -829,7 +892,24 @@ fn windows_runtime_probe_dirs(compiler: &Path) -> Vec<PathBuf> {
             }
         }
     }
-    if let Some(conda_prefix) = env::var_os("CONDA_PREFIX").map(PathBuf::from) {
+    for variable in ["PYO3_PYTHON", "PYTHON_SYS_EXECUTABLE"] {
+        let Some(raw) = env_value(variable) else {
+            continue;
+        };
+        let Some(prefix) = python_prefix_from_executable(&raw) else {
+            continue;
+        };
+        out.extend([
+            prefix.join("Library").join("bin"),
+            prefix.join("Library").join("lib"),
+            prefix.join("DLLs"),
+            prefix.join("bin"),
+        ]);
+    }
+    if let Some(conda_prefix) = env::var_os("CONDA_PREFIX")
+        .map(PathBuf::from)
+        .filter(|prefix| conda_prefix_matches_build_python(prefix))
+    {
         out.push(conda_prefix.join("Library").join("bin"));
         out.push(conda_prefix.join("Library").join("lib"));
         out.push(conda_prefix.join("bin"));
@@ -840,20 +920,20 @@ fn windows_runtime_probe_dirs(compiler: &Path) -> Vec<PathBuf> {
         out.push(parent.join("..").join("bin"));
         out.push(parent.join("..").join("lib"));
     }
+    // Search the general PATH only after explicit and interpreter-matched
+    // runtime directories; PATH can still contain another Conda environment.
+    out.extend(path_env_dirs(&["PATH"]));
     out.into_iter().filter(|p| p.is_dir()).collect()
 }
 
 fn windows_find_runtime_by_name(name: &str, probe_dirs: &[PathBuf]) -> Option<PathBuf> {
-    if let Some(path) = find_command_on_path(name) {
-        return Some(path);
-    }
     for dir in probe_dirs {
         let cand = dir.join(name);
         if cand.is_file() {
             return Some(cand);
         }
     }
-    None
+    find_command_on_path(name)
 }
 
 fn windows_openmp_runtime_artifacts(
@@ -929,7 +1009,27 @@ fn macos_openmp_paths() -> Option<(PathBuf, PathBuf, PathBuf)> {
 
     let mut include_dirs: Vec<PathBuf> = Vec::new();
     let mut lib_dirs: Vec<PathBuf> = Vec::new();
-    if let Some(conda_prefix) = env::var_os("CONDA_PREFIX").map(PathBuf::from) {
+    // PYO3_PYTHON / PYTHON_SYS_EXECUTABLE identify the interpreter used by
+    // this build. Prefer its OpenMP runtime before consulting a potentially
+    // stale CONDA_PREFIX or system Homebrew paths.
+    for variable in ["PYO3_PYTHON", "PYTHON_SYS_EXECUTABLE"] {
+        let Some(raw) = env_value(variable) else {
+            continue;
+        };
+        let Some(prefix) = python_prefix_from_executable(&raw) else {
+            continue;
+        };
+        if let Some(p) = existing_dir(prefix.join("include")) {
+            include_dirs.push(p);
+        }
+        if let Some(p) = existing_dir(prefix.join("lib")) {
+            lib_dirs.push(p);
+        }
+    }
+    if let Some(conda_prefix) = env::var_os("CONDA_PREFIX")
+        .map(PathBuf::from)
+        .filter(|prefix| conda_prefix_matches_build_python(prefix))
+    {
         if let Some(p) = existing_dir(conda_prefix.join("include")) {
             include_dirs.push(p);
         }
@@ -1029,7 +1129,31 @@ fn compile_fasttree_executable() {
     clear_dir_files(&final_dir);
 
     let mut build = cc::Build::new();
-    build.file(&src_path).warnings(false);
+    // FastTree is linked as a standalone executable, so Python-extension Rust
+    // linker flags such as `-undefined dynamic_lookup` must not leak into its
+    // native C linker invocation.
+    build
+        .file(&src_path)
+        .warnings(false)
+        .inherit_rustflags(false);
+    let configured_compiler = build.try_get_compiler().ok();
+    let is_conda_darwin20_clang = configured_compiler.as_ref().is_some_and(|tool| {
+        let name = tool
+            .path()
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("");
+        name.contains("apple-darwin20.0.0-clang")
+            && env::var_os("CONDA_PREFIX")
+                .map(PathBuf::from)
+                .is_some_and(|prefix| conda_prefix_matches_build_python(&prefix))
+    });
+    if target_os == "macos" && is_conda_darwin20_clang && Path::new("/usr/bin/clang").is_file() {
+        println!(
+            "cargo:warning=FastTree: Conda's darwin20 clang may not support the active macOS SDK; using Apple Clang for the bundled executable."
+        );
+        build.compiler("/usr/bin/clang");
+    }
     let compiler_opt = build.try_get_compiler().ok();
     let use_compiler_tool = compiler_opt
         .as_ref()
@@ -1210,8 +1334,8 @@ fn compile_fasttree_executable() {
                         _ => {}
                     }
                 } else {
-                    emit_command_output("fasttree-build-openmp", &out);
                     if openmp_mode == FastTreeOpenMpMode::Required {
+                        emit_command_output("fasttree-build-openmp", &out);
                         panic!(
                             "FastTree OpenMP compilation failed with status {}",
                             out.status
@@ -1238,8 +1362,52 @@ fn compile_fasttree_executable() {
             .output()
             .unwrap_or_else(|e| panic!("failed to start FastTree compiler: {e}"));
         if !out.status.success() {
-            emit_command_output("fasttree-build", &out);
-            panic!("FastTree compilation failed with status {}", out.status);
+            // Conda's macOS clang toolchains can lag behind the active Apple
+            // SDK's .tbd format. If that compiler cannot link the standalone
+            // FastTree executable, retry with the system Apple Clang, which
+            // uses the same SDK but understands its current symbol stubs.
+            let apple_clang = Path::new("/usr/bin/clang");
+            if target_os == "macos" && compiler_path != apple_clang && apple_clang.is_file() {
+                println!(
+                    "cargo:warning=Configured C compiler failed to link FastTree; retrying with Apple Clang at {}.",
+                    apple_clang.display()
+                );
+                let mut fallback = Command::new(apple_clang);
+                fallback
+                    .current_dir(&manifest_dir)
+                    .arg("-O3")
+                    .arg("-std=c99")
+                    .arg("-finline-functions")
+                    .arg("-funroll-loops")
+                    .arg("-o")
+                    .arg(temp_exe.as_os_str());
+                if native_tuning {
+                    match target_arch.as_str() {
+                        "x86" | "x86_64" => {
+                            fallback.arg("-march=native").arg("-mtune=native");
+                        }
+                        "arm" | "aarch64" => {
+                            fallback.arg("-mcpu=native");
+                        }
+                        _ => {}
+                    }
+                }
+                let fallback_out = fallback
+                    .arg(src_path.as_os_str())
+                    .arg("-lm")
+                    .output()
+                    .unwrap_or_else(|e| panic!("failed to start Apple Clang for FastTree: {e}"));
+                if !fallback_out.status.success() {
+                    emit_command_output("fasttree-build", &out);
+                    emit_command_output("fasttree-build-apple-clang", &fallback_out);
+                    panic!(
+                        "FastTree compilation failed with configured compiler ({}) and Apple Clang ({})",
+                        out.status, fallback_out.status
+                    );
+                }
+            } else {
+                panic!("FastTree compilation failed with status {}", out.status);
+            }
         }
     }
 
@@ -1441,13 +1609,19 @@ fn main() {
     println!("cargo:rerun-if-env-changed=BLAS_LIB_DIR");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
     println!("cargo:rerun-if-env-changed=CONDA_PREFIX");
+    println!("cargo:rerun-if-env-changed=PYO3_PYTHON");
+    println!("cargo:rerun-if-env-changed=PYTHON_SYS_EXECUTABLE");
     println!("cargo:rerun-if-env-changed=LIBRARY_LIB");
     println!("cargo:rerun-if-env-changed=LIBRARY_PREFIX");
     println!("cargo:rerun-if-env-changed=JANUSX_LINK_BLAS_FAMILY");
+    println!("cargo:rerun-if-env-changed=JANUSX_ALLOW_RUST_BLAS_FALLBACK");
     println!("cargo:rerun-if-env-changed=JANUSX_FORCE_OPENBLAS_LAPACK");
     println!("cargo:rerun-if-env-changed=JANUSX_DISABLE_OPENBLAS_LAPACK");
     println!("cargo:rerun-if-env-changed=JANUSX_MACOS_PREFER_ACCELERATE");
-    let require_openblas = env_flag("JANUSX_REQUIRE_OPENBLAS");
+    let openblas_feature_enabled = env::var_os("CARGO_FEATURE_BLAS_OPENBLAS").is_some();
+    let allow_rust_fallback = env_flag("JANUSX_ALLOW_RUST_BLAS_FALLBACK");
+    let require_openblas = env_flag("JANUSX_REQUIRE_OPENBLAS")
+        || (cfg!(target_os = "linux") && openblas_feature_enabled && !allow_rust_fallback);
 
     // Only probe OpenBLAS when user explicitly enabled the feature.
     if env::var_os("CARGO_FEATURE_BLAS_OPENBLAS").is_none() {
@@ -1508,11 +1682,20 @@ Enable default features or pass --features blas-openblas."
         }
     }
 
+    // Prefer the Python interpreter selected by maturin/PyO3 before consulting
+    // CONDA_PREFIX, which a caller can inherit from a different environment.
+    if configure_openblas_from_python_env() {
+        return;
+    }
+
     // Conda environments may provide OpenBLAS without pkg-config metadata.
     // On Windows, libraries are usually in %CONDA_PREFIX%/Library/lib.
-    if let Some(conda_prefix) = env::var_os("CONDA_PREFIX") {
+    if let Some(conda_prefix) = env::var_os("CONDA_PREFIX")
+        .map(PathBuf::from)
+        .filter(|prefix| conda_prefix_matches_build_python(prefix))
+    {
         let mut candidates: Vec<(String, String)> = Vec::new();
-        let p = Path::new(&conda_prefix);
+        let p = conda_prefix.as_path();
         candidates.push((
             p.join("lib").to_string_lossy().to_string(),
             "CONDA_PREFIX/lib".to_string(),

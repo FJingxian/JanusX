@@ -954,12 +954,8 @@ fn inspect_plink_bed_shape_local(
 
 #[inline]
 fn splmm_model_key(gm: PackedGeneticModel) -> &'static str {
-    match gm {
-        PackedGeneticModel::Add => "add",
-        PackedGeneticModel::Dom => "dom",
-        PackedGeneticModel::Rec => "rec",
-        PackedGeneticModel::Het => "het",
-    }
+    let _ = gm;
+    "add"
 }
 
 #[inline]
@@ -6313,21 +6309,23 @@ fn splmm_fused_approx_assoc_to_tsv(
     };
     let decode_plan = AdditiveDecodePlan::from_sample_indices(n_samples_full, &scan_sample_idx);
     let scan_prepare_secs = scan_prepare_t0.elapsed().as_secs_f64();
-    eprintln!(
-        "SparseLMM fused approx gamma: gamma={:.9e}, requested={}, used={}, static={}, candidates={}, QC-valid={}, attempts={}, branch={}",
-        gamma_info.gamma,
-        gamma_info.n_requested,
-        gamma_info.n_used,
-        gamma_info.n_static,
-        gamma_info.n_candidates,
-        gamma_info.n_qc_valid,
-        gamma_info.n_attempts,
-        if gamma_info.n_used >= 100 {
-            "null-filtered"
-        } else {
-            "all-valid-residualized"
-        },
-    );
+    if env_truthy("JX_SPLMM_APPROX_GAMMA_DEBUG") {
+        eprintln!(
+            "SparseLMM fused approx gamma: gamma={:.9e}, requested={}, used={}, static={}, candidates={}, QC-valid={}, attempts={}, branch={}",
+            gamma_info.gamma,
+            gamma_info.n_requested,
+            gamma_info.n_used,
+            gamma_info.n_static,
+            gamma_info.n_candidates,
+            gamma_info.n_qc_valid,
+            gamma_info.n_attempts,
+            if gamma_info.n_used >= 100 {
+                "null-filtered"
+            } else {
+                "all-valid-residualized"
+            },
+        );
+    }
     emit_progress_callback(
         stage1_progress_callback.as_ref(),
         8,
@@ -9673,7 +9671,7 @@ mod tests {
         let y_vec = vec![0.5_f64, -1.0_f64, 1.25_f64];
         let analysis = make_diag_analysis(&[1.0_f64, 2.0_f64, 4.0_f64]);
         let lambda = 0.75_f64;
-        let sigma2_scale = 1.8_f64;
+        let sigma2_scale = 2.0_f64;
         let factor_lambda = analysis.factorize_k_plus_lambda_i(lambda).unwrap();
         let factor_scaled = analysis
             .factorize_sigma_g2_k_plus_sigma_e2_i(sigma2_scale, lambda * sigma2_scale)

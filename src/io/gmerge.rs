@@ -1894,16 +1894,15 @@ pub fn convert_genotypes(
             "het must be within [0, 1.0]",
         ));
     }
-    let model_key = model.trim().to_ascii_lowercase();
-    if !matches!(model_key.as_str(), "add" | "dom" | "rec" | "het") {
+    if !model.trim().eq_ignore_ascii_case("add") {
         return Err(pyo3::exceptions::PyValueError::new_err(
-            "model must be one of: add, dom, rec, het",
+            "model must be 'add'; non-additive genotype coding is unsupported",
         ));
     }
-    let apply_het_filter = model_key != "add";
     let maf_f32 = maf as f32;
     let geno_f32 = geno as f32;
     let het_f32 = het as f32;
+    let apply_het_filter = het_f32 < 1.0_f32;
 
     let fmt = infer_out_fmt(&out, out_fmt.as_deref().unwrap_or("auto"))
         .map_err(pyo3::exceptions::PyValueError::new_err)?;

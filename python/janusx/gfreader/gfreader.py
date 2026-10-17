@@ -68,6 +68,13 @@ _GENO_CACHE_ENV = "JANUSX_CACHE_DIR"
 _WARNED_CACHE_FALLBACK_KEYS: set[str] = set()
 
 
+def _validate_additive_model(model: str) -> None:
+    if str(model).strip().lower() != "add":
+        raise ValueError(
+            "model must be 'add'; non-additive genotype coding is unsupported"
+        )
+
+
 def _expanduser_unambiguous(path: Union[str, os.PathLike[str]]) -> str:
     """
     Expand only true home-directory syntax:
@@ -1533,6 +1540,7 @@ def bed_chunk_reader(
       - keep the source BED dosage/allele orientation instead of applying
         prediction-cohort MAF flipping. Intended for loaded-model inference.
     """
+    _validate_additive_model(model)
     global _WARNED_BED_MODEL_FALLBACK
     base_kwargs = dict(
         prefix=prefix,
@@ -1670,9 +1678,7 @@ def _process_txt_like_chunk(
     if g.ndim != 2 or g.shape[0] == 0:
         return np.empty((0, g.shape[1] if g.ndim == 2 else 0), dtype=np.float32), []
 
-    model_key = str(model).lower()
-    if model_key not in {"add", "dom", "rec", "het"}:
-        raise ValueError("model must be one of: add, dom, rec, het")
+    _validate_additive_model(model)
     if not (0.0 <= float(het) <= 1.0):
         raise ValueError("het must be within [0, 1.0]")
 
@@ -1827,9 +1833,8 @@ def load_genotype_chunks(
         Whether to mean-impute missing genotypes.
         If False, missing values remain negative (e.g. -9).
 
-    model : {"add", "dom", "rec", "het"}
-        Genetic effect model flag used for output coding in specialized readers.
-        Variant QC thresholds are applied independently of this choice.
+    model : {"add"}
+        Genetic effect coding. Only additive dosage coding is supported.
 
     het : float
         Maximum allowed heterozygosity rate per SNP.
@@ -1882,6 +1887,7 @@ def load_genotype_chunks(
     ...     print(geno.shape)          # (m_chunk, n_samples)
     ...     print(sites[0].chrom, sites[0].pos)
     """
+    _validate_additive_model(model)
     chunk_size = int(chunk_size)
     kind, prefix, src_path = _resolve_input(path_or_prefix, force_kind=force_kind)
     # 1) Resolve caches and dispatch

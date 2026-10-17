@@ -6,7 +6,7 @@ Supported models
 ----------------
   - BLUP   : Auto-dispatch between additive GBLUP and rrBLUP by n/m regime
   - GBLUP  : Genomic Best Linear Unbiased Prediction.
-             Kernels: additive(a), dominance(d), additive+dominance(ad)
+             Kernel: additive(a)
   - rrBLUP : Ridge regression BLUP (rrBLUP, kinship = None)
   - BayesA : Bayesian marker effect model (via pyBLUP.bayes)
   - BayesB : Bayesian variable selection model (via pyBLUP.bayes)
@@ -135,15 +135,6 @@ from janusx.pyBLUP.ml import (
     _XGBOOST_IMPORT_STATUS,
     threadpool_limits as _ml_threadpool_limits,
 )
-try:
-    from janusx.pyBLUP.blup import BLUP as KernelBLUP, Gmatrix
-    _HAS_ADBLUP_PY = True
-    _ADBLUP_PY_IMPORT_ERROR: Exception | None = None
-except Exception as _adblup_py_exc:
-    KernelBLUP = None  # type: ignore[assignment]
-    Gmatrix = None  # type: ignore[assignment]
-    _HAS_ADBLUP_PY = False
-    _ADBLUP_PY_IMPORT_ERROR = _adblup_py_exc
 from janusx.script._common.log import setup_logging
 from janusx.script._common.config_render import emit_cli_configuration
 from janusx.script._common.cli_args import (
@@ -823,7 +814,7 @@ class _SharedGblupFullGrmCache:
 _GBLUP_METHOD_ADD = "GBLUP"
 _GBLUP_METHOD_DOM = "GBLUP_D"
 _GBLUP_METHOD_AD = "GBLUP_AD"
-_GBLUP_METHOD_SET = {_GBLUP_METHOD_ADD, _GBLUP_METHOD_DOM, _GBLUP_METHOD_AD}
+_GBLUP_METHOD_SET = {_GBLUP_METHOD_ADD}
 
 
 def _default_rrblup_he_thread_policy() -> str:
@@ -1539,71 +1530,6 @@ def _should_promote_bayes_resident_packed(
     return bool(estimate["promote_resident"])
 
 
-def _packed_ctx_dom_af(packed_ctx: dict[str, typing.Any]) -> np.ndarray:
-    dom_raw = packed_ctx.get("dom_af", packed_ctx.get("het_rate", None))
-    if dom_raw is None:
-        source_prefix = str(packed_ctx.get("source_prefix", "") or "").strip()
-        if source_prefix == "":
-            raise ValueError(
-                "Packed context is missing dominance AF metadata (`dom_af`) "
-                "and does not carry a source PLINK prefix for on-demand rebuild."
-            )
-        try:
-            from janusx.gfreader import scan_bed_2bit_packed_stats as _scan_bed_2bit_packed_stats
-        except Exception:
-            _scan_bed_2bit_packed_stats = None  # type: ignore[assignment]
-        try:
-            from janusx.script._common.genoio import _scan_bed_2bit_packed_stats_fallback
-        except Exception as ex:
-            raise RuntimeError(
-                "Dominance packed metadata rebuild is unavailable: missing both "
-                "Rust `scan_bed_2bit_packed_stats` and Python fallback helpers."
-            ) from ex
-
-        n_expected = int(packed_ctx.get("n_samples", 0) or 0)
-        if _scan_bed_2bit_packed_stats is not None:
-            _miss_raw, _maf_raw, _std_raw, _row_flip_raw, het_raw, packed_n = _scan_bed_2bit_packed_stats(
-                str(source_prefix)
-            )
-        else:
-            _miss_raw, _maf_raw, _std_raw, _row_flip_raw, het_raw, packed_n = _scan_bed_2bit_packed_stats_fallback(
-                str(source_prefix),
-                n_expected_samples=int(max(1, n_expected)),
-            )
-        if n_expected > 0 and int(packed_n) != int(n_expected):
-            raise ValueError(
-                "Dominance packed metadata sample count mismatch: "
-                f"expected={int(n_expected)}, got={int(packed_n)}."
-            )
-        dom_full = np.ascontiguousarray(
-            np.asarray(het_raw, dtype=np.float32).reshape(-1),
-            dtype=np.float32,
-        )
-        active_row_idx = _packed_ctx_active_row_idx(packed_ctx)
-        if int(dom_full.shape[0]) == int(active_row_idx.shape[0]):
-            dom_cached = dom_full
-        else:
-            active_max = int(np.max(active_row_idx)) if int(active_row_idx.shape[0]) > 0 else -1
-            if active_max >= int(dom_full.shape[0]):
-                raise ValueError(
-                    "Dominance packed metadata row count is inconsistent with active_row_idx."
-                )
-            dom_cached = np.ascontiguousarray(dom_full[active_row_idx], dtype=np.float32)
-        packed_ctx["dom_af"] = dom_cached
-        dom_raw = dom_cached
-    dom_full = np.ascontiguousarray(
-        np.asarray(dom_raw, dtype=np.float32).reshape(-1),
-        dtype=np.float32,
-    )
-    active_row_idx = _packed_ctx_active_row_idx(packed_ctx)
-    return _packed_ctx_select_active_metadata(
-        dom_full,
-        active_row_idx,
-        dtype=np.float32,
-        name="dom_af",
-    )
-
-
 def _packed_ctx_is_lazy_full(packed_ctx: dict[str, typing.Any]) -> bool:
     return str(packed_ctx.get("packed_filter_mode", "")).strip().lower() == "lazy_full"
 
@@ -1694,10 +1620,8 @@ def _select_loaded_model_packed_context(
     empty zero vector whenever no dense matrix was available.
 
     Other model kinds still require their existing resident/dense route.  ML
-    states are not metadata-streamable.  Additive GBLUP projection states use
-    the same raw marker decoder as linear effects; dominance/AD projections
-    are kept on this path only so the predictor can fail explicitly instead
-    of silently returning an empty vector.
+    states are not metadata-streamable. Additive GBLUP projection states use
+    the same raw marker decoder as linear effects.
     """
     if packed_ctx is None:
         return None
@@ -1710,7 +1634,6 @@ def _select_loaded_model_packed_context(
         "rrblup_linear",
         "bayes_linear",
         "gblup_kernel_projection",
-        "gblup_kernel_projection_ad",
     }:
         return packed_ctx
     return None
@@ -1828,19 +1751,14 @@ def _is_gblup_method(method: str) -> bool:
 
 
 def _gblup_method_kernel_mode(method: str) -> str:
-    m = str(method)
-    if m == _GBLUP_METHOD_DOM:
-        return "d"
-    if m == _GBLUP_METHOD_AD:
-        return "ad"
+    if not _is_gblup_method(str(method)):
+        raise ValueError(f"Unsupported GBLUP method: {method!r}")
     return "a"
 
 
 def _gblup_method_display(method: str) -> str:
-    mode = _gblup_method_kernel_mode(str(method))
-    if mode == "a":
-        return "GBLUP"
-    return f"GBLUP({mode})"
+    _gblup_method_kernel_mode(str(method))
+    return "GBLUP"
 
 
 def _method_display_name(method: str) -> str:
@@ -1856,10 +1774,8 @@ def _method_display_name(method: str) -> str:
 
 def _gblup_mode_label(mode: str) -> str:
     m = str(mode).strip().lower()
-    if m == "d":
-        return "dominance"
-    if m == "ad":
-        return "additive+dominance"
+    if m not in {"a", "add", "additive"}:
+        raise ValueError(f"Unsupported non-additive GBLUP kernel mode: {mode!r}")
     return "additive"
 
 
@@ -1966,18 +1882,8 @@ def _select_top_method_for_trait(
     return best_method, scores
 
 
-def _methods_need_additive_dense(methods: list[str]) -> bool:
-    return any(
-        _is_gblup_method(str(m)) and (_gblup_method_kernel_mode(str(m)) in {"d", "ad"})
-        for m in methods
-    )
-
-
 def _methods_need_raw_additive_dense(methods: list[str]) -> bool:
-    return bool(
-        _methods_need_additive_dense(methods)
-        or any(_is_blup_method(str(m)) for m in methods)
-    )
+    return any(_is_blup_method(str(m)) for m in methods)
 
 
 def _methods_need_rrblup_standardization(methods: list[str]) -> bool:
@@ -2609,7 +2515,7 @@ def _infer_effect_kind_from_state(
         return explicit
     if kind in {"rrblup_linear", "bayes_linear"}:
         return "signed_beta"
-    if kind in {"gblup_kernel_projection", "gblup_kernel_projection_ad"}:
+    if kind == "gblup_kernel_projection":
         return "kernel_projection"
     if _is_gblup_method(method):
         return "kernel_projection"
@@ -5415,34 +5321,16 @@ def _resolve_train_pred_local_indices(
     return np.ascontiguousarray(picked, dtype=np.int64)
 
 
-def _dense_marker_matrix_for_gblup_kernel(
-    marker_by_sample: np.ndarray,
-    *,
-    kernel_mode: str,
-) -> np.ndarray:
-    mat = np.ascontiguousarray(
-        np.asarray(marker_by_sample, dtype=np.float32),
-        dtype=np.float32,
-    )
-    mode = str(kernel_mode).strip().lower()
-    if mode in {"d", "dom", "dominance"}:
-        return np.ascontiguousarray(mat == 1.0, dtype=np.float32)
-    return mat
-
-
 def _build_gblup_cv_grm_once(
     *,
     train_snp: np.ndarray | None,
     packed_ctx: dict[str, typing.Any] | None,
     train_sample_indices: np.ndarray | None,
     n_jobs: int,
-    kernel_mode: str = "a",
 ) -> np.ndarray | None:
     """
     Build one GRM for GBLUP-CV and reuse it by slicing in each fold.
     """
-    mode_norm = str(kernel_mode).strip().lower()
-    mode_is_dom = bool(mode_norm in {"d", "dom", "dominance"})
     if packed_ctx is not None:
         if train_sample_indices is None:
             raise ValueError("Packed GBLUP-CV requires train sample indices.")
@@ -5488,7 +5376,6 @@ def _build_gblup_cv_grm_once(
                     gblup_mmap_window_mb,
                 ) = _packed_gblup_stream_metadata(
                     packed_ctx,
-                    mode=mode_norm,
                     block_rows=int(block_cols),
                 )
                 sidx_arg = None if full_identity else sidx
@@ -5498,7 +5385,7 @@ def _build_gblup_cv_grm_once(
                     row_flip_arg,
                     row_maf_arg,
                     sample_indices=sidx_arg,
-                    method=(3 if mode_is_dom else 1),
+                    method=1,
                     block_cols=int(block_cols),
                     threads=max(1, int(n_jobs)),
                     progress_callback=None,
@@ -5514,10 +5401,7 @@ def _build_gblup_cv_grm_once(
     else:
         if train_snp is None:
             return None
-        train_marker = _dense_marker_matrix_for_gblup_kernel(
-            np.asarray(train_snp, dtype=np.float32),
-            kernel_mode=mode_norm,
-        )
+        train_marker = np.ascontiguousarray(np.asarray(train_snp, dtype=np.float32))
         grm = build_dense_grm_f64(
             train_marker,
             block_rows=4096,
@@ -5611,9 +5495,7 @@ def _build_gblup_kinship_blocks_once(
     train_sample_indices: np.ndarray | None,
     test_sample_indices: np.ndarray | None,
     n_jobs: int,
-    kernel_mode: str = "a",
 ) -> tuple[np.ndarray | None, np.ndarray | None]:
-    mode_norm = str(kernel_mode).strip().lower()
     if packed_ctx is not None:
         if train_sample_indices is None:
             raise ValueError("Packed GBLUP prebuild requires train sample indices.")
@@ -5635,7 +5517,6 @@ def _build_gblup_kinship_blocks_once(
                 packed_ctx=packed_ctx,
                 train_sample_indices=all_abs,
                 n_jobs=n_jobs,
-                kernel_mode=mode_norm,
             )
             if full_grm is None:
                 return None, None
@@ -5661,7 +5542,6 @@ def _build_gblup_kinship_blocks_once(
             packed_ctx=packed_ctx,
             train_sample_indices=train_abs,
             n_jobs=n_jobs,
-            kernel_mode=mode_norm,
         )
         return train_grm, None
 
@@ -5670,20 +5550,13 @@ def _build_gblup_kinship_blocks_once(
         packed_ctx=None,
         train_sample_indices=None,
         n_jobs=n_jobs,
-        kernel_mode=mode_norm,
     )
     if train_grm is None:
         return None, None
     test_train_grm = None
     if test_snp is not None and int(test_snp.shape[1]) > 0 and train_snp is not None:
-        train_marker = _dense_marker_matrix_for_gblup_kernel(
-            np.asarray(train_snp, dtype=np.float32),
-            kernel_mode=mode_norm,
-        )
-        test_marker = _dense_marker_matrix_for_gblup_kernel(
-            np.asarray(test_snp, dtype=np.float32),
-            kernel_mode=mode_norm,
-        )
+        train_marker = np.ascontiguousarray(np.asarray(train_snp, dtype=np.float32))
+        test_marker = np.ascontiguousarray(np.asarray(test_snp, dtype=np.float32))
         test_train_grm = _build_gblup_test_train_cross_from_markers(
             test_snp=test_marker,
             train_snp=train_marker,
@@ -6012,7 +5885,6 @@ def _build_shared_additive_gblup_full_grm_cache(
             packed_ctx=packed_ctx,
             train_sample_indices=sample_indices,
             n_jobs=max(1, int(n_jobs)),
-            kernel_mode="a",
         )
     else:
         grm_full = _build_gblup_cv_grm_once(
@@ -6020,7 +5892,6 @@ def _build_shared_additive_gblup_full_grm_cache(
             packed_ctx=None,
             train_sample_indices=None,
             n_jobs=max(1, int(n_jobs)),
-            kernel_mode="a",
         )
     if grm_full is None:
         raise RuntimeError("Shared additive GBLUP full-GRM build returned no result.")
@@ -6207,105 +6078,6 @@ def _fit_gblup_reml_from_grm(
     }
 
 
-def _fit_gblup_ad_reml_from_grms(
-    y: np.ndarray,
-    grm_add: np.ndarray,
-    grm_dom: np.ndarray,
-) -> dict[str, typing.Any]:
-    if (not _HAS_ADBLUP_PY) or KernelBLUP is None:
-        raise ImportError(
-            "GBLUP(ad) REML/GRM backend is unavailable. "
-            f"Original import error: {_ADBLUP_PY_IMPORT_ERROR}"
-        )
-
-    y_vec = np.asarray(y, dtype=np.float64).reshape(-1, 1)
-    ka = np.asarray(grm_add, dtype=np.float64)
-    kd = np.asarray(grm_dom, dtype=np.float64)
-    if ka.shape != kd.shape or ka.ndim != 2 or ka.shape[0] != ka.shape[1]:
-        raise ValueError(
-            f"GBLUP(ad) expects matching square kernels; got Ka={ka.shape}, Kd={kd.shape}."
-        )
-    if int(y_vec.shape[0]) != int(ka.shape[0]):
-        raise ValueError(
-            f"GBLUP(ad) fit expects y and kernels with matching n. got y={y_vec.shape}, Ka={ka.shape}."
-        )
-
-    n = int(y_vec.shape[0])
-    if n == 0:
-        raise ValueError("GBLUP(ad) fit received empty training set.")
-    if n <= 1:
-        beta0 = float(y_vec[0, 0]) if n == 1 else 0.0
-        return {
-            "model": None,
-            "beta": float(beta0),
-            "vinvr": np.zeros((n,), dtype=np.float64),
-            "g_theta": np.ones((2,), dtype=np.float64),
-            "g_scales": np.ones((2,), dtype=np.float64),
-            "pve": float("nan"),
-            "lambda_reml": float("nan"),
-            "sigma_a2": float("nan"),
-            "sigma_d2": float("nan"),
-            "sigma_e2": float("nan"),
-        }
-
-    ka_fit = np.ascontiguousarray(0.5 * (ka + ka.T), dtype=np.float64)
-    kd_fit = np.ascontiguousarray(0.5 * (kd + kd.T), dtype=np.float64)
-    ka_fit += np.eye(n, dtype=np.float64) * np.float64(1e-6)
-    kd_fit += np.eye(n, dtype=np.float64) * np.float64(1e-6)
-    model = KernelBLUP(y_vec, G=[ka_fit, kd_fit], progress=False)
-
-    beta_fix = np.asarray(
-        getattr(model, "beta", np.asarray([[float(np.mean(y_vec))]], dtype=np.float64)),
-        dtype=np.float64,
-    ).reshape(-1)
-    beta0 = float(beta_fix[0]) if int(beta_fix.size) > 0 else float(np.mean(y_vec))
-    vinvr = np.ascontiguousarray(
-        np.asarray(getattr(model, "_Vinvr", np.zeros((0, 1))), dtype=np.float64).reshape(-1),
-        dtype=np.float64,
-    )
-    g_theta = np.ascontiguousarray(
-        np.asarray(getattr(model, "_g_theta", np.zeros((0,))), dtype=np.float64).reshape(-1),
-        dtype=np.float64,
-    )
-    g_scales = np.ascontiguousarray(
-        np.asarray(getattr(model, "_g_scales", np.ones((0,))), dtype=np.float64).reshape(-1),
-        dtype=np.float64,
-    )
-
-    pve = float("nan")
-    sigma_a2 = float("nan")
-    sigma_d2 = float("nan")
-    sigma_e2 = float("nan")
-    lambda_reml = float("nan")
-    try:
-        var = np.asarray(getattr(model, "var", []), dtype=np.float64).reshape(-1)
-        if int(var.size) >= 3 and np.all(np.isfinite(var[:3])):
-            sigma_a2 = float(var[0])
-            sigma_d2 = float(var[1])
-            sigma_e2 = float(var[2])
-            denom = float(sigma_a2 + sigma_d2 + sigma_e2)
-            if denom > 0.0:
-                pve = float((sigma_a2 + sigma_d2) / denom)
-            vg = float(sigma_a2 + sigma_d2)
-            if vg > 0.0:
-                lambda_reml = float(sigma_e2 / vg)
-    except Exception:
-        pass
-
-    return {
-        "model": model,
-        "beta": float(beta0),
-        "vinvr": vinvr,
-        "g_theta": g_theta,
-        "g_scales": g_scales,
-        "pve": float(pve),
-        "lambda_reml": float(lambda_reml),
-        "sigma_a2": float(sigma_a2),
-        "sigma_d2": float(sigma_d2),
-        "sigma_e2": float(sigma_e2),
-    }
-
-
 def _predict_gblup_from_cross(
     *,
     cross_kernel: np.ndarray,
@@ -6324,35 +6096,11 @@ def _predict_gblup_from_cross(
     return np.asarray(out, dtype=np.float64).reshape(-1, 1)
 
 
-def _predict_gblup_ad_from_cross(
-    *,
-    fit: dict[str, typing.Any],
-    cross_add: np.ndarray,
-    cross_dom: np.ndarray,
-) -> np.ndarray:
-    model = fit.get("model", None)
-    beta0 = float(fit.get("beta", 0.0))
-    ka = np.asarray(cross_add, dtype=np.float64)
-    kd = np.asarray(cross_dom, dtype=np.float64)
-    if ka.shape != kd.shape or ka.ndim != 2:
-        raise ValueError(
-            f"GBLUP(ad) cross-kernel shape mismatch: Ka={ka.shape}, Kd={kd.shape}."
-        )
-    if int(ka.shape[0]) == 0:
-        return np.zeros((0, 1), dtype=np.float64)
-    if model is None:
-        return np.full((int(ka.shape[0]), 1), beta0, dtype=np.float64)
-    pred = model.predict(G=[ka, kd])
-    return np.asarray(pred, dtype=np.float64).reshape(-1, 1)
-
-
 def _kernel_projection_beta_from_backend(
     *,
     packed_ctx: dict[str, typing.Any] | None,
     sample_indices: np.ndarray | None,
     alpha: np.ndarray,
-    mode: str,
-    coef: float,
     dense_marker_by_sample: np.ndarray | None,
     n_jobs: int,
 ) -> np.ndarray | None:
@@ -6385,7 +6133,6 @@ def _kernel_projection_beta_from_backend(
                     gblup_mmap_window_mb,
                 ) = _packed_gblup_stream_metadata(
                     packed_ctx,
-                    mode=mode,
                     block_rows=block_rows,
                 )
                 beta_kp_raw = _jxrs.gblup_effect_from_meta_stream(
@@ -6395,7 +6142,7 @@ def _kernel_projection_beta_from_backend(
                     row_source_indices_arg,
                     row_flip_arg,
                     row_maf_arg,
-                    mode=mode,
+                    mode="a",
                     block_rows=block_rows,
                     threads=int(max(0, int(n_jobs))),
                     mmap_window_mb=int(gblup_mmap_window_mb),
@@ -6404,15 +6151,13 @@ def _kernel_projection_beta_from_backend(
                     np.asarray(beta_kp_raw, dtype=np.float64).reshape(-1),
                     dtype=np.float64,
                 )
-                if float(coef) != 1.0:
-                    beta_kp *= float(coef)
             except Exception:
                 beta_kp = None
     if beta_kp is None and dense_marker_by_sample is not None:
         beta_kp = _kernel_projection_beta_from_dense(
             marker_by_sample=np.asarray(dense_marker_by_sample, dtype=np.float64),
             alpha=alpha_vec,
-            coef=float(coef),
+            coef=1.0,
         )
     return beta_kp
 
@@ -8148,39 +7893,32 @@ def _packed_gblup_stream_metadata(
 
     active_row_idx = _packed_ctx_active_row_idx(packed_ctx)
     mode_norm = str(mode).strip().lower()
-    mode_is_dom = bool(mode_norm in {"d", "dom", "dominance"})
-    if (not mode_is_dom) and _packed_ctx_prefers_metadata_stream(packed_ctx):
+    if mode_norm not in {"a", "add", "additive"}:
+        raise ValueError("Packed GBLUP metadata supports additive coding only.")
+    if _packed_ctx_prefers_metadata_stream(packed_ctx):
         if "row_flip" not in packed_ctx:
             raise ValueError(
                 "Streaming packed context requires cached row_flip metadata; "
                 "rebuild packed-meta cache or disable lazy_full packed fallback."
             )
-    if mode_is_dom:
-        row_flip_arg = np.zeros((int(active_row_idx.shape[0]),), dtype=np.bool_)
-        row_maf_arg = np.ascontiguousarray(
-            np.asarray(_packed_ctx_dom_af(packed_ctx), dtype=np.float32).reshape(-1),
-            dtype=np.float32,
-        )
-    else:
-        # Rust's metadata-stream kernels consume source BED row indices and
-        # compact metadata in the same selected order.  `active_row_idx` is
-        # already the source-row list; only metadata needs active-space
-        # normalization here.
-        row_flip_raw = packed_ctx.get("row_flip", None)
-        if row_flip_raw is None:
-            row_flip_raw = _ensure_packed_row_flip_cached(packed_ctx)
-        row_flip_arg = _packed_ctx_select_active_metadata(
-            row_flip_raw,
-            active_row_idx,
-            dtype=np.bool_,
-            name="row_flip",
-        )
-        row_maf_arg = _packed_ctx_select_active_metadata(
-            packed_ctx["maf"],
-            active_row_idx,
-            dtype=np.float32,
-            name="maf",
-        )
+    # Rust's metadata-stream kernels consume source BED row indices and
+    # compact additive metadata in the same selected order. `active_row_idx`
+    # is the source-row list; only metadata needs active-space normalization.
+    row_flip_raw = packed_ctx.get("row_flip", None)
+    if row_flip_raw is None:
+        row_flip_raw = _ensure_packed_row_flip_cached(packed_ctx)
+    row_flip_arg = _packed_ctx_select_active_metadata(
+        row_flip_raw,
+        active_row_idx,
+        dtype=np.bool_,
+        name="row_flip",
+    )
+    row_maf_arg = _packed_ctx_select_active_metadata(
+        packed_ctx["maf"],
+        active_row_idx,
+        dtype=np.float32,
+        name="maf",
+    )
     row_source_indices_arg = np.ascontiguousarray(
         np.asarray(active_row_idx, dtype=np.int64).reshape(-1),
         dtype=np.int64,
@@ -8978,10 +8716,10 @@ def GSapi(
             enabled=PCAdec,
         )
 
-    if _is_gblup_method(str(method)) and (_gblup_method_kernel_mode(str(method)) in {"d", "ad"}):
+    if str(method) in {_GBLUP_METHOD_DOM, _GBLUP_METHOD_AD}:
         raise ValueError(
-            "GSapi does not fit GBLUP(d/ad) directly. "
-            "Use the workflow-level unified GRM path."
+            f"{method} is a retired non-additive GS model and is unsupported. "
+            "Use additive -BLUP."
         )
 
     # Linear mixed models
@@ -9306,11 +9044,7 @@ def GSapi(
             if not np.isfinite(var_g):
                 return
             gblup_runtime_state["var_g"] = float(var_g)
-            kernel_mode = str(_gblup_method_kernel_mode(str(method))).strip().lower()
-            if kernel_mode == "a":
-                gblup_runtime_state["va"] = float(var_g)
-            elif kernel_mode == "d":
-                gblup_runtime_state["vd"] = float(var_g)
+            gblup_runtime_state["va"] = float(var_g)
 
         if _GS_DEBUG_STAGE:
             t_fit = time.time()
@@ -11727,8 +11461,6 @@ def _run_method_task(
         rrblup_cfg_base["auto_pcg_ref_n"] = int(np.asarray(train_pheno).reshape(-1).shape[0])
     packed_lmm_methods = {
         _GBLUP_METHOD_ADD,
-        _GBLUP_METHOD_DOM,
-        _GBLUP_METHOD_AD,
         "rrBLUP",
         "BayesA",
         "BayesB",
@@ -11913,11 +11645,7 @@ def _run_method_task(
         if (not _is_gblup_method(str(method))) or state is None:
             return
         row: dict[str, typing.Any] = {"fold": int(fold_id)}
-        kernel_mode = str(
-            state.get("kernel_mode", _gblup_method_kernel_mode(str(method)))
-        ).strip().lower()
-        if kernel_mode != "":
-            row["kernel_mode"] = kernel_mode
+        row["kernel_mode"] = "a"
         for key in ("variance_component_path", "variance_component", "backend", "eigh_backend"):
             txt = str(state.get(key, "")).strip()
             if txt != "":
@@ -11925,11 +11653,9 @@ def _run_method_task(
         for key in (
             "sigma_g2",
             "sigma_a2",
-            "sigma_d2",
             "sigma_e2",
             "var_g",
             "va",
-            "vd",
             "h2",
             "pve_pheno_scale_trainvar",
             "lambda_reml",
@@ -11949,11 +11675,12 @@ def _run_method_task(
             )
             if np.isfinite(var_g):
                 row["var_g"] = float(var_g)
+        sigma_g2_row = _float_or_nan(row.get("sigma_g2", np.nan))
+        if np.isfinite(sigma_g2_row) and ("sigma_a2" not in row):
+            row["sigma_a2"] = float(sigma_g2_row)
         var_g_row = _float_or_nan(row.get("var_g", np.nan))
-        if kernel_mode == "a" and np.isfinite(var_g_row) and ("va" not in row):
+        if np.isfinite(var_g_row) and ("va" not in row):
             row["va"] = float(var_g_row)
-        elif kernel_mode == "d" and np.isfinite(var_g_row) and ("vd" not in row):
-            row["vd"] = float(var_g_row)
         if len(row) > 1:
             gblup_vc_rows.append(row)
 
@@ -11963,10 +11690,7 @@ def _run_method_task(
     ) -> dict[str, typing.Any] | None:
         if len(gblup_vc_rows) <= 0:
             return None
-        out: dict[str, typing.Any] = {}
-        kernel_mode = str(_gblup_method_kernel_mode(str(method))).strip().lower()
-        if kernel_mode != "":
-            out["kernel_mode"] = kernel_mode
+        out: dict[str, typing.Any] = {"kernel_mode": "a"}
         for key in ("variance_component_path", "variance_component", "backend", "eigh_backend"):
             for row in gblup_vc_rows:
                 txt = str(row.get(key, "")).strip()
@@ -11976,11 +11700,9 @@ def _run_method_task(
         for key in (
             "sigma_g2",
             "sigma_a2",
-            "sigma_d2",
             "sigma_e2",
             "var_g",
             "va",
-            "vd",
             "h2",
             "pve_pheno_scale_trainvar",
             "lambda_reml",
@@ -11994,15 +11716,8 @@ def _run_method_task(
                 out[key] = float(np.nanmean(vals))
         if ("h2" not in out) and np.isfinite(_float_or_nan(pve_hint)):
             out["h2"] = float(pve_hint)
-        if (
-            ("sigma_g2" not in out)
-            and np.isfinite(_float_or_nan(out.get("sigma_a2", np.nan)))
-            and np.isfinite(_float_or_nan(out.get("sigma_d2", np.nan)))
-        ):
-            out["sigma_g2"] = float(
-                _float_or_nan(out.get("sigma_a2", np.nan))
-                + _float_or_nan(out.get("sigma_d2", np.nan))
-            )
+        if ("sigma_g2" not in out) and np.isfinite(_float_or_nan(out.get("sigma_a2", np.nan))):
+            out["sigma_g2"] = float(_float_or_nan(out.get("sigma_a2", np.nan)))
         if "var_g" not in out:
             var_g = _trainvar_from_pve_ve(
                 out.get("pve_pheno_scale_trainvar", out.get("pve_trainvar", out.get("h2", np.nan))),
@@ -12011,10 +11726,8 @@ def _run_method_task(
             if np.isfinite(var_g):
                 out["var_g"] = float(var_g)
         var_g_out = _float_or_nan(out.get("var_g", np.nan))
-        if kernel_mode == "a" and np.isfinite(var_g_out) and ("va" not in out):
+        if np.isfinite(var_g_out) and ("va" not in out):
             out["va"] = float(var_g_out)
-        elif kernel_mode == "d" and np.isfinite(var_g_out) and ("vd" not in out):
-            out["vd"] = float(var_g_out)
         return out if len(out) > 0 else None
 
     use_hash_cv_compact = bool(
@@ -12027,16 +11740,7 @@ def _run_method_task(
     )
     gblup_cv_grm_full: np.ndarray | None = None
     gblup_final_test_train: np.ndarray | None = None
-    gblup_cv_grm_dom_full: np.ndarray | None = None
-    gblup_final_test_train_dom: np.ndarray | None = None
     gblup_force_kinship = False
-    gblup_dom_prebuild_error: str = ""
-    gblup_ad_prebuild_error: str = ""
-    gblup_kernel_mode = (
-        _gblup_method_kernel_mode(str(method))
-        if _is_gblup_method(str(method))
-        else ""
-    )
     prefer_rust_packed_gblup = bool(
         method == "GBLUP"
         and _looks_like_packed_ctx(packed_ctx)
@@ -12164,115 +11868,6 @@ def _run_method_task(
                             f"[GS-DEBUG] GBLUP kinship backend failed -> fallback GSapi: {ex}",
                             flush=True,
                         )
-    elif method == _GBLUP_METHOD_DOM:
-        try:
-            gblup_cv_grm_full, gblup_final_test_train = _build_gblup_kinship_blocks_once(
-                train_snp=train_snp_add,
-                test_snp=test_snp_add,
-                packed_ctx=(
-                    typing.cast(dict[str, typing.Any], packed_method_ctx)
-                    if packed_method_ctx is not None
-                    else None
-                ),
-                train_sample_indices=train_sample_indices,
-                test_sample_indices=test_sample_indices,
-                n_jobs=max(1, int(n_jobs)),
-                kernel_mode="d",
-            )
-            gblup_force_kinship = bool(gblup_cv_grm_full is not None)
-            if _GS_DEBUG_STAGE and gblup_cv_grm_full is not None:
-                print(
-                    f"[GS-DEBUG] GBLUP(d) prebuilt GRM shape={gblup_cv_grm_full.shape}",
-                    flush=True,
-                )
-        except Exception as ex:
-            gblup_dom_prebuild_error = f"{type(ex).__name__}: {ex}"
-            gblup_cv_grm_full = None
-            gblup_final_test_train = None
-            gblup_force_kinship = False
-            if _GS_DEBUG_STAGE:
-                print(
-                    f"[GS-DEBUG] GBLUP(d) unified GRM build failed: {ex}",
-                    flush=True,
-                )
-    elif method == _GBLUP_METHOD_AD:
-        try:
-            gblup_cv_grm_full, gblup_final_test_train = _build_gblup_kinship_blocks_once(
-                train_snp=train_snp_add,
-                test_snp=test_snp_add,
-                packed_ctx=(
-                    typing.cast(dict[str, typing.Any], packed_method_ctx)
-                    if packed_method_ctx is not None
-                    else None
-                ),
-                train_sample_indices=train_sample_indices,
-                test_sample_indices=test_sample_indices,
-                n_jobs=max(1, int(n_jobs)),
-                kernel_mode="a",
-            )
-            gblup_cv_grm_dom_full, gblup_final_test_train_dom = _build_gblup_kinship_blocks_once(
-                train_snp=train_snp_add,
-                test_snp=test_snp_add,
-                packed_ctx=(
-                    typing.cast(dict[str, typing.Any], packed_method_ctx)
-                    if packed_method_ctx is not None
-                    else None
-                ),
-                train_sample_indices=train_sample_indices,
-                test_sample_indices=test_sample_indices,
-                n_jobs=max(1, int(n_jobs)),
-                kernel_mode="d",
-            )
-            gblup_force_kinship = bool(
-                (gblup_cv_grm_full is not None)
-                and (gblup_cv_grm_dom_full is not None)
-                and (_HAS_ADBLUP_PY and (KernelBLUP is not None))
-            )
-            if _GS_DEBUG_STAGE and gblup_force_kinship:
-                print(
-                    "[GS-DEBUG] GBLUP(ad) prebuilt kernels "
-                    f"Ka={gblup_cv_grm_full.shape} Kd={gblup_cv_grm_dom_full.shape}",
-                    flush=True,
-                )
-        except Exception as ex:
-            gblup_ad_prebuild_error = f"{type(ex).__name__}: {ex}"
-            gblup_cv_grm_full = None
-            gblup_final_test_train = None
-            gblup_cv_grm_dom_full = None
-            gblup_final_test_train_dom = None
-            gblup_force_kinship = False
-            if _GS_DEBUG_STAGE:
-                print(
-                    f"[GS-DEBUG] GBLUP(ad) unified GRM build failed: {ex}",
-                    flush=True,
-                )
-
-    if method == _GBLUP_METHOD_DOM and gblup_cv_grm_full is None:
-        detail = (
-            gblup_dom_prebuild_error
-            if str(gblup_dom_prebuild_error).strip() != ""
-            else "unified dominance GRM build returned no result"
-        )
-        raise RuntimeError(
-            "GBLUP(d) unified GRM path failed. "
-            f"detail: {detail}"
-        )
-    if method == _GBLUP_METHOD_AD:
-        ad_backend_ready = bool(_HAS_ADBLUP_PY and (KernelBLUP is not None))
-        if (not ad_backend_ready) or gblup_cv_grm_full is None or gblup_cv_grm_dom_full is None:
-            if not ad_backend_ready:
-                detail = f"GBLUP(ad) REML/GRM backend unavailable: {_ADBLUP_PY_IMPORT_ERROR}"
-            else:
-                detail = (
-                    gblup_ad_prebuild_error
-                    if str(gblup_ad_prebuild_error).strip() != ""
-                    else "unified additive+dominance GRM build returned no result"
-                )
-            raise RuntimeError(
-                "GBLUP(ad) unified GRM path failed. "
-                f"detail: {detail}"
-            )
-
     need_cv_grm_prebuild = bool(
         (method == "GBLUP")
         and (gblup_force_kinship or (precomputed_train_grm is not None))
@@ -12478,140 +12073,6 @@ def _run_method_task(
                         )
                 else:
                     yhat_train = np.zeros((0, 1), dtype=float)
-            elif (method == _GBLUP_METHOD_DOM) and (gblup_cv_grm_full is not None):
-                y_fold = np.asarray(train_pheno[fold_train_idx], dtype=np.float64).reshape(-1)
-                grm_train = _slice_grm_square_blocked(
-                    np.asarray(gblup_cv_grm_full, dtype=np.float64),
-                    fold_train_idx,
-                    row_block=512,
-                )
-                fit = _fit_gblup_reml_from_grm(y_fold, grm_train)
-                _append_gblup_vc_row(
-                    int(fold_id),
-                    {
-                        "variance_component_path": "grm",
-                        "variance_component": "REML/GRM",
-                        "backend": (
-                            "packed active"
-                            if _looks_like_packed_payload(packed_method_ctx)
-                            else ("packed meta" if packed_method_ctx is not None else "dense")
-                        ),
-                        "kernel_mode": "d",
-                        "sigma_g2": float(fit.get("sigma_g2", np.nan)),
-                        "sigma_d2": float(fit.get("sigma_g2", np.nan)),
-                        "sigma_e2": float(fit.get("sigma_e2", np.nan)),
-                        "lambda_reml": float(fit.get("lambda_reml", np.nan)),
-                        "h2": float(fit.get("pve", np.nan)),
-                        "pve_trainvar": float(fit.get("pve", np.nan)),
-                    },
-                )
-                alpha = np.asarray(fit["alpha"], dtype=np.float64).reshape(-1, 1)
-                beta = float(fit["beta"])
-                pve = float(fit["pve"])
-
-                grm_test_train = _slice_grm_rect_blocked(
-                    np.asarray(gblup_cv_grm_full, dtype=np.float64),
-                    fold_test_idx,
-                    fold_train_idx,
-                    row_block=512,
-                )
-                yhat_test = _predict_gblup_from_cross(
-                    cross_kernel=grm_test_train,
-                    alpha=alpha,
-                    beta=beta,
-                )
-                if need_fold_train_pred:
-                    if fold_train_pred_local_idx is None:
-                        yhat_train = _predict_gblup_from_cross(
-                            cross_kernel=grm_train,
-                            alpha=alpha,
-                            beta=beta,
-                        )
-                    elif int(fold_train_pred_local_idx.size) == 0:
-                        yhat_train = np.zeros((0, 1), dtype=float)
-                    else:
-                        local_idx = np.asarray(fold_train_pred_local_idx, dtype=np.int64).reshape(-1)
-                        grm_pick = np.asarray(grm_train[local_idx, :], dtype=np.float64)
-                        yhat_train = _predict_gblup_from_cross(
-                            cross_kernel=grm_pick,
-                            alpha=alpha,
-                            beta=beta,
-                        )
-                else:
-                    yhat_train = np.zeros((0, 1), dtype=float)
-            elif (
-                (method == _GBLUP_METHOD_AD)
-                and (gblup_cv_grm_full is not None)
-                and (gblup_cv_grm_dom_full is not None)
-                and (_HAS_ADBLUP_PY and (KernelBLUP is not None))
-            ):
-                y_fold = np.asarray(train_pheno[fold_train_idx], dtype=np.float64).reshape(-1)
-                grm_add_train = _slice_grm_square_blocked(
-                    np.asarray(gblup_cv_grm_full, dtype=np.float64),
-                    fold_train_idx,
-                    row_block=512,
-                )
-                grm_dom_train = _slice_grm_square_blocked(
-                    np.asarray(gblup_cv_grm_dom_full, dtype=np.float64),
-                    fold_train_idx,
-                    row_block=512,
-                )
-                fit_ad = _fit_gblup_ad_reml_from_grms(y_fold, grm_add_train, grm_dom_train)
-                _append_gblup_vc_row(
-                    int(fold_id),
-                    {
-                        "variance_component_path": "grm",
-                        "variance_component": "REML/GRM",
-                        "backend": (
-                            "packed active"
-                            if _looks_like_packed_payload(packed_method_ctx)
-                            else ("packed meta" if packed_method_ctx is not None else "dense")
-                        ),
-                        "kernel_mode": "ad",
-                        "sigma_a2": float(fit_ad.get("sigma_a2", np.nan)),
-                        "sigma_d2": float(fit_ad.get("sigma_d2", np.nan)),
-                        "sigma_e2": float(fit_ad.get("sigma_e2", np.nan)),
-                        "lambda_reml": float(fit_ad.get("lambda_reml", np.nan)),
-                        "h2": float(fit_ad.get("pve", np.nan)),
-                        "pve_trainvar": float(fit_ad.get("pve", np.nan)),
-                    },
-                )
-                pve = float(fit_ad["pve"])
-                grm_add_test = _slice_grm_rect_blocked(
-                    np.asarray(gblup_cv_grm_full, dtype=np.float64),
-                    fold_test_idx,
-                    fold_train_idx,
-                    row_block=512,
-                )
-                grm_dom_test = _slice_grm_rect_blocked(
-                    np.asarray(gblup_cv_grm_dom_full, dtype=np.float64),
-                    fold_test_idx,
-                    fold_train_idx,
-                    row_block=512,
-                )
-                yhat_test = _predict_gblup_ad_from_cross(
-                    fit=fit_ad,
-                    cross_add=grm_add_test,
-                    cross_dom=grm_dom_test,
-                )
-                if need_fold_train_pred:
-                    if fold_train_pred_local_idx is None:
-                        train_add_cross = grm_add_train
-                        train_dom_cross = grm_dom_train
-                    elif int(fold_train_pred_local_idx.size) == 0:
-                        train_add_cross = np.zeros((0, grm_add_train.shape[1]), dtype=np.float64)
-                        train_dom_cross = np.zeros((0, grm_dom_train.shape[1]), dtype=np.float64)
-                    else:
-                        local_idx = np.asarray(fold_train_pred_local_idx, dtype=np.int64).reshape(-1)
-                        train_add_cross = np.asarray(grm_add_train[local_idx, :], dtype=np.float64)
-                        train_dom_cross = np.asarray(grm_dom_train[local_idx, :], dtype=np.float64)
-                    yhat_train = _predict_gblup_ad_from_cross(
-                        fit=fit_ad,
-                        cross_add=train_add_cross,
-                        cross_dom=train_dom_cross,
-                    )
-                else:
-                    yhat_train = np.zeros((0, 1), dtype=float)
             else:
                 if (packed_method_ctx is not None) and (method in packed_lmm_methods):
                     if train_sample_indices is None:
@@ -12620,12 +12081,6 @@ def _run_method_task(
                     fold_test = packed_method_ctx
                     fold_train_idx_arg = np.ascontiguousarray(train_sample_indices[fold_train_idx], dtype=np.int64)
                     fold_test_idx_arg = np.ascontiguousarray(train_sample_indices[fold_test_idx], dtype=np.int64)
-                    fold_pca = False
-                elif _is_gblup_method(str(method)) and (_gblup_method_kernel_mode(str(method)) in {"d", "ad"}):
-                    if train_snp_add is None:
-                        raise ValueError(f"{method} requires additive raw genotype matrix.")
-                    fold_train = train_snp_add[:, fold_train_idx]
-                    fold_test = train_snp_add[:, fold_test_idx]
                     fold_pca = False
                 elif method in _ML_METHOD_MAP:
                     if train_snp_ml is None:
@@ -13036,12 +12491,6 @@ def _run_method_task(
         final_pca = False
         final_train_idx_arg = np.ascontiguousarray(train_sample_indices, dtype=np.int64)
         final_test_idx_arg = np.ascontiguousarray(test_sample_indices, dtype=np.int64)
-    elif _is_gblup_method(str(method)) and (_gblup_method_kernel_mode(str(method)) in {"d", "ad"}):
-        if train_snp_add is None or test_snp_add is None:
-            raise ValueError(f"{method} requires additive raw genotype matrices.")
-        final_train = train_snp_add
-        final_test = test_snp_add
-        final_pca = False
     elif method in _ML_METHOD_MAP:
         if train_snp_ml is None or test_snp_ml is None:
             raise ValueError(f"{method} requires raw genotype matrices.")
@@ -13065,18 +12514,9 @@ def _run_method_task(
 
     skip_final_fit = False
     use_custom_gblup_final = bool(
-        (
-            method == "GBLUP"
-            and gblup_cv_grm_full is not None
-            and (gblup_force_kinship or precomputed_train_grm is not None)
-        )
-        or (method == _GBLUP_METHOD_DOM and gblup_cv_grm_full is not None)
-        or (
-            method == _GBLUP_METHOD_AD
-            and gblup_cv_grm_full is not None
-            and gblup_cv_grm_dom_full is not None
-            and (_HAS_ADBLUP_PY and (KernelBLUP is not None))
-        )
+        method == "GBLUP"
+        and gblup_cv_grm_full is not None
+        and (gblup_force_kinship or precomputed_train_grm is not None)
     )
     # Packed-GRM CV prebuild currently only provides train-train GRM; if we
     # still have external holdout samples but no precomputed test-train cross
@@ -13085,13 +12525,7 @@ def _run_method_task(
     if (
         use_custom_gblup_final
         and has_external_test
-        and (
-            (gblup_final_test_train is None)
-            or (
-                method == _GBLUP_METHOD_AD
-                and (gblup_final_test_train_dom is None)
-            )
-        )
+        and (gblup_final_test_train is None)
     ):
         use_custom_gblup_final = False
     if cv_splits is not None:
@@ -13100,11 +12534,6 @@ def _run_method_task(
                 (
                     gblup_final_test_train is None
                     or int(gblup_final_test_train.shape[0]) == 0
-                )
-                and (
-                    method != _GBLUP_METHOD_AD
-                    or gblup_final_test_train_dom is None
-                    or int(gblup_final_test_train_dom.shape[0]) == 0
                 )
             )
         elif (packed_method_ctx is not None) and (method in packed_lmm_methods):
@@ -13236,218 +12665,91 @@ def _run_method_task(
             if _looks_like_packed_payload(packed_method_ctx)
             else ("packed meta" if packed_method_ctx is not None else "dense")
         )
-        fit: dict[str, typing.Any]
-        if method == _GBLUP_METHOD_AD:
-            fit = _fit_gblup_ad_reml_from_grms(
-                np.asarray(train_pheno, dtype=np.float64).reshape(-1),
-                np.asarray(gblup_cv_grm_full, dtype=np.float64),
-                np.asarray(gblup_cv_grm_dom_full, dtype=np.float64),
-            )
-        else:
-            fit = _fit_gblup_reml_from_grm(
-                np.asarray(train_pheno, dtype=np.float64).reshape(-1),
-                np.asarray(gblup_cv_grm_full, dtype=np.float64),
-            )
+        fit = _fit_gblup_reml_from_grm(
+            np.asarray(train_pheno, dtype=np.float64).reshape(-1),
+            np.asarray(gblup_cv_grm_full, dtype=np.float64),
+        )
         _emit_stage("fit_end", method=str(method), elapsed=float(max(0.0, time.time() - _t_fit_stage)))
         _emit_stage("predict_start", method=str(method))
         _t_pred_stage = time.time()
         dense_add_marker: np.ndarray | None = None
-        dense_dom_marker: np.ndarray | None = None
         if (
             want_export_state
             and packed_method_ctx is None
             and hasattr(final_train, "shape")
             and len(getattr(final_train, "shape")) >= 2
         ):
-            dense_add_marker = np.ascontiguousarray(np.asarray(final_train, dtype=np.float32), dtype=np.float32)
-            if method in {_GBLUP_METHOD_DOM, _GBLUP_METHOD_AD}:
-                dense_dom_marker = _dense_marker_matrix_for_gblup_kernel(
-                    dense_add_marker,
-                    kernel_mode="d",
-                )
+            dense_add_marker = np.ascontiguousarray(
+                np.asarray(final_train, dtype=np.float32),
+                dtype=np.float32,
+            )
 
+        alpha = np.asarray(fit["alpha"], dtype=np.float64).reshape(-1, 1)
+        beta = float(fit["beta"])
         pve_final = float(fit.get("pve", np.nan))
-        if method == _GBLUP_METHOD_AD:
-            if gblup_final_test_train is None or gblup_final_test_train_dom is None:
-                test_pred = np.zeros((0, 1), dtype=float)
-            else:
-                test_pred = _predict_gblup_ad_from_cross(
-                    fit=fit,
-                    cross_add=np.asarray(gblup_final_test_train, dtype=np.float64),
-                    cross_dom=np.asarray(gblup_final_test_train_dom, dtype=np.float64),
-                )
-            if want_export_state:
-                alpha_vec = np.ascontiguousarray(
-                    np.asarray(fit.get("vinvr", np.zeros((0,), dtype=np.float64)), dtype=np.float64).reshape(-1),
-                    dtype=np.float64,
-                )
-                g_theta = np.ascontiguousarray(
-                    np.asarray(fit.get("g_theta", np.zeros((0,), dtype=np.float64)), dtype=np.float64).reshape(-1),
-                    dtype=np.float64,
-                )
-                g_scales = np.ascontiguousarray(
-                    np.asarray(fit.get("g_scales", np.ones((0,), dtype=np.float64)), dtype=np.float64).reshape(-1),
-                    dtype=np.float64,
-                )
-                coef_a = (
-                    float(g_theta[0]) / float(max(1e-12, float(g_scales[0])))
-                    if int(g_theta.size) >= 2 and int(g_scales.size) >= 2
-                    else 1.0
-                )
-                coef_d = (
-                    float(g_theta[1]) / float(max(1e-12, float(g_scales[1])))
-                    if int(g_theta.size) >= 2 and int(g_scales.size) >= 2
-                    else 1.0
-                )
-                beta_a = _kernel_projection_beta_from_backend(
-                    packed_ctx=(
-                        typing.cast(dict[str, typing.Any], packed_method_ctx)
-                        if packed_method_ctx is not None
-                        else None
-                    ),
-                    sample_indices=final_train_idx_arg,
-                    alpha=alpha_vec,
-                    mode="a",
-                    coef=float(coef_a),
-                    dense_marker_by_sample=dense_add_marker,
-                    n_jobs=n_jobs,
-                )
-                beta_d = _kernel_projection_beta_from_backend(
-                    packed_ctx=(
-                        typing.cast(dict[str, typing.Any], packed_method_ctx)
-                        if packed_method_ctx is not None
-                        else None
-                    ),
-                    sample_indices=final_train_idx_arg,
-                    alpha=alpha_vec,
-                    mode="d",
-                    coef=float(coef_d),
-                    dense_marker_by_sample=dense_dom_marker,
-                    n_jobs=n_jobs,
-                )
-                beta_sum = None
-                if beta_a is not None and beta_d is not None:
-                    beta_sum = np.ascontiguousarray(
-                        np.asarray(beta_a, dtype=np.float64) + np.asarray(beta_d, dtype=np.float64),
-                        dtype=np.float64,
-                    )
-                model_state_final = {
-                    "kind": "gblup_kernel_projection_ad",
-                    "method": str(method),
-                    "effect_kind": "kernel_projection",
-                    "alpha": float(np.mean(np.asarray(train_pheno, dtype=np.float64))),
-                    "beta_a": (None if beta_a is None else np.ascontiguousarray(beta_a, dtype=np.float64)),
-                    "beta_d": (None if beta_d is None else np.ascontiguousarray(beta_d, dtype=np.float64)),
-                    "kernel_projection_a": (None if beta_a is None else np.ascontiguousarray(beta_a, dtype=np.float64)),
-                    "kernel_projection_d": (None if beta_d is None else np.ascontiguousarray(beta_d, dtype=np.float64)),
-                    "kernel_projection": beta_sum,
-                    "beta": beta_sum,
-                    "packed": bool(packed_method_ctx is not None),
-                    "standardized": False,
-                    "kernel_mode": "ad",
-                    "pve": float(pve_final),
-                }
-            gblup_final_state = {
-                "variance_component_path": "grm",
-                "variance_component": "REML/GRM",
-                "backend": backend_label,
-                "kernel_mode": "ad",
-            }
-            sigma_a2_fit = float(fit.get("sigma_a2", np.nan))
-            sigma_d2_fit = float(fit.get("sigma_d2", np.nan))
-            sigma_e2_fit = float(fit.get("sigma_e2", np.nan))
-            lambda_reml_fit = float(fit.get("lambda_reml", np.nan))
-            h2_fit = float(fit.get("pve", np.nan))
-            var_g_fit = _trainvar_from_pve_ve(h2_fit, sigma_e2_fit)
-            if np.isfinite(sigma_a2_fit) and np.isfinite(sigma_d2_fit):
-                gblup_final_state["sigma_g2"] = float(sigma_a2_fit + sigma_d2_fit)
-            if np.isfinite(sigma_a2_fit):
-                gblup_final_state["sigma_a2"] = float(sigma_a2_fit)
-            if np.isfinite(sigma_d2_fit):
-                gblup_final_state["sigma_d2"] = float(sigma_d2_fit)
-            if np.isfinite(sigma_e2_fit):
-                gblup_final_state["sigma_e2"] = float(sigma_e2_fit)
-            if np.isfinite(var_g_fit):
-                gblup_final_state["var_g"] = float(var_g_fit)
-            if np.isfinite(lambda_reml_fit):
-                gblup_final_state["lambda_reml"] = float(lambda_reml_fit)
-            if np.isfinite(h2_fit):
-                gblup_final_state["h2"] = float(h2_fit)
+        if gblup_final_test_train is None or int(gblup_final_test_train.shape[0]) == 0:
+            test_pred = np.zeros((0, 1), dtype=float)
         else:
-            alpha = np.asarray(fit["alpha"], dtype=np.float64).reshape(-1, 1)
-            beta = float(fit["beta"])
-            if gblup_final_test_train is None or int(gblup_final_test_train.shape[0]) == 0:
-                test_pred = np.zeros((0, 1), dtype=float)
-            else:
-                test_pred = _predict_gblup_from_cross(
-                    cross_kernel=np.asarray(gblup_final_test_train, dtype=np.float64),
-                    alpha=alpha,
-                    beta=beta,
-                )
-            if want_export_state:
-                alpha_vec = np.asarray(alpha, dtype=np.float64).reshape(-1)
-                beta_kp = _kernel_projection_beta_from_backend(
-                    packed_ctx=(
-                        typing.cast(dict[str, typing.Any], packed_method_ctx)
-                        if packed_method_ctx is not None
-                        else None
-                    ),
-                    sample_indices=final_train_idx_arg,
-                    alpha=alpha_vec,
-                    mode=("d" if method == _GBLUP_METHOD_DOM else "a"),
-                    coef=1.0,
-                    dense_marker_by_sample=(
-                        dense_dom_marker if method == _GBLUP_METHOD_DOM else dense_add_marker
-                    ),
-                    n_jobs=n_jobs,
-                )
-                model_state_final = {
-                    "kind": "gblup_kernel_projection",
-                    "method": str(method),
-                    "effect_kind": "kernel_projection",
-                    "alpha": float(np.mean(np.asarray(train_pheno, dtype=np.float64))),
-                    "kernel_projection": (
-                        np.ascontiguousarray(beta_kp, dtype=np.float64)
-                        if beta_kp is not None
-                        else None
-                    ),
-                    "beta": (
-                        np.ascontiguousarray(beta_kp, dtype=np.float64)
-                        if beta_kp is not None
-                        else None
-                    ),
-                    "packed": bool(packed_method_ctx is not None),
-                    "standardized": False,
-                    "kernel_mode": ("d" if method == _GBLUP_METHOD_DOM else "a"),
-                    "pve": float(pve_final),
-                }
-            gblup_final_state = {
-                "variance_component_path": "grm",
-                "variance_component": "REML/GRM",
-                "backend": backend_label,
-                "kernel_mode": ("d" if method == _GBLUP_METHOD_DOM else "a"),
+            test_pred = _predict_gblup_from_cross(
+                cross_kernel=np.asarray(gblup_final_test_train, dtype=np.float64),
+                alpha=alpha,
+                beta=beta,
+            )
+        if want_export_state:
+            beta_kp = _kernel_projection_beta_from_backend(
+                packed_ctx=(
+                    typing.cast(dict[str, typing.Any], packed_method_ctx)
+                    if packed_method_ctx is not None
+                    else None
+                ),
+                sample_indices=final_train_idx_arg,
+                alpha=np.asarray(alpha, dtype=np.float64).reshape(-1),
+                dense_marker_by_sample=dense_add_marker,
+                n_jobs=n_jobs,
+            )
+            model_state_final = {
+                "kind": "gblup_kernel_projection",
+                "method": str(method),
+                "effect_kind": "kernel_projection",
+                "alpha": float(np.mean(np.asarray(train_pheno, dtype=np.float64))),
+                "kernel_projection": (
+                    np.ascontiguousarray(beta_kp, dtype=np.float64)
+                    if beta_kp is not None
+                    else None
+                ),
+                "beta": (
+                    np.ascontiguousarray(beta_kp, dtype=np.float64)
+                    if beta_kp is not None
+                    else None
+                ),
+                "packed": bool(packed_method_ctx is not None),
+                "standardized": False,
+                "kernel_mode": "a",
+                "pve": float(pve_final),
             }
-            sigma_g2_fit = float(fit.get("sigma_g2", np.nan))
-            sigma_e2_fit = float(fit.get("sigma_e2", np.nan))
-            lambda_reml_fit = float(fit.get("lambda_reml", np.nan))
-            h2_fit = float(fit.get("pve", np.nan))
-            var_g_fit = _trainvar_from_pve_ve(h2_fit, sigma_e2_fit)
-            if np.isfinite(sigma_g2_fit):
-                gblup_final_state["sigma_g2"] = float(sigma_g2_fit)
-                if method == _GBLUP_METHOD_DOM:
-                    gblup_final_state["sigma_d2"] = float(sigma_g2_fit)
-            if np.isfinite(sigma_e2_fit):
-                gblup_final_state["sigma_e2"] = float(sigma_e2_fit)
-            if np.isfinite(var_g_fit):
-                gblup_final_state["var_g"] = float(var_g_fit)
-                if method == _GBLUP_METHOD_DOM:
-                    gblup_final_state["vd"] = float(var_g_fit)
-                else:
-                    gblup_final_state["va"] = float(var_g_fit)
-            if np.isfinite(lambda_reml_fit):
-                gblup_final_state["lambda_reml"] = float(lambda_reml_fit)
-            if np.isfinite(h2_fit):
-                gblup_final_state["h2"] = float(h2_fit)
+        gblup_final_state = {
+            "variance_component_path": "grm",
+            "variance_component": "REML/GRM",
+            "backend": backend_label,
+            "kernel_mode": "a",
+        }
+        sigma_g2_fit = float(fit.get("sigma_g2", np.nan))
+        sigma_e2_fit = float(fit.get("sigma_e2", np.nan))
+        lambda_reml_fit = float(fit.get("lambda_reml", np.nan))
+        h2_fit = float(fit.get("pve", np.nan))
+        var_g_fit = _trainvar_from_pve_ve(h2_fit, sigma_e2_fit)
+        if np.isfinite(sigma_g2_fit):
+            gblup_final_state["sigma_g2"] = float(sigma_g2_fit)
+            gblup_final_state["sigma_a2"] = float(sigma_g2_fit)
+        if np.isfinite(sigma_e2_fit):
+            gblup_final_state["sigma_e2"] = float(sigma_e2_fit)
+        if np.isfinite(var_g_fit):
+            gblup_final_state["var_g"] = float(var_g_fit)
+            gblup_final_state["va"] = float(var_g_fit)
+        if np.isfinite(lambda_reml_fit):
+            gblup_final_state["lambda_reml"] = float(lambda_reml_fit)
+        if np.isfinite(h2_fit):
+            gblup_final_state["h2"] = float(h2_fit)
         _emit_stage("predict_end", method=str(method), elapsed=float(max(0.0, time.time() - _t_pred_stage)))
     else:
         rr_cfg_final: dict[str, typing.Any] | None = rrblup_cfg
@@ -13990,9 +13292,8 @@ def _predict_from_loaded_model_state(
         kernel_mode = str(model_state.get("kernel_mode", "a")).strip().lower()
         if kernel_mode in {"d", "dom", "dominance", "ad"}:
             raise ValueError(
-                f"Loaded {kernel_mode.upper()} GBLUP projection for {m} cannot be "
-                "predicted by the additive marker decoder; dominance model reload "
-                "is not supported yet."
+                f"Loaded {kernel_mode.upper()} GBLUP projection for {m} uses a retired "
+                "non-additive genetic model and is unsupported."
             )
         beta_raw = model_state.get("kernel_projection", model_state.get("beta", None))
         if beta_raw is None:
@@ -14041,8 +13342,8 @@ def _predict_from_loaded_model_state(
 
     if kind == "gblup_kernel_projection_ad":
         raise ValueError(
-            f"Loaded AD GBLUP model for {m} cannot be predicted yet; "
-            "AD model reload requires separate additive and dominance decoders."
+            f"Loaded AD GBLUP model for {m} uses a retired non-additive genetic model "
+            "and is unsupported."
         )
 
     if kind == "text_effect_linear":
@@ -15266,11 +14567,7 @@ def _run_methods_parallel(
             vc_path = str(gblup_state.get("variance_component_path", "")).strip().lower()
             eigh_backend = str(gblup_state.get("eigh_backend", "")).strip().lower()
             if vc_label == "":
-                if mode == "ad":
-                    vc_label = "REML/GRM"
-                elif mode == "d":
-                    vc_label = "REML/FaST"
-                elif vc_path in {"fast", "marker_fast"} or eigh_backend.startswith("marker_fast"):
+                if vc_path in {"fast", "marker_fast"} or eigh_backend.startswith("marker_fast"):
                     vc_label = "REML/FaST"
                 elif vc_path == "grm" or eigh_backend != "":
                     vc_label = "REML/GRM"
@@ -15281,20 +14578,15 @@ def _run_methods_parallel(
             sigma_g2 = float(gblup_state.get("sigma_g2", np.nan))
             sigma_e2 = float(gblup_state.get("sigma_e2", np.nan))
             sigma_a2 = float(gblup_state.get("sigma_a2", np.nan))
-            sigma_d2 = float(gblup_state.get("sigma_d2", np.nan))
             var_g = float(gblup_state.get("var_g", np.nan))
             va = sigma_a2 if np.isfinite(sigma_a2) else (
-                var_g if (mode == "a" and np.isfinite(var_g)) else sigma_g2
+                var_g if np.isfinite(var_g) else sigma_g2
             )
-            vd = sigma_d2 if np.isfinite(sigma_d2) else (
-                var_g if (mode == "d" and np.isfinite(var_g)) else sigma_g2
-            )
+
             def _fmt_var(x: float) -> str:
                 return f"{x:.3f}"
-            if mode in {"a", "ad"} and np.isfinite(va):
+            if np.isfinite(va):
                 rows.append(("Va", _fmt_var(va)))
-            if mode in {"d", "ad"} and np.isfinite(vd):
-                rows.append(("Vd", _fmt_var(vd)))
             if np.isfinite(sigma_e2):
                 rows.append(("Ve", _fmt_var(sigma_e2)))
             try:
@@ -20859,16 +20151,6 @@ def _run_gs_pipeline_impl(
         logger.error("Rust backend missing top_fit_model export. Please rebuild JanusX.")
         raise SystemExit(1)
     ml_methods = {"RF", "ET", "GBDT", "XGB", "SVM", "ENET", "PLS", "KRR"}
-    gblup_ad_methods = [
-        m for m in methods
-        if _is_gblup_method(str(m)) and (_gblup_method_kernel_mode(str(m)) == "ad")
-    ]
-    if (len(gblup_ad_methods) > 0) and (not _HAS_ADBLUP_PY):
-        methods = [m for m in methods if m not in set(gblup_ad_methods)]
-        logger.warning(
-            "Skip GBLUP(ad) because its required backend dependency is unavailable. "
-            f"Original import error: {_ADBLUP_PY_IMPORT_ERROR}"
-        )
 
     if any(m in ml_methods for m in methods) and (not _HAS_SKLEARN):
         skipped_ml = [m for m in methods if m in ml_methods]
@@ -21351,8 +20633,6 @@ def _run_gs_pipeline_impl(
     )
     stream_meta_method_set = {
         _GBLUP_METHOD_ADD,
-        _GBLUP_METHOD_DOM,
-        _GBLUP_METHOD_AD,
         BLUP_METHOD,
         "rrBLUP",
         "BayesA",
@@ -21369,14 +20649,7 @@ def _run_gs_pipeline_impl(
         and len(methods) > 0
         and all(str(m) in stream_meta_method_set for m in methods)
     )
-    packed_meta_layer = (
-        "dom"
-        if any(
-            _is_gblup_method(str(m)) and (_gblup_method_kernel_mode(str(m)) in {"d", "ad"})
-            for m in methods
-        )
-        else "basic"
-    )
+    packed_meta_layer = "basic"
     preprocess_qc_requested = bool(
         (args.hash_dim is not None) or (ldprune_spec is not None)
     )
@@ -23085,7 +22358,7 @@ def _run_gs_pipeline_impl(
             if _methods_need_raw_additive_dense(methods):
                 if geno_add_raw is None:
                     raise RuntimeError(
-                        "Internal error: additive raw genotype matrix required by GBLUP(d/ad)/BLUP is missing."
+                        "Internal error: additive raw genotype matrix required by BLUP is missing."
                     )
                 train_snp_add = geno_add_raw[:, trainmask]
                 test_snp_add = geno_add_raw[:, testmask]
@@ -23274,11 +22547,7 @@ def _run_gs_pipeline_impl(
                     vc_path = str(gblup_state.get("variance_component_path", "")).strip().lower()
                     eigh_backend = str(gblup_state.get("eigh_backend", "")).strip().lower()
                     if vc_label == "":
-                        if mode == "ad":
-                            vc_label = "REML/GRM"
-                        elif mode == "d":
-                            vc_label = "REML/FaST"
-                        elif vc_path in {"fast", "marker_fast"} or eigh_backend.startswith("marker_fast"):
+                        if vc_path in {"fast", "marker_fast"} or eigh_backend.startswith("marker_fast"):
                             vc_label = "REML/FaST"
                         elif vc_path == "grm" or eigh_backend != "":
                             vc_label = "REML/GRM"
@@ -23289,18 +22558,12 @@ def _run_gs_pipeline_impl(
                     sigma_g2 = _detail_float_or_nan(gblup_state.get("sigma_g2", np.nan))
                     sigma_e2 = _detail_float_or_nan(gblup_state.get("sigma_e2", np.nan))
                     sigma_a2 = _detail_float_or_nan(gblup_state.get("sigma_a2", np.nan))
-                    sigma_d2 = _detail_float_or_nan(gblup_state.get("sigma_d2", np.nan))
                     var_g = _detail_float_or_nan(gblup_state.get("var_g", np.nan))
                     va = sigma_a2 if np.isfinite(sigma_a2) else (
-                        var_g if (mode == "a" and np.isfinite(var_g)) else sigma_g2
+                        var_g if np.isfinite(var_g) else sigma_g2
                     )
-                    vd = sigma_d2 if np.isfinite(sigma_d2) else (
-                        var_g if (mode == "d" and np.isfinite(var_g)) else sigma_g2
-                    )
-                    if mode in {"a", "ad"} and np.isfinite(va):
+                    if np.isfinite(va):
                         rows.append(("Va", f"{va:.3g}"))
-                    if mode in {"d", "ad"} and np.isfinite(vd):
-                        rows.append(("Vd", f"{vd:.3g}"))
                     if np.isfinite(sigma_e2):
                         rows.append(("Ve", f"{sigma_e2:.3g}"))
                     pve_final = _detail_float_or_nan(res_obj.get("pve_final", np.nan))
@@ -23630,46 +22893,41 @@ def _run_gs_pipeline_impl(
             cv_mode_row = str(res_obj.get("cv_mode", "train_cv")).strip().lower()
             gblup_variance_component_label: str | None = None
             if _is_gblup_method(m_key):
-                gblup_mode = _gblup_method_kernel_mode(m_key)
-                if gblup_mode == "ad":
-                    # Additive+dominance path uses explicit dual-kernel REML.
-                    gblup_variance_component_label = "GRMreml"
-                else:
-                    gblup_state = dict(
+                gblup_state = dict(
                         typing.cast(
                             dict[str, typing.Any] | None,
                             res_obj.get("gblup_final_state"),
                         )
                         or {}
                     )
-                    vc_label = str(gblup_state.get("variance_component", "")).strip()
-                    vc_path = str(gblup_state.get("variance_component_path", "")).strip().lower()
-                    eigh_backend = str(gblup_state.get("eigh_backend", "")).strip().lower()
-                    if vc_label != "":
-                        gblup_variance_component_label = _gblup_vc_method_display(vc_label)
-                    elif vc_path in {"fast", "marker_fast"} or eigh_backend.startswith("marker_fast"):
-                        gblup_variance_component_label = "FaSTreml"
-                    elif vc_path == "grm" or eigh_backend != "":
-                        gblup_variance_component_label = "GRMreml"
-                    else:
+                vc_label = str(gblup_state.get("variance_component", "")).strip()
+                vc_path = str(gblup_state.get("variance_component_path", "")).strip().lower()
+                eigh_backend = str(gblup_state.get("eigh_backend", "")).strip().lower()
+                if vc_label != "":
+                    gblup_variance_component_label = _gblup_vc_method_display(vc_label)
+                elif vc_path in {"fast", "marker_fast"} or eigh_backend.startswith("marker_fast"):
+                    gblup_variance_component_label = "FaSTreml"
+                elif vc_path == "grm" or eigh_backend != "":
+                    gblup_variance_component_label = "GRMreml"
+                else:
+                    m_eff = 0
+                    try:
+                        if _looks_like_packed_payload(trait_packed_ctx):
+                            m_eff = int(
+                                np.asarray(
+                                    typing.cast(dict[str, typing.Any], trait_packed_ctx)["packed"]
+                                ).shape[0]
+                            )
+                        elif train_snp is not None:
+                            m_eff = int(np.asarray(train_snp).shape[0])
+                    except Exception:
                         m_eff = 0
-                        try:
-                            if _looks_like_packed_payload(trait_packed_ctx):
-                                m_eff = int(
-                                    np.asarray(
-                                        typing.cast(dict[str, typing.Any], trait_packed_ctx)["packed"]
-                                    ).shape[0]
-                                )
-                            elif train_snp is not None:
-                                m_eff = int(np.asarray(train_snp).shape[0])
-                        except Exception:
-                            m_eff = 0
-                        n_eff = int(np.asarray(train_pheno).reshape(-1).shape[0])
-                        gblup_variance_component_label = (
-                            "FaSTreml"
-                            if (m_eff > 0 and n_eff > m_eff)
-                            else "GRMreml"
-                        )
+                    n_eff = int(np.asarray(train_pheno).reshape(-1).shape[0])
+                    gblup_variance_component_label = (
+                        "FaSTreml"
+                        if (m_eff > 0 and n_eff > m_eff)
+                        else "GRMreml"
+                    )
             if m_key in {"BayesA", "BayesB", "BayesC", "BayesR"}:
                 cv_rhat_rows_raw = res_obj.get("bayes_rhat_cv_rows", [])
                 if isinstance(cv_rhat_rows_raw, (list, tuple)):

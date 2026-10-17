@@ -79,7 +79,7 @@ from .workflow import (
     _run_fastplot_from_tsv_with_status,
     _run_result_write_with_status,
     _safe_trait_file_label,
-    _splmm_fused_qc_opted_in,
+    _splmm_fused_qc_eligible,
     _filter_trait_prepared_meta_by_bimranges,
     _site_tuple_parts,
     _subset_square_matrix_identity_aware,
@@ -1946,11 +1946,6 @@ def _prepare_packed_bed_once_for_gwas(
                 np.asarray(packed_ctx_obj["std_denom"], dtype=np.float32).reshape(-1),
                 dtype=np.float32,
             )
-        if "dom_af" in packed_ctx_obj:
-            packed_ctx["dom_af"] = np.ascontiguousarray(
-                np.asarray(packed_ctx_obj["dom_af"], dtype=np.float32).reshape(-1),
-                dtype=np.float32,
-            )
         sites_pre = pre.get("site_meta", pre.get("sites_all"))
         site_meta = _coerce_bim_site_columns(sites_pre)
         if load_site_meta and site_meta is not None and len(site_meta) > 0:
@@ -2884,6 +2879,8 @@ def _write_splmm_assoc_tsv(
     genetic_model: str,
     chunk_rows: int = 131072,
 ) -> int:
+    if str(genetic_model).strip().lower() != "add":
+        raise ValueError("SparseLMM currently supports only additive coding (model='add').")
     if not hasattr(jxrs, "GwasAssocTsvWriter") or not hasattr(jxrs, "SiteInfo"):
         raise RuntimeError(
             "Rust extension missing GwasAssocTsvWriter/SiteInfo required by SparseLMM TSV writer."
@@ -2900,17 +2897,6 @@ def _write_splmm_assoc_tsv(
         raise ValueError(
             f"SparseLMM TSV writer result shape mismatch: got {res_arr.shape}, expected ({n_rows}, 3)."
         )
-    gm = str(genetic_model).strip().lower()
-
-    def _alleles(a0: str, a1: str) -> tuple[str, str]:
-        if gm == "dom":
-            return f"{a0}{a0}", f"{a0}{a1}/{a1}{a1}"
-        if gm == "rec":
-            return f"{a0}{a1}/{a0}{a0}", f"{a1}{a1}"
-        if gm == "het":
-            return f"{a0}{a0}/{a1}{a1}", f"{a0}{a1}"
-        return str(a0), str(a1)
-
     step = int(max(1, chunk_rows))
     written = 0
     with open(out_tsv, "w", encoding="utf-8", newline="") as fh:
@@ -2927,9 +2913,8 @@ def _write_splmm_assoc_tsv(
                 chisq = float("nan")
                 if np.isfinite(beta) and np.isfinite(se) and se > 0.0:
                     chisq = float((beta / se) ** 2)
-                a0_txt, a1_txt = _alleles(str(allele0), str(allele1))
                 chunk_text.append(
-                    f"{chrom}\t{int(pos)}\t{snp}\t{a0_txt}\t{a1_txt}\t"
+                    f"{chrom}\t{int(pos)}\t{snp}\t{allele0}\t{allele1}\t"
                     f"{float(maf_arr[idx]):.4f}\t{float(miss_arr[idx]):.4f}\t"
                     f"{beta:.4f}\t{se:.4f}\t{chisq:.6g}\t{pwald:.4e}\n"
                 )
@@ -3801,6 +3786,8 @@ def run_fvlmm_packed_fullrank(
     preloaded_packed: Union[dict[str, object], None] = None,
     force_model: bool = False,
 ) -> None:
+    if str(genetic_model).strip().lower() != "add":
+        raise ValueError("GWAS currently supports only additive coding (model='add').")
     _route_model_key = "fvlmm"
     _route_model_label = "FvLMM"
     required_symbols = [
@@ -4028,12 +4015,8 @@ def run_fvlmm_packed_fullrank(
                 gwas_pbar.update(step)
                 gwas_last_done = d
 
-        gm_tag = str(genetic_model).lower()
         pname_tag = _safe_trait_file_label(pname)
-        if gm_tag == "add":
-            out_tsv = f"{outprefix}.{pname_tag}.{_route_model_key}.tsv"
-        else:
-            out_tsv = f"{outprefix}.{pname_tag}.{gm_tag}.{_route_model_key}.tsv"
+        out_tsv = f"{outprefix}.{pname_tag}.{_route_model_key}.tsv"
         tmp_tsv = _gwas_result_tmp_path(out_tsv)
 
         gwas_ok = False
@@ -4410,12 +4393,8 @@ def run_lm_packed_fullrank(
             dtype=np.float64,
         )
         sample_idx_trait = np.ascontiguousarray(sample_map[keep_idx], dtype=np.int64)
-        gm_tag = str(genetic_model).lower()
         pname_tag = _safe_trait_file_label(pname)
-        if gm_tag == "add":
-            out_tsv = f"{outprefix}.{pname_tag}.lm.tsv"
-        else:
-            out_tsv = f"{outprefix}.{pname_tag}.{gm_tag}.lm.tsv"
+        out_tsv = f"{outprefix}.{pname_tag}.lm.tsv"
         tmp_tsv = _gwas_result_tmp_path(out_tsv)
 
         gwas_t0 = time.monotonic()
@@ -4597,6 +4576,8 @@ def run_lm_stream_bed_single_entry(
     model_key: str = "lm",
     lm2_covariate_indices: Union[np.ndarray, None] = None,
 ) -> None:
+    if str(genetic_model).strip().lower() != "add":
+        raise ValueError("GWAS currently supports only additive coding (model='add').")
     model_key_norm = str(model_key).strip().lower()
     rust_symbol = "lm2_stream_bed_to_tsv" if model_key_norm == "lm2" else "lm_stream_bed_to_tsv"
     if not hasattr(jxrs, rust_symbol):
@@ -4692,12 +4673,8 @@ def run_lm_stream_bed_single_entry(
                 f"(n={int(n_idv)}).",
             )
 
-        gm_tag = str(genetic_model).lower()
         pname_tag = _safe_trait_file_label(pname)
-        if gm_tag == "add":
-            out_tsv = f"{outprefix}.{pname_tag}.{model_key_norm}.tsv"
-        else:
-            out_tsv = f"{outprefix}.{pname_tag}.{gm_tag}.{model_key_norm}.tsv"
+        out_tsv = f"{outprefix}.{pname_tag}.{model_key_norm}.tsv"
         tmp_tsv = _gwas_result_tmp_path(out_tsv)
 
         scan_threads = int(threads)
@@ -5982,7 +5959,7 @@ def _run_mixed_trait_packed_multi_entry(
 ) -> None:
     model_label = "LMM"
     if str(genetic_model).lower() != "add":
-        raise ValueError(f"{model_label} trait-level route supports additive coding only.")
+        raise ValueError("GWAS currently supports only additive coding (model='add').")
     if plot:
         raise ValueError(f"{model_label} trait-level route does not support per-trait plotting.")
     if grm is None:
@@ -7007,12 +6984,8 @@ def run_lmm_packed_fullrank(
 
         gwas_ok = False
         null_lbd = float("nan")
-        gm_tag = str(genetic_model).lower()
         pname_tag = _safe_trait_file_label(pname)
-        if gm_tag == "add":
-            out_tsv = f"{outprefix}.{pname_tag}.lmm.tsv"
-        else:
-            out_tsv = f"{outprefix}.{pname_tag}.{gm_tag}.lmm.tsv"
+        out_tsv = f"{outprefix}.{pname_tag}.lmm.tsv"
         tmp_tsv = _gwas_result_tmp_path(out_tsv)
         try:
             with _gwas_scan_stage_ctx(max(1, int(threads))):
@@ -7734,6 +7707,7 @@ def run_splmm_windowed_fullrank(
     result_stem: str = "splmm",
     model_label: str = "SparseLMM",
     bimranges: Optional[list[tuple[str, int, int]]] = None,
+    row_stat_mode: str = "strict-train",
 ) -> None:
     if str(genetic_model).lower() != "add":
         raise ValueError("SparseLMM windowed BED route supports additive coding only.")
@@ -7999,23 +7973,24 @@ def run_splmm_windowed_fullrank(
                 method=int(splmm_sparse_method),
             )
             sparse_kinship_cache[sparse_cache_key] = str(trait_sparse_kinship_path)
-        fused_qc_raw_requested = bool(
-            _splmm_fused_qc_opted_in()
-            and scan_mode_norm in {"approx", "exact"}
-            and not packed_preload_is_ready(preloaded_packed)
-            and shared_sparse_kinship_path is not None
-            and str(genetic_model).strip().lower() == "add"
-            and (
-                (
-                    scan_mode_norm == "approx"
-                    and hasattr(jxrs, "splmm_assoc_pcg_bed_to_tsv_fused_approx")
-                )
-                or (
-                    scan_mode_norm == "exact"
-                    and hasattr(jxrs, "splmm_assoc_pcg_bed_to_tsv_fused_exact")
-                )
-            )
-            and os.path.exists(f"{str(prefix)}.bed")
+        fused_binding_available = (
+            hasattr(jxrs, "splmm_assoc_pcg_bed_to_tsv_fused_exact")
+            if scan_mode_norm == "exact"
+            else hasattr(jxrs, "splmm_assoc_pcg_bed_to_tsv_fused_approx")
+        )
+        fused_qc_raw_requested = _splmm_fused_qc_eligible(
+            route_name="splmm",
+            genetic_model=genetic_model,
+            scan_mode=scan_mode_norm,
+            row_stat_mode=row_stat_mode,
+            bed_exists=os.path.exists(f"{str(prefix)}.bed"),
+            sparse_grm_available=bool(
+                trait_sparse_kinship_path
+                and os.path.exists(str(trait_sparse_kinship_path))
+            ),
+            packed_preload_ready=packed_preload_is_ready(preloaded_packed),
+            prepared_scan_meta_ready=bool(use_preloaded_scan_meta),
+            fused_binding_available=fused_binding_available,
         )
         prepare_handle = (
             _start_indeterminate_progress_bar(

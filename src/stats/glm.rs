@@ -533,35 +533,6 @@ pub(crate) fn lm_resolve_snp_name(snp: &str, chrom: &str, pos: i32) -> String {
 }
 
 #[inline]
-fn transform_model_value(v: f32, model: &str) -> f32 {
-    match model {
-        "add" => v,
-        "dom" => {
-            if (v - 1.0).abs() <= 1e-6 || (v - 2.0).abs() <= 1e-6 {
-                1.0
-            } else {
-                0.0
-            }
-        }
-        "rec" => {
-            if (v - 2.0).abs() <= 1e-6 {
-                1.0
-            } else {
-                0.0
-            }
-        }
-        "het" => {
-            if (v - 1.0).abs() <= 1e-6 {
-                1.0
-            } else {
-                0.0
-            }
-        }
-        _ => v,
-    }
-}
-
-#[inline]
 fn cast_f64_slice_to_f32(input: &[f64]) -> Result<Vec<f32>, String> {
     let mut out = Vec::with_capacity(input.len());
     for &value in input {
@@ -1259,6 +1230,7 @@ pub(crate) fn lm_stream_bed_additive_windowed_unified(
     sample_indices: &[usize],
     maf_threshold: f32,
     max_missing_rate: f32,
+    het_threshold: f32,
     snps_only: bool,
     chunk_size: usize,
     threads: usize,
@@ -1407,6 +1379,10 @@ pub(crate) fn lm_stream_bed_additive_windowed_unified(
                             missing_count: missing,
                         })
                     };
+                }
+
+                if het as f32 / non_missing as f32 > het_threshold {
+                    return None;
                 }
 
                 let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
@@ -2404,9 +2380,9 @@ pub fn lm_stream_bed_to_tsv(
         ));
     }
     let model = genetic_model.trim().to_ascii_lowercase();
-    if !matches!(model.as_str(), "add" | "dom" | "rec" | "het") {
+    if model != "add" {
         return Err(PyValueError::new_err(
-            "genetic_model must be one of: add, dom, rec, het",
+            "GWAS currently supports only additive coding (genetic_model='add').",
         ));
     }
     if let Some(window_mb) = mmap_window_mb {
@@ -2441,22 +2417,10 @@ pub fn lm_stream_bed_to_tsv(
     let qr_ctx =
         LmQrProjection::from_design(x_flat.as_ref(), y, n, q0).map_err(PyRuntimeError::new_err)?;
     let q_rank = qr_ctx.rank;
-    let additive_model = model.as_str() == "add";
-    let x_f32_add = if additive_model {
-        Some(qr_ctx.q_f32.clone())
-    } else {
-        None
-    };
     let y_raw = y.to_vec();
     let rhs_add_cols = q_rank.saturating_add(1);
-    let rhs_add_f32 = if additive_model {
-        Some(
-            pack_lm_scan_rhs_f32(y_raw.as_slice(), x_f32_add.as_deref(), q_rank)
-                .map_err(PyRuntimeError::new_err)?,
-        )
-    } else {
-        None
-    };
+    let rhs_add_f32 = pack_lm_scan_rhs_f32(y_raw.as_slice(), Some(qr_ctx.q_f32.as_slice()), q_rank)
+        .map_err(PyRuntimeError::new_err)?;
     let prepared_meta_input = match (row_indices, row_flip, row_missing, row_maf) {
         (None, None, None, None) => None,
         (Some(row_idx), Some(row_flip), Some(row_missing), Some(row_maf)) => {
@@ -2483,70 +2447,64 @@ pub fn lm_stream_bed_to_tsv(
     };
 
     let norm_prefix = normalize_plink_prefix_local(&prefix);
-    if additive_model {
-        if let Some(prepared_meta_input) = prepared_meta_input {
-            let samples = gfcore::read_fam(&norm_prefix).map_err(PyRuntimeError::new_err)?;
-            let (sample_indices, _sample_ids_ordered) =
-                build_sample_selection(&samples, sample_ids, None)
-                    .map_err(PyRuntimeError::new_err)?;
-            if sample_indices.len() != n {
-                return Err(PyRuntimeError::new_err(format!(
-                    "sample_ids length mismatch: selected n={} but len(y)={n}",
-                    sample_indices.len()
-                )));
-            }
-            let out_tsv_path = out_tsv.clone();
-            return py.detach(move || -> PyResult<(usize, usize)> {
-                lm_stream_bed_additive_prepared_unified(
-                    norm_prefix.as_str(),
-                    &qr_ctx,
-                    rhs_add_f32
-                        .as_ref()
-                        .expect("additive RHS missing")
-                        .as_slice(),
-                    out_tsv_path.as_str(),
-                    sample_indices.as_slice(),
-                    prepared_meta_input,
-                    chunk_size,
-                    threads,
-                    progress_callback.as_ref(),
-                    progress_every,
-                    mmap_window_mb,
-                )
-                .map_err(PyRuntimeError::new_err)
-            });
+    if let Some(prepared_meta_input) = prepared_meta_input {
+        let samples = gfcore::read_fam(&norm_prefix).map_err(PyRuntimeError::new_err)?;
+        let (sample_indices, _sample_ids_ordered) =
+            build_sample_selection(&samples, sample_ids, None).map_err(PyRuntimeError::new_err)?;
+        if sample_indices.len() != n {
+            return Err(PyRuntimeError::new_err(format!(
+                "sample_ids length mismatch: selected n={} but len(y)={n}",
+                sample_indices.len()
+            )));
         }
-        if let Some(window_mb) = mmap_window_mb {
-            let samples = gfcore::read_fam(&norm_prefix).map_err(PyRuntimeError::new_err)?;
-            let (sample_indices, _sample_ids_ordered) =
-                build_sample_selection(&samples, sample_ids, None)
-                    .map_err(PyRuntimeError::new_err)?;
-            if sample_indices.len() != n {
-                return Err(PyRuntimeError::new_err(format!(
-                    "sample_ids length mismatch: selected n={} but len(y)={n}",
-                    sample_indices.len()
-                )));
-            }
-            let out_tsv_path = out_tsv.clone();
-            return py.detach(move || -> PyResult<(usize, usize)> {
-                lm_stream_bed_additive_windowed_unified(
-                    norm_prefix.as_str(),
-                    y_raw.as_slice(),
-                    &qr_ctx,
-                    out_tsv_path.as_str(),
-                    sample_indices.as_slice(),
-                    maf_threshold,
-                    max_missing_rate,
-                    snps_only,
-                    chunk_size,
-                    threads,
-                    progress_callback.as_ref(),
-                    progress_every,
-                    window_mb,
-                )
-                .map_err(PyRuntimeError::new_err)
-            });
+        let out_tsv_path = out_tsv.clone();
+        return py.detach(move || -> PyResult<(usize, usize)> {
+            lm_stream_bed_additive_prepared_unified(
+                norm_prefix.as_str(),
+                &qr_ctx,
+                rhs_add_f32.as_slice(),
+                out_tsv_path.as_str(),
+                sample_indices.as_slice(),
+                prepared_meta_input,
+                chunk_size,
+                threads,
+                progress_callback.as_ref(),
+                progress_every,
+                mmap_window_mb,
+            )
+            .map_err(PyRuntimeError::new_err)
+        });
+    }
+    if let Some(window_mb) = mmap_window_mb {
+        let samples = gfcore::read_fam(&norm_prefix).map_err(PyRuntimeError::new_err)?;
+        let (sample_indices, _sample_ids_ordered) =
+            build_sample_selection(&samples, sample_ids, None).map_err(PyRuntimeError::new_err)?;
+        if sample_indices.len() != n {
+            return Err(PyRuntimeError::new_err(format!(
+                "sample_ids length mismatch: selected n={} but len(y)={n}",
+                sample_indices.len()
+            )));
         }
+        let out_tsv_path = out_tsv.clone();
+        return py.detach(move || -> PyResult<(usize, usize)> {
+            lm_stream_bed_additive_windowed_unified(
+                norm_prefix.as_str(),
+                y_raw.as_slice(),
+                &qr_ctx,
+                out_tsv_path.as_str(),
+                sample_indices.as_slice(),
+                maf_threshold,
+                max_missing_rate,
+                het_threshold,
+                snps_only,
+                chunk_size,
+                threads,
+                progress_callback.as_ref(),
+                progress_every,
+                window_mb,
+            )
+            .map_err(PyRuntimeError::new_err)
+        });
     }
 
     let mut it = if let Some(window_mb) = mmap_window_mb {
@@ -2608,19 +2566,14 @@ pub fn lm_stream_bed_to_tsv(
         let output_row_limit = lm_max_output_rows_env();
         let mut written_total: usize = 0;
         let code4_lut = &packed_byte_lut().code4;
-        let _blas_guard = if additive_model {
-            let lm_parallel_rhs =
-                lm_prefer_parallel_small_rhs(chunk_size.max(1), n, rhs_add_cols, pool.as_ref());
-            let blas_threads = if lm_parallel_rhs || rust_sgemm_prefers_rayon_rowmajor_f32_kernel()
-            {
-                1usize
-            } else {
-                threads.max(1)
-            };
-            Some(BlasThreadGuard::enter(blas_threads))
+        let lm_parallel_rhs =
+            lm_prefer_parallel_small_rhs(chunk_size.max(1), n, rhs_add_cols, pool.as_ref());
+        let blas_threads = if lm_parallel_rhs || rust_sgemm_prefers_rayon_rowmajor_f32_kernel() {
+            1usize
         } else {
-            None
+            threads.max(1)
         };
+        let _blas_guard = BlasThreadGuard::enter(blas_threads);
 
         let finalize_row = |row_sub: &mut [f32],
                             site: &mut gfcore::SiteInfo,
@@ -2635,7 +2588,7 @@ pub fn lm_stream_bed_to_tsv(
                     maf_threshold,
                     max_missing_rate,
                     true,
-                    model.as_str() != "add",
+                    true,
                     het_threshold,
                 )
             } else {
@@ -2646,7 +2599,7 @@ pub fn lm_stream_bed_to_tsv(
                     maf_threshold,
                     max_missing_rate,
                     true,
-                    model.as_str() != "add",
+                    true,
                     het_threshold,
                 )
             };
@@ -2654,23 +2607,12 @@ pub fn lm_stream_bed_to_tsv(
                 return None;
             };
 
-            let mut sum_model = 0.0_f64;
-            let mut maf_sum = 0.0_f64;
-            for v in row_sub.iter_mut() {
-                let mv = transform_model_value(*v, model.as_str());
-                *v = mv;
-                sum_model += mv as f64;
-                maf_sum += mv as f64;
-            }
-            let mean_model = (sum_model / n as f64) as f32;
+            let alt_sum = row_sub.iter().map(|&v| v as f64).sum::<f64>();
+            let mean_model = (alt_sum / n as f64) as f32;
             for v in row_sub.iter_mut() {
                 *v -= mean_model;
             }
-            let maf_val = if model.as_str() == "add" {
-                ((maf_sum / n as f64) * 0.5_f64) as f32
-            } else {
-                (maf_sum / n as f64) as f32
-            };
+            let maf_val = ((alt_sum / n as f64) * 0.5_f64) as f32;
             Some((maf_val, stats.missing_count as f32))
         };
 
@@ -2687,7 +2629,7 @@ pub fn lm_stream_bed_to_tsv(
             Some((row_sub, site, maf_val, miss_val))
         };
 
-        if additive_model && !windowed_mode {
+        if !windowed_mode {
             let prepared = prepare_bed_logic_meta_owned_for_stats_samples_cached(
                 norm_prefix.as_str(),
                 maf_threshold,
@@ -2746,10 +2688,7 @@ pub fn lm_stream_bed_to_tsv(
                     block_slice,
                     rows_here,
                     n,
-                    rhs_add_f32
-                        .as_ref()
-                        .expect("additive RHS missing")
-                        .as_slice(),
+                    rhs_add_f32.as_slice(),
                     rhs_add_cols,
                     xts_slice,
                     pool.as_ref(),
@@ -3032,126 +2971,56 @@ pub fn lm_stream_bed_to_tsv(
             }
 
             let out = &mut out_buf[..m * 5];
-            if additive_model {
-                let block_rows: &[f32] = if windowed_mode {
-                    let dense_window_rows = kept_window_rows
-                        .iter()
-                        .take(m)
-                        .enumerate()
-                        .all(|(dst_idx, &src_idx)| dst_idx == src_idx);
-                    if dense_window_rows {
-                        &window_rows[..m * n]
-                    } else {
-                        chunk_rows.clear();
-                        for &src_idx in kept_window_rows.iter().take(m) {
-                            chunk_rows
-                                .extend_from_slice(&window_rows[src_idx * n..(src_idx + 1) * n]);
-                        }
-                        &chunk_rows[..m * n]
-                    }
+            let block_rows: &[f32] = if windowed_mode {
+                let dense_window_rows = kept_window_rows
+                    .iter()
+                    .take(m)
+                    .enumerate()
+                    .all(|(dst_idx, &src_idx)| dst_idx == src_idx);
+                if dense_window_rows {
+                    &window_rows[..m * n]
                 } else {
+                    chunk_rows.clear();
+                    for &src_idx in kept_window_rows.iter().take(m) {
+                        chunk_rows.extend_from_slice(&window_rows[src_idx * n..(src_idx + 1) * n]);
+                    }
                     &chunk_rows[..m * n]
-                };
-                let gy_slice = &mut gy_block[..m];
-                let xts_slice = &mut xts_block[..m * rhs_add_cols];
-                let ss_slice = &mut row_ss[..m];
-                row_major_block_mul_mat_f32_lm(
-                    block_rows,
-                    m,
-                    n,
-                    rhs_add_f32
-                        .as_ref()
-                        .expect("additive RHS missing")
-                        .as_slice(),
-                    rhs_add_cols,
-                    xts_slice,
-                    pool.as_ref(),
-                );
-                row_major_block_first_col_f32_to_f64(
-                    xts_slice,
-                    m,
-                    rhs_add_cols,
-                    gy_slice,
-                    pool.as_ref(),
-                );
-                row_major_block_sumsq_f64(block_rows, m, n, ss_slice, pool.as_ref());
-                for idx in 0..m {
-                    let xts_row =
-                        &xts_slice[idx * rhs_add_cols + 1..idx * rhs_add_cols + 1 + q_rank];
-                    for j in 0..q_rank {
-                        xts_tmp[j] = xts_row[j] as f64;
-                    }
-                    let stats = lm_assoc_from_qr_projection_raw(
-                        &xts_tmp[..q_rank],
-                        gy_slice[idx],
-                        ss_slice[idx],
-                        &qr_ctx,
-                    );
-                    out[idx * 5..(idx + 1) * 5].copy_from_slice(&stats);
-                }
-            } else if windowed_mode {
-                let mut runner = || {
-                    out.par_chunks_mut(5).enumerate().for_each_init(
-                        || GlmScratch::new(q_rank),
-                        |scr, (idx, row_out)| {
-                            let src_idx = kept_window_rows[idx];
-                            let grow = &window_rows[src_idx * n..(src_idx + 1) * n];
-                            scr.reset_xs();
-                            let mut gy_resid = 0.0_f64;
-                            let mut ss = 0.0_f64;
-
-                            for k in 0..n {
-                                let gv = grow[k] as f64;
-                                gy_resid += gv * qr_ctx.y_resid[k];
-                                ss += gv * gv;
-                                let qrow = &qr_ctx.q[k * q_rank..(k + 1) * q_rank];
-                                for j in 0..q_rank {
-                                    scr.xs[j] += qrow[j] * gv;
-                                }
-                            }
-
-                            row_out.copy_from_slice(&lm_assoc_from_qr_projection(
-                                &scr.xs, gy_resid, ss, &qr_ctx,
-                            ));
-                        },
-                    );
-                };
-                if let Some(p) = &pool {
-                    p.install(&mut runner);
-                } else {
-                    runner();
                 }
             } else {
-                let mut runner = || {
-                    out.par_chunks_mut(5).enumerate().for_each_init(
-                        || GlmScratch::new(q_rank),
-                        |scr, (idx, row_out)| {
-                            let grow = &chunk_rows[idx * n..(idx + 1) * n];
-                            scr.reset_xs();
-                            let mut gy_resid = 0.0_f64;
-                            let mut ss = 0.0_f64;
-
-                            for k in 0..n {
-                                let gv = grow[k] as f64;
-                                gy_resid += gv * qr_ctx.y_resid[k];
-                                ss += gv * gv;
-                                let qrow = &qr_ctx.q[k * q_rank..(k + 1) * q_rank];
-                                for j in 0..q_rank {
-                                    scr.xs[j] += qrow[j] * gv;
-                                }
-                            }
-
-                            row_out.copy_from_slice(&lm_assoc_from_qr_projection(
-                                &scr.xs, gy_resid, ss, &qr_ctx,
-                            ));
-                        },
-                    );
-                };
-                if let Some(p) = &pool {
-                    p.install(&mut runner);
-                } else {
-                    runner();
+                &chunk_rows[..m * n]
+            };
+            let gy_slice = &mut gy_block[..m];
+            let xts_slice = &mut xts_block[..m * rhs_add_cols];
+            let ss_slice = &mut row_ss[..m];
+            row_major_block_mul_mat_f32_lm(
+                block_rows,
+                m,
+                n,
+                rhs_add_f32.as_slice(),
+                rhs_add_cols,
+                xts_slice,
+                pool.as_ref(),
+            );
+            row_major_block_first_col_f32_to_f64(
+                xts_slice,
+                m,
+                rhs_add_cols,
+                gy_slice,
+                pool.as_ref(),
+            );
+            row_major_block_sumsq_f64(block_rows, m, n, ss_slice, pool.as_ref());
+            for idx in 0..m {
+                let xts_row = &xts_slice[idx * rhs_add_cols + 1..idx * rhs_add_cols + 1 + q_rank];
+                for j in 0..q_rank {
+                    xts_tmp[j] = xts_row[j] as f64;
                 }
+                let stats = lm_assoc_from_qr_projection_raw(
+                    &xts_tmp[..q_rank],
+                    gy_slice[idx],
+                    ss_slice[idx],
+                    &qr_ctx,
+                );
+                out[idx * 5..(idx + 1) * 5].copy_from_slice(&stats);
             }
 
             let write_rows = output_row_limit
@@ -3172,7 +3041,7 @@ pub fn lm_stream_bed_to_tsv(
                         chisq_col: 2,
                         raw_p_col: 3,
                     },
-                    model.as_str(),
+                    "add",
                     AssocCoreSitesBlock {
                         sites: &chunk_sites[..write_rows],
                         maf: &chunk_maf[..write_rows],
@@ -3507,20 +3376,6 @@ pub fn lm_stream_bed_segments_compact_to_tsv<'py>(
         )
         .map_err(PyRuntimeError::new_err)
     })
-}
-
-struct GlmScratch {
-    xs: Vec<f64>, // q0
-}
-
-impl GlmScratch {
-    fn new(q0: usize) -> Self {
-        Self { xs: vec![0.0; q0] }
-    }
-    #[inline]
-    fn reset_xs(&mut self) {
-        self.xs.fill(0.0);
-    }
 }
 
 /// Unified LM block formula using centered/residualized approach with BLAS-3.

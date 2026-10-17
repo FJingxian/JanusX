@@ -60,6 +60,16 @@ impl From<core::SiteInfo> for SiteInfo {
     }
 }
 
+fn validate_additive_model(model: Option<&str>, argument: &str) -> PyResult<()> {
+    if model.unwrap_or("add").trim().eq_ignore_ascii_case("add") {
+        Ok(())
+    } else {
+        Err(PyValueError::new_err(format!(
+            "{argument} must be 'add'; non-additive genotype coding is unsupported"
+        )))
+    }
+}
+
 #[pymethods]
 impl SiteInfo {
     #[new]
@@ -2762,14 +2772,7 @@ pub fn bed_filter_stream_to_plink_rust(
         ));
     }
 
-    let model_key = model
-        .unwrap_or_else(|| "add".to_string())
-        .to_ascii_lowercase();
-    if !matches!(model_key.as_str(), "add" | "dom" | "rec" | "het") {
-        return Err(PyValueError::new_err(
-            "model must be one of: add, dom, rec, het",
-        ));
-    }
+    validate_additive_model(model.as_deref(), "model")?;
     let het = het_threshold.unwrap_or(1.0);
     if !(0.0..=1.0).contains(&het) {
         return Err(PyValueError::new_err(
@@ -3155,14 +3158,7 @@ pub fn bed_filter_to_plink_rust(
         ));
     }
 
-    let model_key = model
-        .unwrap_or_else(|| "add".to_string())
-        .to_ascii_lowercase();
-    if !matches!(model_key.as_str(), "add" | "dom" | "rec" | "het") {
-        return Err(PyValueError::new_err(
-            "model must be one of: add, dom, rec, het",
-        ));
-    }
+    validate_additive_model(model.as_deref(), "model")?;
     let het = het_threshold.unwrap_or(1.0);
     if !(0.0..=1.0).contains(&het) {
         return Err(PyValueError::new_err(
@@ -3235,42 +3231,6 @@ pub struct BedChunkReader {
     apply_het_filter: bool,
     het_threshold: f32,
     preserve_alt_orientation: bool,
-}
-
-#[derive(Clone, Copy)]
-enum BedPreparedCodingMode {
-    Add,
-    Dom,
-    Rec,
-    Het,
-}
-
-#[inline]
-fn bed_apply_coding_value(v: f32, mode: BedPreparedCodingMode) -> f32 {
-    match mode {
-        BedPreparedCodingMode::Add => v,
-        BedPreparedCodingMode::Dom => {
-            if (v - 1.0_f32).abs() <= 1e-6_f32 || (v - 2.0_f32).abs() <= 1e-6_f32 {
-                1.0_f32
-            } else {
-                0.0_f32
-            }
-        }
-        BedPreparedCodingMode::Rec => {
-            if (v - 2.0_f32).abs() <= 1e-6_f32 {
-                1.0_f32
-            } else {
-                0.0_f32
-            }
-        }
-        BedPreparedCodingMode::Het => {
-            if (v - 1.0_f32).abs() <= 1e-6_f32 {
-                1.0_f32
-            } else {
-                0.0_f32
-            }
-        }
-    }
 }
 
 #[inline]
@@ -3356,12 +3316,7 @@ impl BedChunkReader {
         let maf = maf_threshold.unwrap_or(0.0);
         let miss = max_missing_rate.unwrap_or(1.0);
         let fill = fill_missing.unwrap_or(true);
-        let model_key = model.as_deref().unwrap_or("add").to_ascii_lowercase();
-        if !matches!(model_key.as_str(), "add" | "dom" | "rec" | "het") {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "model must be one of: add, dom, rec, het",
-            ));
-        }
+        validate_additive_model(model.as_deref(), "model")?;
         let het = het_threshold.unwrap_or(1.0);
         let preserve_alt_orientation = preserve_alt_orientation.unwrap_or(false);
         if !(0.0..=1.0).contains(&het) {
@@ -3707,13 +3662,12 @@ impl BedChunkReader {
         Ok(Some((py_mat, sites)))
     }
 
-    /// Return chunk with model-coding + row-centering prepared in Rust.
+    /// Return additive dosage rows with row-centering prepared in Rust.
     ///
     /// Output tuple:
     ///   (geno_centered, sites, af, miss)
     /// where `af` is:
-    ///   - additive: mean(additive dosage)/2 with ALT kept as dosage 1
-    ///   - dom/rec/het: mean(coded value)
+    ///   - mean additive dosage / 2 with ALT kept as dosage 1
     /// and `miss` is the per-site missing genotype count on the selected samples.
     #[pyo3(signature = (chunk_size, coding=None, snps_only=false))]
     fn next_chunk_prepared<'py>(
@@ -3739,18 +3693,11 @@ impl BedChunkReader {
             .unwrap_or_else(|| "add".to_string())
             .trim()
             .to_ascii_lowercase();
-        let coding_mode = match coding_key.as_str() {
-            "add" => BedPreparedCodingMode::Add,
-            "dom" => BedPreparedCodingMode::Dom,
-            "rec" => BedPreparedCodingMode::Rec,
-            "het" => BedPreparedCodingMode::Het,
-            _ => {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "coding must be one of: add, dom, rec, het",
-                ));
-            }
-        };
-        let additive_mode = matches!(coding_mode, BedPreparedCodingMode::Add);
+        if coding_key != "add" {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "coding must be 'add'; non-additive genotype coding is unsupported",
+            ));
+        }
 
         let n = self.sample_indices.len();
         if n == 0 {
@@ -3794,21 +3741,14 @@ impl BedChunkReader {
             }
 
             let mut sum = 0.0_f64;
-            for v in row_sub.iter_mut() {
-                let mv = bed_apply_coding_value(*v, coding_mode);
-                *v = mv;
-                sum += mv as f64;
+            for &v in row_sub.iter() {
+                sum += v as f64;
             }
-            let coded_mean = (sum / n as f64) as f32;
-            let mean = coded_mean;
+            let mean = (sum / n as f64) as f32;
             for v in row_sub.iter_mut() {
                 *v -= mean;
             }
-            let af_v = if additive_mode {
-                coded_mean * 0.5_f32
-            } else {
-                coded_mean
-            };
+            let af_v = mean * 0.5_f32;
             Some((row_sub, site.into(), af_v, stats.missing_count as f32))
         };
 
@@ -4018,12 +3958,7 @@ impl VcfChunkReader {
         let maf = maf_threshold.unwrap_or(0.0);
         let miss = max_missing_rate.unwrap_or(1.0);
         let fill = fill_missing.unwrap_or(true);
-        let model_key = model.as_deref().unwrap_or("add").to_ascii_lowercase();
-        if !matches!(model_key.as_str(), "add" | "dom" | "rec" | "het") {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "model must be one of: add, dom, rec, het",
-            ));
-        }
+        validate_additive_model(model.as_deref(), "model")?;
         let het = het_threshold.unwrap_or(1.0);
         if !(0.0..=1.0).contains(&het) {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -4171,12 +4106,7 @@ impl HmpChunkReader {
         let maf = maf_threshold.unwrap_or(0.0);
         let miss = max_missing_rate.unwrap_or(1.0);
         let fill = fill_missing.unwrap_or(true);
-        let model_key = model.as_deref().unwrap_or("add").to_ascii_lowercase();
-        if !matches!(model_key.as_str(), "add" | "dom" | "rec" | "het") {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "model must be one of: add, dom, rec, het",
-            ));
-        }
+        validate_additive_model(model.as_deref(), "model")?;
         let het = het_threshold.unwrap_or(1.0);
         if !(0.0..=1.0).contains(&het) {
             return Err(pyo3::exceptions::PyValueError::new_err(
@@ -4368,12 +4298,7 @@ impl TxtChunkReader {
         let maf = maf_threshold.unwrap_or(0.0);
         let miss = max_missing_rate.unwrap_or(1.0);
         let fill = fill_missing.unwrap_or(true);
-        let model_key = model.as_deref().unwrap_or("add").to_ascii_lowercase();
-        if !matches!(model_key.as_str(), "add" | "dom" | "rec" | "het") {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "model must be one of: add, dom, rec, het",
-            ));
-        }
+        validate_additive_model(model.as_deref(), "model")?;
         let het = het_threshold.unwrap_or(1.0);
         if !(0.0..=1.0).contains(&het) {
             return Err(pyo3::exceptions::PyValueError::new_err(

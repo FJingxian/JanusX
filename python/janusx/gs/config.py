@@ -83,8 +83,11 @@ class GsConfig:
                     raise ValueError(f"trait index must be >= 0, got {x}")
         for k in self.gblup_kernels:
             kk = str(k).strip().lower()
-            if kk not in {"a", "d", "ad"}:
-                raise ValueError(f"Unsupported GBLUP kernel token: {k}")
+            if kk != "a":
+                raise ValueError(
+                    "GS supports additive GBLUP only; "
+                    f"unsupported kernel token: {k!r}."
+                )
         for name in ("bayesb", "bayesc"):
             value = getattr(self, name)
             if value is False or value is True or value is None:
@@ -139,8 +142,7 @@ class GsConfig:
             g_tokens = [str(x).strip().lower() for x in self.gblup_kernels]
             if g_tokens != ["a"]:
                 raise ValueError(
-                    "The public GS CLI now exposes additive GBLUP through -BLUP; "
-                    "explicit dominance GBLUP kernels are not available through GsConfig."
+                    "The public GS CLI supports additive GBLUP only through -BLUP."
                 )
             argv.append("-BLUP")
         if bool(self.blup):

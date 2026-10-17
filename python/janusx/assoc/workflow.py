@@ -257,10 +257,51 @@ from janusx.assoc.workflow_cache import (
 )
 
 
-def _splmm_fused_qc_opted_in() -> bool:
-    """Return whether the experimental one-pass SparseLMM QC route is enabled."""
-    value = str(os.environ.get("JANUSX_SPLMM_FUSED_QC", "")).strip().lower()
-    return value in {"1", "true", "yes", "on"}
+def _splmm_fused_qc_enabled() -> bool:
+    """Resolve the fused SparseLMM QC default; set JANUSX_SPLMM_FUSED_QC=0 to disable."""
+    raw_value = os.environ.get("JANUSX_SPLMM_FUSED_QC")
+    if raw_value is None or str(raw_value).strip() == "":
+        return True
+    value = str(raw_value).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        "Invalid JANUSX_SPLMM_FUSED_QC value "
+        f"{raw_value!r}; expected 1/true/yes/on or 0/false/no/off."
+    )
+
+
+def _splmm_fused_qc_eligible(
+    *,
+    route_name: str,
+    genetic_model: str,
+    scan_mode: str,
+    row_stat_mode: str,
+    bed_exists: bool,
+    sparse_grm_available: bool,
+    packed_preload_ready: bool,
+    prepared_scan_meta_ready: bool,
+    fused_binding_available: bool,
+) -> bool:
+    """Return the single policy decision shared by metadata and scan routing."""
+    if (
+        str(route_name).strip().lower() != "splmm"
+        or str(genetic_model).strip().lower() != "add"
+    ):
+        return False
+    enabled = _splmm_fused_qc_enabled()
+    return bool(
+        enabled
+        and str(scan_mode).strip().lower() in {"approx", "exact"}
+        and str(row_stat_mode).strip().lower() == "strict-train"
+        and bool(bed_exists)
+        and bool(sparse_grm_available)
+        and not bool(packed_preload_ready)
+        and not bool(prepared_scan_meta_ready)
+        and bool(fused_binding_available)
+    )
 
 
 def _write_pca_cache_with_ids(path: str, sample_ids: np.ndarray, qmatrix: np.ndarray) -> None:
@@ -4323,6 +4364,8 @@ def prepare_streaming_context(
       - GRM + Q (cached)
       - covariates (optional)
     """
+    if str(genetic_model).strip().lower() != "add":
+        raise ValueError("GWAS currently supports only additive coding (model='add').")
     if _is_kfile_prefix(genofile):
         k_chunk = max(
             1,
@@ -7144,6 +7187,9 @@ def _run_file_dense_fast_once(
 ) -> tuple[pd.DataFrame, np.ndarray, int]:
     from janusx.pyBLUP.QK2 import GRM as _calc_grm
 
+    if str(getattr(args, "model", "add")).strip().lower() != "add":
+        raise ValueError("GWAS currently supports only additive coding (model='add').")
+
     def _extract_ref_alt(
         ref_alt_obj: object,
         n_markers: int,
@@ -7177,48 +7223,6 @@ def _run_file_dense_fast_once(
         het_rate[idx] = het_count[idx] / non_missing[idx]
         keep &= het_rate <= float(het_threshold)
         return keep
-
-    def _apply_genetic_model(geno_add: np.ndarray, model: str) -> np.ndarray:
-        m = str(model).lower()
-        g = np.asarray(geno_add, dtype=np.float32)
-        if m == "add":
-            return g
-        if m == "dom":
-            return (
-                np.isclose(g, 1.0, atol=1e-6) | np.isclose(g, 2.0, atol=1e-6)
-            ).astype(np.float32, copy=False)
-        if m == "rec":
-            return np.isclose(g, 2.0, atol=1e-6).astype(np.float32, copy=False)
-        if m == "het":
-            return np.isclose(g, 1.0, atol=1e-6).astype(np.float32, copy=False)
-        raise ValueError(f"Unsupported genetic model for dense FILE fast route: {model}")
-
-    def _transform_alleles(
-        allele0_list: list[str],
-        allele1_list: list[str],
-        model: str,
-    ) -> tuple[list[str], list[str]]:
-        m = str(model).lower()
-        if m == "add":
-            return allele0_list, allele1_list
-        out0: list[str] = []
-        out1: list[str] = []
-        for a0, a1 in zip(allele0_list, allele1_list):
-            hom0 = f"{a0}{a0}"
-            het = f"{a0}{a1}"
-            hom1 = f"{a1}{a1}"
-            if m == "dom":
-                out0.append(hom0)
-                out1.append(f"{het}/{hom1}")
-            elif m == "rec":
-                out0.append(f"{het}/{hom0}")
-                out1.append(hom1)
-            elif m == "het":
-                out0.append(f"{hom0}/{hom1}")
-                out1.append(het)
-            else:
-                raise ValueError(f"Unsupported genetic model for dense FILE packed route: {model}")
-        return out0, out1
 
     process = psutil.Process()
     n_cores = detect_effective_threads()
@@ -7303,7 +7307,6 @@ def _run_file_dense_fast_once(
     )
 
     model_sequence = [m for m in stream_models if m in {"lm", "lm2", "lmm", "lmm2", "fvlmm"}]
-    gm_tag = "add"
     pheno_aligned, ids = _align_pheno_to_sample_order(pheno, ids)
     trait_iter = list(pheno_aligned.columns)
     multi_trait_mode = len(trait_iter) > 1
@@ -7363,10 +7366,12 @@ def _run_file_dense_fast_once(
         x_arg = x_cov if int(x_cov.shape[1]) > 0 else None
 
         geno_add_sub = np.ascontiguousarray(geno[:, keep_idx], dtype=np.float32)
-        if gm_tag == "add":
-            keep_site = np.ones((int(geno_add_sub.shape[0]),), dtype=bool)
-        else:
-            keep_site = _heter_keep_mask(geno_add_sub, float(args.het))
+        het_threshold = float(args.het)
+        keep_site = (
+            np.ones((int(geno_add_sub.shape[0]),), dtype=bool)
+            if het_threshold >= 1.0
+            else _heter_keep_mask(geno_add_sub, het_threshold)
+        )
 
         if not np.any(keep_site):
             for mkey in model_sequence:
@@ -7418,10 +7423,7 @@ def _run_file_dense_fast_once(
             continue
 
         geno_add_use = np.ascontiguousarray(geno_add_sub[keep_site], dtype=np.float32)
-        geno_model = np.ascontiguousarray(
-            _apply_genetic_model(geno_add_use, gm_tag),
-            dtype=np.float32,
-        )
+        geno_model = geno_add_use
         p = np.asarray(np.mean(geno_add_use, axis=1, dtype=np.float64) / 2.0, dtype=np.float64)
         p = np.clip(p, 0.0, 1.0)
         af = np.ascontiguousarray(p, dtype=np.float32)
@@ -7432,7 +7434,7 @@ def _run_file_dense_fast_once(
         snp_keep = [snp_all[int(i)] for i in idx_keep]
         allele0_keep = [allele0_all[int(i)] for i in idx_keep]
         allele1_keep = [allele1_all[int(i)] for i in idx_keep]
-        allele0_use, allele1_use = _transform_alleles(allele0_keep, allele1_keep, gm_tag)
+        allele0_use, allele1_use = allele0_keep, allele1_keep
 
         kinship_sub: Union[np.ndarray, None] = None
         lmm_model_obj: Optional[Any] = None
@@ -7448,12 +7450,8 @@ def _run_file_dense_fast_once(
                 model_label = str(mkey).upper()
             model_tag = str(mkey).lower()
             pname_tag = _safe_trait_file_label(pname)
-            if gm_tag == "add":
-                out_tsv = f"{outprefix}.{pname_tag}.{model_tag}.tsv"
-                out_svg = f"{outprefix}.{pname_tag}.{model_tag}.svg"
-            else:
-                out_tsv = f"{outprefix}.{pname_tag}.{gm_tag}.{model_tag}.tsv"
-                out_svg = f"{outprefix}.{pname_tag}.{gm_tag}.{model_tag}.svg"
+            out_tsv = f"{outprefix}.{pname_tag}.{model_tag}.tsv"
+            out_svg = f"{outprefix}.{pname_tag}.{model_tag}.svg"
 
             cpu_t0 = process.cpu_times()
             wall_t0 = time.monotonic()
@@ -9933,6 +9931,7 @@ def _run_gwas_pipeline(
                             result_stem=str(run_cfg.get("result_stem", "splmm") or "splmm"),
                             model_label=str(run_cfg.get("model_label", "SparseLMM") or "SparseLMM"),
                             bimranges=scan_bimranges,
+                            row_stat_mode=gwas_row_stat_mode,
                         )
 
                     def _run_route_fvlmm_stream(
@@ -10362,6 +10361,7 @@ def _run_gwas_pipeline(
                     def _splmm_fused_qc_bypasses_prepared_meta(
                         route_name: str,
                         model_token: Optional[str],
+                        trait_token: str,
                     ) -> bool:
                         route_key = str(route_name).lower().strip()
                         model_key = str(model_token or "").lower().strip()
@@ -10374,18 +10374,37 @@ def _run_gwas_pipeline(
                         fused_binding_available = (
                             hasattr(jxrs, "splmm_assoc_pcg_bed_to_tsv_fused_exact")
                             if scan_mode == "exact"
-                            else hasattr(jxrs, "splmm_assoc_pcg_bed_to_tsv_fused_approx")
+                            else (
+                                hasattr(jxrs, "splmm_assoc_pcg_bed_to_tsv_fused_approx")
+                                if scan_mode == "approx"
+                                else False
+                            )
                         )
-                        fused_model_eligible = scan_mode in {"exact", "approx"}
-                        return bool(
-                            _splmm_fused_qc_opted_in()
-                            and route_key == "splmm"
-                            and cfg is not None
-                            and fused_binding_available
-                            and fused_model_eligible
-                            and cfg.get("sparse_jxgrm_path", None) is not None
-                            and prefix_meta is not None
-                            and str(args.model).lower() == "add"
+                        sparse_path = (
+                            cfg.get("sparse_jxgrm_path", None)
+                            if cfg is not None
+                            else None
+                        )
+                        return _splmm_fused_qc_eligible(
+                            route_name=route_key,
+                            genetic_model=str(args.model),
+                            scan_mode=scan_mode,
+                            row_stat_mode=gwas_row_stat_mode,
+                            bed_exists=bool(
+                                prefix_meta is not None
+                                and os.path.exists(f"{str(prefix_meta)}.bed")
+                            ),
+                            sparse_grm_available=bool(
+                                sparse_path is not None
+                                and os.path.exists(str(sparse_path))
+                            ),
+                            packed_preload_ready=packed_preload_is_ready(
+                                preloaded_packed
+                            ),
+                            prepared_scan_meta_ready=(
+                                str(trait_token) in trait_shared_meta_cache
+                            ),
+                            fused_binding_available=fused_binding_available,
                         )
 
                     def _trait_prepared_meta_needs_build(
@@ -10399,6 +10418,7 @@ def _run_gwas_pipeline(
                             _splmm_fused_qc_bypasses_prepared_meta(
                                 route_key,
                                 model_token,
+                                trait_token,
                             )
                             or
                             route_key not in meta_capable_routes
@@ -10431,6 +10451,7 @@ def _run_gwas_pipeline(
                             _splmm_fused_qc_bypasses_prepared_meta(
                                 route_key,
                                 model_token,
+                                trait_token,
                             )
                             or
                             route_key not in meta_capable_routes

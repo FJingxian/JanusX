@@ -6,7 +6,7 @@ use crate::bedmath::{
 };
 use crate::gfreader::SampleSubsetPlan;
 use crate::gload::WindowedBedMatrix;
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::PyResult;
 use rayon::prelude::*;
 use std::sync::Arc;
@@ -99,49 +99,15 @@ impl AdditiveDecodePlan {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PackedGeneticModel {
     Add,
-    Dom,
-    Rec,
-    Het,
 }
 
 impl PackedGeneticModel {
     pub(crate) fn parse(text: &str) -> PyResult<Self> {
         match text.to_ascii_lowercase().as_str() {
             "add" => Ok(Self::Add),
-            "dom" => Ok(Self::Dom),
-            "rec" => Ok(Self::Rec),
-            "het" => Ok(Self::Het),
-            _ => Err(PyRuntimeError::new_err(
-                "model must be one of: add, dom, rec, het",
+            _ => Err(PyValueError::new_err(
+                "model must be 'add'; non-additive genotype coding is unsupported",
             )),
-        }
-    }
-
-    #[inline]
-    pub(crate) fn apply(self, g: f64) -> f64 {
-        match self {
-            Self::Add => g,
-            Self::Dom => {
-                if g > 0.0 {
-                    1.0
-                } else {
-                    0.0
-                }
-            }
-            Self::Rec => {
-                if (g - 2.0).abs() < 1e-6 {
-                    1.0
-                } else {
-                    0.0
-                }
-            }
-            Self::Het => {
-                if (g - 1.0).abs() < 1e-6 {
-                    1.0
-                } else {
-                    0.0
-                }
-            }
         }
     }
 }
@@ -160,21 +126,13 @@ pub(crate) fn resolve_source_row_index(row_indices: Option<&[usize]>, row_idx: u
 }
 
 #[inline]
-fn packed_model_value_lut_f32<F>(apply: &F, flip: bool, mean_g: f32) -> [f32; 4]
-where
-    F: Fn(f64) -> f64 + Sync,
-{
+fn packed_additive_value_lut_f32(flip: bool, mean_g: f32) -> [f32; 4] {
     let raw = if flip {
         [2.0_f32, mean_g, 1.0_f32, 0.0_f32]
     } else {
         [0.0_f32, mean_g, 1.0_f32, 2.0_f32]
     };
-    [
-        apply(raw[0] as f64) as f32,
-        apply(raw[1] as f64) as f32,
-        apply(raw[2] as f64) as f32,
-        apply(raw[3] as f64) as f32,
-    ]
+    raw
 }
 
 #[inline]
@@ -189,7 +147,7 @@ fn center_decoded_row_inplace_f32(row: &mut [f32]) {
 }
 
 #[inline]
-pub(crate) fn decode_centered_block_packed_f32<F>(
+pub(crate) fn decode_centered_block_packed_f32(
     packed_flat: &[u8],
     bytes_per_snp: usize,
     row_flip: &[bool],
@@ -198,14 +156,11 @@ pub(crate) fn decode_centered_block_packed_f32<F>(
     row_start: usize,
     rows: usize,
     n: usize,
-    apply: &F,
     sample_identity: bool,
     subset_plan: Option<&SubsetDecodePlan>,
     dense_subset_pos: Option<&[isize]>,
     out: &mut [f32],
-) where
-    F: Fn(f64) -> f64 + Sync,
-{
+) {
     if rows == 0 || n == 0 {
         return;
     }
@@ -218,7 +173,7 @@ pub(crate) fn decode_centered_block_packed_f32<F>(
             let src_row = row_indices.map(|v| v[idx]).unwrap_or(idx);
             let row = &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
             let mean_g = (2.0_f64 * (row_maf[idx] as f64)).max(0.0);
-            let value_lut = packed_model_value_lut_f32(apply, row_flip[idx], mean_g as f32);
+            let value_lut = packed_additive_value_lut_f32(row_flip[idx], mean_g as f32);
             decode_row_centered_full_lut(row, n, code4_lut, &value_lut, dst);
             center_decoded_row_inplace_f32(dst);
         });
@@ -233,7 +188,7 @@ pub(crate) fn decode_centered_block_packed_f32<F>(
                 let src_row = row_indices.map(|v| v[idx]).unwrap_or(idx);
                 let row = &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
                 let mean_g = (2.0_f64 * (row_maf[idx] as f64)).max(0.0);
-                let value_lut = packed_model_value_lut_f32(apply, row_flip[idx], mean_g as f32);
+                let value_lut = packed_additive_value_lut_f32(row_flip[idx], mean_g as f32);
                 decode_row_centered_full_lut(
                     row,
                     sample_pos.len(),
@@ -264,7 +219,7 @@ pub(crate) fn decode_centered_block_packed_f32<F>(
         let src_row = row_indices.map(|v| v[idx]).unwrap_or(idx);
         let row = &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
         let mean_g = (2.0_f64 * (row_maf[idx] as f64)).max(0.0);
-        let value_lut = packed_model_value_lut_f32(apply, row_flip[idx], mean_g as f32);
+        let value_lut = packed_additive_value_lut_f32(row_flip[idx], mean_g as f32);
         decode_subset_with_plan(row, plan, &value_lut, dst);
         center_decoded_row_inplace_f32(dst);
     });
@@ -286,6 +241,7 @@ pub(crate) fn decode_centered_block_packed_model_f32(
     dense_subset_pos: Option<&[isize]>,
     out: &mut [f32],
 ) {
+    let _ = gm;
     decode_centered_block_packed_f32(
         packed_flat,
         bytes_per_snp,
@@ -295,7 +251,6 @@ pub(crate) fn decode_centered_block_packed_model_f32(
         row_start,
         rows,
         n,
-        &|g| gm.apply(g),
         sample_identity,
         subset_plan,
         dense_subset_pos,
@@ -304,19 +259,16 @@ pub(crate) fn decode_centered_block_packed_model_f32(
 }
 
 #[inline]
-pub(crate) fn decode_packed_row_model_into_f64<F>(
+pub(crate) fn decode_packed_row_additive_into_f64(
     row: &[u8],
     flip: bool,
     row_maf: f32,
     n: usize,
-    apply: &F,
     sample_identity: bool,
     sample_byte_idx: Option<&[usize]>,
     sample_bit_shift: Option<&[u8]>,
     out: &mut [f64],
-) where
-    F: Fn(f64) -> f64 + Sync,
-{
+) {
     debug_assert_eq!(out.len(), n);
     let mean_g = (2.0_f64 * row_maf as f64).max(0.0);
     if sample_identity {
@@ -334,7 +286,7 @@ pub(crate) fn decode_packed_row_model_into_f64<F>(
                 if flip && code != 0b01 {
                     gv = 2.0_f64 - gv;
                 }
-                out[j] = apply(gv);
+                out[j] = gv;
                 lane += 1;
                 j += 1;
             }
@@ -359,7 +311,7 @@ pub(crate) fn decode_packed_row_model_into_f64<F>(
         if flip && code != 0b01 {
             gv = 2.0_f64 - gv;
         }
-        out[j] = apply(gv);
+        out[j] = gv;
     }
 }
 
@@ -375,12 +327,12 @@ pub(crate) fn decode_packed_row_model_enum_into_f64(
     sample_bit_shift: Option<&[u8]>,
     out: &mut [f64],
 ) {
-    decode_packed_row_model_into_f64(
+    let _ = gm;
+    decode_packed_row_additive_into_f64(
         row,
         flip,
         row_maf,
         n,
-        &|g| gm.apply(g),
         sample_identity,
         sample_byte_idx,
         sample_bit_shift,

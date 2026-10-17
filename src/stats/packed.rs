@@ -2703,15 +2703,11 @@ pub fn packed_malpha_mode_f64<'py>(
     threads: usize,
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let mode_norm = mode.trim().to_ascii_lowercase();
-    let mode_is_dom = match mode_norm.as_str() {
-        "a" | "add" | "additive" => false,
-        "d" | "dom" | "dominance" => true,
-        _ => {
-            return Err(PyRuntimeError::new_err(
-                "mode must be one of {'a','additive','d','dominance'}",
-            ))
-        }
-    };
+    if !matches!(mode_norm.as_str(), "a" | "add" | "additive") {
+        return Err(PyRuntimeError::new_err(
+            "packed marker effects support additive mode only ('a'/'additive')",
+        ));
+    }
     if n_samples == 0 {
         return Err(PyRuntimeError::new_err("n_samples must be > 0"));
     }
@@ -2815,10 +2811,7 @@ pub fn packed_malpha_mode_f64<'py>(
                                     [row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
                                 let p = row_maf_vec[row_idx].clamp(0.0_f32, 1.0_f32);
                                 let mean_add = 2.0_f32 * p;
-                                let mean_dom = 2.0_f32 * p * (1.0_f32 - p);
-                                let value_lut = if mode_is_dom {
-                                    [0.0_f32, mean_dom, 1.0_f32, 0.0_f32]
-                                } else if row_flip_vec[row_idx] {
+                                let value_lut = if row_flip_vec[row_idx] {
                                     [2.0_f32, mean_add, 1.0_f32, 0.0_f32]
                                 } else {
                                     [0.0_f32, mean_add, 1.0_f32, 2.0_f32]
@@ -2841,29 +2834,19 @@ pub fn packed_malpha_mode_f64<'py>(
                                 let flip = row_flip_vec[row_idx];
                                 let p = row_maf_vec[row_idx].clamp(0.0_f32, 1.0_f32);
                                 let mean_add = 2.0_f32 * p;
-                                let mean_dom = 2.0_f32 * p * (1.0_f32 - p);
                                 for (j, &sid) in sample_idx.iter().enumerate() {
                                     let b = row[sid >> 2];
                                     let code = (b >> ((sid & 3) * 2)) & 0b11;
-                                    let gv = if mode_is_dom {
-                                        match code {
-                                            0b10 => 1.0_f32,
-                                            0b00 | 0b11 => 0.0_f32,
-                                            _ => mean_dom,
-                                        }
-                                    } else {
-                                        let mut x = match code {
-                                            0b00 => 0.0_f32,
-                                            0b10 => 1.0_f32,
-                                            0b11 => 2.0_f32,
-                                            _ => mean_add,
-                                        };
-                                        if flip && code != 0b01 {
-                                            x = 2.0_f32 - x;
-                                        }
-                                        x
+                                    let mut x = match code {
+                                        0b00 => 0.0_f32,
+                                        0b10 => 1.0_f32,
+                                        0b11 => 2.0_f32,
+                                        _ => mean_add,
                                     };
-                                    out_row[j] = gv;
+                                    if flip && code != 0b01 {
+                                        x = 2.0_f32 - x;
+                                    }
+                                    out_row[j] = x;
                                 }
                             },
                         );

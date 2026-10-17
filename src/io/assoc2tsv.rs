@@ -113,29 +113,6 @@ enum AssocMissValue {
     Rate(f32),
 }
 
-#[inline]
-pub(crate) fn transform_alleles_by_model(
-    ref_allele: &str,
-    alt_allele: &str,
-    model_key: &str,
-) -> (String, String) {
-    match model_key {
-        "dom" => (
-            format!("{ref_allele}{ref_allele}"),
-            format!("{ref_allele}{alt_allele}/{alt_allele}{alt_allele}"),
-        ),
-        "rec" => (
-            format!("{ref_allele}{alt_allele}/{ref_allele}{ref_allele}"),
-            format!("{alt_allele}{alt_allele}"),
-        ),
-        "het" => (
-            format!("{ref_allele}{ref_allele}/{alt_allele}{alt_allele}"),
-            format!("{ref_allele}{alt_allele}"),
-        ),
-        _ => (ref_allele.to_string(), alt_allele.to_string()),
-    }
-}
-
 pub(crate) fn resolve_assoc_tsv_metadata(
     bed_prefix: Option<&str>,
     chrom: Vec<String>,
@@ -371,7 +348,9 @@ fn append_assoc_row_text(
     miss_rate: f32,
     row: &[f64],
 ) {
-    let (a0, a1) = transform_alleles_by_model(&site.ref_allele, &site.alt_allele, model_key);
+    let _ = model_key;
+    let a0 = &site.ref_allele;
+    let a1 = &site.alt_allele;
     let beta = row[0];
     let se = row[1];
     let pwald = sanitize_assoc_pvalue(beta, se, row[2]);
@@ -440,7 +419,9 @@ fn append_assoc_row_from_fields(
     miss: AssocMissValue,
     row: &[f64],
 ) {
-    let (a0, a1) = transform_alleles_by_model(allele0, allele1, model_key);
+    let _ = model_key;
+    let a0 = allele0;
+    let a1 = allele1;
     match layout {
         AssocResultLayout::ResultCols { schema, .. } => {
             let beta = row[0];
@@ -774,9 +755,9 @@ impl GwasAssocTsvWriter {
     #[pyo3(signature = (path, genetic_model="add"))]
     fn new(path: String, genetic_model: &str) -> PyResult<Self> {
         let model_key = genetic_model.trim().to_ascii_lowercase();
-        if !matches!(model_key.as_str(), "add" | "dom" | "rec" | "het") {
+        if model_key != "add" {
             return Err(PyValueError::new_err(
-                "genetic_model must be one of: add, dom, rec, het",
+                "genetic_model must be 'add'; non-additive genotype coding is unsupported",
             ));
         }
         Ok(Self {

@@ -38,6 +38,7 @@ from ._typing import (
 )
 from .workflow_model_packed import (
     _splmm_normalize_sparse_grm_path,
+    _splmm_rank_reduce_covariates,
     _splmm_sparse_null_fit,
 )
 
@@ -1033,6 +1034,10 @@ class ASSOC:
             raise ValueError("Phenotype contains NaN/Inf values.")
         x_cov = _coerce_covariates(X, sample_index=sample_index, n_samples=int(y_arr.shape[0]))
         route = self._resolve_route(k)
+        if route == "splmm" and x_cov is not None and int(x_cov.shape[1]) > 0:
+            x_cov, _fixed_effect_kept, _fixed_effect_dropped = (
+                _splmm_rank_reduce_covariates(x_cov)
+            )
 
         self.sample_index_ = sample_index
         self.sample_ids_str_ = _sample_ids_to_strings(sample_index)

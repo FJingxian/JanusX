@@ -3157,6 +3157,25 @@ def _splmm_fastgwa_fixed_vp_prepare_response(
     return y_centered, vp
 
 
+def _splmm_rank_reduce_covariates(
+    x_cov: np.ndarray,
+    *,
+    warn: bool = True,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    x = np.ascontiguousarray(np.asarray(x_cov, dtype=np.float64), dtype=np.float64)
+    if x.ndim != 2:
+        raise ValueError(f"SparseLMM covariates must be 2D, got shape {x.shape}.")
+    n = int(x.shape[0])
+    if int(x.shape[1]) == 0:
+        raise ValueError("SparseLMM rank reduction requires at least one covariate column.")
+    design = np.ascontiguousarray(
+        np.concatenate([np.ones((n, 1), dtype=np.float64), x], axis=1),
+        dtype=np.float64,
+    )
+    design, kept, dropped = _rank_reduce_fixed_effect_design(design, warn=bool(warn))
+    return design[:, 1:], kept, dropped
+
+
 def _splmm_design_with_intercept(
     x_cov: Union[np.ndarray, None],
     n: int,
@@ -7929,6 +7948,27 @@ def run_splmm_windowed_fullrank(
                 np.concatenate([x_cov, cov_all[keep_idx]], axis=1),
                 dtype=np.float64,
             )
+        if int(x_cov.shape[1]) > 0:
+            x_cov, fixed_effect_kept, fixed_effect_dropped = (
+                _splmm_rank_reduce_covariates(x_cov, warn=False)
+            )
+            if fixed_effect_dropped.size > 0:
+                dropped_covariates = [
+                    int(column_idx - 1)
+                    for column_idx in fixed_effect_dropped
+                    if int(column_idx) > 0
+                ]
+                _log_model_line(
+                    logger,
+                    model_label_norm,
+                    (
+                        "fixed-effect design rank reduction: retained "
+                        f"{int(fixed_effect_kept.size)} independent column(s) "
+                        f"including the intercept; dropped redundant covariate "
+                        f"column(s) {dropped_covariates}."
+                    ),
+                    use_spinner=bool(use_spinner),
+                )
         x_arg = x_cov if int(x_cov.shape[1]) > 0 else None
         scan_sample_idx_trait = np.ascontiguousarray(scan_sample_map[keep_idx], dtype=np.int64)
         kinship_sample_idx_trait = np.ascontiguousarray(kinship_sample_map[keep_idx], dtype=np.int64)

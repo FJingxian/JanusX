@@ -304,7 +304,8 @@ pub fn gwas_trait_model_dispatch_v2<'py>(
     progress_callback=None,
     progress_every=0,
     row_indices=None,
-    bed_prefix=None
+    bed_prefix=None,
+    source_row_indices=None
 ))]
 pub fn gwas_packed_unified_to_tsv<'py>(
     py: Python<'py>,
@@ -325,6 +326,7 @@ pub fn gwas_packed_unified_to_tsv<'py>(
     progress_every: usize,
     row_indices: Option<PyReadonlyArray1<'py, i64>>,
     bed_prefix: Option<&str>,
+    source_row_indices: Option<PyReadonlyArray1<'py, i64>>,
 ) -> PyResult<Bound<'py, PyList>> {
     if n_samples == 0 {
         return Err(PyRuntimeError::new_err("n_samples must be > 0"));
@@ -659,7 +661,7 @@ pub fn gwas_packed_unified_to_tsv<'py>(
                         out_tsv.as_str(),
                         sample_indices,
                         row_indices.clone(),
-                        row_indices.clone(),
+                        source_row_indices.clone().or_else(|| row_indices.clone()),
                         threshold,
                         max_iter,
                         qtn_bound,
@@ -734,7 +736,7 @@ pub fn gwas_packed_unified_to_tsv<'py>(
                     row_missing.clone(),
                     out_tsv.as_str(),
                     sample_indices,
-                    row_indices_use,
+                    row_indices_use.clone(),
                     qtn_bound,
                     lambda_steps,
                     lambda_min_ratio,
@@ -744,6 +746,9 @@ pub fn gwas_packed_unified_to_tsv<'py>(
                     scan_progress_callback,
                     pseudo_tsv.as_deref(),
                     bed_prefix,
+                    source_row_indices
+                        .clone()
+                        .or_else(|| row_indices_use.clone()),
                 )?;
                 result_obj.set_item("qtn_count", qtn_n)?;
                 result_obj.set_item("pseudo_rows", pseudo_n)?;

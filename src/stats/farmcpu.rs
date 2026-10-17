@@ -2766,6 +2766,23 @@ fn scan_packed_full_matrix_reduced(
     Ok((marker_p, qtn_min_p))
 }
 
+#[inline]
+fn farmcpu_bim_rows_for_chunk<'a>(
+    row_start: usize,
+    row_end: usize,
+    bim_row_indices: Option<&'a [usize]>,
+    packed_row_indices: Option<&'a [usize]>,
+) -> Result<Option<&'a [usize]>, String> {
+    let selected = bim_row_indices.or(packed_row_indices);
+    match selected {
+        Some(rows) => rows
+            .get(row_start..row_end)
+            .map(Some)
+            .ok_or_else(|| "FarmCPU BIM row mapping does not cover scan chunk".to_string()),
+        None => Ok(None),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_farmcpu_packed_main_scan(
     out_writer: &AsyncTsvWriter,
@@ -2779,6 +2796,7 @@ fn write_farmcpu_packed_main_scan(
     row_flip: &[bool],
     row_maf: &[f32],
     row_indices: Option<&[usize]>,
+    bim_row_indices: Option<&[usize]>,
     sample_idx: &[usize],
     threads: usize,
     scan_progress_callback: Option<&Py<PyAny>>,
@@ -2814,6 +2832,11 @@ fn write_farmcpu_packed_main_scan(
     }
     if qtn_estimable.len() != qtn_lookup.len() {
         return Err("FarmCPU QTN estimability length mismatch".to_string());
+    }
+    if bim_row_indices.map(|v| v.len() != m).unwrap_or(false) {
+        return Err(
+            "FarmCPU BIM source-row mapping length mismatch during streaming scan".to_string(),
+        );
     }
 
     let bytes_per_snp = (n_samples + 3) / 4;
@@ -2951,8 +2974,10 @@ fn write_farmcpu_packed_main_scan(
         let b21_slice = &mut chunk.b21_block[..n_block * q0];
         let stats_slice = &mut chunk.stat_block[..n_block * row_stride];
         let source_rows_owned;
-        let source_rows_block: &[usize] = if let Some(all_rows) = row_indices {
-            &all_rows[row_start..row_end]
+        let source_rows_block: &[usize] = if let Some(rows) =
+            farmcpu_bim_rows_for_chunk(row_start, row_end, bim_row_indices, row_indices)?
+        {
+            rows
         } else {
             source_rows_owned = (row_start..row_end).collect::<Vec<usize>>();
             source_rows_owned.as_slice()
@@ -4498,6 +4523,7 @@ pub fn farmcpu_packed_to_tsv(
                 row_flip,
                 row_maf,
                 row_idx.as_deref(),
+                meta_row_idx,
                 &sample_idx,
                 threads,
                 progress_callback.as_ref(),
@@ -4769,6 +4795,22 @@ mod tests {
                 (lhs - rhs).abs()
             );
         }
+    }
+
+    #[test]
+    fn farmcpu_compacted_scan_uses_source_rows_for_bim_metadata() {
+        let packed_rows = [0usize, 1, 2, 3];
+        let source_rows = [2usize, 5, 8, 11];
+
+        let selected = farmcpu_bim_rows_for_chunk(1, 3, Some(&source_rows), Some(&packed_rows))
+            .expect("source row mapping covers the chunk");
+        assert_eq!(selected, Some(&source_rows[1..3]));
+
+        let legacy = farmcpu_bim_rows_for_chunk(1, 3, None, Some(&packed_rows))
+            .expect("packed row mapping covers the chunk");
+        assert_eq!(legacy, Some(&packed_rows[1..3]));
+
+        assert!(farmcpu_bim_rows_for_chunk(3, 5, Some(&source_rows), None).is_err());
     }
 
     #[test]

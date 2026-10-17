@@ -1,7 +1,7 @@
 use memmap2::{MmapMut, MmapOptions};
 use nalgebra::{DMatrix, DVector};
 use numpy::{PyReadonlyArray1, PyReadonlyArray2};
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use std::borrow::Cow;
@@ -6824,7 +6824,8 @@ fn write_algwas_stage1_summary_tsv(
     threads=0,
     progress_callback=None,
     pseudo_tsv=None,
-    bed_prefix=None
+    bed_prefix=None,
+    source_row_indices=None
 ))]
 pub fn algwas_packed_to_tsv(
     _py: Python<'_>,
@@ -6852,6 +6853,7 @@ pub fn algwas_packed_to_tsv(
     progress_callback: Option<Py<PyAny>>,
     pseudo_tsv: Option<&str>,
     bed_prefix: Option<&str>,
+    source_row_indices: Option<PyReadonlyArray1<'_, i64>>,
 ) -> PyResult<(usize, usize, usize)> {
     if n_samples == 0 {
         return Err(PyRuntimeError::new_err("n_samples must be > 0"));
@@ -6908,6 +6910,28 @@ pub fn algwas_packed_to_tsv(
         None
     };
     let m = row_idx.as_ref().map(|v| v.len()).unwrap_or(m_packed);
+    let source_row_idx: Option<Vec<usize>> = if let Some(src_idx) = source_row_indices {
+        let raw = src_idx.as_slice()?;
+        if raw.len() != m {
+            return Err(PyRuntimeError::new_err(format!(
+                "source_row_indices length mismatch: got {}, expected {m}",
+                raw.len(),
+            )));
+        }
+        Some(
+            raw.iter()
+                .map(|&idx| {
+                    usize::try_from(idx).map_err(|_| {
+                        PyValueError::new_err(format!(
+                            "source_row_indices must be non-negative, got {idx}"
+                        ))
+                    })
+                })
+                .collect::<PyResult<Vec<_>>>()?,
+        )
+    } else {
+        None
+    };
     if row_flip.len() != m || row_maf.len() != m || row_missing.len() != m {
         return Err(PyRuntimeError::new_err("row metadata length mismatch"));
     }
@@ -6918,7 +6942,7 @@ pub fn algwas_packed_to_tsv(
         snp,
         allele0,
         allele1,
-        row_idx.as_deref(),
+        source_row_idx.as_deref().or(row_idx.as_deref()),
         m,
     )
     .map_err(PyRuntimeError::new_err)?;

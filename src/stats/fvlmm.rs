@@ -38,9 +38,7 @@ use crate::decode::{
 };
 use crate::gfcore;
 use crate::gfcore::BimChunkReader;
-use crate::gfreader::{
-    count_packed_row_counts, count_packed_row_counts_selected_with_excluded, is_simple_snp_allele,
-};
+use crate::gfreader::{evaluate_packed_bed_row_qc, is_simple_snp_allele};
 use crate::gload::WindowedBedMatrix;
 use crate::kmer::KfileAssocSource;
 use crate::linalg::{
@@ -2926,60 +2924,32 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                             let local_idx = snp_idx - chunk_start;
                             let row = &chunk_packed
                                 [local_idx * bytes_per_snp..(local_idx + 1) * bytes_per_snp];
-                            let (missing, het, hom_alt) = if use_selected {
-                                count_packed_row_counts_selected_with_excluded(
-                                    row,
-                                    n_samples_full,
-                                    &sample_idx,
-                                    selected_excluded_sample_indices,
-                                )
-                            } else {
-                                count_packed_row_counts(row, n_samples_full)
-                            };
-                            let non_missing = n.saturating_sub(missing);
-
-                            let miss_rate = if n > 0 {
-                                missing as f32 / n as f32
-                            } else {
-                                1.0_f32
-                            };
-                            if miss_rate > miss_thr {
-                                return None;
-                            }
-
-                            if non_missing == 0 {
-                                return if maf_thr > 0.0 {
-                                    None
+                            let qc = evaluate_packed_bed_row_qc(
+                                row,
+                                n_samples_full,
+                                if use_selected {
+                                    Some(sample_idx.as_slice())
                                 } else {
-                                    Some(SnpCounts {
-                                        flip: false,
-                                        maf: 0.0_f32,
-                                        miss_rate,
-                                        missing_count: missing,
-                                    })
-                                };
-                            }
-
-                            if het_thr > 0.0 {
-                                let het_rate = het as f32 / non_missing as f32;
-                                if het_rate > het_thr {
-                                    return None;
-                                }
-                            }
-
-                            let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
-                            let alt_freq = alt_sum as f32 / (2.0_f32 * non_missing as f32);
-                            let maf_v = alt_freq.min(1.0_f32 - alt_freq);
-
-                            if maf_v < maf_thr {
+                                    None
+                                },
+                                if use_selected {
+                                    selected_excluded_sample_indices
+                                } else {
+                                    None
+                                },
+                                n,
+                                maf_thr,
+                                miss_thr,
+                                het_thr,
+                            );
+                            if !qc.keep {
                                 return None;
                             }
-
                             Some(SnpCounts {
-                                flip: false,
-                                maf: alt_freq,
-                                miss_rate,
-                                missing_count: missing,
+                                flip: qc.row_flip,
+                                maf: qc.alt_freq,
+                                miss_rate: qc.missing_rate,
+                                missing_count: qc.missing_count,
                             })
                         })
                         .collect();

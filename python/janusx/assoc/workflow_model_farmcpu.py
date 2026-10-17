@@ -172,6 +172,14 @@ def _normalize_packed_ctx_for_farmcpu_cache(
         )
 
     active_rows = int(row_idx.shape[0])
+    source_row_idx = np.ascontiguousarray(
+        np.asarray(packed_obj.get("source_row_indices", row_idx), dtype=np.int64).reshape(-1),
+        dtype=np.int64,
+    )
+    if int(source_row_idx.shape[0]) != active_rows or (
+        int(source_row_idx.shape[0]) > 0 and int(source_row_idx.min()) < 0
+    ):
+        raise ValueError("FarmCPU packed cache source_row_indices are invalid.")
 
     def _active_view(arr: np.ndarray, name: str) -> np.ndarray:
         if int(arr.shape[0]) == active_rows:
@@ -210,6 +218,7 @@ def _normalize_packed_ctx_for_farmcpu_cache(
         "maf": maf_arr,
         "row_flip": row_flip_arr,
         "row_indices": row_idx,
+        "source_row_indices": source_row_idx,
         "active_row_idx": row_idx,
         "site_keep": site_keep_norm,
         "packed_filter_mode": str(
@@ -644,6 +653,8 @@ def run_farmcpu_fullmem(
     qtn_preloaded_packed: Union[dict[str, object], None] = None,
     emit_file_dense_warning: bool = True,
     trait_prepared_meta: Union[dict[str, object], None] = None,
+    fused_qc_load: bool = False,
+    fused_qc_sample_indices: Union[np.ndarray, None] = None,
 ) -> dict[str, object]:
     """
     Run FarmCPU via the Rust packed-BED controller (packed genotype + QK + PCA).
@@ -678,7 +689,10 @@ def run_farmcpu_fullmem(
         if not isinstance(qtn_ctx_obj, dict):
             raise ValueError("Invalid QTN packed payload for FarmCPU: missing packed_ctx.")
         qtn_ctx = _normalize_packed_ctx_for_farmcpu_cache(qtn_ctx_obj)
-        qtn_row_idx = np.asarray(qtn_ctx.get("row_indices", []), dtype=np.int64).reshape(-1)
+        qtn_row_idx = np.asarray(
+            qtn_ctx.get("source_row_indices", qtn_ctx.get("row_indices", [])),
+            dtype=np.int64,
+        ).reshape(-1)
         qtn_ids = np.asarray(qtn_preloaded_packed.get("full_ids", []), dtype=str)
         id_to_qtn = {str(sid): i for i, sid in enumerate(qtn_ids)}
         try:
@@ -708,6 +722,8 @@ def run_farmcpu_fullmem(
         status_label: str,
         trait_prepared_meta: Union[dict[str, object], None] = None,
         emit_status: bool = True,
+        fused_qc_load: bool = False,
+        stats_sample_indices: Union[np.ndarray, None] = None,
     ) -> tuple[dict[str, object], object]:
         from janusx.assoc.workflow_model_packed import (
             _coerce_trait_prepared_scan_meta,
@@ -715,11 +731,20 @@ def run_farmcpu_fullmem(
             _prepare_packed_bed_once_for_gwas,
         )
 
+        use_fused_qc = bool(
+            fused_qc_load
+            and (
+                bool(getattr(args, "global_stats", False))
+                or stats_sample_indices is not None
+            )
+        )
         prepared_scan_meta = _coerce_trait_prepared_scan_meta(trait_prepared_meta)
         effective_scan_meta = (
             trait_prepared_meta if prepared_scan_meta is not None else None
         )
-        if effective_scan_meta is None:
+        if use_fused_qc:
+            effective_scan_meta = None
+        elif effective_scan_meta is None:
             effective_scan_meta = _gwas_logic_meta_global_cached(
                 str(packed_prefix),
                 maf_threshold=float(args.maf),
@@ -749,6 +774,9 @@ def run_farmcpu_fullmem(
             status_label=str(status_label),
             trait_prepared_meta=effective_scan_meta,
             emit_status=bool(emit_status),
+            fused_qc_load=bool(use_fused_qc),
+            stats_sample_indices=stats_sample_indices,
+            bimranges=list(getattr(args, "bimrange_ranges", []) or []),
         )
         full_ids_loaded = np.asarray(_full_ids_loaded, dtype=str).reshape(-1)
         if (
@@ -778,10 +806,23 @@ def run_farmcpu_fullmem(
         )
         if int(row_idx_loaded.shape[0]) == 0:
             raise ValueError("FarmCPU packed context produced zero active SNPs.")
+        source_row_idx_loaded = np.ascontiguousarray(
+            np.asarray(
+                packed_ctx_loaded.get("source_row_indices", row_idx_loaded),
+                dtype=np.int64,
+            ).reshape(-1),
+            dtype=np.int64,
+        )
+        if int(source_row_idx_loaded.shape[0]) != int(row_idx_loaded.shape[0]):
+            raise ValueError(
+                "FarmCPU packed context source-row mapping length mismatch: "
+                f"source_rows={int(source_row_idx_loaded.shape[0])}, "
+                f"active_rows={int(row_idx_loaded.shape[0])}."
+            )
         ref_alt_loaded = _make_deferred_bim_metadata(
             str(packed_prefix),
-            row_idx_loaded,
-            n_markers=int(row_idx_loaded.shape[0]),
+            source_row_idx_loaded,
+            n_markers=int(source_row_idx_loaded.shape[0]),
         )
         return packed_ctx_loaded, ref_alt_loaded
 
@@ -1139,6 +1180,8 @@ def run_farmcpu_fullmem(
                 status_label="Loading BED genotype of trait-subset",
                 trait_prepared_meta=trait_prepared_meta,
                 emit_status=False,
+                fused_qc_load=bool(fused_qc_load),
+                stats_sample_indices=fused_qc_sample_indices,
             )
             farmcpu_cache["packed_ctx"] = packed_ctx
             farmcpu_cache["ref_alt"] = ref_alt
@@ -1348,8 +1391,20 @@ def run_farmcpu_fullmem(
                     ).reshape(-1),
                     dtype=np.int64,
                 )
+                source_row_idx_arr = np.ascontiguousarray(
+                    np.asarray(
+                        packed_payload.get("source_row_indices", row_idx_arr),
+                        dtype=np.int64,
+                    ).reshape(-1),
+                    dtype=np.int64,
+                )
                 packed_rows = int(np.asarray(packed_arr, dtype=np.uint8).shape[0])
                 meta_rows = int(row_idx_arr.shape[0])
+                if int(source_row_idx_arr.shape[0]) != meta_rows:
+                    raise ValueError(
+                        "FarmCPU packed source row mapping length mismatch: "
+                        f"source_rows={int(source_row_idx_arr.shape[0])}, packed_rows={meta_rows}."
+                    )
                 if isinstance(ref_alt, dict) and str(ref_alt.get("_kind", "")) == "deferred_bim":
                     bed_prefix_raw = str(ref_alt.get("bed_prefix", "") or "").strip()
                     if bed_prefix_raw != "":
@@ -1374,7 +1429,7 @@ def run_farmcpu_fullmem(
                             ref_alt,
                             expected_rows=meta_rows,
                             prefix=str(bed_prefix_meta),
-                            row_indices=row_idx_arr,
+                            row_indices=source_row_idx_arr,
                         )
                     return fallback_meta_cols
 
@@ -1420,7 +1475,7 @@ def run_farmcpu_fullmem(
                             tmp_tsv,
                             sample_idx_use,
                             row_indices=row_idx_arr,
-                            source_row_indices=row_idx_arr,
+                            source_row_indices=source_row_idx_arr,
                             threshold=float(farm_threshold),
                             max_iter=int(farm_iter),
                             qtn_bound=farm_qtn_bound,
@@ -1470,7 +1525,7 @@ def run_farmcpu_fullmem(
                             tmp_tsv,
                             sample_idx_use,
                             row_indices=None,
-                            source_row_indices=row_idx_arr,
+                            source_row_indices=source_row_idx_arr,
                             threshold=float(farm_threshold),
                             max_iter=int(farm_iter),
                             qtn_bound=farm_qtn_bound,

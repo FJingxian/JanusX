@@ -250,10 +250,11 @@ use gffanno::GffAnnotationIndex;
 use gfreader::{
     bed_filter_stream_to_plink_rust, bed_filter_to_plink_rust, bed_mmap_filter_to_plink_rust,
     count_hmp_snps, count_vcf_snps, load_bed_2bit_packed, load_bed_u8_matrix, load_bim_columns,
-    load_site_info, prepare_bed_2bit_packed, prepare_bed_logic_keep_mask,
-    prepare_bed_logic_keep_mask_pure_line, prepare_bed_logic_meta_selected,
-    scan_bed_2bit_packed_stats, BedChunkReader, BedChunkReaderFromMeta, BedMmapReader,
-    HmpChunkReader, NpyMmapReader, SiteInfo, TxtChunkReader, VcfChunkReader,
+    load_site_info, prepare_bed_2bit_packed, prepare_bed_fused_qc_packed,
+    prepare_bed_logic_keep_mask, prepare_bed_logic_keep_mask_pure_line,
+    prepare_bed_logic_meta_selected, scan_bed_2bit_packed_stats, BedChunkReader,
+    BedChunkReaderFromMeta, BedMmapReader, HmpChunkReader, NpyMmapReader, SiteInfo, TxtChunkReader,
+    VcfChunkReader,
 };
 use glm::{
     lm_assoc_kfile_to_tsv_f32, lm_block_assoc_f32, lm_block_assoc_packed,
@@ -796,6 +797,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(prepare_bed_logic_keep_mask, m)?)?;
     m.add_function(wrap_pyfunction!(prepare_bed_logic_keep_mask_pure_line, m)?)?;
     m.add_function(wrap_pyfunction!(prepare_bed_logic_meta_selected, m)?)?;
+    m.add_function(wrap_pyfunction!(prepare_bed_fused_qc_packed, m)?)?;
     m.add_function(wrap_pyfunction!(load_bed_u8_matrix, m)?)?;
     m.add_function(wrap_pyfunction!(load_site_info, m)?)?;
     m.add_function(wrap_pyfunction!(load_bim_columns, m)?)?;

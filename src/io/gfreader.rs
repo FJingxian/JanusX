@@ -14,8 +14,9 @@ use std::arch::x86 as x86_avx2;
 use std::arch::x86_64 as x86_avx2;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::mem::{ManuallyDrop, MaybeUninit};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64"))]
 use std::sync::OnceLock;
@@ -1973,6 +1974,7 @@ pub(crate) struct PackedSnpQc {
     pub(crate) missing_rate: f32,
     pub(crate) alt_freq: f32,
     pub(crate) row_flip: bool,
+    pub(crate) missing_count: usize,
 }
 
 /// Apply the selected-cohort BED QC comparisons used by the metadata builder.
@@ -1994,6 +1996,7 @@ pub(crate) fn evaluate_packed_snp_qc(
             missing_rate: 0.0,
             alt_freq: 0.0,
             row_flip: false,
+            missing_count: 0,
         };
     }
     let non_missing = n_selected.saturating_sub(missing);
@@ -2021,7 +2024,41 @@ pub(crate) fn evaluate_packed_snp_qc(
         // The selected metadata builder stores BED A2 frequency and does not
         // flip the row; preserve that orientation for this route.
         row_flip: false,
+        missing_count: missing.min(n_selected),
     }
+}
+
+/// Count and apply the exact numeric QC policy shared by selected-sample
+/// metadata preparation and fused BED scans.
+#[inline]
+pub(crate) fn evaluate_packed_bed_row_qc(
+    row: &[u8],
+    n_samples_full: usize,
+    selected_sample_indices: Option<&[usize]>,
+    selected_excluded_sample_indices: Option<&[usize]>,
+    n_selected: usize,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+) -> PackedSnpQc {
+    let (missing, het, hom_alt) = match selected_sample_indices {
+        Some(indices) => count_packed_row_counts_selected_with_excluded(
+            row,
+            n_samples_full,
+            indices,
+            selected_excluded_sample_indices,
+        ),
+        None => count_packed_row_counts(row, n_samples_full),
+    };
+    evaluate_packed_snp_qc(
+        missing,
+        het,
+        hom_alt,
+        n_selected,
+        maf_threshold,
+        max_missing_rate,
+        het_threshold,
+    )
 }
 
 const PURE_LINE_FILTER_KEEP: u8 = 0;
@@ -3470,11 +3507,11 @@ impl BedChunkReader {
                     }
                 } else {
                     for &snp_idx in batch.iter() {
+                        self.it.set_cursor(snp_idx);
                         let maybe = if full_samples {
-                            self.it.get_snp_row_raw(snp_idx)
+                            self.it.next_snp_raw()
                         } else {
-                            self.it
-                                .get_snp_row_selected_raw(snp_idx, &self.sample_indices)
+                            self.it.next_snp_selected_raw(&self.sample_indices)
                         };
                         if let Some((mut row_sub, mut site)) = maybe {
                             let keep = process_bed_chunk_row(
@@ -3753,11 +3790,6 @@ impl BedChunkReader {
         };
 
         if let Some(ref snp_indices) = self.snp_indices {
-            if windowed_mode {
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    "windowed mmap mode does not support explicit snp index selection",
-                ));
-            }
             while m < chunk_size && self.snp_pos < snp_indices.len() {
                 let need = chunk_size - m;
                 let end = (self.snp_pos + need).min(snp_indices.len());
@@ -3782,11 +3814,11 @@ impl BedChunkReader {
                     let mut tmp: Vec<Option<(Vec<f32>, SiteInfo, f32, f32)>> =
                         Vec::with_capacity(batch.len());
                     for &snp_idx in batch.iter() {
+                        self.it.set_cursor(snp_idx);
                         let maybe = if full_samples {
-                            self.it.get_snp_row_raw(snp_idx)
+                            self.it.next_snp_raw()
                         } else {
-                            self.it
-                                .get_snp_row_selected_raw(snp_idx, &self.sample_indices)
+                            self.it.next_snp_selected_raw(&self.sample_indices)
                         };
                         tmp.push(maybe.and_then(|(row_sub, site)| prepare_one(row_sub, site)));
                     }
@@ -4622,6 +4654,11 @@ pub(crate) struct PreparedBedLogicMetaOwned {
     pub bytes_per_snp: usize,
 }
 
+pub(crate) struct PreparedBedLogicMetaAndPackedOwned {
+    pub meta: PreparedBedLogicMetaOwned,
+    pub packed_all_rows: Vec<u8>,
+}
+
 /// Build logic metadata from a keep mask that was already computed for the
 /// same BED/sample selection. This avoids rescanning the BED payload merely
 /// to reconstruct source-row indices and retained BIM metadata.
@@ -4763,6 +4800,50 @@ fn collect_bed_interval_candidate_rows_local(
     }
     bim.ensure_exhausted(n_snps_total)?;
     Ok((row_source_indices, sites))
+}
+
+fn collect_bed_interval_candidate_rows_and_snp_flags_local(
+    prefix: &str,
+    interval_groups: &[Vec<(String, i32, i32)>],
+    n_snps_total: usize,
+    collect_snp_flags: bool,
+) -> Result<(Vec<usize>, Option<Vec<bool>>), String> {
+    if interval_groups.is_empty() {
+        return Ok((Vec::new(), collect_snp_flags.then(Vec::<bool>::new)));
+    }
+    let merged = merge_interval_groups_local(interval_groups);
+    if merged.is_empty() {
+        return Ok((Vec::new(), collect_snp_flags.then(Vec::<bool>::new)));
+    }
+
+    let mut bim = core::BimChunkReader::open(prefix)?;
+    let mut row_source_indices = Vec::<usize>::new();
+    let mut snp_flags = collect_snp_flags.then(Vec::<bool>::new);
+    let chunk_rows = 131_072usize;
+    let mut base = 0usize;
+    while base < n_snps_total {
+        let end = (base + chunk_rows).min(n_snps_total);
+        let chunk_sites = bim.read_range(base, end)?;
+        for (off, site) in chunk_sites.into_iter().enumerate() {
+            let chrom_key = normalize_chr_key_local(site.chrom.as_str());
+            let Some(intervals) = merged.get(&chrom_key) else {
+                continue;
+            };
+            if !merged_interval_contains_pos_local(intervals.as_slice(), site.pos) {
+                continue;
+            }
+            row_source_indices.push(base + off);
+            if let Some(flags) = snp_flags.as_mut() {
+                flags.push(
+                    is_simple_snp_allele(&site.ref_allele)
+                        && is_simple_snp_allele(&site.alt_allele),
+                );
+            }
+        }
+        base = end;
+    }
+    bim.ensure_exhausted(n_snps_total)?;
+    Ok((row_source_indices, snp_flags))
 }
 
 fn prepare_bed_logic_meta_owned_for_candidate_rows_pure_line(
@@ -5289,6 +5370,338 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_sparse_windowed(
     })
 }
 
+pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window(
+    prefix: &str,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
+    stats_sample_indices: Option<&[usize]>,
+    stats_only: bool,
+    mmap_window_mb: Option<usize>,
+    threads: usize,
+) -> Result<PreparedBedLogicMetaOwned, String> {
+    prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window_internal(
+        prefix,
+        maf_threshold,
+        max_missing_rate,
+        het_threshold,
+        snps_only,
+        stats_sample_indices,
+        stats_only,
+        mmap_window_mb,
+        threads,
+        false,
+    )
+    .map(|(meta, _)| meta)
+}
+
+pub(crate) fn prepare_bed_logic_meta_and_packed_owned_for_stats_samples(
+    prefix: &str,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
+    stats_sample_indices: Option<&[usize]>,
+) -> Result<PreparedBedLogicMetaAndPackedOwned, String> {
+    let (meta, packed_all_rows) =
+        prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window_internal(
+            prefix,
+            maf_threshold,
+            max_missing_rate,
+            het_threshold,
+            snps_only,
+            stats_sample_indices,
+            true,
+            None,
+            rayon::current_num_threads().max(1),
+            true,
+        )?;
+    let packed_all_rows = packed_all_rows
+        .ok_or_else(|| "fused packed BED loader did not materialize genotype bytes".to_string())?;
+    Ok(PreparedBedLogicMetaAndPackedOwned {
+        meta,
+        packed_all_rows,
+    })
+}
+
+pub(crate) fn prepare_bed_logic_meta_and_packed_owned_for_stats_samples_with_ranges(
+    prefix: &str,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
+    stats_sample_indices: Option<&[usize]>,
+    bimranges: &[(String, i64, i64)],
+) -> Result<PreparedBedLogicMetaAndPackedOwned, String> {
+    if bimranges.is_empty() {
+        return prepare_bed_logic_meta_and_packed_owned_for_stats_samples(
+            prefix,
+            maf_threshold,
+            max_missing_rate,
+            het_threshold,
+            snps_only,
+            stats_sample_indices,
+        );
+    }
+
+    let bed_prefix = normalize_plink_prefix_local(prefix);
+    let mut normalized_ranges = Vec::<(String, i32, i32)>::with_capacity(bimranges.len());
+    for (index, (chrom, start, end)) in bimranges.iter().enumerate() {
+        if chrom.trim().is_empty() {
+            return Err(format!("bimranges[{index}] chromosome must not be empty"));
+        }
+        if *start < 0 || *end < 0 {
+            return Err(format!(
+                "bimranges[{index}] has invalid bounds ({start}, {end})"
+            ));
+        }
+        let range_start = (*start).min(*end);
+        let range_end = (*start).max(*end);
+        let max_bim_pos = i32::MAX as i64;
+        if range_start > max_bim_pos {
+            continue;
+        }
+        normalized_ranges.push((
+            normalize_chr_key_local(chrom),
+            range_start as i32,
+            range_end.min(max_bim_pos) as i32,
+        ));
+    }
+    if normalized_ranges.is_empty() {
+        return Err("No SNPs can match the requested BIM ranges.".to_string());
+    }
+
+    let shape_reader = BedSnpIter::new_for_grm_window(&bed_prefix, 1)?;
+    let n_samples = shape_reader.n_samples();
+    let n_snps_total = shape_reader.n_snps();
+    drop(shape_reader);
+    if n_samples == 0 || n_snps_total == 0 {
+        return Err("PLINK BED input has no samples or SNPs".to_string());
+    }
+
+    let (row_source_indices, candidate_snp_flags) =
+        collect_bed_interval_candidate_rows_and_snp_flags_local(
+            &bed_prefix,
+            &[normalized_ranges],
+            n_snps_total,
+            snps_only,
+        )?;
+    if row_source_indices.is_empty() {
+        return Err("No SNPs found in the requested BIM ranges.".to_string());
+    }
+
+    prepare_bed_logic_meta_and_packed_owned_for_candidate_rows(
+        &bed_prefix,
+        maf_threshold,
+        max_missing_rate,
+        het_threshold,
+        snps_only,
+        stats_sample_indices,
+        &row_source_indices,
+        candidate_snp_flags,
+        n_samples,
+        n_snps_total,
+    )
+}
+
+fn prepare_bed_logic_meta_and_packed_owned_for_candidate_rows(
+    prefix: &str,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
+    stats_sample_indices: Option<&[usize]>,
+    row_source_indices: &[usize],
+    candidate_snp_flags: Option<Vec<bool>>,
+    expected_n_samples: usize,
+    n_snps_total: usize,
+) -> Result<PreparedBedLogicMetaAndPackedOwned, String> {
+    if !(0.0..=0.5).contains(&maf_threshold) {
+        return Err("maf_threshold must be within [0, 0.5]".to_string());
+    }
+    if !(0.0..=1.0).contains(&max_missing_rate) {
+        return Err("max_missing_rate must be within [0, 1.0]".to_string());
+    }
+    if !(0.0..=1.0).contains(&het_threshold) {
+        return Err("het_threshold must be within [0, 1.0]".to_string());
+    }
+    if row_source_indices.is_empty()
+        || candidate_snp_flags
+            .as_ref()
+            .is_some_and(|flags| row_source_indices.len() != flags.len())
+        || (snps_only && candidate_snp_flags.is_none())
+    {
+        return Err(format!(
+            "BIM range candidate mismatch: rows={}, SNP flags={}",
+            row_source_indices.len(),
+            candidate_snp_flags.as_ref().map_or(0, Vec::len)
+        ));
+    }
+    if row_source_indices.windows(2).any(|rows| rows[0] >= rows[1]) {
+        return Err("BIM range source rows must be strictly increasing".to_string());
+    }
+    if let Some(&bad_row) = row_source_indices.iter().find(|&&row| row >= n_snps_total) {
+        return Err(format!(
+            "BIM range source row {bad_row} is outside BED marker range 0..{n_snps_total}"
+        ));
+    }
+
+    let bed_prefix = normalize_plink_prefix_local(prefix);
+    let samples = core::read_fam(&bed_prefix)?;
+    let n_samples = samples.len();
+    if n_samples == 0 || n_samples != expected_n_samples {
+        return Err(format!(
+            "BED sample count changed while preparing BIM range: expected={expected_n_samples}, got={n_samples}"
+        ));
+    }
+    let selected_samples = stats_sample_indices.unwrap_or(&[]);
+    if selected_samples.iter().any(|&index| index >= n_samples) {
+        return Err("selected sample index out of range for BIM range QC".to_string());
+    }
+    let stats_identity = selected_samples.is_empty()
+        || (selected_samples.len() == n_samples && sample_indices_are_identity(selected_samples));
+    let stats_n_samples = if stats_identity {
+        n_samples
+    } else {
+        selected_samples.len()
+    };
+    if stats_n_samples == 0 {
+        return Err("selected sample set for BIM range QC is empty".to_string());
+    }
+    let excluded_samples = if stats_identity {
+        None
+    } else {
+        precompute_excluded_sample_indices(n_samples, selected_samples)
+    };
+
+    const BIM_RANGE_QC_WINDOW_MB: usize = 128;
+    let mut bed_iter = BedSnpIter::new_for_grm_window(&bed_prefix, BIM_RANGE_QC_WINDOW_MB)?;
+    if bed_iter.n_samples() != n_samples || bed_iter.n_snps() != n_snps_total {
+        return Err("BED shape changed while preparing BIM range QC".to_string());
+    }
+    let bytes_per_snp = bed_iter.bytes_per_snp();
+    let reserve_bytes = row_source_indices
+        .len()
+        .checked_mul(bytes_per_snp)
+        .ok_or_else(|| "BIM range packed byte length overflow".to_string())?;
+    let mut packed_all_rows = Vec::<u8>::new();
+    packed_all_rows
+        .try_reserve_exact(reserve_bytes)
+        .map_err(|error| {
+            format!("unable to reserve {reserve_bytes} bytes for BIM range packed BED: {error}")
+        })?;
+
+    let apply_het_filter = het_threshold > 0.0_f32;
+    let candidate_snp_flags = candidate_snp_flags.as_deref();
+    let mut row_eval_batch = Vec::<(bool, f32, f32)>::new();
+    let mut row_source_kept = Vec::<usize>::new();
+    let mut missing_rate_kept = Vec::<f32>::new();
+    let mut maf_kept = Vec::<f32>::new();
+    row_source_kept.reserve(row_source_indices.len());
+    missing_rate_kept.reserve(row_source_indices.len());
+    maf_kept.reserve(row_source_indices.len());
+
+    let mut evaluated = 0usize;
+    while evaluated < row_source_indices.len() {
+        let first_row = row_source_indices[evaluated];
+        bed_iter.ensure_window_for_snp(first_row)?;
+        let window_end = first_row + bed_iter.mapped_contiguous_snps_from(first_row);
+        let mut batch_end = evaluated + 1;
+        while batch_end < row_source_indices.len()
+            && row_source_indices[batch_end] >= first_row
+            && row_source_indices[batch_end] < window_end
+        {
+            batch_end += 1;
+        }
+        let batch_len = batch_end - evaluated;
+        row_eval_batch.resize(batch_len, (false, 0.0_f32, 0.0_f32));
+
+        let bed_ref = &bed_iter;
+        row_eval_batch
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(offset, destination)| {
+                let candidate_index = evaluated + offset;
+                let source_row = row_source_indices[candidate_index];
+                let row = bed_ref
+                    .packed_snp_bytes_at(source_row)
+                    .expect("validated BIM range BED row must be in mapped window");
+                let (missing, het, hom_alt) = if stats_identity {
+                    count_packed_row_counts(row, n_samples)
+                } else {
+                    count_packed_row_counts_selected_with_excluded(
+                        row,
+                        n_samples,
+                        selected_samples,
+                        excluded_samples.as_deref(),
+                    )
+                };
+                let non_missing = stats_n_samples.saturating_sub(missing);
+                let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
+                let missing_rate = if stats_n_samples > 0 {
+                    (missing as f32) / (stats_n_samples as f32)
+                } else {
+                    1.0_f32
+                };
+                let alt_freq = if non_missing > 0 {
+                    (alt_sum as f32) / (2.0_f32 * non_missing as f32)
+                } else {
+                    0.0_f32
+                };
+                let pass_num = if missing_rate > max_missing_rate {
+                    false
+                } else if non_missing == 0 {
+                    maf_threshold <= 0.0_f32
+                } else if apply_het_filter
+                    && (het as f64) / (non_missing as f64) > het_threshold as f64
+                {
+                    false
+                } else {
+                    alt_freq.min(1.0_f32 - alt_freq) >= maf_threshold
+                };
+                let pass_snp =
+                    !snps_only || candidate_snp_flags.is_some_and(|flags| flags[candidate_index]);
+                *destination = (pass_num && pass_snp, missing_rate, alt_freq);
+            });
+
+        for (offset, &(keep, missing_rate, alt_freq)) in row_eval_batch.iter().enumerate() {
+            if !keep {
+                continue;
+            }
+            let source_row = row_source_indices[evaluated + offset];
+            let source_bytes = bed_iter
+                .packed_snp_bytes_at(source_row)
+                .ok_or_else(|| format!("BIM range BED row {source_row} left its mapped window"))?;
+            packed_all_rows.extend_from_slice(source_bytes);
+            row_source_kept.push(source_row);
+            missing_rate_kept.push(missing_rate);
+            // Preserve the fused packed loader's A2-frequency orientation.
+            maf_kept.push(alt_freq);
+        }
+        evaluated = batch_end;
+    }
+
+    if row_source_kept.is_empty() {
+        return Err("No SNPs left after fused QC within the requested BIM ranges.".to_string());
+    }
+    let meta = PreparedBedLogicMetaOwned {
+        site_keep: Vec::new(),
+        row_flip: vec![false; row_source_kept.len()],
+        row_source_indices: row_source_kept,
+        missing_rate: missing_rate_kept,
+        maf: maf_kept,
+        sites: Vec::new(),
+        n_samples,
+        n_snps_total,
+        bytes_per_snp,
+    };
+    Ok(PreparedBedLogicMetaAndPackedOwned {
+        meta,
+        packed_all_rows,
+    })
+}
+
 pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples(
     prefix: &str,
     maf_threshold: f32,
@@ -5311,7 +5724,106 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples(
     )
 }
 
-pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window(
+fn copy_packed_rows_and_map<T, F>(
+    source: &[u8],
+    bytes_per_row: usize,
+    map_row: F,
+) -> Result<(Vec<u8>, Vec<T>), String>
+where
+    T: Send,
+    F: Fn(usize, &[u8]) -> T + Send + Sync,
+{
+    if bytes_per_row == 0 {
+        return Err("packed row size must be greater than zero".to_string());
+    }
+    if source.len() % bytes_per_row != 0 {
+        return Err(format!(
+            "packed byte length {} is not divisible by row size {bytes_per_row}",
+            source.len()
+        ));
+    }
+
+    let mut copied_uninit = Vec::<MaybeUninit<u8>>::new();
+    copied_uninit
+        .try_reserve_exact(source.len())
+        .map_err(|error| {
+            format!(
+                "unable to reserve {} bytes for fused packed BED load: {error}",
+                source.len()
+            )
+        })?;
+    // SAFETY: every byte is initialized by the parallel row copy below before
+    // this vector is converted into Vec<u8>. If mapping a row panics, dropping
+    // MaybeUninit<u8> is safe and conversion is skipped.
+    unsafe { copied_uninit.set_len(source.len()) };
+
+    let row_stats = copied_uninit
+        .par_chunks_mut(bytes_per_row)
+        .zip(source.par_chunks(bytes_per_row))
+        .enumerate()
+        .map(|(row_idx, (destination, source_row))| {
+            debug_assert_eq!(destination.len(), source_row.len());
+            // SAFETY: the row slices are disjoint, have equal lengths, and
+            // point to distinct allocations; every destination byte is set.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    source_row.as_ptr(),
+                    destination.as_mut_ptr().cast::<u8>(),
+                    source_row.len(),
+                );
+            }
+            map_row(row_idx, source_row)
+        })
+        .collect::<Vec<_>>();
+
+    let len = copied_uninit.len();
+    let capacity = copied_uninit.capacity();
+    let ptr = copied_uninit.as_mut_ptr().cast::<u8>();
+    let _copied_uninit = ManuallyDrop::new(copied_uninit);
+    // SAFETY: all bytes were initialized by the completed parallel copy. The
+    // allocation, length, and capacity are unchanged by the element cast.
+    let copied = unsafe { Vec::from_raw_parts(ptr, len, capacity) };
+    Ok((copied, row_stats))
+}
+
+fn compact_packed_rows_in_place(
+    packed: &mut Vec<u8>,
+    bytes_per_row: usize,
+    keep_rows: &[bool],
+) -> Result<usize, String> {
+    if bytes_per_row == 0 {
+        return Err("packed row size must be greater than zero".to_string());
+    }
+    let expected_len = keep_rows
+        .len()
+        .checked_mul(bytes_per_row)
+        .ok_or_else(|| "packed row byte length overflow".to_string())?;
+    if packed.len() != expected_len {
+        return Err(format!(
+            "packed data length mismatch: got {}, expected {expected_len}",
+            packed.len()
+        ));
+    }
+
+    let mut kept_rows = 0usize;
+    for (source_row, &keep) in keep_rows.iter().enumerate() {
+        if !keep {
+            continue;
+        }
+        if kept_rows != source_row {
+            let source_start = source_row * bytes_per_row;
+            let source_end = source_start + bytes_per_row;
+            let destination_start = kept_rows * bytes_per_row;
+            packed.copy_within(source_start..source_end, destination_start);
+        }
+        kept_rows += 1;
+    }
+    packed.truncate(kept_rows * bytes_per_row);
+    packed.shrink_to_fit();
+    Ok(kept_rows)
+}
+
+fn prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window_internal(
     prefix: &str,
     maf_threshold: f32,
     max_missing_rate: f32,
@@ -5321,7 +5833,8 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window(
     stats_only: bool,
     mmap_window_mb: Option<usize>,
     threads: usize,
-) -> Result<PreparedBedLogicMetaOwned, String> {
+    materialize_packed_rows: bool,
+) -> Result<(PreparedBedLogicMetaOwned, Option<Vec<u8>>), String> {
     let total_t0 = Instant::now();
     let mut read_bim_secs = 0.0_f64;
     if !(0.0..=0.5).contains(&maf_threshold) {
@@ -5341,7 +5854,7 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window(
     }
 
     if let Some(window_mb) = mmap_window_mb {
-        if stats_only {
+        if stats_only && !materialize_packed_rows {
             return prepare_bed_logic_meta_owned_for_stats_samples_sparse_windowed(
                 &bed_prefix,
                 maf_threshold,
@@ -5354,7 +5867,8 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window(
                 None,
                 0usize,
                 0usize,
-            );
+            )
+            .map(|meta| (meta, None));
         }
     }
 
@@ -5416,9 +5930,10 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window(
         return Err("no SNP sites found in PLINK BED input".to_string());
     }
 
-    // The general path still needs all metadata when it is returning sites;
-    // only stats-only calls can defer BIM string materialization.
-    let load_sites_all = snps_only || !stats_only;
+    // Stats-only fused loads need only a compact allele mask for `snps_only`;
+    // all other callers retain the full BIM records they already require.
+    let load_simple_snp_mask = stats_only && materialize_packed_rows && snps_only;
+    let load_sites_all = !stats_only || (snps_only && !load_simple_snp_mask);
     let sites_all = if load_sites_all {
         let read_bim_t0 = Instant::now();
         let sites_all = core::read_bim(&bed_prefix).map_err(|e| e.to_string())?;
@@ -5440,6 +5955,27 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window(
     } else {
         None
     };
+    let simple_snp_mask = if load_simple_snp_mask {
+        let read_bim_t0 = Instant::now();
+        let mask = read_bim_simple_snp_allele_mask(&bed_prefix)?;
+        read_bim_secs = read_bim_t0.elapsed().as_secs_f64();
+        if mask.is_empty() {
+            return Err("no SNP sites found in PLINK BIM input".to_string());
+        }
+        if n_snps_bed != mask.len() {
+            return Err(format!(
+                "BED/BIM SNP count mismatch: bed={n_snps_bed}, bim={}",
+                mask.len()
+            ));
+        }
+        emit_gfreader_rss_debug(
+            "prepare_bed_logic_meta/read_bim_allele_mask",
+            &format!("prefix={bed_prefix} n_snps={}", mask.len()),
+        );
+        Some(mask)
+    } else {
+        None
+    };
     let n_snps = n_snps_bed;
 
     let packed_full = &mmap[3..];
@@ -5453,53 +5989,63 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window(
 
     let apply_het_filter = het_threshold > 0.0_f32;
     let row_stats_t0 = Instant::now();
-    let keep_flip_stats: Vec<(bool, f32, f32)> = packed_full
-        .par_chunks(bytes_per_snp)
-        .enumerate()
-        .map(|(i, row)| {
-            let (missing, het, hom_alt) = if stats_identity {
-                count_packed_row_counts(row, n_samples)
+    let qc_for_row = |i: usize, row: &[u8]| {
+        let (missing, het, hom_alt) = if stats_identity {
+            count_packed_row_counts(row, n_samples)
+        } else {
+            count_packed_row_counts_selected_with_excluded(
+                row,
+                n_samples,
+                stats_sample_indices,
+                stats_excluded_sample_indices.as_deref(),
+            )
+        };
+        let non_missing = stats_n_samples.saturating_sub(missing);
+        let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
+        let het_count = if apply_het_filter { het } else { 0usize };
+        let (missing_rate, _maf, _std) =
+            packed_row_stats_from_counts(stats_n_samples, non_missing, alt_sum);
+        let alt_freq = if non_missing > 0 {
+            (alt_sum as f32) / (2.0_f32 * non_missing as f32)
+        } else {
+            0.0_f32
+        };
+        let pass_num = if missing_rate > max_missing_rate {
+            false
+        } else if non_missing == 0 {
+            maf_threshold <= 0.0_f32
+        } else if apply_het_filter
+            && ((het_count as f64) / (non_missing as f64)) > (het_threshold as f64)
+        {
+            false
+        } else {
+            alt_freq.min(1.0_f32 - alt_freq) >= maf_threshold
+        };
+        let pass_snp = if snps_only {
+            if let Some(mask) = simple_snp_mask.as_ref() {
+                mask[i] != 0
             } else {
-                count_packed_row_counts_selected_with_excluded(
-                    row,
-                    n_samples,
-                    stats_sample_indices,
-                    stats_excluded_sample_indices.as_deref(),
-                )
-            };
-            let non_missing = stats_n_samples.saturating_sub(missing);
-            let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
-            let het_count = if apply_het_filter { het } else { 0usize };
-            let (missing_rate, _maf, _std) =
-                packed_row_stats_from_counts(stats_n_samples, non_missing, alt_sum);
-            let alt_freq = if non_missing > 0 {
-                (alt_sum as f32) / (2.0_f32 * non_missing as f32)
-            } else {
-                0.0_f32
-            };
-            let pass_num = if missing_rate > max_missing_rate {
-                false
-            } else if non_missing == 0 {
-                maf_threshold <= 0.0_f32
-            } else if apply_het_filter
-                && ((het_count as f64) / (non_missing as f64)) > (het_threshold as f64)
-            {
-                false
-            } else {
-                alt_freq.min(1.0_f32 - alt_freq) >= maf_threshold
-            };
-            let pass_snp = if snps_only {
                 let site = &sites_all
                     .as_ref()
                     .expect("snps_only requires BIM metadata for allele filtering")[i];
                 is_simple_snp_allele(&site.ref_allele) && is_simple_snp_allele(&site.alt_allele)
-            } else {
-                true
-            };
-            let keep = pass_num && pass_snp;
-            (keep, missing_rate, alt_freq)
-        })
-        .collect();
+            }
+        } else {
+            true
+        };
+        (pass_num && pass_snp, missing_rate, alt_freq)
+    };
+    let (mut packed_all_rows, keep_flip_stats) = if materialize_packed_rows {
+        let (packed, stats) = copy_packed_rows_and_map(packed_full, bytes_per_snp, qc_for_row)?;
+        (Some(packed), stats)
+    } else {
+        let stats = packed_full
+            .par_chunks(bytes_per_snp)
+            .enumerate()
+            .map(|(i, row)| qc_for_row(i, row))
+            .collect();
+        (None, stats)
+    };
     let row_stats_secs = row_stats_t0.elapsed().as_secs_f64();
     let site_keep_t0 = Instant::now();
     let site_keep: Vec<bool> = keep_flip_stats.iter().map(|(keep, _, _)| *keep).collect();
@@ -5516,6 +6062,18 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window(
         return Err(
             "No SNPs left after packed BED filtering. Please relax thresholds.".to_string(),
         );
+    }
+    if materialize_packed_rows {
+        drop(mmap);
+        let packed = packed_all_rows
+            .as_mut()
+            .ok_or_else(|| "fused packed BED load is missing genotype bytes".to_string())?;
+        let compacted_n = compact_packed_rows_in_place(packed, bytes_per_snp, &site_keep)?;
+        if compacted_n != kept_n {
+            return Err(format!(
+                "internal error: compacted packed rows {compacted_n} != kept_n {kept_n}"
+            ));
+        }
     }
     emit_gfreader_rss_debug(
         "prepare_bed_logic_meta/site_keep_ready",
@@ -5576,7 +6134,7 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window(
         stats_only,
     );
 
-    Ok(PreparedBedLogicMetaOwned {
+    let meta = PreparedBedLogicMetaOwned {
         site_keep,
         row_flip: row_flip_keep,
         row_source_indices,
@@ -5586,7 +6144,8 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window(
         n_samples,
         n_snps_total: n_snps,
         bytes_per_snp,
-    })
+    };
+    Ok((meta, packed_all_rows))
 }
 
 pub(crate) fn prepare_bed_logic_meta_owned(
@@ -7096,11 +7655,52 @@ pub fn scan_bed_2bit_packed_stats<'py>(
 
 #[inline]
 pub(crate) fn is_simple_snp_allele(a: &str) -> bool {
-    let t = a.trim().to_ascii_uppercase();
-    if t.len() != 1 {
-        return false;
+    let bytes = a.trim().as_bytes();
+    bytes.len() == 1
+        && matches!(
+            bytes[0],
+            b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't'
+        )
+}
+
+#[inline]
+fn bim_line_simple_snp_alleles(line: &str) -> Option<bool> {
+    let mut columns = line.split_whitespace();
+    for _ in 0..4 {
+        columns.next()?;
     }
-    matches!(t.as_bytes()[0], b'A' | b'C' | b'G' | b'T')
+    let allele1 = columns.next()?;
+    let allele2 = columns.next()?;
+    Some(is_simple_snp_allele(allele1) && is_simple_snp_allele(allele2))
+}
+
+fn read_bim_simple_snp_allele_mask(prefix: &str) -> Result<Vec<u8>, String> {
+    let path = PathBuf::from(format!("{prefix}.bim"));
+    let file = File::open(&path).map_err(|error| error.to_string())?;
+    let mut reader = BufReader::with_capacity(1 << 20, file);
+    let mut line = String::new();
+    let mut line_no = 0usize;
+    let mut mask = Vec::new();
+    loop {
+        line.clear();
+        let bytes_read = reader
+            .read_line(&mut line)
+            .map_err(|error| format!("{}:{}: {}", path.display(), line_no + 1, error))?;
+        if bytes_read == 0 {
+            break;
+        }
+        line_no += 1;
+        let parsed_line = line.trim_end_matches(['\r', '\n']);
+        let pass_snp = bim_line_simple_snp_alleles(parsed_line).ok_or_else(|| {
+            format!(
+                "Malformed BIM line at {}:{}: {parsed_line}",
+                path.display(),
+                line_no
+            )
+        })?;
+        mask.push(u8::from(pass_snp));
+    }
+    Ok(mask)
 }
 
 #[pyfunction]
@@ -7317,6 +7917,133 @@ pub fn prepare_bed_logic_meta_selected<'py>(
         site_keep_arr,
         prepared.n_samples,
         prepared.n_snps_total,
+    ))
+}
+
+#[pyfunction]
+#[pyo3(signature = (
+    prefix,
+    sample_indices=None,
+    maf_threshold=0.0,
+    max_missing_rate=1.0,
+    het_threshold=1.0,
+    snps_only=false,
+    bimranges=Vec::new(),
+))]
+pub fn prepare_bed_fused_qc_packed<'py>(
+    py: Python<'py>,
+    prefix: String,
+    sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
+    bimranges: Vec<(String, i64, i64)>,
+) -> PyResult<(
+    Bound<'py, PyArray2<u8>>,
+    Bound<'py, PyArray1<i64>>,
+    Bound<'py, PyArray1<f32>>,
+    Bound<'py, PyArray1<f32>>,
+    Bound<'py, PyArray1<bool>>,
+    usize,
+    usize,
+)> {
+    if !(0.0..=0.5).contains(&maf_threshold) {
+        return Err(PyValueError::new_err(
+            "maf_threshold must be within [0, 0.5]",
+        ));
+    }
+    if !(0.0..=1.0).contains(&max_missing_rate) {
+        return Err(PyValueError::new_err(
+            "max_missing_rate must be within [0, 1.0]",
+        ));
+    }
+    if !(0.0..=1.0).contains(&het_threshold) {
+        return Err(PyValueError::new_err(
+            "het_threshold must be within [0, 1.0]",
+        ));
+    }
+
+    let total_t0 = Instant::now();
+    let bed_prefix = normalize_plink_prefix_local(&prefix);
+    let n_samples_full = core::read_fam(&bed_prefix)
+        .map_err(PyRuntimeError::new_err)?
+        .len();
+    if n_samples_full == 0 {
+        return Err(PyRuntimeError::new_err("no samples found in PLINK input"));
+    }
+    let sample_idx: Option<Vec<usize>> = if let Some(sample_indices) = sample_indices {
+        let idx64 = sample_indices
+            .as_slice()
+            .map_err(|_| PyRuntimeError::new_err("sample_indices must be contiguous int64"))?;
+        let mut out = Vec::with_capacity(idx64.len());
+        for &sid in idx64 {
+            if sid < 0 || (sid as usize) >= n_samples_full {
+                return Err(PyValueError::new_err(format!(
+                    "sample index out of range: {sid} for n_samples={n_samples_full}"
+                )));
+            }
+            out.push(sid as usize);
+        }
+        Some(out)
+    } else {
+        None
+    };
+
+    let rust_core_t0 = Instant::now();
+    let prepared = py
+        .detach(move || {
+            prepare_bed_logic_meta_and_packed_owned_for_stats_samples_with_ranges(
+                &bed_prefix,
+                maf_threshold,
+                max_missing_rate,
+                het_threshold,
+                snps_only,
+                sample_idx.as_deref(),
+                bimranges.as_slice(),
+            )
+        })
+        .map_err(PyRuntimeError::new_err)?;
+    let rust_core_secs = rust_core_t0.elapsed().as_secs_f64();
+
+    let meta = prepared.meta;
+    let packed_mat = Array2::from_shape_vec(
+        (meta.row_source_indices.len(), meta.bytes_per_snp),
+        prepared.packed_all_rows,
+    )
+    .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+    let row_idx = meta
+        .row_source_indices
+        .iter()
+        .map(|&row| row as i64)
+        .collect::<Vec<_>>();
+    #[allow(deprecated)]
+    let packed_arr = PyArray2::from_owned_array(py, packed_mat).into_bound();
+    #[allow(deprecated)]
+    let row_idx_arr = PyArray1::from_owned_array(py, Array1::from_vec(row_idx)).into_bound();
+    #[allow(deprecated)]
+    let miss_arr = PyArray1::from_owned_array(py, Array1::from_vec(meta.missing_rate)).into_bound();
+    #[allow(deprecated)]
+    let maf_arr = PyArray1::from_owned_array(py, Array1::from_vec(meta.maf)).into_bound();
+    #[allow(deprecated)]
+    let row_flip_arr = PyArray1::from_owned_array(py, Array1::from_vec(meta.row_flip)).into_bound();
+    emit_bed_logic_meta_py_timing(
+        "prepare_bed_fused_qc_packed_py",
+        rust_core_secs,
+        0.0,
+        total_t0.elapsed().as_secs_f64(),
+        meta.n_samples,
+        meta.n_snps_total,
+        meta.row_source_indices.len(),
+    );
+    Ok((
+        packed_arr,
+        row_idx_arr,
+        miss_arr,
+        maf_arr,
+        row_flip_arr,
+        meta.n_samples,
+        meta.n_snps_total,
     ))
 }
 
@@ -8888,20 +9615,47 @@ pub fn count_hmp_snps(path: String) -> PyResult<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
+        bim_line_simple_snp_alleles, compact_packed_rows_in_place, copy_packed_rows_and_map,
         count_packed_row_counts, count_packed_row_counts_selected,
         count_packed_row_counts_selected_with_excluded, count_packed_row_pure_line_counts,
         count_packed_row_pure_line_counts_fast,
         count_packed_row_pure_line_counts_selected_with_excluded,
         count_packed_row_pure_line_counts_selected_with_excluded_fast,
-        count_packed_row_pure_line_counts_selected_with_excluded_lut,
+        count_packed_row_pure_line_counts_selected_with_excluded_lut, evaluate_packed_bed_row_qc,
         evaluate_packed_row_keep_and_flip, evaluate_packed_snp_qc,
         format_zero_sites_pure_line_error, precompute_excluded_sample_indices,
+        prepare_bed_logic_meta_and_packed_owned_for_stats_samples,
+        prepare_bed_logic_meta_and_packed_owned_for_stats_samples_with_ranges,
         prepare_bed_logic_meta_owned_for_stats_samples_pure_line_intervals,
         prepare_bed_logic_meta_owned_for_stats_samples_pure_line_with_mmap_window,
         prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window,
-        pure_line_filter_status_from_counts, pure_line_filter_status_reason,
+        pure_line_filter_status_from_counts, pure_line_filter_status_reason, BedChunkReader,
         PURE_LINE_FILTER_FAIL_MISSING, PURE_LINE_FILTER_KEEP,
     };
+
+    #[test]
+    fn fused_bed_qc_matches_prepared_het_threshold_rounding() {
+        let mut codes = vec![0b10u8; 7];
+        codes.extend([0b00u8; 3]);
+        let packed = pack_plink_codes(&codes);
+        assert_eq!(count_packed_row_counts(&packed, codes.len()), (0, 7, 0));
+        let observed = evaluate_packed_bed_row_qc(
+            packed.as_slice(),
+            codes.len(),
+            None,
+            None,
+            codes.len(),
+            0.0,
+            1.0,
+            0.7,
+        );
+
+        // 7 / 10 is greater than f32(0.7) when compared as f64. The fused
+        // kernels previously rounded 7 / 10 to f32 first and incorrectly kept it.
+        assert!(!observed.keep);
+        assert!((observed.alt_freq - 0.35).abs() < 1e-6);
+        assert_eq!(observed.missing_count, 0);
+    }
 
     fn pack_plink_codes(codes: &[u8]) -> Vec<u8> {
         let mut out = vec![0u8; (codes.len() + 3) / 4];
@@ -8995,6 +9749,266 @@ mod tests {
         }
 
         fs::remove_dir_all(dir).expect("remove temporary BED directory");
+    }
+
+    #[test]
+    fn fused_qc_packed_load_matches_metadata_and_keeps_source_row_mapping() {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        pyo3::Python::initialize();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("janusx_fused_qc_packed_{stamp}"));
+        fs::create_dir_all(&dir).expect("create temporary BED directory");
+        let prefix = dir.join("tiny");
+        fs::write(
+            prefix.with_extension("fam"),
+            "f1 s1 0 0 1 -9\nf2 s2 0 0 1 -9\nf3 s3 0 0 1 -9\nf4 s4 0 0 1 -9\n",
+        )
+        .expect("write FAM");
+        fs::write(
+            prefix.with_extension("bim"),
+            "1 rs1 0 10 A G\n1 rs2 0 20 AT A\n1 rs3 0 30 G A\n1 rs4 0 40 T C\n",
+        )
+        .expect("write BIM");
+        let codes = [
+            [0b00u8, 0b10, 0b01, 0b11],
+            [0b00u8, 0b00, 0b00, 0b00],
+            [0b01u8, 0b01, 0b11, 0b00],
+            [0b11u8, 0b11, 0b11, 0b11],
+        ];
+        let mut bed = vec![0x6c, 0x1b, 0x01];
+        for row in &codes {
+            bed.extend(pack_plink_codes(row));
+        }
+        fs::write(prefix.with_extension("bed"), bed.as_slice()).expect("write BED");
+
+        let thresholds = (0.0_f32, 0.25_f32, 0.4_f32);
+        for (snps_only, sample_indices) in [(false, None), (true, Some(&[3usize, 2, 0][..]))] {
+            let expected = prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window(
+                prefix.to_str().unwrap(),
+                thresholds.0,
+                thresholds.1,
+                thresholds.2,
+                snps_only,
+                sample_indices,
+                true,
+                Some(1),
+                1,
+            )
+            .expect("prepare separate-scan metadata reference");
+            let observed = prepare_bed_logic_meta_and_packed_owned_for_stats_samples(
+                prefix.to_str().unwrap(),
+                thresholds.0,
+                thresholds.1,
+                thresholds.2,
+                snps_only,
+                sample_indices,
+            )
+            .expect("fused QC and packed load");
+
+            let mut expected_packed = Vec::new();
+            for &source_row in &observed.meta.row_source_indices {
+                let start = 3 + source_row * observed.meta.bytes_per_snp;
+                let end = start + observed.meta.bytes_per_snp;
+                expected_packed.extend_from_slice(&bed[start..end]);
+            }
+            assert_eq!(observed.packed_all_rows, expected_packed);
+            assert_eq!(observed.meta.site_keep, expected.site_keep);
+            assert_eq!(
+                observed.meta.row_source_indices,
+                expected.row_source_indices
+            );
+            assert_eq!(observed.meta.row_flip, expected.row_flip);
+            assert_eq!(observed.meta.missing_rate, expected.missing_rate);
+            assert_eq!(observed.meta.maf, expected.maf);
+            assert_eq!(observed.meta.n_samples, expected.n_samples);
+            assert_eq!(observed.meta.n_snps_total, expected.n_snps_total);
+        }
+
+        fs::remove_dir_all(dir).expect("remove temporary BED directory");
+    }
+
+    #[test]
+    fn fused_qc_packed_bimrange_keeps_only_matching_source_rows() {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        pyo3::Python::initialize();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("janusx_fused_qc_bimrange_{stamp}"));
+        fs::create_dir_all(&dir).expect("create temporary BED directory");
+        let prefix = dir.join("tiny");
+        fs::write(
+            prefix.with_extension("fam"),
+            "f1 s1 0 0 1 -9\nf2 s2 0 0 1 -9\nf3 s3 0 0 1 -9\nf4 s4 0 0 1 -9\n",
+        )
+        .expect("write FAM");
+        fs::write(
+            prefix.with_extension("bim"),
+            "1 rs1 0 10 A G\n1 rs2 0 20 C CT\n2 rs3 0 30 G A\n1 rs4 0 40 T C\n",
+        )
+        .expect("write BIM");
+        let codes = [
+            [0b00u8, 0b10, 0b01, 0b11],
+            [0b00u8, 0b00, 0b00, 0b00],
+            [0b01u8, 0b01, 0b11, 0b00],
+            [0b11u8, 0b11, 0b11, 0b11],
+        ];
+        let mut bed = vec![0x6c, 0x1b, 0x01];
+        for row in &codes {
+            bed.extend(pack_plink_codes(row));
+        }
+        fs::write(prefix.with_extension("bed"), bed.as_slice()).expect("write BED");
+
+        let ranges = vec![("chr1".to_string(), 20_i64, 10_i64)];
+        let observed = prepare_bed_logic_meta_and_packed_owned_for_stats_samples_with_ranges(
+            prefix.to_str().unwrap(),
+            0.0,
+            1.0,
+            1.0,
+            false,
+            None,
+            ranges.as_slice(),
+        )
+        .expect("fused range QC and packed load");
+
+        assert_eq!(observed.meta.row_source_indices, vec![0, 1]);
+        assert_eq!(observed.meta.n_snps_total, 4);
+        assert_eq!(observed.meta.missing_rate, vec![0.25, 0.0]);
+        assert_eq!(observed.meta.maf, vec![0.5, 0.0]);
+        assert_eq!(&observed.packed_all_rows, &bed[3..5]);
+
+        let snps_only = prepare_bed_logic_meta_and_packed_owned_for_stats_samples_with_ranges(
+            prefix.to_str().unwrap(),
+            0.0,
+            1.0,
+            1.0,
+            true,
+            None,
+            ranges.as_slice(),
+        )
+        .expect("fused range QC with SNP-only filtering");
+        assert_eq!(snps_only.meta.row_source_indices, vec![0]);
+        assert_eq!(snps_only.meta.maf, vec![0.5]);
+        assert_eq!(&snps_only.packed_all_rows, &bed[3..4]);
+
+        fs::remove_dir_all(dir).expect("remove temporary BED directory");
+    }
+
+    #[test]
+    fn bed_chunk_reader_windowed_bimranges_read_only_matching_rows() {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        pyo3::Python::initialize();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("janusx_bed_chunk_bimranges_{stamp}"));
+        fs::create_dir_all(&dir).expect("create temporary BED directory");
+        let prefix = dir.join("tiny");
+        fs::write(
+            prefix.with_extension("fam"),
+            "f1 s1 0 0 1 -9\nf2 s2 0 0 1 -9\nf3 s3 0 0 1 -9\nf4 s4 0 0 1 -9\n",
+        )
+        .expect("write FAM");
+        fs::write(
+            prefix.with_extension("bim"),
+            "1 rs1 0 10 A G\n1 rs2 0 20 C T\n2 rs3 0 30 G A\n1 rs4 0 40 T C\n",
+        )
+        .expect("write BIM");
+        let rows = [
+            [0b00u8, 0b00, 0b11, 0b11],
+            [0b00u8, 0b10, 0b01, 0b11],
+            [0b00u8, 0b00, 0b00, 0b00],
+            [0b11u8, 0b11, 0b11, 0b11],
+        ];
+        let mut bed = vec![0x6c, 0x1b, 0x01];
+        for row in &rows {
+            bed.extend(pack_plink_codes(row));
+        }
+        fs::write(prefix.with_extension("bed"), bed).expect("write BED");
+
+        pyo3::Python::attach(|py| {
+            let mut reader = BedChunkReader::new(
+                prefix.to_string_lossy().into_owned(),
+                Some(0.0),
+                Some(1.0),
+                Some(true),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(1),
+                None,
+                None,
+                None,
+                Some(vec![("chr1".to_string(), 15, 25)]),
+                None,
+                Some(1.0),
+                Some(true),
+            )
+            .expect("construct windowed BED reader with BIM ranges");
+            assert_eq!(reader.n_snps(), 1);
+            let (_, sites) = reader
+                .next_chunk(py, 4)
+                .expect("read filtered BED chunk")
+                .expect("range should retain one marker");
+            assert_eq!(sites.len(), 1);
+            assert_eq!(sites[0].snp, "rs2");
+            assert!(reader
+                .next_chunk(py, 4)
+                .expect("finish filtered BED reader")
+                .is_none());
+        });
+
+        fs::remove_dir_all(dir).expect("remove temporary BED directory");
+    }
+
+    #[test]
+    fn packed_copy_map_matches_source_bytes_and_row_order() {
+        let source = [1_u8, 2, 3, 4, 5, 6];
+        let (copied, row_sums) = copy_packed_rows_and_map(&source, 2, |row_idx, row| {
+            (
+                row_idx,
+                row.iter().map(|&value| value as usize).sum::<usize>(),
+            )
+        })
+        .expect("copy packed rows while mapping row statistics");
+
+        assert_eq!(copied, source);
+        assert_eq!(row_sums, vec![(0, 3), (1, 7), (2, 11)]);
+    }
+
+    #[test]
+    fn bim_allele_mask_parser_matches_simple_snp_rules() {
+        assert_eq!(bim_line_simple_snp_alleles("1 rs1 0 10 a C"), Some(true));
+        assert_eq!(bim_line_simple_snp_alleles("1 rs2 0 20 AT A"), Some(false));
+        assert_eq!(bim_line_simple_snp_alleles("1 rs3 0 30 N G"), Some(false));
+        assert_eq!(bim_line_simple_snp_alleles("1 rs4 0 40 A"), None);
+        assert_eq!(bim_line_simple_snp_alleles(""), None);
+    }
+
+    #[test]
+    fn packed_rows_compact_in_keep_order_and_validate_shape() {
+        let mut packed = vec![1_u8, 2, 3, 4, 5, 6, 7, 8];
+        let kept = compact_packed_rows_in_place(&mut packed, 2, &[false, true, false, true])
+            .expect("compact selected packed rows");
+        assert_eq!(kept, 2);
+        assert_eq!(packed, vec![3, 4, 7, 8]);
+
+        let mut malformed = vec![1_u8, 2, 3];
+        assert!(compact_packed_rows_in_place(&mut malformed, 2, &[true, false]).is_err());
     }
 
     #[test]

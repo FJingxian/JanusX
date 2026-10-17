@@ -946,6 +946,56 @@ def _detect_pregsf90_apy_mode(pregsf90_bin: str) -> str:
     return mode
 
 
+def _blupf90_library_path_prefixes(
+    environment: dict[str, str], binaries: Iterable[str]
+) -> list[str]:
+    """Return runtime library dirs matching the active Python/tool envs.
+
+    A stale CONDA_PREFIX should not shadow libraries for the current Python.
+    Keep it when it matches the interpreter or contains one of the selected
+    BLUPF90 executables, since those binaries may need their own Conda runtime.
+    """
+    python_prefixes = [Path(sys.prefix), Path(sys.base_prefix)]
+    conda_raw = str(environment.get("CONDA_PREFIX", "")).strip()
+    conda_path: Path | None = Path(conda_raw) if conda_raw else None
+    conda_is_runtime = False
+    conda_contains_tool = False
+    if conda_path is not None:
+        try:
+            resolved_conda = conda_path.resolve()
+            conda_is_runtime = resolved_conda in {
+                prefix.resolve() for prefix in python_prefixes
+            }
+            for binary in binaries:
+                try:
+                    Path(binary).expanduser().resolve().relative_to(resolved_conda)
+                    conda_contains_tool = True
+                    break
+                except (OSError, ValueError):
+                    continue
+        except OSError:
+            conda_path = None
+
+    prefixes: list[Path] = []
+    if conda_path is not None and conda_contains_tool and not conda_is_runtime:
+        prefixes.append(conda_path)
+    prefixes.extend(python_prefixes)
+    if conda_path is not None and conda_is_runtime:
+        prefixes.append(conda_path)
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for prefix in prefixes:
+        lib_dir = prefix / "lib"
+        if not lib_dir.is_dir():
+            continue
+        resolved = str(lib_dir.resolve())
+        if resolved not in seen:
+            seen.add(resolved)
+            out.append(resolved)
+    return out
+
+
 def _build_apy_option_lines(*, n_levels: int, apy_mode: str, apy_type: int = 2) -> list[str]:
     raw = str(os.environ.get("JX_GBLUPBENCH_APY_OPTION", "")).strip()
     if raw != "":
@@ -3210,12 +3260,14 @@ def _run_engine_blupf90(
     blup_env.pop("KMP_AFFINITY", None)
     blup_env.setdefault("OMP_PROC_BIND", "false")
 
-    conda_prefix = str(blup_env.get("CONDA_PREFIX", "")).strip()
-    if conda_prefix != "":
-        conda_lib = str((Path(conda_prefix) / "lib").resolve())
-        old_ld = str(blup_env.get("LD_LIBRARY_PATH", ""))
+    active_lib_dirs = _blupf90_library_path_prefixes(
+        blup_env, (pregsf90_bin, blupf90_bin)
+    )
+    if active_lib_dirs:
+        old_ld = str(blup_env.get("LD_LIBRARY_PATH", "")).strip()
+        prefix_ld = ":".join(active_lib_dirs)
         blup_env["LD_LIBRARY_PATH"] = (
-            f"{conda_lib}:{old_ld}" if old_ld.strip() != "" else conda_lib
+            f"{prefix_ld}:{old_ld}" if old_ld else prefix_ld
         )
 
     apy_mode = _detect_pregsf90_apy_mode(pregsf90_bin) if use_apy else "modern"
@@ -3557,7 +3609,7 @@ def _run_engine_blupf90(
                 if ("SIGSEGV" in tail) or ("segmentation fault" in tail.lower()):
                     note = (
                         f"{note} SIGSEGV detected; retry with "
-                        "JX_GBLUPBENCH_BLUPF90_THREADS=1 and ensure CONDA_PREFIX/lib in LD_LIBRARY_PATH."
+                        "JX_GBLUPBENCH_BLUPF90_THREADS=1 and ensure the BLUPF90 runtime libraries are on LD_LIBRARY_PATH."
                     )
             except Exception:
                 pass

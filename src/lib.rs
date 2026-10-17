@@ -312,7 +312,7 @@ use packed::{
 };
 use plot::{qq_band_beta_logp_exact, qq_rank_sample_zero_based};
 use reml::{
-    ai_reml_multi_f64, ai_reml_null_f64, lmm_null_fit_f32, lmm_reml_null_f32,
+    ai_reml_multi_f64, ai_reml_null_f64, lmm_null_fit_f32, lmm_null_pve_se_f64, lmm_reml_null_f32,
     lmm_rotate_x_y_with_ut_f64, lmm_rotate_y_with_ut_f64, ml_loglike_null_f32,
 };
 use rrblup::{
@@ -948,6 +948,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(farmcpu_write_assoc_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_reml_null_f32, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_null_fit_f32, m)?)?;
+    m.add_function(wrap_pyfunction!(lmm_null_pve_se_f64, m)?)?;
     m.add_function(wrap_pyfunction!(ml_loglike_null_f32, m)?)?;
     m.add_function(wrap_pyfunction!(ai_reml_null_f64, m)?)?;
     m.add_function(wrap_pyfunction!(ai_reml_multi_f64, m)?)?;

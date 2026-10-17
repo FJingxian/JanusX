@@ -359,6 +359,65 @@ pub(crate) fn reml_loglike(
     }
 }
 
+/// Estimate the standard error of phenotype-scale PVE from the observed
+/// curvature of the profiled REML likelihood in log10(lambda), using the
+/// delta method. Returns `None` at optimizer boundaries or when the local
+/// likelihood is not concave enough to define a finite standard error.
+fn profile_reml_pve_se(
+    log10_lbd: f64,
+    s: &[f64],
+    xcov: &[f64],
+    y: &[f64],
+    n: usize,
+    p_cov: usize,
+    trace_mean: f64,
+    low: f64,
+    high: f64,
+) -> Option<f64> {
+    const STEP: f64 = 1.0e-2;
+    if !log10_lbd.is_finite()
+        || !trace_mean.is_finite()
+        || trace_mean <= 0.0
+        || !low.is_finite()
+        || !high.is_finite()
+        || low >= high
+        || log10_lbd - 2.0 * STEP <= low
+        || log10_lbd + 2.0 * STEP >= high
+    {
+        return None;
+    }
+
+    let eval = |theta| reml_loglike(theta, s, xcov, y, None, n, p_cov);
+    let f0 = eval(log10_lbd);
+    let fm1 = eval(log10_lbd - STEP);
+    let fp1 = eval(log10_lbd + STEP);
+    let fm2 = eval(log10_lbd - 2.0 * STEP);
+    let fp2 = eval(log10_lbd + 2.0 * STEP);
+    if [f0, fm1, fp1, fm2, fp2]
+        .iter()
+        .any(|v| !v.is_finite() || *v == -1.0e8)
+    {
+        return None;
+    }
+
+    // Five-point central second derivative of the profiled REML log-likelihood.
+    let second = (-fp2 + 16.0 * fp1 - 30.0 * f0 + 16.0 * fm1 - fm2) / (12.0 * STEP * STEP);
+    let observed_information = -second;
+    if !observed_information.is_finite() || observed_information <= 0.0 {
+        return None;
+    }
+
+    let lambda = 10.0_f64.powf(log10_lbd);
+    let denom = trace_mean + lambda;
+    if !lambda.is_finite() || lambda <= 0.0 || !denom.is_finite() || denom <= 0.0 {
+        return None;
+    }
+    // PVE on phenotype scale is trace_mean / (trace_mean + lambda).
+    let derivative = trace_mean * lambda * std::f64::consts::LN_10 / denom.powi(2);
+    let se = derivative / observed_information.sqrt();
+    (se.is_finite() && se >= 0.0).then_some(se)
+}
+
 pub(crate) fn ml_loglike(
     log10_lbd: f64,
     s: &[f64],
@@ -593,6 +652,66 @@ pub fn lmm_null_fit_f32<'py>(
     tol: f64,
 ) -> PyResult<(f64, f64, f64, f64)> {
     fit_lmm_null_f32(py, s, xcov, y_rot, low, high, max_iter, tol, true)
+}
+
+/// Return the delta-method standard error for phenotype-scale PVE at a
+/// previously fitted null REML lambda. `NaN` means the local profile
+/// likelihood does not support a finite interior estimate.
+#[pyfunction]
+#[pyo3(signature = (s, xcov, y_rot, log10_lbd, trace_mean, low=-5.0, high=5.0))]
+pub fn lmm_null_pve_se_f64<'py>(
+    py: Python<'py>,
+    s: PyReadonlyArray1<'py, f64>,
+    xcov: PyReadonlyArray2<'py, f64>,
+    y_rot: PyReadonlyArray1<'py, f64>,
+    log10_lbd: f64,
+    trace_mean: f64,
+    low: f64,
+    high: f64,
+) -> PyResult<f64> {
+    let s = s.as_slice()?;
+    let xcov_arr = xcov.as_array();
+    let y = y_rot.as_slice()?;
+    let n = y.len();
+    let p_cov = xcov_arr.shape()[1];
+    if xcov_arr.shape()[0] != n || s.len() != n || n <= p_cov {
+        return Err(PyRuntimeError::new_err(format!(
+            "null PVE SE shape mismatch: len(S)={}, Xcov={}x{}, len(y)={n}",
+            s.len(),
+            xcov_arr.shape()[0],
+            p_cov,
+        )));
+    }
+    if !log10_lbd.is_finite()
+        || !trace_mean.is_finite()
+        || trace_mean <= 0.0
+        || !low.is_finite()
+        || !high.is_finite()
+        || low >= high
+    {
+        return Err(PyRuntimeError::new_err(
+            "null PVE SE requires finite lambda, positive trace mean and valid bounds",
+        ));
+    }
+
+    let xcov_flat: Cow<[f64]> = match crate::stats_common::array_standard_slice(&xcov) {
+        Ok(values) => Cow::Borrowed(values),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&xcov_arr)),
+    };
+    if s.iter()
+        .chain(xcov_flat.iter())
+        .chain(y.iter())
+        .any(|value| !value.is_finite())
+    {
+        return Err(PyRuntimeError::new_err(
+            "null PVE SE inputs must contain only finite values",
+        ));
+    }
+
+    let pve_se = py.detach(|| {
+        profile_reml_pve_se(log10_lbd, s, &xcov_flat, y, n, p_cov, trace_mean, low, high)
+    });
+    Ok(pve_se.unwrap_or(f64::NAN))
 }
 
 fn fit_lmm_null_f32<'py>(
@@ -1112,4 +1231,50 @@ pub fn ai_reml_multi_f64<'py>(
 
     let theta_arr = PyArray1::<f64>::from_vec(py, theta.iter().copied().collect()).into_bound();
     Ok((theta_arr, last_ml, last_reml, used_iter, converged))
+}
+
+#[cfg(test)]
+mod pve_se_tests {
+    use super::*;
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+    use rand_distr::StandardNormal;
+
+    #[test]
+    fn profile_reml_curvature_produces_interior_pve_se() {
+        let n = 400usize;
+        let s: Vec<f64> = (0..n)
+            .map(|i| 0.1 + 1.9 * (i as f64 / (n - 1) as f64))
+            .collect();
+        let trace_mean = s.iter().sum::<f64>() / n as f64;
+        let lambda_true = 0.7_f64;
+        let mut rng = StdRng::seed_from_u64(0x50e_5eed);
+        let y: Vec<f64> = s
+            .iter()
+            .map(|&si| {
+                let z: f64 = rng.sample(StandardNormal);
+                z * (si + lambda_true).sqrt()
+            })
+            .collect();
+        let xcov = vec![1.0_f64; n];
+        let (theta_hat, _) = brent_minimize(
+            |theta| -reml_loglike(theta, &s, &xcov, &y, None, n, 1),
+            -4.0,
+            4.0,
+            1e-6,
+            100,
+        );
+
+        let pve_se = profile_reml_pve_se(theta_hat, &s, &xcov, &y, n, 1, trace_mean, -5.0, 5.0)
+            .expect("interior REML maximum should yield finite PVE SE");
+        assert!(pve_se.is_finite() && pve_se > 0.0 && pve_se < 0.5);
+    }
+
+    #[test]
+    fn profile_reml_pve_se_is_unavailable_at_lambda_boundary() {
+        let s = [0.5_f64, 1.0, 1.5, 2.0];
+        let xcov = [1.0_f64; 4];
+        let y = [-1.0_f64, 0.5, 0.1, 1.2];
+        assert!(profile_reml_pve_se(-5.0 + 0.01, &s, &xcov, &y, 4, 1, 1.25, -5.0, 5.0,).is_none());
+    }
 }

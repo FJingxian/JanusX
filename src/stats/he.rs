@@ -947,6 +947,7 @@ fn dot_sum_intercept_f32_neon(row: &[f32], score: &[f32]) -> (f32, f32) {
     }
 }
 
+#[cfg(test)]
 #[inline]
 pub(crate) fn dot_sum_intercept_f32_row(row: &[f32], score: &[f32]) -> (f32, f32) {
     debug_assert_eq!(row.len(), score.len());
@@ -967,6 +968,82 @@ pub(crate) fn dot_sum_intercept_f32_row(row: &[f32], score: &[f32]) -> (f32, f32
         (
             (dot_lanes[0] + dot_lanes[1]) + (dot_lanes[2] + dot_lanes[3]),
             (sum_lanes[0] + sum_lanes[1]) + (sum_lanes[2] + sum_lanes[3]),
+        )
+    }
+}
+
+/// Compute g' score, g' 1, and g' g in one pass for intercept-only scans.
+/// The reduction order matches the existing paired dot/sum and sum-of-squares
+/// kernels so callers can fuse memory reads without changing marker results.
+#[inline]
+pub(crate) fn dot_sum_sumsq_intercept_f32_row(row: &[f32], score: &[f32]) -> (f32, f32, f64) {
+    debug_assert_eq!(row.len(), score.len());
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::aarch64::*;
+        unsafe {
+            let zero = vdupq_n_f32(0.0);
+            let mut dots = zero;
+            let mut sums = zero;
+            let mut sumsq_low = vdupq_n_f64(0.0);
+            let mut sumsq_high = vdupq_n_f64(0.0);
+            let mut c = 0usize;
+            while c + 4 <= row.len() {
+                let g = vld1q_f32(row.as_ptr().add(c));
+                let y = vld1q_f32(score.as_ptr().add(c));
+                let product = vbslq_f32(vceqq_f32(g, zero), zero, vmulq_f32(g, y));
+                dots = vaddq_f32(dots, product);
+                sums = vaddq_f32(sums, g);
+
+                let low = vcvt_f64_f32(vget_low_f32(g));
+                let high = vcvt_f64_f32(vget_high_f32(g));
+                sumsq_low = vaddq_f64(sumsq_low, vmulq_f64(low, low));
+                sumsq_high = vaddq_f64(sumsq_high, vmulq_f64(high, high));
+                c += 4;
+            }
+
+            let mut dot_lanes = [0.0_f32; 4];
+            let mut sum_lanes = [0.0_f32; 4];
+            vst1q_f32(dot_lanes.as_mut_ptr(), dots);
+            vst1q_f32(sum_lanes.as_mut_ptr(), sums);
+            let mut sumsq_lanes = [0.0_f64; 2];
+            vst1q_f64(sumsq_lanes.as_mut_ptr(), vaddq_f64(sumsq_low, sumsq_high));
+            let mut sumsq = sumsq_lanes[0] + sumsq_lanes[1];
+            while c < row.len() {
+                let g = row[c];
+                if g != 0.0 {
+                    dot_lanes[c & 3] += g * score[c];
+                    sum_lanes[c & 3] += g;
+                }
+                let g64 = g as f64;
+                sumsq += g64 * g64;
+                c += 1;
+            }
+
+            (
+                (dot_lanes[0] + dot_lanes[1]) + (dot_lanes[2] + dot_lanes[3]),
+                (sum_lanes[0] + sum_lanes[1]) + (sum_lanes[2] + sum_lanes[3]),
+                sumsq,
+            )
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let mut dot_lanes = [0.0_f32; 4];
+        let mut sum_lanes = [0.0_f32; 4];
+        let mut sumsq = 0.0_f64;
+        for (idx, (&g, &y)) in row.iter().zip(score.iter()).enumerate() {
+            if g != 0.0 {
+                dot_lanes[idx & 3] += g * y;
+                sum_lanes[idx & 3] += g;
+            }
+            let g64 = g as f64;
+            sumsq += g64 * g64;
+        }
+        (
+            (dot_lanes[0] + dot_lanes[1]) + (dot_lanes[2] + dot_lanes[3]),
+            (sum_lanes[0] + sum_lanes[1]) + (sum_lanes[2] + sum_lanes[3]),
+            sumsq,
         )
     }
 }

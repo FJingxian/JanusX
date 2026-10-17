@@ -345,6 +345,11 @@ def get_rich_spinner_name() -> str:
 def _console_for_print(*, force_color: bool) -> Optional["Console"]:
     if not _HAS_RICH:
         return None
+    # Rich honors NO_COLOR even when force_terminal is set, while the plain
+    # fallback below deliberately emits ANSI when force_color=True. Keep the
+    # explicit force_color behavior consistent across both backends.
+    if force_color and os.environ.get("NO_COLOR") is not None:
+        return None
     is_tty = stdout_is_tty()
     if not (is_tty or force_color):
         return None
@@ -567,6 +572,7 @@ class CliStatus:
         desc: str,
         *,
         enabled: bool = True,
+        animate: bool = True,
         timeout: float = 0.08,
         show_elapsed: bool = True,
         use_process: bool = False,
@@ -574,6 +580,7 @@ class CliStatus:
     ) -> None:
         self.desc = str(desc)
         self.enabled = bool(enabled)
+        self.animate = bool(animate)
         self.timeout = float(timeout)
         self.show_elapsed = bool(show_elapsed)
         self.use_process = bool(use_process)
@@ -581,6 +588,7 @@ class CliStatus:
         # contexts keep output clean and emit only completion lines.
         self._animate = bool(
             self.enabled
+            and self.animate
             and stdout_is_tty()
             and (bool(force_animate) or should_animate_status(self.desc))
         )
@@ -1108,6 +1116,9 @@ class ProgressBarAdapter:
         force_animate: bool = False,
         logger=None,
         log_unit: str = "item",
+        description_template: str = "[green]{task.description}",
+        show_bar: bool = True,
+        show_percentage: bool = True,
     ) -> None:
         self.total = int(max(0, total))
         self.desc = _normalize_status_base(desc)
@@ -1130,6 +1141,9 @@ class ProgressBarAdapter:
 
         if self._animate:
             progress = build_rich_progress(
+                description_template=description_template,
+                show_bar=bool(show_bar),
+                show_percentage=bool(show_percentage),
                 show_spinner=bool(show_spinner),
                 show_remaining=bool(show_remaining),
                 field_templates=["{task.fields[postfix]}"] if self._show_postfix else [],
@@ -1159,8 +1173,12 @@ class ProgressBarAdapter:
                     desc=self.desc,
                     ascii=True,
                     leave=bool(self._keep_display),
-                    bar_format="{desc}: {percentage:3.0f}%|{bar}| "
-                    "[{elapsed}<{remaining}, {rate_fmt}{postfix}]",
+                    bar_format=(
+                        "{desc}: "
+                        + ("{percentage:3.0f}%" if show_percentage else "")
+                        + ("|{bar}| " if show_bar else "")
+                        + ("[{elapsed}<{remaining}, {rate_fmt}{postfix}]" if show_remaining else "[{elapsed}{postfix}]")
+                    ),
                 )
                 self._backend = "tqdm"
 

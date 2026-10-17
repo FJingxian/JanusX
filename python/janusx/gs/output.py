@@ -11,6 +11,9 @@ import logging
 import math
 import typing
 
+from janusx.script._common.progress import _emit_to_file_handlers, stdout_is_tty
+from .progress import format_completion
+
 SuccessLogger = typing.Callable[..., None]
 FoldRow = tuple[str, int, float, float, float, float, float, float, float]
 
@@ -132,7 +135,31 @@ def emit_trait_header(
     gblup_backend_label: str | None = None,
     gblup_backend_n: int | None = None,
     gblup_backend_m: int | None = None,
+    tty_style: bool = False,
 ) -> None:
+    if tty_style:
+        width = max(40, int(sep_width))
+        logger.info("")
+        logger.info("=" * width)
+        logger.info("GS task")
+        logger.info("=" * width)
+        logger.info(
+            f"* {trait_name} (train={int(train_size)}; test={int(test_size)}; "
+            f"EffSNPs={int(eff_snp)})"
+        )
+        logger.info("-" * width)
+        if (
+            bool(debug_mode)
+            and gblup_backend_label is not None
+            and gblup_backend_n is not None
+            and gblup_backend_m is not None
+        ):
+            logger.info(
+                f"GBLUP backend(auto): {gblup_backend_label} "
+                f"(n={int(gblup_backend_n)}, m={int(gblup_backend_m)})"
+            )
+        return
+
     logger.info("*" * max(1, int(sep_width)))
     logger.info(f"* Genomic Selection for trait: {trait_name}")
     logger.info(
@@ -150,8 +177,18 @@ def emit_trait_header(
         )
 
 
-def emit_method_header(logger: logging.Logger, method_display: str) -> None:
-    logger.info(f"** {str(method_display)}")
+def emit_method_header(
+    logger: logging.Logger,
+    method_display: str,
+    *,
+    terminal_logger: logging.Logger | None = None,
+) -> None:
+    method = str(method_display)
+    if terminal_logger is None:
+        logger.info(f"** {method}")
+        return
+    _emit_to_file_handlers(logger, logging.INFO, f"** {method}")
+    terminal_logger.info(f"{method}:")
 
 
 def emit_method_stage_lines(
@@ -170,15 +207,34 @@ def emit_method_stage_lines(
     terminal_columns: int,
     format_elapsed: typing.Callable[[float], str],
     log_success: SuccessLogger,
+    cv_terminal_emitted: bool = False,
+    stages_terminal_emitted: bool = False,
 ) -> None:
+    def emit(message: str, *, terminal_message: str | None = None, file_only=False):
+        formatted_message = format_completion(message)
+        if file_only:
+            _emit_to_file_handlers(logger, logging.INFO, formatted_message)
+        else:
+            log_success(
+                logger,
+                (
+                    terminal_message
+                    if stdout_is_tty() and terminal_message is not None
+                    else message
+                ),
+                log_message=formatted_message,
+                force_color=stdout_is_tty(),
+            )
+
     if cv_skipped:
         total_sec = float(total_elapsed_sec) if total_elapsed_sec is not None else 0.0
         if not math.isfinite(total_sec):
             total_sec = 0.0
-        log_success(
-            logger,
-            f"Cross-validation ...Skipped [{format_elapsed(total_sec)}]",
-            force_color=True,
+        elapsed_text = format_elapsed(total_sec)
+        emit(
+            f"CV ...Skipped [{elapsed_text}]",
+            terminal_message=f"Cross-validation ...Skipped [{elapsed_text}]",
+            file_only=cv_terminal_emitted,
         )
     elif cv_folds is not None and int(cv_folds) > 0:
         total = int(max(1, int(cv_folds)))
@@ -193,33 +249,41 @@ def emit_method_stage_lines(
                 - 2,
             ),
         )
-        log_success(
-            logger,
-            f"Cross-validation {'━' * bar_w} {total}/{total} {elapsed_text}",
-            force_color=True,
+        emit(
+            f"CV ...Finished [{total}/{total} folds | {elapsed_text}]",
+            terminal_message=f"Cross-validation {'━' * bar_w} {total}/{total} {elapsed_text}",
+            file_only=cv_terminal_emitted,
         )
 
     if include_fit:
         if fit_skipped:
-            log_success(
-                logger,
-                f"Fitting ...Skipped [{format_elapsed(0.0)}]",
-                force_color=True,
+            emit(
+                f"Fit ...Skipped [{format_elapsed(0.0)}]",
+                terminal_message=f"Fitting ...Skipped [{format_elapsed(0.0)}]",
+                file_only=stages_terminal_emitted,
             )
         else:
             fit_sec = float(fit_elapsed_sec) if math.isfinite(float(fit_elapsed_sec)) else 0.0
-            log_success(logger, f"Fitting ...Finished [{fit_sec:.3f}s]", force_color=True)
+            emit(
+                f"Fit ...Finished [{format_elapsed(fit_sec)}]",
+                terminal_message=f"Fitting ...Finished [{fit_sec:.3f}s]",
+                file_only=stages_terminal_emitted,
+            )
 
     if include_predict:
         if predict_skipped:
-            log_success(
-                logger,
-                f"Predicting ...Skipped [{format_elapsed(0.0)}]",
-                force_color=True,
+            emit(
+                f"Predict ...Skipped [{format_elapsed(0.0)}]",
+                terminal_message=f"Predicting ...Skipped [{format_elapsed(0.0)}]",
+                file_only=stages_terminal_emitted,
             )
         else:
             pred_sec = float(predict_elapsed_sec) if math.isfinite(float(predict_elapsed_sec)) else 0.0
-            log_success(logger, f"Predicting ...Finished [{pred_sec:.3f}s]", force_color=True)
+            emit(
+                f"Predict ...Finished [{format_elapsed(pred_sec)}]",
+                terminal_message=f"Predicting ...Finished [{pred_sec:.3f}s]",
+                file_only=stages_terminal_emitted,
+            )
 
 
 def emit_method_detail_lines(

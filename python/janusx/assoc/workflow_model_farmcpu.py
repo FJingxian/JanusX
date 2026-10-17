@@ -1789,11 +1789,11 @@ def run_farmcpu_fullmem(
             saved_paths.append(str(pseudo_tsv))
 
         farm_times = [
-            _format_farmcpu_done_elapsed(stage1_secs),
-            _format_farmcpu_done_elapsed(stage2_secs),
+            f"Stage1 {_format_farmcpu_done_elapsed(stage1_secs)}",
+            f"Stage2 {_format_farmcpu_done_elapsed(stage2_secs)}",
         ]
         if args.plot:
-            farm_times.append(_format_farmcpu_done_elapsed(viz_secs))
+            farm_times.append(f"Plot {_format_farmcpu_done_elapsed(viz_secs)}")
         farm_done_msg = f"FarmCPU ...Found {n_pseudo_qtn} QTNs [{'/'.join(farm_times)}]"
         if (not bool(emit_trait_header)) and multi_trait_mode:
             farm_done_msg = f"FarmCPU({phename}) ...Found {n_pseudo_qtn} QTNs [{'/'.join(farm_times)}]"

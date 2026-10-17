@@ -4382,10 +4382,10 @@ def run_fvlmm_packed_fullrank(
 
         done_times: list[str] = []
         if grm_secs > 0:
-            done_times.append(format_elapsed(grm_secs))
-        done_times.extend([format_elapsed(evd_secs), format_elapsed(scan_secs)])
+            done_times.append(f"GRM {format_elapsed(grm_secs)}")
+        done_times.extend([f"EVD {format_elapsed(evd_secs)}", f"Scan {format_elapsed(scan_secs)}"])
         if plot:
-            done_times.append(format_elapsed(viz_secs))
+            done_times.append(f"Plot {format_elapsed(viz_secs)}")
         _rich_success(
             logger,
             (
@@ -4663,9 +4663,9 @@ def run_lm_packed_fullrank(
             }
         )
 
-        done_times = [format_elapsed(gwas_secs)]
+        done_times = [f"Scan {format_elapsed(gwas_secs)}"]
         if plot:
-            done_times.append(format_elapsed(viz_secs))
+            done_times.append(f"Plot {format_elapsed(viz_secs)}")
         _rich_success(
             logger,
             f"LM ...Finished [{'/'.join(done_times)}]",
@@ -4819,6 +4819,7 @@ def run_lm_stream_bed_single_entry(
                     desc=model_label,
                     force_animate=True,
                     logger=logger,
+                    trait=str(pname),
                 )
         pbar_done = 0
         warm_task: Optional[CliStatus] = None
@@ -4852,6 +4853,7 @@ def run_lm_stream_bed_single_entry(
                     desc=model_label,
                     force_animate=True,
                     logger=logger,
+                    trait=str(pname),
                 )
             total_cap = int(max(1, pbar.total))
             d = int(max(0, min(d, total_cap)))
@@ -5126,9 +5128,9 @@ def run_lm_stream_bed_single_entry(
             }
         )
 
-        done_parts = [format_elapsed(gwas_secs)]
+        done_parts = [f"Scan {format_elapsed(gwas_secs)}"]
         if plot:
-            done_parts.append(format_elapsed(viz_secs))
+            done_parts.append(f"Plot {format_elapsed(viz_secs)}")
         _rich_success(
             logger,
             f"{str(model_key_norm).upper()} ...Finished [{'/'.join(done_parts)}]",
@@ -5567,7 +5569,7 @@ def run_lm_trait_bed_multi_entry(
 
         _rich_success(
             logger,
-            f"LM ...Finished [{format_elapsed(wall)}]",
+            f"LM ...Finished [Total {format_elapsed(wall)}]",
             use_spinner=bool(use_spinner),
         )
         return
@@ -5868,7 +5870,7 @@ def run_lm_trait_bed_multi_entry(
 
     _rich_success(
         logger,
-        f"LM ...Finished [{format_elapsed(wall)}]",
+        f"LM ...Finished [Total {format_elapsed(wall)}]",
         use_spinner=bool(use_spinner),
     )
 
@@ -6850,7 +6852,7 @@ def _run_mixed_trait_packed_multi_entry(
 
     _rich_success(
         logger,
-        f"{model_label} ...Finished [{format_elapsed(wall)}]",
+        f"{model_label} ...Finished [Total {format_elapsed(wall)}]",
         use_spinner=bool(use_spinner),
     )
 
@@ -7301,9 +7303,9 @@ def run_lmm_packed_fullrank(
             }
         )
 
-        done_times = [format_elapsed(evd_secs), format_elapsed(gwas_secs)]
+        done_times = [f"EVD {format_elapsed(evd_secs)}", f"Scan {format_elapsed(gwas_secs)}"]
         if plot:
-            done_times.append(format_elapsed(viz_secs))
+            done_times.append(f"Plot {format_elapsed(viz_secs)}")
         _rich_success(
             logger,
             (
@@ -7808,9 +7810,9 @@ def run_algwas_packed_fullrank(
             }
         )
 
-        done_times = [format_elapsed(stage1_secs), format_elapsed(stage2_secs)]
+        done_times = [f"Stage1 {format_elapsed(stage1_secs)}", f"Stage2 {format_elapsed(stage2_secs)}"]
         if plot:
-            done_times.append(format_elapsed(viz_secs))
+            done_times.append(f"Plot {format_elapsed(viz_secs)}")
         _rich_success(
             logger,
             f"ALGWAS ...Found {int(qtn_count)} QTNs [{'/'.join(done_times)}]",
@@ -9264,11 +9266,11 @@ def run_splmm_windowed_fullrank(
         )
 
         done_times = [
-            format_elapsed(null_secs),
-            format_elapsed(scan_secs),
+            f"Null {format_elapsed(null_secs)}",
+            f"Scan {format_elapsed(scan_secs)}",
         ]
         if plot:
-            done_times.append(format_elapsed(viz_secs))
+            done_times.append(f"Plot {format_elapsed(viz_secs)}")
         _rich_success(
             logger,
             (

@@ -105,6 +105,8 @@ from janusx.script._common.cli_args import (
     add_common_trait_selector_args,
     add_common_variant_filter_args,
     parse_trait_selector_specs,
+    resolve_trait_selectors,
+    trait_selector_help_text,
 )
 from janusx.script._common.genoio import (
     determine_genotype_source_force_kind_from_args,
@@ -228,6 +230,7 @@ FvLMM = _LazyPyBlupAssocSymbol("FvLMM")
 farmcpu = _LazyPyBlupAssocSymbol("farmcpu")
 
 from janusx.assoc.workflow_ui import (
+    _gwas_progress_enabled,
     _format_progress_metric,
     _log_file_only,
     _log_info,
@@ -2963,54 +2966,8 @@ def load_phenotype(
                 selected_ncol.append(idx)
         else:
             cols = list(pheno.columns)
-            by_str: dict[str, list[int]] = {}
-            for i, col in enumerate(cols):
-                by_str.setdefault(str(col), []).append(i)
-
-            def _resolve_name_to_index(name: object) -> Optional[int]:
-                exact = [i for i, col in enumerate(cols) if col == name]
-                if len(exact) == 1:
-                    return int(exact[0])
-                if len(exact) > 1:
-                    raise ValueError(
-                        f"Ambiguous phenotype selector '{name}': multiple columns match exactly."
-                    )
-                matched = by_str.get(str(name), [])
-                if len(matched) == 1:
-                    return int(matched[0])
-                if len(matched) > 1:
-                    raise ValueError(
-                        f"Ambiguous phenotype selector '{name}': multiple columns share this string form."
-                    )
-                return None
-
-            for spec in requested_specs:
-                local_idx: Optional[int] = None
-                global_idx: Optional[int] = None
-                if isinstance(spec, int):
-                    idx = int(spec)
-                    if 0 <= idx < int(pheno.shape[1]):
-                        local_idx = idx
-                        global_idx = idx
-                    else:
-                        fallback_idx = _resolve_name_to_index(str(spec))
-                        if fallback_idx is not None:
-                            local_idx = int(fallback_idx)
-                            global_idx = int(fallback_idx)
-                else:
-                    resolved_idx = _resolve_name_to_index(spec)
-                    if resolved_idx is not None:
-                        local_idx = int(resolved_idx)
-                        global_idx = int(resolved_idx)
-
-                if local_idx is None or global_idx is None:
-                    invalid_specs.append(str(spec))
-                    continue
-                if local_idx in seen_local:
-                    continue
-                seen_local.add(local_idx)
-                ncol_take.append(local_idx)
-                selected_ncol.append(global_idx)
+            ncol_take, invalid_specs = resolve_trait_selectors(cols, requested_specs)
+            selected_ncol = list(ncol_take)
 
         if len(ncol_take) == 0:
             max_idx = int(pheno.shape[1]) - 1
@@ -7938,11 +7895,7 @@ def parse_args(argv: Optional[list[str]] = None):
     add_common_trait_selector_args(
         phenotype_group,
         dest="ncol",
-        help_text=(
-            "Phenotype column(s), accepted as zero-based index (excluding sample ID), "
-            "column name, comma list (e.g. 0,2 or TraitA,TraitB), or numeric range "
-            "(e.g. 0:2). Repeat this flag for multiple traits. (default: all)"
-        ),
+        help_text=trait_selector_help_text() + " (default: all)",
     )
 
     models_group = parser.add_argument_group("Model Arguments (Required: Select at least one)")
@@ -8520,7 +8473,8 @@ def _run_gwas_pipeline(
     log_path = f"{outprefix}.gwas.log"
     logger = setup_logging(log_path)
     setattr(logger, "_janusx_gwas_verbose", bool(getattr(args, "verbose", False)))
-    setattr(logger, "_janusx_gwas_progress_enabled", False)
+    progress_log_enabled = _gwas_progress_enabled(None)
+    setattr(logger, "_janusx_gwas_progress_enabled", progress_log_enabled)
     _file_only_logger = logging.getLogger("janusx.gwas.file_only")
     _file_only_logger.handlers.clear()
     _file_only_logger.setLevel(logging.INFO)
@@ -8541,7 +8495,7 @@ def _run_gwas_pipeline(
     for _lg in {logger, _file_only_logger, _stream_only_logger, report_logger, terminal_logger}:
         try:
             setattr(_lg, "_janusx_gwas_verbose", bool(getattr(args, "verbose", False)))
-            setattr(_lg, "_janusx_gwas_progress_enabled", False)
+            setattr(_lg, "_janusx_gwas_progress_enabled", progress_log_enabled)
             setattr(_lg, "_janusx_gwas_terminal_rich", terminal_rich)
             setattr(_lg, "_janusx_gwas_report_logger", report_logger)
             setattr(_lg, "_janusx_gwas_stream_logger", terminal_logger if terminal_rich else None)

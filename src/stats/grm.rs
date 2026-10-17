@@ -1339,6 +1339,14 @@ struct GrmStreamPreStatsF32 {
 }
 
 #[inline]
+fn grm_stream_requires_extra_filters(snps_only: bool, het_threshold: f32) -> bool {
+    // A heterozygosity threshold of 1.0 cannot reject a row because the rate
+    // is bounded by one. Treat the CLI default as no extra filter so the
+    // fused single-pass stream can handle it without a prepared-row scan.
+    snps_only || (het_threshold > 0.0_f32 && het_threshold < 1.0_f32)
+}
+
+#[inline]
 fn parse_grm_accum_mode(raw: &str) -> Result<GrmAccumMode, String> {
     let m = raw.trim().to_ascii_lowercase();
     match m.as_str() {
@@ -1427,8 +1435,7 @@ fn grm_stream_row_prepare_from_counts_f64(
         alt_sum = 2.0_f64 * non_missing as f64 - alt_sum;
         alt_freq = alt_sum / (2.0_f64 * non_missing as f64);
     }
-    let maf = alt_freq.min(1.0_f64 - alt_freq);
-    if maf < maf_thr as f64 {
+    if !crate::gfreader::maf_passes_threshold_from_counts(alt_sum, non_missing, maf_thr) {
         return None;
     }
 
@@ -1525,8 +1532,7 @@ fn grm_stream_row_prepare_from_counts_f32(
         alt_sum = 2.0_f64 * non_missing as f64 - alt_sum;
         alt_freq = alt_sum / (2.0_f64 * non_missing as f64);
     }
-    let maf = alt_freq.min(1.0_f64 - alt_freq);
-    if maf < maf_thr as f64 {
+    if !crate::gfreader::maf_passes_threshold_from_counts(alt_sum, non_missing, maf_thr) {
         return None;
     }
 
@@ -2600,7 +2606,7 @@ fn grm_stream_scan_prestats_f64(
     let mut eff_m = 0usize;
     let mut varsum = 0.0_f64;
     let mut scanned = 0usize;
-    let use_extra_filters = snps_only || het_thr > 0.0_f32;
+    let use_extra_filters = grm_stream_requires_extra_filters(snps_only, het_thr);
 
     if use_extra_filters && snps_only && it.sites.len() != n_total {
         return Err("snps_only filter requires BED site metadata during GRM pre-scan".to_string());
@@ -2739,7 +2745,7 @@ fn grm_stream_scan_prestats_f32(
     let mut eff_m = 0usize;
     let mut varsum = 0.0_f64;
     let mut scanned = 0usize;
-    let use_extra_filters = snps_only || het_thr > 0.0_f32;
+    let use_extra_filters = grm_stream_requires_extra_filters(snps_only, het_thr);
 
     if use_extra_filters && snps_only && it.sites.len() != n_total {
         return Err("snps_only filter requires BED site metadata during GRM pre-scan".to_string());
@@ -4490,7 +4496,7 @@ pub fn grm_stream_bed_f64<'py>(
     let maf_thr = maf_threshold.clamp(0.0, 0.5);
     let miss_thr = max_missing_rate.clamp(0.0, 1.0);
     let het_thr = het_threshold.clamp(0.0, 1.0);
-    let use_extra_filters = snps_only || het_thr > 0.0_f32;
+    let use_extra_filters = grm_stream_requires_extra_filters(snps_only, het_thr);
     let two_stage_default_on = std::env::var("JX_GRM_STREAM_TWO_STAGE")
         .ok()
         .map(|s| {
@@ -5240,7 +5246,7 @@ pub fn grm_stream_bed_f32<'py>(
     let maf_thr = maf_threshold.clamp(0.0, 0.5);
     let miss_thr = max_missing_rate.clamp(0.0, 1.0);
     let het_thr = het_threshold.clamp(0.0, 1.0);
-    let use_extra_filters = snps_only || het_thr > 0.0_f32;
+    let use_extra_filters = grm_stream_requires_extra_filters(snps_only, het_thr);
     let two_stage_default_on = std::env::var("JX_GRM_STREAM_TWO_STAGE")
         .ok()
         .map(|s| {

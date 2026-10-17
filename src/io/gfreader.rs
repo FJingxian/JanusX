@@ -1968,6 +1968,27 @@ pub(crate) fn packed_row_stats_from_counts(
     (miss, maf, std)
 }
 
+/// Compare MAF using the decoded allele count rather than a rounded `f32`
+/// frequency. `alt_sum` is an integer-valued count carried as `f64` by the
+/// streaming GRM decoders; realistic sample counts are exactly representable.
+#[inline]
+pub(crate) fn maf_passes_threshold_from_counts(
+    alt_sum: f64,
+    non_missing: usize,
+    maf_threshold: f32,
+) -> bool {
+    if non_missing == 0 {
+        return maf_threshold <= 0.0_f32;
+    }
+    let total_alleles = 2.0_f64 * non_missing as f64;
+    if !alt_sum.is_finite() || alt_sum < 0.0_f64 || alt_sum > total_alleles {
+        return false;
+    }
+    let minor_alleles = alt_sum.min(total_alleles - alt_sum);
+    let maf = minor_alleles / total_alleles;
+    maf >= maf_threshold as f64
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PackedSnpQc {
     pub(crate) keep: bool,
@@ -2015,7 +2036,7 @@ pub(crate) fn evaluate_packed_snp_qc(
     } else if apply_het_filter && ((het as f64) / (non_missing as f64)) > (het_threshold as f64) {
         false
     } else {
-        alt_freq.min(1.0_f32 - alt_freq) >= maf_threshold
+        maf_passes_threshold_from_counts(alt_sum as f64, non_missing, maf_threshold)
     };
     PackedSnpQc {
         keep,
@@ -5271,7 +5292,11 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_sparse_windowed(
                     {
                         false
                     } else {
-                        alt_freq.min(1.0_f32 - alt_freq) >= maf_threshold
+                        maf_passes_threshold_from_counts(
+                            counts.alt_sum as f64,
+                            non_missing,
+                            maf_threshold,
+                        )
                     };
                     let pass_snp = if let Some(sites_all_ref) = sites_all_ref {
                         let site = &sites_all_ref[snp_idx];
@@ -5658,7 +5683,7 @@ fn prepare_bed_logic_meta_and_packed_owned_for_candidate_rows(
                 {
                     false
                 } else {
-                    alt_freq.min(1.0_f32 - alt_freq) >= maf_threshold
+                    maf_passes_threshold_from_counts(alt_sum as f64, non_missing, maf_threshold)
                 };
                 let pass_snp =
                     !snps_only || candidate_snp_flags.is_some_and(|flags| flags[candidate_index]);
@@ -6019,7 +6044,7 @@ fn prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window_internal(
         {
             false
         } else {
-            alt_freq.min(1.0_f32 - alt_freq) >= maf_threshold
+            maf_passes_threshold_from_counts(alt_sum as f64, non_missing, maf_threshold)
         };
         let pass_snp = if snps_only {
             if let Some(mask) = simple_snp_mask.as_ref() {

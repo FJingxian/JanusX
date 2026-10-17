@@ -1903,6 +1903,146 @@ def build_sparse_grm_packed_bed(
     return str(sparse_path), int(sparse_n), int(sparse_nnz)
 
 
+def _sparse_fused_dense_estimate_bytes(n_samples: int) -> int:
+    """Conservative peak estimate for fused dense accumulation + CSC conversion."""
+    n = max(0, int(n_samples))
+    return n * n * 4 * 4
+
+
+def _sparse_fused_stream_eligible(
+    *,
+    n_samples: int,
+    method: int,
+    het_threshold: float,
+    snps_only: bool,
+    block_target_mb: Union[float, None],
+) -> bool:
+    forced_two_stage = any(
+        os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+        for name in ("JX_GRM_STREAM_TWO_STAGE", "JX_GRM_STREAM_PRESTAT_CORE")
+    )
+    if (
+        method not in (1, 2)
+        or bool(snps_only)
+        or (0.0 < float(het_threshold) < 1.0)
+        or forced_two_stage
+        or block_target_mb is None
+        or _grm_stream_bed_f32 is None
+        or _spgrm_dense_f32_to_jxgrm is None
+    ):
+        return False
+    dense_peak_bytes = _sparse_fused_dense_estimate_bytes(n_samples)
+    decode_budget_bytes = max(0.0, float(block_target_mb)) * 1024.0 * 1024.0
+    # The fused stream holds an n x n accumulator/result while scanning BED.
+    # Bound that extra dense state against both a fixed cap and the user's
+    # decode-memory budget; larger cohorts keep the sample-blocked sparse path.
+    dense_limit_bytes = min(128 * 1024 * 1024, decode_budget_bytes * 0.5)
+    return dense_peak_bytes > 0 and dense_peak_bytes <= dense_limit_bytes
+
+
+def build_sparse_grm_fused_stream_bed(
+    genofile: str,
+    out_prefix: str,
+    n_samples: int,
+    n_snps: int,
+    method: int,
+    kinship_cutoff: float,
+    maf_threshold: float,
+    max_missing_rate: float,
+    het_threshold: float,
+    snps_only: bool,
+    chunk_size: int,
+    mmap_window_mb: Union[int, None],
+    threads: int,
+    block_target_mb: Union[float, None],
+    stage_timing: bool,
+    verbose: bool,
+    logger,
+) -> tuple[str, int, int]:
+    if _grm_stream_bed_f32 is None:
+        raise RuntimeError("Fused BED GRM kernel is unavailable.")
+    if _spgrm_dense_f32_to_jxgrm is None:
+        raise RuntimeError("Sparse GRM dense-to-CSC writer is unavailable.")
+
+    _log_verbose_or_file_only(
+        logger,
+        verbose=bool(verbose),
+        msg=(
+            "Sparse GRM route selected fused-bed-stream: single-pass BED QC + "
+            "dense accumulation + CSC output; estimated dense working set=%s."
+        ),
+        args=(
+            _format_memory_budget_gb(
+                _sparse_fused_dense_estimate_bytes(n_samples) / (1024.0 * 1024.0 * 1024.0)
+            ),
+        ),
+    )
+    scan_t0 = time.monotonic()
+    dense, eff_m = build_grm_streaming(
+        genofile=str(genofile),
+        n_samples=int(n_samples),
+        n_snps=int(n_snps),
+        method=int(method),
+        maf_threshold=float(maf_threshold),
+        max_missing_rate=float(max_missing_rate),
+        het_threshold=float(het_threshold),
+        snps_only=bool(snps_only),
+        block_rows=max(1, int(chunk_size)),
+        mmap_window_mb=mmap_window_mb,
+        threads=max(1, int(threads)),
+        memory_mb=block_target_mb,
+        stage_timing=bool(stage_timing),
+        logger=logger,
+    )
+    if dense.shape != (int(n_samples), int(n_samples)):
+        raise RuntimeError(
+            f"Fused dense GRM has unexpected shape {dense.shape}; "
+            f"expected ({int(n_samples)}, {int(n_samples)})"
+        )
+
+    write_pbar = ProgressAdapter(
+        total=max(1, int(n_samples)),
+        desc="Sparse GRM (CSC write)",
+        emit_done=False,
+        force_animate=True,
+    )
+    last_write_done = 0
+
+    def _write_progress_cb(done: int, _total: int) -> None:
+        nonlocal last_write_done
+        d = max(0, min(int(done), max(1, int(n_samples))))
+        if d > last_write_done:
+            write_pbar.update(d - last_write_done)
+            last_write_done = d
+
+    try:
+        sparse_path, sparse_n, sparse_nnz = _spgrm_dense_f32_to_jxgrm(
+            dense,
+            str(out_prefix),
+            float(kinship_cutoff),
+            False,
+            _write_progress_cb,
+            1,
+        )
+    finally:
+        write_pbar.finish()
+        write_pbar.close()
+
+    if int(sparse_n) != int(n_samples):
+        raise RuntimeError(
+            f"Fused sparse GRM writer sample count mismatch: got {int(sparse_n)}, "
+            f"expected {int(n_samples)}"
+        )
+    elapsed = max(0.0, time.monotonic() - scan_t0)
+    log_success(
+        logger,
+        f"Sparse GRM fused scan (Effective SNPs: {int(eff_m)}, NNZ: {int(sparse_nnz)}) "
+        f"...Finished [{format_elapsed(elapsed)}]",
+        force_color=True,
+    )
+    return str(sparse_path), int(sparse_n), int(sparse_nnz)
+
+
 def build_sparse_grm_from_meta(
     genofile: str,
     out_prefix: str,
@@ -2760,59 +2900,97 @@ def main(log: bool = True):
             )
         if args.txt:
             logger.warning("`--txt` is ignored for sparse GRM output; writing `.spgrm` CSC.")
-        _log_verbose_or_file_only(
-            logger,
-            verbose=bool(getattr(args, "verbose", False)),
-            msg=(
-                "GRM auto route selected backend: sparse-meta-stream "
-                "(in-memory row statistics + blockwise streaming sparse CSC writer)."
-            ),
-        )
         sparse_prefix = f"{outprefix}.{_grm_method_tag(args.method)}"
         sparse_meta_source = "bed"
-        try:
-            grm_path, sparse_n, sparse_nnz = build_sparse_grm_from_meta(
-                genofile=grm_input,
-                out_prefix=sparse_prefix,
-                n_samples=n_samples,
-                method=args.method,
-                kinship_cutoff=sparse_cutoff,
-                maf_threshold=maf_threshold,
-                max_missing_rate=max_missing_rate,
-                het_threshold=het_threshold,
-                snps_only=bool(args.snps_only),
-                chunk_size=stream_block_rows,
-                mmap_window_mb=mmap_window_mb,
-                threads=int(args.thread),
-                block_target_mb=memory_mb,
+        sparse_built = False
+        use_sparse_fused_stream = _sparse_fused_stream_eligible(
+            n_samples=int(n_samples),
+            method=int(args.method),
+            het_threshold=float(het_threshold),
+            snps_only=bool(args.snps_only),
+            block_target_mb=float(memory_mb),
+        )
+        if use_sparse_fused_stream:
+            try:
+                grm_path, sparse_n, sparse_nnz = build_sparse_grm_fused_stream_bed(
+                    genofile=grm_input,
+                    out_prefix=sparse_prefix,
+                    n_samples=n_samples,
+                    n_snps=n_snps,
+                    method=args.method,
+                    kinship_cutoff=sparse_cutoff,
+                    maf_threshold=maf_threshold,
+                    max_missing_rate=max_missing_rate,
+                    het_threshold=het_threshold,
+                    snps_only=bool(args.snps_only),
+                    chunk_size=stream_block_rows,
+                    mmap_window_mb=mmap_window_mb,
+                    threads=int(args.thread),
+                    block_target_mb=memory_mb,
+                    stage_timing=bool(args.stage_timing),
+                    verbose=bool(getattr(args, "verbose", False)),
+                    logger=logger,
+                )
+                sparse_meta_source = "bed_fused_stream"
+                sparse_built = True
+            except Exception as ex:
+                logger.warning(
+                    "Sparse GRM fused stream failed; falling back to metadata route. "
+                    f"reason={ex}"
+                )
+
+        if not sparse_built:
+            _log_verbose_or_file_only(
+                logger,
                 verbose=bool(getattr(args, "verbose", False)),
-                logger=logger,
+                msg=(
+                    "GRM auto route selected backend: sparse-meta-stream "
+                    "(in-memory row statistics + blockwise streaming sparse CSC writer)."
+                ),
             )
-            sparse_meta_source = "bed_meta"
-        except Exception as ex:
-            logger.warning(
-                "Sparse GRM meta kernel failed; fallback to BED prepare route. "
-                f"reason={ex}"
-            )
-            grm_path, sparse_n, sparse_nnz = build_sparse_grm_packed_bed(
-                genofile=grm_input,
-                out_prefix=sparse_prefix,
-                n_samples=n_samples,
-                n_snps=n_snps,
-                method=args.method,
-                kinship_cutoff=sparse_cutoff,
-                maf_threshold=maf_threshold,
-                max_missing_rate=max_missing_rate,
-                het_threshold=het_threshold,
-                snps_only=bool(args.snps_only),
-                chunk_size=stream_block_rows,
-                mmap_window_mb=mmap_window_mb,
-                threads=int(args.thread),
-                block_target_mb=memory_mb,
-                stage_timing=bool(args.stage_timing),
-                verbose=bool(getattr(args, "verbose", False)),
-                logger=logger,
-            )
+            try:
+                grm_path, sparse_n, sparse_nnz = build_sparse_grm_from_meta(
+                    genofile=grm_input,
+                    out_prefix=sparse_prefix,
+                    n_samples=n_samples,
+                    method=args.method,
+                    kinship_cutoff=sparse_cutoff,
+                    maf_threshold=maf_threshold,
+                    max_missing_rate=max_missing_rate,
+                    het_threshold=het_threshold,
+                    snps_only=bool(args.snps_only),
+                    chunk_size=stream_block_rows,
+                    mmap_window_mb=mmap_window_mb,
+                    threads=int(args.thread),
+                    block_target_mb=memory_mb,
+                    verbose=bool(getattr(args, "verbose", False)),
+                    logger=logger,
+                )
+                sparse_meta_source = "bed_meta"
+            except Exception as ex:
+                logger.warning(
+                    "Sparse GRM meta kernel failed; fallback to BED prepare route. "
+                    f"reason={ex}"
+                )
+                grm_path, sparse_n, sparse_nnz = build_sparse_grm_packed_bed(
+                    genofile=grm_input,
+                    out_prefix=sparse_prefix,
+                    n_samples=n_samples,
+                    n_snps=n_snps,
+                    method=args.method,
+                    kinship_cutoff=sparse_cutoff,
+                    maf_threshold=maf_threshold,
+                    max_missing_rate=max_missing_rate,
+                    het_threshold=het_threshold,
+                    snps_only=bool(args.snps_only),
+                    chunk_size=stream_block_rows,
+                    mmap_window_mb=mmap_window_mb,
+                    threads=int(args.thread),
+                    block_target_mb=memory_mb,
+                    stage_timing=bool(args.stage_timing),
+                    verbose=bool(getattr(args, "verbose", False)),
+                    logger=logger,
+                )
         _write_sparse_grm_meta(
             grm_path,
             cutoff=sparse_cutoff,
@@ -2849,8 +3027,16 @@ def main(log: bool = True):
         grm = None
         grm_path = None
         dense_saved_direct = False
+        # Keep the established metadata route for explicit SNP-only or strict
+        # heterozygosity filters. The default het=1.0 is a no-op and can use
+        # the fused streaming route without materializing per-row statistics.
+        requires_extra_filter_metadata = bool(args.snps_only) or (
+            0.0 < het_threshold < 1.0
+        )
         prefer_meta_stream = bool(
-            int(args.method) in (1, 2) and (not bool(args.stage_timing))
+            int(args.method) in (1, 2)
+            and not bool(args.stage_timing)
+            and requires_extra_filter_metadata
         )
 
         if prefer_meta_stream:

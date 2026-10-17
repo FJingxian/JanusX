@@ -450,6 +450,14 @@ jobs:
             maturin build --release --out dist --target ${{ matrix.target }} --interpreter python --features blas-openblas,python-extension
           fi
 
+      - name: Clear build-only Windows OpenBLAS hints
+        if: ${{ matrix.label == 'windows-x86_64' }}
+        shell: bash
+        run: |
+          # The wheel now contains its runtime DLLs; later probes must exercise
+          # the packaged runtime instead of the temporary build directory.
+          printf 'OPENBLAS_BIN_DIR=\nOPENBLAS_LIB_DIR=\nLIBRARY_BIN=\nLIBRARY_LIB=\n' >> "$GITHUB_ENV"
+
       - name: Probe SGEMM backend from built wheel
         if: ${{ matrix.label != 'windows-arm64' }}
         shell: bash

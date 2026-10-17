@@ -51,6 +51,24 @@ jobs:
           grep -nF "Install OpenBLAS (Windows ARM64 via vcpkg)" .github/workflows/reusable-wheel-build.yml
           grep -nF "auditwheel repair" .github/workflows/reusable-wheel-build.yml
 
+          clear_step_line="$(grep -nF \
+            "      - name: Clear build-only Windows OpenBLAS hints" \
+            .github/workflows/reusable-wheel-build.yml | cut -d: -f1 || true)"
+          probe_step_line="$(grep -nF \
+            "      - name: Probe SGEMM backend from built wheel" \
+            .github/workflows/reusable-wheel-build.yml | cut -d: -f1 || true)"
+          if [[ -z "$clear_step_line" || -z "$probe_step_line" || "$clear_step_line" -ge "$probe_step_line" ]]; then
+            echo "Windows wheel probes must clear build-only OpenBLAS hints before importing the wheel."
+            exit 1
+          fi
+          clear_block="$(sed -n "${clear_step_line},${probe_step_line}p" .github/workflows/reusable-wheel-build.yml)"
+          for hint in OPENBLAS_BIN_DIR OPENBLAS_LIB_DIR LIBRARY_BIN LIBRARY_LIB; do
+            if ! grep -qF "${hint}=" <<< "$clear_block"; then
+              echo "Windows wheel probe cleanup is missing ${hint}."
+              exit 1
+            fi
+          done
+
           if grep -nF \
             -e "Build wheels (Linux)" \
             -e "Install OpenBLAS (Windows ARM64 via vcpkg)" \

@@ -44,7 +44,7 @@ use crate::gfreader::{
 use crate::gload::WindowedBedMatrix;
 use crate::kmer::KfileAssocSource;
 use crate::linalg::{
-    chi2_sf_df1, cholesky_inplace, cholesky_logdet, cholesky_solve_into, normal_sf,
+    chi2_sf_df1, cholesky_gram_inplace, cholesky_logdet, cholesky_solve_into, normal_sf,
 };
 use crate::stats_common::{
     env_truthy, get_cached_pool, parse_index_vec_i64, parse_index_vec_i64_result, AsyncTsvWriter,
@@ -53,7 +53,7 @@ use memmap2::Mmap;
 use std::fs::File;
 
 pub use crate::fastlmm_lowrank::{
-    fastlmm_assoc_from_snp_f32, fastlmm_reml_chunk_f32, fastlmm_reml_null_f32,
+    fastlmm_assoc_from_snp_f32, fastlmm_null_fit_f32, fastlmm_reml_chunk_f32, fastlmm_reml_null_f32,
 };
 use crate::reml::{
     gwas_max_output_rows_env, ml_loglike, reml_loglike, run_rotated_assoc_block_f32,
@@ -1520,14 +1520,12 @@ fn prepare_fixed_lambda_assoc_cache_f32(
         }
     }
 
-    let ridge = 1e-6_f64;
     for r in 0..p {
-        a[r * p + r] += ridge;
         for c in 0..r {
             a[c * p + r] = a[r * p + c];
         }
     }
-    if cholesky_inplace(&mut a, p).is_none() {
+    if cholesky_gram_inplace(&mut a, p).is_none() {
         return Err(PyRuntimeError::new_err("X'WX not SPD"));
     }
 
@@ -3685,12 +3683,7 @@ pub fn fastlmm_assoc_chunk_f32<'py>(
                         scr.xtv_inv_x[p * dim + p] = u1_snp_snp + v2_inv * u2_snp_snp;
                         scr.xtv_inv_y[p] = u1_snp_ty + v2_inv * u2_snp_ty;
 
-                        let ridge = 1e-6;
-                        for r in 0..dim {
-                            scr.xtv_inv_x[r * dim + r] += ridge;
-                        }
-
-                        if cholesky_inplace(&mut scr.xtv_inv_x, dim).is_none() {
+                        if cholesky_gram_inplace(&mut scr.xtv_inv_x, dim).is_none() {
                             out_row[0] = f64::NAN;
                             out_row[1] = f64::NAN;
                             out_row[2] = f64::NAN;
@@ -3878,11 +3871,7 @@ fn fastlmm_null_eval_packed(
     }
 
     let mut chol_a = base_a.clone();
-    let ridge = 1e-6_f64;
-    for i in 0..p {
-        chol_a[i * p + i] += ridge;
-    }
-    if cholesky_inplace(&mut chol_a, p).is_none() {
+    if cholesky_gram_inplace(&mut chol_a, p).is_none() {
         return None;
     }
     let log_det_xtv = cholesky_logdet(&chol_a, p);
@@ -4321,14 +4310,12 @@ pub fn fastlmm_assoc_packed_f32<'py>(
                 }
             }
         }
-        let ridge = 1e-6_f64;
         for r in 0..p {
-            a[r * p + r] += ridge;
             for c in 0..r {
                 a[c * p + r] = a[r * p + c];
             }
         }
-        if cholesky_inplace(&mut a, p).is_none() {
+        if cholesky_gram_inplace(&mut a, p).is_none() {
             return Err(PyRuntimeError::new_err("X'WX not SPD in packed fastlmm"));
         }
         let mut a_inv_b = vec![0.0_f64; p];
@@ -4891,14 +4878,12 @@ pub fn fastlmm_assoc_packed_f32_to_tsv<'py>(
                 }
             }
         }
-        let ridge = 1e-6_f64;
         for r in 0..p {
-            a[r * p + r] += ridge;
             for c in 0..r {
                 a[c * p + r] = a[r * p + c];
             }
         }
-        if cholesky_inplace(&mut a, p).is_none() {
+        if cholesky_gram_inplace(&mut a, p).is_none() {
             return Err(PyRuntimeError::new_err("X'WX not SPD in packed fastlmm"));
         }
         let mut a_inv_b = vec![0.0_f64; p];

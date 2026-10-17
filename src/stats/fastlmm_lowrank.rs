@@ -9,8 +9,8 @@ use std::f64::consts::PI;
 
 use crate::brent::brent_minimize;
 use crate::linalg::{
-    chi2_sf_df1, cholesky_inplace, cholesky_logdet, cholesky_solve_into, normal_sf,
-    sanitize_assoc_pvalue,
+    chi2_sf_df1, cholesky_gram_inplace, cholesky_logdet, cholesky_solve_into, normal_sf,
+    sanitize_assoc_pvalue, validate_fixed_effect_design,
 };
 
 #[derive(Clone, Copy)]
@@ -295,9 +295,7 @@ fn fill_xtv(
         scratch.xtv_inv_x[p * dim + p] = sum;
     }
 
-    let ridge = 1e-6;
     for r in 0..dim {
-        scratch.xtv_inv_x[r * dim + r] += ridge;
         for c in 0..r {
             let vrc = scratch.xtv_inv_x[r * dim + c];
             scratch.xtv_inv_x[c * dim + r] = vrc;
@@ -324,7 +322,7 @@ fn fast_reml_cost(
         None => return 1e100,
     };
 
-    if cholesky_inplace(&mut scratch.xtv_inv_x[..dim * dim], dim).is_none() {
+    if cholesky_gram_inplace(&mut scratch.xtv_inv_x[..dim * dim], dim).is_none() {
         return 1e100;
     }
 
@@ -388,7 +386,7 @@ fn fast_ml_loglike(
         None => return f64::NAN,
     };
 
-    if cholesky_inplace(&mut scratch.xtv_inv_x[..dim * dim], dim).is_none() {
+    if cholesky_gram_inplace(&mut scratch.xtv_inv_x[..dim * dim], dim).is_none() {
         return f64::NAN;
     }
 
@@ -459,7 +457,7 @@ fn fast_reml_beta_se(
         None => return (f64::NAN, f64::NAN),
     };
 
-    if cholesky_inplace(&mut scratch.xtv_inv_x[..dim * dim], dim).is_none() {
+    if cholesky_gram_inplace(&mut scratch.xtv_inv_x[..dim * dim], dim).is_none() {
         return (f64::NAN, f64::NAN);
     }
 
@@ -532,8 +530,57 @@ pub fn fastlmm_reml_null_f32<'py>(
     tol: f64,
     model: &str,
 ) -> PyResult<(f64, f64, f64)> {
-    if low >= high {
-        return Err(PyRuntimeError::new_err("low must be < high"));
+    let (lbd, ml_at_reml, reml, _) = fit_fastlmm_null_f32(
+        py, s, u1tx, u2tx, u1ty, u2ty, low, high, max_iter, tol, model, false,
+    )?;
+    Ok((lbd, ml_at_reml, reml))
+}
+
+/// Explicit low-rank null fit with separate conditional and maximized ML.
+#[pyfunction]
+#[pyo3(signature = (s, u1tx, u2tx, u1ty, u2ty, low, high, max_iter=50, tol=1e-2, model="add"))]
+pub fn fastlmm_null_fit_f32<'py>(
+    py: Python<'py>,
+    s: PyReadonlyArray1<'py, f64>,
+    u1tx: PyReadonlyArray2<'py, f64>,
+    u2tx: PyReadonlyArray2<'py, f64>,
+    u1ty: PyReadonlyArray1<'py, f64>,
+    u2ty: PyReadonlyArray1<'py, f64>,
+    low: f64,
+    high: f64,
+    max_iter: usize,
+    tol: f64,
+    model: &str,
+) -> PyResult<(f64, f64, f64, f64)> {
+    fit_fastlmm_null_f32(
+        py, s, u1tx, u2tx, u1ty, u2ty, low, high, max_iter, tol, model, true,
+    )
+}
+
+fn fit_fastlmm_null_f32<'py>(
+    py: Python<'py>,
+    s: PyReadonlyArray1<'py, f64>,
+    u1tx: PyReadonlyArray2<'py, f64>,
+    u2tx: PyReadonlyArray2<'py, f64>,
+    u1ty: PyReadonlyArray1<'py, f64>,
+    u2ty: PyReadonlyArray1<'py, f64>,
+    low: f64,
+    high: f64,
+    max_iter: usize,
+    tol: f64,
+    model: &str,
+    maximize_ml: bool,
+) -> PyResult<(f64, f64, f64, f64)> {
+    if !low.is_finite()
+        || !high.is_finite()
+        || low >= high
+        || max_iter == 0
+        || !tol.is_finite()
+        || tol <= 0.0
+    {
+        return Err(PyRuntimeError::new_err(
+            "invalid null-fit optimizer bounds, iterations or tolerance",
+        ));
     }
     // Keep API consistent with chunk function; null model has no SNP term.
     let _gm = GeneticModel::parse(model)?;
@@ -573,6 +620,22 @@ pub fn fastlmm_reml_null_f32<'py>(
     if n_minus_p <= 0 {
         return Err(PyRuntimeError::new_err("n must be > p"));
     }
+    if k > n
+        || s_cow
+            .iter()
+            .chain(u1ty_cow.iter())
+            .chain(u2ty_cow.iter())
+            .any(|v| !v.is_finite())
+    {
+        return Err(PyRuntimeError::new_err(
+            "null fit requires finite inputs and rank <= n",
+        ));
+    }
+    let mut x_design = Vec::with_capacity((k + n) * p1);
+    x_design.extend_from_slice(u1tx_cow.as_ref());
+    x_design.extend_from_slice(u2tx_cow.as_ref());
+    validate_fixed_effect_design(&x_design, k + n, p1).map_err(PyRuntimeError::new_err)?;
+    drop(x_design);
 
     let (u2_xtx, u2_xty) = precompute_u2_base(u2tx_cow.as_ref(), u2ty_cow.as_ref(), n, p1);
 
@@ -596,7 +659,7 @@ pub fn fastlmm_reml_null_f32<'py>(
     let c_ml = n_f * (n_f.ln() - 1.0 - (2.0 * PI).ln()) / 2.0;
 
     let mut scratch = FastLmmScratch::new(k, p1);
-    let (best_log10, best_cost, ml) = py.detach(|| {
+    let (best_log10, best_cost, ml_at_reml, ml_max) = py.detach(|| {
         let (best_log10, best_cost) = brent_minimize(
             |log10_lbd| fast_reml_cost(log10_lbd, &data, None, &mut scratch, n_minus_p_f, c_const),
             low,
@@ -604,13 +667,36 @@ pub fn fastlmm_reml_null_f32<'py>(
             tol,
             max_iter,
         );
-        let ml = fast_ml_loglike(best_log10, &data, None, &mut scratch, n_f, c_ml);
-        (best_log10, best_cost, ml)
+        let ml_at_reml = fast_ml_loglike(best_log10, &data, None, &mut scratch, n_f, c_ml);
+        let ml_max = if maximize_ml {
+            let (_, ml_cost) = brent_minimize(
+                |log10_lbd| -fast_ml_loglike(log10_lbd, &data, None, &mut scratch, n_f, c_ml),
+                low,
+                high,
+                tol,
+                max_iter,
+            );
+            -ml_cost
+        } else {
+            ml_at_reml
+        };
+        (best_log10, best_cost, ml_at_reml, ml_max)
     });
 
     let lbd = 10.0_f64.powf(best_log10);
     let reml = -best_cost;
-    Ok((lbd, ml, reml))
+    if !lbd.is_finite()
+        || lbd <= 0.0
+        || !reml.is_finite()
+        || reml <= -1e99
+        || !ml_at_reml.is_finite()
+        || !ml_max.is_finite()
+    {
+        return Err(PyRuntimeError::new_err(
+            "null model fit failed; check covariance and positive residual variance",
+        ));
+    }
+    Ok((lbd, ml_at_reml, reml, ml_max))
 }
 
 #[pyfunction]

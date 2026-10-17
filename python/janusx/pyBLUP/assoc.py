@@ -126,6 +126,144 @@ def _emit_runtime_warning_once(flag_name: str, message: str) -> None:
         pass
 
 
+def rank_reduce_fixed_effect_design(
+    design: np.ndarray,
+    *,
+    warn: bool = True,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Drop numerically exact redundant columns while preserving the design span.
+
+    Column 0 is treated as the intercept and always retained. Remaining
+    columns are assessed after removing their intercept component and scaling
+    to unit norm, so the rank decision does not depend on covariate units.
+    Exact dependencies are removed by column-pivoted, twice-reorthogonalized
+    modified Gram-Schmidt. Near-collinear but numerically full-rank designs
+    raise instead of being silently changed.
+
+    Returns the reduced matrix and zero-based kept/dropped column indices in
+    the original design.
+    """
+    x = np.ascontiguousarray(np.asarray(design, dtype=np.float64))
+    if x.ndim != 2:
+        raise ValueError("fixed-effect design must be a 2D matrix")
+    n, p = x.shape
+    if n == 0 or p == 0:
+        raise ValueError("fixed-effect design must contain samples and an intercept")
+    if not np.all(np.isfinite(x)):
+        raise ValueError("fixed-effect design contains NaN/Inf values")
+    if n <= 1:
+        raise ValueError("fixed-effect design leaves no residual degrees of freedom")
+
+    intercept_scale = float(np.max(np.abs(x[:, 0])))
+    if not np.isfinite(intercept_scale) or intercept_scale == 0.0:
+        raise ValueError("fixed-effect design intercept is zero or invalid")
+    intercept_reference = float(x[0, 0])
+    intercept_tol = (
+        8.0
+        * np.finfo(np.float64).eps
+        * max(float(np.sqrt(n)), float(p))
+        * intercept_scale
+    )
+    if float(np.max(np.abs(x[:, 0] - intercept_reference))) > intercept_tol:
+        raise ValueError("fixed-effect design column 0 must be the intercept")
+    intercept = x[:, 0] / intercept_scale
+    intercept_norm = float(np.linalg.norm(intercept))
+    if not np.isfinite(intercept_norm) or intercept_norm == 0.0:
+        raise ValueError("fixed-effect design intercept is zero or invalid")
+    intercept /= intercept_norm
+
+    q = p - 1
+    if q == 0:
+        kept = np.asarray([0], dtype=np.int64)
+        if n <= 1:
+            raise ValueError("fixed-effect design leaves no residual degrees of freedom")
+        return x, kept, np.empty(0, dtype=np.int64)
+
+    residualized: list[tuple[int, np.ndarray]] = []
+    eps = np.finfo(np.float64).eps
+    rank_tol = 8.0 * eps * max(float(np.sqrt(n)), float(p))
+    near_tol = np.sqrt(eps)
+    for j in range(q):
+        column = x[:, j + 1]
+        scale = float(np.max(np.abs(column)))
+        if scale == 0.0:
+            continue
+        scaled = column / scale
+        residual = scaled - intercept * float(intercept @ scaled)
+        norm = float(np.linalg.norm(residual))
+        if not np.isfinite(norm):
+            raise ValueError(f"fixed-effect column {j + 1} has invalid norm")
+        if norm <= rank_tol:
+            continue
+        if norm <= near_tol:
+            raise ValueError(
+                "fixed-effect design is near-collinear with the intercept "
+                f"(column {j} residual ratio={norm:.3g}); "
+                "rescale or remove the affected covariate explicitly"
+            )
+        residualized.append((j + 1, residual / norm))
+
+    # Rank-revealing pivoted modified Gram-Schmidt. Equal residual norms are
+    # resolved by original column index, so rescaling cannot change which
+    # member of an exactly redundant set is retained.
+    basis = [intercept]
+    remaining = list(residualized)
+    kept_cov: list[int] = []
+    tie_tol = 8.0 * eps * max(float(np.sqrt(n)), float(p))
+    while remaining:
+        residual_candidates: list[tuple[int, np.ndarray, float]] = []
+        for column_idx, column in remaining:
+            residual = column.copy()
+            for _ in range(2):
+                for qvec in basis:
+                    residual -= qvec * float(qvec @ residual)
+            norm = float(np.linalg.norm(residual))
+            residual_candidates.append((column_idx, residual, norm))
+
+        best_norm = max(item[2] for item in residual_candidates)
+        if best_norm <= rank_tol:
+            break
+        if best_norm <= near_tol:
+            raise ValueError(
+                "fixed-effect design is near-collinear after unit scaling "
+                f"(next orthogonalization residual ratio={best_norm:.3g}); "
+                "rescale or remove the affected covariates explicitly"
+            )
+        tied = [
+            item
+            for item in residual_candidates
+            if best_norm - item[2] <= tie_tol
+        ]
+        chosen = min(tied, key=lambda item: item[0])
+        column_idx, residual, norm = chosen
+        basis.append(residual / norm)
+        kept_cov.append(column_idx)
+        remaining = [item for item in remaining if item[0] != column_idx]
+
+    kept = np.asarray([0, *sorted(kept_cov)], dtype=np.int64)
+    keep_set = set(int(i) for i in kept)
+    dropped = np.asarray([j for j in range(p) if j not in keep_set], dtype=np.int64)
+    if n <= kept.size:
+        raise ValueError(
+            "fixed-effect design leaves no residual degrees of freedom "
+            f"(rank={kept.size}, samples={n})"
+        )
+    reduced = np.ascontiguousarray(x[:, kept], dtype=np.float64)
+
+    if dropped.size and warn:
+        covariate_indices = [int(j - 1) for j in dropped if j > 0]
+        warnings.warn(
+            "Rank-deficient fixed-effect design: retained the intercept and "
+            f"{kept.size - 1} independent covariate column(s); dropped "
+            f"redundant 0-based covariate columns {covariate_indices}. "
+            "Association tests use "
+            "the same fixed-effect column space.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return reduced, kept, dropped
+
+
 def _env_positive_int(name: str) -> Optional[int]:
     raw = str(os.environ.get(str(name), "")).strip()
     if raw == "":
@@ -210,10 +348,12 @@ from janusx.janusx import (
     lm_block_assoc_f32,
     lmm_reml_chunk_f32,
     lmm_reml_null_f32,
+    lmm_null_fit_f32,
     ml_loglike_null_f32,
     lmm_assoc_chunk_f32,
     fastlmm_reml_chunk_f32,
     fastlmm_reml_null_f32,
+    fastlmm_null_fit_f32,
     fastlmm_assoc_chunk_f32,
 )
 import janusx.janusx as _jxrs
@@ -897,7 +1037,9 @@ def lmm_reml_null(
         Null-model lambda (ve/vg).
 
     ml : float
-        Null ML log-likelihood (higher is better).
+        Null ML evaluated at the returned REML lambda (higher is better).
+        This legacy value is for conditional/fixed-lambda comparisons, not
+        the maximized ML needed for automatic mixed-model selection.
 
     reml : float
         Null REML log-likelihood (higher is better).
@@ -1057,7 +1199,8 @@ def fastlmm_reml_null(
         Estimated lambda (ve/vg).
 
     ml : float
-        ML log-likelihood (higher is better).
+        Null ML evaluated at the returned REML lambda (higher is better).
+        This legacy value is not the maximized ML used for model selection.
 
     reml : float
         REML log-likelihood (higher is better).
@@ -1760,6 +1903,15 @@ class LMM:
         if X_design.shape[0] != n:
             raise ValueError(f"design row mismatch: got {X_design.shape[0]}, expected {n}")
 
+        X_design, fixed_effect_kept, fixed_effect_dropped = (
+            rank_reduce_fixed_effect_design(X_design)
+        )
+        self.fixed_effect_rank = int(fixed_effect_kept.size)
+        self.fixed_effect_dropped_columns = np.ascontiguousarray(
+            fixed_effect_dropped[fixed_effect_dropped > 0] - 1,
+            dtype=np.int64,
+        )
+
         lam_max = float(np.max(s_full)) if s_full.size > 0 else 0.0
         rank_thr = float(self._LOWRANK_REL_TOL) * max(lam_max, 0.0)
         keep_mask = np.isfinite(s_full) & (s_full > rank_thr)
@@ -1814,13 +1966,14 @@ class LMM:
             self.u1ty = np.ascontiguousarray(np.asarray(u1ty, dtype=np.float64).reshape(-1), dtype=np.float64)
             self.u2ty = np.ascontiguousarray(np.asarray(u2ty, dtype=np.float64).reshape(-1), dtype=np.float64)
             self.y = y_vec.reshape(-1, 1)
-            lbd_null, ml0, reml = fastlmm_reml_null(
+            lbd_null, ml0, reml, ml0_model_selection = fastlmm_null_fit_f32(
                 self.S,
                 self.u1tx,
                 self.u2tx,
                 self.u1ty,
                 self.u2ty,
-                (-5, 5),
+                -5.0,
+                5.0,
                 max_iter=50,
                 tol=1e-3,
                 model="add",
@@ -1844,11 +1997,12 @@ class LMM:
             )
             self.Xcov = np.ascontiguousarray(np.asarray(xcov_rot, dtype=np.float64), dtype=np.float64)
             self.y = np.ascontiguousarray(np.asarray(y_rot, dtype=np.float64), dtype=np.float64)
-            lbd_null, ml0, reml = lmm_reml_null(
+            lbd_null, ml0, reml, ml0_model_selection = lmm_null_fit_f32(
                 self.S,
                 self.Xcov,
-                self.y,
-                (-5, 5),
+                self.y.reshape(-1),
+                -5.0,
+                5.0,
                 max_iter=50,
                 tol=1e-3,
             )
@@ -1885,6 +2039,9 @@ class LMM:
         self.pve_pheno_scale = float(self.pve)
         self.LL0 = float(reml)
         self.ML0 = float(ml0)
+        # Do not reuse ML0_model_selection in fixed-lambda PLRT: its null
+        # likelihood maximizes a different nuisance-parameter objective.
+        self.ML0_model_selection = float(ml0_model_selection)
         if self.pve > 0.95 or self.pve < 0.05 or (not np.isfinite(self.lbd_null)) or self.lbd_null <= 0.0:
             self.bounds = (-5, 5)
         else:
@@ -1910,6 +2067,9 @@ class LMM:
             "sigma_e2_null",
             "LL0",
             "ML0",
+            "ML0_model_selection",
+            "fixed_effect_rank",
+            "fixed_effect_dropped_columns",
             "bounds",
             "evd_secs",
             "n",
@@ -2206,10 +2366,18 @@ class LM:
 
     def __init__(self, y: np.ndarray, X: Optional[np.ndarray] = None):
         self.y = np.asarray(y).reshape(-1, 1)
-        self.X = (
+        design = (
             np.concatenate([np.ones((self.y.shape[0], 1)), X], axis=1)
             if X is not None
             else np.ones((self.y.shape[0], 1))
+        )
+        self.X, fixed_effect_kept, fixed_effect_dropped = (
+            rank_reduce_fixed_effect_design(design)
+        )
+        self.fixed_effect_rank = int(fixed_effect_kept.size)
+        self.fixed_effect_dropped_columns = np.ascontiguousarray(
+            fixed_effect_dropped[fixed_effect_dropped > 0] - 1,
+            dtype=np.int64,
         )
         self.ixx = _lm_precompute_ixx_qr(self.X)
 

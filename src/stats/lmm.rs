@@ -44,7 +44,7 @@ use crate::gfreader::{
 };
 use crate::gload::WindowedBedMatrix;
 use crate::kmer::KfileAssocSource;
-use crate::linalg::{chi2_sf_df1, cholesky_inplace, cholesky_solve_into, normal_sf};
+use crate::linalg::{chi2_sf_df1, cholesky_gram_inplace, cholesky_solve_into, normal_sf};
 use crate::stats_common::{env_truthy, get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
 use memmap2::Mmap;
 use std::fs::File;
@@ -2100,16 +2100,14 @@ pub fn lmm_assoc_chunk_f32<'py>(
         }
     }
 
-    let ridge = 1e-6;
     for r in 0..p {
-        a[r * p + r] += ridge;
         for c in 0..r {
             let vrc = a[r * p + c];
             a[c * p + r] = vrc;
         }
     }
 
-    if cholesky_inplace(&mut a, p).is_none() {
+    if cholesky_gram_inplace(&mut a, p).is_none() {
         return Err(PyRuntimeError::new_err("X'WX not SPD"));
     }
 
@@ -2330,16 +2328,14 @@ pub fn lmm_assoc_chunk_from_snp_f32<'py>(
         }
     }
 
-    let ridge = 1e-6;
     for r in 0..p {
-        a[r * p + r] += ridge;
         for c in 0..r {
             let vrc = a[r * p + c];
             a[c * p + r] = vrc;
         }
     }
 
-    if cholesky_inplace(&mut a, p).is_none() {
+    if cholesky_gram_inplace(&mut a, p).is_none() {
         return Err(PyRuntimeError::new_err("X'WX not SPD"));
     }
 

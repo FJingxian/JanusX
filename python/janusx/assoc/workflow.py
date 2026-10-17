@@ -195,6 +195,15 @@ def _resolve_pyblup_assoc_symbol(name: str):
     return getattr(_assoc, str(name))
 
 
+def _rank_reduce_fixed_effect_design(
+    design: np.ndarray,
+    *,
+    warn: bool = True,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    reducer = _resolve_pyblup_assoc_symbol("rank_reduce_fixed_effect_design")
+    return reducer(design, warn=warn)
+
+
 class _LazyPyBlupAssocSymbol:
     def __init__(self, name: str):
         self._name = str(name)
@@ -1019,8 +1028,9 @@ def _mixed_model_switch_to_lm_decision(
     """
     Decide whether a mixed-model null fit should collapse to LM.
 
-    This compares the null-model log-likelihood against the plain LM null
-    model under the boundary test H0: Va = 0.
+    This compares separately maximized null ML against the plain LM null
+    model under the boundary test H0: Va = 0. Do not pass ML evaluated only
+    at the REML-optimal lambda; that conditional value is for fixed-lambda PLRT.
     """
     ml0 = None
     try:
@@ -1040,7 +1050,20 @@ def _mixed_model_switch_to_lm_decision(
             "Rust symbol gwas_lmm_lm_null_lrt_decision is unavailable."
         )
     y_arr = np.ascontiguousarray(np.asarray(y_vec, dtype=np.float64).reshape(-1))
-    x_arr = np.ascontiguousarray(np.asarray(x_cov, dtype=np.float64))
+    x_arr = np.asarray(x_cov, dtype=np.float64)
+    if x_arr.ndim == 1:
+        x_arr = x_arr.reshape(-1, 1)
+    if x_arr.ndim != 2 or int(x_arr.shape[0]) != int(y_arr.size):
+        raise ValueError("LMM->LM comparison covariates must be a 2D matrix aligned to y")
+    full_design = np.ascontiguousarray(
+        np.column_stack([np.ones(y_arr.size, dtype=np.float64), x_arr]),
+        dtype=np.float64,
+    )
+    reduced_design, _kept, _dropped = _rank_reduce_fixed_effect_design(
+        full_design,
+        warn=False,
+    )
+    x_arr = np.ascontiguousarray(reduced_design[:, 1:], dtype=np.float64)
     switch_to_lm, lrt_stat, pval, _lm_ml0 = jxrs.gwas_lmm_lm_null_lrt_decision(
         y_arr,
         x_arr,

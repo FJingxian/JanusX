@@ -168,7 +168,7 @@ class _Stage1GroupedProfile:
 
 @dataclass
 class _JointKernelResult:
-    """Additive and independent residual variance estimates for line-level REML."""
+    """Additive and residual estimates from a dense REML fit."""
 
     va: float
     vresidual: float
@@ -177,6 +177,7 @@ class _JointKernelResult:
     add_blup: np.ndarray
     residual_blup: np.ndarray
     noise_mean: float
+    observation_residual: float = np.nan
 
 
 _JOINT_VAR_FLOOR = 1e-10
@@ -2395,6 +2396,221 @@ def _fit_dense_narrow_corrected(
     )
 
 
+def _fit_dense_observation_reml(
+    y_obs: np.ndarray,
+    line_ids: list[str] | np.ndarray,
+    *,
+    sample_ids: list[str],
+    kinship: np.ndarray,
+    x_fixed: np.ndarray | None,
+    maxiter: int,
+    initial_va: float | None = None,
+    initial_ve: float | None = None,
+) -> _JointKernelResult:
+    """Fit the dense additive model at observation level without BLUE plug-in.
+
+    The model is ``y = Xb + Zu + e``, with ``u ~ N(0, va K)`` and
+    ``e ~ N(0, ve I)``.  Since each row of ``Z`` selects one line, the
+    observation covariance can be split into within-line contrasts and
+    weighted line means.  This evaluates the exact observation-level REML
+    likelihood using an ``n_lines x n_lines`` Cholesky factor rather than an
+    ``n_obs x n_obs`` covariance matrix.
+
+    The existing two-stage BLUE likelihood treats its standard errors as
+    independent across lines.  That is inaccurate when fixed covariates are
+    unbalanced across lines, because estimating their shared effects induces
+    cross-line covariance.  This exact path is used when there are no
+    additional random nuisance terms; those terms retain the existing
+    corrected two-stage fit.
+    """
+
+    y = np.asarray(y_obs, dtype=float).reshape(-1)
+    ids = [str(value) for value in sample_ids]
+    obs_ids = np.asarray([str(value) for value in line_ids], dtype=object).reshape(-1)
+    n_obs = int(y.size)
+    n_lines = len(ids)
+    if obs_ids.size != n_obs:
+        raise ValueError(
+            f"Observation line-ID length mismatch: got {obs_ids.size}, expected {n_obs}."
+        )
+    if n_lines <= 1 or n_obs < n_lines:
+        raise ValueError("Dense observation-level REML needs at least two observed lines.")
+    if not np.all(np.isfinite(y)):
+        raise ValueError("Dense observation-level REML requires finite phenotypes.")
+
+    line_index = {sid: idx for idx, sid in enumerate(ids)}
+    if len(line_index) != n_lines:
+        raise ValueError("Dense REML line IDs must be unique.")
+    try:
+        line_codes = np.asarray([line_index[sid] for sid in obs_ids], dtype=np.int64)
+    except KeyError as exc:
+        raise ValueError(f"Observation line ID is absent from the dense GRM: {exc.args[0]}") from exc
+    counts = np.bincount(line_codes, minlength=n_lines).astype(float)
+    if np.any(counts <= 0.0):
+        raise ValueError("Every dense GRM line must have at least one observation.")
+
+    if x_fixed is None:
+        fixed = np.ones((n_obs, 1), dtype=float)
+    else:
+        fixed_arr = np.asarray(x_fixed, dtype=float)
+        if fixed_arr.ndim != 2 or fixed_arr.shape[0] != n_obs:
+            raise ValueError(
+                "Dense observation-level fixed design must have shape (n_obs, n_fixed); "
+                f"got {fixed_arr.shape} for n_obs={n_obs}."
+            )
+        if not np.all(np.isfinite(fixed_arr)):
+            raise ValueError("Dense observation-level fixed design contains non-finite values.")
+        fixed = np.column_stack((np.ones(n_obs, dtype=float), fixed_arr))
+
+    # REML is invariant to a full-rank reparameterization of X.  An
+    # orthonormal basis keeps the fixed-effect determinant well conditioned
+    # and naturally drops aliased columns.
+    q_fixed, singular_values, _ = np.linalg.svd(fixed, full_matrices=False)
+    if singular_values.size == 0 or singular_values[0] <= 0.0:
+        raise ValueError("Dense observation-level fixed design has rank zero.")
+    rank_tol = max(fixed.shape) * np.finfo(float).eps * float(singular_values[0])
+    fixed_rank = int(np.sum(singular_values > rank_tol))
+    if fixed_rank <= 0 or fixed_rank >= n_obs:
+        raise ValueError(
+            "Dense observation-level REML requires a non-saturated fixed-effect design."
+        )
+    x = np.ascontiguousarray(q_fixed[:, :fixed_rank], dtype=float)
+
+    k = np.asarray(kinship, dtype=float)
+    if k.shape != (n_lines, n_lines):
+        raise ValueError(f"kinship shape mismatch: got {k.shape}, expected {(n_lines, n_lines)}")
+    k = (k + k.T) * 0.5
+    k_diag_mean = float(np.mean(np.diag(k)))
+    if not np.isfinite(k_diag_mean) or k_diag_mean <= 0.0:
+        raise ValueError(f"Invalid kinship mean diagonal: {k_diag_mean}")
+    k /= k_diag_mean
+
+    sqrt_counts = np.sqrt(counts)
+    line_y = np.bincount(line_codes, weights=y, minlength=n_lines) / sqrt_counts
+    line_x = np.column_stack(
+        [
+            np.bincount(line_codes, weights=x[:, col], minlength=n_lines) / sqrt_counts
+            for col in range(fixed_rank)
+        ]
+    )
+    within_y_ss = float(y @ y - line_y @ line_y)
+    within_xx = x.T @ x - line_x.T @ line_x
+    within_xy = x.T @ y - line_x.T @ line_y
+    within_xx = (within_xx + within_xx.T) * 0.5
+    within_y_ss = max(within_y_ss, 0.0)
+    weighted_k = sqrt_counts[:, None] * k * sqrt_counts[None, :]
+
+    y_var = float(np.var(y, ddof=1)) if n_obs > 1 else 1.0
+    if not np.isfinite(y_var) or y_var <= 0.0:
+        y_var = 1.0
+    starts = [
+        (initial_va, initial_ve),
+        (0.5 * y_var, 0.5 * y_var),
+        (0.9 * y_var, 0.1 * y_var),
+        (0.1 * y_var, 0.9 * y_var),
+    ]
+    start_unique: list[tuple[float, float]] = []
+    seen_starts: set[tuple[int, int]] = set()
+    for va0, ve0 in starts:
+        va_use = float(va0) if va0 is not None and np.isfinite(va0) and va0 > 0.0 else y_var * 0.5
+        ve_use = float(ve0) if ve0 is not None and np.isfinite(ve0) and ve0 > 0.0 else y_var * 0.5
+        va_use = max(va_use, _JOINT_VAR_FLOOR)
+        ve_use = max(ve_use, _JOINT_VAR_FLOOR)
+        key = (
+            int(np.round(np.log10(va_use) * 1000.0)),
+            int(np.round(np.log10(ve_use) * 1000.0)),
+        )
+        if key not in seen_starts:
+            seen_starts.add(key)
+            start_unique.append((va_use, ve_use))
+
+    def evaluate(eta: np.ndarray) -> tuple[float, tuple[float, float, np.ndarray, np.ndarray] | None]:
+        eta_arr = np.asarray(eta, dtype=float).reshape(-1)
+        if eta_arr.size != 2 or not np.all(np.isfinite(eta_arr)):
+            return _JOINT_OBJ_PENALTY, None
+        va, ve = np.exp(np.clip(eta_arr, _JOINT_LOG_FLOOR, _JOINT_LOG_CEIL))
+        covariance = ve * np.eye(n_lines, dtype=float) + va * weighted_k
+        try:
+            chol = np.linalg.cholesky(covariance)
+            ci_line_x = cho_solve((chol, True), line_x)
+            ci_line_y = cho_solve((chol, True), line_y)
+            xt_vinv_x = within_xx / ve + line_x.T @ ci_line_x
+            xt_vinv_x = (xt_vinv_x + xt_vinv_x.T) * 0.5
+            chol_x = np.linalg.cholesky(xt_vinv_x)
+            xt_vinv_y = within_xy / ve + line_x.T @ ci_line_y
+            beta = cho_solve((chol_x, True), xt_vinv_y)
+            quad = float(
+                within_y_ss / ve
+                + line_y @ ci_line_y
+                - xt_vinv_y @ beta
+            )
+            if not np.isfinite(quad) or quad < -1e-8:
+                return _JOINT_OBJ_PENALTY, None
+            quad = max(quad, 0.0)
+            logdet_covariance = float(
+                (n_obs - n_lines) * np.log(ve)
+                + 2.0 * np.sum(np.log(np.diag(chol)))
+            )
+            logdet_fixed = float(2.0 * np.sum(np.log(np.diag(chol_x))))
+            objective = 0.5 * (logdet_covariance + logdet_fixed + quad)
+            if not np.isfinite(objective):
+                return _JOINT_OBJ_PENALTY, None
+            return float(objective), (float(va), float(ve), beta, chol)
+        except (np.linalg.LinAlgError, FloatingPointError, ValueError):
+            return _JOINT_OBJ_PENALTY, None
+
+    best_objective = np.inf
+    best_eta: np.ndarray | None = None
+    for va0, ve0 in start_unique:
+        eta0 = np.log(np.asarray([va0, ve0], dtype=float))
+        result = minimize(
+            lambda eta: evaluate(eta)[0],
+            eta0,
+            method="L-BFGS-B",
+            bounds=[(_JOINT_LOG_FLOOR, _JOINT_LOG_CEIL)] * 2,
+            options={
+                "maxiter": max(25, int(maxiter)),
+                "ftol": 1e-12,
+                "gtol": 1e-8,
+                "maxls": 50,
+            },
+        )
+        for candidate in (np.asarray(result.x, dtype=float), eta0):
+            objective, state = evaluate(candidate)
+            if state is not None and objective < best_objective:
+                best_objective = objective
+                best_eta = np.asarray(candidate, dtype=float)
+
+    if best_eta is None:
+        raise RuntimeError("Exact observation-level dense REML failed to find a finite solution.")
+    _objective, fitted = evaluate(best_eta)
+    if fitted is None:
+        raise RuntimeError("Exact observation-level dense REML solution became invalid.")
+    va, ve, beta, chol = fitted
+
+    # Conditional mean of the line genetic values under the fitted model.
+    residual = y - x @ beta
+    line_residual = np.bincount(line_codes, weights=residual, minlength=n_lines) / sqrt_counts
+    ci_line_residual = cho_solve((chol, True), line_residual)
+    add_blup = va * (k @ (sqrt_counts * ci_line_residual))
+
+    # Report entry-mean h2 on the same phenotype scale as the existing output.
+    # In this fixed-effects-only model, residual error in a line mean is Ve/r_i.
+    noise_mean = float(ve * np.mean(1.0 / counts))
+    denom = va + noise_mean
+    h2_raw = float(va / denom) if denom > 0.0 else np.nan
+    return _JointKernelResult(
+        va=float(va),
+        vresidual=0.0,
+        h2_raw=h2_raw,
+        beta=np.asarray(beta, dtype=float).reshape(-1),
+        add_blup=np.asarray(add_blup, dtype=float).reshape(-1),
+        residual_blup=np.zeros(n_lines, dtype=float),
+        noise_mean=noise_mean,
+        observation_residual=float(ve),
+    )
+
+
 def _fit_sparse_narrow_corrected(
     *,
     jxgrm_path: str,
@@ -3584,13 +3800,60 @@ def main(argv: list[str] | None = None) -> None:
                         if grm_ctx is not None:
                             grm_idx = [grm_ctx.index[sid] for sid in kept_ids]
                             kinship = grm_ctx.matrix[np.ix_(grm_idx, grm_idx)]
-                            joint_state = _fit_dense_narrow_corrected(
-                                kept[trait].to_numpy(dtype=float),
-                                kinship=kinship,
-                                noise_diag=noise_diag,
-                                x_fixed=x_stage2,
-                                maxiter=int(args.maxiter),
+                            exact_observation_path = not (
+                                compiled.random_specs
+                                or compiled.gxe_specs
+                                or compiled.gxc_specs
                             )
+                            if exact_observation_path:
+                                kept_set = set(kept_ids)
+                                observation_ids = (
+                                    sub[line_col]
+                                    .astype("string")
+                                    .fillna("NA")
+                                    .astype(str)
+                                )
+                                observation_mask = observation_ids.isin(kept_set).to_numpy()
+                                observation_fixed = (
+                                    None
+                                    if compiled.fixed_matrix is None
+                                    else np.asarray(compiled.fixed_matrix, dtype=float)[
+                                        observation_mask, :
+                                    ]
+                                )
+                                joint_state = _fit_dense_observation_reml(
+                                    y.reshape(-1)[observation_mask],
+                                    observation_ids.loc[observation_mask].to_numpy(dtype=object),
+                                    sample_ids=kept_ids,
+                                    kinship=kinship,
+                                    x_fixed=observation_fixed,
+                                    maxiter=int(args.maxiter),
+                                    initial_va=vg,
+                                    initial_ve=ve,
+                                )
+                                narrow_method = "exact_dense_observation_reml"
+                                logger.info(
+                                    "Trait %s: exact dense observation-level REML residual variance = %s",
+                                    trait,
+                                    _fmt_metric(joint_state.observation_residual),
+                                )
+                                narrow_sigma_g2 = float(joint_state.va)
+                                narrow_sigma_e2 = float(joint_state.observation_residual)
+                                narrow_lambda = (
+                                    float(narrow_sigma_e2 / narrow_sigma_g2)
+                                    if narrow_sigma_g2 > 0.0
+                                    else np.nan
+                                )
+                                narrow_grm_mean_diag = float(np.mean(np.diag(kinship)))
+                            else:
+                                joint_state = _fit_dense_narrow_corrected(
+                                    kept[trait].to_numpy(dtype=float),
+                                    kinship=kinship,
+                                    noise_diag=noise_diag,
+                                    x_fixed=x_stage2,
+                                    maxiter=int(args.maxiter),
+                                )
+                                narrow_method = "joint_dense_corrected_reml"
                             va_joint = float(joint_state.va)
                             vresidual_joint = float(joint_state.vresidual)
                             noise_mean_joint = float(joint_state.noise_mean)
@@ -3601,8 +3864,9 @@ def main(argv: list[str] | None = None) -> None:
                                 if latent_denom > 0.0
                                 else np.nan
                             )
-                            narrow_method = "joint_dense_corrected_reml"
-                            if va_joint <= 1e-9 or vresidual_joint <= 1e-9:
+                            if va_joint <= 1e-9 or (
+                                not exact_observation_path and vresidual_joint <= 1e-9
+                            ):
                                 logger.warning(
                                     "Trait %s: dense variance component is at/near the non-negative boundary (Va=%s, Vresidual=%s).",
                                     trait,
@@ -3750,9 +4014,19 @@ def main(argv: list[str] | None = None) -> None:
                     _fmt_metric(h2_narrow),
                 )
             if np.isfinite(va_joint):
-                logger.info(
-                    f"  joint additive={_fmt_metric(va_joint)} | joint residual={_fmt_metric(vresidual_joint)} | joint noise_mean={_fmt_metric(noise_mean_joint)}"
-                )
+                if narrow_method == "exact_dense_observation_reml":
+                    logger.info(
+                        "  exact dense additive=%s | observation residual=%s | line-mean noise=%s",
+                        _fmt_metric(va_joint),
+                        _fmt_metric(
+                            getattr(joint_state, "observation_residual", np.nan)
+                        ),
+                        _fmt_metric(noise_mean_joint),
+                    )
+                else:
+                    logger.info(
+                        f"  joint additive={_fmt_metric(va_joint)} | joint residual={_fmt_metric(vresidual_joint)} | joint noise_mean={_fmt_metric(noise_mean_joint)}"
+                    )
 
             summary_rows.append(
                 {

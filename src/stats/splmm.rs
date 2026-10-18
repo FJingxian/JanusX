@@ -45,7 +45,9 @@ use crate::decode::{
     decode_indexed_row_model_into_f64, decode_packed_row_model_enum_into_f64, AdditiveDecodePlan,
     PackedGeneticModel, PackedRowDecodeSource,
 };
-use crate::gfcore::{read_fam, BimChunkReader};
+use crate::gfcore::{
+    block_rows_from_memory_target_mb, parse_positive_env_f64, read_fam, BimChunkReader,
+};
 use crate::gfreader::{
     count_packed_row_counts, count_packed_row_counts_selected_prevalidated,
     count_packed_row_counts_selected_with_excluded, evaluate_packed_snp_qc, is_simple_snp_allele,
@@ -1691,11 +1693,87 @@ fn splmm_raw_scan_exact_block_single_buffer(
     Ok(total_kept)
 }
 
+#[derive(Default)]
 struct SplmmRawTsvBlockPayload {
     source_rows: Vec<usize>,
     alt_freq: Vec<f32>,
     missing_rate: Vec<f32>,
     results: Vec<f64>,
+}
+
+impl SplmmRawTsvBlockPayload {
+    fn rows(&self) -> usize {
+        self.source_rows.len()
+    }
+
+    fn append_range(&mut self, other: &Self, start: usize, end: usize) {
+        self.source_rows
+            .extend_from_slice(&other.source_rows[start..end]);
+        self.alt_freq.extend_from_slice(&other.alt_freq[start..end]);
+        self.missing_rate
+            .extend_from_slice(&other.missing_rate[start..end]);
+        self.results
+            .extend_from_slice(&other.results[start * 3..end * 3]);
+    }
+}
+
+struct SplmmRawTsvPayloadBatcher<'a> {
+    tx: &'a SyncSender<SplmmRawTsvBlockPayload>,
+    max_rows: usize,
+    pending: SplmmRawTsvBlockPayload,
+    send_secs: &'a mut f64,
+}
+
+impl SplmmRawTsvPayloadBatcher<'_> {
+    fn send(&mut self, payload: SplmmRawTsvBlockPayload) -> Result<(), String> {
+        *self.send_secs += send_tsv_payload_with_wait(self.tx, payload)
+            .map_err(|_| "send raw SparseLMM TSV block: writer receiver disconnected")?;
+        Ok(())
+    }
+
+    fn push(&mut self, payload: SplmmRawTsvBlockPayload) -> Result<(), String> {
+        let rows = payload.rows();
+        if rows == 0
+            || payload.alt_freq.len() != rows
+            || payload.missing_rate.len() != rows
+            || payload.results.len() != rows.saturating_mul(3)
+        {
+            return Err(format!(
+                "raw SparseLMM TSV payload length mismatch: rows={rows}, af={}, miss={}, results={}",
+                payload.alt_freq.len(),
+                payload.missing_rate.len(),
+                payload.results.len()
+            ));
+        }
+        if self.pending.rows() == 0 && rows == self.max_rows {
+            return self.send(payload);
+        }
+        let mut offset = 0usize;
+        while offset < rows {
+            let room = self.max_rows.saturating_sub(self.pending.rows());
+            let take = room.min(rows - offset);
+            if take == 0 {
+                let batch = std::mem::take(&mut self.pending);
+                self.send(batch)?;
+                continue;
+            }
+            self.pending.append_range(&payload, offset, offset + take);
+            offset += take;
+            if self.pending.rows() == self.max_rows {
+                let batch = std::mem::take(&mut self.pending);
+                self.send(batch)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), String> {
+        if self.pending.rows() > 0 {
+            let batch = std::mem::take(&mut self.pending);
+            self.send(batch)?;
+        }
+        Ok(())
+    }
 }
 
 struct SplmmRawPrefetchedBedBlock {
@@ -1719,14 +1797,15 @@ where
 {
     let buffer_bytes = block_rows.max(1).saturating_mul(bytes_per_snp);
     let first_buffer = vec![0u8; buffer_bytes];
-    let second_buffer = vec![0u8; buffer_bytes];
+    // A spare is useful only when there is another block to prefetch.
+    let second_buffer = (block_rows < n_snps).then(|| vec![0u8; buffer_bytes]);
     std::thread::scope(|scope| {
         let (ready_tx, ready_rx) = sync_channel::<Result<SplmmRawPrefetchedBedBlock, String>>(1);
         let (recycle_tx, recycle_rx) = sync_channel::<Vec<u8>>(1);
         let worker = scope.spawn(move || -> Result<(), String> {
             let mut source_start = 0usize;
             let mut next_buffer = Some(first_buffer);
-            let mut spare_buffer = Some(second_buffer);
+            let mut spare_buffer = second_buffer;
             while source_start < n_snps {
                 let mut packed = if let Some(buffer) = next_buffer.take() {
                     buffer
@@ -1878,12 +1957,36 @@ fn format_splmm_raw_tsv_block(
     })
 }
 
+#[cfg(test)]
 fn run_splmm_raw_bed_tsv_writer<R, F>(
     out_tsv: &str,
     bed_prefix: &str,
     gm: PackedGeneticModel,
     format_pool: Option<Arc<rayon::ThreadPool>>,
     format_threads: usize,
+    run_scan: F,
+) -> Result<(R, usize, SplmmTsvTiming), String>
+where
+    F: FnOnce(&mut dyn FnMut(SplmmRawTsvBlockPayload) -> Result<(), String>) -> Result<R, String>,
+{
+    run_splmm_raw_bed_tsv_writer_bounded(
+        out_tsv,
+        bed_prefix,
+        gm,
+        format_pool,
+        format_threads,
+        16_384,
+        run_scan,
+    )
+}
+
+fn run_splmm_raw_bed_tsv_writer_bounded<R, F>(
+    out_tsv: &str,
+    bed_prefix: &str,
+    gm: PackedGeneticModel,
+    format_pool: Option<Arc<rayon::ThreadPool>>,
+    format_threads: usize,
+    writer_block_rows: usize,
     run_scan: F,
 ) -> Result<(R, usize, SplmmTsvTiming), String>
 where
@@ -1981,15 +2084,27 @@ where
             Ok((rows_written, timing))
         });
             let mut send_secs = 0.0_f64;
-            let mut sink = |payload| {
-                send_secs += send_tsv_payload_with_wait(&tx, payload)
-                    .map_err(|_| "send raw SparseLMM TSV block: writer receiver disconnected")?;
-                Ok(())
+            let mut payload_batcher = SplmmRawTsvPayloadBatcher {
+                tx: &tx,
+                max_rows: writer_block_rows.max(1),
+                pending: SplmmRawTsvBlockPayload {
+                    source_rows: Vec::new(),
+                    alt_freq: Vec::new(),
+                    missing_rate: Vec::new(),
+                    results: Vec::new(),
+                },
+                send_secs: &mut send_secs,
             };
+            let mut sink = |payload| payload_batcher.push(payload);
             let producer_t0 = Instant::now();
             let scan_result = run_scan(&mut sink);
-            let producer_secs = producer_t0.elapsed().as_secs_f64();
             drop(sink);
+            let scan_result = match scan_result {
+                Ok(result) => payload_batcher.flush().map(|()| result),
+                Err(error) => Err(error),
+            };
+            let producer_secs = producer_t0.elapsed().as_secs_f64();
+            drop(payload_batcher);
             drop(tx);
             let finish_t0 = Instant::now();
             let writer_result = match writer.join() {
@@ -3506,32 +3621,182 @@ fn fused_block_sv_xtz_scalar_p1(
 
 #[inline]
 fn adaptive_exact_block_rows(requested: usize, n: usize) -> usize {
-    // Exact block-scan peak memory model, per row (one SNP) of the block:
-    //   block          f32 [n]     = 4n
-    //   spy_block      f32 [1]     = 4
-    //   z_col_major    f64 [n]     = 8n
-    //   xts_block      f32 [p]     ≈4p
-    //   c_block        f64 [p]     ≈8p
-    //   row_ss         f64 [1]     = 8
-    //   sv_block       f64 [1]     = 8
-    //   out_block      f64 [3]     = 24
-    //   --------------------------------------------------
-    //   total per row              ≈12n + 12p + 52 bytes
-    //
-    // We approximate p=4 for safety and add slack for the sparse-solve
-    // workspace and allocation overhead.
-    // Default cap: 128 MiB, overridable via JX_SPLMM_EXACT_MAX_BLOCK_BYTES.
-    const DEFAULT_MAX_BYTES: usize = 128 * 1024 * 1024; // 128 MiB
-    let max_bytes: usize = std::env::var("JX_SPLMM_EXACT_MAX_BLOCK_BYTES")
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(DEFAULT_MAX_BYTES);
-    // Conservative cap after removing the extra RHS buffer:
-    //   16n + 160 bytes per row
-    let bytes_per_row = (16 * n.max(1)).saturating_add(160);
-    let max_rows = max_bytes / bytes_per_row;
-    requested.min(max_rows).max(1)
+    let target_mb =
+        parse_positive_env_f64(&["JX_BED_BLOCK_TARGET_MB", "JANUSX_BED_BLOCK_TARGET_MB"])
+            .unwrap_or(1024.0);
+    adaptive_exact_block_rows_for_target(requested, n, target_mb)
+}
+
+#[inline]
+fn adaptive_exact_block_rows_for_target(requested: usize, n: usize, target_mb: f64) -> usize {
+    block_rows_from_memory_target_mb(
+        target_mb,
+        splmm_exact_scan_bytes_per_row(n),
+        requested.max(1),
+        1,
+        1,
+        0,
+    )
+}
+
+fn splmm_exact_scan_bytes_per_row(n: usize) -> usize {
+    // Genotypes (4n), solved RHS (8n), tiled permutation/solve scratch
+    // (at most 16n), fixed-effect products (p <= n), and row metadata.
+    // Include alignment slack; this is a working-set estimate, not an RSS cap.
+    n.max(1).saturating_mul(40).saturating_add(512)
+}
+
+#[derive(Debug)]
+struct SplmmFusedBlockPlan {
+    read_rows: usize,
+    compute_rows: usize,
+    write_rows: usize,
+    estimated_bytes: usize,
+    prefetch_buffers: usize,
+}
+
+fn splmm_fused_block_plan(
+    memory_mb: Option<f64>,
+    requested_rows: usize,
+    n_snps: usize,
+    n_samples_full: usize,
+    n_selected: usize,
+    threads: usize,
+    exact: bool,
+) -> Result<SplmmFusedBlockPlan, String> {
+    let bytes_per_snp = n_samples_full.div_ceil(4);
+    let reserve_bytes = n_samples_full
+        .saturating_add(n_selected)
+        .saturating_mul(4)
+        .saturating_mul(threads.max(1))
+        .saturating_add(8 * 1024 * 1024);
+    let compute_bytes_per_row = if exact {
+        splmm_exact_scan_bytes_per_row(n_selected).saturating_add(32)
+    } else {
+        // QC indices/statistics, packed row references, and three result values.
+        // Per-thread genotype/decode scratch is covered by reserve_bytes.
+        128
+    };
+    let (read_rows, compute_rows, write_rows, estimated_bytes) = if let Some(target_mb) = memory_mb
+    {
+        if !(target_mb.is_finite() && target_mb > 0.0) {
+            return Err("SparseLMM scan memory_mb must be finite and > 0".to_string());
+        }
+        const READ_BUFFER_TOTAL_TARGET_BYTES: usize = 64 * 1024 * 1024;
+        const WRITER_QUEUE_TARGET_BYTES: usize = 8 * 1024 * 1024;
+        const EXACT_READ_BUFFER_TOTAL_TARGET_BYTES: usize = 4 * 1024 * 1024;
+        const EXACT_WRITER_QUEUE_TARGET_BYTES: usize = 4 * 1024 * 1024;
+        const WRITER_BYTES_PER_ROW_IN_FLIGHT: usize = 3 * 160;
+        const APPROX_MAX_COMPUTE_ROWS: usize = 65_536;
+        const EXACT_MAX_COMPUTE_ROWS: usize = 8_192;
+
+        let budget_bytes = (target_mb * 1024.0 * 1024.0).min(usize::MAX as f64).floor() as usize;
+        let working_bytes = budget_bytes.saturating_sub(reserve_bytes);
+        let (read_target_bytes, writer_target_bytes) = if exact {
+            (
+                EXACT_READ_BUFFER_TOTAL_TARGET_BYTES,
+                EXACT_WRITER_QUEUE_TARGET_BYTES,
+            )
+        } else {
+            (READ_BUFFER_TOTAL_TARGET_BYTES, WRITER_QUEUE_TARGET_BYTES)
+        };
+        // Reserve at most a quarter of the available budget for both packed
+        // BED buffers. Exact scans use a smaller cap because sparse solves
+        // benefit more from compute workspace than from larger I/O blocks.
+        let read_bytes = (working_bytes / 4).min(read_target_bytes);
+        let mut read_rows = (read_bytes / 2 / bytes_per_snp.max(1))
+            .max(1)
+            .min(n_snps.max(1));
+        let mut prefetch_buffers = if read_rows < n_snps { 2 } else { 1 };
+        let mut read_working_bytes = read_rows
+            .saturating_mul(bytes_per_snp)
+            .saturating_mul(prefetch_buffers);
+
+        // A writer batch accounts for its payload, formatted strings, and a
+        // second queued/in-progress payload. Keep the queue bounded by bytes.
+        let writer_bytes = (working_bytes / 8).min(writer_target_bytes);
+        let write_rows = (writer_bytes / WRITER_BYTES_PER_ROW_IN_FLIGHT)
+            .max(1)
+            .min(16_384)
+            .min(n_snps.max(1));
+        let writer_working_bytes = write_rows.saturating_mul(WRITER_BYTES_PER_ROW_IN_FLIGHT);
+        let max_compute_rows = if exact {
+            EXACT_MAX_COMPUTE_ROWS
+        } else {
+            APPROX_MAX_COMPUTE_ROWS
+        };
+        let compute_budget = working_bytes
+            .saturating_sub(read_working_bytes)
+            .saturating_sub(writer_working_bytes);
+        let mut compute_rows = (compute_budget / compute_bytes_per_row)
+            .max(1)
+            .min(max_compute_rows)
+            .min(n_snps.max(1));
+        if exact && read_rows < compute_rows {
+            // A read block smaller than the solve block would silently shrink
+            // every effective exact solve batch. Grow it to fit one compute
+            // batch, then account for that buffer before finalizing the plan.
+            read_rows = compute_rows;
+            prefetch_buffers = if read_rows < n_snps { 2 } else { 1 };
+            read_working_bytes = read_rows
+                .saturating_mul(bytes_per_snp)
+                .saturating_mul(prefetch_buffers);
+            let compute_budget = working_bytes
+                .saturating_sub(read_working_bytes)
+                .saturating_sub(writer_working_bytes);
+            compute_rows = (compute_budget / compute_bytes_per_row)
+                .max(1)
+                .min(max_compute_rows)
+                .min(n_snps.max(1));
+        }
+        // Compute chunks are sliced from one decoded read block; they cannot
+        // be larger than the rows currently available in that block.
+        compute_rows = compute_rows.min(read_rows);
+        let estimated_bytes = reserve_bytes
+            .saturating_add(read_working_bytes)
+            .saturating_add(writer_working_bytes)
+            .saturating_add(compute_rows.saturating_mul(compute_bytes_per_row));
+        (read_rows, compute_rows, write_rows, estimated_bytes)
+    } else {
+        let read_rows = requested_rows.max(1).min(n_snps.max(1));
+        let compute_rows = if exact {
+            adaptive_exact_block_rows(read_rows, n_selected)
+        } else {
+            read_rows.min(65_536)
+        };
+        let write_rows = read_rows.min(16_384).max(1);
+        let prefetch_buffers = if read_rows < n_snps { 2 } else { 1 };
+        let estimated_bytes = reserve_bytes
+            .saturating_add(
+                read_rows
+                    .saturating_mul(bytes_per_snp)
+                    .saturating_mul(prefetch_buffers),
+            )
+            .saturating_add(compute_rows.saturating_mul(compute_bytes_per_row))
+            .saturating_add(write_rows.saturating_mul(3 * 160));
+        (read_rows, compute_rows, write_rows, estimated_bytes)
+    };
+    let prefetch_buffers = if read_rows < n_snps { 2 } else { 1 };
+    Ok(SplmmFusedBlockPlan {
+        read_rows,
+        compute_rows,
+        write_rows,
+        estimated_bytes,
+        prefetch_buffers,
+    })
+}
+
+fn emit_splmm_fused_block_plan(mode: &str, memory_mb: Option<f64>, plan: &SplmmFusedBlockPlan) {
+    if splmm_top_level_timing_enabled() || splmm_packed_stage_timing_enabled() {
+        eprintln!(
+            "SparseLMM BED buffers: mode={mode}, target_mb={memory_mb:?}, read_block_rows={}, compute_block_rows={}, write_block_rows={}, estimated_working_bytes={}, prefetch_buffers={}",
+            plan.read_rows,
+            plan.compute_rows,
+            plan.write_rows,
+            plan.estimated_bytes,
+            plan.prefetch_buffers,
+        );
+    }
 }
 
 #[inline]
@@ -4856,11 +5121,11 @@ fn build_sparse_splmm_null_state(
 #[allow(clippy::too_many_arguments)]
 fn prepare_splmm_scan_state(
     factor: SparseJxgrmCholesky,
-    scan_prepared: &SplmmPreparedInput,
+    _scan_prepared: &SplmmPreparedInput,
     x_design: &[f64],
     y_vec: &[f64],
-    threads: usize,
-    block_rows: usize,
+    _threads: usize,
+    _block_rows: usize,
     stage1_cb: Option<&Py<PyAny>>,
     scan_mode: SplmmScanMode,
 ) -> Result<SplmmPreparedScanState, String> {
@@ -4874,15 +5139,8 @@ fn prepare_splmm_scan_state(
     }
     let n = y_vec.len();
     let p = x_design.len() / n;
-    let m = scan_prepared.n_rows();
-    let scan_block_hint = block_rows.max(512).max(1);
-    let est_block_rows = adaptive_exact_block_rows(
-        adaptive_grm_block_rows(scan_block_hint, m, n, 0usize, threads).max(1),
-        n,
-    );
-    let solve_cap = est_block_rows.max(p).max(1);
     let workspace_t0 = Instant::now();
-    let mut solve_workspace = factor.make_solve_workspace(solve_cap)?;
+    let mut solve_workspace = factor.make_solve_workspace(p.max(1))?;
     prepare_timing.workspace_secs = workspace_t0.elapsed().as_secs_f64();
     let null_state =
         build_sparse_splmm_null_state(&factor, x_design, y_vec, &mut solve_workspace, stage1_cb)?;
@@ -5432,7 +5690,8 @@ pub fn splmm_sparse_null_model_debug<'py>(
     block_rows=4096,
     stage1_progress_callback=None,
     scan_progress_callback=None,
-    progress_every=0
+    progress_every=0,
+    memory_mb=None
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn splmm_assoc_pcg_bed_to_tsv_fused_exact<'py>(
@@ -5455,6 +5714,7 @@ pub fn splmm_assoc_pcg_bed_to_tsv_fused_exact<'py>(
     stage1_progress_callback: Option<Py<PyAny>>,
     scan_progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
+    memory_mb: Option<f64>,
 ) -> PyResult<(
     f64,
     bool,
@@ -5534,6 +5794,7 @@ pub fn splmm_assoc_pcg_bed_to_tsv_fused_exact<'py>(
             stage1_progress_callback,
             scan_progress_callback,
             progress_every,
+            memory_mb,
         )
     })
     .map_err(PyRuntimeError::new_err)
@@ -6367,6 +6628,7 @@ fn splmm_fused_approx_assoc_to_tsv(
     stage1_progress_callback: Option<Py<PyAny>>,
     scan_progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
+    memory_mb: Option<f64>,
 ) -> Result<
     (
         f64,
@@ -6525,7 +6787,18 @@ fn splmm_fused_approx_assoc_to_tsv(
     )?;
 
     let n_snps = reader.n_snps();
-    let block_rows = block_rows.max(1).min(n_snps.max(1));
+    let block_plan = splmm_fused_block_plan(
+        memory_mb,
+        block_rows,
+        n_snps,
+        n_samples_full,
+        n,
+        threads,
+        false,
+    )?;
+    emit_splmm_fused_block_plan("approx", memory_mb, &block_plan);
+    let read_block_rows = block_plan.read_rows;
+    let compute_block_rows = block_plan.compute_rows;
     let bytes_per_snp = reader.bytes_per_snp();
     let n_samples_full = reader.n_samples_full();
     let packed_stage_timing = splmm_packed_stage_timing_enabled();
@@ -6535,12 +6808,13 @@ fn splmm_fused_approx_assoc_to_tsv(
     } else {
         None
     };
-    let (_n_scanned, written_rows, tsv_timing) = run_splmm_raw_bed_tsv_writer(
+    let (_n_scanned, written_rows, tsv_timing) = run_splmm_raw_bed_tsv_writer_bounded(
         &out_tsv,
         &bed_prefix,
         PackedGeneticModel::Add,
         pool.clone(),
         splmm_raw_tsv_format_threads(threads.max(1)),
+        block_plan.write_rows,
         |sink| {
             let progress_step = if progress_every == 0 {
                 (n_snps / 200).max(1)
@@ -6551,63 +6825,70 @@ fn splmm_fused_approx_assoc_to_tsv(
             run_splmm_raw_bed_prefetch(
                 reader,
                 n_snps,
-                block_rows,
+                read_block_rows,
                 bytes_per_snp,
                 |source_start, rows_here, packed_block| {
-                    let block_sites = source_bim
-                        .as_mut()
-                        .map(|bim| bim.read_range(source_start, source_start + rows_here))
-                        .transpose()?;
-                    let block = splmm_raw_process_assoc_block_single_buffer(
-                        packed_block,
-                        source_start,
-                        rows_here,
-                        n_samples_full,
-                        &scan_sample_idx,
-                        sample_identity,
-                        excluded_sample_indices.as_deref(),
-                        n,
-                        maf_threshold,
-                        max_missing_rate,
-                        het_threshold,
-                        snps_only,
-                        &bimranges,
-                        block_sites.as_deref(),
-                        &model,
-                        &score_f32,
-                        x_design_f32.as_deref(),
-                        &packed_byte_lut().code4,
-                        &decode_plan,
-                        pool.as_ref(),
-                        &mut raw_scan_timing,
-                        packed_stage_timing,
-                    )?;
-                    if !block.source_rows.is_empty() {
-                        let sink_t0 = packed_stage_timing.then(Instant::now);
-                        sink(SplmmRawTsvBlockPayload {
-                            source_rows: block.source_rows,
-                            alt_freq: block.alt_freq,
-                            missing_rate: block.missing_rate,
-                            results: block.results,
-                        })?;
-                        if let Some(t0) = sink_t0 {
-                            raw_scan_timing.sink_secs += t0.elapsed().as_secs_f64();
-                        }
-                    }
-                    let source_end = source_start.saturating_add(rows_here);
-                    if scan_progress_callback.is_some()
-                        && (source_end == n_snps || source_end >= next_progress)
-                    {
-                        emit_progress_callback(
-                            scan_progress_callback.as_ref(),
-                            9,
-                            source_end,
-                            n_snps.max(1),
+                    for compute_offset in (0..rows_here).step_by(compute_block_rows) {
+                        let compute_rows = compute_block_rows.min(rows_here - compute_offset);
+                        let compute_start = source_start + compute_offset;
+                        let compute_end = compute_start + compute_rows;
+                        let packed_start = compute_offset * bytes_per_snp;
+                        let packed_end = packed_start + compute_rows * bytes_per_snp;
+                        let compute_block = &packed_block[packed_start..packed_end];
+                        let block_sites = source_bim
+                            .as_mut()
+                            .map(|bim| bim.read_range(compute_start, compute_end))
+                            .transpose()?;
+                        let block = splmm_raw_process_assoc_block_single_buffer(
+                            compute_block,
+                            compute_start,
+                            compute_rows,
+                            n_samples_full,
+                            &scan_sample_idx,
+                            sample_identity,
+                            excluded_sample_indices.as_deref(),
+                            n,
+                            maf_threshold,
+                            max_missing_rate,
+                            het_threshold,
+                            snps_only,
+                            &bimranges,
+                            block_sites.as_deref(),
+                            &model,
+                            &score_f32,
+                            x_design_f32.as_deref(),
+                            &packed_byte_lut().code4,
+                            &decode_plan,
+                            pool.as_ref(),
+                            &mut raw_scan_timing,
+                            packed_stage_timing,
                         )?;
-                        while next_progress <= source_end {
-                            next_progress = next_progress.saturating_add(progress_step);
-                            if next_progress == usize::MAX {
-                                break;
+                        if !block.source_rows.is_empty() {
+                            let sink_t0 = packed_stage_timing.then(Instant::now);
+                            sink(SplmmRawTsvBlockPayload {
+                                source_rows: block.source_rows,
+                                alt_freq: block.alt_freq,
+                                missing_rate: block.missing_rate,
+                                results: block.results,
+                            })?;
+                            if let Some(t0) = sink_t0 {
+                                raw_scan_timing.sink_secs += t0.elapsed().as_secs_f64();
+                            }
+                        }
+                        if scan_progress_callback.is_some()
+                            && (compute_end == n_snps || compute_end >= next_progress)
+                        {
+                            emit_progress_callback(
+                                scan_progress_callback.as_ref(),
+                                9,
+                                compute_end,
+                                n_snps.max(1),
+                            )?;
+                            while next_progress <= compute_end {
+                                next_progress = next_progress.saturating_add(progress_step);
+                                if next_progress == usize::MAX {
+                                    break;
+                                }
                             }
                         }
                     }
@@ -6696,6 +6977,7 @@ fn splmm_fused_exact_assoc_to_tsv(
     stage1_progress_callback: Option<Py<PyAny>>,
     scan_progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
+    memory_mb: Option<f64>,
 ) -> Result<
     (
         f64,
@@ -6810,11 +7092,20 @@ fn splmm_fused_exact_assoc_to_tsv(
 
     let (scan_block_hint, progress_step) =
         splmm_scan_block_hint_and_progress_step(block_rows, progress_every);
-    let exact_capacity = adaptive_exact_block_rows(
-        adaptive_grm_block_rows(scan_block_hint, n_snps, n, 0usize, threads).max(1),
+    let block_plan = splmm_fused_block_plan(
+        memory_mb,
+        scan_block_hint,
+        n_snps,
+        n_samples_full,
         n,
-    );
-    let mut solve_workspace = factor.make_solve_workspace(exact_capacity.max(p).max(1))?;
+        threads,
+        true,
+    )?;
+    emit_splmm_fused_block_plan("exact", memory_mb, &block_plan);
+    let exact_capacity = block_plan.compute_rows;
+    // Scan solves use ExactScanBlockWorkspace's tiled workspaces. This one
+    // is only used to prepare V^-1 y and V^-1 X for the null model.
+    let mut solve_workspace = factor.make_solve_workspace(p.max(1))?;
     let null_state = build_sparse_splmm_null_state(
         &factor,
         &x_design,
@@ -6834,7 +7125,7 @@ fn splmm_fused_exact_assoc_to_tsv(
     let decode_plan = AdditiveDecodePlan::from_sample_indices(n_samples_full, &scan_sample_idx);
     let scan_prepare_secs =
         total_t0.elapsed().as_secs_f64() - input_prepare_secs - factor_load_secs;
-    let raw_block_rows = block_rows.max(1).min(n_snps);
+    let read_block_rows = block_plan.read_rows;
     let mut source_bim = if snps_only || !bimranges.is_empty() {
         Some(BimChunkReader::open(&bed_prefix)?)
     } else {
@@ -6843,69 +7134,77 @@ fn splmm_fused_exact_assoc_to_tsv(
     let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
     let packed_stage_timing = splmm_packed_stage_timing_enabled();
     let mut raw_scan_timing = SplmmPackedScanTiming::default();
-    let (_n_scanned, written_rows, tsv_timing) = run_splmm_raw_bed_tsv_writer(
+    let (_n_scanned, written_rows, tsv_timing) = run_splmm_raw_bed_tsv_writer_bounded(
         &out_tsv,
         &bed_prefix,
         PackedGeneticModel::Add,
         pool.clone(),
         1,
+        block_plan.write_rows,
         |sink| {
             let mut next_progress = progress_step.max(1);
             run_splmm_raw_bed_prefetch(
                 reader,
                 n_snps,
-                raw_block_rows,
+                read_block_rows,
                 bytes_per_snp,
                 |source_start, rows_here, packed_block| {
-                    let block_sites = source_bim
-                        .as_mut()
-                        .map(|bim| bim.read_range(source_start, source_start + rows_here))
-                        .transpose()?;
-                    splmm_raw_scan_exact_block_single_buffer(
-                        &factor,
-                        &mut exact_workspace,
-                        &mut solve_workspace,
-                        &x_design,
-                        &null_state.x_design_col_major,
-                        &null_state.null_model.py,
-                        &score_f32,
-                        null_state.null_model.ypy,
-                        null_state.null_model.df,
-                        &null_state.null_model.xt_w_x_chol,
-                        packed_block,
-                        source_start,
-                        rows_here,
-                        n_samples_full,
-                        &scan_sample_idx,
-                        scan_sample_identity,
-                        excluded_sample_indices.as_deref(),
-                        maf_threshold,
-                        max_missing_rate,
-                        het_threshold,
-                        snps_only,
-                        &bimranges,
-                        block_sites.as_deref(),
-                        &decode_plan,
-                        threads,
-                        pool.as_ref(),
-                        &mut raw_scan_timing,
-                        packed_stage_timing,
-                        sink,
-                    )?;
-                    let source_end = source_start.saturating_add(rows_here);
-                    if scan_progress_callback.is_some()
-                        && (source_end == n_snps || source_end >= next_progress)
-                    {
-                        emit_progress_callback(
-                            scan_progress_callback.as_ref(),
-                            9,
-                            source_end,
-                            n_snps.max(1),
+                    for compute_offset in (0..rows_here).step_by(exact_capacity) {
+                        let compute_rows = exact_capacity.min(rows_here - compute_offset);
+                        let compute_start = source_start + compute_offset;
+                        let compute_end = compute_start + compute_rows;
+                        let packed_start = compute_offset * bytes_per_snp;
+                        let packed_end = packed_start + compute_rows * bytes_per_snp;
+                        let compute_block = &packed_block[packed_start..packed_end];
+                        let block_sites = source_bim
+                            .as_mut()
+                            .map(|bim| bim.read_range(compute_start, compute_end))
+                            .transpose()?;
+                        splmm_raw_scan_exact_block_single_buffer(
+                            &factor,
+                            &mut exact_workspace,
+                            &mut solve_workspace,
+                            &x_design,
+                            &null_state.x_design_col_major,
+                            &null_state.null_model.py,
+                            &score_f32,
+                            null_state.null_model.ypy,
+                            null_state.null_model.df,
+                            &null_state.null_model.xt_w_x_chol,
+                            compute_block,
+                            compute_start,
+                            compute_rows,
+                            n_samples_full,
+                            &scan_sample_idx,
+                            scan_sample_identity,
+                            excluded_sample_indices.as_deref(),
+                            maf_threshold,
+                            max_missing_rate,
+                            het_threshold,
+                            snps_only,
+                            &bimranges,
+                            block_sites.as_deref(),
+                            &decode_plan,
+                            threads,
+                            pool.as_ref(),
+                            &mut raw_scan_timing,
+                            packed_stage_timing,
+                            sink,
                         )?;
-                        while next_progress <= source_end {
-                            next_progress = next_progress.saturating_add(progress_step.max(1));
-                            if next_progress == usize::MAX {
-                                break;
+                        if scan_progress_callback.is_some()
+                            && (compute_end == n_snps || compute_end >= next_progress)
+                        {
+                            emit_progress_callback(
+                                scan_progress_callback.as_ref(),
+                                9,
+                                compute_end,
+                                n_snps.max(1),
+                            )?;
+                            while next_progress <= compute_end {
+                                next_progress = next_progress.saturating_add(progress_step.max(1));
+                                if next_progress == usize::MAX {
+                                    break;
+                                }
                             }
                         }
                     }
@@ -6990,7 +7289,8 @@ fn splmm_fused_exact_assoc_to_tsv(
     stage1_progress_callback=None,
     scan_progress_callback=None,
     progress_every=0,
-    x_cov=None
+    x_cov=None,
+    memory_mb=None
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn splmm_assoc_pcg_bed_to_tsv_fused_approx<'py>(
@@ -7015,6 +7315,7 @@ pub fn splmm_assoc_pcg_bed_to_tsv_fused_approx<'py>(
     scan_progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
     x_cov: Option<PyReadonlyArray2<'py, f64>>,
+    memory_mb: Option<f64>,
 ) -> PyResult<(
     f64,
     bool,
@@ -7093,6 +7394,7 @@ pub fn splmm_assoc_pcg_bed_to_tsv_fused_approx<'py>(
             stage1_progress_callback,
             scan_progress_callback,
             progress_every,
+            memory_mb,
         )
     })
     .map_err(PyRuntimeError::new_err)
@@ -7351,12 +7653,7 @@ pub fn splmm_assoc_pcg_kfile_to_tsv<'py>(
 
             if scan_mode == SplmmScanMode::Exact {
                 let prepare_t0 = Instant::now();
-                let scan_block_rows = adaptive_exact_block_rows(
-                    adaptive_grm_block_rows(block_rows_use, marker_count, n, 0, threads_use)
-                        .max(1),
-                    n,
-                );
-                let mut solve_workspace = factor.make_solve_workspace(scan_block_rows.max(p).max(1))?;
+                let mut solve_workspace = factor.make_solve_workspace(p.max(1))?;
                 let null_state = build_sparse_splmm_null_state(
                     &factor,
                     x_design.as_slice(),
@@ -8263,13 +8560,7 @@ pub fn splmm_assoc_pcg_dense_f32<'py>(
                 None,
             )?;
 
-            let scan_block_hint = block_rows.max(512).max(1);
-            let est_block_rows = adaptive_exact_block_rows(
-                adaptive_grm_block_rows(scan_block_hint, m, n, 0usize, threads_use).max(1),
-                n,
-            );
-            let solve_cap = est_block_rows.max(p).max(1);
-            let mut solve_workspace = factor.make_solve_workspace(solve_cap)?;
+            let mut solve_workspace = factor.make_solve_workspace(p.max(1))?;
             let null_state = build_sparse_splmm_null_state(
                 &factor,
                 x_design.as_slice(),
@@ -8461,8 +8752,8 @@ mod tests {
 
         assert_eq!(rows, 1);
         assert!(
-            timing.finish_secs + 0.05 < timing.producer_secs,
-            "finish_secs should measure only the writer tail after the producer: {timing:?}"
+            timing.total_wall_secs + 1e-6 >= timing.producer_secs + timing.finish_secs,
+            "total wall time must cover the producer and writer tail: {timing:?}"
         );
         assert!(
             timing.producer_secs >= 0.07,
@@ -8907,13 +9198,14 @@ mod tests {
         write_sparse_grm_csc(grm_path.to_str().unwrap(), &grm).unwrap();
 
         let out_tsv = dir.join("fused.tsv");
+        let out_large_tsv = dir.join("fused_large.tsv");
         let baseline_tsv = dir.join("fused_intercept.tsv");
         let y = vec![1.0, -0.5, 0.25, 2.0];
         let x_cov = vec![0.0_f64, 0.5, 1.0, 1.5];
         let result = splmm_fused_approx_assoc_to_tsv(
             prefix.to_string_lossy().into_owned(),
             y.clone(),
-            Some(x_cov),
+            Some(x_cov.clone()),
             1,
             1.0,
             out_tsv.to_string_lossy().into_owned(),
@@ -8932,6 +9224,7 @@ mod tests {
             None,
             None,
             1,
+            Some(0.001),
         )
         .unwrap();
         assert_eq!(result.9, 3);
@@ -8942,6 +9235,34 @@ mod tests {
         assert!(lines[1].contains("\trs0\t"));
         assert!(lines[2].contains("\trs1\t"));
         assert!(lines[3].contains("\trs3\t"));
+
+        let result_large = splmm_fused_approx_assoc_to_tsv(
+            prefix.to_string_lossy().into_owned(),
+            y.clone(),
+            Some(x_cov.clone()),
+            1,
+            1.0,
+            out_large_tsv.to_string_lossy().into_owned(),
+            vec![0, 1, 2, 3],
+            vec![0, 1, 2, 3],
+            grm_path.to_string_lossy().into_owned(),
+            0.1,
+            0.25,
+            1.0,
+            false,
+            Vec::new(),
+            1,
+            2,
+            2,
+            20261004,
+            None,
+            None,
+            1,
+            Some(8192.0),
+        )
+        .unwrap();
+        assert_eq!(result_large.9, 3);
+        assert_eq!(std::fs::read_to_string(&out_large_tsv).unwrap(), tsv);
 
         let baseline = splmm_fused_approx_assoc_to_tsv(
             prefix.to_string_lossy().into_owned(),
@@ -8965,6 +9286,7 @@ mod tests {
             None,
             None,
             1,
+            None,
         )
         .unwrap();
         assert_eq!(baseline.9, 3);
@@ -9127,15 +9449,16 @@ mod tests {
         .unwrap();
 
         let out_tsv = dir.join("fused.tsv");
+        let out_large_tsv = dir.join("fused_large.tsv");
         let fused = splmm_fused_exact_assoc_to_tsv(
-            prefix_str,
-            y,
-            Some(x_cov),
+            prefix_str.clone(),
+            y.clone(),
+            Some(x_cov.clone()),
             1,
             0.7,
             out_tsv.to_string_lossy().into_owned(),
             sample_idx.clone(),
-            sample_idx,
+            sample_idx.clone(),
             grm_path.to_string_lossy().into_owned(),
             maf_threshold,
             max_missing_rate,
@@ -9147,6 +9470,7 @@ mod tests {
             None,
             None,
             1,
+            Some(0.001),
         )
         .unwrap();
         assert_eq!(fused.9, 3);
@@ -9180,6 +9504,32 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_close(&observed, &expected_tsv, 1e-12);
+
+        let fused_large = splmm_fused_exact_assoc_to_tsv(
+            prefix_str,
+            y,
+            Some(x_cov),
+            1,
+            0.7,
+            out_large_tsv.to_string_lossy().into_owned(),
+            sample_idx.clone(),
+            sample_idx,
+            grm_path.to_string_lossy().into_owned(),
+            maf_threshold,
+            max_missing_rate,
+            het_threshold,
+            false,
+            Vec::new(),
+            1,
+            2,
+            None,
+            None,
+            1,
+            Some(8192.0),
+        )
+        .unwrap();
+        assert_eq!(fused_large.9, 3);
+        assert_eq!(std::fs::read_to_string(&out_large_tsv).unwrap(), tsv);
 
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -10182,5 +10532,36 @@ mod tests {
             splmm_scan_block_hint_and_progress_step(0, 0);
         assert_eq!(scan_block_hint_zero, 512);
         assert_eq!(progress_step_zero, 512);
+    }
+
+    #[test]
+    fn exact_scan_memory_target_can_exceed_the_old_fixed_block_limit() {
+        let rows = adaptive_exact_block_rows_for_target(100_000, 1493, 8192.0);
+        assert_eq!(rows, 100_000);
+    }
+
+    #[test]
+    fn fused_scan_memory_plan_scales_paths_with_independent_blocks() {
+        for exact in [false, true] {
+            let small = splmm_fused_block_plan(Some(128.0), 4096, 12_000_000, 1493, 1493, 8, exact)
+                .unwrap();
+            let large =
+                splmm_fused_block_plan(Some(8192.0), 4096, 12_000_000, 1493, 1493, 8, exact)
+                    .unwrap();
+            assert!(large.read_rows > small.read_rows);
+            assert!(large.compute_rows >= small.compute_rows);
+            assert!(large.estimated_bytes <= 8192 * 1024 * 1024);
+            if exact {
+                assert!(large.compute_rows > small.compute_rows * 3);
+                assert!(large.compute_rows <= 8192);
+            }
+            let tiny = splmm_fused_block_plan(Some(0.001), 4096, 10, 1493, 1493, 8, exact).unwrap();
+            assert_eq!(tiny.read_rows, 1);
+            assert_eq!(tiny.compute_rows, 1);
+            assert_eq!(tiny.write_rows, 1);
+        }
+        for target in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(splmm_fused_block_plan(Some(target), 4096, 10, 4, 4, 1, true).is_err());
+        }
     }
 }

@@ -165,10 +165,12 @@ _GWAS_AUTO_MEM_LM_TARGET_MB = 192.0
 _GWAS_AUTO_MEM_GRM_BLOCK_ROWS = 4096
 _GWAS_AUTO_MEM_COPY_DECODE_BLOCK_ROWS = 8192
 _GWAS_AUTO_MEM_PACKED_BLOCK_ROWS = 4096
+_GWAS_AUTO_MEM_SPLMM_EXACT_BLOCK_ROWS = 8192
 _GWAS_WORKING_BUFFERS_LM = 1
 _GWAS_WORKING_BUFFERS_GRM = 2
 _GWAS_WORKING_BUFFERS_PACKED = 2
 _GWAS_WORKING_BUFFERS_COPY = 3
+_GWAS_WORKING_BUFFERS_SPLMM_EXACT = 12
 from janusx.script._common.genocache import configure_genotype_cache_from_out
 from janusx.script._common.genoio import (
     basename_only as _basename_only,
@@ -261,10 +263,10 @@ from janusx.assoc.workflow_cache import (
 
 
 def _splmm_fused_qc_enabled() -> bool:
-    """Resolve the fused SparseLMM QC default; set JANUSX_SPLMM_FUSED_QC=0 to disable."""
+    """Resolve the opt-in fused SparseLMM QC flag."""
     raw_value = os.environ.get("JANUSX_SPLMM_FUSED_QC")
     if raw_value is None or str(raw_value).strip() == "":
-        return True
+        return False
     value = str(raw_value).strip().lower()
     if value in {"1", "true", "yes", "on"}:
         return True
@@ -317,7 +319,7 @@ def _kinship_fused_qc_eligible(
     prepared_meta_ready: bool,
     fused_binding_available: bool,
 ) -> bool:
-    """Decide whether a unified BED route can fuse strict-train QC."""
+    """Allow fused QC only when the model-specific environment flag opts in."""
     model_key = str(model_token).strip().lower()
     route_key = str(route_name).strip().lower()
     env_key_by_model = {
@@ -333,7 +335,7 @@ def _kinship_fused_qc_eligible(
     env_key = env_key_by_model[model_key]
     raw_value = os.environ.get(env_key)
     if raw_value is None or str(raw_value).strip() == "":
-        enabled = True
+        enabled = False
     else:
         value = str(raw_value).strip().lower()
         if value in {"1", "true", "yes", "on"}:
@@ -368,7 +370,7 @@ def _packed_model_fused_qc_eligible(
     memory_budget_mb: Union[float, None],
     snps_only: bool,
 ) -> bool:
-    """Gate one-pass full packed loads for the packed FarmCPU/ALGWAS routes."""
+    """Gate full packed QC loads; fused loading stays off unless explicitly enabled."""
     model_key = str(model_token).strip().lower()
     route_key = str(route_name).strip().lower()
     env_key = {
@@ -378,15 +380,16 @@ def _packed_model_fused_qc_eligible(
     if env_key is None or route_key != model_key:
         return False
     raw_value = os.environ.get(env_key)
-    if raw_value is not None and str(raw_value).strip() != "":
-        value = str(raw_value).strip().lower()
-        if value in {"0", "false", "no", "off"}:
-            return False
-        if value not in {"1", "true", "yes", "on"}:
-            raise ValueError(
-                f"Invalid {env_key} value {raw_value!r}; expected "
-                "1/true/yes/on or 0/false/no/off."
-            )
+    if raw_value is None or str(raw_value).strip() == "":
+        return False
+    value = str(raw_value).strip().lower()
+    if value in {"0", "false", "no", "off"}:
+        return False
+    if value not in {"1", "true", "yes", "on"}:
+        raise ValueError(
+            f"Invalid {env_key} value {raw_value!r}; expected "
+            "1/true/yes/on or 0/false/no/off."
+        )
     if (
         not bool(fused_binding_available)
         or str(genetic_model).strip().lower() != "add"
@@ -6456,7 +6459,24 @@ def _resolve_gwas_auto_decode_memory_gb(
             ),
         )
 
-    packed_models = sorted(models & {"splmm", "splmm2", "algwas", "farmcpu"})
+    if "splmm2" in models:
+        # Exact scans also retain f64 RHS and tiled sparse-solve scratch.
+        # Pick a useful default block shape; explicit -mem bypasses this policy.
+        exact_rows = int(min(m_total, int(_GWAS_AUTO_MEM_SPLMM_EXACT_BLOCK_ROWS)))
+        _push(
+            _memory_gb_for_target_decode_shape(
+                n_total,
+                exact_rows,
+                elem_bytes=4,
+                buffers=_GWAS_WORKING_BUFFERS_SPLMM_EXACT,
+            ),
+            (
+                f"SparseLMM exact decode/solve block_rows={int(exact_rows)} "
+                f"x{int(_GWAS_WORKING_BUFFERS_SPLMM_EXACT)}"
+            ),
+        )
+
+    packed_models = sorted(models & {"splmm", "algwas", "farmcpu"})
     if len(packed_models) > 0:
         packed_rows = int(min(m_total, int(_GWAS_AUTO_MEM_PACKED_BLOCK_ROWS)))
         packed_label = "/".join(packed_models)

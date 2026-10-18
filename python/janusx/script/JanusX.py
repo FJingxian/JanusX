@@ -160,7 +160,7 @@ _CLI_MODULE_SECTIONS = [
 _MODULE_NAMES = [
     "gwas", "fvlmm2", "postgwas", "postgarfield", "postbsa",
     "garfield", "grm", "pca", "gstats", "fst", "gs", "reml", "postgs",
-    "sim", "simulation", "benchmark", "gblupbench", "garfieldbench", "fastpop", "adamixture", "tree", "gformat", "gmerge", "hybrid", "webui",
+    "sim", "simulation", "gblupbench", "garfieldbench", "fastpop", "adamixture", "tree", "gformat", "gmerge", "hybrid", "webui",
     "fastq2vcf", "fastq2count", "kmer", "kmerge", "kstats", "kformat", "view", "treeplot", "refcheck",
 ]
 _SCRIPT_MODULE_ALIASES = {

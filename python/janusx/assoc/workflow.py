@@ -262,11 +262,11 @@ from janusx.assoc.workflow_cache import (
 )
 
 
-def _splmm_fused_qc_enabled() -> bool:
-    """Resolve the opt-in fused SparseLMM QC flag."""
+def _splmm_fused_qc_enabled(scan_mode: str) -> bool:
+    """Default to fused exact scans; keep approx opt-in until gamma sampling aligns."""
     raw_value = os.environ.get("JANUSX_SPLMM_FUSED_QC")
     if raw_value is None or str(raw_value).strip() == "":
-        return False
+        return str(scan_mode).strip().lower() == "exact"
     value = str(raw_value).strip().lower()
     if value in {"1", "true", "yes", "on"}:
         return True
@@ -296,7 +296,7 @@ def _splmm_fused_qc_eligible(
         or str(genetic_model).strip().lower() != "add"
     ):
         return False
-    enabled = _splmm_fused_qc_enabled()
+    enabled = _splmm_fused_qc_enabled(scan_mode)
     return bool(
         enabled
         and str(scan_mode).strip().lower() in {"approx", "exact"}
@@ -319,7 +319,7 @@ def _kinship_fused_qc_eligible(
     prepared_meta_ready: bool,
     fused_binding_available: bool,
 ) -> bool:
-    """Allow fused QC only when the model-specific environment flag opts in."""
+    """Enable fused QC for streaming association models unless explicitly disabled."""
     model_key = str(model_token).strip().lower()
     route_key = str(route_name).strip().lower()
     env_key_by_model = {
@@ -335,7 +335,7 @@ def _kinship_fused_qc_eligible(
     env_key = env_key_by_model[model_key]
     raw_value = os.environ.get(env_key)
     if raw_value is None or str(raw_value).strip() == "":
-        enabled = False
+        enabled = True
     else:
         value = str(raw_value).strip().lower()
         if value in {"1", "true", "yes", "on"}:

@@ -106,7 +106,7 @@ Inspect a module-specific log first when debugging unexpected behavior. Most mod
 ### 3.1 Build GRM and PCA
 
 ```bash
-jx grm -bfile example/~mouse_hs1940.snp0 -m 1 -o demo/mouse_hs1940
+jx grm -vcf example/mouse_hs1940.vcf.gz -m 1 -o demo/mouse_hs1940
 jx pca -k demo/mouse_hs1940 -dim 10 -plot -o demo/mouse_hs1940.pca
 ```
 
@@ -119,9 +119,9 @@ Notes:
 ### 3.2 Run GWAS
 
 ```bash
-jx gwas -bfile example/~mouse_hs1940.snp0 -p example/mouse_hs1940.pheno -lmm -n 0 -q 3 -o demo -prefix mouse_hs1940
-jx gwas -bfile example/~mouse_hs1940.snp0 -p example/mouse_hs1940.pheno -lm -n 0 -o demo -prefix mouse_hs1940
-jx gwas -bfile example/~mouse_hs1940.snp0 -p example/mouse_hs1940.pheno -fvlmm -n 0 -o demo -prefix mouse_hs1940
+jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -lmm -n 0 -q 3 -o demo -prefix mouse_hs1940
+jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -lm -n 0 -o demo -prefix mouse_hs1940
+jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -fvlmm -n 0 -o demo -prefix mouse_hs1940
 ```
 
 Current model flags:
@@ -143,8 +143,8 @@ Useful notes:
 ### 3.3 Run GS and REML
 
 ```bash
-jx gs -bfile example/~mouse_hs1940.snp0 -p example/mouse_hs1940.pheno -BLUP -cv 5 -n 0 -o demo -prefix mouse_hs1940
-jx gs -bfile example/~mouse_hs1940.snp0 -p example/mouse_hs1940.pheno -RF -ET -GBDT -SVM -ENET -cv 5 -n 0 -o demo -prefix mouse_hs1940
+jx gs -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -BLUP -cv 5 -n 0 -o demo -prefix mouse_hs1940
+jx gs -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -RF -ET -GBDT -SVM -ENET -cv 5 -n 0 -o demo -prefix mouse_hs1940
 
 jx reml -p example/rice6048.reml.tsv -n Plant_height -c year,loc -o demo/rice6048
 ```
@@ -193,8 +193,8 @@ narrow-sense h².
 ### 3.4 Run FastPop
 
 ```bash
-jx fastpop -bfile example/~mouse_hs1940.snp0 -k 1..6 -cv -o demo -prefix mouse_hs1940
-jx fastpop -bfile example/~mouse_hs1940.snp0 -k 4 -tag x,1 -o demo -prefix mouse_hs1940
+jx fastpop -vcf example/mouse_hs1940.vcf.gz -k 1..6 -cv -o demo -prefix mouse_hs1940
+jx fastpop -vcf example/mouse_hs1940.vcf.gz -k 4 -tag x,1 -o demo -prefix mouse_hs1940
 ```
 
 Compatibility note: `jx adamixture` is still accepted as an alias.
@@ -210,7 +210,8 @@ Accepted `-k` forms:
 
 ```bash
 jx gformat -vcf example/mouse_hs1940.vcf.gz -o demo -prefix mouse_hs1940
-jx gformat -bfile example/~mouse_hs1940.snp0 --prune 500 10 0.2 -o demo -prefix mouse_hs1940
+jx gformat -vcf example/mouse_hs1940.vcf.gz -fmt plink -o demo -prefix mouse_hs1940
+jx gformat -vcf example/mouse_hs1940.vcf.gz --prune 500 10 0.2 -o demo -prefix mouse_hs1940_pruned
 
 jx gmerge -bfile cohort_a cohort_b -fmt plink -o demo -prefix merged
 ```
@@ -240,7 +241,7 @@ to also print them to the terminal.
 jx postgwas -gwasfile demo/mouse_hs1940.test0.lmm.tsv -manh -qq -o demo/postgwas/
 jx postgwas -i demo/mouse_hs1940.test0.lmm.tsv demo/mouse_hs1940.test0.lm.tsv -manh-merge -qq-merge -fontsize 11 -fontstyle arial -o demo/postgwas/
 jx postgwas -i demo/mouse_hs1940.test0.lmm.tsv demo/mouse_hs1940.test0.lm.tsv demo/mouse_hs1940.test0.fvlmm.tsv -manh-merge -qq-merge -scatter-size 4 10 -alpha 0.2 0.5 -ylim 2 10 -o demo/postgwas/
-jx postgwas -bfile example/~mouse_hs1940.snp0 -bimrange 1:3-5 -ldblock-all -o demo/postgwas/
+jx postgwas -bfile demo/mouse_hs1940 -bimrange 1:3-5 -ldblock-all -o demo/postgwas/
 
 jx postgs -json demo/mouse_hs1940.gs.model/summary.json -o demo/postgs/
 ```

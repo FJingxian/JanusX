@@ -23,11 +23,12 @@ use crate::decode::PackedGeneticModel;
 use crate::gfcore::read_fam;
 use crate::linalg::{chi2_sf_df1, cholesky_inplace, cholesky_solve_into};
 use crate::splmm::{
-    choose_rhat_rows, decode_rhat_markers_col_major, emit_progress_callback,
+    choose_rhat_rows_uniform, decode_rhat_markers_col_major, emit_progress_callback,
     emit_splmm_null_scan_core_timing, n_rhat_progress_total, scan_to_tsv_with_py_and_rhat,
-    scan_with_py_and_rhat, splmm_residual_sumsq_is_effectively_zero,
-    splmm_top_level_timing_enabled, trivial_pcg_null_info, trivial_pcg_rhat_info,
-    SplmmPreparedInput, SplmmScanResult, SplmmScanToTsvResult, SplmmTsvMetaInput,
+    scan_with_py_and_rhat, splmm_approx_gamma_candidate_rows,
+    splmm_residual_sumsq_is_effectively_zero, splmm_top_level_timing_enabled,
+    trivial_pcg_null_info, trivial_pcg_rhat_info, SplmmPreparedInput, SplmmRawBimRange,
+    SplmmScanResult, SplmmScanToTsvResult, SplmmTsvMetaInput,
 };
 use pyo3::prelude::*;
 use std::fs::{create_dir_all, File};
@@ -716,6 +717,8 @@ pub(crate) fn estimate_residualized_approx_scan_sparse(
     approx_fit_tol: f64,
     approx_fit_max_iter: usize,
     mmap_window_mb: Option<usize>,
+    snps_only: bool,
+    bimranges: Vec<SplmmRawBimRange>,
 ) -> Result<SplmmScanResult, String> {
     let _ = (approx_fit_tol, approx_fit_max_iter);
     let stage1_cb = stage1_progress_callback.as_ref();
@@ -734,7 +737,14 @@ pub(crate) fn estimate_residualized_approx_scan_sparse(
     if stage1_cb.is_some() {
         emit_progress_callback(stage1_cb, 5, 1, 1)?;
     }
-    let rhat_rows = choose_rhat_rows(scan_prepared.n_rows(), rhat_markers, rhat_seed);
+    let rhat_rows = splmm_approx_gamma_candidate_rows(
+        &scan_prepared,
+        rhat_markers,
+        rhat_seed,
+        snps_only,
+        &bimranges,
+    )?
+    .unwrap_or_else(|| choose_rhat_rows_uniform(scan_prepared.n_rows(), rhat_markers, rhat_seed));
     let n_rhat = rhat_rows.len();
     let rhat_progress_total = n_rhat_progress_total(scan_prepared.n_rows(), rhat_markers);
     if stage1_cb.is_some() {
@@ -815,6 +825,8 @@ pub(crate) fn estimate_residualized_approx_scan_to_tsv_sparse(
     approx_fit_max_iter: usize,
     factor_load_secs: f64,
     mmap_window_mb: Option<usize>,
+    snps_only: bool,
+    bimranges: Vec<SplmmRawBimRange>,
 ) -> Result<SplmmScanToTsvResult, String> {
     let _ = (approx_fit_tol, approx_fit_max_iter);
     let stage1_cb = stage1_progress_callback.as_ref();
@@ -833,7 +845,14 @@ pub(crate) fn estimate_residualized_approx_scan_to_tsv_sparse(
     if stage1_cb.is_some() {
         emit_progress_callback(stage1_cb, 5, 1, 1)?;
     }
-    let rhat_rows = choose_rhat_rows(scan_prepared.n_rows(), rhat_markers, rhat_seed);
+    let rhat_rows = splmm_approx_gamma_candidate_rows(
+        &scan_prepared,
+        rhat_markers,
+        rhat_seed,
+        snps_only,
+        &bimranges,
+    )?
+    .unwrap_or_else(|| choose_rhat_rows_uniform(scan_prepared.n_rows(), rhat_markers, rhat_seed));
     let n_rhat = rhat_rows.len();
     let rhat_progress_total = n_rhat_progress_total(scan_prepared.n_rows(), rhat_markers);
     if stage1_cb.is_some() {

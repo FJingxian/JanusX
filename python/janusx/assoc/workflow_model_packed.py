@@ -9037,6 +9037,11 @@ def run_splmm_windowed_fullrank(
                         rhat_tol=1e-3,
                         scan_mode=effective_scan_mode,
                         mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
+                        snps_only=bool(snps_only),
+                        bimranges=[
+                            (str(chrom), int(start), int(end))
+                            for chrom, start, end in scan_bimranges
+                        ],
                     )
                 elif not use_fused_raw_scan:
                     splmm_out = jxrs.splmm_assoc_pcg_bed(
@@ -9069,6 +9074,11 @@ def run_splmm_windowed_fullrank(
                         rhat_tol=1e-3,
                         scan_mode=effective_scan_mode,
                         mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
+                        snps_only=bool(snps_only),
+                        bimranges=[
+                            (str(chrom), int(start), int(end))
+                            for chrom, start, end in scan_bimranges
+                        ],
                     )
             scan_ok = True
         finally:

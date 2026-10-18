@@ -1,6 +1,6 @@
 # JanusX CLI Guide
 
-Version baseline: `v1.0.24`
+Version baseline: `v2.0.0`
 
 This guide tracks the current command-line surface in this repository. For exact flags of any single module, always prefer:
 
@@ -87,7 +87,7 @@ Examples:
 
 ```bash
 jx gwas -bfile panel -p trait.tsv -lmm -n 0
-jx gs   -bfile panel -p trait.tsv -GBLUP -cv 5 -n 0,2
+jx gs   -bfile panel -p trait.tsv -BLUP -cv 5 -n 0,2
 jx reml -p effects.tsv -n trait1 -c environment
 ```
 
@@ -95,8 +95,8 @@ jx reml -p effects.tsv -n trait1 -c environment
 
 Common flags you will see repeatedly:
 
-- `-o`: output directory
-- `-prefix`: output prefix
+- `-o`: output prefix. To write into a directory, pass an existing directory or include a trailing slash (for example, `-o results/`).
+- `-prefix`: supported by many modules to set the output basename under the directory given by `-o`.
 - `-t`: thread count
 
 Inspect a module-specific log first when debugging unexpected behavior. Most modules emit a dedicated log file under the chosen output prefix or directory.
@@ -106,8 +106,8 @@ Inspect a module-specific log first when debugging unexpected behavior. Most mod
 ### 3.1 Build GRM and PCA
 
 ```bash
-jx grm -bfile example/~mouse_hs1940 -m 1 -npy -o demo -prefix mouse_hs1940
-jx pca -k demo/mouse_hs1940 -dim 10 -plot -o demo -prefix mouse_hs1940
+jx grm -bfile example/~mouse_hs1940.snp0 -m 1 -o demo/mouse_hs1940
+jx pca -k demo/mouse_hs1940 -dim 10 -plot -o demo/mouse_hs1940.pca
 ```
 
 Notes:
@@ -119,15 +119,19 @@ Notes:
 ### 3.2 Run GWAS
 
 ```bash
-jx gwas -bfile example/~mouse_hs1940 -p example/mouse_hs1940.pheno -lmm -n 0 -q 3 -o demo -prefix mouse_hs1940
-jx gwas -bfile example/~mouse_hs1940 -p example/mouse_hs1940.pheno -lm -model add -n 0 1 -o demo -prefix mouse_hs1940
+jx gwas -bfile example/~mouse_hs1940.snp0 -p example/mouse_hs1940.pheno -lmm -n 0 -q 3 -o demo -prefix mouse_hs1940
+jx gwas -bfile example/~mouse_hs1940.snp0 -p example/mouse_hs1940.pheno -lm -n 0 -o demo -prefix mouse_hs1940
+jx gwas -bfile example/~mouse_hs1940.snp0 -p example/mouse_hs1940.pheno -fvlmm -n 0 -o demo -prefix mouse_hs1940
 ```
 
 Current model flags:
 
 - `-lm`
 - `-lmm`
-- `-fastlmm`
+- `-lmm2` for per-marker Wald and likelihood-ratio results
+- `-fvlmm`
+- `-splmm` for the approximate GRAMMAR-gamma SparseLMM scan
+- `-splmm-exact` for the exact sparse-Cholesky SparseLMM scan
 - `-farmcpu`
 
 Useful notes:
@@ -139,15 +143,19 @@ Useful notes:
 ### 3.3 Run GS and REML
 
 ```bash
-jx gs -bfile example/~mouse_hs1940 -p example/mouse_hs1940.pheno -GBLUP -rrBLUP -cv 5 -n 0 -o demo -prefix mouse_hs1940
-jx gs -bfile example/~mouse_hs1940 -p example/mouse_hs1940.pheno -RF -ET -GBDT -SVM -ENET -cv 5 -n 0 -o demo -prefix mouse_hs1940
+jx gs -bfile example/~mouse_hs1940.snp0 -p example/mouse_hs1940.pheno -BLUP -cv 5 -n 0 -o demo -prefix mouse_hs1940
+jx gs -bfile example/~mouse_hs1940.snp0 -p example/mouse_hs1940.pheno -RF -ET -GBDT -SVM -ENET -cv 5 -n 0 -o demo -prefix mouse_hs1940
 
-jx reml -p example/rice6048.reml.tsv -n 3 -c year,loc -rc block -k rice.cGRM.npy -o demo -prefix rice6048
+jx reml -p example/rice6048.reml.tsv -n Plant_height -c year,loc -o demo/rice6048
 ```
+
+`-BLUP` selects GBLUP or rrBLUP automatically based on the sample and marker
+counts. Set `GS_BLUP=0` to force GBLUP, `1` to force exact rrBLUP, or `2` to
+force PCG rrBLUP.
 
 Current GS model groups:
 
-- kernel models: `-GBLUP`, `-rrBLUP`
+- automatic BLUP dispatch: `-BLUP`
 - Bayesian models: `-BayesA`, `-BayesB`, `-BayesC`, `-BayesR`
 
 `-BayesB` and `-BayesC` optionally accept a marker inclusion probability, for
@@ -185,8 +193,8 @@ narrow-sense h².
 ### 3.4 Run FastPop
 
 ```bash
-jx fastpop -bfile example/~mouse_hs1940 -k 1..6 -cv -o demo -prefix mouse_hs1940
-jx fastpop -bfile example/~mouse_hs1940 -k 4 -tag sample1,sample2 -o demo -prefix mouse_hs1940
+jx fastpop -bfile example/~mouse_hs1940.snp0 -k 1..6 -cv -o demo -prefix mouse_hs1940
+jx fastpop -bfile example/~mouse_hs1940.snp0 -k 4 -tag x,1 -o demo -prefix mouse_hs1940
 ```
 
 Compatibility note: `jx adamixture` is still accepted as an alias.
@@ -202,7 +210,7 @@ Accepted `-k` forms:
 
 ```bash
 jx gformat -vcf example/mouse_hs1940.vcf.gz -o demo -prefix mouse_hs1940
-jx gformat -bfile example/~mouse_hs1940 --prune 500kb 10 0.2 -o demo -prefix mouse_hs1940
+jx gformat -bfile example/~mouse_hs1940.snp0 --prune 500 10 0.2 -o demo -prefix mouse_hs1940
 
 jx gmerge -bfile cohort_a cohort_b -fmt plink -o demo -prefix merged
 ```
@@ -229,12 +237,12 @@ to also print them to the terminal.
 ### 3.6 Post-processing and visualization
 
 ```bash
-jx postgwas -gwasfile result.lmm.tsv -manh -qq -o demo/postgwas
-jx postgwas -i a.tsv b.tsv -manh-merge -qq-merge -fontsize 11 -fontstyle arial -o demo/postgwas
-jx postgwas -i a.tsv b.tsv c.tsv -manh-merge -qq-merge -scatter-size 4 10 -alpha 0.2 0.5 -ylim 2 10 -o demo/postgwas
-jx postgwas -bfile example/~mouse_hs1940 -bimrange 1:1-2 -ldblock-all -o demo/postgwas
+jx postgwas -gwasfile demo/mouse_hs1940.test0.lmm.tsv -manh -qq -o demo/postgwas/
+jx postgwas -i demo/mouse_hs1940.test0.lmm.tsv demo/mouse_hs1940.test0.lm.tsv -manh-merge -qq-merge -fontsize 11 -fontstyle arial -o demo/postgwas/
+jx postgwas -i demo/mouse_hs1940.test0.lmm.tsv demo/mouse_hs1940.test0.lm.tsv demo/mouse_hs1940.test0.fvlmm.tsv -manh-merge -qq-merge -scatter-size 4 10 -alpha 0.2 0.5 -ylim 2 10 -o demo/postgwas/
+jx postgwas -bfile example/~mouse_hs1940.snp0 -bimrange 1:3-5 -ldblock-all -o demo/postgwas/
 
-jx postgs -json demo/mouse_hs1940.gs.model/summary.json -o demo/postgs
+jx postgs -json demo/mouse_hs1940.gs.model/summary.json -o demo/postgs/
 ```
 
 The main reporting modules are:

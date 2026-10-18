@@ -80,3 +80,4 @@ doc/agent
 
 .janusx_test
 .worktrees/
+/output/

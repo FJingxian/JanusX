@@ -263,10 +263,10 @@ from janusx.assoc.workflow_cache import (
 
 
 def _splmm_fused_qc_enabled(scan_mode: str) -> bool:
-    """Default to fused exact scans; keep approx opt-in until gamma sampling aligns."""
+    """Use fused BED QC by default for both SparseLMM scan modes."""
     raw_value = os.environ.get("JANUSX_SPLMM_FUSED_QC")
     if raw_value is None or str(raw_value).strip() == "":
-        return str(scan_mode).strip().lower() == "exact"
+        return True
     value = str(raw_value).strip().lower()
     if value in {"1", "true", "yes", "on"}:
         return True

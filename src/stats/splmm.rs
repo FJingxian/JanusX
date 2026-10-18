@@ -1080,10 +1080,10 @@ fn build_splmm_tsv_meta_input(
 }
 
 #[derive(Clone, Debug)]
-struct SplmmRawBimRange {
-    chrom: String,
-    start: i64,
-    end: i64,
+pub(crate) struct SplmmRawBimRange {
+    pub(crate) chrom: String,
+    pub(crate) start: i64,
+    pub(crate) end: i64,
 }
 
 struct SplmmRawBedAssocBlock {
@@ -1141,7 +1141,7 @@ fn splmm_raw_bim_static_eligible(
 /// Sample a bounded, deterministic reservoir from rows passing static BIM
 /// filters. With no static filters, sample BED rows directly without scanning
 /// the BIM. Genotype QC is deferred to the selected rows.
-fn splmm_raw_static_candidate_rows(
+pub(crate) fn splmm_raw_static_candidate_rows(
     prefix: &str,
     n_snps: usize,
     capacity: usize,
@@ -1201,6 +1201,101 @@ fn splmm_raw_static_candidate_rows(
     reader.ensure_exhausted(n_snps)?;
     rows.shuffle(&mut rng);
     Ok((rows, n_static))
+}
+
+fn splmm_prepared_rows_for_source_candidates(
+    row_source_indices: Option<&[usize]>,
+    n_rows: usize,
+    candidate_source_rows: &[usize],
+    limit: usize,
+) -> Vec<usize> {
+    if n_rows == 0 || candidate_source_rows.is_empty() || limit == 0 {
+        return Vec::new();
+    }
+    let mut candidate_rank =
+        std::collections::HashMap::<usize, usize>::with_capacity(candidate_source_rows.len());
+    for (rank, &source_row) in candidate_source_rows.iter().enumerate() {
+        candidate_rank.entry(source_row).or_insert(rank);
+    }
+    let mut local_rows_by_rank = vec![usize::MAX; candidate_source_rows.len()];
+    if let Some(source_rows) = row_source_indices {
+        for (local_row, &source_row) in source_rows.iter().take(n_rows).enumerate() {
+            if let Some(&rank) = candidate_rank.get(&source_row) {
+                local_rows_by_rank[rank] = local_row;
+            }
+        }
+    } else {
+        for local_row in 0..n_rows {
+            if let Some(&rank) = candidate_rank.get(&local_row) {
+                local_rows_by_rank[rank] = local_row;
+            }
+        }
+    }
+    local_rows_by_rank
+        .into_iter()
+        .filter(|&local_row| local_row != usize::MAX)
+        .take(limit)
+        .collect()
+}
+
+/// Select the same bounded raw-BED gamma candidates as the fused path, then
+/// map them to the locally prepared rows that passed genotype QC. The map is
+/// bounded by the candidate pool, not by the number of genome-wide markers.
+pub(crate) fn splmm_approx_gamma_candidate_rows(
+    scan_prepared: &SplmmPreparedInput,
+    rhat_markers: usize,
+    seed: u64,
+    snps_only: bool,
+    ranges: &[SplmmRawBimRange],
+) -> Result<Option<Vec<usize>>, String> {
+    let Some(prefix) = scan_prepared.bed_prefix() else {
+        return Ok(None);
+    };
+    let reader = PackedBedSourceReader::open(prefix, scan_prepared.n_samples_full)?;
+    let n_snps = reader.n_snps();
+    let target = rhat_markers.min(n_snps);
+    if target == 0 {
+        return Ok(Some(Vec::new()));
+    }
+    let attempt_cap = n_snps.min(1024usize.max(rhat_markers.saturating_mul(32)));
+    let (candidate_source_rows, n_static) =
+        splmm_raw_static_candidate_rows(prefix, n_snps, attempt_cap, seed, snps_only, ranges)?;
+    let qc_target = target.min(n_static);
+    if qc_target < rhat_markers {
+        return Ok(None);
+    }
+    let candidate_rows = splmm_prepared_rows_for_source_candidates(
+        scan_prepared.row_source_indices.as_deref(),
+        scan_prepared.n_rows(),
+        &candidate_source_rows,
+        qc_target,
+    );
+    if candidate_rows.len() < qc_target {
+        return Ok(None);
+    }
+    Ok(Some(candidate_rows))
+}
+
+pub(crate) fn choose_rhat_rows_uniform(m: usize, count: usize, seed: u64) -> Vec<usize> {
+    let sample_count = count.min(m);
+    if sample_count == 0 {
+        return Vec::new();
+    }
+    if sample_count == m {
+        let mut rows = (0..m).collect::<Vec<_>>();
+        rows.shuffle(&mut StdRng::seed_from_u64(seed));
+        return rows;
+    }
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut rows = (0..sample_count).collect::<Vec<_>>();
+    for upper in sample_count..m {
+        let slot = rng.random_range(0..=upper);
+        if slot < sample_count {
+            rows[slot] = upper;
+        }
+    }
+    rows.shuffle(&mut rng);
+    rows
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2653,22 +2748,6 @@ fn prepare_splmm_assoc_inputs<'py>(
         scan_sample_idx,
         operator_sample_idx,
     })
-}
-
-pub(crate) fn choose_rhat_rows(m: usize, count: usize, seed: u64) -> Vec<usize> {
-    let soft_cap = count.min(m);
-    if soft_cap == m {
-        return (0..m).collect();
-    }
-    let mut rng = StdRng::seed_from_u64(seed);
-    let draw_count = soft_cap.saturating_mul(2).max(soft_cap);
-    let mut out = Vec::with_capacity(draw_count);
-    for _ in 0..draw_count {
-        out.push(rng.random_range(0..m));
-    }
-    out.sort_unstable();
-    out.dedup();
-    out
 }
 
 #[inline]
@@ -5258,6 +5337,8 @@ fn estimate_rhat_and_scan(
     approx_fit_tol: f64,
     approx_fit_max_iter: usize,
     mmap_window_mb: Option<usize>,
+    snps_only: bool,
+    bimranges: Vec<SplmmRawBimRange>,
 ) -> Result<SplmmScanResult, String> {
     let stage1_cb = stage1_progress_callback.as_ref();
     let prefix = operator_prepared
@@ -5300,6 +5381,8 @@ fn estimate_rhat_and_scan(
             approx_fit_tol,
             approx_fit_max_iter,
             mmap_window_mb,
+            snps_only,
+            bimranges,
         );
     }
     estimate_rhat_and_scan_sparse(
@@ -5347,6 +5430,8 @@ fn estimate_rhat_and_scan_to_tsv(
     approx_fit_tol: f64,
     approx_fit_max_iter: usize,
     mmap_window_mb: Option<usize>,
+    snps_only: bool,
+    bimranges: Vec<SplmmRawBimRange>,
 ) -> Result<SplmmScanToTsvResult, String> {
     let stage1_cb = stage1_progress_callback.as_ref();
     let prefix = operator_prepared
@@ -5394,6 +5479,8 @@ fn estimate_rhat_and_scan_to_tsv(
             approx_fit_max_iter,
             factor_load_secs,
             mmap_window_mb,
+            snps_only,
+            bimranges,
         );
     }
     if scan_mode != SplmmScanMode::Exact {
@@ -6216,7 +6303,9 @@ pub fn splmm_residualized_approx_sample_state_from_jxgrm_lambda<'py>(
     progress_every=0,
     rhat_tol=1e-3,
     scan_mode="exact",
-    mmap_window_mb=None
+    mmap_window_mb=None,
+    snps_only=false,
+    bimranges=Vec::new()
 ))]
 pub fn splmm_assoc_pcg_bed<'py>(
     py: Python<'py>,
@@ -6250,6 +6339,8 @@ pub fn splmm_assoc_pcg_bed<'py>(
     rhat_tol: f64,
     scan_mode: &str,
     mmap_window_mb: Option<usize>,
+    snps_only: bool,
+    bimranges: Vec<(String, i64, i64)>,
 ) -> PyResult<(
     f64,
     bool,
@@ -6279,6 +6370,14 @@ pub fn splmm_assoc_pcg_bed<'py>(
     if scan_mode.needs_rhat() && rhat_markers == 0 {
         return Err(PyRuntimeError::new_err("rhat_markers must be > 0"));
     }
+    let bimranges = bimranges
+        .into_iter()
+        .map(|(chrom, start, end)| SplmmRawBimRange {
+            chrom: splmm_raw_bim_chrom_norm(&chrom),
+            start,
+            end,
+        })
+        .collect::<Vec<_>>();
     let _ = (std_eps, use_train_maf, rhat_tol);
     emit_progress_callback(stage1_progress_callback.as_ref(), 0, 0, 1)
         .map_err(PyRuntimeError::new_err)?;
@@ -6330,6 +6429,8 @@ pub fn splmm_assoc_pcg_bed<'py>(
                 tol,
                 max_iter,
                 mmap_window_mb,
+                snps_only,
+                bimranges,
             )
         })
         .map_err(PyRuntimeError::new_err)?;
@@ -6389,7 +6490,9 @@ pub fn splmm_assoc_pcg_bed<'py>(
     progress_every=0,
     rhat_tol=1e-3,
     scan_mode="exact",
-    mmap_window_mb=None
+    mmap_window_mb=None,
+    snps_only=false,
+    bimranges=Vec::new()
 ))]
 pub fn splmm_assoc_pcg_bed_to_tsv<'py>(
     py: Python<'py>,
@@ -6429,6 +6532,8 @@ pub fn splmm_assoc_pcg_bed_to_tsv<'py>(
     rhat_tol: f64,
     scan_mode: &str,
     mmap_window_mb: Option<usize>,
+    snps_only: bool,
+    bimranges: Vec<(String, i64, i64)>,
 ) -> PyResult<(
     f64,
     bool,
@@ -6462,6 +6567,14 @@ pub fn splmm_assoc_pcg_bed_to_tsv<'py>(
     if scan_mode.needs_rhat() && rhat_markers == 0 {
         return Err(PyRuntimeError::new_err("rhat_markers must be > 0"));
     }
+    let bimranges = bimranges
+        .into_iter()
+        .map(|(chrom, start, end)| SplmmRawBimRange {
+            chrom: splmm_raw_bim_chrom_norm(&chrom),
+            start,
+            end,
+        })
+        .collect::<Vec<_>>();
     let _ = (std_eps, use_train_maf, rhat_tol);
 
     emit_progress_callback(stage1_progress_callback.as_ref(), 0, 0, 1)
@@ -6541,6 +6654,8 @@ pub fn splmm_assoc_pcg_bed_to_tsv<'py>(
                 tol,
                 max_iter,
                 mmap_window_mb,
+                snps_only,
+                bimranges,
             )
         })
         .map_err(PyRuntimeError::new_err)?;
@@ -7725,7 +7840,7 @@ pub fn splmm_assoc_pcg_kfile_to_tsv<'py>(
                 if stage_cb.is_some() {
                     emit_progress_callback(stage_cb, 5, 1, 1)?;
                 }
-                let rhat_rows = choose_rhat_rows(marker_count, rhat_markers, rhat_seed);
+                let rhat_rows = choose_rhat_rows_uniform(marker_count, rhat_markers, rhat_seed);
                 let rhat_total = n_rhat_progress_total(marker_count, rhat_markers);
                 if stage_cb.is_some() {
                     emit_progress_callback(stage_cb, 8, 0, rhat_total)?;
@@ -8783,6 +8898,202 @@ mod tests {
                 .len(),
             20
         );
+    }
+
+    #[test]
+    fn gamma_fallback_sampling_is_uniform_without_replacement() {
+        let first = choose_rhat_rows_uniform(100, 20, 117);
+        let second = choose_rhat_rows_uniform(100, 20, 117);
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 20);
+        assert_eq!(
+            first
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            20
+        );
+        assert!(first.iter().all(|&row| row < 100));
+        assert_eq!(choose_rhat_rows_uniform(4, 10, 117).len(), 4);
+        assert!(choose_rhat_rows_uniform(4, 0, 117).is_empty());
+    }
+
+    #[test]
+    fn raw_gamma_candidates_map_to_qc_rows_in_the_same_source_order() {
+        let candidate_source_rows = [8usize, 1, 5, 2, 9];
+        let prepared_source_rows = [2usize, 5, 8];
+        let prepared_rows = splmm_prepared_rows_for_source_candidates(
+            Some(&prepared_source_rows),
+            prepared_source_rows.len(),
+            &candidate_source_rows,
+            3,
+        );
+
+        // The legacy route must use the same candidate order as the fused
+        // reader, after implicitly filtering candidates that fail QC.
+        assert_eq!(prepared_rows, vec![2, 1, 0]);
+        assert_eq!(
+            prepared_rows
+                .iter()
+                .map(|&row| prepared_source_rows[row])
+                .collect::<Vec<_>>(),
+            vec![8, 5, 2]
+        );
+    }
+
+    #[test]
+    fn splmm_approx_metadata_gamma_uses_the_fused_candidate_sequence() {
+        use crate::gfreader::prepare_bed_logic_meta_owned_for_stats_samples;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "janusx_splmm_approx_gamma_candidates_{}_{}",
+            std::process::id(),
+            stamp
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prefix = dir.join("tiny");
+        let prefix_str = prefix.to_string_lossy().into_owned();
+        std::fs::write(
+            prefix.with_extension("fam"),
+            "F1 I1 0 0 1 1\nF1 I2 0 0 1 1\nF1 I3 0 0 1 1\nF1 I4 0 0 1 1\n",
+        )
+        .unwrap();
+        let codes = [
+            [0b00, 0b10, 0b11, 0b00],
+            [0b10, 0b10, 0b00, 0b11],
+            [0b01, 0b01, 0b11, 0b00],
+            [0b00, 0b10, 0b11, 0b00],
+        ];
+        let packed_rows = codes.map(|row| pack_plink_codes(&row));
+        let mut bed = vec![0x6c, 0x1b, 0x01];
+        for row in &packed_rows {
+            bed.extend_from_slice(row);
+        }
+        std::fs::write(prefix.with_extension("bed"), bed).unwrap();
+        std::fs::write(
+            prefix.with_extension("bim"),
+            (0..codes.len())
+                .map(|idx| format!("1 rs{idx} 0 {} A G\n", idx + 1))
+                .collect::<String>(),
+        )
+        .unwrap();
+
+        let sample_idx = [0usize, 1, 2, 3];
+        let maf_threshold = 0.1_f32;
+        let max_missing_rate = 0.25_f32;
+        let het_threshold = 1.0_f32;
+        let meta = prepare_bed_logic_meta_owned_for_stats_samples(
+            &prefix_str,
+            maf_threshold,
+            max_missing_rate,
+            het_threshold,
+            false,
+            Some(&sample_idx),
+            false,
+        )
+        .unwrap();
+        let bed_file = File::open(prefix.with_extension("bed")).unwrap();
+        let bed_mmap = Arc::new(unsafe { Mmap::map(&bed_file) }.unwrap());
+        let scan_prepared = SplmmPreparedInput {
+            bed_prefix: Some(prefix_str.clone()),
+            payload: Some(SplmmPreparedPayload::Mmap(bed_mmap)),
+            n_samples_full: sample_idx.len(),
+            bytes_per_snp: meta.bytes_per_snp,
+            row_flip: Arc::from(meta.row_flip),
+            row_maf: Arc::from(meta.maf),
+            row_missing: Arc::from(meta.missing_rate),
+            row_source_indices: Some(Arc::from(meta.row_source_indices)),
+        };
+
+        let requested = 2usize;
+        let seed = 20261019_u64;
+        let prepared_rows =
+            splmm_approx_gamma_candidate_rows(&scan_prepared, requested, seed, false, &[])
+                .unwrap()
+                .expect("candidate metadata should be available");
+        let (candidate_source_rows, _) = splmm_raw_static_candidate_rows(
+            &prefix_str,
+            codes.len(),
+            codes.len(),
+            seed,
+            false,
+            &[],
+        )
+        .unwrap();
+        let prepared_source_rows = scan_prepared.row_source_indices.as_deref().unwrap();
+        let expected_source_rows = candidate_source_rows
+            .into_iter()
+            .filter(|source_row| prepared_source_rows.contains(source_row))
+            .take(requested)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            prepared_rows
+                .iter()
+                .map(|&row| prepared_source_rows[row])
+                .collect::<Vec<_>>(),
+            expected_source_rows
+        );
+
+        let x_design = vec![1.0_f64; sample_idx.len()];
+        let y = [1.0_f64, -0.5, 0.25, 2.0];
+        let fit = build_residualized_approx_scan_null_from_lambda_and_factor(
+            make_diag_factor(&[1.0_f64; 4]),
+            &x_design,
+            &y,
+            0.7,
+        )
+        .unwrap();
+        let mut reader = PackedBedSourceReader::open(&prefix_str, sample_idx.len()).unwrap();
+        let raw_gamma = splmm_raw_estimate_gamma(
+            &mut reader,
+            &prefix_str,
+            &fit,
+            &x_design,
+            &sample_idx,
+            true,
+            None,
+            sample_idx.len(),
+            maf_threshold,
+            max_missing_rate,
+            het_threshold,
+            requested,
+            seed,
+            false,
+            &[],
+            1,
+            None,
+        )
+        .unwrap();
+        let prepared_markers = decode_rhat_markers_col_major(
+            &scan_prepared,
+            &sample_idx,
+            PackedGeneticModel::Add,
+            &prepared_rows,
+            None,
+            8,
+            requested,
+            None,
+        )
+        .unwrap();
+        let (prepared_gamma, prepared_used) = fit
+            .estimate_gamma_from_markers(
+                &x_design,
+                &prepared_markers,
+                prepared_rows.len(),
+                requested,
+            )
+            .unwrap();
+        assert_eq!(raw_gamma.n_qc_valid, prepared_rows.len());
+        assert_eq!(raw_gamma.n_used, prepared_used);
+        assert!((raw_gamma.gamma - prepared_gamma).abs() <= 1e-12);
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

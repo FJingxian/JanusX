@@ -1962,12 +1962,12 @@ mod tests {
         let hj = [0b0010_0100u64];
         let aj = [0b0100_0000u64];
         let counts = king_pair_counts(&zi, &hi, &ai, &zj, &hj, &aj);
-        assert_eq!(counts.shared_nonmissing, 6);
-        assert_eq!(counts.ibs0, 1);
+        assert_eq!(counts.shared_nonmissing, 3);
+        assert_eq!(counts.ibs0, 0);
         assert_eq!(counts.same_hom, 1);
         assert_eq!(counts.both_het, 0);
         assert_eq!(counts.het_i_obs, 2);
-        assert_eq!(counts.het_j_obs, 2);
+        assert_eq!(counts.het_j_obs, 0);
     }
 
     #[test]

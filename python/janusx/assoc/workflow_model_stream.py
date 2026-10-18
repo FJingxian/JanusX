@@ -2040,11 +2040,10 @@ def run_chunked_gwas_lmm_lm(
                     row_maf=prepared_row_maf,
                     low=float(lmm_low),
                     high=float(lmm_high),
-                    # Match LMM.gwas()/lmm_reml_from_snp optimizer accuracy.
-                    # Use a fixed null-model seed for each SNP; the Rust route
-                    # deliberately does not carry lambda estimates across SNPs.
+                    # Keep per-marker optimization at the legacy tolerance;
+                    # trait-level null lambda is fitted once at tighter tolerance.
                     max_iter=30,
-                    tol=1e-4,
+                    tol=1e-2,
                     threads=int(scan_threads),
                     nullml=None,
                     init_log10_lbd=init_log10_lbd,

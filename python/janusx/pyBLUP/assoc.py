@@ -1754,6 +1754,7 @@ class LMM:
     _LOWRANK_REL_TOL = 1e-8
     _GRM_EIGH_RIDGE = 1e-6
     _ENABLE_LOWRANK_FAST = False
+    _NULL_REML_TOL = 1e-6
 
     def __init__(self, y: np.ndarray, X: Optional[np.ndarray], kinship: np.ndarray):
         global _WARNED_EIGH_NON_LAPACK, _WARNED_EIGH_SCIPY_FALLBACK
@@ -1980,7 +1981,7 @@ class LMM:
                 -5.0,
                 5.0,
                 max_iter=50,
-                tol=1e-3,
+                tol=self._NULL_REML_TOL,
                 model="add",
             )
             vg_null = float(self.trace_mean)
@@ -2009,7 +2010,7 @@ class LMM:
                 -5.0,
                 5.0,
                 max_iter=50,
-                tol=1e-3,
+                tol=self._NULL_REML_TOL,
             )
             sigma_g2_null, sigma_e2_null = _lmm_profile_exact_vc(
                 self.S,

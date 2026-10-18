@@ -2529,7 +2529,8 @@ def _fit_dense_observation_reml(
         if eta_arr.size != 2 or not np.all(np.isfinite(eta_arr)):
             return _JOINT_OBJ_PENALTY, None
         va, ve = np.exp(np.clip(eta_arr, _JOINT_LOG_FLOOR, _JOINT_LOG_CEIL))
-        covariance = ve * np.eye(n_lines, dtype=float) + va * weighted_k
+        covariance = va * weighted_k
+        covariance.flat[:: n_lines + 1] += ve
         try:
             chol = np.linalg.cholesky(covariance)
             ci_line_x = cho_solve((chol, True), line_x)

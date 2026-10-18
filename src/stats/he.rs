@@ -1843,7 +1843,7 @@ pub fn he_variance_components_packed_with_covariates(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn he_variance_components_meta_stream_with_covariates(
+pub(crate) fn he_variance_components_meta_stream_with_covariates(
     prefix: &str,
     row_source_indices: &[usize],
     row_flip: &[bool],

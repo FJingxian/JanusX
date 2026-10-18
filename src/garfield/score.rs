@@ -2,20 +2,27 @@
 //
 // Active GARFIELD continuous search uses the dual-bitplane fuzzy dosage route
 // (`g >= 1`, `g >= 2`) together with dosage-aware centered-gain scoring.
-// Legacy packed-0/1 score helpers are retained below only for backward-
-// compatible parsing/evaluation paths and tests.
+// Packed-0/1 score helpers are retained below for binary compatibility and
+// evaluation paths alongside the active dual-bitplane scoring.
 
 use crate::bitwise::{and_popcount, popcount};
-use numpy::{PyArray1, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
+use crate::stats_common::{check_ctrlc, interrupt_requested, INTERRUPTED_MSG};
+use numpy::ndarray::Array1;
+use numpy::{PyArray1, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
+use pyo3::BoundObject;
 use rayon::prelude::*;
 use std::borrow::Cow;
+use std::time::Instant;
 
 const BATCH_PAR_MIN_ROWS: usize = 64;
 const SUM_Y_LOOKUP_SEGMENTS_PER_WORD: usize = 8;
 const SUM_Y_LOOKUP_VALUES_PER_SEGMENT: usize = 256;
-const SUM_Y_LOOKUP_MIN_POPCNT: u32 = 6;
+// Measured on the JXFU26 x86 screen node (3750 samples, 58 full words):
+// set-bit enumeration wins through popcount 7; LUT8 wins from popcount 8.
+const SUM_Y_LOOKUP_MIN_POPCNT: u32 = 7;
 #[cfg(target_arch = "x86_64")]
 const SUM_Y_MASKLOAD_MIN_POPCNT: u32 = 10;
 #[cfg(target_arch = "aarch64")]
@@ -124,6 +131,261 @@ fn invalid_rule_score() -> ContinuousRuleScore {
         n_hit: 0,
         n_ge2: 0,
         n_miss: 0,
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct BatchScoreParts {
+    raw_score: Vec<f64>,
+    mean_hit: Vec<f64>,
+    mean_miss: Vec<f64>,
+    support_frac: Vec<f64>,
+    n_hit: Vec<u32>,
+    n_miss: Vec<u32>,
+    sum_hit: Vec<f64>,
+    total_sum: f64,
+    n_rows: usize,
+    row_words: usize,
+    n_samples: usize,
+}
+
+#[inline]
+fn validate_batch_shape(
+    y: &[f64],
+    row_words: usize,
+    n_rows: usize,
+    n_samples: usize,
+    ctx: &str,
+) -> Result<(), String> {
+    if n_rows == 0 {
+        return Err(format!("{ctx}: n_rows must be > 0"));
+    }
+    if n_samples == 0 {
+        return Err(format!("{ctx}: n_samples must be > 0"));
+    }
+    if row_words == 0 {
+        return Err(format!("{ctx}: row_words must be > 0"));
+    }
+    let bit_cap = row_words.saturating_mul(64);
+    if n_samples > bit_cap {
+        return Err(format!(
+            "{ctx}: n_samples={} exceeds bit capacity={} (row_words={})",
+            n_samples, bit_cap, row_words
+        ));
+    }
+    validate_continuous_y(y, n_samples, ctx)?;
+    Ok(())
+}
+
+fn build_score_parts_from_sum_hit(
+    sum_hit: Vec<f64>,
+    n_hit: Vec<u32>,
+    n_samples: usize,
+    total_sum: f64,
+    row_words: usize,
+) -> Result<BatchScoreParts, String> {
+    let n_rows = sum_hit.len();
+    let mut raw_score = Vec::with_capacity(n_rows);
+    let mut mean_hit = Vec::with_capacity(n_rows);
+    let mut mean_miss = Vec::with_capacity(n_rows);
+    let mut support_frac = Vec::with_capacity(n_rows);
+    let mut n_miss = Vec::with_capacity(n_rows);
+    for (idx, (&sum_hit_i, &n_hit_i)) in sum_hit.iter().zip(n_hit.iter()).enumerate() {
+        if (idx & 255) == 0 {
+            check_interrupt_fast()?;
+        }
+        let sc = score_cont_centered_gain_from_sum_and_n_hit(
+            total_sum,
+            sum_hit_i,
+            n_samples,
+            n_hit_i as usize,
+        );
+        raw_score.push(sc.raw_score);
+        mean_hit.push(sc.mean_hit);
+        mean_miss.push(sc.mean_miss);
+        support_frac.push(sc.support_frac);
+        n_miss.push(sc.n_miss as u32);
+    }
+    Ok(BatchScoreParts {
+        raw_score,
+        mean_hit,
+        mean_miss,
+        support_frac,
+        n_hit,
+        n_miss,
+        sum_hit,
+        total_sum,
+        n_rows,
+        row_words,
+        n_samples,
+    })
+}
+
+fn score_cont_centered_gain_batch_packed_cpu_impl(
+    y: &[f64],
+    bits_flat: &[u64],
+    row_words: usize,
+    n_rows: usize,
+    n_samples: usize,
+) -> Result<BatchScoreParts, String> {
+    const CTX: &str = "garfield_score_cont_centered_gain_batch_packed_cpu";
+    check_ctrlc()?;
+    validate_batch_shape(y, row_words, n_rows, n_samples, CTX)?;
+    if bits_flat.len() != row_words.saturating_mul(n_rows) {
+        return Err(format!(
+            "{CTX}: bits size mismatch: got {}, expected {} (n_rows={} row_words={})",
+            bits_flat.len(),
+            row_words.saturating_mul(n_rows),
+            n_rows,
+            row_words
+        ));
+    }
+    let total_sum = y.iter().take(n_samples).copied().sum::<f64>();
+    let mut sum_hit = Vec::with_capacity(n_rows);
+    let mut n_hit = Vec::with_capacity(n_rows);
+    for rid in 0..n_rows {
+        if (rid & 63) == 0 {
+            check_interrupt_fast()?;
+        }
+        let row = &bits_flat[rid * row_words..(rid + 1) * row_words];
+        let (n1, s1) = count_sum_y_where_bit1(row, y, n_samples);
+        n_hit.push(n1 as u32);
+        sum_hit.push(s1);
+    }
+    build_score_parts_from_sum_hit(sum_hit, n_hit, n_samples, total_sum, row_words)
+}
+
+fn batch_score_parts_to_pydict<'py>(
+    py: Python<'py>,
+    parts: BatchScoreParts,
+    backend: &str,
+    elapsed_ms: Option<f64>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let out = PyDict::new(py).into_bound();
+    out.set_item(
+        "raw_score",
+        PyArray1::from_owned_array(py, Array1::from_vec(parts.raw_score)).into_bound(),
+    )?;
+    out.set_item(
+        "mean_hit",
+        PyArray1::from_owned_array(py, Array1::from_vec(parts.mean_hit)).into_bound(),
+    )?;
+    out.set_item(
+        "mean_miss",
+        PyArray1::from_owned_array(py, Array1::from_vec(parts.mean_miss)).into_bound(),
+    )?;
+    out.set_item(
+        "support_frac",
+        PyArray1::from_owned_array(py, Array1::from_vec(parts.support_frac)).into_bound(),
+    )?;
+    out.set_item(
+        "n_hit",
+        PyArray1::from_owned_array(py, Array1::from_vec(parts.n_hit)).into_bound(),
+    )?;
+    out.set_item(
+        "n_miss",
+        PyArray1::from_owned_array(py, Array1::from_vec(parts.n_miss)).into_bound(),
+    )?;
+    out.set_item(
+        "sum_hit",
+        PyArray1::from_owned_array(py, Array1::from_vec(parts.sum_hit)).into_bound(),
+    )?;
+    out.set_item("backend", backend)?;
+    out.set_item("total_sum", parts.total_sum)?;
+    out.set_item("n_rows", parts.n_rows)?;
+    out.set_item("row_words", parts.row_words)?;
+    out.set_item("n_samples", parts.n_samples)?;
+    if let Some(v) = elapsed_ms {
+        out.set_item("elapsed_ms", v)?;
+    }
+    Ok(out)
+}
+
+#[inline]
+fn tail_mask(n_samples: usize) -> Option<u64> {
+    let rem = n_samples & 63;
+    if rem == 0 {
+        None
+    } else {
+        Some((1u64 << rem) - 1u64)
+    }
+}
+
+#[inline]
+fn apply_tail_mask(bits: &mut [u64], mask: Option<u64>) {
+    if let Some(mask) = mask {
+        if let Some(last) = bits.last_mut() {
+            *last &= mask;
+        }
+    }
+}
+
+#[inline]
+fn complement_first_literal(bits: &[u64], n_samples: usize) -> Vec<u64> {
+    let needed_words = words_for_samples(n_samples);
+    let mut out = bits[..needed_words].to_vec();
+    for word in out.iter_mut() {
+        *word = !*word;
+    }
+    apply_tail_mask(&mut out, tail_mask(n_samples));
+    out
+}
+
+#[inline]
+fn batch_parts_row_to_score(parts: &BatchScoreParts, row_idx: usize) -> ContinuousRuleScore {
+    ContinuousRuleScore {
+        score: parts.raw_score[row_idx],
+        raw_score: parts.raw_score[row_idx],
+        mean_hit: parts.mean_hit[row_idx],
+        mean_miss: parts.mean_miss[row_idx],
+        support_frac: parts.support_frac[row_idx],
+        dosage_maf: binary_maf_from_n_hit(parts.n_samples, parts.n_hit[row_idx] as usize),
+        n_hit: parts.n_hit[row_idx] as usize,
+        n_ge2: 0,
+        n_miss: parts.n_miss[row_idx] as usize,
+    }
+}
+
+#[inline]
+fn singleton_scores_from_positive_parts(
+    parts: &BatchScoreParts,
+) -> Result<Vec<ContinuousRuleScore>, String> {
+    let mut out = Vec::with_capacity(parts.n_rows.saturating_mul(2));
+    for row_idx in 0..parts.n_rows {
+        if (row_idx & 255) == 0 {
+            check_interrupt_fast()?;
+        }
+        out.push(batch_parts_row_to_score(parts, row_idx));
+        out.push(score_cont_centered_gain_from_sum_and_n_hit(
+            parts.total_sum,
+            parts.total_sum - parts.sum_hit[row_idx],
+            parts.n_samples,
+            parts
+                .n_samples
+                .saturating_sub(parts.n_hit[row_idx] as usize),
+        ));
+    }
+    Ok(out)
+}
+
+pub(crate) fn score_cont_centered_gain_singletons_packed_cpu_impl(
+    y: &[f64],
+    bits_flat: &[u64],
+    row_words: usize,
+    n_rows: usize,
+    n_samples: usize,
+) -> Result<Vec<ContinuousRuleScore>, String> {
+    singleton_scores_from_positive_parts(&score_cont_centered_gain_batch_packed_cpu_impl(
+        y, bits_flat, row_words, n_rows, n_samples,
+    )?)
+}
+
+#[inline]
+fn check_interrupt_fast() -> Result<(), String> {
+    if interrupt_requested() {
+        Err(INTERRUPTED_MSG.to_string())
+    } else {
+        Ok(())
     }
 }
 
@@ -421,6 +683,11 @@ pub struct PackedYSumLookup {
 }
 
 impl PackedYSumLookup {
+    #[inline]
+    pub(crate) fn n_words(&self) -> usize {
+        self.n_words
+    }
+
     pub fn build(y: &[f64], n_samples: usize) -> Result<Self, String> {
         if y.len() < n_samples {
             return Err(format!(
@@ -455,17 +722,60 @@ impl PackedYSumLookup {
         Ok(Self { n_words, values })
     }
 
-    #[inline]
+    #[inline(always)]
     pub(crate) fn sum_word(&self, word_idx: usize, word: u64) -> f64 {
         debug_assert!(word_idx < self.n_words);
-        let stride = SUM_Y_LOOKUP_SEGMENTS_PER_WORD * SUM_Y_LOOKUP_VALUES_PER_SEGMENT;
-        let word_base = word_idx.saturating_mul(stride);
+        let word_base =
+            word_idx * (SUM_Y_LOOKUP_SEGMENTS_PER_WORD * SUM_Y_LOOKUP_VALUES_PER_SEGMENT);
         let mut sum = 0.0_f64;
-        for segment_idx in 0..SUM_Y_LOOKUP_SEGMENTS_PER_WORD {
-            let mask = ((word >> (segment_idx << 3)) & 0xff) as usize;
-            sum += self.values[word_base + segment_idx * SUM_Y_LOOKUP_VALUES_PER_SEGMENT + mask];
-        }
+        sum += self.values[word_base + (word & 0xff) as usize];
+        sum += self.values[word_base + 256 + ((word >> 8) & 0xff) as usize];
+        sum += self.values[word_base + 512 + ((word >> 16) & 0xff) as usize];
+        sum += self.values[word_base + 768 + ((word >> 24) & 0xff) as usize];
+        sum += self.values[word_base + 1024 + ((word >> 32) & 0xff) as usize];
+        sum += self.values[word_base + 1280 + ((word >> 40) & 0xff) as usize];
+        sum += self.values[word_base + 1536 + ((word >> 48) & 0xff) as usize];
+        sum += self.values[word_base + 1792 + ((word >> 56) & 0xff) as usize];
         sum
+    }
+
+    /// Exact scalar reference for one packed word.  This is kept separate
+    /// from `sum_word` so screen diagnostics and the adaptive one-cell path
+    /// can compare the two accumulation kernels without changing the lookup
+    /// table itself.
+    #[inline(always)]
+    pub(crate) fn sum_word_scalar(&self, y: &[f64], word_idx: usize, word: u64) -> f64 {
+        sum_y_from_word_scalar(y, word_idx << 6, word)
+    }
+
+    #[inline(always)]
+    pub(crate) fn adaptive_uses_setbit(word: u64) -> bool {
+        word.count_ones() <= SUM_Y_LOOKUP_MIN_POPCNT
+    }
+
+    /// Choose the exact weighted-sum backend from the measured popcount
+    /// crossover.  The scalar path changes only floating-point accumulation
+    /// order; it does not change the mathematical subset sum.
+    #[inline(always)]
+    pub(crate) fn sum_word_adaptive(&self, y: &[f64], word_idx: usize, word: u64) -> f64 {
+        self.sum_word_adaptive_with_popcount(y, word_idx, word, word.count_ones())
+    }
+
+    /// Same dispatch when the caller already computed the word popcount for
+    /// another statistic, avoiding a second population-count instruction.
+    #[inline(always)]
+    pub(crate) fn sum_word_adaptive_with_popcount(
+        &self,
+        y: &[f64],
+        word_idx: usize,
+        word: u64,
+        popcount: u32,
+    ) -> f64 {
+        if popcount <= SUM_Y_LOOKUP_MIN_POPCNT {
+            self.sum_word_scalar(y, word_idx, word)
+        } else {
+            self.sum_word(word_idx, word)
+        }
     }
 }
 
@@ -1191,35 +1501,71 @@ pub fn score_cont_centered_gain_dual_packed(
     )
 }
 
+#[pyfunction(name = "garfield_score_cont_centered_gain_batch_packed_cpu")]
+pub fn garfield_score_cont_centered_gain_batch_packed_cpu_py<'py>(
+    py: Python<'py>,
+    y: PyReadonlyArray1<'py, f64>,
+    bits: PyReadonlyArray2<'py, u64>,
+    n_samples: usize,
+) -> PyResult<Bound<'py, PyDict>> {
+    let yv = y.as_slice()?;
+    let shape = bits.shape();
+    if shape.len() != 2 {
+        return Err(PyRuntimeError::new_err("bits must be a 2D uint64 array"));
+    }
+    let n_rows = shape[0];
+    let row_words = shape[1];
+    let bits_flat_storage = crate::stats_common::array_standard_cow(&bits);
+    let bits_flat = &*bits_flat_storage;
+    let t0 = Instant::now();
+    let parts = py
+        .detach(|| {
+            score_cont_centered_gain_batch_packed_cpu_impl(
+                yv, bits_flat, row_words, n_rows, n_samples,
+            )
+        })
+        .map_err(PyRuntimeError::new_err)?;
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    batch_score_parts_to_pydict(py, parts, "cpu", Some(elapsed_ms))
+}
+
 #[inline]
 fn readonly_u8_to_cow<'a>(arr: &'a PyReadonlyArray1<'a, u8>) -> Cow<'a, [u8]> {
-    match arr.as_slice() {
+    match crate::stats_common::array_standard_slice(&arr) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(arr.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &arr.as_array(),
+        )),
     }
 }
 
 #[inline]
 fn readonly_f64_to_cow<'a>(arr: &'a PyReadonlyArray1<'a, f64>) -> Cow<'a, [f64]> {
-    match arr.as_slice() {
+    match crate::stats_common::array_standard_slice(&arr) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(arr.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &arr.as_array(),
+        )),
     }
 }
 
 #[inline]
 fn readonly_u64_to_cow<'a>(arr: &'a PyReadonlyArray1<'a, u64>) -> Cow<'a, [u64]> {
-    match arr.as_slice() {
+    match crate::stats_common::array_standard_slice(&arr) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(arr.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &arr.as_array(),
+        )),
     }
 }
 
 #[inline]
 fn readonly_u64_2d_to_flat_cow<'a>(arr: &'a PyReadonlyArray2<'a, u64>) -> Cow<'a, [u64]> {
-    match arr.as_slice() {
+    match crate::stats_common::array_standard_slice(&arr) {
         Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(arr.as_array().iter().copied().collect()),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+            &arr.as_array(),
+        )),
     }
 }
 
@@ -1395,6 +1741,8 @@ pub fn score_cont_mean_diff_corr_batch_py<'py>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::hint::black_box;
+    use std::time::Instant;
 
     fn pack01(v: &[u8]) -> Vec<u64> {
         let words = v.len().div_ceil(64);
@@ -1405,6 +1753,87 @@ mod tests {
             }
         }
         out
+    }
+
+    fn median_ns_per_call(samples_ns: &mut [f64]) -> f64 {
+        samples_ns.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        samples_ns[samples_ns.len() / 2]
+    }
+
+    fn make_sum_y_bench_inputs<F>(n_samples: usize, pred: F) -> (Vec<u64>, Vec<u64>, Vec<f64>)
+    where
+        F: Fn(usize) -> (bool, bool),
+    {
+        let mut lhs = vec![0u64; words_for_samples(n_samples).max(1)];
+        let mut rhs = vec![0u64; words_for_samples(n_samples).max(1)];
+        let mut y = Vec::<f64>::with_capacity(n_samples);
+        for i in 0..n_samples {
+            let (a, b) = pred(i);
+            if a {
+                lhs[i >> 6] |= 1u64 << (i & 63);
+            }
+            if b {
+                rhs[i >> 6] |= 1u64 << (i & 63);
+            }
+            y.push(((i as f64) * 0.03125) - 7.0 + ((i % 13) as f64) * 0.0075);
+        }
+        (lhs, rhs, y)
+    }
+
+    fn bench_sum_y_backend<F>(
+        lhs: &[u64],
+        rhs: &[u64],
+        y: &[f64],
+        n_samples: usize,
+        iters: usize,
+        mut f: F,
+    ) -> (f64, f64)
+    where
+        F: FnMut(&[u64], &[u64], &[f64], usize) -> f64,
+    {
+        black_box(f(lhs, rhs, y, n_samples));
+        let mut samples = [0.0_f64; 5];
+        let mut sink = 0.0_f64;
+        for slot in samples.iter_mut() {
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                sink += black_box(f(lhs, rhs, y, n_samples));
+            }
+            let elapsed = t0.elapsed().as_secs_f64();
+            *slot = elapsed * 1e9 / (iters as f64);
+        }
+        black_box(sink);
+        let median = median_ns_per_call(samples.as_mut_slice());
+        let checksum = f(lhs, rhs, y, n_samples);
+        (median, checksum)
+    }
+
+    fn bench_sum_y_four<F>(
+        pairs: [(&[u64], &[u64]); 4],
+        y: &[f64],
+        n_samples: usize,
+        iters: usize,
+        mut f: F,
+    ) -> (f64, [f64; 4])
+    where
+        F: FnMut([(&[u64], &[u64]); 4], &[f64], usize) -> [f64; 4],
+    {
+        black_box(f(pairs, y, n_samples));
+        let mut samples = [0.0_f64; 5];
+        let mut sink = 0.0_f64;
+        for slot in samples.iter_mut() {
+            let t0 = Instant::now();
+            for _ in 0..iters {
+                let out = black_box(f(pairs, y, n_samples));
+                sink += out.iter().sum::<f64>();
+            }
+            *slot = t0.elapsed().as_secs_f64() * 1e9 / (iters as f64);
+        }
+        black_box(sink);
+        (
+            median_ns_per_call(samples.as_mut_slice()),
+            f(pairs, y, n_samples),
+        )
     }
 
     #[test]
@@ -1519,23 +1948,13 @@ mod tests {
         ];
         let expected = pairs.map(|(lhs, rhs)| sum_y_where_both1(lhs, rhs, y.as_slice(), n));
         let got = sum_y_where_both1_four(pairs, y.as_slice(), n, None);
-        for (actual, expected) in got.iter().zip(expected.iter()) {
-            assert!(
-                (actual - expected).abs() <= 1e-12_f64,
-                "four-way sum differs from individual sum: actual={actual}, expected={expected}"
-            );
-        }
+        assert_eq!(got, expected);
 
         let lookup = PackedYSumLookup::build(y.as_slice(), n).unwrap();
         let expected_lookup = pairs
             .map(|(lhs, rhs)| sum_y_where_both1_with_lookup(lhs, rhs, y.as_slice(), n, &lookup));
         let got_lookup = sum_y_where_both1_four(pairs, y.as_slice(), n, Some(&lookup));
-        for (actual, expected) in got_lookup.iter().zip(expected_lookup.iter()) {
-            assert!(
-                (actual - expected).abs() <= 1e-12_f64,
-                "four-way lookup sum differs from individual sum: actual={actual}, expected={expected}"
-            );
-        }
+        assert_eq!(got_lookup, expected_lookup);
     }
 
     #[test]
@@ -1617,6 +2036,190 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn bench_sum_y_where_both1_backends() {
+        let n_samples = 65_536usize;
+        let sparse = make_sum_y_bench_inputs(n_samples, |i| {
+            let lhs = (i % 29) == 0 || (i % 31) == 1 || (i % 37) == 3;
+            let rhs = (i % 41) == 0 || (i % 43) == 2 || (i % 47) == 4;
+            (lhs, rhs)
+        });
+        let dense = make_sum_y_bench_inputs(n_samples, |i| {
+            let lhs = ((i & 1) == 0) || ((i % 7) <= 2) || ((i % 19) <= 6);
+            let rhs = ((i % 3) != 1) || ((i % 11) <= 4) || ((i % 23) <= 7);
+            (lhs, rhs)
+        });
+        let iters = 512usize;
+
+        let run_case = |label: &str, lhs: &[u64], rhs: &[u64], y: &[f64]| {
+            let (scalar_ns, scalar_sum) =
+                bench_sum_y_backend(lhs, rhs, y, n_samples, iters, sum_y_where_both1_scalar);
+            #[cfg(target_arch = "aarch64")]
+            {
+                if std::arch::is_aarch64_feature_detected!("neon") {
+                    let (neon_ns, neon_sum) =
+                        bench_sum_y_backend(lhs, rhs, y, n_samples, iters, |a, b, c, n| unsafe {
+                            sum_y_where_both1_neon(a, b, c, n)
+                        });
+                    let diff = (scalar_sum - neon_sum).abs();
+                    let tol = scalar_sum.abs().max(1.0) * 1e-10;
+                    assert!(
+                        diff <= tol,
+                        "checksum drift too large: diff={diff} tol={tol}"
+                    );
+                    eprintln!(
+                        "[sum_y bench][{label}] scalar={scalar_ns:.1} ns/call neon={neon_ns:.1} ns/call speedup={:.2}x diff={diff:.3e}",
+                        scalar_ns / neon_ns,
+                    );
+                    return;
+                }
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                if std::arch::is_x86_feature_detected!("avx2") {
+                    let (avx2_ns, avx2_sum) =
+                        bench_sum_y_backend(lhs, rhs, y, n_samples, iters, |a, b, c, n| unsafe {
+                            sum_y_where_both1_avx2(a, b, c, n)
+                        });
+                    let diff = (scalar_sum - avx2_sum).abs();
+                    let tol = scalar_sum.abs().max(1.0) * 1e-10;
+                    assert!(
+                        diff <= tol,
+                        "checksum drift too large: diff={diff} tol={tol}"
+                    );
+                    eprintln!(
+                        "[sum_y bench][{label}] scalar={scalar_ns:.1} ns/call avx2={avx2_ns:.1} ns/call speedup={:.2}x diff={diff:.3e}",
+                        scalar_ns / avx2_ns,
+                    );
+                    return;
+                }
+            }
+            eprintln!(
+                "[sum_y bench][{label}] simd backend unavailable; scalar={scalar_ns:.1} ns/call"
+            );
+        };
+
+        run_case(
+            "sparse",
+            sparse.0.as_slice(),
+            sparse.1.as_slice(),
+            sparse.2.as_slice(),
+        );
+        run_case(
+            "dense",
+            dense.0.as_slice(),
+            dense.1.as_slice(),
+            dense.2.as_slice(),
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_sum_y_where_both1_lookup_realistic_samples() {
+        let n_samples = 1_402usize;
+        let lookup_y = (0..n_samples)
+            .map(|i| ((i as f64) * 0.03125) - 7.0 + ((i % 13) as f64) * 0.0075)
+            .collect::<Vec<_>>();
+        let cases = [
+            (
+                "sparse",
+                make_sum_y_bench_inputs(n_samples, |i| {
+                    (
+                        (i % 29) == 0 || (i % 31) == 1,
+                        (i % 37) == 3 || (i % 41) == 0,
+                    )
+                }),
+            ),
+            (
+                "dense",
+                make_sum_y_bench_inputs(n_samples, |i| {
+                    (
+                        ((i & 1) == 0) || ((i % 7) <= 2),
+                        ((i % 3) != 1) || ((i % 11) <= 4),
+                    )
+                }),
+            ),
+        ];
+        for (label, (lhs, rhs, _)) in cases {
+            let iters = 20_000usize;
+            let (scalar_ns, scalar_sum) = bench_sum_y_backend(
+                lhs.as_slice(),
+                rhs.as_slice(),
+                lookup_y.as_slice(),
+                n_samples,
+                iters,
+                sum_y_where_both1,
+            );
+            let lookup = PackedYSumLookup::build(lookup_y.as_slice(), n_samples).unwrap();
+            let (lookup_ns, lookup_sum) = bench_sum_y_backend(
+                lhs.as_slice(),
+                rhs.as_slice(),
+                lookup_y.as_slice(),
+                n_samples,
+                iters,
+                |a, b, c, n| sum_y_where_both1_with_lookup(a, b, c, n, &lookup),
+            );
+            let diff = (scalar_sum - lookup_sum).abs();
+            let tol = scalar_sum.abs().max(1.0) * 1e-10;
+            assert!(diff <= tol, "{label}: diff={diff} tol={tol}");
+            eprintln!(
+                "[sum_y lookup bench][{label}] scalar={scalar_ns:.1} ns/call lookup={lookup_ns:.1} ns/call speedup={:.2}x",
+                scalar_ns / lookup_ns,
+            );
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_sum_y_where_both1_four_realistic_samples() {
+        let n_samples = 1_402usize;
+        let y = (0..n_samples)
+            .map(|i| ((i as f64) * 0.03125) - 7.0 + ((i % 13) as f64) * 0.0075)
+            .collect::<Vec<_>>();
+        let rows = [
+            make_sum_y_bench_inputs(n_samples, |i| ((i & 1) == 0, (i % 3) != 1)),
+            make_sum_y_bench_inputs(n_samples, |i| ((i % 7) <= 2, (i % 11) <= 4)),
+            make_sum_y_bench_inputs(n_samples, |i| {
+                ((i % 29) == 0 || (i % 31) == 1, (i % 37) == 3)
+            }),
+            make_sum_y_bench_inputs(n_samples, |i| {
+                ((i % 5) == 0, (i % 41) == 0 || (i % 43) == 2)
+            }),
+        ];
+        let pairs = [
+            (rows[0].0.as_slice(), rows[1].1.as_slice()),
+            (rows[1].0.as_slice(), rows[2].1.as_slice()),
+            (rows[0].0.as_slice(), rows[2].0.as_slice()),
+            (rows[3].1.as_slice(), rows[1].0.as_slice()),
+        ];
+        let iters = 20_000usize;
+        let (individual_ns, individual_sum) =
+            bench_sum_y_four(pairs, y.as_slice(), n_samples, iters, |p, c, n| {
+                p.map(|(a, b)| sum_y_where_both1(a, b, c, n))
+            });
+        let (four_ns, four_sum) =
+            bench_sum_y_four(pairs, y.as_slice(), n_samples, iters, |p, c, n| {
+                sum_y_where_both1_four(p, c, n, None)
+            });
+        let lookup = PackedYSumLookup::build(y.as_slice(), n_samples).unwrap();
+        let (individual_lookup_ns, individual_lookup_sum) =
+            bench_sum_y_four(pairs, y.as_slice(), n_samples, iters, |p, c, n| {
+                p.map(|(a, b)| sum_y_where_both1_with_lookup(a, b, c, n, &lookup))
+            });
+        let (four_lookup_ns, four_lookup_sum) =
+            bench_sum_y_four(pairs, y.as_slice(), n_samples, iters, |p, c, n| {
+                sum_y_where_both1_four(p, c, n, Some(&lookup))
+            });
+        assert_eq!(four_sum, individual_sum);
+        assert_eq!(four_lookup_sum, individual_lookup_sum);
+        eprintln!(
+            "[sum_y four bench] scalar individual={individual_ns:.1} ns/call four={four_ns:.1} ns/call speedup={:.2}x; lookup individual={individual_lookup_ns:.1} ns/call four={four_lookup_ns:.1} ns/call speedup={:.2}x",
+            individual_ns / four_ns,
+            individual_lookup_ns / four_lookup_ns,
+        );
+    }
+
+    #[test]
     fn test_binary_batch_matches_single() {
         let n = 100usize;
         let y: Vec<u8> = (0..n).map(|i| (i % 3 == 0) as u8).collect();
@@ -1674,6 +2277,67 @@ mod tests {
                 assert!((md[r] - md_s).abs() < 1e-12);
             }
             assert!((corr[r] - corr_s).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn test_cpu_singleton_backend_matches_scalar_scores() {
+        pyo3::Python::initialize();
+        let n_samples = 70;
+        let row_words = 2;
+        let n_rows = 3;
+        let y = (0..n_samples)
+            .map(|idx| 0.5 + (idx as f64) * 0.125)
+            .collect::<Vec<_>>();
+        let mut bits = vec![0u64; n_rows * row_words];
+        for row in 0..n_rows {
+            for sample in 0..n_samples {
+                let hit = match row {
+                    0 => sample % 3 != 0,
+                    1 => sample < 17 || (sample >= 39 && sample < 61),
+                    _ => (sample / 5) % 2 == 0,
+                };
+                if hit {
+                    bits[row * row_words + (sample >> 6)] |= 1u64 << (sample & 63);
+                }
+            }
+        }
+        let total_sum = y.iter().sum::<f64>();
+        let got = score_cont_centered_gain_singletons_packed_cpu_impl(
+            &y, &bits, row_words, n_rows, n_samples,
+        )
+        .expect("CPU singleton scores");
+
+        assert_eq!(got.len(), n_rows * 2);
+        for row in 0..n_rows {
+            let packed = &bits[row * row_words..(row + 1) * row_words];
+            let n_hit = support_size_packed(packed, n_samples);
+            let positive =
+                score_cont_centered_gain_packed_with_n_hit(&y, packed, n_samples, total_sum, n_hit);
+            let mut negative = packed.to_vec();
+            for word in negative.iter_mut() {
+                *word = !*word;
+            }
+            let rem = n_samples & 63;
+            if rem != 0 {
+                let last_word = negative.len() - 1;
+                negative[last_word] &= (1u64 << rem) - 1u64;
+            }
+            let negative_score = score_cont_centered_gain_packed_with_n_hit(
+                &y,
+                &negative,
+                n_samples,
+                total_sum,
+                n_samples - n_hit,
+            );
+            for (actual, expected) in [
+                (&got[row * 2], &positive),
+                (&got[row * 2 + 1], &negative_score),
+            ] {
+                assert!((actual.score - expected.score).abs() < 1.0e-10);
+                assert_eq!(actual.n_hit, expected.n_hit);
+                assert_eq!(actual.n_miss, expected.n_miss);
+            }
         }
     }
 

@@ -1,32 +1,30 @@
-# GARFIELD 算法
+# GARFIELD: Max6 → GRM-INT
 
-## 二元离散变量 (Case|Control)
+The production window and gene scans use a two-stage interaction workflow:
 
-负对数似然 (Negetive Log Likelihood, NLL) 作为评估函数:
-$$
-NLL=\sum{w_i*[ y_i * ln(p_i) + (1 - y_i) * ln(1 - p_i) ]}
-$$
-其中
-$$
-p_0 = mean(y | pred=0) \\
-p_1 = mean(y | pred=1) \\
-$$
+1. Apply genotype quality filters on the phenotype-aligned samples and pack the
+   retained pure-line genotypes for the scan.
+2. Exhaustively screen eligible marker pairs with the Max6 statistic, using
+   genotype-identical LD tags by default.
+3. Keep up to `-topk` pairs per scan unit and score their one-degree-of-freedom
+   interaction with the GRM-INT FWL test. The test adjusts for both main
+   effects, supplied covariates, and the aligned GRM.
 
-NLL的推导：
+Example:
 
-- 首先是单个样本的似然 (两种可能性, `0`或`1`的概率)
-$$P(y_i \mid p_i) = p_i^{y_i}(1-p_i)^{1-y_i}$$
+```bash
+jx garfield -bfile cohort -p traits.tsv -k cohort.grm.npy \
+  -c cohort.pcs.tsv -w -topk 100 -o results/cohort
+```
 
-- 随后累乘获得全部样本（独立）似然
-$$L = \prod_i p_i^{y_i}(1-p_i)^{1-y_i}$$
+GRM-INT is enabled by default for the Max6 scan. Each result row reports the
+Max6 screen rank and score, the four-cell counts, the minimum cell count, the
+GRM-INT chi-square statistic, and its one-df p-value. The p-value is an
+unadjusted per-pair value; the printed Bonferroni threshold is a reference for
+the unique-pair family and does not filter rows.
 
-- 最后取负对数得到NLL
-$$-\log L = -\sum_i \big[ y_i \log p_i + (1-y_i)\log(1-p_i) \big]$$
-
-## 连续变量
-
-$$
-\mu_0 = mean(y | pred=0) \\
-\mu_1 = mean(y | pred=1) \\
-MSE=\frac{\sum{(y_i-\mu_i)^2}}{n}
-$$
+`--min-cell` sets the minimum sample count required in every binary genotype
+cell (default 10); `--min-cell-frac` can impose an additional fraction of the
+effective sample size. `--ld-tag-r2 1` keeps only identical encoded genotypes.
+Lower values enable approximate LD compression and can change which pairs are
+screened.

@@ -47,11 +47,19 @@ from janusx.script._common.genoio import (
 )
 from janusx.script._common.genocache import configure_genotype_cache_from_out
 from janusx.script._common.outprefix import apply_output_prefix_compat
-from janusx.script._common.grmio import format_grm_cache_num, load_and_align_grm
+from janusx.script._common.grmio import (
+    format_grm_cache_num, load_and_align_grm, read_id_file, resolve_grm_id_path,
+)
 from janusx.script._common.cli_core import CliArgumentParser, cli_help_formatter
 from janusx.script._common.log import setup_logging
 from janusx.script._common.memory import (
     resolve_decode_mmap_window_mb as _common_resolve_decode_mmap_window_mb,
+)
+from janusx.script._common.max6_display import (
+    MAX6_BONFERRONI_LOADING_DESC,
+    MAX6_LD_TAG_LOADING_DESC,
+    format_max6_count,
+    pwald_bonferroni_reference,
 )
 from janusx.script._common.pathcheck import (
     ensure_all_true,
@@ -63,10 +71,11 @@ from janusx.script._common.progress import (
     CliStatus,
     ProgressAdapter,
     build_rich_progress,
+    format_elapsed,
     print_failure,
+    print_success,
     rich_progress_available,
     stdout_is_tty,
-    success_symbol,
 )
 from janusx.script._common.threads import (
     apply_outer_thread_cap,
@@ -83,15 +92,21 @@ from janusx.script.fvlmm2 import (
 
 
 try:
-    from janusx.janusx import garfield_logic_search_bed
+    from janusx.janusx import (
+        finalize_max6_genotype_universe,
+        garfield_logic_search_bed,
+        prepare_max6_genotype_tags,
+    )
 except Exception as _exc:  # pragma: no cover
     garfield_logic_search_bed = None  # type: ignore[assignment]
+    finalize_max6_genotype_universe = None  # type: ignore[assignment]
+    prepare_max6_genotype_tags = None  # type: ignore[assignment]
     _RUST_IMPORT_ERROR = _exc
 else:
     _RUST_IMPORT_ERROR = None
 
-# Python 仅负责 CLI 调度；训练/测试划分、null-model 残差化、ML 候选筛选、
-# beam search 与最终导出都由 Rust 端统一完成。
+# Python 仅负责 CLI 调度；训练/测试划分、null-model 残差化、LD-tag
+# exhaustive Max6/GRM-Max6 扫描与最终导出都由 Rust 端统一完成。
 
 
 def _current_bed_memory_mb() -> float:
@@ -110,6 +125,41 @@ def _env_truthy(name: str) -> bool:
 def _resolve_garfield_xor_search(requested: bool) -> bool:
     """Resolve the explicit XOR-search opt-in and legacy force-off override."""
     return bool(requested) and not _env_truthy("JX_GARFIELD_DISABLE_XOR_SEARCH")
+
+
+def _is_max6_grm_backend(search_backend: object) -> bool:
+    return str(search_backend).strip().lower() in {
+        "max6-grmmax6",
+        "max6-grmmax6-legacy",
+    }
+
+
+def _is_ld_tag_max6_backend(search_backend: object) -> bool:
+    return str(search_backend).strip().lower() == "max6-grmmax6"
+
+
+def _resolve_garfield_grm_int_mode(
+    requested: bool | None,
+    search_backend: object,
+) -> tuple[bool, str]:
+    if requested is None:
+        enabled = _is_ld_tag_max6_backend(search_backend)
+        return enabled, "default_max6_grmmax6" if enabled else "default_off_for_route"
+    return bool(requested), "explicit_enabled" if requested else "explicit_disabled"
+
+
+def _resolve_garfield_null_resampling(
+    search_backend: object,
+    explicit_permutation_spec: object,
+    max6_audit_requested: bool,
+) -> bool:
+    if _is_ld_tag_max6_backend(search_backend):
+        if explicit_permutation_spec is not None:
+            raise ValueError(
+                "max6-grmmax6 uses an analytical Bonferroni cutoff; -pm/--permutation is unsupported"
+            )
+        return bool(max6_audit_requested)
+    return True
 
 
 def _garfield_rss_debug_enabled() -> bool:
@@ -162,6 +212,20 @@ def _format_mem_bytes(value: object) -> str:
     if b >= kib:
         return f"{b / kib:.1f} KiB"
     return f"{b} B"
+
+
+def _format_max6_score_value(value: object) -> str:
+    """Format Max6 output scores without hiding very small values."""
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return "NA"
+    if not np.isfinite(score):
+        return "NA"
+    if abs(score) < 0.0001:
+        mantissa, exponent = f"{score:.4e}".split("e", 1)
+        return f"{mantissa}e{int(exponent)}"
+    return f"{score:.4f}"
 
 
 class _GarfieldRssSampler:
@@ -1326,32 +1390,6 @@ def _emit_garfield_saved_paths(
     )
 
 
-def _emit_garfield_summary_to_log(logger, summary_rows: list[dict[str, object]]) -> None:
-    if len(summary_rows) == 0:
-        return
-    headers = ["trait", "n_samples", "best_score", "route"]
-    rows: list[list[str]] = []
-    for row in summary_rows:
-        best_score_text = _garfield_format_fixed4(row.get("best_score", float("nan")))
-        rows.append(
-            [
-                str(row.get("trait", "")),
-                f"{int(row.get('n_samples', 0))}",
-                best_score_text,
-                str(row.get("route", "")),
-            ]
-        )
-    widths = [len(x) for x in headers]
-    for row in rows:
-        for idx, value in enumerate(row):
-            widths[idx] = max(widths[idx], len(value))
-    logger.info("")
-    logger.info("[ GARFIELD Summary ]")
-    logger.info("  ".join(headers[idx].ljust(widths[idx]) for idx in range(len(headers))))
-    for row in rows:
-        logger.info("  ".join(row[idx].ljust(widths[idx]) for idx in range(len(row))))
-
-
 def _emit_garfield_bg_noise_summary_to_log(
     logger,
     *,
@@ -1484,8 +1522,11 @@ class _GarfieldStageProgress:
     def __init__(self, *, scan_desc: str, enabled: bool) -> None:
         self.scan_desc = str(scan_desc)
         self.enabled = bool(enabled)
+        self._start_ts = time.monotonic()
+        self._closed = False
         self._rich = None
-        self._tasks: dict[str, int] = {}
+        self._task_id: int | None = None
+        self._task_total = 1
         self._current_stage: str | None = None
         self._adapter: ProgressAdapter | None = None
         self._adapter_done = 0
@@ -1496,14 +1537,49 @@ class _GarfieldStageProgress:
                 show_percentage=True,
                 show_elapsed=True,
                 show_remaining=True,
-                field_templates=["{task.fields[postfix]}"],
-                finished_text=f"[green]{success_symbol()}[/green]",
-                transient=False,
+                field_templates=[],
+                bar_width=30,
+                finished_text=" ",
+                transient=True,
             )
-            if self._rich is not None:
-                self._rich.start()
 
     def _label(self, stage: str) -> str:
+        if stage == "garfield_marker_qc":
+            return "Reading genotype metadata / applying QC"
+        if stage == "garfield_auto_grm":
+            return "Building additive GRM"
+        if stage == "garfield_residual_fit":
+            return "Fitting observed-y LMM null"
+        if stage == "garfield_projection":
+            return "Building exact GRM projection"
+        if stage == "garfield_logic_bits":
+            return "Packing genotype bitsets"
+        if stage == "max6_setup_margins":
+            return "Preparing Max6 marker margins"
+        if stage == "max6_setup_ld_tags":
+            return "Preparing Max6 LD-tag universe"
+        if stage == "max6_pair_count":
+            return "Counting Bonferroni pair universe"
+        if stage == "max6_grmmax6_scan_pairs":
+            return "Screening Max6 pair chunks"
+        if stage == "max6_screen_calibration":
+            return "Max6 screen null calibration"
+        if stage == "max6_screen_validation":
+            return "Independent Max6 screen validation"
+        if stage == "max6_screen_sample_selection":
+            return "Selecting sampled Max6 null universe"
+        if stage == "max6_screen_sample_scoring":
+            return "Scoring sampled Max6 null maxima"
+        if stage == "max6_exceedance_pair_census":
+            return "Census unique pairs by support stratum"
+        if stage == "max6_exceedance_pair_preflight":
+            return "Preflighting exceedance sample memory"
+        if stage == "max6_exceedance_pair_sample_selection":
+            return "Selecting deterministic nested pair samples"
+        if stage == "max6_screen_exceedance_full_scan":
+            return "Exact full-universe exceedance audit"
+        if stage == "max6_grmmax6_scan":
+            return self.scan_desc
         if stage == "null_prep":
             return "Preparing Null Penalty"
         if stage == "null_penalty":
@@ -1512,6 +1588,8 @@ class _GarfieldStageProgress:
             return self.scan_desc
         if stage == "structure_prior":
             return self.scan_desc
+        if stage == "max6_grmmax6_permutation":
+            return "Calibrating Max6 Null Threshold"
         return self.scan_desc
 
     def update(self, stage: str, done: int, total: int, meta: object | None = None) -> None:
@@ -1520,42 +1598,41 @@ class _GarfieldStageProgress:
             return
         done_i = max(0, int(done))
         total_i = max(done_i, int(total))
-        postfix = "" if meta in {None, ""} else str(meta)
+        self._task_total = max(1, total_i)
         label = self._label(stage_key)
 
         if self._rich is not None:
-            task_id = self._tasks.get(stage_key)
-            if task_id is None:
-                task_id = self._rich.add_task(
+            if self._task_id is None:
+                self._rich.start()
+                self._task_id = self._rich.add_task(
                     label,
                     total=max(1, total_i),
                     completed=min(done_i, max(1, total_i)),
-                    postfix=postfix,
                 )
-                self._tasks[stage_key] = task_id
             else:
                 self._rich.update(
-                    task_id,
+                    self._task_id,
                     description=label,
                     total=max(1, total_i),
                     completed=min(done_i, max(1, total_i)),
-                    postfix=postfix,
                 )
+            self._current_stage = stage_key
             return
 
         if not self.enabled:
             return
         if self._current_stage != stage_key or self._adapter is None:
             if self._adapter is not None:
-                self._adapter.finish()
-                self._adapter.close()
+                self._adapter.close(show_done=False)
             self._adapter = ProgressAdapter(
                 total=max(1, total_i),
                 desc=label,
                 show_spinner=True,
-                show_postfix=True,
+                show_postfix=False,
                 show_remaining=True,
-                emit_done=True,
+                keep_display=False,
+                emit_done=False,
+                bar_width=30,
                 force_animate=True,
             )
             self._current_stage = stage_key
@@ -1566,20 +1643,30 @@ class _GarfieldStageProgress:
         delta = max(0, done_i - self._adapter_done)
         if delta > 0:
             self._adapter.update(delta)
-        if postfix != "":
-            self._adapter.set_postfix(progress=f"{done_i}/{total_i}", detail=postfix)
-        else:
-            self._adapter.set_postfix(progress=f"{done_i}/{total_i}")
         self._adapter_done = done_i
 
-    def close(self) -> None:
+    def close(self, *, success: bool = True) -> None:
+        if self._closed:
+            return
+        self._closed = True
         if self._adapter is not None:
-            self._adapter.finish()
-            self._adapter.close()
+            if success:
+                self._adapter.finish()
+            self._adapter.close(show_done=False)
             self._adapter = None
         if self._rich is not None:
-            self._rich.stop()
+            if success and self._task_id is not None:
+                self._rich.update(self._task_id, completed=self._task_total)
+            if self._task_id is not None:
+                self._rich.stop()
             self._rich = None
+        if success and self.enabled:
+            elapsed = format_elapsed(time.monotonic() - self._start_ts)
+            print_success(f"{self.scan_desc} ...Finished [{elapsed}]", force_color=True)
+
+    @property
+    def elapsed_text(self) -> str:
+        return format_elapsed(time.monotonic() - self._start_ts)
 
 
 def _run_scan_with_progress(
@@ -1592,62 +1679,30 @@ def _run_scan_with_progress(
         with CliStatus(f"{desc}...", enabled=False, timeout=0.1):
             return invoke(None)
 
-    prepare_desc = "Preparing GARFIELD input"
-    prepare_status = CliStatus(
-        f"{prepare_desc}...",
-        enabled=bool(use_spinner),
-        timeout=0.08,
-        show_elapsed=True,
-        force_animate=True,
-    )
-    stage_progress: _GarfieldStageProgress | None = None
-    prepare_done = False
-
-    def _finish_prepare() -> None:
-        nonlocal prepare_done
-        if prepare_done:
-            return
-        prepare_status.complete(f"{prepare_desc} ...Finished")
-        prepare_done = True
-
-    def _ensure_stage_progress() -> _GarfieldStageProgress:
-        nonlocal stage_progress
-        if stage_progress is None:
-            _finish_prepare()
-            stage_progress = _GarfieldStageProgress(
-                scan_desc=desc,
-                enabled=bool(use_spinner),
-            )
-        return stage_progress
+    stage_progress = _GarfieldStageProgress(scan_desc=desc, enabled=bool(use_spinner))
 
     def _progress_cb(*event) -> None:
         if len(event) == 4:
             stage, done, total, meta = event
             stage_name = str(stage)
-            if stage_progress is None and _GarfieldStageProgress.is_hidden_stage(stage_name):
+            if _GarfieldStageProgress.is_hidden_stage(stage_name):
                 return
-            _ensure_stage_progress().update(stage_name, int(done), int(total), meta)
+            stage_progress.update(stage_name, int(done), int(total), meta)
             return
         if len(event) == 2:
             done, total = event
-            _ensure_stage_progress().update("scan", int(done), int(total), None)
+            stage_progress.update("scan", int(done), int(total), None)
             return
         raise ValueError(f"unexpected GARFIELD progress event: {event!r}")
 
     try:
-        with prepare_status:
-            out = invoke(_progress_cb)
-            _finish_prepare()
+        out = invoke(_progress_cb)
     except BaseException:
-        if stage_progress is not None:
-            stage_progress.close()
-            print_failure(f"{desc} ...Failed", force_color=True)
-        else:
-            prepare_status.fail(f"{prepare_desc} ...Failed")
+        stage_progress.close(success=False)
+        print_failure(f"{desc} ...Failed [{stage_progress.elapsed_text}]", force_color=True)
         raise
 
-    if stage_progress is not None:
-        stage_progress.close()
+    stage_progress.close()
     return out
 
 
@@ -1669,7 +1724,7 @@ def main() -> None:
         include_bfile=True,
         help_profile="plink_prefix_short",
     )
-    add_common_pheno_arg(required_group, required=False, help_text="Phenotype file.")
+    add_common_pheno_arg(required_group, required=False, help_text="Phenotype file for the scan.")
     scan_mode_group = required_group.add_mutually_exclusive_group(required=True)
     scan_mode_group.add_argument(
         "-w",
@@ -1764,12 +1819,50 @@ def main() -> None:
         default=None,
     )
     optional_group.add_argument(
+        "--residual-method",
+        dest="residual_method",
+        choices=["exact", "rrblup_pcg"],
+        default="exact",
+        help=(
+            "Residualization method: exact GRM-eigh/REML (default) or "
+            "rrBLUP-PCG additive projection."
+        ),
+    )
+    optional_group.add_argument(
+        "--pcg-max-iter",
+        dest="pcg_max_iter",
+        type=int,
+        default=100,
+        help="Maximum marker-space PCG iterations for --residual-method rrblup_pcg.",
+    )
+    optional_group.add_argument(
+        "--pcg-tol",
+        dest="pcg_tol",
+        type=float,
+        default=1e-4,
+        help="Relative residual tolerance for rrBLUP-PCG (default: 1e-4).",
+    )
+    optional_group.add_argument(
+        "--pcg-small-n-max",
+        dest="pcg_small_n_max",
+        type=int,
+        default=15000,
+        help=(
+            "Use GRM-eigh/Brent-REML for PCG lambda selection when n is at most this "
+            "value; larger n uses HE (default: 15000)."
+        ),
+    )
+    optional_group.add_argument(
         "-engine",
         "--engine",
         type=str.upper,
-        choices=["CORR", "RF", "GBDT"],
-        default="CORR",
-        help="ML engine for candidate search. Default: CORR.",
+        choices=["NONE", "CORR", "RF", "GBDT"],
+        default="NONE",
+        help=(
+            "Legacy ML engine for candidate search. The default max6-grmmax6 backend uses "
+            "LD-tag exhaustive Max6 screening followed by GRM-INT Top-K scoring and does "
+            "not call ML/CORR."
+        ),
     )
     optional_group.add_argument(
         "-width",
@@ -1785,10 +1878,10 @@ def main() -> None:
         type=str,
         default=None,
         help=(
-            "Set the GARFIELD bucket null-penalty method. Default uses `g99` "
-            "(GEV/Gumbel-fit extreme-value threshold at target quantile 0.99). "
-            "You may also pass `gev`, `gumbel`, `bayes`, `g99`, `g99.9`, or an empirical quantile "
-            "such as `q99`, `q99.9`, or `0.99`. "
+            "Set the GARFIELD bucket null-penalty method for legacy backends. "
+            "The analytical `max6-grmmax6` backend does not accept this option. "
+            "Legacy backends accept `gev`, `gumbel`, `bayes`, `g99`, `g99.9`, "
+            "or an empirical quantile such as `q99`, `q99.9`, or `0.99`. "
             "This option only controls the null-penalty threshold; it does not append "
             "permutation p-value or FDR columns."
         ),
@@ -1850,14 +1943,147 @@ def main() -> None:
         ),
     )
     dev_group.add_argument(
+        "--sampled-screen-null-diagnostic",
+        action="store_true",
+        default=False,
+        help=(
+            "Run diagnostic-only exact Max6 null maxima over nested uniform hash-priority samples "
+            "of 100k/1m/10m/50m unique canonical pairs. Requires max6-grmmax6, -dev, and exactly "
+            "100 existing null draws; never changes the production screen threshold."
+            if show_dev_help
+            else argparse.SUPPRESS
+        ),
+    )
+    dev_group.add_argument(
+        "--sampled-screen-pair-seed",
+        type=int,
+        default=0x4A5853414D504C45,
+        help=(
+            "Independent deterministic pair-priority seed for the sampled-screen diagnostic."
+            if show_dev_help
+            else argparse.SUPPRESS
+        ),
+    )
+    dev_group.add_argument(
+        "--sampled-screen-pair-seeds",
+        default=None,
+        help=(
+            "Optional comma-separated list of 3–5 independent deterministic pair-priority seeds; "
+            "sampled runs are sequential and share the same full-null maxima. If omitted, use the "
+            "single --sampled-screen-pair-seed value."
+            if show_dev_help
+            else argparse.SUPPRESS
+        ),
+    )
+    dev_group.add_argument(
+        "--sampled-screen-maf-cutpoints",
+        default="0,0.05,0.10,0.20,0.30,0.50",
+        help=(
+            "Configurable diagnostic min-binary-MAF bin edges (comma-separated; provisional defaults, "
+            "not yet canonical)."
+            if show_dev_help
+            else argparse.SUPPRESS
+        ),
+    )
+    dev_group.add_argument(
+        "--sampled-screen-r2-cutpoints",
+        default="0,0.2,0.4,0.6,0.8,1.0",
+        help=(
+            "Configurable diagnostic binary pairwise-r2 bin edges (comma-separated; provisional defaults, "
+            "not yet canonical)."
+            if show_dev_help
+            else argparse.SUPPRESS
+        ),
+    )
+    dev_group.add_argument(
+        "--max6-screen-tail-audit",
+        action="store_true",
+        default=False,
+        help=(
+            "Run an opt-in exact full-MaxT tail audit, retaining bounded Top-4096 pairs per null. "
+            "Diagnostic only; does not change the production threshold. Requires -dev and "
+            "max6-grmmax6."
+            if show_dev_help
+            else argparse.SUPPRESS
+        ),
+    )
+    dev_group.add_argument(
+        "--max6-screen-exceedance-audit",
+        action="store_true",
+        default=False,
+        help=(
+            "Run the opt-in weighted Max6 exceedance-count audit on the exact full-MaxT calibration nulls; "
+            "diagnostic only, with no threshold or FWER-claim changes. Requires -dev, "
+            "--search-backend max6-grmmax6, exact residualization, and 100 or 500 null repeats."
+            if show_dev_help
+            else argparse.SUPPRESS
+        ),
+    )
+    dev_group.add_argument(
+        "--max6-screen-pot-audit",
+        action="store_true",
+        default=False,
+        help=(
+            "Run the opt-in exact sampled-pair Max6 marginal POT/GPD diagnostic using 5 nested uniform samples; "
+            "diagnostic only, never changes production thresholds. Requires -dev, max6-grmmax6, exact residualization, "
+            "and 100 or 500 null repeats."
+            if show_dev_help
+            else argparse.SUPPRESS
+        ),
+    )
+    dev_group.add_argument(
+        "--max6-screen-tail-audit-repeats",
+        type=int,
+        choices=(100, 250, 500),
+        default=500,
+        help=(
+            "Independent audit null draw count (use 500 for the main region and 100 for geometry replications)."
+            if show_dev_help
+            else argparse.SUPPRESS
+        ),
+    )
+    dev_group.add_argument(
+        "--max6-screen-tail-pair-seed",
+        type=int,
+        default=0x4A5853414D504C45,
+        help=(
+            "Deterministic hash-priority pair sample seed, independent of the null stream."
+            if show_dev_help
+            else argparse.SUPPRESS
+        ),
+    )
+    dev_group.add_argument(
+        "--max6-screen-tail-support-aware",
+        action="store_true",
+        default=False,
+        help=(
+            "Compare uniform sampling with diagnostic 40/50/60% allocations to min_cell 5–19; "
+            "does not alter production thresholds or FWER claims."
+            if show_dev_help
+            else argparse.SUPPRESS
+        ),
+    )
+    dev_group.add_argument(
+        "--max6-screen-tail-support-shares",
+        default="40,50,60",
+        help=(
+            "Comma-separated support-aware min_cell 5–19 shares (allowed: 40,50,60); "
+            "use one selected share for replication regions."
+            if show_dev_help
+            else argparse.SUPPRESS
+        ),
+    )
+    dev_group.add_argument(
         "--search-backend",
         dest="search_backend",
-        choices=["legacy", "pair-triple"],
-        default="legacy",
+        choices=["legacy", "pair-triple", "max6-grmmax6", "max6-grmmax6-legacy"],
+        default="max6-grmmax6",
         help=(
-            "Experimental rule-search backend. `pair-triple` runs exhaustive pair "
-            "scanning followed by pair-seeded triple refinement; it is not a formal "
-            "production-calibrated path yet."
+            "GARFIELD search backend. `max6-grmmax6` runs deterministic LD-tag "
+            "exhaustive packed Max6 screening followed by one-df GRM-INT Top-K ranking "
+            "by default (`--no-grm-int` selects exact GRM-Max6 reranking); "
+            "`max6-grmmax6-legacy` retains the former ML/CORR-prefiltered path; "
+            "`pair-triple` remains development-only."
             if show_dev_help
             else argparse.SUPPRESS
         ),
@@ -1880,12 +2106,57 @@ def main() -> None:
         "--null-repeats",
         dest="null_repeats",
         type=int,
-        default=100,
+        default=300,
         help=(
             "Number of full-scan null replicates used for rule-tail calibration "
-            "(default: 100; minimum: 50; 300-500 recommended for stable 4/5-way tails)."
+            "(default: 300; minimum: 50; 100 or 300 allowed outside -dev; "
+            "300-500 recommended for stable 4/5-way tails)."
             if show_dev_help
             else argparse.SUPPRESS
+        ),
+    )
+    optional_group.add_argument(
+        "--grm-int",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Use one-df GRM interaction-only FWL scoring for the Max6 Top-K pairs "
+            "(g1×g2 adjusted for g1, g2, covariates, and GRM), write chi-square/pwald, "
+            "and rank within Top-K by interaction chi-square. Defaults on for "
+            "--search-backend max6-grmmax6 and off for other routes; --no-grm-int "
+            "selects exact GRM-Max6 scoring."
+        ),
+    )
+    optional_group.add_argument(
+        "--min-cell",
+        type=int,
+        default=None,
+        help=(
+            "Before Max6 scoring, require at least this many samples in each of the four "
+            "binary genotype cells for a marker pair (default: 10 for Max6; 0 disables "
+            "the count floor). Combined with --min-cell-frac by taking the maximum."
+        ),
+    )
+    optional_group.add_argument(
+        "--ld-tag-r2",
+        type=float,
+        default=1.0,
+        help=(
+            "Max6 pre-screen genotype compression (default: 1, identical encoded "
+            "genotypes only). Values in (0, 1) enable approximate LD compression; "
+            "0.95 reproduces the previous faster, lossy search."
+        ),
+    )
+    optional_group.add_argument(
+        "--min-cell-frac",
+        "--min-cell-fraction",
+        type=float,
+        default=0.0,
+        help=(
+            "Minimum fraction of effective samples in each of the four genotype cells "
+            "(default: 0; range: 0 to 0.25). Use 0.02 for 2%%. The effective threshold "
+            "is max(min-cell, ceil(min-cell-frac * Neff)), using the aligned samples "
+            "actually scored for each phenotype. Max6 backends only."
         ),
     )
     optional_group.add_argument(
@@ -1895,7 +2166,7 @@ def main() -> None:
         type=int,
         default=1,
         help=(
-            "Keep top-k de-duplicated candidate combinations per scan unit after beam search "
+            "Keep up to top-k de-duplicated Max6 pairs per scan unit for GRM-INT scoring "
             "(default: 1)."
         ),
     )
@@ -1906,10 +2177,11 @@ def main() -> None:
         action="append",
         default=None,
         help=(
-            "Restrict only the final scan stage to one or more genomic bp intervals. "
+            "Restrict scan units to one or more genomic bp intervals. "
             "Repeat the flag or use comma-separated items, e.g. "
             "--bimrange 10:110800000-111200000,10:112000000-112200000. "
-            "Background-noise calibration remains genome-wide."
+            "The analytical Max6 Bonferroni pair count uses this selected unique-pair "
+            "universe; other backend calibration scopes are backend-specific."
         ),
     )
     optional_group.add_argument(
@@ -1936,9 +2208,34 @@ def main() -> None:
     )
 
     args, extras = parser.parse_known_args()
+    args.grm_int, args.grm_int_mode_source = _resolve_garfield_grm_int_mode(
+        args.grm_int,
+        args.search_backend,
+    )
 
     has_genotype = bool(args.bfile)
     has_pheno = bool(args.pheno)
+    if bool(args.grm_int) and str(args.search_backend).strip().lower() != "max6-grmmax6":
+        parser.error("--grm-int requires --search-backend max6-grmmax6")
+    if args.min_cell is not None:
+        if int(args.min_cell) < 0:
+            parser.error("--min-cell must be >= 0")
+        if not _is_max6_grm_backend(args.search_backend):
+            parser.error("--min-cell requires a Max6 GARFIELD search backend")
+    if not np.isfinite(args.min_cell_frac) or not 0.0 <= args.min_cell_frac <= 0.25:
+        parser.error("--min-cell-frac must be finite and between 0 and 0.25")
+    if args.min_cell_frac > 0.0:
+        if not _is_max6_grm_backend(args.search_backend):
+            parser.error("--min-cell-frac requires a Max6 GARFIELD search backend")
+    if not np.isfinite(args.ld_tag_r2) or not 0.0 < args.ld_tag_r2 <= 1.0:
+        parser.error("--ld-tag-r2 must be finite and in (0, 1]")
+    if args.ld_tag_r2 != 1.0 and not _is_ld_tag_max6_backend(args.search_backend):
+        parser.error("--ld-tag-r2 requires the max6-grmmax6 search backend")
+    args.min_cell_runtime = (
+        int(args.min_cell)
+        if args.min_cell is not None
+        else (10 if _is_max6_grm_backend(args.search_backend) else 0)
+    )
     if not has_genotype and not has_pheno:
         parser.error("the following arguments are required: -p/--pheno and -bfile/--bfile")
     if not has_genotype:
@@ -1949,12 +2246,116 @@ def main() -> None:
         parser.error("unrecognized arguments: " + " ".join(extras))
     if bool(args.diagnostics) and not bool(args.dev):
         parser.error("--diagnostics requires -dev")
-    if str(args.search_backend) != "legacy" and not bool(args.dev):
-        parser.error("--search-backend requires -dev")
-    if int(args.null_repeats) < 50:
-        parser.error("--null-repeats must be at least 50")
-    if int(args.null_repeats) != 100 and not bool(args.dev):
-        parser.error("--null-repeats requires -dev")
+    if bool(args.sampled_screen_null_diagnostic):
+        if not bool(args.dev):
+            parser.error("--sampled-screen-null-diagnostic requires -dev")
+        if str(args.search_backend).lower() != "max6-grmmax6":
+            parser.error("--sampled-screen-null-diagnostic requires --search-backend max6-grmmax6")
+        if int(args.null_repeats) != 100:
+            parser.error("--sampled-screen-null-diagnostic requires --null-repeats 100")
+        seed_values_raw = (
+            [value.strip() for value in str(args.sampled_screen_pair_seeds).split(",")]
+            if args.sampled_screen_pair_seeds is not None
+            else [str(args.sampled_screen_pair_seed)]
+        )
+        try:
+            pair_sample_seeds = [int(value) for value in seed_values_raw]
+        except ValueError as exc:
+            parser.error(f"invalid --sampled-screen-pair-seeds value: {exc}")
+        if not pair_sample_seeds or (
+            len(pair_sample_seeds) != 1 and not 3 <= len(pair_sample_seeds) <= 5
+        ):
+            parser.error("provide one sampled pair seed or 3–5 independent pair seeds")
+        if len(set(pair_sample_seeds)) != len(pair_sample_seeds):
+            parser.error("--sampled-screen-pair-seeds must not contain duplicates")
+        if any(seed < 0 or seed > 0xFFFFFFFFFFFFFFFF for seed in pair_sample_seeds):
+            parser.error("sampled pair seeds must be unsigned 64-bit integers")
+        if int(args.seed) in pair_sample_seeds:
+            parser.error("pair sample seeds must be separate from --seed/null stream")
+        args.sampled_screen_pair_seeds_normalized = ",".join(
+            str(seed) for seed in pair_sample_seeds
+        )
+    else:
+        args.sampled_screen_pair_seeds_normalized = ""
+    if bool(args.max6_screen_tail_audit):
+        if not bool(args.dev):
+            parser.error("--max6-screen-tail-audit requires -dev")
+        if str(args.search_backend).lower() != "max6-grmmax6":
+            parser.error("--max6-screen-tail-audit requires --search-backend max6-grmmax6")
+        if str(args.residual_method).lower() != "exact":
+            parser.error("--max6-screen-tail-audit requires exact LMM residualization")
+        if int(args.max6_screen_tail_pair_seed) == int(args.seed):
+            parser.error("tail pair-sample seed must be separate from --seed")
+    if bool(args.max6_screen_exceedance_audit):
+        if not bool(args.dev):
+            parser.error("--max6-screen-exceedance-audit requires -dev")
+        if str(args.search_backend).lower() != "max6-grmmax6":
+            parser.error("--max6-screen-exceedance-audit requires --search-backend max6-grmmax6")
+        if str(args.residual_method).lower() != "exact":
+            parser.error("--max6-screen-exceedance-audit requires exact LMM residualization")
+        if int(args.null_repeats) not in (100, 500):
+            parser.error("--max6-screen-exceedance-audit requires --null-repeats 100 or 500")
+        if bool(args.sampled_screen_null_diagnostic) or bool(args.max6_screen_tail_audit):
+            parser.error(
+                "--max6-screen-exceedance-audit cannot be combined with sampled-max or Top-4096 tail-audit modes"
+            )
+    if bool(args.max6_screen_pot_audit):
+        if not bool(args.dev):
+            parser.error("--max6-screen-pot-audit requires -dev")
+        if str(args.search_backend).lower() != "max6-grmmax6":
+            parser.error("--max6-screen-pot-audit requires --search-backend max6-grmmax6")
+        if str(args.residual_method).lower() != "exact":
+            parser.error("--max6-screen-pot-audit requires exact LMM residualization")
+        if int(args.null_repeats) not in (100, 500):
+            parser.error("--max6-screen-pot-audit requires --null-repeats 100 or 500")
+        pot_pair_sample_seeds = {
+            0x2F6E2B1D6F6E0A11,
+            0x79D23B474A5C19E3,
+            0xA8C590D12E736B45,
+            0xC4E18F2A0B6D9357,
+            0xE75A13C98D42B60F,
+        }
+        if int(args.seed) in pot_pair_sample_seeds:
+            parser.error("POT pair-sample seeds must be separate from --seed/null stream")
+        if (
+            bool(args.sampled_screen_null_diagnostic)
+            or bool(args.max6_screen_tail_audit)
+        ):
+            parser.error(
+                "--max6-screen-pot-audit cannot be combined with sampled-max or Top-4096 tail-audit modes"
+            )
+    if bool(args.max6_screen_tail_support_aware):
+        if not bool(args.max6_screen_tail_audit):
+            parser.error("--max6-screen-tail-support-aware requires --max6-screen-tail-audit")
+        try:
+            support_shares = [
+                int(value.strip())
+                for value in str(args.max6_screen_tail_support_shares).split(",")
+                if value.strip()
+            ]
+        except ValueError as exc:
+            parser.error(f"invalid --max6-screen-tail-support-shares: {exc}")
+        if not support_shares or any(value not in (40, 50, 60) for value in support_shares):
+            parser.error("support-aware shares must be a non-empty subset of 40,50,60")
+        if len(set(support_shares)) != len(support_shares):
+            parser.error("--max6-screen-tail-support-shares must not contain duplicates")
+        args.max6_screen_tail_support_shares_normalized = support_shares
+    else:
+        args.max6_screen_tail_support_shares_normalized = []
+    if str(args.search_backend).lower() == "pair-triple" and not bool(args.dev):
+        parser.error("--search-backend pair-triple requires -dev")
+    if int(args.null_repeats) < 1:
+        parser.error("--null-repeats must be at least 1")
+    if int(args.null_repeats) < 50 and not bool(args.dev):
+        parser.error("--null-repeats below 50 is allowed only with -dev")
+    if int(args.null_repeats) not in (100, 300) and not bool(args.dev):
+        parser.error("--null-repeats must be 100 or 300 outside -dev")
+    if int(args.pcg_max_iter) <= 0:
+        parser.error("--pcg-max-iter must be > 0")
+    if not np.isfinite(float(args.pcg_tol)) or float(args.pcg_tol) <= 0.0:
+        parser.error("--pcg-tol must be finite and > 0")
+    if int(args.pcg_small_n_max) <= 0:
+        parser.error("--pcg-small-n-max must be > 0")
     args.xor_search_requested = bool(args.xor_search)
     args.xor_search = _resolve_garfield_xor_search(args.xor_search_requested)
     try:
@@ -1966,6 +2367,28 @@ def main() -> None:
         ) = _parse_rule_null_penalty_spec(args.rule_permutation_quantile)
     except ValueError as e:
         parser.error(str(e))
+
+    max6_audit_requested = any(
+        (
+            args.sampled_screen_null_diagnostic,
+            args.max6_screen_exceedance_audit,
+            args.max6_screen_pot_audit,
+            args.max6_screen_tail_audit,
+        )
+    )
+    try:
+        args.rule_permutation_runtime = _resolve_garfield_null_resampling(
+            args.search_backend,
+            args.rule_permutation_quantile,
+            max6_audit_requested,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    # Explicit development audits retain their historical null stream.
+    if _is_ld_tag_max6_backend(args.search_backend) and max6_audit_requested:
+        args.rule_null_penalty_method_runtime = "empirical"
+        args.rule_null_quantile_runtime = 0.95
+        args.rule_null_quantile_spec_runtime = "q95"
 
     default_extension = 50_000
     if bool(args.whole_genome):
@@ -2054,6 +2477,11 @@ def main() -> None:
         args.engine = str(args.engine).upper()
     if str(args.scan_mode).lower() == "wholegenome":
         args.engine = "NONE"
+    if _is_ld_tag_max6_backend(args.search_backend):
+        # The production Max6 path is deliberately exhaustive after
+        # genotype-only LD-tag compression. Do not let a stale --engine flag
+        # claim ML prefiltering when Rust bypasses it by construction.
+        args.engine = "NONE"
 
     ml_skip_tokens = {"NONE", "SKIP", "DIRECT"}
     args.ml_top_k_runtime = int(args.width) if args.engine not in ml_skip_tokens else 0
@@ -2079,6 +2507,18 @@ def main() -> None:
 
     gfile, prefix = determine_genotype_source(args)
     out_dir, outprefix, out_stem = apply_output_prefix_compat(args, prefix)
+    if bool(args.max6_screen_exceedance_audit) or bool(args.max6_screen_pot_audit):
+        project_root = Path(__file__).resolve().parents[3]
+        resolved_output_prefix = Path(outprefix).expanduser().resolve()
+        try:
+            resolved_output_prefix.relative_to(project_root)
+        except ValueError:
+            pass
+        else:
+            raise SystemExit(
+                "Max6 null-audit outputs must be outside the JanusX project; "
+                "use /Volumes/data/... or /share/home/jxfu26/benchmark/..."
+            )
     os.makedirs(out_dir, mode=0o755, exist_ok=True)
     configure_genotype_cache_from_out(out_dir)
 
@@ -2133,15 +2573,31 @@ def main() -> None:
         ("Extension", int(args.extension)),
         ("Step", int(args.step)),
         ("Bimrange", None if not args.bimrange else ",".join(str(x) for x in args.bimrange)),
-        ("Split", "none (full data)"),
         ("Engine", "none (skip ML)" if ml_skipped else args.engine),
-        ("Pseudo GWAS", "FvLMM follow-up"),
         ("Structured pruning", not bool(args.no_clean)),
         ("Width", int(args.width)),
-        ("Layer", int(args.layer)),
-        ("Pair seed depth", int(args.exhaustive_depth_runtime)),
         ("Search backend", str(args.search_backend)),
-        ("Rule ranking", rank_schedule_runtime),
+        (
+            "Max6 minimum cell",
+            int(args.min_cell_runtime) if _is_max6_grm_backend(args.search_backend) else None,
+        ),
+        (
+            "Max6 minimum cell fraction",
+            float(args.min_cell_frac) if _is_max6_grm_backend(args.search_backend) else None,
+        ),
+        (
+            "Max6 genotype compression",
+            "exact identity" if args.ld_tag_r2 == 1.0
+            else f"approximate LD r2 >= {args.ld_tag_r2:g}",
+        ),
+        (
+            "Post-screen test",
+            (
+                f"GRM-INT 1df; Max6 Top-{int(args.top_rules_runtime)} per unit; rank by interaction p"
+                if args.grm_int
+                else "GRM-Max6 exact candidate rerank"
+            ),
+        ),
         ("Seed", int(args.seed)),
     ]
 
@@ -2165,6 +2621,11 @@ def main() -> None:
         line_max_chars=_gwas_terminal_config_line_max_chars(60),
     )
     _emit_garfield_command_to_log(logger)
+    if bool(args.dev) and int(args.null_repeats) < 50:
+        logger.warning(
+            "Development run uses fewer than 50 Max6 null replicates; "
+            "threshold/FWER outputs are timing diagnostics only and are not statistically interpretable."
+        )
     # logger.info(
     #     "Rule-ranking resolution: logic_gate=%s, source=%s -> %s",
     #     logic_gate_runtime,
@@ -2196,13 +2657,22 @@ def main() -> None:
 
     aligned_grm = None
     resolved_grm_id = None
+    grm_sample_ids = sample_ids.tolist()
+    grm_index_map = sample_index_map
     if args.grm:
         grm_src = os.path.basename(str(args.grm))
         with CliStatus(f"Loading GRM from {grm_src}...", enabled=use_spinner) as task:
             try:
+                resolved_grm_id = resolve_grm_id_path(str(args.grm))
+                if resolved_grm_id is not None:
+                    available_grm_ids = set(read_id_file(resolved_grm_id))
+                    grm_sample_ids = [sid for sid in sample_ids.tolist() if sid in available_grm_ids]
+                    if not grm_sample_ids:
+                        raise ValueError("No overlapping sample IDs across genotype and GARFIELD GRM.")
+                grm_index_map = {sid: i for i, sid in enumerate(grm_sample_ids)}
                 aligned_grm, resolved_grm_id = load_and_align_grm(
                     str(args.grm),
-                    sample_ids.tolist(),
+                    grm_sample_ids,
                     grm_id_path=None,
                     label="GARFIELD GRM",
                 )
@@ -2233,12 +2703,20 @@ def main() -> None:
     pheno_ids_all = pheno.index.astype(str).to_numpy()
     common = set(geno_ids) & set(pheno_ids_all)
     if aligned_grm is not None:
-        common &= set(geno_ids)
+        common &= set(grm_sample_ids)
     if cov_ids is not None:
         common &= set(cov_ids.astype(str))
     sample_pool = [sid for sid in geno_ids.tolist() if sid in common]
     if len(sample_pool) == 0:
         raise ValueError("No overlapping samples across genotype/phenotype/GRM/cov.")
+    _emit_garfield_file_only_line(
+        logger,
+        f"Sample intersection: retained {len(sample_pool)}/{len(geno_ids)} genotype samples; "
+        f"missing phenotype ID={len(set(geno_ids) - set(pheno_ids_all))}, "
+        f"missing GRM ID={len(set(geno_ids) - set(grm_sample_ids))}, "
+        f"missing covariate ID={0 if cov_ids is None else len(set(geno_ids) - set(cov_ids))} "
+        "(exclusion counts may overlap; nonfinite phenotypes are filtered per trait).",
+    )
 
     cov_index = (
         None
@@ -2264,7 +2742,10 @@ def main() -> None:
     elif args.scan_mode == "wholegenome":
         scan_unit_total = 1
     global_site_keep: Optional[np.ndarray] = None
-    if bool(args.global_stats):
+    use_prepared_max6 = bool(
+        _is_ld_tag_max6_backend(args.search_backend) and not max6_audit_requested
+    )
+    if bool(args.global_stats) and not use_prepared_max6:
         global_site_keep = _prepare_site_keep(
             genofile=gfile,
             sample_ids=list(sample_pool),
@@ -2300,21 +2781,109 @@ def main() -> None:
 
     grm_n: int | str = "NA" if aligned_grm is None else int(aligned_grm.shape[0])
     cov_n: int | str = "NA" if cov_ids is None else int(len(cov_ids))
-    split_line = "-" * 60
-    preface_lines = [
+    prepared_max6_tags = None
+    prepared_max6_universe = None
+    prepared_sample_ids: Optional[list[str]] = None
+    if use_prepared_max6:
+        if (
+            prepare_max6_genotype_tags is None
+            or finalize_max6_genotype_universe is None
+        ):
+            raise RuntimeError(
+                "The installed JanusX native extension does not expose the shared "
+                "Max6 genotype-preparation API; rebuild the extension before using "
+                "the prepared max6-grmmax6 path."
+            ) from _RUST_IMPORT_ERROR
+        prepared_sample_ids = list(sample_pool)
+        prepared_sample_indices = [
+            int(sample_index_map[sid]) for sid in prepared_sample_ids
+        ]
+        prep_groups = (
+            group_intervals
+            if args.scan_mode not in {"window", "wholegenome"}
+            else None
+        )
+        prep_group_names = (
+            group_labels
+            if args.scan_mode not in {"window", "wholegenome"}
+            else None
+        )
+        with CliStatus(
+            MAX6_LD_TAG_LOADING_DESC,
+            enabled=use_spinner,
+            use_process=True,
+        ) as task:
+            try:
+                prepared_max6_tags = prepare_max6_genotype_tags(
+                    str(gfile),
+                    sample_ids=prepared_sample_ids,
+                    sample_indices=prepared_sample_indices,
+                    unit_kind=_scan_mode_to_logic_unit_kind(args.scan_mode),
+                    groups=prep_groups,
+                    group_names=prep_group_names,
+                    ld_tag_r2=float(args.ld_tag_r2),
+                    extension=int(args.extension),
+                    step=int(args.step),
+                    scan_bimranges=args.bimrange,
+                    maf_threshold=float(args.maf),
+                    max_missing_rate=float(args.geno),
+                    het_threshold=float(args.het),
+                    snps_only=False,
+                    threads=int(args.thread),
+                    logic_mem_budget_bytes=int(
+                        max(0.0, float(args.logic_memory_mb)) * 1024.0 * 1024.0
+                    ),
+                )
+            except BaseException:
+                task.fail("Loading Max6 LD tags ...Failed")
+                raise
+            task.complete(
+                "Loading Max6 LD tags "
+                f"(units={int(prepared_max6_tags.unit_count)}, "
+                f"tags={format_max6_count(prepared_max6_tags.tag_count)})...Finished"
+            )
+        with CliStatus(
+            MAX6_BONFERRONI_LOADING_DESC,
+            enabled=use_spinner,
+            use_process=True,
+        ) as task:
+            try:
+                prepared_max6_universe = finalize_max6_genotype_universe(
+                    prepared_max6_tags
+                )
+            except BaseException:
+                task.fail("Preparing the unique-pair Bonferroni family...Failed")
+                raise
+            task.complete(
+                "Unique-pair family ready "
+                f"(N_unique={format_max6_count(prepared_max6_universe.unique_pair_count)})...Finished"
+            )
+        if bool(args.global_stats) and aligned_grm is None:
+            global_site_keep = np.asarray(
+                prepared_max6_universe.global_site_keep,
+                dtype=np.bool_,
+            )
+        prepared_max6_tags = None
+
+    _emit_plain_info_line(
+        logger,
         (
             f"geno={len(geno_ids)}, pheno={len(pheno_ids_all)}, "
             f"grm={grm_n}, q=NA, cov={cov_n} -> {len(sample_pool)}"
-        )
-    ]
+        ),
+        use_spinner=use_spinner,
+    )
+
+    split_line = "-" * 60
     if scan_unit_total is not None and int(scan_unit_total) > 0:
-        preface_lines.append(
-            f"Prepared {int(scan_unit_total)} scan unit(s) for {args.scan_mode} scan."
+        _emit_plain_info_line(
+            logger,
+            f"Prepared {int(scan_unit_total)} scan unit(s) for {args.scan_mode} scan.",
+            use_spinner=use_spinner,
         )
-    preface_lines.append(split_line)
     _emit_plain_info_line(
         logger,
-        "\n".join(preface_lines),
+        split_line,
         use_spinner=use_spinner,
     )
 
@@ -2329,6 +2898,7 @@ def main() -> None:
 
         trait_name = str(trait)
         pheno_col = pheno[trait].dropna()
+        pheno_col = pheno_col[np.isfinite(pheno_col.to_numpy(dtype=float))]
         pheno_ids = set(pheno_col.index.astype(str).to_numpy())
         common_ids = [sid for sid in sample_pool if sid in pheno_ids]
         if len(common_ids) == 0:
@@ -2344,13 +2914,17 @@ def main() -> None:
         _emit_plain_info_line(
             logger,
             (
-                f"{trait_name} (n={len(common_ids)}, response={response_mode}{response_note}, "
-                f"logic_maf={logic_maf_threshold:.4f}, source={logic_maf_source})"
+                f"{trait_name} (n={len(common_ids)}, " #response={response_mode}{response_note},
+                f"logic_maf={logic_maf_threshold:.4f})" # , source={logic_maf_source}
             ),
             use_spinner=use_spinner,
         )
         site_keep_trait = global_site_keep
-        if site_keep_trait is None:
+        if prepared_max6_universe is not None and aligned_grm is not None:
+            # External-GRM Max6 only needs trait-sample QC for the frozen tag
+            # rows; the native consumer performs that bounded source-row QC.
+            site_keep_trait = None
+        elif site_keep_trait is None:
             site_keep_trait = _prepare_site_keep(
                 genofile=gfile,
                 sample_ids=list(common_ids),
@@ -2375,7 +2949,7 @@ def main() -> None:
         trait_grm = None
         if aligned_grm is not None:
             common_positions = np.asarray(
-                [sample_index_map[sid] for sid in common_ids],
+                [grm_index_map[sid] for sid in common_ids],
                 dtype=np.intp,
             )
             trait_grm = np.asarray(
@@ -2398,8 +2972,9 @@ def main() -> None:
         rust_group_names = group_labels if args.scan_mode not in {"window", "wholegenome"} else None
         rust_null_groups = null_group_intervals if args.scan_mode in {"gene", "geneset"} else None
         trait_logic_prefix = f"{trait_outprefix}.garfield"
-        # Rust handles full-data residualization before ML candidate search
-        # and beam search are executed.
+        # Rust handles residualization, genotype-only LD-tag compression,
+        # exhaustive Max6 screening, and the selected GRM-INT or exact
+        # GRM-Max6 scoring route.
         result = _run_scan_with_progress(
             scan_desc,
             use_spinner=use_spinner,
@@ -2455,13 +3030,17 @@ def main() -> None:
                 add_intercept=True,
                 exact_n_max=15000,
                 require_lapack=False,
+                residual_method=str(args.residual_method),
+                pcg_max_iter=int(args.pcg_max_iter),
+                pcg_tol=float(args.pcg_tol),
+                pcg_small_n_max=int(args.pcg_small_n_max),
                 out_prefix=trait_logic_prefix,
                 simbench_path=args.simbench,
                 top_rules_per_unit=int(args.top_rules_runtime),
                 max_output_rules=int(args.max_output_rules_runtime),
                 max_output_ratio=float(args.max_output_ratio_runtime),
                 search_backend=str(args.search_backend),
-                rule_permutation=True,
+                rule_permutation=bool(args.rule_permutation_runtime),
                 prior_len=None,
                 no_clean=bool(args.no_clean),
                 raw_design=bool(args.raw_design),
@@ -2474,9 +3053,35 @@ def main() -> None:
                     max(0.0, float(args.logic_memory_mb)) * 1024.0 * 1024.0
                 ),
                 diagnostics=bool(args.diagnostics),
+                sampled_screen_null_diagnostic=bool(args.sampled_screen_null_diagnostic),
+                max6_screen_exceedance_audit=bool(args.max6_screen_exceedance_audit),
+                max6_screen_pot_audit=bool(args.max6_screen_pot_audit),
+                sampled_screen_pair_seed=int(args.sampled_screen_pair_seed),
+                sampled_screen_pair_seeds=str(args.sampled_screen_pair_seeds_normalized),
+                sampled_screen_maf_cutpoints=str(args.sampled_screen_maf_cutpoints),
+                sampled_screen_r2_cutpoints=str(args.sampled_screen_r2_cutpoints),
+                max6_screen_tail_audit=bool(args.max6_screen_tail_audit),
+                max6_screen_tail_audit_repeats=int(args.max6_screen_tail_audit_repeats),
+                max6_screen_tail_pair_seed=int(args.max6_screen_tail_pair_seed),
+                max6_screen_tail_support_aware=bool(args.max6_screen_tail_support_aware),
+                max6_screen_tail_support_shares=list(args.max6_screen_tail_support_shares_normalized),
+                prepared_max6_universe=prepared_max6_universe,
+                prepared_sample_ids=prepared_sample_ids,
+                grm_int_only=bool(args.grm_int),
+                min_cell=int(args.min_cell_runtime),
+                min_cell_fraction=float(args.min_cell_frac),
+                ld_tag_r2=float(args.ld_tag_r2),
             ),
         )
         rust_memory_debug = result.get("memory_debug")
+        if _is_max6_grm_backend(args.search_backend):
+            _emit_plain_info_line(
+                logger,
+                f"Max6 cell threshold: {result['min_cell_effective']} "
+                f"(count={args.min_cell_runtime}, fraction={args.min_cell_frac:g}, "
+                f"Neff={result['min_cell_neff']})",
+                use_spinner=use_spinner,
+            )
         if _garfield_rss_debug_enabled() and isinstance(rust_memory_debug, dict):
             for stage_name in (
                 "global_bits_loaded",
@@ -2495,6 +3100,376 @@ def main() -> None:
             bg_noise_summary=result.get("bg_noise_summary"),
             use_spinner=use_spinner,
         )
+        grm_int_pwald_reference = (
+            pwald_bonferroni_reference(result.get("max6_pair_universe_size", 0))
+            if args.grm_int
+            else None
+        )
+        if _is_max6_grm_backend(args.search_backend):
+            screen_method = result.get("max6_screen_threshold_method")
+            if _is_ld_tag_max6_backend(args.search_backend) and (
+                args.grm_int or not screen_method
+            ):
+                if args.grm_int:
+                    _emit_garfield_file_only_line(
+                        logger,
+                        (
+                            f"Max6 -> GRM-INT: topk={int(args.top_rules_runtime)} per scan unit; "
+                            "interaction-only one-df FWL score; output ranked by grm_int_chisq; "
+                            "pwald=chi2_1; Bonferroni threshold is a reference only"
+                        ),
+                    )
+                    if grm_int_pwald_reference is not None:
+                        _emit_garfield_file_only_line(
+                            logger,
+                            (
+                                "GRM-INT pwald Bonferroni reference line: "
+                                f"N_unique={format_max6_count(grm_int_pwald_reference['n_unique_pairs'])}, "
+                                f"alpha={grm_int_pwald_reference['alpha']:.3g}, "
+                                f"p_cut={grm_int_pwald_reference['p_cut']:.6g}, "
+                                f"-log10(p_cut)={grm_int_pwald_reference['minus_log10_p_cut']:.3f}; "
+                                "one chi-square(1) test per unique pair; not applied to output"
+                            ),
+                        )
+                else:
+                    _emit_garfield_file_only_line(
+                        logger,
+                        (
+                            "GRM-Max6 pwald Bonferroni reference line: "
+                            f"N_unique={format_max6_count(result.get('max6_pair_universe_size', 0))}, "
+                            f"m={int(result.get('max6_bonferroni_channel_count', 0))}, "
+                            f"alpha={result.get('max6_bonferroni_alpha')}, "
+                            f"p_cut={result.get('max6_bonferroni_p_cut')}; "
+                            "pair column=pwald; "
+                            "screen=deterministic Top-5000; null calibration=inactive"
+                        ),
+                    )
+            elif screen_method:
+                _emit_garfield_file_only_line(
+                    logger,
+                    (
+                        "Max6 screen operational threshold: "
+                        f"quantile={_format_max6_score_value(args.rule_null_quantile_runtime)}, "
+                        f"empirical_q={_format_max6_score_value(result.get('max6_screen_threshold'))}, "
+                        f"gumbel_diagnostic_q={_format_max6_score_value(result.get('max6_gumbel_score_threshold'))}, "
+                        f"null_repeats={int(result.get('max6_screen_null_repeats', 0))}, "
+                        f"pair_universe_unique={format_max6_count(result.get('max6_screen_pair_universe_size', 0))}, "
+                        f"window_pair_occurrences={int(result.get('max6_screen_window_pair_occurrences', 0))}, "
+                        f"calibration={float(result.get('timing_max6_screen_calibration_wall_s', 0.0)):.3f}s "
+                        f"({float(result.get('timing_max6_screen_calibration_wall_s', 0.0)) / max(1, int(result.get('max6_screen_null_repeats', 0))):.6f}s/null), "
+                        f"validation={float(result.get('timing_max6_screen_validation_wall_s', 0.0)):.3f}s "
+                        f"({float(result.get('timing_max6_screen_validation_wall_s', 0.0)) / max(1, int(result.get('max6_screen_validation_repeats', 0))):.6f}s/null), "
+                        f"screen_candidates={int(result.get('max6_screen_candidate_count', 0))}; "
+                        f"validation={int(result.get('max6_screen_validation_rejections', 0))}/"
+                        f"{int(result.get('max6_screen_validation_repeats', 0))} null maxima, "
+                        f"FWER={_format_max6_score_value(result.get('max6_screen_validation_fwer'))}, "
+                        f"95% exact CI=[{_format_max6_score_value(result.get('max6_screen_validation_ci_lower'))}, "
+                        f"{_format_max6_score_value(result.get('max6_screen_validation_ci_upper'))}]; "
+                        f"D_final subset audit={'PASS' if result.get('max6_final_screen_subset_audit_passed') else 'NOT PASS'}, "
+                        f"checked={int(result.get('max6_final_screen_subset_audit_pairs_checked', 0))}, "
+                        f"violations={int(result.get('max6_final_screen_subset_audit_violations', 0))}; "
+                        "scope=weak_global_null; final_output=subset_of_screen_pass; "
+                        f"calibration_maxima={result.get('max6_screen_maxima_tsv') or 'not saved (enable --diagnostics)'}, "
+                        f"validation_maxima={result.get('max6_screen_validation_maxima_tsv') or 'not saved (enable --diagnostics)'}"
+                    ),
+                )
+            if result.get("max6_screen_exceedance_audit_manifest_json"):
+                _emit_garfield_file_only_line(
+                    logger,
+                    (
+                        "Max6 weighted exceedance audit completed using paired full-MaxT calibration nulls; "
+                        f"wall={float(result.get('timing_max6_screen_exceedance_audit_wall_s', 0.0)):.3f}s, "
+                        f"manifest={result.get('max6_screen_exceedance_audit_manifest_json')}"
+                    ),
+                )
+            if result.get("max6_screen_pot_audit_manifest_json"):
+                _emit_garfield_file_only_line(
+                    logger,
+                    (
+                        "Max6 marginal POT sample audit completed using calibration nulls; "
+                        f"wall={float(result.get('timing_max6_screen_pot_audit_wall_s', 0.0)):.3f}s, "
+                        f"manifest={result.get('max6_screen_pot_audit_manifest_json')}"
+                    ),
+                )
+            if not _is_ld_tag_max6_backend(args.search_backend):
+                _emit_garfield_file_only_line(
+                    logger,
+                    (
+                        "Max6 -> GRM-Max6 legacy threshold: "
+                        f"quantile={_format_max6_score_value(args.rule_null_quantile_runtime)}, "
+                        f"empirical_q={_format_max6_score_value(result.get('max6_score_threshold'))}, "
+                        f"gumbel_moment_q={_format_max6_score_value(result.get('max6_gumbel_score_threshold'))}, "
+                        f"n_permutations={int(result.get('permutation_null_repeats', 0))}, "
+                        f"pairs_per_permutation={int(result.get('max6_permutation_pairs_per_repeat', 0))}, "
+                        f"pair_pool={int(result.get('max6_permutation_pair_pool_size', 0))}, "
+                        f"n_max_scores={int(result.get('max6_permutation_score_count', 0))}; "
+                        "legacy threshold=empirical order statistic; "
+                        f"maxima={result.get('max6_permutation_maxima_tsv') or 'not saved (enable --diagnostics)'}"
+                    ),
+                )
+            if _is_ld_tag_max6_backend(args.search_backend):
+                _emit_garfield_file_only_line(
+                    logger,
+                    (
+                        "Max6 pair universe: genotype-tag exhaustive; "
+                        f"compression={result.get('max6_ld_tag_mode')}; "
+                        f"r2_threshold={result.get('max6_ld_tag_r2')}, "
+                        f"tag_map={result.get('max6_ld_tags_tsv') or 'not written'}"
+                    ),
+                )
+            if _is_max6_grm_backend(args.search_backend) and int(
+                result.get("max6_observed_units_timed", 0)
+            ):
+                observed_rerank_stages = [
+                    (
+                        "endpoint_prepare",
+                        float(result.get("timing_max6_observed_rerank_endpoint_prepare_task_sum_s", 0.0)),
+                    ),
+                    (
+                        "PCX",
+                        float(result.get("timing_max6_observed_rerank_pcx_task_sum_s", 0.0)),
+                    ),
+                    (
+                        "candidate_geometry",
+                        float(result.get("timing_max6_observed_rerank_geometry_task_sum_s", 0.0)),
+                    ),
+                    (
+                        "mincell_q",
+                        float(result.get("timing_max6_observed_rerank_q_task_sum_s", 0.0)),
+                    ),
+                    (
+                        "score_assembly",
+                        float(result.get("timing_max6_observed_rerank_score_task_sum_s", 0.0)),
+                    ),
+                    (
+                        "Top-K",
+                        float(result.get("timing_max6_observed_rerank_topk_task_sum_s", 0.0)),
+                    ),
+                    (
+                        "other",
+                        float(result.get("timing_max6_observed_rerank_other_task_sum_s", 0.0)),
+                    ),
+                ]
+                dominant_stage, dominant_seconds = max(
+                    observed_rerank_stages, key=lambda item: item[1]
+                )
+                rerank_task_sum = sum(value for _, value in observed_rerank_stages)
+                dominant_share = (
+                    100.0 * dominant_seconds / rerank_task_sum
+                    if rerank_task_sum > 0.0
+                    else 0.0
+                )
+                if args.grm_int:
+                    observed_score_summary = (
+                        "GRM-INT_score_task_sum="
+                        f"{float(result.get('timing_max6_observed_grm_int_task_sum_s', 0.0)):.3f}s, "
+                        f"batches={int(result.get('max6_observed_grm_int_batches', 0))}, "
+                        "invalid_singular="
+                        f"{int(result.get('max6_observed_grm_int_singular_endpoint_design_pairs', 0))}, "
+                        "invalid_no_interaction_info="
+                        f"{int(result.get('max6_observed_grm_int_negligible_interaction_information_pairs', 0))}, "
+                        "invalid_nonfinite="
+                        f"{int(result.get('max6_observed_grm_int_nonfinite_pairs', 0))}"
+                    )
+                    scored_candidate_count = int(
+                        result.get("max6_observed_grm_int_pair_occurrences", 0)
+                    )
+                    scored_candidate_label = "GRM-INT_scored_occurrences"
+                else:
+                    observed_score_summary = (
+                        f"exact_rerank_task_sum={float(result.get('timing_max6_observed_rerank_kernel_task_sum_s', 0.0)):.3f}s "
+                        f"[endpoint={observed_rerank_stages[0][1]:.3f}s, "
+                        f"PCX={observed_rerank_stages[1][1]:.3f}s, "
+                        f"geometry={observed_rerank_stages[2][1]:.3f}s, "
+                        f"q={observed_rerank_stages[3][1]:.3f}s "
+                        f"(P_C validation={float(result.get('timing_max6_observed_rerank_q_validation_task_sum_s', 0.0)):.3f}s, "
+                        f"quadratic={float(result.get('timing_max6_observed_rerank_q_quadratic_task_sum_s', 0.0)):.3f}s), "
+                        f"geometry_detail(marker_moments={float(result.get('timing_max6_observed_rerank_geometry_marker_moments_task_sum_s', 0.0)):.3f}s, "
+                        f"pairwise={float(result.get('timing_max6_observed_rerank_geometry_pairwise_task_sum_s', 0.0)):.3f}s, "
+                        f"lookup={float(result.get('timing_max6_observed_rerank_geometry_lookup_task_sum_s', 0.0)):.3f}s, "
+                        f"interaction_py={float(result.get('timing_max6_observed_rerank_geometry_interaction_py_task_sum_s', 0.0)):.3f}s, "
+                        f"fused_AU_Py={float(result.get('timing_max6_observed_au_fused_py_task_sum_s', 0.0)):.3f}s (included in pairwise if selected), "
+                        f"unclassified={float(result.get('timing_max6_observed_rerank_geometry_unclassified_task_sum_s', 0.0)):.3f}s), "
+                        f"score={observed_rerank_stages[4][1]:.3f}s, "
+                        f"Top-K={observed_rerank_stages[5][1]:.3f}s, "
+                        f"other={observed_rerank_stages[6][1]:.3f}s]; "
+                        f"largest={dominant_stage} ({dominant_share:.1f}% of measured rerank stages)"
+                    )
+                    scored_candidate_count = int(
+                        result.get("max6_observed_exact_candidate_pairs", 0)
+                    )
+                    scored_candidate_label = "exact_scored_occurrences"
+                _emit_garfield_file_only_line(
+                    logger,
+                    (
+                        f"Observed Max6 -> {'GRM-INT' if args.grm_int else 'GRM-Max6'} timing (summed window-task elapsed time; "
+                        "parallel stages overlap): "
+                        f"scan_wall={float(result.get('timing_scan_wall_s', 0.0)):.3f}s, "
+                        f"windows={int(result.get('max6_observed_units_timed', 0))}, "
+                        f"screen_candidates={int(result.get('max6_observed_screen_candidate_pairs', 0))}, "
+                        f"screen_batches={int(result.get('max6_observed_screen_batch_count', 0))}, "
+                        f"batch_unique_pairs={int(result.get('max6_observed_screen_batch_unique_scored_pairs', 0))}, "
+                        f"batch_score_offers={int(result.get('max6_observed_screen_batch_score_offers', 0))}, "
+                        f"batch_direct_fallbacks={int(result.get('max6_observed_screen_batch_direct_fallbacks', 0))}; "
+                        f"{scored_candidate_label}={scored_candidate_count}; "
+                        f"screen_input={float(result.get('timing_max6_observed_screen_input_prepare_task_sum_s', 0.0)):.3f}s, "
+                        f"Max6_screen={float(result.get('timing_max6_observed_screen_kernel_task_sum_s', 0.0)):.3f}s, "
+                        f"candidate_setup={float(result.get('timing_max6_observed_candidate_prepare_task_sum_s', 0.0)):.3f}s, "
+                        f"{observed_score_summary}; "
+                        f"output_finalize={float(result.get('timing_max6_observed_output_finalize_task_sum_s', 0.0)):.3f}s"
+                    ),
+                )
+                batch_count = int(result.get("max6_observed_screen_batch_count", 0))
+                if batch_count and "timing_max6_batch_pair_scan_merge_wall_s" in result:
+                    wall_stages = {
+                        name: float(result.get(f"timing_max6_batch_{name}_wall_s", 0.0))
+                        for name in (
+                            "batch_prepare", "membership_prepare", "pair_scan_merge",
+                            "finalists", "grm_int", "result_drain",
+                        )
+                    }
+                    accounted_wall = sum(wall_stages.values())
+                    scan_wall = float(result.get("timing_scan_wall_s", 0.0))
+                    _emit_garfield_file_only_line(
+                        logger,
+                        "Max6 batch phase timing (disjoint wall spans): "
+                        + ", ".join(f"{name}={seconds:.3f}s" for name, seconds in wall_stages.items())
+                        + f"; accounted={accounted_wall:.3f}s, scan_wall={scan_wall:.3f}s, "
+                        + f"unaccounted={scan_wall - accounted_wall:.3f}s; "
+                        + "heap_merge_task_sum="
+                        + f"{float(result.get('timing_max6_batch_heap_merge_task_sum_s', 0.0)):.3f}s "
+                        + "(overlaps pair_scan_merge; not additive); "
+                        + f"parallel_batches={int(result.get('max6_batch_parallel_count', 0))}, "
+                        + f"serial_batches={int(result.get('max6_batch_serial_count', 0))}, "
+                        + f"shared_path_source_rows_sum={int(result.get('max6_batch_source_rows_sum', 0))}, "
+                        + f"source_rows_max={int(result.get('max6_batch_source_rows_max', 0))}, "
+                        + f"memberships_sum={int(result.get('max6_batch_memberships_sum', 0))}; "
+                        + "direct fallback timing includes its per-unit prepare/finalize work; "
+                        + "grm_int wall includes unit setup/finalization; "
+                        + "result_drain includes four-cell recount, TSV writes and progress callbacks",
+                    )
+                batch_profiles = result.get("max6_batch_scan_profiles") or []
+                if batch_profiles:
+                    def _batch_quantile(values, probability):
+                        ordered = sorted(float(value) for value in values)
+                        if not ordered:
+                            return float("nan")
+                        index = max(
+                            0,
+                            min(len(ordered) - 1, int(np.ceil(probability * len(ordered))) - 1),
+                        )
+                        return ordered[index]
+
+                    tail_values = [row[11] for row in batch_profiles]
+                    skew_values = [row[10] for row in batch_profiles]
+                    fold_max_values = [row[3] for row in batch_profiles]
+                    merge_path_values = [row[15] for row in batch_profiles]
+                    scan_reduce_path_values = [row[16] for row in batch_profiles]
+                    anchor_imbalance = [row[5] / row[4] for row in batch_profiles if row[4] > 0]
+                    worker_imbalance = [row[9] / row[7] for row in batch_profiles if row[7] > 0]
+                    topk_merge_task_sum = sum(row[12] for row in batch_profiles)
+                    topk_merge_wall_max = max(row[13] for row in batch_profiles)
+                    topk_merge_count = sum(int(row[14]) for row in batch_profiles)
+                    _emit_garfield_file_only_line(
+                        logger,
+                        "Max6 batch worker/Top-K diagnostics (per-batch p50/p95/max): "
+                        + f"post_last_fold_tail={_batch_quantile(tail_values, .50):.4f}/"
+                        + f"{_batch_quantile(tail_values, .95):.4f}/{max(tail_values):.4f}s, "
+                        + f"worker_finish_skew={_batch_quantile(skew_values, .50):.4f}/"
+                        + f"{_batch_quantile(skew_values, .95):.4f}/{max(skew_values):.4f}s, "
+                        + f"fold_task_max={_batch_quantile(fold_max_values, .50):.4f}/"
+                        + f"{_batch_quantile(fold_max_values, .95):.4f}/{max(fold_max_values):.4f}s, "
+                        + f"fold_anchor_max/min_ratio={_batch_quantile(anchor_imbalance, .50):.2f}/"
+                        + f"{_batch_quantile(anchor_imbalance, .95):.2f}/{max(anchor_imbalance, default=float('nan')):.2f}, "
+                        + f"worker_task_wall_max/min_ratio={_batch_quantile(worker_imbalance, .50):.2f}/"
+                        + f"{_batch_quantile(worker_imbalance, .95):.2f}/{max(worker_imbalance, default=float('nan')):.2f}, "
+                        + f"TopK_merge_critical_path={_batch_quantile(merge_path_values, .50):.4f}/"
+                        + f"{_batch_quantile(merge_path_values, .95):.4f}/{max(merge_path_values):.4f}s, "
+                        + f"scan_plus_merge_critical_path={_batch_quantile(scan_reduce_path_values, .50):.4f}/"
+                        + f"{_batch_quantile(scan_reduce_path_values, .95):.4f}/{max(scan_reduce_path_values):.4f}s; "
+                        + f"TopK_merge_task_sum={topk_merge_task_sum:.3f}s, "
+                        + f"max_merge_call={topk_merge_wall_max:.6f}s, calls={topk_merge_count}; "
+                        + "fold and Top-K task sums overlap wall time",
+                    )
+                reuse_diagnostic = result.get("max6_candidate_reuse_diagnostic")
+                if isinstance(reuse_diagnostic, dict) and reuse_diagnostic.get("enabled"):
+                    screen_profile = reuse_diagnostic.get("screen_microprofile") or {}
+                    _emit_garfield_file_only_line(
+                        logger,
+                        (
+                            "Max6 candidate-reuse diagnostic: "
+                            f"screen_pairs={int(reuse_diagnostic.get('screen_pairs_evaluated', 0))}, "
+                            f"screen={float(reuse_diagnostic.get('screen_kernel_task_seconds', 0.0)):.3f}s "
+                            f"({float(reuse_diagnostic.get('screen_kernel_nanoseconds_per_evaluated_pair', 0.0)):.1f} ns/evaluated pair); "
+                            f"scored_occurrences={int(reuse_diagnostic.get('scored_candidate_pair_occurrences', 0))}, "
+                            f"global_unique_pairs={int(reuse_diagnostic.get('global_unique_scored_pairs', 0))}, "
+                            f"cross_window_duplicate_fraction={float(reuse_diagnostic.get('duplicate_fraction_of_scored_occurrences', 0.0)):.3%}, "
+                            f"pair_multiplicity p50/p90/p99/max="
+                            f"{int(reuse_diagnostic.get('pair_multiplicity_p50', 0))}/"
+                            f"{int(reuse_diagnostic.get('pair_multiplicity_p90', 0))}/"
+                            f"{int(reuse_diagnostic.get('pair_multiplicity_p99', 0))}/"
+                            f"{int(reuse_diagnostic.get('pair_multiplicity_max', 0))}; "
+                            f"endpoint reuse={float(reuse_diagnostic.get('endpoint_reuse_factor', 0.0)):.3f}x, "
+                            f"pair-key buffer={int(reuse_diagnostic.get('candidate_pair_key_buffer_bytes', 0)) / (1024 * 1024):.1f} MiB, "
+                            f"dedup={float(reuse_diagnostic.get('candidate_key_sort_and_summary_wall_seconds', 0.0)):.3f}s; "
+                            f"screen profile={int(screen_profile.get('profiled_windows', 0))} windows/"
+                            f"{int(screen_profile.get('sampled_pairs', 0))} sampled pairs, "
+                            f"bitset={float((screen_profile.get('stage_seconds') or {}).get('bitset_intersection_popcount_seconds', 0.0)):.3f}s, "
+                            f"weighted-y={float((screen_profile.get('stage_seconds') or {}).get('weighted_y_lookup_seconds', 0.0)):.3f}s, "
+                            f"score={float((screen_profile.get('stage_seconds') or {}).get('score_assembly_seconds', 0.0)):.3f}s, "
+                            f"heap={float((screen_profile.get('stage_seconds') or {}).get('heap_topk_seconds', 0.0)):.3f}s"
+                        ),
+                    )
+                au_kernel = os.environ.get(
+                    "JX_GARFIELD_EXPERIMENTAL_CANDIDATE_AU_KERNEL", "reference"
+                )
+                if au_kernel != "reference":
+                    _emit_garfield_file_only_line(
+                        logger,
+                        (
+                            f"Experimental candidate A/U kernel={au_kernel}; "
+                            f"allocation={float(result.get('timing_max6_observed_au_allocation_task_sum_s', 0.0)):.3f}s, "
+                            f"X_times_Z={float(result.get('timing_max6_observed_au_materialization_task_sum_s', 0.0)):.3f}s, "
+                            f"A/H_GEMM={float(result.get('timing_max6_observed_au_gemm_task_sum_s', 0.0)):.3f}s, "
+                            f"candidate_lookup={float(result.get('timing_max6_observed_au_candidate_lookup_task_sum_s', 0.0)):.3f}s, "
+                            f"copy={float(result.get('timing_max6_observed_au_copy_task_sum_s', 0.0)):.3f}s, "
+                            f"validation={float(result.get('timing_max6_observed_au_validation_task_sum_s', 0.0)):.3f}s, "
+                            f"max_extra_workspace={int(result.get('timing_max6_observed_au_max_workspace_bytes', 0))} bytes"
+                        ),
+                    )
+            if not screen_method and not _is_ld_tag_max6_backend(args.search_backend):
+                _emit_garfield_file_only_line(
+                    logger,
+                    (
+                        "Max6 permutation timing (wall / summed task time): "
+                        f"setup={_format_max6_score_value(result.get('timing_max6_permutation_setup_wall_s'))}s, "
+                        f"score_wall={_format_max6_score_value(result.get('timing_max6_permutation_score_wall_s'))}s, "
+                        f"project_PCy={_format_max6_score_value(result.get('timing_max6_permutation_projected_y_task_sum_s'))}s, "
+                        f"endpoint_prepare={_format_max6_score_value(result.get('timing_max6_permutation_endpoint_prepare_task_sum_s'))}s, "
+                        f"rerank={_format_max6_score_value(result.get('timing_max6_permutation_rerank_kernel_task_sum_s'))}s "
+                        "[PCX="
+                        f"{_format_max6_score_value(result.get('timing_max6_permutation_rerank_pcx_task_sum_s'))}s, "
+                        f"geometry={_format_max6_score_value(result.get('timing_max6_permutation_rerank_geometry_task_sum_s'))}s, "
+                        f"q={_format_max6_score_value(result.get('timing_max6_permutation_rerank_q_task_sum_s'))}s, "
+                        f"score={_format_max6_score_value(result.get('timing_max6_permutation_rerank_score_task_sum_s'))}s, "
+                        f"topk={_format_max6_score_value(result.get('timing_max6_permutation_rerank_topk_task_sum_s'))}s, "
+                        f"other={_format_max6_score_value(result.get('timing_max6_permutation_rerank_other_task_sum_s'))}s], "
+                        f"threshold={_format_max6_score_value(result.get('timing_max6_permutation_threshold_wall_s'))}s, "
+                        f"maxima_write={_format_max6_score_value(result.get('timing_max6_permutation_maxima_write_wall_s'))}s; "
+                        f"pair_score_calls={int(result.get('timing_max6_permutation_pair_score_count', 0))}"
+                    ),
+                )
+            _emit_garfield_file_only_line(
+                logger,
+                (
+                    "Max6 -> GRM-Max6 score scale: "
+                    f"sigma_g2={_format_max6_score_value(result.get('full_sigma_g2'))}, "
+                    f"scale=1/sigma_g2={_format_max6_score_value(result.get('max6_score_scale'))}, "
+                    "source=inverse_sigma_g2; "
+                    f"scope={'conditional_interaction' if args.grm_int else 'exact_channels'}; "
+                    "screen=raw_Max6_proposal_score"
+                ),
+            )
 
         pseudo_path = f"{trait_logic_prefix}.pseudo"
         posterior_tsv_path = f"{trait_logic_prefix}.posterior.tsv"
@@ -2529,11 +3504,64 @@ def main() -> None:
             for msg in skipped_messages:
                 _emit_garfield_file_only_line(logger, str(msg))
         n_rules = int(result.get("n_rules", 0))
+        # The Max6 -> GRM-Max6 backend emits pair results rather than legacy
+        # beam-rule records.  Keep the existing control flow alive for log
+        # and manifest generation without pretending that pair rows are beam
+        # rules.
+        if n_rules <= 0 and result.get("max6_pairs_tsv"):
+            n_rules = int(result.get("max6_pair_count", 0))
         if n_rules <= 0:
             _remove_file_if_exists(pseudo_path)
             _remove_file_if_exists(posterior_tsv_path)
             _remove_file_if_exists(run_config_path)
             _remove_file_if_exists(posterior_json_path)
+            sampled_maxima_path = result.get("max6_screen_sampled_maxima_tsv")
+            if (
+                (bool(args.sampled_screen_null_diagnostic) and sampled_maxima_path)
+                or bool(args.max6_screen_tail_audit)
+                or bool(args.max6_screen_exceedance_audit)
+                or bool(args.max6_screen_pot_audit)
+            ):
+                sampled_paths = [
+                    sampled_maxima_path,
+                    result.get("max6_screen_sample_manifest_json"),
+                    result.get("max6_screen_sample_strata_tsv"),
+                    result.get("max6_screen_full_maximizer_geometry_tsv"),
+                    result.get("max6_screen_tail_top_pairs_tsv"),
+                    result.get("max6_screen_tail_sampled_ranks_tsv"),
+                    result.get("max6_screen_tail_summary_json"),
+                    result.get("max6_screen_tail_support_aware_maxima_tsv"),
+                    result.get("max6_screen_tail_support_aware_strata_tsv"),
+                    result.get("max6_screen_tail_support_aware_summary_json"),
+                    result.get("max6_screen_exceedance_audit_per_null_tsv"),
+                    result.get("max6_screen_exceedance_audit_summary_tsv"),
+                    result.get("max6_screen_exceedance_audit_top_pairs_tsv"),
+                    result.get("max6_screen_exceedance_audit_manifest_json"),
+                    result.get("max6_screen_pot_audit_manifest_json"),
+                    result.get("max6_screen_pot_sample_scores_manifest_json"),
+                    result.get("max6_screen_maxima_tsv"),
+                    result.get("max6_screen_validation_maxima_tsv"),
+                ]
+                _emit_garfield_saved_paths(
+                    logger,
+                    sampled_paths,
+                    use_spinner=use_spinner,
+                )
+                _emit_garfield_file_only_line(
+                    logger,
+                    "No observed pair passed the unchanged production screen threshold; "
+                    "the opt-in null audit completed independently.",
+                )
+                summary_rows.append(
+                    {
+                        "trait": trait_name,
+                        "n_samples": len(common_ids),
+                        "best_score": float("nan"),
+                        "route": "rust-bed-sampled-diagnostic",
+                    }
+                )
+                saved += 1
+                continue
             logger.warning(f"No GARFIELD rules survived Rust search for trait '{trait_name}', skipped.")
             continue
 
@@ -2569,7 +3597,8 @@ def main() -> None:
                         use_spinner=use_spinner,
                     )
                 common_positions = np.asarray(
-                    [sample_index_map[sid] for sid in common_ids],
+                    [(grm_index_map if aligned_grm is not None else sample_index_map)[sid]
+                     for sid in common_ids],
                     dtype=np.intp,
                 )
                 trait_grm_followup = np.asarray(
@@ -2609,11 +3638,6 @@ def main() -> None:
                     "follow-up",
                     followup_memory_debug,
                 )
-        elif not pseudo_prefix:
-            logger.warning(
-                "GARFIELD pseudo follow-up skipped for '%s' because pseudo BED is missing.",
-                trait_name,
-            )
         _remove_file_if_exists(run_config_path)
         _remove_file_if_exists(posterior_json_path)
         trait_memory_debug = (
@@ -2629,6 +3653,10 @@ def main() -> None:
             "garfield_prefix": trait_logic_prefix,
             "pseudo_prefix": pseudo_prefix,
             "route": "rust-bed",
+            "min_cell": int(args.min_cell_runtime),
+            "min_cell_fraction": float(args.min_cell_frac),
+            "min_cell_effective": result.get("min_cell_effective"),
+            "min_cell_neff": result.get("min_cell_neff"),
             "evaluation_mode": str(result.get("evaluation_mode", "full_exploratory")),
             "scan_mode": args.scan_mode,
             "unit_kind": logic_unit_kind,
@@ -2636,22 +3664,79 @@ def main() -> None:
             "engine": args.engine,
             "engine_runtime": engine_runtime,
             "ml_skipped": ml_skipped,
-            # Keep the historical flag for downstream readers, but make its
-            # scope explicit: it calibrates rule-null penalties rather than
-            # representing an independent train/test validation split.
-            "permutation": bool(result.get("rule_permutation_active", False)),
-            "permutation_scope": "rule_null_penalty",
-            "null_generation": str(
-                result.get("rule_null_generation", "lmm_parametric_bootstrap")
+            # Keep the historical flag for downstream readers.
+            "permutation": (
+                bool(result.get("rule_permutation_active", False))
+                and not _is_ld_tag_max6_backend(args.search_backend)
+                and not args.grm_int
             ),
-            "rule_null_penalty_method": str(args.rule_null_penalty_method_runtime),
-            "rule_null_quantile": float(args.rule_null_quantile_runtime),
+            "permutation_scope": (
+                None
+                if _is_ld_tag_max6_backend(args.search_backend) or args.grm_int
+                else "global_pair_score_threshold"
+                if _is_max6_grm_backend(args.search_backend)
+                else "rule_null_penalty"
+            ),
+            "null_calibration_scope": (
+                "screen_maxT_weak_global_null"
+                if _is_ld_tag_max6_backend(args.search_backend)
+                and args.rule_permutation_runtime
+                else None
+            ),
+            "null_generation": (
+                (
+                    "lmm_parametric_bootstrap_max6_screen"
+                    if args.rule_permutation_runtime
+                    else None
+                )
+                if _is_ld_tag_max6_backend(args.search_backend)
+                else None
+                if _is_max6_grm_backend(args.search_backend) and args.grm_int
+                else "global_pair_score_permutation_fixed_pc"
+                if _is_max6_grm_backend(args.search_backend)
+                else str(result.get("rule_null_generation", "lmm_parametric_bootstrap"))
+            ),
+            "operational_fwer_scope": (
+                "weak_global_null_screen_subset"
+                if _is_ld_tag_max6_backend(args.search_backend)
+                and args.rule_permutation_runtime
+                else None
+            ),
+            "residual_method": str(result.get("residualization_method", args.residual_method)),
+            "lambda_source": str(result.get("lambda_source", "NA")),
+            "no_grm_boundary": bool(result.get("no_grm_boundary", False)),
+            "lambda_boundary_policy": str(
+                result.get("lambda_boundary_policy", "finite_reml_lambda")
+            ),
+            "lambda_vc": float(result.get("lambda_vc", float("nan"))),
+            "lambda_marker": float(result.get("lambda_marker", float("nan"))),
+            "residual_marker_count": int(result.get("residual_marker_count", 0)),
+            "pcg_converged": bool(result.get("pcg_converged", True)),
+            "pcg_iters": int(result.get("pcg_iters", 0)),
+            "pcg_rel_res": float(result.get("pcg_rel_res", 0.0)),
+            "lambda_converged": bool(result.get("lambda_converged", True)),
+            "lambda_iters": int(result.get("lambda_iters", 0)),
+            "lambda_rel_res": float(result.get("lambda_rel_res", 0.0)),
+            "rule_null_penalty_method": (
+                None if _is_ld_tag_max6_backend(args.search_backend)
+                and not args.rule_permutation_runtime
+                else str(args.rule_null_penalty_method_runtime)
+            ),
+            "rule_null_quantile": (
+                None if _is_ld_tag_max6_backend(args.search_backend)
+                and not args.rule_permutation_runtime
+                else float(args.rule_null_quantile_runtime)
+            ),
             "rule_null_report_pvalue": bool(args.rule_null_report_pvalue_runtime),
             "rule_null_quantile_spec": args.rule_null_quantile_spec_runtime,
             "bg_noise_summary": result.get("bg_noise_summary"),
             "scheduler_scan": result.get("scheduler_scan"),
             "scheduler_permutation": result.get("scheduler_permutation"),
             "rule_permutation_active": bool(result.get("rule_permutation_active", False)),
+            "null_calibration_active": bool(
+                result.get("max6_screen_null_repeats", 0)
+                or result.get("rule_permutation_active", False)
+            ),
             "null_chunk_bp": int(result.get("null_chunk_bp", 0)),
             "null_chunk_min_snps": int(result.get("null_chunk_min_snps", 0)),
             "null_chunk_target": int(result.get("null_chunk_target", 0)),
@@ -2670,8 +3755,294 @@ def main() -> None:
             "layer": int(args.layer),
             "pair_seed_depth": int(args.exhaustive_depth_runtime),
             "search_backend": str(args.search_backend),
+            "grm_int_mode_source": str(args.grm_int_mode_source),
+            **(
+                {
+                    "grm_int_only": True,
+                    "grm_int_test": "one_df_FWL_g1xg2_adjusted_for_g1_g2_covariates_GRM",
+                    "grm_int_pvalue_calibration": "nominal_chi2_1_after_Max6_selection_unadjusted",
+                    "pwald_bonferroni_reference": grm_int_pwald_reference,
+                    "pwald_bonferroni_reference_applied": False,
+                    "pwald_bonferroni_reference_method": (
+                        "alpha_over_full_unique_pair_universe_one_df_chi2"
+                    ),
+                    "grm_int_screen_source": "Max6 proposal score; exact requested Top-K per scan unit",
+                    "grm_int_best_channel_source": "winning gate from the Max6 screen",
+                    "grm_int_output_order": "conditional GRM-INT chi-square(1) within selected Top-K",
+                    "grm_int_screen_threshold_applied": False,
+                }
+                if args.grm_int
+                else {}
+            ),
+            "max6_pairs_tsv": result.get("max6_pairs_tsv"),
+            "max6_pairs_provenance_tsv": result.get("max6_pairs_provenance_tsv"),
+            "max6_ld_tags_tsv": result.get("max6_ld_tags_tsv"),
+            "max6_ld_tag_r2": result.get("max6_ld_tag_r2"),
+            "max6_ld_tag_mode": result.get("max6_ld_tag_mode"),
+            "max6_pair_universe": (
+                "ld_tag_pairs"
+                if _is_ld_tag_max6_backend(args.search_backend)
+                else "legacy_ml_prefilter_pairs"
+            ),
+            "max6_threshold_tsv": result.get("max6_threshold_tsv"),
+            "max6_screen_maxima_tsv": result.get("max6_screen_maxima_tsv"),
+            "max6_screen_validation_maxima_tsv": result.get(
+                "max6_screen_validation_maxima_tsv"
+            ),
+            "max6_screen_exceedance_audit": bool(args.max6_screen_exceedance_audit),
+            "max6_screen_exceedance_audit_per_null_tsv": result.get(
+                "max6_screen_exceedance_audit_per_null_tsv"
+            ),
+            "max6_screen_exceedance_audit_summary_tsv": result.get(
+                "max6_screen_exceedance_audit_summary_tsv"
+            ),
+            "max6_screen_exceedance_audit_top_pairs_tsv": result.get(
+                "max6_screen_exceedance_audit_top_pairs_tsv"
+            ),
+            "max6_screen_exceedance_audit_manifest_json": result.get(
+                "max6_screen_exceedance_audit_manifest_json"
+            ),
+            "max6_screen_pot_audit": bool(args.max6_screen_pot_audit),
+            "max6_screen_pot_audit_manifest_json": result.get(
+                "max6_screen_pot_audit_manifest_json"
+            ),
+            "max6_screen_pot_sample_scores_manifest_json": result.get(
+                "max6_screen_pot_sample_scores_manifest_json"
+            ),
+            "timing_max6_screen_pot_audit_wall_s": float(
+                result.get("timing_max6_screen_pot_audit_wall_s", 0.0)
+            ),
+            "timing_max6_screen_exceedance_audit_wall_s": float(
+                result.get("timing_max6_screen_exceedance_audit_wall_s", 0.0)
+            ),
+            "max6_permutation_maxima_tsv": result.get("max6_permutation_maxima_tsv"),
+            "max6_pair_pve_total_quadratic": result.get("max6_pair_pve_total_quadratic"),
+            "max6_pair_pve_definition": result.get("max6_pair_pve_definition"),
+            "max6_pair_universe_size": int(result.get("max6_pair_universe_size", 0)),
+            **(
+                {
+                    "max6_bonferroni_alpha": result.get("max6_bonferroni_alpha"),
+                    "max6_bonferroni_channel_count": result.get(
+                        "max6_bonferroni_channel_count"
+                    ),
+                    "max6_bonferroni_p_cut": result.get("max6_bonferroni_p_cut"),
+                }
+                if not args.grm_int
+                else {}
+            ),
+            "max6_pvalue_method": result.get("max6_pvalue_method"),
+            "max6_score_threshold": result.get("max6_score_threshold"),
+            "max6_gumbel_score_threshold": result.get("max6_gumbel_score_threshold"),
+            "max6_screen_threshold": result.get("max6_screen_threshold"),
+            "max6_screen_threshold_method": result.get("max6_screen_threshold_method"),
+            "max6_screen_null_repeats": int(result.get("max6_screen_null_repeats", 0)),
+            "max6_screen_validation_method": result.get("max6_screen_validation_method"),
+            "max6_screen_validation_seed_policy": result.get(
+                "max6_screen_validation_seed_policy"
+            ),
+            "max6_screen_validation_repeats": int(
+                result.get("max6_screen_validation_repeats", 0)
+            ),
+            "max6_screen_validation_rejections": int(
+                result.get("max6_screen_validation_rejections", 0)
+            ),
+            "max6_screen_validation_fwer": result.get("max6_screen_validation_fwer"),
+            "max6_screen_validation_ci_lower": result.get(
+                "max6_screen_validation_ci_lower"
+            ),
+            "max6_screen_validation_ci_upper": result.get(
+                "max6_screen_validation_ci_upper"
+            ),
+            "max6_final_screen_subset_audit_passed": result.get(
+                "max6_final_screen_subset_audit_passed"
+            ),
+            "max6_final_screen_subset_audit_pairs_checked": int(
+                result.get("max6_final_screen_subset_audit_pairs_checked", 0)
+            ),
+            "max6_final_screen_subset_audit_violations": int(
+                result.get("max6_final_screen_subset_audit_violations", 0)
+            ),
+            "max6_screen_pair_universe_size": int(
+                result.get("max6_screen_pair_universe_size", 0)
+            ),
+            "max6_screen_window_pair_occurrences": int(
+                result.get("max6_screen_window_pair_occurrences", 0)
+            ),
+            "timing_max6_screen_calibration_wall_s": float(
+                result.get("timing_max6_screen_calibration_wall_s", 0.0)
+            ),
+            "timing_max6_screen_validation_wall_s": float(
+                result.get("timing_max6_screen_validation_wall_s", 0.0)
+            ),
+            "max6_screen_candidate_count": int(
+                result.get("max6_screen_candidate_count", 0)
+            ),
+            "max6_score_scale": result.get("max6_score_scale"),
+            "max6_score_scale_source": result.get("max6_score_scale_source"),
+            "max6_threshold_method": result.get("max6_threshold_method"),
+            "max6_permutation_pair_pool_size": int(
+                result.get("max6_permutation_pair_pool_size", 0)
+            ),
+            "max6_permutation_pairs_per_repeat": int(
+                result.get("max6_permutation_pairs_per_repeat", 0)
+            ),
+            "max6_permutation_pair_draw_count": int(
+                result.get("max6_permutation_pair_draw_count", 0)
+            ),
+            "timing_max6_permutation_setup_wall_s": float(
+                result.get("timing_max6_permutation_setup_wall_s", 0.0)
+            ),
+            "timing_max6_permutation_score_wall_s": float(
+                result.get("timing_max6_permutation_score_wall_s", 0.0)
+            ),
+            "timing_max6_permutation_threshold_wall_s": float(
+                result.get("timing_max6_permutation_threshold_wall_s", 0.0)
+            ),
+            "timing_max6_permutation_maxima_write_wall_s": float(
+                result.get("timing_max6_permutation_maxima_write_wall_s", 0.0)
+            ),
+            "timing_max6_permutation_projected_y_task_sum_s": float(
+                result.get("timing_max6_permutation_projected_y_task_sum_s", 0.0)
+            ),
+            "timing_max6_permutation_endpoint_prepare_task_sum_s": float(
+                result.get("timing_max6_permutation_endpoint_prepare_task_sum_s", 0.0)
+            ),
+            "timing_max6_permutation_rerank_kernel_task_sum_s": float(
+                result.get("timing_max6_permutation_rerank_kernel_task_sum_s", 0.0)
+            ),
+            "timing_max6_permutation_rerank_pcx_task_sum_s": float(
+                result.get("timing_max6_permutation_rerank_pcx_task_sum_s", 0.0)
+            ),
+            "timing_max6_permutation_rerank_geometry_task_sum_s": float(
+                result.get("timing_max6_permutation_rerank_geometry_task_sum_s", 0.0)
+            ),
+            "timing_max6_permutation_rerank_q_task_sum_s": float(
+                result.get("timing_max6_permutation_rerank_q_task_sum_s", 0.0)
+            ),
+            "timing_max6_permutation_rerank_score_task_sum_s": float(
+                result.get("timing_max6_permutation_rerank_score_task_sum_s", 0.0)
+            ),
+            "timing_max6_permutation_rerank_topk_task_sum_s": float(
+                result.get("timing_max6_permutation_rerank_topk_task_sum_s", 0.0)
+            ),
+            "timing_max6_permutation_rerank_other_task_sum_s": float(
+                result.get("timing_max6_permutation_rerank_other_task_sum_s", 0.0)
+            ),
+            "timing_max6_permutation_pair_score_count": int(
+                result.get("timing_max6_permutation_pair_score_count", 0)
+            ),
+            "max6_observed_units_timed": int(
+                result.get("max6_observed_units_timed", 0)
+            ),
+            "max6_observed_screen_candidate_pairs": int(
+                result.get("max6_observed_screen_candidate_pairs", 0)
+            ),
+            "max6_observed_screen_pairs_evaluated": int(
+                result.get("max6_observed_screen_pairs_evaluated", 0)
+            ),
+            "max6_observed_screen_batch_count": int(
+                result.get("max6_observed_screen_batch_count", 0)
+            ),
+            "max6_observed_screen_batch_unique_scored_pairs": int(
+                result.get("max6_observed_screen_batch_unique_scored_pairs", 0)
+            ),
+            "max6_observed_screen_batch_score_offers": int(
+                result.get("max6_observed_screen_batch_score_offers", 0)
+            ),
+            "max6_observed_screen_batch_direct_fallbacks": int(
+                result.get("max6_observed_screen_batch_direct_fallbacks", 0)
+            ),
+            "max6_observed_exact_candidate_pairs": int(
+                result.get("max6_observed_exact_candidate_pairs", 0)
+            ),
+            "max6_candidate_reuse_diagnostic": result.get(
+                "max6_candidate_reuse_diagnostic"
+            ),
+            "timing_max6_observed_screen_input_prepare_task_sum_s": float(
+                result.get("timing_max6_observed_screen_input_prepare_task_sum_s", 0.0)
+            ),
+            "timing_max6_observed_screen_kernel_task_sum_s": float(
+                result.get("timing_max6_observed_screen_kernel_task_sum_s", 0.0)
+            ),
+            "timing_max6_observed_candidate_prepare_task_sum_s": float(
+                result.get("timing_max6_observed_candidate_prepare_task_sum_s", 0.0)
+            ),
+            "timing_max6_observed_rerank_endpoint_prepare_task_sum_s": float(
+                result.get("timing_max6_observed_rerank_endpoint_prepare_task_sum_s", 0.0)
+            ),
+            "timing_max6_observed_rerank_kernel_task_sum_s": float(
+                result.get("timing_max6_observed_rerank_kernel_task_sum_s", 0.0)
+            ),
+            "timing_max6_observed_rerank_pcx_task_sum_s": float(
+                result.get("timing_max6_observed_rerank_pcx_task_sum_s", 0.0)
+            ),
+            "timing_max6_observed_rerank_geometry_task_sum_s": float(
+                result.get("timing_max6_observed_rerank_geometry_task_sum_s", 0.0)
+            ),
+            "timing_max6_observed_rerank_geometry_marker_moments_task_sum_s": float(
+                result.get(
+                    "timing_max6_observed_rerank_geometry_marker_moments_task_sum_s", 0.0
+                )
+            ),
+            "timing_max6_observed_rerank_geometry_pairwise_task_sum_s": float(
+                result.get("timing_max6_observed_rerank_geometry_pairwise_task_sum_s", 0.0)
+            ),
+            "timing_max6_observed_rerank_geometry_lookup_task_sum_s": float(
+                result.get("timing_max6_observed_rerank_geometry_lookup_task_sum_s", 0.0)
+            ),
+            "timing_max6_observed_rerank_geometry_interaction_py_task_sum_s": float(
+                result.get(
+                    "timing_max6_observed_rerank_geometry_interaction_py_task_sum_s", 0.0
+                )
+            ),
+            "timing_max6_observed_au_fused_py_task_sum_s": float(
+                result.get("timing_max6_observed_au_fused_py_task_sum_s", 0.0)
+            ),
+            "timing_max6_observed_rerank_geometry_unclassified_task_sum_s": float(
+                result.get(
+                    "timing_max6_observed_rerank_geometry_unclassified_task_sum_s", 0.0
+                )
+            ),
+            "timing_max6_observed_rerank_q_task_sum_s": float(
+                result.get("timing_max6_observed_rerank_q_task_sum_s", 0.0)
+            ),
+            "timing_max6_observed_rerank_q_validation_task_sum_s": float(
+                result.get("timing_max6_observed_rerank_q_validation_task_sum_s", 0.0)
+            ),
+            "timing_max6_observed_rerank_q_bitset_task_sum_s": float(
+                result.get("timing_max6_observed_rerank_q_bitset_task_sum_s", 0.0)
+            ),
+            "timing_max6_observed_rerank_q_cell_task_sum_s": float(
+                result.get("timing_max6_observed_rerank_q_cell_task_sum_s", 0.0)
+            ),
+            "timing_max6_observed_rerank_q_enumerate_task_sum_s": float(
+                result.get("timing_max6_observed_rerank_q_enumerate_task_sum_s", 0.0)
+            ),
+            "timing_max6_observed_rerank_q_quadratic_task_sum_s": float(
+                result.get("timing_max6_observed_rerank_q_quadratic_task_sum_s", 0.0)
+            ),
+            "timing_max6_observed_rerank_q_reconstruct_task_sum_s": float(
+                result.get("timing_max6_observed_rerank_q_reconstruct_task_sum_s", 0.0)
+            ),
+            "timing_max6_observed_rerank_score_task_sum_s": float(
+                result.get("timing_max6_observed_rerank_score_task_sum_s", 0.0)
+            ),
+            "timing_max6_observed_rerank_topk_task_sum_s": float(
+                result.get("timing_max6_observed_rerank_topk_task_sum_s", 0.0)
+            ),
+            "timing_max6_observed_rerank_other_task_sum_s": float(
+                result.get("timing_max6_observed_rerank_other_task_sum_s", 0.0)
+            ),
+            "timing_max6_observed_output_finalize_task_sum_s": float(
+                result.get("timing_max6_observed_output_finalize_task_sum_s", 0.0)
+            ),
+            "max6_pair_count": int(result.get("max6_pair_count", 0)),
             "beam_width": int(args.beam_width),
-            "not_control": "null_penalty_only",
+            "not_control": (
+                "score_threshold_only"
+                if _is_max6_grm_backend(args.search_backend)
+                else "null_penalty_only"
+            ),
             "rank_schedule_source": rank_schedule_source,
             "gain_start_layer_runtime": gain_start_layer_runtime,
             "rank_schedule_runtime": rank_schedule_runtime,
@@ -2710,7 +4081,7 @@ def main() -> None:
             "seed": trait_seed,
             "n_samples": len(common_ids),
             "full_n": int(result.get("full_n", result.get("n_samples", 0))),
-            "n_rules": int(result.get("n_rules", 0)),
+            "n_rules": int(n_rules),
             "units_total": int(result.get("units_total", 0)),
             "units_scanned": int(result.get("units_scanned", 0)),
             "full_pve": float(result.get("full_pve", float("nan"))),
@@ -2719,6 +4090,9 @@ def main() -> None:
             "memory_debug": trait_memory_debug,
             "outputs": {
                 "rules_tsv": result.get("rules_tsv"),
+                "max6_pairs_tsv": result.get("max6_pairs_tsv"),
+                "max6_pairs_provenance_tsv": result.get("max6_pairs_provenance_tsv"),
+                "max6_threshold_tsv": result.get("max6_threshold_tsv"),
                 "diagnostics_tsv": result.get("diagnostics_tsv"),
                 "frontier_diagnostics_tsv": result.get("frontier_diagnostics_tsv"),
                 "pseudo_fvlmm_raw_tsv": None,
@@ -2787,6 +4161,21 @@ def main() -> None:
         )
         trait_saved_paths: list[object] = [
             result.get("rules_tsv"),
+            result.get("max6_pairs_tsv"),
+            result.get("max6_pairs_provenance_tsv"),
+            result.get("max6_screen_maxima_tsv"),
+            result.get("max6_screen_validation_maxima_tsv"),
+            result.get("max6_screen_sampled_maxima_tsv"),
+            result.get("max6_screen_sample_manifest_json"),
+            result.get("max6_screen_sample_strata_tsv"),
+            result.get("max6_screen_full_maximizer_geometry_tsv"),
+            result.get("max6_screen_tail_top_pairs_tsv"),
+            result.get("max6_screen_tail_sampled_ranks_tsv"),
+            result.get("max6_screen_tail_summary_json"),
+            result.get("max6_screen_tail_support_aware_maxima_tsv"),
+            result.get("max6_screen_tail_support_aware_strata_tsv"),
+            result.get("max6_screen_tail_support_aware_summary_json"),
+            result.get("max6_threshold_tsv"),
             result.get("diagnostics_tsv"),
             result.get("frontier_diagnostics_tsv"),
         ]
@@ -2824,14 +4213,198 @@ def main() -> None:
                 "rank_schedule_runtime": rank_schedule_runtime,
                 "rank_schedule_source": rank_schedule_source,
                 "search_backend": str(args.search_backend),
+                "grm_int_mode_source": str(args.grm_int_mode_source),
+                **(
+                    {
+                        "grm_int_only": True,
+                        "grm_int_test": "one_df_FWL_g1xg2_adjusted_for_g1_g2_covariates_GRM",
+                        "grm_int_pvalue_calibration": "nominal_chi2_1_after_Max6_selection_unadjusted",
+                        "grm_int_screen_source": "Max6 proposal score; exact requested Top-K per scan unit",
+                        "grm_int_best_channel_source": "winning gate from the Max6 screen",
+                        "grm_int_output_order": "conditional GRM-INT chi-square(1) within selected Top-K",
+                        "grm_int_screen_threshold_applied": False,
+                    }
+                    if args.grm_int
+                    else {}
+                ),
+                "max6_pairs_tsv": [
+                    item.get("max6_pairs_tsv")
+                    for item in garfield_manifest_traits
+                    if isinstance(item, dict) and item.get("max6_pairs_tsv")
+                ],
+                "max6_pairs_provenance_tsv": [
+                    item.get("max6_pairs_provenance_tsv")
+                    for item in garfield_manifest_traits
+                    if isinstance(item, dict) and item.get("max6_pairs_provenance_tsv")
+                ],
+                "max6_ld_tags_tsv": [
+                    item.get("max6_ld_tags_tsv")
+                    for item in garfield_manifest_traits
+                    if isinstance(item, dict) and item.get("max6_ld_tags_tsv")
+                ],
+                "max6_threshold_tsv": [
+                    item.get("max6_threshold_tsv")
+                    for item in garfield_manifest_traits
+                    if isinstance(item, dict) and item.get("max6_threshold_tsv")
+                ],
+                "max6_screen_maxima_tsv": [
+                    item.get("max6_screen_maxima_tsv")
+                    for item in garfield_manifest_traits
+                    if isinstance(item, dict) and item.get("max6_screen_maxima_tsv")
+                ],
+                "max6_screen_validation_maxima_tsv": [
+                    item.get("max6_screen_validation_maxima_tsv")
+                    for item in garfield_manifest_traits
+                    if isinstance(item, dict) and item.get("max6_screen_validation_maxima_tsv")
+                ],
+                "max6_screen_validation_fwer": [
+                    item.get("max6_screen_validation_fwer")
+                    for item in garfield_manifest_traits
+                    if isinstance(item, dict)
+                    and item.get("max6_screen_validation_fwer") is not None
+                ],
+                "max6_screen_validation": [
+                    {
+                        "trait": item.get("trait"),
+                        "scope": item.get("operational_fwer_scope"),
+                        "method": item.get("max6_screen_validation_method"),
+                        "threshold": item.get("max6_screen_threshold"),
+                        "threshold_method": item.get("max6_screen_threshold_method"),
+                        "pair_universe_size": item.get("max6_screen_pair_universe_size"),
+                        "window_pair_occurrences": item.get(
+                            "max6_screen_window_pair_occurrences"
+                        ),
+                        "calibration_repeats": item.get("max6_screen_null_repeats"),
+                        "validation_repeats": item.get("max6_screen_validation_repeats"),
+                        "validation_rejections": item.get("max6_screen_validation_rejections"),
+                        "validation_fwer": item.get("max6_screen_validation_fwer"),
+                        "validation_ci95": [
+                            item.get("max6_screen_validation_ci_lower"),
+                            item.get("max6_screen_validation_ci_upper"),
+                        ],
+                        "final_subset_audit": {
+                            "passed": item.get("max6_final_screen_subset_audit_passed"),
+                            "pairs_checked": item.get(
+                                "max6_final_screen_subset_audit_pairs_checked", 0
+                            ),
+                            "violations": item.get(
+                                "max6_final_screen_subset_audit_violations", 0
+                            ),
+                        },
+                    }
+                    for item in garfield_manifest_traits
+                    if isinstance(item, dict)
+                    and item.get("max6_screen_validation_repeats", 0) > 0
+                ],
+                "max6_final_screen_subset_audit": [
+                    {
+                        "passed": item.get("max6_final_screen_subset_audit_passed"),
+                        "pairs_checked": item.get(
+                            "max6_final_screen_subset_audit_pairs_checked", 0
+                        ),
+                        "violations": item.get(
+                            "max6_final_screen_subset_audit_violations", 0
+                        ),
+                    }
+                    for item in garfield_manifest_traits
+                    if isinstance(item, dict)
+                    and item.get("max6_final_screen_subset_audit_passed") is not None
+                ],
+                "max6_pair_pve_definition": (
+                    "scaled_winner_score / scaled_y_quadratic; GRM-metric partial-R2"
+                    if any(
+                        isinstance(item, dict) and item.get("max6_pair_pve_total_quadratic") is not None
+                        for item in garfield_manifest_traits
+                    )
+                    else None
+                ),
+                "max6_pair_pve_total_quadratic": [
+                    item.get("max6_pair_pve_total_quadratic")
+                    for item in garfield_manifest_traits
+                    if isinstance(item, dict) and item.get("max6_pair_pve_total_quadratic") is not None
+                ],
+                "max6_bonferroni_thresholds": (
+                    []
+                    if args.grm_int
+                    else [
+                        {
+                            "trait": item.get("trait"),
+                            "N_unique": item.get("max6_pair_universe_size"),
+                            "alpha": item.get("max6_bonferroni_alpha"),
+                            "m": item.get("max6_bonferroni_channel_count"),
+                            "p_cut": item.get("max6_bonferroni_p_cut"),
+                        }
+                        for item in garfield_manifest_traits
+                        if isinstance(item, dict)
+                        and item.get("max6_bonferroni_p_cut") is not None
+                    ]
+                ),
+                "pwald_bonferroni_thresholds": [
+                    {
+                        "trait": item.get("trait"),
+                        "N_unique_pairs": item["pwald_bonferroni_reference"][
+                            "n_unique_pairs"
+                        ],
+                        "alpha": item["pwald_bonferroni_reference"]["alpha"],
+                        "p_cut": item["pwald_bonferroni_reference"]["p_cut"],
+                        "minus_log10_p_cut": item["pwald_bonferroni_reference"][
+                            "minus_log10_p_cut"
+                        ],
+                        "method": item.get("pwald_bonferroni_reference_method"),
+                        "applied": item.get("pwald_bonferroni_reference_applied"),
+                    }
+                    for item in garfield_manifest_traits
+                    if isinstance(item, dict)
+                    and isinstance(item.get("pwald_bonferroni_reference"), dict)
+                ],
                 "xor_search_requested": bool(args.xor_search_requested),
                 "xor_search_enabled": bool(args.xor_search),
                 "evaluation_mode": "full_exploratory",
-                "permutation": True,
-                "permutation_scope": "rule_null_penalty",
-                "null_generation": "lmm_parametric_bootstrap",
-                "rule_null_penalty_method": str(args.rule_null_penalty_method_runtime),
-                "rule_null_quantile": float(args.rule_null_quantile_runtime),
+                "permutation": (
+                    not _is_ld_tag_max6_backend(args.search_backend) and not args.grm_int
+                ),
+                "permutation_scope": (
+                    None
+                    if _is_ld_tag_max6_backend(args.search_backend) or args.grm_int
+                    else "global_pair_score_threshold"
+                    if _is_max6_grm_backend(args.search_backend)
+                    else "rule_null_penalty"
+                ),
+                "null_calibration_scope": (
+                    "screen_maxT_weak_global_null"
+                    if _is_ld_tag_max6_backend(args.search_backend)
+                    and args.rule_permutation_runtime
+                    else None
+                ),
+                "null_generation": (
+                    (
+                        "lmm_parametric_bootstrap_max6_screen"
+                        if args.rule_permutation_runtime
+                        else None
+                )
+                if _is_ld_tag_max6_backend(args.search_backend)
+                else None
+                if _is_max6_grm_backend(args.search_backend) and args.grm_int
+                else "global_pair_score_permutation_fixed_pc"
+                if _is_max6_grm_backend(args.search_backend)
+                    else "lmm_parametric_bootstrap"
+                ),
+                "operational_fwer_scope": (
+                    "weak_global_null_screen_subset"
+                    if _is_ld_tag_max6_backend(args.search_backend)
+                    and args.rule_permutation_runtime
+                    else None
+                ),
+                "rule_null_penalty_method": (
+                    None if _is_ld_tag_max6_backend(args.search_backend)
+                    and not args.rule_permutation_runtime
+                    else str(args.rule_null_penalty_method_runtime)
+                ),
+                "rule_null_quantile": (
+                    None if _is_ld_tag_max6_backend(args.search_backend)
+                    and not args.rule_permutation_runtime
+                    else float(args.rule_null_quantile_runtime)
+                ),
                 "rule_null_report_pvalue": bool(args.rule_null_report_pvalue_runtime),
                 "rule_null_quantile_spec": args.rule_null_quantile_spec_runtime,
                 "null_chunk_bp": int(args.extension) * 2,
@@ -2840,7 +4413,11 @@ def main() -> None:
                 "bimrange": (list(args.bimrange) if args.bimrange else None),
                 "top_rules_per_unit": int(args.top_rules_runtime),
                 "pair_seed_depth": int(args.exhaustive_depth_runtime),
-                "not_control": "null_penalty_only",
+                "not_control": (
+                    "score_threshold_only"
+                    if _is_max6_grm_backend(args.search_backend)
+                    else "null_penalty_only"
+                ),
                 "thread": int(args.thread),
                 "seed": int(args.seed),
                 "summary_rows": summary_rows,
@@ -2855,8 +4432,6 @@ def main() -> None:
         [aggregate_json_path],
         use_spinner=use_spinner,
     )
-    _emit_garfield_summary_to_log(logger, summary_rows)
-
     _rich_success(
         logger,
         f"\nFinished. Total wall time: {round(time.time() - t_start, 2)} seconds\n"

@@ -131,6 +131,35 @@ fn selected_sgemm_backend() -> SgemmBackend {
     *SGEMM_BACKEND.get_or_init(resolve_sgemm_backend)
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[inline]
+fn garfield_backend_guard_error(backend: SgemmBackend) -> Option<&'static str> {
+    match backend {
+        SgemmBackend::Rust => Some(
+            "Garfield Max6 requires a linked BLAS backend; the pure-Rust BLAS fallback is disabled for this path",
+        ),
+        SgemmBackend::Accelerate | SgemmBackend::OpenBlas | SgemmBackend::Blas => None,
+    }
+}
+
+/// Require a linked BLAS implementation for the performance-sensitive
+/// Garfield Max6 paths. Other JanusX modules may still use the historical
+/// Rust fallback, but Max6 and GRM-Max6 must never silently run through it.
+pub(crate) fn ensure_garfield_blas_backend() -> Result<(), String> {
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    {
+        let backend = selected_sgemm_backend();
+        if let Some(message) = garfield_backend_guard_error(backend) {
+            return Err(format!("{message} (selected backend: {backend:?})"));
+        }
+        return Ok(());
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        Err("Garfield Max6 requires a linked BLAS backend; unsupported target".to_string())
+    }
+}
+
 #[cfg(all(
     target_os = "macos",
     not(all(feature = "blas-openblas", jx_openblas_available))
@@ -2989,12 +3018,6 @@ fn mac_eigh_lapack_pref() -> MacEighLapackPref {
 #[cfg(target_os = "macos")]
 #[inline]
 fn should_try_openblas_lapack_on_macos() -> bool {
-    // A later optional import can introduce another libomp even after the
-    // initial backend prewarm. Recheck before using the dynamic LAPACK path:
-    // mixed OpenMP worker/barrier state can segfault inside either runtime.
-    if macos_has_multiple_openmp_runtimes_loaded() {
-        return false;
-    }
     match mac_eigh_lapack_pref() {
         MacEighLapackPref::OpenBlas => true,
         MacEighLapackPref::Accelerate => false,
@@ -3134,27 +3157,6 @@ fn macos_is_openmp_runtime_name(name: &str) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_has_multiple_openmp_runtimes_loaded() -> bool {
-    let mut seen = Vec::<PathBuf>::new();
-    for path in macos_loaded_image_paths() {
-        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        if !macos_is_openmp_runtime_name(name) {
-            continue;
-        }
-        let canonical = std::fs::canonicalize(&path).unwrap_or(path);
-        if !seen.contains(&canonical) {
-            seen.push(canonical);
-            if seen.len() > 1 {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-#[cfg(target_os = "macos")]
 #[inline]
 fn macos_is_openblas_runtime_name(name: &str) -> bool {
     let low = name.to_ascii_lowercase();
@@ -3276,10 +3278,10 @@ fn openblas_lapack_candidates(pref: MacEighLapackPref) -> Vec<String> {
         }
     }
 
-    // 3) Host-system libraries require an explicit OpenBLAS backend request.
-    // Auto must not pull a second Conda/Homebrew OpenMP stack into an isolated
-    // Python environment. Without a reusable/bundled runtime use Accelerate.
-    if matches!(pref, MacEighLapackPref::OpenBlas) {
+    // 3) System-wide / provisioned OpenBLAS fallbacks. Keep these in auto
+    //    mode too so editable/dev installs on macOS can still use OpenBLAS
+    //    LAPACK without requiring wheel-bundled dylibs.
+    if matches!(pref, MacEighLapackPref::Auto | MacEighLapackPref::OpenBlas) {
         if let Ok(prefix) = std::env::var("CONDA_PREFIX") {
             let base = Path::new(&prefix).join("lib");
             for leaf in [
@@ -3765,6 +3767,14 @@ pub fn rust_blas_get_num_threads() -> isize {
 ))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn garfield_blas_guard_rejects_rust_backend() {
+        assert!(garfield_backend_guard_error(SgemmBackend::Rust).is_some());
+        assert!(garfield_backend_guard_error(SgemmBackend::Accelerate).is_none());
+        assert!(garfield_backend_guard_error(SgemmBackend::OpenBlas).is_none());
+        assert!(garfield_backend_guard_error(SgemmBackend::Blas).is_none());
+    }
 
     #[cfg(all(target_os = "linux", feature = "blas-openblas"))]
     #[test]

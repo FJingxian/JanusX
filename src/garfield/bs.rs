@@ -20,13 +20,9 @@ use super::score::{
     and_popcount_sum_y_where_both1_with_lookup, binary_maf_from_n_hit, dosage_maf_from_dual_counts,
     dual_packed_summary, score_cont_centered_gain_dual_from_summary,
     score_cont_centered_gain_dual_packed_with_sum, score_cont_centered_gain_from_sum_and_n_hit,
-    score_cont_centered_gain_packed_with_sum, score_cont_corr_packed, sum_y_where_both1,
-    sum_y_where_both1_four, sum_y_where_both1_with_lookup, validate_continuous_y,
-    ContinuousRuleScore, PackedYSumLookup,
-};
-use super::score_backend::{
-    parse_centered_gain_backend_mode_from_env,
-    score_cont_centered_gain_singletons_packed_with_backend,
+    score_cont_centered_gain_packed_with_sum, score_cont_centered_gain_singletons_packed_cpu_impl,
+    score_cont_corr_packed, sum_y_where_both1, sum_y_where_both1_four,
+    sum_y_where_both1_with_lookup, validate_continuous_y, ContinuousRuleScore, PackedYSumLookup,
 };
 use crate::bitwise::{and_popcount, bitand_assign, bitnot_masked, popcount};
 use crate::stats_common::{
@@ -265,6 +261,14 @@ pub enum BeamGroupConstraintMode {
 pub enum GarfieldSearchBackend {
     Legacy,
     PairTriple,
+    /// Production GARFIELD pair pipeline: deterministic LD-tag compression,
+    /// exhaustive packed Max6 screening over the tag-pair universe, then
+    /// exact GRM-Max6 candidate reranking. This is deliberately separate from
+    /// `PairTriple`; it does not enter beam search.
+    Max6GrmMax6,
+    /// Compatibility/debug backend for the former ML/CORR-prefiltered
+    /// Max6->GRM-Max6 path. It is never selected by the normal CLI default.
+    Max6GrmMax6Legacy,
 }
 
 impl GarfieldSearchBackend {
@@ -272,8 +276,14 @@ impl GarfieldSearchBackend {
         match raw.trim().to_ascii_lowercase().as_str() {
             "" | "legacy" | "beam" => Ok(Self::Legacy),
             "pair-triple" | "pair_triple" | "pairtriple" => Ok(Self::PairTriple),
+            "max6-grmmax6" | "max6_grmmax6" | "max6grmmax6" | "grm-max6"
+            | "grm_max6" | "max6-grmmax6-ldtag" | "max6_grmmax6_ldtag" => {
+                Ok(Self::Max6GrmMax6)
+            }
+            "max6-grmmax6-legacy" | "max6_grmmax6_legacy" | "max6grmmax6legacy"
+            | "grm-max6-legacy" => Ok(Self::Max6GrmMax6Legacy),
             other => Err(format!(
-                "GARFIELD search backend must be legacy or pair-triple, got '{other}'"
+                "GARFIELD search backend must be legacy, pair-triple, max6-grmmax6, or max6-grmmax6-legacy, got '{other}'"
             )),
         }
     }
@@ -3577,7 +3587,6 @@ fn precompute_literal_singleton_scores(
 ) -> Result<Vec<LiteralSingletonScore>, String> {
     let score_t0 = Instant::now();
     let out = (|| {
-        let mode = parse_centered_gain_backend_mode_from_env()?;
         let shared_inputs = needed_words_train == needed_words_test
             && literal_inputs_are_shared(
                 y_train,
@@ -3591,8 +3600,7 @@ fn precompute_literal_singleton_scores(
                 n_rows,
             );
         if shared_inputs {
-            let shared_scores = precompute_literal_singleton_backend_scores(
-                mode,
+            let shared_scores = precompute_literal_singleton_cpu_scores(
                 y_train,
                 bits_train,
                 row_words_train,
@@ -3607,16 +3615,14 @@ fn precompute_literal_singleton_scores(
                 })
                 .collect());
         }
-        let train_scores = precompute_literal_singleton_backend_scores(
-            mode,
+        let train_scores = precompute_literal_singleton_cpu_scores(
             y_train,
             bits_train,
             row_words_train,
             n_train,
             n_rows,
         )?;
-        let test_scores = precompute_literal_singleton_backend_scores(
-            mode,
+        let test_scores = precompute_literal_singleton_cpu_scores(
             y_test,
             bits_test,
             row_words_test,
@@ -3650,7 +3656,6 @@ pub(crate) fn precompute_literal_singleton_scores_batched(
         let ctx = "garfield::precompute_literal_singleton_scores_batched";
         validate_continuous_y(y_train, n_train, ctx)?;
         validate_continuous_y(y_test, n_test, ctx)?;
-        let mode = parse_centered_gain_backend_mode_from_env()?;
         let max_rows = literal_batch_max_rows();
         let max_work_words = literal_batch_max_work_words();
         let mut out = vec![Vec::<LiteralSingletonScore>::new(); requests.len()];
@@ -3746,8 +3751,7 @@ pub(crate) fn precompute_literal_singleton_scores_batched(
             }
 
             if batch_shared_inputs {
-                let shared_scores = precompute_literal_singleton_backend_scores(
-                    mode,
+                let shared_scores = precompute_literal_singleton_cpu_scores(
                     y_train,
                     merged_train.as_slice(),
                     row_words_train,
@@ -3769,16 +3773,14 @@ pub(crate) fn precompute_literal_singleton_scores_batched(
                     row_offset = row_offset.saturating_add(req.n_rows);
                 }
             } else {
-                let train_scores = precompute_literal_singleton_backend_scores(
-                    mode,
+                let train_scores = precompute_literal_singleton_cpu_scores(
                     y_train,
                     merged_train.as_slice(),
                     row_words_train,
                     n_train,
                     batch_rows,
                 )?;
-                let test_scores = precompute_literal_singleton_backend_scores(
-                    mode,
+                let test_scores = precompute_literal_singleton_cpu_scores(
                     y_test,
                     merged_test.as_slice(),
                     row_words_test,
@@ -3806,18 +3808,14 @@ pub(crate) fn precompute_literal_singleton_scores_batched(
     out
 }
 
-fn precompute_literal_singleton_backend_scores(
-    mode: super::score_backend::GarfieldCenteredGainBackendMode,
+fn precompute_literal_singleton_cpu_scores(
     y: &[f64],
     bits: &[u64],
     row_words: usize,
     n_samples: usize,
     n_rows: usize,
 ) -> Result<Vec<ContinuousRuleScore>, String> {
-    score_cont_centered_gain_singletons_packed_with_backend(
-        mode, y, bits, row_words, n_rows, n_samples,
-    )
-    .map(|v| v.0)
+    score_cont_centered_gain_singletons_packed_cpu_impl(y, bits, row_words, n_rows, n_samples)
 }
 
 #[inline]
@@ -10079,6 +10077,22 @@ fn final_test_score_for_rule_fuzzy(
 mod tests {
     use super::super::score::{score_cont_centered_gain_packed_with_n_hit, support_size_packed};
     use super::*;
+
+    #[test]
+    fn parses_max6_grmmax6_backend_without_entering_pair_triple() {
+        assert_eq!(
+            GarfieldSearchBackend::parse("max6-grmmax6").unwrap(),
+            GarfieldSearchBackend::Max6GrmMax6
+        );
+        assert_eq!(
+            GarfieldSearchBackend::parse("GRM_Max6").unwrap(),
+            GarfieldSearchBackend::Max6GrmMax6
+        );
+        assert_eq!(
+            GarfieldSearchBackend::parse("max6-grmmax6-legacy").unwrap(),
+            GarfieldSearchBackend::Max6GrmMax6Legacy
+        );
+    }
 
     #[test]
     fn test_binary_xor_lmaf_requires_both_directional_substates() {

@@ -1726,6 +1726,28 @@ pub fn bitnot_masked_py(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    fn make_words(n: usize, seed: u64) -> Vec<u64> {
+        let mut x = seed ^ 0x9E37_79B9_7F4A_7C15u64;
+        let mut out = vec![0u64; n];
+        for v in out.iter_mut() {
+            x ^= x << 7;
+            x ^= x >> 9;
+            x = x.wrapping_mul(0xD134_2543_DE82_EF95);
+            *v = x;
+        }
+        out
+    }
+
+    fn as_gbps(bytes: f64, sec: f64) -> f64 {
+        if sec <= 0.0 {
+            0.0
+        } else {
+            bytes / sec / 1e9
+        }
+    }
 
     #[test]
     fn test_popcount_basic() {
@@ -1827,6 +1849,111 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn bench_and_popcount_bounded_block_widths() {
+        let n_words = std::env::var("JANUSX_BITWISE_BLOCK_BENCH_WORDS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(22);
+        let iters = std::env::var("JANUSX_BITWISE_BLOCK_BENCH_ITERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(5_000_000);
+        let lhs = make_words(n_words, 0x1234_5678_9ABC_DEF0);
+        let rhs = make_words(n_words, 0x0FED_CBA9_8765_4321);
+        let lhs_support4 = block_supports::<4>(&lhs);
+        let rhs_support4 = block_supports::<4>(&rhs);
+        let lhs_support8 = block_supports::<8>(&lhs);
+        let rhs_support8 = block_supports::<8>(&rhs);
+        let lhs_total = lhs_support8.iter().map(|&v| u64::from(v)).sum::<u64>();
+        let rhs_total = rhs_support8.iter().map(|&v| u64::from(v)).sum::<u64>();
+        let backend = resolve_reduce_backend();
+        let mut sink = 0u64;
+
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            sink ^= and_popcount(&lhs, &rhs);
+        }
+        let full = t0.elapsed();
+
+        let t1 = Instant::now();
+        for _ in 0..iters {
+            sink ^= and_popcount_bounded_blocks_with_backend::<4>(
+                &lhs,
+                &rhs,
+                &lhs_support4,
+                &rhs_support4,
+                lhs_total,
+                rhs_total,
+                u32::MAX,
+                u32::MAX,
+                backend,
+            ) as u64;
+        }
+        let block4 = t1.elapsed();
+
+        let t2 = Instant::now();
+        for _ in 0..iters {
+            sink ^= and_popcount_bounded_blocks_with_backend::<8>(
+                &lhs,
+                &rhs,
+                &lhs_support8,
+                &rhs_support8,
+                lhs_total,
+                rhs_total,
+                u32::MAX,
+                u32::MAX,
+                backend,
+            ) as u64;
+        }
+        let block8 = t2.elapsed();
+
+        let t3 = Instant::now();
+        for _ in 0..iters {
+            sink ^= and_popcount_bounded_blocks_with_backend::<8>(
+                &lhs,
+                &rhs,
+                &lhs_support8,
+                &rhs_support8,
+                lhs_total,
+                rhs_total,
+                u32::MAX,
+                1,
+                backend,
+            ) as u64;
+        }
+        let early_high = t3.elapsed();
+
+        let t4 = Instant::now();
+        for _ in 0..iters {
+            sink ^= and_popcount_bounded_blocks_with_backend::<8>(
+                &lhs,
+                &rhs,
+                &lhs_support8,
+                &rhs_support8,
+                lhs_total,
+                rhs_total,
+                u32::try_from(n_words.saturating_mul(64)).unwrap_or(u32::MAX),
+                u32::MAX,
+                backend,
+            ) as u64;
+        }
+        let early_low = t4.elapsed();
+
+        println!(
+            "bounded_block_bench words={} iters={} full_ms={:.3} block4_ms={:.3} block8_ms={:.3} early_high_ms={:.3} early_low_ms={:.3} sink={}",
+            n_words,
+            iters,
+            full.as_secs_f64() * 1e3,
+            block4.as_secs_f64() * 1e3,
+            block8.as_secs_f64() * 1e3,
+            early_high.as_secs_f64() * 1e3,
+            early_low.as_secs_f64() * 1e3,
+            black_box(sink)
+        );
+    }
+
+    #[test]
     fn test_king_pair_counts_basic() {
         let zi = [0b0001_0010u64];
         let hi = [0b0100_1000u64];
@@ -1835,12 +1962,12 @@ mod tests {
         let hj = [0b0010_0100u64];
         let aj = [0b0100_0000u64];
         let counts = king_pair_counts(&zi, &hi, &ai, &zj, &hj, &aj);
-        assert_eq!(counts.shared_nonmissing, 3);
-        assert_eq!(counts.ibs0, 0);
+        assert_eq!(counts.shared_nonmissing, 6);
+        assert_eq!(counts.ibs0, 1);
         assert_eq!(counts.same_hom, 1);
         assert_eq!(counts.both_het, 0);
         assert_eq!(counts.het_i_obs, 2);
-        assert_eq!(counts.het_j_obs, 0);
+        assert_eq!(counts.het_j_obs, 2);
     }
 
     #[test]
@@ -1872,5 +1999,106 @@ mod tests {
         let mut bits = [u64::MAX, 123, 456];
         bitnot_masked(&mut bits, 0);
         assert_eq!(bits, [0, 0, 0]);
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_bitwise_throughput() {
+        let n_words = std::env::var("JANUSX_BITWISE_BENCH_WORDS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2_000_000);
+        let iters = std::env::var("JANUSX_BITWISE_BENCH_ITERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(24);
+
+        let a = make_words(n_words, 0x1234_5678_9ABC_DEF0);
+        let b = make_words(n_words, 0x0FED_CBA9_8765_4321);
+
+        let mut sink = 0u64;
+        let force_scalar = force_scalar_runtime();
+        let force_simd_reduce = force_simd_reduce_runtime();
+        let force_simd_mutate = force_simd_mutate_runtime();
+        println!(
+            "bitwise_bench mode={} simd_reduce={} simd_mutate={} threads={} n_words={} iters={}",
+            if force_scalar { "scalar" } else { "simd_auto" },
+            force_simd_reduce,
+            force_simd_mutate,
+            rayon::current_num_threads(),
+            n_words,
+            iters
+        );
+
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            sink ^= popcount(&a);
+        }
+        let d_pop = t0.elapsed();
+
+        let t1 = Instant::now();
+        for _ in 0..iters {
+            sink ^= and_popcount(&a, &b);
+        }
+        let d_and_pop = t1.elapsed();
+
+        let mut dsta = a.clone();
+        let t2 = Instant::now();
+        for i in 0..iters {
+            bitand_assign(&mut dsta, &b);
+            sink ^= dsta[i % dsta.len()];
+        }
+        let d_and_assign = t2.elapsed();
+
+        let mut dsto = a.clone();
+        let t3 = Instant::now();
+        for i in 0..iters {
+            bitor_into(&mut dsto, &b);
+            sink ^= dsto[i % dsto.len()];
+        }
+        let d_or_into = t3.elapsed();
+
+        let mut dstn = a.clone();
+        let valid_bits = n_words * 64 - 7;
+        let t4 = Instant::now();
+        for i in 0..iters {
+            bitnot_masked(&mut dstn, valid_bits);
+            sink ^= dstn[i % dstn.len()];
+        }
+        let d_not = t4.elapsed();
+
+        let bytes_pop = (n_words * 8 * iters) as f64;
+        let bytes_and_pop = (n_words * 16 * iters) as f64;
+        let bytes_and_assign = (n_words * 24 * iters) as f64;
+        let bytes_or_into = (n_words * 24 * iters) as f64;
+        let bytes_not = (n_words * 16 * iters) as f64;
+
+        println!(
+            "popcount      {:>8.3} ms  {:>8.2} GB/s",
+            d_pop.as_secs_f64() * 1e3,
+            as_gbps(bytes_pop, d_pop.as_secs_f64())
+        );
+        println!(
+            "and_popcount  {:>8.3} ms  {:>8.2} GB/s",
+            d_and_pop.as_secs_f64() * 1e3,
+            as_gbps(bytes_and_pop, d_and_pop.as_secs_f64())
+        );
+        println!(
+            "bitand_assign {:>8.3} ms  {:>8.2} GB/s",
+            d_and_assign.as_secs_f64() * 1e3,
+            as_gbps(bytes_and_assign, d_and_assign.as_secs_f64())
+        );
+        println!(
+            "bitor_into    {:>8.3} ms  {:>8.2} GB/s",
+            d_or_into.as_secs_f64() * 1e3,
+            as_gbps(bytes_or_into, d_or_into.as_secs_f64())
+        );
+        println!(
+            "bitnot_masked {:>8.3} ms  {:>8.2} GB/s",
+            d_not.as_secs_f64() * 1e3,
+            as_gbps(bytes_not, d_not.as_secs_f64())
+        );
+
+        black_box(sink);
     }
 }

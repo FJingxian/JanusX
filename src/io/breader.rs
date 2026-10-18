@@ -402,6 +402,18 @@ pub fn load_bin01_selected_rows_as_u64_words(
     Ok((bits_flat, row_words, n_rows, n_samples))
 }
 
+/// Read only the dimensions of a marker-major BIN01 file.
+///
+/// Candidate-only consumers use this instead of materializing every marker
+/// row merely to learn the full marker count and packed row width.
+pub fn bin01_shape(path: &str, ctx: &str) -> Result<(usize, usize, usize), String> {
+    let file = File::open(path).map_err(|e| format!("{ctx}: failed to open {path}: {e}"))?;
+    let mmap = unsafe { Mmap::map(&file) }
+        .map_err(|e| format!("{ctx}: failed to mmap {}: {}", path, e))?;
+    let (n_rows, n_samples, _row_bytes, _data_offset) = parse_bin01_header(&mmap[..], ctx)?;
+    Ok((n_rows, words_for_samples(n_samples), n_samples))
+}
+
 pub fn gather_rows_by_indices(
     bits_flat: &[u64],
     row_words: usize,

@@ -2036,7 +2036,7 @@ pub(crate) fn evaluate_packed_snp_qc(
     } else if apply_het_filter && ((het as f64) / (non_missing as f64)) > (het_threshold as f64) {
         false
     } else {
-        maf_passes_threshold_from_counts(alt_sum as f64, non_missing, maf_threshold)
+        alt_freq.min(1.0_f32 - alt_freq) >= maf_threshold
     };
     PackedSnpQc {
         keep,
@@ -2163,7 +2163,7 @@ fn pure_line_filter_status_from_counts(
     )
 }
 
-fn format_zero_sites_pure_line_error(
+pub(crate) fn format_zero_sites_pure_line_error(
     stats_n_samples: usize,
     n_samples_total: usize,
     n_snps: usize,
@@ -4680,6 +4680,143 @@ pub(crate) struct PreparedBedLogicMetaAndPackedOwned {
     pub packed_all_rows: Vec<u8>,
 }
 
+/// Compact, Max6-only BIM metadata. Repeated chromosome and allele strings
+/// are stored once in `texts`; SNP IDs remain per-row strings because they
+/// are commonly unique and are frequently used in result labels.
+#[derive(Debug, Default)]
+pub(crate) struct CompactMax6SiteMetadata {
+    sites: Vec<CompactMax6Site>,
+    snp_ids: Vec<String>,
+    texts: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct CompactMax6SiteMetadataBuilder {
+    sites: Vec<CompactMax6Site>,
+    snp_ids: Vec<String>,
+    texts: Vec<String>,
+    text_hashes: std::collections::HashMap<u64, Vec<u32>>,
+    last_chrom_id: Option<u32>,
+    last_ref_id: Option<u32>,
+    last_alt_id: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CompactMax6Site {
+    chrom_id: u32,
+    pos: i32,
+    ref_id: u32,
+    alt_id: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CompactMax6SiteFields<'a> {
+    pub chrom: &'a str,
+    pub pos: i32,
+    pub snp: &'a str,
+    pub ref_allele: &'a str,
+    pub alt_allele: &'a str,
+}
+
+pub(crate) fn compact_max6_text_id(pool_len: usize) -> Result<u32, String> {
+    u32::try_from(pool_len)
+        .map_err(|_| format!("Max6 compact BIM text pool exceeds u32 capacity: {pool_len}"))
+}
+
+impl CompactMax6SiteMetadata {
+    pub(crate) fn builder(site_capacity: usize) -> CompactMax6SiteMetadataBuilder {
+        CompactMax6SiteMetadataBuilder {
+            sites: Vec::with_capacity(site_capacity),
+            snp_ids: Vec::with_capacity(site_capacity),
+            texts: Vec::new(),
+            text_hashes: std::collections::HashMap::new(),
+            last_chrom_id: None,
+            last_ref_id: None,
+            last_alt_id: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_sites(sites: Vec<core::SiteInfo>) -> Result<Self, String> {
+        let mut builder = Self::builder(sites.len());
+        for site in sites {
+            builder.push(site)?;
+        }
+        Ok(builder.finish())
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.sites.len()
+    }
+
+    pub(crate) fn fields(&self, index: usize) -> Option<CompactMax6SiteFields<'_>> {
+        let site = self.sites.get(index)?;
+        Some(CompactMax6SiteFields {
+            chrom: self.texts.get(site.chrom_id as usize)?.as_str(),
+            pos: site.pos,
+            snp: self.snp_ids.get(index)?.as_str(),
+            ref_allele: self.texts.get(site.ref_id as usize)?.as_str(),
+            alt_allele: self.texts.get(site.alt_id as usize)?.as_str(),
+        })
+    }
+}
+
+impl CompactMax6SiteMetadataBuilder {
+    pub(crate) fn push(&mut self, site: core::SiteInfo) -> Result<(), String> {
+        let chrom_id = self.intern_text(site.chrom, self.last_chrom_id)?;
+        self.last_chrom_id = Some(chrom_id);
+        let ref_id = self.intern_text(site.ref_allele, self.last_ref_id)?;
+        self.last_ref_id = Some(ref_id);
+        let alt_id = self.intern_text(site.alt_allele, self.last_alt_id)?;
+        self.last_alt_id = Some(alt_id);
+        self.sites.push(CompactMax6Site {
+            chrom_id,
+            pos: site.pos,
+            ref_id,
+            alt_id,
+        });
+        self.snp_ids.push(site.snp);
+        Ok(())
+    }
+
+    fn intern_text(&mut self, text: String, last_id: Option<u32>) -> Result<u32, String> {
+        use std::hash::{Hash, Hasher};
+
+        if let Some(id) = last_id {
+            if self
+                .texts
+                .get(id as usize)
+                .is_some_and(|cached| cached == &text)
+            {
+                return Ok(id);
+            }
+        }
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut hasher);
+        let hash = hasher.finish();
+        if let Some(ids) = self.text_hashes.get(&hash) {
+            for &id in ids {
+                if self.texts[id as usize] == text {
+                    return Ok(id);
+                }
+            }
+        }
+        let id = compact_max6_text_id(self.texts.len())?;
+        self.texts.push(text);
+        self.text_hashes.entry(hash).or_default().push(id);
+        Ok(id)
+    }
+
+    pub(crate) fn finish(self) -> CompactMax6SiteMetadata {
+        CompactMax6SiteMetadata {
+            sites: self.sites,
+            snp_ids: self.snp_ids,
+            texts: self.texts,
+        }
+    }
+}
+
 /// Build logic metadata from a keep mask that was already computed for the
 /// same BED/sample selection. This avoids rescanning the BED payload merely
 /// to reconstruct source-row indices and retained BIM metadata.
@@ -4867,6 +5004,39 @@ fn collect_bed_interval_candidate_rows_and_snp_flags_local(
     Ok((row_source_indices, snp_flags))
 }
 
+enum BedCandidateSites<'a> {
+    Borrowed(&'a [core::SiteInfo]),
+    CompactMax6NoRetain(&'a CompactMax6SiteMetadata),
+    Owned(Vec<core::SiteInfo>),
+}
+
+impl BedCandidateSites<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Borrowed(sites) => sites.len(),
+            Self::CompactMax6NoRetain(sites) => sites.len(),
+            Self::Owned(sites) => sites.len(),
+        }
+    }
+
+    fn alleles(&self, index: usize) -> Option<(&str, &str)> {
+        match self {
+            Self::Borrowed(sites) => {
+                let site = sites.get(index)?;
+                Some((site.ref_allele.as_str(), site.alt_allele.as_str()))
+            }
+            Self::CompactMax6NoRetain(sites) => {
+                let site = sites.fields(index)?;
+                Some((site.ref_allele, site.alt_allele))
+            }
+            Self::Owned(sites) => {
+                let site = sites.get(index)?;
+                Some((site.ref_allele.as_str(), site.alt_allele.as_str()))
+            }
+        }
+    }
+}
+
 fn prepare_bed_logic_meta_owned_for_candidate_rows_pure_line(
     prefix: &str,
     maf_threshold: f32,
@@ -4876,6 +5046,50 @@ fn prepare_bed_logic_meta_owned_for_candidate_rows_pure_line(
     stats_sample_indices: Option<&[usize]>,
     row_source_indices: &[usize],
     candidate_sites: &[core::SiteInfo],
+) -> Result<PreparedBedLogicMetaOwned, String> {
+    prepare_bed_logic_meta_owned_for_candidate_rows_pure_line_impl(
+        prefix,
+        maf_threshold,
+        max_missing_rate,
+        het_threshold,
+        snps_only,
+        stats_sample_indices,
+        row_source_indices,
+        BedCandidateSites::Borrowed(candidate_sites),
+    )
+}
+
+fn prepare_bed_logic_meta_owned_for_candidate_rows_pure_line_owned(
+    prefix: &str,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
+    stats_sample_indices: Option<&[usize]>,
+    row_source_indices: &[usize],
+    candidate_sites: Vec<core::SiteInfo>,
+) -> Result<PreparedBedLogicMetaOwned, String> {
+    prepare_bed_logic_meta_owned_for_candidate_rows_pure_line_impl(
+        prefix,
+        maf_threshold,
+        max_missing_rate,
+        het_threshold,
+        snps_only,
+        stats_sample_indices,
+        row_source_indices,
+        BedCandidateSites::Owned(candidate_sites),
+    )
+}
+
+fn prepare_bed_logic_meta_owned_for_candidate_rows_pure_line_impl(
+    prefix: &str,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
+    stats_sample_indices: Option<&[usize]>,
+    row_source_indices: &[usize],
+    candidate_sites: BedCandidateSites<'_>,
 ) -> Result<PreparedBedLogicMetaOwned, String> {
     if row_source_indices.len() != candidate_sites.len() {
         return Err(format!(
@@ -4925,75 +5139,89 @@ fn prepare_bed_logic_meta_owned_for_candidate_rows_pure_line(
         precompute_excluded_sample_indices(n_samples, stats_sample_indices)
     };
 
-    let bed_path = format!("{bed_prefix}.bed");
-    let bed_file = File::open(&bed_path).map_err(|e| format!("failed to open {bed_path}: {e}"))?;
-    let mmap =
-        unsafe { Mmap::map(&bed_file) }.map_err(|e| format!("failed to mmap {bed_path}: {e}"))?;
-    if mmap.len() < 3 {
-        return Err("BED too small".to_string());
-    }
-    if mmap[0] != 0x6C || mmap[1] != 0x1B || mmap[2] != 0x01 {
-        return Err("Only SNP-major BED supported".to_string());
-    }
-    let bytes_per_snp = (n_samples + 3) / 4;
-    let data_len = mmap.len() - 3;
-    if bytes_per_snp == 0 || data_len % bytes_per_snp != 0 {
+    // The source rows are already ordered in the production tag paths. Keep
+    // only one BED window mapped while evaluating each parallel row batch;
+    // mapping the whole multi-GiB BED makes file-backed pages dominate RSS.
+    const TAG_QC_BED_WINDOW_MB: usize = 128;
+    let mut bed_iter = BedSnpIter::new_for_grm_window(&bed_prefix, TAG_QC_BED_WINDOW_MB)?;
+    if bed_iter.n_samples() != n_samples {
         return Err(format!(
-            "invalid BED payload length: data_len={data_len}, bytes_per_snp={bytes_per_snp}"
+            "BED sample count {} != FAM sample count {n_samples}",
+            bed_iter.n_samples()
         ));
     }
-    let n_snps_total = data_len / bytes_per_snp;
+    let bytes_per_snp = bed_iter.bytes_per_snp();
+    let n_snps_total = bed_iter.n_snps();
     if let Some(&bad_idx) = row_source_indices.iter().find(|&&idx| idx >= n_snps_total) {
         return Err(format!(
             "row_source_indices contains out-of-range source row {bad_idx} for n_snps={n_snps_total}"
         ));
     }
 
-    let packed_src = &mmap[3..];
-    let row_eval = row_source_indices
-        .par_iter()
-        .zip(candidate_sites.par_iter())
-        .map(|(&src_row, site)| {
-            let src_off = src_row * bytes_per_snp;
-            let row = &packed_src[src_off..src_off + bytes_per_snp];
-            let (missing, het, hom_alt) = if stats_identity {
-                count_packed_row_counts(row, n_samples)
-            } else {
-                count_packed_row_counts_selected_with_excluded(
-                    row,
-                    n_samples,
-                    stats_sample_indices,
-                    stats_excluded_sample_indices.as_deref(),
-                )
-            };
-            let (mut status, missing_rate, alt_freq) = pure_line_filter_status_from_counts(
-                stats_n_samples,
-                missing,
-                het,
-                hom_alt,
-                maf_threshold,
-                max_missing_rate,
-                het_threshold,
-            );
-            if snps_only
-                && pure_line_filter_status_reason(status) == PURE_LINE_FILTER_KEEP
-                && (!is_simple_snp_allele(&site.ref_allele)
-                    || !is_simple_snp_allele(&site.alt_allele))
-            {
-                status = pure_line_filter_status_replace_reason(
-                    status,
-                    PURE_LINE_FILTER_FAIL_NON_SIMPLE_SNP,
+    let mut row_eval = vec![(0u8, 0.0f32, 0.0f32); row_source_indices.len()];
+    let mut evaluated = 0usize;
+    while evaluated < row_source_indices.len() {
+        let first_row = row_source_indices[evaluated];
+        bed_iter.ensure_window_for_snp(first_row)?;
+        let window_end = first_row + bed_iter.mapped_contiguous_snps_from(first_row);
+        let mut batch_end = evaluated + 1;
+        while batch_end < row_source_indices.len()
+            && row_source_indices[batch_end] >= first_row
+            && row_source_indices[batch_end] < window_end
+        {
+            batch_end += 1;
+        }
+        let bed_ref = &bed_iter;
+        row_eval[evaluated..batch_end]
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(offset, destination)| {
+                let row_index = evaluated + offset;
+                let src_row = row_source_indices[row_index];
+                let row = bed_ref
+                    .packed_snp_bytes_at(src_row)
+                    .expect("validated candidate BED row must be in mapped window");
+                let (missing, het, hom_alt) = if stats_identity {
+                    count_packed_row_counts(row, n_samples)
+                } else {
+                    count_packed_row_counts_selected_with_excluded(
+                        row,
+                        n_samples,
+                        stats_sample_indices,
+                        stats_excluded_sample_indices.as_deref(),
+                    )
+                };
+                let (mut status, missing_rate, alt_freq) = pure_line_filter_status_from_counts(
+                    stats_n_samples,
+                    missing,
+                    het,
+                    hom_alt,
+                    maf_threshold,
+                    max_missing_rate,
+                    het_threshold,
                 );
-            }
-            (status, missing_rate, alt_freq)
-        })
-        .collect::<Vec<_>>();
+                if snps_only
+                    && pure_line_filter_status_reason(status) == PURE_LINE_FILTER_KEEP
+                    && candidate_sites
+                        .alleles(row_index)
+                        .is_none_or(|(ref_allele, alt_allele)| {
+                            !is_simple_snp_allele(ref_allele) || !is_simple_snp_allele(alt_allele)
+                        })
+                {
+                    status = pure_line_filter_status_replace_reason(
+                        status,
+                        PURE_LINE_FILTER_FAIL_NON_SIMPLE_SNP,
+                    );
+                }
+                *destination = (status, missing_rate, alt_freq);
+            });
+        evaluated = batch_end;
+    }
 
     let mut row_flip = Vec::<bool>::with_capacity(row_source_indices.len());
     let mut kept_rows = Vec::<usize>::with_capacity(row_source_indices.len());
     let mut kept_missing = Vec::<f32>::with_capacity(row_source_indices.len());
     let mut kept_maf = Vec::<f32>::with_capacity(row_source_indices.len());
-    let mut kept_sites = Vec::<core::SiteInfo>::with_capacity(row_source_indices.len());
     let mut fail_missing = 0usize;
     let mut fail_het = 0usize;
     let mut fail_no_non_missing = 0usize;
@@ -5002,15 +5230,12 @@ fn prepare_bed_logic_meta_owned_for_candidate_rows_pure_line(
     let mut het_sites = 0usize;
     let mut raw_missing_sites = 0usize;
 
-    for (idx, ((status, missing_rate, alt_freq), site)) in
-        row_eval.into_iter().zip(candidate_sites.iter()).enumerate()
-    {
+    for (idx, &(status, missing_rate, alt_freq)) in row_eval.iter().enumerate() {
         let reason = pure_line_filter_status_reason(status);
         if reason == PURE_LINE_FILTER_KEEP {
             kept_rows.push(row_source_indices[idx]);
             kept_missing.push(missing_rate);
             kept_maf.push(alt_freq);
-            kept_sites.push(site.clone());
             // `alt_freq` is the BED A2 frequency.  Keep the retained-site
             // orientation consistent with both full and windowed scans so
             // interval/grouped callers also label the minor state correctly.
@@ -5052,6 +5277,28 @@ fn prepare_bed_logic_meta_owned_for_candidate_rows_pure_line(
         ));
     }
 
+    let kept_sites = match candidate_sites {
+        BedCandidateSites::CompactMax6NoRetain(_) => Vec::new(),
+        BedCandidateSites::Borrowed(sites) => sites
+            .iter()
+            .zip(row_eval.iter())
+            .filter_map(|(site, &(status, _, _))| {
+                (pure_line_filter_status_reason(status) == PURE_LINE_FILTER_KEEP)
+                    .then(|| site.clone())
+            })
+            .collect(),
+        BedCandidateSites::Owned(mut sites) => {
+            let mut index = 0usize;
+            sites.retain(|_| {
+                let keep =
+                    pure_line_filter_status_reason(row_eval[index].0) == PURE_LINE_FILTER_KEEP;
+                index += 1;
+                keep
+            });
+            sites
+        }
+    };
+
     Ok(PreparedBedLogicMetaOwned {
         site_keep: Vec::new(),
         row_flip,
@@ -5063,6 +5310,272 @@ fn prepare_bed_logic_meta_owned_for_candidate_rows_pure_line(
         n_snps_total,
         bytes_per_snp,
     })
+}
+
+pub(crate) fn prepare_bed_logic_meta_owned_for_source_rows_pure_line(
+    prefix: &str,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
+    stats_sample_indices: Option<&[usize]>,
+    row_source_indices: &[usize],
+) -> Result<PreparedBedLogicMetaOwned, String> {
+    if !(0.0..=0.5).contains(&maf_threshold) {
+        return Err("maf_threshold must be within [0, 0.5]".to_string());
+    }
+    if !(0.0..=1.0).contains(&max_missing_rate) {
+        return Err("max_missing_rate must be within [0, 1.0]".to_string());
+    }
+    if !(0.0..=1.0).contains(&het_threshold) {
+        return Err("het_threshold must be within [0, 1.0]".to_string());
+    }
+    if row_source_indices.is_empty() {
+        return Err("preselected source rows must not be empty".to_string());
+    }
+    if row_source_indices.windows(2).any(|rows| rows[0] >= rows[1]) {
+        return Err("preselected source rows must be strictly increasing".to_string());
+    }
+
+    let mut bed_prefix = prefix.to_string();
+    let lower = bed_prefix.to_ascii_lowercase();
+    if lower.ends_with(".bed") || lower.ends_with(".bim") || lower.ends_with(".fam") {
+        bed_prefix.truncate(bed_prefix.len() - 4);
+    }
+
+    let samples = core::read_fam(&bed_prefix).map_err(|error| error.to_string())?;
+    let n_samples = samples.len();
+    if n_samples == 0 {
+        return Err("no samples found in PLINK input".to_string());
+    }
+    let bed_iter = BedSnpIter::new_for_grm_window(&bed_prefix, 128)?;
+    if bed_iter.n_samples() != n_samples {
+        return Err(format!(
+            "BED sample count {} != FAM sample count {n_samples}",
+            bed_iter.n_samples()
+        ));
+    }
+    let n_snps_total = bed_iter.n_snps();
+    if n_snps_total == 0 {
+        return Err("no SNP sites found in PLINK BED input".to_string());
+    }
+    if let Some(&bad_row) = row_source_indices.iter().find(|&&row| row >= n_snps_total) {
+        return Err(format!(
+            "preselected source row {bad_row} is outside BED marker range 0..{n_snps_total}"
+        ));
+    }
+    drop(bed_iter);
+
+    let mut bim = core::BimChunkReader::open(&bed_prefix)?;
+    let chunk_rows = 131_072usize;
+    let mut candidate_sites = Vec::<core::SiteInfo>::with_capacity(row_source_indices.len());
+    let mut selected_cursor = 0usize;
+    let mut base = 0usize;
+    while base < n_snps_total {
+        let end = (base + chunk_rows).min(n_snps_total);
+        let mut keep = vec![false; end - base];
+        while selected_cursor < row_source_indices.len()
+            && row_source_indices[selected_cursor] < end
+        {
+            let row = row_source_indices[selected_cursor];
+            if row < base {
+                return Err(format!(
+                    "preselected source row {row} was skipped before BIM chunk {base}"
+                ));
+            }
+            keep[row - base] = true;
+            selected_cursor += 1;
+        }
+        candidate_sites.extend(bim.read_range_masked(base, end, keep.as_slice())?);
+        base = end;
+    }
+    bim.ensure_exhausted(n_snps_total)?;
+    if selected_cursor != row_source_indices.len()
+        || candidate_sites.len() != row_source_indices.len()
+    {
+        return Err(format!(
+            "preselected BIM row collection mismatch: requested={}, consumed={}, sites={}",
+            row_source_indices.len(),
+            selected_cursor,
+            candidate_sites.len()
+        ));
+    }
+
+    prepare_bed_logic_meta_owned_for_candidate_rows_pure_line_owned(
+        bed_prefix.as_str(),
+        maf_threshold,
+        max_missing_rate,
+        het_threshold,
+        snps_only,
+        stats_sample_indices,
+        row_source_indices,
+        candidate_sites,
+    )
+}
+
+/// Prepare trait-specific BED QC for globally preselected rows using BIM
+/// metadata retained by the shared genotype preparation handle. This path is
+/// intentionally BIM-free: repeated traits only revisit the selected BED
+/// rows, not the full marker metadata file.
+pub(crate) fn prepare_bed_logic_meta_owned_for_cached_compact_source_rows_pure_line(
+    prefix: &str,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
+    stats_sample_indices: Option<&[usize]>,
+    row_source_indices: &[usize],
+    candidate_sites: &CompactMax6SiteMetadata,
+) -> Result<PreparedBedLogicMetaOwned, String> {
+    if !(0.0..=0.5).contains(&maf_threshold) {
+        return Err("maf_threshold must be within [0, 0.5]".to_string());
+    }
+    if !(0.0..=1.0).contains(&max_missing_rate) {
+        return Err("max_missing_rate must be within [0, 1.0]".to_string());
+    }
+    if !(0.0..=1.0).contains(&het_threshold) {
+        return Err("het_threshold must be within [0, 1.0]".to_string());
+    }
+    if row_source_indices.is_empty() {
+        return Err("preselected source rows must not be empty".to_string());
+    }
+    if row_source_indices.windows(2).any(|rows| rows[0] >= rows[1]) {
+        return Err("preselected source rows must be strictly increasing".to_string());
+    }
+    if row_source_indices.len() != candidate_sites.len() {
+        return Err(format!(
+            "cached source row/site length mismatch: rows={}, sites={}",
+            row_source_indices.len(),
+            candidate_sites.len()
+        ));
+    }
+
+    let mut bed_prefix = prefix.to_string();
+    let lower = bed_prefix.to_ascii_lowercase();
+    if lower.ends_with(".bed") || lower.ends_with(".bim") || lower.ends_with(".fam") {
+        bed_prefix.truncate(bed_prefix.len() - 4);
+    }
+
+    prepare_bed_logic_meta_owned_for_candidate_rows_pure_line_impl(
+        bed_prefix.as_str(),
+        maf_threshold,
+        max_missing_rate,
+        het_threshold,
+        snps_only,
+        stats_sample_indices,
+        row_source_indices,
+        BedCandidateSites::CompactMax6NoRetain(candidate_sites),
+    )
+}
+
+/// Load genotype-global Max6 tag metadata from selected BIM rows in bounded
+/// chunks, then run the shared pure-line QC against the compact cache. This
+/// avoids ever materializing a full selected-tag `Vec<SiteInfo>`.
+pub(crate) fn prepare_bed_logic_meta_owned_and_compact_source_rows_pure_line(
+    prefix: &str,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
+    stats_sample_indices: Option<&[usize]>,
+    row_source_indices: &[usize],
+) -> Result<(PreparedBedLogicMetaOwned, CompactMax6SiteMetadata), String> {
+    if !(0.0..=0.5).contains(&maf_threshold) {
+        return Err("maf_threshold must be within [0, 0.5]".to_string());
+    }
+    if !(0.0..=1.0).contains(&max_missing_rate) {
+        return Err("max_missing_rate must be within [0, 1.0]".to_string());
+    }
+    if !(0.0..=1.0).contains(&het_threshold) {
+        return Err("het_threshold must be within [0, 1.0]".to_string());
+    }
+    if row_source_indices.is_empty() {
+        return Err("preselected source rows must not be empty".to_string());
+    }
+    if row_source_indices.windows(2).any(|rows| rows[0] >= rows[1]) {
+        return Err("preselected source rows must be strictly increasing".to_string());
+    }
+
+    let mut bed_prefix = prefix.to_string();
+    let lower = bed_prefix.to_ascii_lowercase();
+    if lower.ends_with(".bed") || lower.ends_with(".bim") || lower.ends_with(".fam") {
+        bed_prefix.truncate(bed_prefix.len() - 4);
+    }
+    let samples = core::read_fam(&bed_prefix).map_err(|error| error.to_string())?;
+    if samples.is_empty() {
+        return Err("no samples found in PLINK input".to_string());
+    }
+    let bed_iter = BedSnpIter::new_for_grm_window(&bed_prefix, 128)?;
+    if bed_iter.n_samples() != samples.len() {
+        return Err(format!(
+            "BED sample count {} != FAM sample count {}",
+            bed_iter.n_samples(),
+            samples.len()
+        ));
+    }
+    let n_snps_total = bed_iter.n_snps();
+    if n_snps_total == 0 {
+        return Err("no SNP sites found in PLINK BED input".to_string());
+    }
+    if let Some(&bad_row) = row_source_indices.iter().find(|&&row| row >= n_snps_total) {
+        return Err(format!(
+            "preselected source row {bad_row} is outside BED marker range 0..{n_snps_total}"
+        ));
+    }
+    drop(bed_iter);
+
+    let mut bim = core::BimChunkReader::open(&bed_prefix)?;
+    let chunk_rows = 131_072usize;
+    let mut builder = CompactMax6SiteMetadata::builder(row_source_indices.len());
+    let mut selected_cursor = 0usize;
+    let mut base = 0usize;
+    while base < n_snps_total {
+        let end = (base + chunk_rows).min(n_snps_total);
+        let mut keep = vec![false; end - base];
+        while selected_cursor < row_source_indices.len()
+            && row_source_indices[selected_cursor] < end
+        {
+            let row = row_source_indices[selected_cursor];
+            if row < base {
+                return Err(format!(
+                    "preselected source row {row} was skipped before BIM chunk {base}"
+                ));
+            }
+            keep[row - base] = true;
+            selected_cursor += 1;
+        }
+        for site in bim.read_range_masked(base, end, keep.as_slice())? {
+            builder.push(site)?;
+        }
+        base = end;
+    }
+    bim.ensure_exhausted(n_snps_total)?;
+    if selected_cursor != row_source_indices.len() {
+        return Err(format!(
+            "preselected BIM row collection mismatch: requested={}, consumed={}",
+            row_source_indices.len(),
+            selected_cursor
+        ));
+    }
+    let compact_sites = builder.finish();
+    if compact_sites.len() != row_source_indices.len() {
+        return Err(format!(
+            "preselected BIM compact-row mismatch: requested={}, sites={}",
+            row_source_indices.len(),
+            compact_sites.len()
+        ));
+    }
+    let meta = prepare_bed_logic_meta_owned_for_cached_compact_source_rows_pure_line(
+        bed_prefix.as_str(),
+        maf_threshold,
+        max_missing_rate,
+        het_threshold,
+        snps_only,
+        stats_sample_indices,
+        row_source_indices,
+        &compact_sites,
+    )?;
+    Ok((meta, compact_sites))
 }
 
 pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_pure_line_intervals(
@@ -5292,11 +5805,7 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_sparse_windowed(
                     {
                         false
                     } else {
-                        maf_passes_threshold_from_counts(
-                            counts.alt_sum as f64,
-                            non_missing,
-                            maf_threshold,
-                        )
+                        alt_freq.min(1.0_f32 - alt_freq) >= maf_threshold
                     };
                     let pass_snp = if let Some(sites_all_ref) = sites_all_ref {
                         let site = &sites_all_ref[snp_idx];
@@ -5683,7 +6192,7 @@ fn prepare_bed_logic_meta_and_packed_owned_for_candidate_rows(
                 {
                     false
                 } else {
-                    maf_passes_threshold_from_counts(alt_sum as f64, non_missing, maf_threshold)
+                    alt_freq.min(1.0_f32 - alt_freq) >= maf_threshold
                 };
                 let pass_snp =
                     !snps_only || candidate_snp_flags.is_some_and(|flags| flags[candidate_index]);
@@ -6044,7 +6553,7 @@ fn prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window_internal(
         {
             false
         } else {
-            maf_passes_threshold_from_counts(alt_sum as f64, non_missing, maf_threshold)
+            alt_freq.min(1.0_f32 - alt_freq) >= maf_threshold
         };
         let pass_snp = if snps_only {
             if let Some(mask) = simple_snp_mask.as_ref() {
@@ -9640,8 +10149,8 @@ pub fn count_hmp_snps(path: String) -> PyResult<usize> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bim_line_simple_snp_alleles, compact_packed_rows_in_place, copy_packed_rows_and_map,
-        count_packed_row_counts, count_packed_row_counts_selected,
+        bim_line_simple_snp_alleles, compact_max6_text_id, compact_packed_rows_in_place,
+        copy_packed_rows_and_map, count_packed_row_counts, count_packed_row_counts_selected,
         count_packed_row_counts_selected_with_excluded, count_packed_row_pure_line_counts,
         count_packed_row_pure_line_counts_fast,
         count_packed_row_pure_line_counts_selected_with_excluded,
@@ -9651,11 +10160,15 @@ mod tests {
         format_zero_sites_pure_line_error, precompute_excluded_sample_indices,
         prepare_bed_logic_meta_and_packed_owned_for_stats_samples,
         prepare_bed_logic_meta_and_packed_owned_for_stats_samples_with_ranges,
+        prepare_bed_logic_meta_owned_and_compact_source_rows_pure_line,
+        prepare_bed_logic_meta_owned_for_cached_compact_source_rows_pure_line,
+        prepare_bed_logic_meta_owned_for_candidate_rows_pure_line_owned,
+        prepare_bed_logic_meta_owned_for_source_rows_pure_line,
         prepare_bed_logic_meta_owned_for_stats_samples_pure_line_intervals,
         prepare_bed_logic_meta_owned_for_stats_samples_pure_line_with_mmap_window,
         prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window,
         pure_line_filter_status_from_counts, pure_line_filter_status_reason, BedChunkReader,
-        PURE_LINE_FILTER_FAIL_MISSING, PURE_LINE_FILTER_KEEP,
+        CompactMax6SiteMetadata, PURE_LINE_FILTER_FAIL_MISSING, PURE_LINE_FILTER_KEEP,
     };
 
     #[test]
@@ -9680,6 +10193,61 @@ mod tests {
         assert!(!observed.keep);
         assert!((observed.alt_freq - 0.35).abs() < 1e-6);
         assert_eq!(observed.missing_count, 0);
+    }
+
+    #[test]
+    fn compact_max6_site_metadata_round_trips_bim_text_and_deduplicates_shared_fields() {
+        let compact = CompactMax6SiteMetadata::from_sites(vec![
+            crate::gfcore::SiteInfo {
+                chrom: "chr01".to_string(),
+                pos: 19,
+                snp: "rs-alpha".to_string(),
+                ref_allele: "A".to_string(),
+                alt_allele: "G".to_string(),
+            },
+            crate::gfcore::SiteInfo {
+                chrom: "chr01".to_string(),
+                pos: 20,
+                snp: "rs-beta".to_string(),
+                ref_allele: "A".to_string(),
+                alt_allele: "G".to_string(),
+            },
+        ])
+        .expect("compact BIM metadata");
+
+        let first = compact.fields(0).expect("first compact BIM row");
+        let second = compact.fields(1).expect("second compact BIM row");
+        assert_eq!(
+            (
+                first.chrom,
+                first.pos,
+                first.snp,
+                first.ref_allele,
+                first.alt_allele
+            ),
+            ("chr01", 19, "rs-alpha", "A", "G")
+        );
+        assert_eq!(
+            (
+                second.chrom,
+                second.pos,
+                second.snp,
+                second.ref_allele,
+                second.alt_allele
+            ),
+            ("chr01", 20, "rs-beta", "A", "G")
+        );
+        assert_eq!(compact.texts.len(), 3);
+        assert_eq!(compact.sites[0].chrom_id, compact.sites[1].chrom_id);
+        assert_eq!(compact.sites[0].ref_id, compact.sites[1].ref_id);
+        assert_eq!(compact.sites[0].alt_id, compact.sites[1].alt_id);
+        assert!(compact.fields(2).is_none());
+    }
+
+    #[test]
+    fn compact_max6_text_pool_id_rejects_values_outside_u32() {
+        assert_eq!(compact_max6_text_id(u32::MAX as usize).unwrap(), u32::MAX);
+        assert!(compact_max6_text_id(u32::MAX as usize + 1).is_err());
     }
 
     fn pack_plink_codes(codes: &[u8]) -> Vec<u8> {
@@ -10188,6 +10756,276 @@ mod tests {
         assert_eq!(windowed_sites, full_sites);
 
         fs::remove_dir_all(dir).expect("remove temporary BED directory");
+    }
+
+    #[test]
+    fn tag_only_trait_qc_drops_failed_preselected_rows_without_replacement() {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("janusx_max6_tag_qc_{stamp}"));
+        fs::create_dir_all(&dir).expect("create temporary BED directory");
+        let prefix = dir.join("tiny");
+        fs::write(
+            prefix.with_extension("fam"),
+            "f1 s1 0 0 1 -9\nf2 s2 0 0 1 -9\nf3 s3 0 0 1 -9\nf4 s4 0 0 1 -9\n",
+        )
+        .expect("write FAM");
+        fs::write(
+            prefix.with_extension("bim"),
+            "1 rs1 0 10 A G\n1 rs2 0 20 C T\n1 rs3 0 30 G A\n",
+        )
+        .expect("write BIM");
+        let mut bed = vec![0x6c, 0x1b, 0x01];
+        bed.extend(pack_plink_codes(&[0b00, 0b00, 0b11, 0b11]));
+        bed.extend(pack_plink_codes(&[0b00, 0b00, 0b00, 0b00]));
+        bed.extend(pack_plink_codes(&[0b00, 0b00, 0b00, 0b11]));
+        fs::write(prefix.with_extension("bed"), bed).expect("write BED");
+
+        let trait_meta = prepare_bed_logic_meta_owned_for_source_rows_pure_line(
+            prefix.to_str().unwrap(),
+            0.1,
+            0.05,
+            1.0,
+            false,
+            Some(&[0usize, 2]),
+            &[0usize, 2],
+        )
+        .expect("QC preselected tags on the trait sample set");
+
+        assert_eq!(trait_meta.row_source_indices, vec![0]);
+        assert_eq!(trait_meta.sites[0].snp, "rs1");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn owned_tag_qc_moves_retained_metadata_without_cloning() {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("janusx_owned_tag_qc_{stamp}"));
+        fs::create_dir_all(&dir).expect("create temporary BED directory");
+        let prefix = dir.join("tiny");
+        fs::write(
+            prefix.with_extension("fam"),
+            "f1 s1 0 0 1 -9\nf2 s2 0 0 1 -9\nf3 s3 0 0 1 -9\nf4 s4 0 0 1 -9\n",
+        )
+        .expect("write FAM");
+        fs::write(
+            prefix.with_extension("bim"),
+            "1 rs1 0 10 A G\n1 rs2 0 20 C T\n",
+        )
+        .expect("write BIM");
+        let mut bed = vec![0x6c, 0x1b, 0x01];
+        bed.extend(pack_plink_codes(&[0b00, 0b00, 0b11, 0b11]));
+        bed.extend(pack_plink_codes(&[0b00, 0b00, 0b00, 0b00]));
+        fs::write(prefix.with_extension("bed"), bed).expect("write BED");
+
+        let candidate_sites = vec![
+            crate::gfcore::SiteInfo {
+                chrom: "1".to_string(),
+                pos: 10,
+                snp: "rs1".to_string(),
+                ref_allele: "A".to_string(),
+                alt_allele: "G".to_string(),
+            },
+            crate::gfcore::SiteInfo {
+                chrom: "1".to_string(),
+                pos: 20,
+                snp: "rs2".to_string(),
+                ref_allele: "C".to_string(),
+                alt_allele: "T".to_string(),
+            },
+        ];
+        let original_sites_ptr = candidate_sites.as_ptr();
+        let original_snp_ptr = candidate_sites[0].snp.as_ptr();
+        let result = prepare_bed_logic_meta_owned_for_candidate_rows_pure_line_owned(
+            prefix.to_str().unwrap(),
+            0.1,
+            0.05,
+            1.0,
+            false,
+            Some(&[0, 2]),
+            &[0, 1],
+            candidate_sites,
+        )
+        .expect("QC owned candidate metadata");
+
+        assert_eq!(result.row_source_indices, vec![0]);
+        assert_eq!(result.row_flip, vec![false]);
+        assert_eq!(result.missing_rate, vec![0.0]);
+        assert_eq!(result.maf, vec![0.5]);
+        assert_eq!(result.sites.len(), 1);
+        assert_eq!(result.sites[0].snp, "rs1");
+        assert_eq!(result.sites.as_ptr(), original_sites_ptr);
+        assert_eq!(result.sites[0].snp.as_ptr(), original_snp_ptr);
+        fs::remove_dir_all(dir).expect("remove temporary BED directory");
+    }
+
+    #[test]
+    fn selected_tag_qc_reads_across_bed_mapping_windows() {
+        use std::fs::{self, OpenOptions};
+        use std::io::{Seek, SeekFrom, Write};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("janusx_tag_qc_windows_{stamp}"));
+        fs::create_dir_all(&dir).expect("create temporary BED directory");
+        let prefix = dir.join("sparse");
+        fs::write(
+            prefix.with_extension("fam"),
+            "f1 s1 0 0 1 -9\nf2 s2 0 0 1 -9\nf3 s3 0 0 1 -9\nf4 s4 0 0 1 -9\n",
+        )
+        .expect("write FAM");
+        let far_row = 128usize * 1024 * 1024;
+        let mut bed = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(prefix.with_extension("bed"))
+            .expect("create sparse BED");
+        bed.set_len((3 + far_row + 1) as u64)
+            .expect("set sparse BED length");
+        bed.write_all(&[0x6c, 0x1b, 0x01])
+            .expect("write BED header");
+        let row = pack_plink_codes(&[0b00, 0b00, 0b11, 0b11]);
+        bed.write_all(&row).expect("write first candidate row");
+        bed.seek(SeekFrom::Start((3 + far_row) as u64))
+            .expect("seek to second mapping window");
+        bed.write_all(&row).expect("write far candidate row");
+        drop(bed);
+
+        let sites = [0, 1].map(|index| crate::gfcore::SiteInfo {
+            chrom: "1".to_string(),
+            pos: (index + 1) as i32,
+            snp: format!("rs{index}"),
+            ref_allele: "A".to_string(),
+            alt_allele: "G".to_string(),
+        });
+        let result = super::prepare_bed_logic_meta_owned_for_candidate_rows_pure_line(
+            prefix.to_str().unwrap(),
+            0.1,
+            0.05,
+            1.0,
+            false,
+            None,
+            &[0, far_row],
+            &sites,
+        )
+        .expect("QC candidate rows in separate BED windows");
+        assert_eq!(result.row_source_indices, vec![0, far_row]);
+        assert_eq!(result.maf, vec![0.5, 0.5]);
+        assert_eq!(result.row_flip, vec![false, false]);
+        fs::remove_dir_all(dir).expect("remove temporary BED directory");
+    }
+
+    #[test]
+    fn cached_tag_trait_qc_does_not_reopen_bim() {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("janusx_cached_tag_qc_{stamp}"));
+        fs::create_dir_all(&dir).expect("create temporary BED directory");
+        let prefix = dir.join("tiny");
+        fs::write(
+            prefix.with_extension("fam"),
+            "f1 s1 0 0 1 -9\nf2 s2 0 0 1 -9\nf3 s3 0 0 1 -9\nf4 s4 0 0 1 -9\n",
+        )
+        .expect("write FAM");
+        fs::write(
+            prefix.with_extension("bim"),
+            "1 rs1 0 10 A G\n1 rs2 0 20 C T\n",
+        )
+        .expect("write BIM");
+        let mut bed = vec![0x6c, 0x1b, 0x01];
+        bed.extend(pack_plink_codes(&[0b00, 0b00, 0b11, 0b11]));
+        bed.extend(pack_plink_codes(&[0b00, 0b00, 0b00, 0b00]));
+        fs::write(prefix.with_extension("bed"), bed).expect("write BED");
+
+        let (global_meta, compact_sites) =
+            prepare_bed_logic_meta_owned_and_compact_source_rows_pure_line(
+                prefix.to_str().unwrap(),
+                0.1,
+                0.05,
+                1.0,
+                false,
+                None,
+                &[0usize],
+            )
+            .expect("load and compact the selected global BIM row");
+        assert_eq!(global_meta.row_source_indices, vec![0]);
+        assert_eq!(global_meta.row_flip, vec![false]);
+        assert_eq!(global_meta.maf, vec![0.5]);
+        assert_eq!(
+            (
+                compact_sites.fields(0).unwrap().chrom,
+                compact_sites.fields(0).unwrap().pos,
+                compact_sites.fields(0).unwrap().snp,
+                compact_sites.fields(0).unwrap().ref_allele,
+                compact_sites.fields(0).unwrap().alt_allele,
+            ),
+            ("1", 10, "rs1", "A", "G")
+        );
+
+        // The prepared genotype handle supplies raw BIM metadata. Trait QC
+        // must be able to use it without reopening or traversing the BIM.
+        fs::remove_file(prefix.with_extension("bim")).expect("remove BIM after metadata cache");
+        let trait_meta = prepare_bed_logic_meta_owned_for_cached_compact_source_rows_pure_line(
+            prefix.to_str().unwrap(),
+            0.1,
+            0.05,
+            1.0,
+            false,
+            Some(&[0usize, 2]),
+            &[0usize],
+            &compact_sites,
+        )
+        .expect("QC cached tag metadata on the trait sample set");
+
+        assert_eq!(trait_meta.row_source_indices, vec![0]);
+        assert_eq!(trait_meta.row_flip, vec![false]);
+        assert_eq!(trait_meta.maf, vec![0.5]);
+        // Cached global BIM metadata remains the source of truth; per-trait
+        // QC must not clone every SiteInfo merely to pass the same text on.
+        assert!(trait_meta.sites.is_empty());
+
+        let non_snp_sites = CompactMax6SiteMetadata::from_sites(vec![crate::gfcore::SiteInfo {
+            chrom: "1".to_string(),
+            pos: 10,
+            snp: "rs1".to_string(),
+            ref_allele: "AT".to_string(),
+            alt_allele: "A".to_string(),
+        }])
+        .expect("compact a non-SNP BIM allele");
+        let snps_only_error =
+            prepare_bed_logic_meta_owned_for_cached_compact_source_rows_pure_line(
+                prefix.to_str().unwrap(),
+                0.1,
+                0.05,
+                1.0,
+                true,
+                Some(&[0usize, 2]),
+                &[0usize],
+                &non_snp_sites,
+            )
+            .err()
+            .expect("SNP-only trait QC must reject non-simple alleles from compact metadata");
+        assert!(snps_only_error.contains("non_simple_alleles=1"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

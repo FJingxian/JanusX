@@ -702,7 +702,7 @@ fn sample_penalty_from_method(scores: &[f64], method: RuleNullPenaltyMethod) -> 
 }
 
 #[inline]
-fn gumbel_penalty_from_maxima(scores: &[f64], fwer_alpha: f64) -> Option<f64> {
+pub(crate) fn gumbel_penalty_from_maxima(scores: &[f64], fwer_alpha: f64) -> Option<f64> {
     let stats = summarize_scores(scores)?;
     if stats.n < NULL_EXACT_MIN_SAMPLES {
         return None;

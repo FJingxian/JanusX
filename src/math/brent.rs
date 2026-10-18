@@ -12,6 +12,15 @@ where
     brent_minimize_with_init(&mut f, low, high, tol, max_iter, None)
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BrentMinimizeDiagnostics {
+    pub x: f64,
+    pub value: f64,
+    pub iterations: usize,
+    pub converged: bool,
+    pub relative_bracket_width: f64,
+}
+
 #[inline(always)]
 pub(crate) fn brent_minimize_with_init<F>(
     mut f: F,
@@ -21,6 +30,36 @@ pub(crate) fn brent_minimize_with_init<F>(
     max_iter: usize,
     init_x: Option<f64>,
 ) -> (f64, f64)
+where
+    F: FnMut(f64) -> f64,
+{
+    let result = brent_minimize_with_init_diagnostics(&mut f, low, high, tol, max_iter, init_x);
+    (result.x, result.value)
+}
+
+#[inline(always)]
+pub(crate) fn brent_minimize_with_diagnostics<F>(
+    mut f: F,
+    low: f64,
+    high: f64,
+    tol: f64,
+    max_iter: usize,
+) -> BrentMinimizeDiagnostics
+where
+    F: FnMut(f64) -> f64,
+{
+    brent_minimize_with_init_diagnostics(&mut f, low, high, tol, max_iter, None)
+}
+
+#[inline(always)]
+fn brent_minimize_with_init_diagnostics<F>(
+    f: &mut F,
+    low: f64,
+    high: f64,
+    tol: f64,
+    max_iter: usize,
+    init_x: Option<f64>,
+) -> BrentMinimizeDiagnostics
 where
     F: FnMut(f64) -> f64,
 {
@@ -45,13 +84,17 @@ where
 
     let mut d = 0.0_f64;
     let mut e = 0.0_f64;
+    let mut iterations = 0usize;
+    let mut converged = false;
 
     for _ in 0..max_iter {
+        iterations = iterations.saturating_add(1);
         let m = 0.5 * (a + c);
         let tol1 = tol * x.abs() + eps;
         let tol2 = 2.0 * tol1;
 
         if (x - m).abs() <= tol2 - 0.5 * (c - a) {
+            converged = true;
             break;
         }
 
@@ -132,5 +175,12 @@ where
         }
     }
 
-    (x, fx)
+    let relative_bracket_width = (c - a).abs() / x.abs().max(1.0);
+    BrentMinimizeDiagnostics {
+        x,
+        value: fx,
+        iterations,
+        converged,
+        relative_bracket_width,
+    }
 }

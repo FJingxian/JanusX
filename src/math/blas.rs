@@ -131,6 +131,35 @@ fn selected_sgemm_backend() -> SgemmBackend {
     *SGEMM_BACKEND.get_or_init(resolve_sgemm_backend)
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[inline]
+fn garfield_backend_guard_error(backend: SgemmBackend) -> Option<&'static str> {
+    match backend {
+        SgemmBackend::Rust => Some(
+            "Garfield Max6 requires a linked BLAS backend; the pure-Rust BLAS fallback is disabled for this path",
+        ),
+        SgemmBackend::Accelerate | SgemmBackend::OpenBlas | SgemmBackend::Blas => None,
+    }
+}
+
+/// Require a linked BLAS implementation for the performance-sensitive
+/// Garfield Max6 paths. Other JanusX modules may still use the historical
+/// Rust fallback, but Max6 and GRM-Max6 must never silently run through it.
+pub(crate) fn ensure_garfield_blas_backend() -> Result<(), String> {
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    {
+        let backend = selected_sgemm_backend();
+        if let Some(message) = garfield_backend_guard_error(backend) {
+            return Err(format!("{message} (selected backend: {backend:?})"));
+        }
+        return Ok(());
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        Err("Garfield Max6 requires a linked BLAS backend; unsupported target".to_string())
+    }
+}
+
 #[cfg(all(
     target_os = "macos",
     not(all(feature = "blas-openblas", jx_openblas_available))
@@ -3765,6 +3794,14 @@ pub fn rust_blas_get_num_threads() -> isize {
 ))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn garfield_blas_guard_rejects_rust_backend() {
+        assert!(garfield_backend_guard_error(SgemmBackend::Rust).is_some());
+        assert!(garfield_backend_guard_error(SgemmBackend::Accelerate).is_none());
+        assert!(garfield_backend_guard_error(SgemmBackend::OpenBlas).is_none());
+        assert!(garfield_backend_guard_error(SgemmBackend::Blas).is_none());
+    }
 
     #[cfg(all(target_os = "linux", feature = "blas-openblas"))]
     #[test]

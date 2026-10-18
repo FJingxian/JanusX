@@ -2036,7 +2036,7 @@ pub(crate) fn evaluate_packed_snp_qc(
     } else if apply_het_filter && ((het as f64) / (non_missing as f64)) > (het_threshold as f64) {
         false
     } else {
-        alt_freq.min(1.0_f32 - alt_freq) >= maf_threshold
+        maf_passes_threshold_from_counts(alt_sum as f64, non_missing, maf_threshold)
     };
     PackedSnpQc {
         keep,
@@ -5805,7 +5805,7 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_sparse_windowed(
                     {
                         false
                     } else {
-                        alt_freq.min(1.0_f32 - alt_freq) >= maf_threshold
+                        maf_passes_threshold_from_counts(alt_sum as f64, non_missing, maf_threshold)
                     };
                     let pass_snp = if let Some(sites_all_ref) = sites_all_ref {
                         let site = &sites_all_ref[snp_idx];
@@ -6192,7 +6192,7 @@ fn prepare_bed_logic_meta_and_packed_owned_for_candidate_rows(
                 {
                     false
                 } else {
-                    alt_freq.min(1.0_f32 - alt_freq) >= maf_threshold
+                    maf_passes_threshold_from_counts(alt_sum as f64, non_missing, maf_threshold)
                 };
                 let pass_snp =
                     !snps_only || candidate_snp_flags.is_some_and(|flags| flags[candidate_index]);
@@ -6553,7 +6553,7 @@ fn prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window_internal(
         {
             false
         } else {
-            alt_freq.min(1.0_f32 - alt_freq) >= maf_threshold
+            maf_passes_threshold_from_counts(alt_sum as f64, non_missing, maf_threshold)
         };
         let pass_snp = if snps_only {
             if let Some(mask) = simple_snp_mask.as_ref() {
@@ -10157,7 +10157,8 @@ mod tests {
         count_packed_row_pure_line_counts_selected_with_excluded_fast,
         count_packed_row_pure_line_counts_selected_with_excluded_lut, evaluate_packed_bed_row_qc,
         evaluate_packed_row_keep_and_flip, evaluate_packed_snp_qc,
-        format_zero_sites_pure_line_error, precompute_excluded_sample_indices,
+        format_zero_sites_pure_line_error, maf_passes_threshold_from_counts,
+        precompute_excluded_sample_indices,
         prepare_bed_logic_meta_and_packed_owned_for_stats_samples,
         prepare_bed_logic_meta_and_packed_owned_for_stats_samples_with_ranges,
         prepare_bed_logic_meta_owned_and_compact_source_rows_pure_line,
@@ -10170,6 +10171,18 @@ mod tests {
         pure_line_filter_status_from_counts, pure_line_filter_status_reason, BedChunkReader,
         CompactMax6SiteMetadata, PURE_LINE_FILTER_FAIL_MISSING, PURE_LINE_FILTER_KEEP,
     };
+
+    #[test]
+    fn packed_snp_qc_uses_the_shared_count_based_maf_boundary() {
+        // f32(0.1) rounds above the exact rational 2 / 20. Keep the same
+        // count-based comparison used by GRM and the other BED QC paths.
+        let observed = evaluate_packed_snp_qc(0, 2, 0, 10, 0.1_f32, 1.0, 1.0);
+        assert_eq!(
+            observed.keep,
+            maf_passes_threshold_from_counts(2.0, 10, 0.1_f32)
+        );
+        assert!(!observed.keep);
+    }
 
     #[test]
     fn fused_bed_qc_matches_prepared_het_threshold_rounding() {

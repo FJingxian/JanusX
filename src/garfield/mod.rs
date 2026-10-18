@@ -99,7 +99,9 @@ use crate::stats_common::{
     arm_interrupt_trap, check_ctrlc, env_truthy, format_bytes, interrupt_requested,
     map_err_string_to_py, process_memory_usage, INTERRUPTED_MSG,
 };
-use memmap2::{Advice, MmapMut, MmapOptions};
+#[cfg(unix)]
+use memmap2::Advice;
+use memmap2::{MmapMut, MmapOptions};
 
 use numpy::ndarray::{Array1, Array2};
 use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
@@ -9346,6 +9348,7 @@ fn convert_bed_prefix_to_logic_bits(
                 return Err(format!("finalize GARFIELD mapped bitset: {e}"));
             }
         };
+        #[cfg(unix)]
         let _ = mmap.advise(Advice::Random);
         if let Some(path) = bits_mmap_path.as_ref() {
             let _ = fs::remove_file(path);
@@ -18947,6 +18950,7 @@ impl Max6LogicBitsAccumulator {
             let mmap = mmap_mut
                 .make_read_only()
                 .map_err(|error| format!("finalize Max6 mapped bitset: {error}"))?;
+            #[cfg(unix)]
             let _ = mmap.advise(Advice::Random);
             if let Some(path) = self.mmap_path.take() {
                 let _ = fs::remove_file(path);

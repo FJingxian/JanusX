@@ -3018,6 +3018,12 @@ fn mac_eigh_lapack_pref() -> MacEighLapackPref {
 #[cfg(target_os = "macos")]
 #[inline]
 fn should_try_openblas_lapack_on_macos() -> bool {
+    // A later optional import can introduce another libomp even after the
+    // initial backend prewarm. Recheck before using the dynamic LAPACK path:
+    // mixed OpenMP worker/barrier state can segfault inside either runtime.
+    if macos_has_multiple_openmp_runtimes_loaded() {
+        return false;
+    }
     match mac_eigh_lapack_pref() {
         MacEighLapackPref::OpenBlas => true,
         MacEighLapackPref::Accelerate => false,
@@ -3157,6 +3163,27 @@ fn macos_is_openmp_runtime_name(name: &str) -> bool {
 }
 
 #[cfg(target_os = "macos")]
+fn macos_has_multiple_openmp_runtimes_loaded() -> bool {
+    let mut seen = Vec::<PathBuf>::new();
+    for path in macos_loaded_image_paths() {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !macos_is_openmp_runtime_name(name) {
+            continue;
+        }
+        let canonical = std::fs::canonicalize(&path).unwrap_or(path);
+        if !seen.contains(&canonical) {
+            seen.push(canonical);
+            if seen.len() > 1 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "macos")]
 #[inline]
 fn macos_is_openblas_runtime_name(name: &str) -> bool {
     let low = name.to_ascii_lowercase();
@@ -3278,10 +3305,10 @@ fn openblas_lapack_candidates(pref: MacEighLapackPref) -> Vec<String> {
         }
     }
 
-    // 3) System-wide / provisioned OpenBLAS fallbacks. Keep these in auto
-    //    mode too so editable/dev installs on macOS can still use OpenBLAS
-    //    LAPACK without requiring wheel-bundled dylibs.
-    if matches!(pref, MacEighLapackPref::Auto | MacEighLapackPref::OpenBlas) {
+    // 3) Host-system libraries require an explicit OpenBLAS backend request.
+    // Auto must not pull a second Conda/Homebrew OpenMP stack into an isolated
+    // Python environment. Without a reusable/bundled runtime use Accelerate.
+    if matches!(pref, MacEighLapackPref::OpenBlas) {
         if let Ok(prefix) = std::env::var("CONDA_PREFIX") {
             let base = Path::new(&prefix).join("lib");
             for leaf in [

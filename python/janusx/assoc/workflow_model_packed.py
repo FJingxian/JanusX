@@ -8893,6 +8893,7 @@ def run_splmm_windowed_fullrank(
                             ],
                             threads=int(threads),
                             block_rows=int(block_rows_use),
+                            memory_mb=float(_current_bed_memory_mb()),
                             stage1_progress_callback=None,
                             scan_progress_callback=sparse_progress,
                             progress_every=int(max(512, min(int(block_rows_use), 4096))),

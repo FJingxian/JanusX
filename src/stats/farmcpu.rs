@@ -1960,6 +1960,20 @@ impl FarmcpuQtnColumnCache {
     }
 }
 
+fn farmcpu_chromosome_blocks(chrom: &[String]) -> HashMap<&str, i64> {
+    // Preserve lexicographic chromosome ranks while borrowing labels instead
+    // of cloning one owned String for every marker.
+    let mut unique_chrom: HashSet<&str> = chrom.iter().map(String::as_str).collect();
+    let mut ordered_chrom: Vec<&str> = unique_chrom.drain().collect();
+    ordered_chrom.sort_unstable();
+
+    ordered_chrom
+        .into_iter()
+        .enumerate()
+        .map(|(idx, label)| (label, idx as i64))
+        .collect()
+}
+
 fn pinv_xtx_with_rank(xtx: &[f64], q: usize) -> Result<(Vec<f64>, usize), String> {
     let (inverse, rank, _estimable) = pinv_xtx_with_rank_and_estimability(xtx, q)?;
     Ok((inverse, rank))
@@ -3734,16 +3748,10 @@ pub fn farmcpu_packed_to_tsv(
         dst.copy_from_slice(src);
     }
 
-    let mut uniq_chrom = chrom.clone();
-    uniq_chrom.sort();
-    uniq_chrom.dedup();
-    let mut chr_block: HashMap<String, i64> = HashMap::with_capacity(uniq_chrom.len());
-    for (i, c) in uniq_chrom.into_iter().enumerate() {
-        chr_block.insert(c, i as i64);
-    }
+    let chr_block = farmcpu_chromosome_blocks(&chrom);
     let global_pos: Vec<i64> = (0..m)
         .map(|i| {
-            let block = *chr_block.get(&chrom[i]).unwrap_or(&0_i64);
+            let block = *chr_block.get(chrom[i].as_str()).unwrap_or(&0_i64);
             pos[i].saturating_add(block.saturating_mul(1_000_000_000_000_i64))
         })
         .collect();

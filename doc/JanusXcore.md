@@ -1,6 +1,6 @@
 # JanusX Core API Guide
 
-Version baseline: `v1.0.24`
+Version baseline: `v2.0.0`
 
 This document focuses on Python usage through the `janusx` package. It complements `doc/JanusXcli.md`: the CLI guide explains command-line workflows, while this file explains recommended imports, wrappers, and lower-level kernels.
 

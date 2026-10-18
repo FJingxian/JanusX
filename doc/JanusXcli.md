@@ -295,11 +295,10 @@ Use launcher `jx` when you want the full external workflow to run.
 - `fastq2vcf`: FASTQ-to-VCF compatibility check in Python mode; full pipeline in launcher mode
 - `fastq2count`: FASTQ-to-count compatibility check in Python mode; full pipeline in launcher mode
 
-### 4.6 Benchmark and simulation
+### 4.6 Simulation and standalone benchmark tools
 
 - `sim`: quick simulation workflow
 - `simulation`: extended simulation and benchmarking workflow
-- `benchmark`: FarmCPU benchmark workflow
 - `gblupbench`: GBLUP benchmark workflow
 - `garfieldbench`: GARFIELD local-interval benchmark workflow
 

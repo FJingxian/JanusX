@@ -54,6 +54,25 @@ struct RotatedRemlAssocState {
     last_log10_lbd: Option<f64>,
 }
 
+const LMM_DETERMINISTIC_WARM_START_BLOCK_ROWS: usize = 16;
+
+struct RotatedRemlWarmStartState {
+    assoc: RotatedRemlAssocState,
+    rows_in_group: usize,
+}
+
+impl RotatedRemlWarmStartState {
+    fn new(n: usize) -> Self {
+        Self {
+            assoc: RotatedRemlAssocState {
+                snp_vec: vec![0.0_f64; n],
+                last_log10_lbd: None,
+            },
+            rows_in_group: 0,
+        }
+    }
+}
+
 struct RotatedLmm2AssocState {
     snp_vec: Vec<f64>,
 }
@@ -91,9 +110,100 @@ fn fill_invalid_rotated_lmm2_row(out_row: &mut [f64]) {
 
 #[inline]
 fn unified_lmm_reml_start_policy(no_warm_start: bool) -> (bool, bool) {
-    // A fixed null-model seed is deterministic per SNP. Carrying a previous SNP's
-    // optimum makes results depend on Rayon worker scheduling and block layout.
-    (!no_warm_start, false)
+    // Reuse the previous marker's optimum within fixed-size groups. The scanner
+    // carries a partial group's state across read chunks so `-mem` does not
+    // change which marker receives which initial lambda.
+    (!no_warm_start, !no_warm_start)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_rotated_reml_assoc_row(
+    row: &[f32],
+    s: &[f64],
+    xcov_flat: &[f64],
+    y: &[f64],
+    n: usize,
+    p_cov: usize,
+    low: f64,
+    high: f64,
+    tol: f64,
+    max_iter: usize,
+    init_log10_lbd: Option<f64>,
+    seed_with_init_guess: bool,
+    carry_warm_start: bool,
+    nullml_val: f64,
+    with_plrt: bool,
+    state: &mut RotatedRemlAssocState,
+    out_row: &mut [f64],
+) {
+    let snp_ssq = copy_rotated_snp_row_to_f64(row, &mut state.snp_vec);
+    if !snp_ssq.is_finite() || snp_ssq <= 1e-12 {
+        fill_invalid_rotated_assoc_row(out_row, with_plrt);
+        return;
+    }
+
+    let init_guess = if carry_warm_start {
+        state.last_log10_lbd.or(init_log10_lbd)
+    } else if seed_with_init_guess {
+        init_log10_lbd
+    } else {
+        None
+    };
+    let (best_log10_lbd, _best_cost) = if let Some(guess) = init_guess {
+        brent_minimize_with_init(
+            |x| -reml_loglike(x, s, xcov_flat, y, Some(&state.snp_vec[..]), n, p_cov),
+            low,
+            high,
+            tol,
+            max_iter,
+            Some(guess),
+        )
+    } else {
+        brent_minimize(
+            |x| -reml_loglike(x, s, xcov_flat, y, Some(&state.snp_vec[..]), n, p_cov),
+            low,
+            high,
+            tol,
+            max_iter,
+        )
+    };
+    if carry_warm_start {
+        state.last_log10_lbd = Some(best_log10_lbd);
+    }
+
+    let (beta, se, _lbd) = final_beta_se(best_log10_lbd, s, xcov_flat, y, &state.snp_vec, n, p_cov);
+    let pwald = if beta.is_finite() && se.is_finite() && se > 0.0 {
+        let z = beta / se;
+        (2.0 * normal_sf(z.abs())).clamp(f64::MIN_POSITIVE, 1.0)
+    } else {
+        fill_invalid_rotated_assoc_row(out_row, with_plrt);
+        return;
+    };
+
+    out_row[0] = beta;
+    out_row[1] = se;
+    out_row[2] = if pwald.is_finite() { pwald } else { 1.0 };
+
+    if with_plrt {
+        let ml = ml_loglike(
+            best_log10_lbd,
+            s,
+            xcov_flat,
+            y,
+            Some(&state.snp_vec[..]),
+            n,
+            p_cov,
+        );
+        out_row[3] = if ml.is_finite() {
+            let mut stat = 2.0 * (ml - nullml_val);
+            if !stat.is_finite() || stat < 0.0 {
+                stat = 0.0;
+            }
+            chi2_sf_df1(stat)
+        } else {
+            1.0
+        };
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -117,91 +227,203 @@ fn run_rotated_reml_assoc_block_f32(
     out_cols: usize,
     pool: Option<&Arc<rayon::ThreadPool>>,
 ) {
+    debug_assert!(g_block.len() >= rows.saturating_mul(n));
+    debug_assert!(out.len() >= rows.saturating_mul(out_cols));
+    if rows == 0 || n == 0 || out_cols == 0 {
+        return;
+    }
     let with_plrt = nullml.is_some();
     let nullml_val = nullml.unwrap_or(0.0);
-    run_rotated_assoc_block_f32(
-        g_block,
-        rows,
-        n,
-        out,
-        out_cols,
-        pool,
-        || RotatedRemlAssocState {
-            snp_vec: vec![0.0_f64; n],
-            last_log10_lbd: None,
-        },
-        |_, row, state, out_row| {
-            let snp_ssq = copy_rotated_snp_row_to_f64(row, &mut state.snp_vec);
-            if !snp_ssq.is_finite() || snp_ssq <= 1e-12 {
-                fill_invalid_rotated_assoc_row(out_row, with_plrt);
-                return;
-            }
+    let init_state = || RotatedRemlAssocState {
+        snp_vec: vec![0.0_f64; n],
+        last_log10_lbd: None,
+    };
+    let process_row = |row: &[f32], state: &mut RotatedRemlAssocState, out_row: &mut [f64]| {
+        process_rotated_reml_assoc_row(
+            row,
+            s,
+            xcov_flat,
+            y,
+            n,
+            p_cov,
+            low,
+            high,
+            tol,
+            max_iter,
+            init_log10_lbd,
+            seed_with_init_guess,
+            carry_warm_start,
+            nullml_val,
+            with_plrt,
+            state,
+            out_row,
+        );
+    };
 
-            let init_guess = if carry_warm_start {
-                state.last_log10_lbd.or(init_log10_lbd)
-            } else if seed_with_init_guess {
-                init_log10_lbd
-            } else {
-                None
-            };
-            let (best_log10_lbd, _best_cost) = if let Some(guess) = init_guess {
-                brent_minimize_with_init(
-                    |x| -reml_loglike(x, s, xcov_flat, y, Some(&state.snp_vec[..]), n, p_cov),
-                    low,
-                    high,
-                    tol,
-                    max_iter,
-                    Some(guess),
-                )
-            } else {
-                brent_minimize(
-                    |x| -reml_loglike(x, s, xcov_flat, y, Some(&state.snp_vec[..]), n, p_cov),
-                    low,
-                    high,
-                    tol,
-                    max_iter,
-                )
-            };
-            if carry_warm_start {
-                state.last_log10_lbd = Some(best_log10_lbd);
-            }
-
-            let (beta, se, _lbd) =
-                final_beta_se(best_log10_lbd, s, xcov_flat, y, &state.snp_vec, n, p_cov);
-            let pwald = if beta.is_finite() && se.is_finite() && se > 0.0 {
-                let z = beta / se;
-                (2.0 * normal_sf(z.abs())).clamp(f64::MIN_POSITIVE, 1.0)
-            } else {
-                fill_invalid_rotated_assoc_row(out_row, with_plrt);
-                return;
-            };
-
-            out_row[0] = beta;
-            out_row[1] = se;
-            out_row[2] = if pwald.is_finite() { pwald } else { 1.0 };
-
-            if with_plrt {
-                let ml = ml_loglike(
-                    best_log10_lbd,
-                    s,
-                    xcov_flat,
-                    y,
-                    Some(&state.snp_vec[..]),
-                    n,
-                    p_cov,
-                );
-                out_row[3] = if ml.is_finite() {
-                    let mut stat = 2.0 * (ml - nullml_val);
-                    if !stat.is_finite() || stat < 0.0 {
-                        stat = 0.0;
+    if carry_warm_start {
+        let fixed_rows = LMM_DETERMINISTIC_WARM_START_BLOCK_ROWS;
+        let mut run = || {
+            out[..rows * out_cols]
+                .par_chunks_mut(fixed_rows * out_cols)
+                .enumerate()
+                .for_each_init(init_state, |state, (block_idx, out_block)| {
+                    let block_start = block_idx * fixed_rows;
+                    let block_rows = out_block.len() / out_cols;
+                    let g_start = block_start * n;
+                    let g_end = g_start + block_rows * n;
+                    let g_block = &g_block[g_start..g_end];
+                    state.last_log10_lbd = None;
+                    for (row_idx, out_row) in out_block.chunks_mut(out_cols).enumerate() {
+                        let row_start = row_idx * n;
+                        process_row(&g_block[row_start..row_start + n], state, out_row);
                     }
-                    chi2_sf_df1(stat)
-                } else {
-                    1.0
-                };
+                });
+        };
+        if let Some(tp) = pool {
+            tp.install(run);
+        } else {
+            run();
+        }
+    } else {
+        run_rotated_assoc_block_f32(
+            g_block,
+            rows,
+            n,
+            out,
+            out_cols,
+            pool,
+            init_state,
+            |_, row, state, out_row| process_row(row, state, out_row),
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_rotated_reml_assoc_block_f32_with_warm_state(
+    g_block: &[f32],
+    rows: usize,
+    n: usize,
+    s: &[f64],
+    xcov_flat: &[f64],
+    y: &[f64],
+    p_cov: usize,
+    low: f64,
+    high: f64,
+    tol: f64,
+    max_iter: usize,
+    init_log10_lbd: Option<f64>,
+    seed_with_init_guess: bool,
+    nullml: Option<f64>,
+    state: &mut RotatedRemlWarmStartState,
+    out: &mut [f64],
+    out_cols: usize,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) {
+    debug_assert!(g_block.len() >= rows.saturating_mul(n));
+    debug_assert!(out.len() >= rows.saturating_mul(out_cols));
+    if rows == 0 || n == 0 || out_cols == 0 {
+        return;
+    }
+
+    let with_plrt = nullml.is_some();
+    let nullml_val = nullml.unwrap_or(0.0);
+    let mut row_start = 0usize;
+
+    if state.rows_in_group > 0 {
+        let prefix_rows = (LMM_DETERMINISTIC_WARM_START_BLOCK_ROWS - state.rows_in_group).min(rows);
+        for row_idx in 0..prefix_rows {
+            let row = &g_block[row_idx * n..(row_idx + 1) * n];
+            let out_row = &mut out[row_idx * out_cols..(row_idx + 1) * out_cols];
+            process_rotated_reml_assoc_row(
+                row,
+                s,
+                xcov_flat,
+                y,
+                n,
+                p_cov,
+                low,
+                high,
+                tol,
+                max_iter,
+                init_log10_lbd,
+                seed_with_init_guess,
+                true,
+                nullml_val,
+                with_plrt,
+                &mut state.assoc,
+                out_row,
+            );
+        }
+        state.rows_in_group += prefix_rows;
+        row_start += prefix_rows;
+        if state.rows_in_group == LMM_DETERMINISTIC_WARM_START_BLOCK_ROWS {
+            state.rows_in_group = 0;
+            state.assoc.last_log10_lbd = None;
+        }
+    }
+
+    let remaining_rows = rows - row_start;
+    let full_rows = (remaining_rows / LMM_DETERMINISTIC_WARM_START_BLOCK_ROWS)
+        * LMM_DETERMINISTIC_WARM_START_BLOCK_ROWS;
+    if full_rows > 0 {
+        let full_start = row_start;
+        let full_end = full_start + full_rows;
+        run_rotated_reml_assoc_block_f32(
+            &g_block[full_start * n..full_end * n],
+            full_rows,
+            n,
+            s,
+            xcov_flat,
+            y,
+            p_cov,
+            low,
+            high,
+            tol,
+            max_iter,
+            init_log10_lbd,
+            seed_with_init_guess,
+            true,
+            nullml,
+            &mut out[full_start * out_cols..full_end * out_cols],
+            out_cols,
+            pool,
+        );
+        row_start = full_end;
+    }
+
+    if row_start < rows {
+        if state.rows_in_group == 0 {
+            state.assoc.last_log10_lbd = None;
+        }
+        for row_idx in row_start..rows {
+            let row = &g_block[row_idx * n..(row_idx + 1) * n];
+            let out_row = &mut out[row_idx * out_cols..(row_idx + 1) * out_cols];
+            process_rotated_reml_assoc_row(
+                row,
+                s,
+                xcov_flat,
+                y,
+                n,
+                p_cov,
+                low,
+                high,
+                tol,
+                max_iter,
+                init_log10_lbd,
+                seed_with_init_guess,
+                true,
+                nullml_val,
+                with_plrt,
+                &mut state.assoc,
+                out_row,
+            );
+            state.rows_in_group += 1;
+            if state.rows_in_group == LMM_DETERMINISTIC_WARM_START_BLOCK_ROWS {
+                state.rows_in_group = 0;
+                state.assoc.last_log10_lbd = None;
             }
-        },
-    );
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -973,11 +1195,11 @@ fn run_unified_bed_scan_to_tsv_common<RunRows, FormatRows>(
     prepared_meta: Option<&PreparedBedScanMeta>,
     header: &[u8],
     text_capacity_per_row: usize,
-    run_rows: RunRows,
+    mut run_rows: RunRows,
     format_rows: FormatRows,
 ) -> Result<UnifiedBedScanSummary, String>
 where
-    RunRows: Fn(&[f32], usize, &mut [f64]),
+    RunRows: FnMut(&[f32], usize, &mut [f64]),
     FormatRows: Fn(&mut String, &StreamingChunk, usize),
 {
     let total_t0 = Instant::now();
@@ -2606,6 +2828,53 @@ pub fn lmm_reml_assoc_bed_to_tsv_f32<'py>(
             b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n"
         };
 
+        let mut warm_state = RotatedRemlWarmStartState::new(n);
+        let run_rows = |g_block: &[f32], rows: usize, out_block: &mut [f64]| {
+            if carry_snp_lambda {
+                run_rotated_reml_assoc_block_f32_with_warm_state(
+                    g_block,
+                    rows,
+                    n,
+                    s_slice,
+                    &xcov_flat,
+                    y,
+                    p,
+                    low,
+                    high,
+                    tol,
+                    max_iter,
+                    init_log10_lbd,
+                    seed_with_null_lambda,
+                    if with_plrt { Some(nullml_val) } else { None },
+                    &mut warm_state,
+                    out_block,
+                    out_cols,
+                    assoc_pool.as_ref(),
+                );
+            } else {
+                run_rotated_reml_assoc_block_f32(
+                    g_block,
+                    rows,
+                    n,
+                    s_slice,
+                    &xcov_flat,
+                    y,
+                    p,
+                    low,
+                    high,
+                    tol,
+                    max_iter,
+                    init_log10_lbd,
+                    seed_with_null_lambda,
+                    false,
+                    if with_plrt { Some(nullml_val) } else { None },
+                    out_block,
+                    out_cols,
+                    assoc_pool.as_ref(),
+                );
+            }
+        };
+
         let summary = run_unified_bed_scan_to_tsv_common(
             &bed_prefix_owned,
             &out_tsv_owned,
@@ -2626,28 +2895,7 @@ pub fn lmm_reml_assoc_bed_to_tsv_f32<'py>(
             prepared_meta.as_ref(),
             header,
             128,
-            |g_block, rows, out_block| {
-                run_rotated_reml_assoc_block_f32(
-                    g_block,
-                    rows,
-                    n,
-                    s_slice,
-                    &xcov_flat,
-                    y,
-                    p,
-                    low,
-                    high,
-                    tol,
-                    max_iter,
-                    init_log10_lbd,
-                    seed_with_null_lambda,
-                    carry_snp_lambda,
-                    if with_plrt { Some(nullml_val) } else { None },
-                    out_block,
-                    out_cols,
-                    assoc_pool.as_ref(),
-                );
-            },
+            run_rows,
             |text_buf, chunk, rows| {
                 let miss_rate_buf: Vec<f32> = chunk.miss_block[..rows]
                     .iter()
@@ -2840,6 +3088,7 @@ pub fn lmm_reml_assoc_kfile_to_tsv_f32<'py>(
         .map_err(PyRuntimeError::new_err)?;
         let mut rot_block = vec![0.0_f32; block_rows.saturating_mul(n)];
         let mut out_block = vec![0.0_f64; block_rows.saturating_mul(3)];
+        let mut warm_state = RotatedRemlWarmStartState::new(n);
         let mut text = String::with_capacity(block_rows.saturating_mul(96));
         let mut done = 0usize;
         let mut next_progress = progress_block.min(total_rows).max(1);
@@ -2865,7 +3114,7 @@ pub fn lmm_reml_assoc_kfile_to_tsv_f32<'py>(
                 pool.as_ref(),
             );
             let out_sub = &mut out_block[..rows * 3];
-            run_rotated_reml_assoc_block_f32(
+            run_rotated_reml_assoc_block_f32_with_warm_state(
                 rot_sub,
                 rows,
                 n,
@@ -2879,8 +3128,8 @@ pub fn lmm_reml_assoc_kfile_to_tsv_f32<'py>(
                 max_iter,
                 init_log10_lbd,
                 true,
-                true,
                 None,
+                &mut warm_state,
                 out_sub,
                 3,
                 pool.as_ref(),
@@ -3409,9 +3658,10 @@ pub fn lmm_reml_assoc_packed_f32<'py>(
 
         let mut snp_buf = vec![0.0_f32; block_rows * n];
         let mut rot_buf = vec![0.0_f32; block_rows * n];
+        let mut warm_state = RotatedRemlWarmStartState::new(n);
 
-        let run_rows = |g_block: &[f32], out_block: &mut [f64]| {
-            run_rotated_reml_assoc_block_f32(
+        let mut run_rows = |g_block: &[f32], out_block: &mut [f64]| {
+            run_rotated_reml_assoc_block_f32_with_warm_state(
                 g_block,
                 out_block.len() / out_cols,
                 n,
@@ -3425,8 +3675,8 @@ pub fn lmm_reml_assoc_packed_f32<'py>(
                 max_iter,
                 init_log10_lbd,
                 true,
-                true,
                 if with_plrt { Some(nullml_val) } else { None },
+                &mut warm_state,
                 out_block,
                 out_cols,
                 pool.as_ref(),
@@ -3771,12 +4021,13 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
 
         let mut snp_buf = vec![0.0_f32; block_rows * n];
         let mut rot_buf = vec![0.0_f32; block_rows * n];
+        let mut warm_state = RotatedRemlWarmStartState::new(n);
         let mut out_block = vec![0.0_f64; block_rows * out_cols];
         let mut miss_block = vec![0usize; block_rows];
         let mut text_buf = String::with_capacity(block_rows * 128);
 
-        let run_rows = |g_block: &[f32], out_block: &mut [f64]| {
-            run_rotated_reml_assoc_block_f32(
+        let mut run_rows = |g_block: &[f32], out_block: &mut [f64]| {
+            run_rotated_reml_assoc_block_f32_with_warm_state(
                 g_block,
                 out_block.len() / out_cols,
                 n,
@@ -3790,8 +4041,8 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
                 max_iter,
                 init_log10_lbd,
                 true,
-                true,
                 if with_plrt { Some(nullml_val) } else { None },
+                &mut warm_state,
                 out_block,
                 out_cols,
                 pool.as_ref(),
@@ -3974,12 +4225,95 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
 }
 #[cfg(test)]
 mod tests {
-    use super::{run_rotated_lmm2_assoc_block_f32, unified_lmm_reml_start_policy};
+    use super::{
+        run_rotated_lmm2_assoc_block_f32, run_rotated_reml_assoc_block_f32_with_warm_state,
+        unified_lmm_reml_start_policy, RotatedRemlWarmStartState,
+    };
+    use std::sync::Arc;
 
     #[test]
-    fn unified_lmm_uses_fixed_null_seed_without_cross_snp_carry() {
-        assert_eq!(unified_lmm_reml_start_policy(false), (true, false));
+    fn unified_lmm_uses_fixed_null_seed_with_deterministic_snp_carry() {
+        assert_eq!(unified_lmm_reml_start_policy(false), (true, true));
         assert_eq!(unified_lmm_reml_start_policy(true), (false, false));
+    }
+
+    #[test]
+    fn lmm_snp_warm_start_is_invariant_to_outer_chunk_boundaries() {
+        let n = 12usize;
+        let rows = 32usize;
+        let s = [
+            0.15_f64, 0.25, 0.35, 0.5, 0.65, 0.8, 0.95, 1.1, 1.3, 1.55, 1.8, 2.1,
+        ];
+        let xcov = [1.0_f64; 12];
+        let y = [
+            -0.8_f64, 0.2, 1.1, -0.4, 0.7, 1.4, -1.2, 0.5, 0.9, -0.1, 1.8, -0.6,
+        ];
+        let mut genotypes = vec![0.0_f32; rows * n];
+        for marker in 0..rows {
+            for sample in 0..n {
+                genotypes[marker * n + sample] =
+                    ((marker * 7 + sample * (marker % 5 + 1)) % 3) as f32;
+            }
+        }
+        let one_thread_pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(1)
+                .build()
+                .unwrap(),
+        );
+        let four_thread_pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(4)
+                .build()
+                .unwrap(),
+        );
+
+        let run_chunks = |chunk_rows: &[usize], pool: &Arc<rayon::ThreadPool>| {
+            let mut output = vec![0.0_f64; rows * 3];
+            let mut warm_state = RotatedRemlWarmStartState::new(n);
+            let mut row_start = 0usize;
+            for &chunk_len in chunk_rows {
+                let row_end = row_start + chunk_len;
+                run_rotated_reml_assoc_block_f32_with_warm_state(
+                    &genotypes[row_start * n..row_end * n],
+                    chunk_len,
+                    n,
+                    &s,
+                    &xcov,
+                    &y,
+                    1,
+                    -5.0,
+                    5.0,
+                    0.2,
+                    4,
+                    Some(-0.5),
+                    true,
+                    None,
+                    &mut warm_state,
+                    &mut output[row_start * 3..row_end * 3],
+                    3,
+                    Some(pool),
+                );
+                row_start = row_end;
+            }
+            assert_eq!(row_start, rows, "chunk lengths must cover all markers");
+            output
+        };
+
+        let one_chunk = run_chunks(&[rows], &one_thread_pool);
+        let split_at_non_group_boundary = run_chunks(&[13, 19], &one_thread_pool);
+        let many_small_chunks = run_chunks(&[5, 11, 7, 9], &four_thread_pool);
+        for (label, compared) in [
+            ("13/19 split", &split_at_non_group_boundary),
+            ("5/11/7/9 split with four threads", &many_small_chunks),
+        ] {
+            for (idx, (&whole, &split)) in one_chunk.iter().zip(compared).enumerate() {
+                assert!(
+                    whole == split || (whole.is_nan() && split.is_nan()),
+                    "association result changed at cell {idx} for {label}: {whole:?} != {split:?}"
+                );
+            }
+        }
     }
 
     #[test]

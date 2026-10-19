@@ -39,7 +39,6 @@ import time
 import re
 import gzip
 import shutil
-import subprocess
 import itertools
 from threading import Lock
 from dataclasses import dataclass
@@ -72,6 +71,11 @@ try:
     from janusx.janusx import bed_packed_ld_prune_maf_priority as _bed_packed_ld_prune_maf_priority
 except Exception:
     _bed_packed_ld_prune_maf_priority = None
+
+try:
+    from janusx.janusx import bed_fam_founder_indices as _bed_fam_founder_indices
+except Exception:
+    _bed_fam_founder_indices = None
 
 try:
     from janusx.janusx import bed_prune_to_plink_rust as _bed_prune_to_plink_rust
@@ -716,37 +720,6 @@ def _resolve_prune_mask_mmap_window_mb() -> int | None:
     return int(value)
 
 
-def _resolve_ld_prune_backend() -> str:
-    raw = str(os.getenv("JX_LD_PRUNE_BACKEND", "")).strip().lower()
-    if raw in {"", "auto", "default", "rust"}:
-        return "rust"
-    if raw in {"plink", "plink-external", "external-plink"}:
-        return "plink"
-    return "rust"
-
-
-def _format_prune_window_for_plink(spec: PruneSpec) -> str:
-    if spec.window_variants is not None:
-        return str(int(spec.window_variants))
-    if spec.window_bp is None:
-        raise ValueError("Invalid prune window for PLINK backend.")
-    kb = float(int(spec.window_bp)) / 1000.0
-    tok = f"{kb:.6f}".rstrip("0").rstrip(".")
-    if tok == "":
-        tok = "0"
-    return f"{tok}kb"
-
-
-def _count_nonempty_text_lines(path: str) -> int:
-    n = 0
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        for line in f:
-            s = line.strip()
-            if s and (not s.startswith("#")):
-                n += 1
-    return int(n)
-
-
 def _inspect_plink_prefix_light(prefix: str) -> tuple[list[str], int]:
     p = str(prefix)
     if p.lower().endswith((".bed", ".bim", ".fam")):
@@ -781,30 +754,6 @@ def _inspect_plink_prefix_light(prefix: str) -> tuple[list[str], int]:
     if n_sites <= 0:
         raise ValueError(f"No variants found in BIM: {bim_path}")
     return sample_ids, int(n_sites)
-
-
-def _run_external_command(
-    cmd: list[str],
-    *,
-    logger,
-) -> None:
-    logger.info("Running external command: %s", " ".join(cmd))
-    proc = subprocess.run(
-        cmd,
-        check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-    out = str(proc.stdout or "").strip()
-    if out:
-        logger.info(out)
-    if int(proc.returncode) != 0:
-        tail = "\n".join(out.splitlines()[-20:]) if out else "(no output)"
-        raise RuntimeError(
-            "External command failed "
-            f"(exit={int(proc.returncode)}): {' '.join(cmd)}\n{tail}"
-        )
 
 
 def _site_passes(site: SiteInfo, flt: SiteFilterSpec) -> bool:
@@ -1159,7 +1108,7 @@ def _resolve_plink_selected_snp_indices_for_prune(
     needs_bed_stats = bool(
         float(maf_threshold) > 0.0
         or float(max_missing_rate) < 1.0
-        or float(het_threshold) > 0.0
+        or float(het_threshold) < 1.0
     )
     if not needs_bed_stats:
         return _scan_plink_selected_snp_indices_from_bim(
@@ -1398,6 +1347,10 @@ def _ld_prune_with_maf_priority_packed_plink(
         raise RuntimeError(
             "Rust packed LD prune kernel is unavailable. Rebuild JanusX extension."
         )
+    if _bed_fam_founder_indices is None:
+        raise RuntimeError(
+            "Rust FAM founder-index helper is unavailable. Rebuild JanusX extension."
+        )
     packed_raw, _miss_raw, _maf_raw, _std_raw, n_samples = load_bed_2bit_packed(str(prefix))
     packed = np.ascontiguousarray(packed_raw, dtype=np.uint8)
     if packed.ndim != 2:
@@ -1415,6 +1368,9 @@ def _ld_prune_with_maf_priority_packed_plink(
         n_samples=int(n_samples),
         spec=spec,
         threads=int(threads),
+        founder_indices=np.asarray(
+            _bed_fam_founder_indices(str(prefix)), dtype=np.int64
+        ),
     )
     return keep, sites_all, packed, int(n_samples)
 
@@ -1426,6 +1382,7 @@ def _ld_prune_with_maf_priority_packed_sites(
     n_samples: int,
     spec: PruneSpec,
     threads: int = 0,
+    founder_indices: np.ndarray | None = None,
 ) -> np.ndarray:
     if _bed_packed_ld_prune_maf_priority is None:
         raise RuntimeError(
@@ -1472,6 +1429,11 @@ def _ld_prune_with_maf_priority_packed_sites(
             step_variants=int(spec.step_variants),
             r2_threshold=float(spec.r2_threshold),
             threads=int(max(0, int(threads))),
+            founder_indices=(
+                np.ascontiguousarray(np.asarray(founder_indices, dtype=np.int64))
+                if founder_indices is not None
+                else None
+            ),
         ),
         dtype=bool,
     ).reshape(-1)
@@ -1723,93 +1685,47 @@ def _ld_prune_with_selected_first_streaming_pipeline(
     return keep_n, pre_n, float(time.time() - t0)
 
 
-def _ld_prune_with_external_plink(
+def _copy_prune_fam_with_source_pedigree(
     *,
     src_prefix: str,
-    out_prefix: str,
-    spec: PruneSpec,
-    threads: int,
-    logger,
-) -> tuple[int, int, float]:
-    plink_bin_raw = str(os.getenv("JX_PLINK_BIN", "plink")).strip() or "plink"
-    if os.path.sep in plink_bin_raw or plink_bin_raw.startswith("."):
-        if os.path.isfile(plink_bin_raw) and os.access(plink_bin_raw, os.X_OK):
-            plink_bin = plink_bin_raw
-        else:
-            plink_bin = ""
-    else:
-        found = shutil.which(plink_bin_raw)
-        plink_bin = str(found) if found else ""
-    if plink_bin == "":
-        raise RuntimeError(
-            "External PLINK backend requested but PLINK binary was not found. "
-            "Please install PLINK 1.9 and/or set JX_PLINK_BIN=/path/to/plink."
+    filtered_prefix: str,
+    sample_ids: list[str] | None,
+) -> None:
+    """Restore source pedigree metadata after the packed QC writer normalizes FAM rows."""
+    source_fam = f"{str(src_prefix)}.fam"
+    filtered_fam = f"{str(filtered_prefix)}.fam"
+    if sample_ids is None:
+        shutil.copyfile(source_fam, filtered_fam)
+        return
+
+    wanted_counts: dict[str, int] = {}
+    for sample_id in sample_ids:
+        sid = str(sample_id)
+        wanted_counts[sid] = wanted_counts.get(sid, 0) + 1
+    source_rows: list[str] = []
+    with open(source_fam, "r", encoding="utf-8", errors="replace") as fh:
+        for line_no, line in enumerate(fh, start=1):
+            fields = line.split()
+            if len(fields) < 2:
+                raise ValueError(
+                    f"Malformed FAM line {source_fam}:{line_no} while preserving prune pedigree."
+                )
+            iid = str(fields[1])
+            remaining = wanted_counts.get(iid, 0)
+            if remaining > 0:
+                source_rows.append(
+                    line if line.endswith(("\n", "\r")) else f"{line}\n"
+                )
+                wanted_counts[iid] = remaining - 1
+
+    missing = [sid for sid, count in wanted_counts.items() if count > 0]
+    if missing:
+        raise ValueError(
+            "Unable to preserve pedigree for selected prune samples; missing FAM IDs: "
+            + ", ".join(missing[:10])
         )
-
-    window_tok = _format_prune_window_for_plink(spec)
-    step_tok = str(int(spec.step_variants))
-    r2_tok = f"{float(spec.r2_threshold):.12g}"
-    thread_tok = str(max(1, int(threads)))
-
-    tmp_prefix = (
-        f"{str(out_prefix)}.jxprune_tmp_{int(os.getpid())}_{int(time.time() * 1000)}"
-    )
-    prune_in = f"{tmp_prefix}.prune.in"
-    t0 = time.time()
-    keep_tmp = _env_truthy("JX_KEEP_PLINK_TMP", "0")
-    tmp_paths = [
-        f"{tmp_prefix}.prune.in",
-        f"{tmp_prefix}.prune.out",
-        f"{tmp_prefix}.log",
-        f"{tmp_prefix}.nosex",
-    ]
-    try:
-        _run_external_command(
-            [
-                str(plink_bin),
-                "--bfile",
-                str(src_prefix),
-                "--indep-pairwise",
-                str(window_tok),
-                str(step_tok),
-                str(r2_tok),
-                "--threads",
-                str(thread_tok),
-                "--out",
-                str(tmp_prefix),
-            ],
-            logger=logger,
-        )
-        if not Path(prune_in).is_file():
-            raise RuntimeError(f"PLINK did not produce prune list: {prune_in}")
-
-        _run_external_command(
-            [
-                str(plink_bin),
-                "--bfile",
-                str(src_prefix),
-                "--extract",
-                str(prune_in),
-                "--make-bed",
-                "--threads",
-                str(thread_tok),
-                "--out",
-                str(out_prefix),
-            ],
-            logger=logger,
-        )
-
-        total_n = _count_nonempty_text_lines(f"{str(src_prefix)}.bim")
-        keep_n = _count_nonempty_text_lines(f"{str(out_prefix)}.bim")
-        return int(keep_n), int(total_n), float(time.time() - t0)
-    finally:
-        if not keep_tmp:
-            for p in tmp_paths:
-                try:
-                    if Path(p).exists():
-                        Path(p).unlink()
-                except Exception:
-                    pass
+    with open(filtered_fam, "w", encoding="utf-8", newline="") as fw:
+        fw.writelines(source_rows)
 
 
 def _ld_prune_with_rust_filtered_pipeline(
@@ -1890,6 +1806,15 @@ def _ld_prune_with_rust_filtered_pipeline(
                 "(-extract/-chr/-from-bp/-to-bp/-maf/-geno/-het)."
             )
 
+        # The packed filter writer emits simplified founder FAM rows. Pruning
+        # must use the pedigree from the source so its founder-only LD scope
+        # remains unchanged after QC or sample selection.
+        _copy_prune_fam_with_source_pedigree(
+            src_prefix=str(src_prefix),
+            filtered_prefix=str(tmp_prefix),
+            sample_ids=sample_ids,
+        )
+
         prune_args = dict(
             src_prefix=str(tmp_prefix),
             out_prefix=str(out_prefix),
@@ -1952,26 +1877,64 @@ def _ld_prune_with_rust_filtered_pipeline(
                     pass
 
 
-def _compute_maf_and_z(geno: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _compute_maf(geno: np.ndarray) -> np.ndarray:
     x = np.asarray(geno, dtype=np.float32)
     if x.ndim != 2:
         raise ValueError(f"Genotype matrix must be 2D, got {x.shape}")
     m, n = x.shape
-    valid = np.isfinite(x) & (x >= 0.0)
-    cnt = valid.sum(axis=1).astype(np.float64, copy=False)
-    x_safe = np.where(valid, x, 0.0).astype(np.float64, copy=False)
-    s = x_safe.sum(axis=1)
-    mean = np.divide(s, cnt, out=np.zeros_like(s), where=cnt > 0)
-    af = np.divide(s, 2.0 * cnt, out=np.zeros_like(s), where=cnt > 0)
-    maf = np.minimum(af, 1.0 - af).astype(np.float64, copy=False)
+    maf = np.zeros((m,), dtype=np.float64)
+    # Bound temporary validity-mask memory for large dense inputs.
+    rows_per_block = max(1, min(m or 1, 1_000_000 // max(1, n)))
+    for start in range(0, m, rows_per_block):
+        end = min(m, start + rows_per_block)
+        block = x[start:end, :]
+        valid = np.isfinite(block) & (block >= 0.0)
+        cnt = np.sum(valid, axis=1, dtype=np.int64)
+        allele_sum = np.sum(block, axis=1, dtype=np.float64, where=valid)
+        allele_freq = np.divide(
+            allele_sum,
+            2.0 * cnt,
+            out=np.zeros_like(allele_sum),
+            where=cnt > 0,
+        )
+        maf[start:end] = np.minimum(allele_freq, 1.0 - allele_freq)
+    return maf
 
-    x_imp = np.where(valid, x.astype(np.float64, copy=False), mean[:, None])
-    xc = x_imp - mean[:, None]
-    denom = max(1, int(n - 1))
-    var = np.sum(xc * xc, axis=1) / float(denom)
-    std = np.sqrt(np.maximum(var, 1e-12))
-    z = (xc / std[:, None]).astype(np.float32, copy=False)
-    return np.asarray(maf, dtype=np.float64), np.ascontiguousarray(z, dtype=np.float32)
+
+def _pairwise_complete_r2_against_row(
+    row: np.ndarray,
+    candidate_rows: np.ndarray,
+) -> np.ndarray:
+    """Compute pairwise-complete genotype r² for one row against a row block."""
+    x_i = np.asarray(row, dtype=np.float32).reshape(-1)
+    x_j = np.asarray(candidate_rows, dtype=np.float32)
+    if x_j.ndim != 2 or x_j.shape[1] != x_i.size:
+        raise ValueError(
+            f"Pairwise LD shape mismatch: row={x_i.shape}, candidates={x_j.shape}"
+        )
+    valid_i = np.isfinite(x_i) & (x_i >= 0.0)
+    valid_j = np.isfinite(x_j) & (x_j >= 0.0)
+    joint = valid_j & valid_i[None, :]
+    n_obs = np.sum(joint, axis=1, dtype=np.float64)
+
+    x_i64 = np.where(valid_i, x_i, 0.0).astype(np.float64, copy=False)
+    x_j64 = np.where(valid_j, x_j, 0.0).astype(np.float64, copy=False)
+    sum_i = joint @ x_i64
+    sum_i2 = joint @ (x_i64 * x_i64)
+    sum_j = np.sum(x_j64 * joint, axis=1, dtype=np.float64)
+    sum_j2 = np.sum((x_j64 * x_j64) * joint, axis=1, dtype=np.float64)
+    sum_ij = np.sum((x_j64 * x_i64[None, :]) * joint, axis=1, dtype=np.float64)
+
+    cov_num = sum_ij * n_obs - sum_i * sum_j
+    var_i_num = sum_i2 * n_obs - sum_i * sum_i
+    var_j_num = sum_j2 * n_obs - sum_j * sum_j
+    denominator = var_i_num * var_j_num
+    r2 = np.zeros((x_j.shape[0],), dtype=np.float64)
+    valid_pair = (n_obs > 1.0) & np.isfinite(denominator) & (denominator > 0.0)
+    r2[valid_pair] = (
+        cov_num[valid_pair] * cov_num[valid_pair] / denominator[valid_pair]
+    )
+    return r2
 
 
 def _window_end_by_bp(pos: np.ndarray, start_idx: int, win_bp: int) -> int:
@@ -1999,9 +1962,9 @@ def _ld_prune_with_maf_priority(
 ) -> np.ndarray:
     """
     Greedy LD prune (windowed) with MAF-priority conflict rule:
-    1) Current site i compares with sites j in current window.
-    2) If any correlated j has higher MAF than i, drop i.
-    3) Otherwise drop correlated j with lower MAF than i.
+    Scan pairs in window order and prune the first pair above the strict r²
+    threshold. Drop the lower-MAF site (ties drop the later site), then repeat
+    each window until no correlated pair remains.
     """
     x = np.asarray(geno, dtype=np.float32)
     if x.ndim != 2:
@@ -2012,10 +1975,11 @@ def _ld_prune_with_maf_priority(
     if len(sites) != int(m):
         raise ValueError(f"sites length mismatch: rows={m}, sites={len(sites)}")
 
-    maf, z = _compute_maf_and_z(x)
+    maf = _compute_maf(x)
     keep = np.ones((m,), dtype=bool)
-    denom = float(max(1, int(n - 1)))
     eps = 1e-12
+    if n >= 2:
+        keep[maf <= 0.0] = False
     by_chr: dict[str, list[int]] = {}
     for i, s in enumerate(sites):
         c = _normalize_chr_key(str(s.chrom))
@@ -2026,8 +1990,10 @@ def _ld_prune_with_maf_priority(
             continue
         idx_arr = np.asarray(idx_list, dtype=np.int64)
         pos = np.asarray([int(sites[int(i)].pos) for i in idx_arr], dtype=np.int64)
-        dropped = np.zeros((idx_arr.size,), dtype=bool)
+        dropped = ~keep[idx_arr].copy()
         l = int(idx_arr.size)
+        first_unchecked = np.arange(l, dtype=np.int64) + 1
+        pair_rows_per_block = max(1, min(64, 1_000_000 // max(1, n)))
         start = 0
         while start < l:
             if spec.window_bp is not None:
@@ -2036,38 +2002,57 @@ def _ld_prune_with_maf_priority(
                 end = min(l, start + int(spec.window_variants or 1))
             if end <= start:
                 end = start + 1
-            win = np.arange(start, end, dtype=np.int64)
-            for li in win.tolist():
-                if dropped[int(li)]:
-                    continue
-                right = win[win > int(li)]
-                if right.size <= 0:
-                    continue
-                right = right[~dropped[right]]
-                if right.size <= 0:
-                    continue
+            if end > start + 1:
+                while True:
+                    at_least_one_prune = False
+                    for li in range(start, end - 1):
+                        if dropped[li]:
+                            continue
+                        scan_min = max(int(first_unchecked[li]), start + 1)
+                        if scan_min >= end:
+                            first_unchecked[li] = end
+                            continue
 
-                gi = int(idx_arr[int(li)])
-                gj = idx_arr[right].astype(np.int64, copy=False)
-                zi = np.asarray(z[gi, :], dtype=np.float32)
-                zj = np.asarray(z[gj, :], dtype=np.float32)
-                corr = (zj @ zi) / denom
-                r2 = np.asarray(corr * corr, dtype=np.float64)
-                hit = np.asarray(r2 >= float(spec.r2_threshold), dtype=bool)
-                if not np.any(hit):
-                    continue
-                hit_local = right[hit]
-                hit_global = idx_arr[hit_local].astype(np.int64, copy=False)
-                maf_i = float(maf[gi])
-                maf_j = np.asarray(maf[hit_global], dtype=np.float64)
+                        gi = int(idx_arr[li])
+                        maf_i = float(maf[gi])
+                        pruned_this_round = False
+                        for block_start in range(
+                            scan_min, end, pair_rows_per_block
+                        ):
+                            right_block = np.arange(
+                                block_start,
+                                min(end, block_start + pair_rows_per_block),
+                                dtype=np.int64,
+                            )
+                            right_block = right_block[~dropped[right_block]]
+                            if right_block.size == 0:
+                                continue
+                            gj = idx_arr[right_block].astype(np.int64, copy=False)
+                            r2 = _pairwise_complete_r2_against_row(x[gi, :], x[gj, :])
+                            hit = np.flatnonzero(
+                                r2 > float(spec.r2_threshold) * (1.0 + eps)
+                            )
+                            if hit.size == 0:
+                                continue
 
-                if np.any(maf_j > (maf_i + eps)):
-                    dropped[int(li)] = True
-                    continue
+                            lj = int(right_block[int(hit[0])])
+                            at_least_one_prune = True
+                            pruned_this_round = True
+                            if maf_i < (1.0 - eps) * float(maf[int(idx_arr[lj])]):
+                                dropped[li] = True
+                            else:
+                                dropped[lj] = True
+                                nxt = lj + 1
+                                while nxt < end and dropped[nxt]:
+                                    nxt += 1
+                                first_unchecked[li] = nxt
+                            break
 
-                drop_low = hit_local[maf_j < (maf_i - eps)]
-                if drop_low.size > 0:
-                    dropped[drop_low] = True
+                        if not pruned_this_round and not dropped[li]:
+                            first_unchecked[li] = end
+
+                    if not at_least_one_prune:
+                        break
 
             start += int(spec.step_variants)
 
@@ -2504,9 +2489,8 @@ def build_parser() -> CliArgumentParser:
         help=(
             "LD prune with MAF-priority rule. Usage: "
             "--prune <window size[kb|bp]> <step size (variant ct)> <r^2 threshold>. "
-            "Built-in backend uses strict sliding-window + greedy semantics. "
-            "Set env JX_LD_PRUNE_BACKEND=plink to run external PLINK backend "
-            "(PLINK input/output prune-only path). "
+            "Native Rust uses strict sliding-window + greedy semantics and "
+            "founder-only LD calculations. "
             "Bare numeric windows are variant counts; use kb/bp suffixes for physical windows. "
             "Examples: --prune 500 50 0.2, --prune 500kb 50 0.2, --prune 100bp 5 0.2."
         ),
@@ -2555,8 +2539,6 @@ def main() -> None:
         prune_spec = _parse_prune_args(args.prune)
     except Exception as e:
         parser.error(str(e))
-    prune_backend_raw = str(os.getenv("JX_LD_PRUNE_BACKEND", "")).strip().lower()
-    prune_backend = _resolve_ld_prune_backend()
     try:
         output_site_limit = _resolve_max_output_sites_env()
     except ValueError as e:
@@ -2583,12 +2565,6 @@ def main() -> None:
             f"using {int(args.thread)}."
         )
     status_enabled = stdout_is_tty()
-    if prune_backend_raw not in {"", "auto", "default", "rust", "plink", "plink-external", "external-plink"}:
-        logger.warning(
-            "Unknown JX_LD_PRUNE_BACKEND=%r; fallback to Rust backend.",
-            prune_backend_raw,
-        )
-
     extract_mode, extract_file = _parse_extract_arg(args.extract)
     chr_keys = _expand_chr_selector(args.chr_filter)
     if args.from_bp is not None and args.to_bp is not None and int(args.from_bp) > int(args.to_bp):
@@ -2618,14 +2594,7 @@ def main() -> None:
                             else "None"
                         ),
                     ),
-                    (
-                        "Prune backend",
-                        (
-                            ("PLINK external (env)")
-                            if (prune_spec is not None and prune_backend == "plink")
-                            else "Rust (default)"
-                        ),
-                    ),
+                    ("Prune backend", "Rust (native, founder-aware)"),
                     (
                         "Prune PLINK I/O",
                         (
@@ -3156,7 +3125,7 @@ def main() -> None:
         or bool(args.biallelic_only)
         or (float(args.maf) > 0.0)
         or (float(args.geno) < 1.0)
-        or (float(args.het) > 0.0)
+        or (float(args.het) < 1.0)
         or (use_direct_no_cache and out_fmt in {"npy", "txt"})
         or (prune_spec is not None)
     )
@@ -3181,20 +3150,7 @@ def main() -> None:
             or bool(site_type_snps_only)
             or float(args.maf) > 0.0
             or float(args.geno) < 1.0
-            or float(args.het) > 0.0
-        )
-        use_external_plink_prune = bool(
-            prune_backend == "plink"
-            and source_kind == "plink"
-            and out_fmt == "plink"
-            and keep_sample_ids is None
-            and push_snp_sites is None
-            and push_bim_range is None
-            and (not post_filter.active())
-            and (not bool(site_type_snps_only))
-            and float(args.maf) <= 0.0
-            and float(args.geno) >= 1.0
-            and float(args.het) <= 0.0
+            or float(args.het) < 1.0
         )
         use_packed_prune_fastpath = bool(
             source_kind == "plink"
@@ -3206,7 +3162,7 @@ def main() -> None:
             and (not bool(site_type_snps_only))
             and float(args.maf) <= 0.0
             and float(args.geno) >= 1.0
-            and float(args.het) <= 0.0
+            and float(args.het) >= 1.0
         )
         use_selected_stream_prune_direct = bool(
             source_kind == "plink"
@@ -3227,7 +3183,6 @@ def main() -> None:
         )
         if (
             use_packed_prune_fastpath
-            and (not use_external_plink_prune)
             and _packed_prune_kernel_stats is not None
         ):
             try:
@@ -3256,47 +3211,9 @@ def main() -> None:
             and _bed_filter_to_plink_rust is not None
             and _bed_prune_to_plink_rust is not None
         )
-        if prune_backend == "plink" and (not use_external_plink_prune):
-            logger.warning(
-                "JX_LD_PRUNE_BACKEND=plink requires PLINK input/output prune without "
-                "extra filters; falling back to built-in backend."
-            )
         if not status_enabled:
             _log_status_file_only(logger, prune_desc)
-        if use_external_plink_prune:
-            with CliStatus(prune_desc, enabled=status_enabled) as task:
-                try:
-                    keep_n, total_n, wall = _ld_prune_with_external_plink(
-                        src_prefix=str(gfile),
-                        out_prefix=str(out_prefix),
-                        spec=prune_spec,
-                        threads=int(args.thread),
-                        logger=logger,
-                    )
-                    rust_prune_direct_wall = float(wall)
-                    prune_pre_sites = int(total_n)
-                    selected_n_sites = int(keep_n)
-                    rust_prune_direct_done = True
-                    prune_direct_backend = "plink-external"
-                    if keep_n <= 0:
-                        raise ValueError(
-                            "All variants were filtered out by LD prune; "
-                            "try a looser --prune r^2 threshold or larger window."
-                        )
-                    task.complete(
-                        "Applying LD prune ...Finished "
-                        f"(backend={prune_direct_backend}, kept={keep_n}, dropped={int(prune_pre_sites - keep_n)})"
-                    )
-                except Exception:
-                    task.fail("Applying LD prune ...Failed")
-                    raise
-            if not status_enabled:
-                _log_status_file_only(
-                    logger,
-                    "Applying LD prune ...Finished "
-                    f"(backend={prune_direct_backend}, kept={selected_n_sites}, dropped={int(prune_pre_sites - selected_n_sites)})",
-                )
-        elif use_rust_prune_direct and status_enabled:
+        if use_rust_prune_direct and status_enabled:
             chrom_progress = _ChromPruneProgress(max_visible=min(5, int(args.thread)))
             prune_success_msg: str | None = None
 
@@ -3673,7 +3590,6 @@ def main() -> None:
                 )
         if (
             use_packed_prune_fastpath
-            and (not use_external_plink_prune)
             and _packed_prune_kernel_stats is not None
         ):
             try:

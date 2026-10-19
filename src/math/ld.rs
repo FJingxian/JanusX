@@ -285,6 +285,57 @@ pub(crate) fn build_bitplanes_u64(
     (h_bits, l_bits, m_bits, words, word_masks)
 }
 
+pub(crate) fn build_bitplanes_u64_for_samples(
+    packed_flat: &[u8],
+    m: usize,
+    bytes_per_snp: usize,
+    sample_indices: &[usize],
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> (Vec<u64>, Vec<u64>, Vec<u64>, usize, Vec<u64>) {
+    let words = sample_indices.len().div_ceil(64);
+    if m == 0 || words == 0 {
+        return (Vec::new(), Vec::new(), Vec::new(), 0, Vec::new());
+    }
+    let mut word_masks = vec![u64::MAX; words];
+    let rem = sample_indices.len() % 64;
+    if rem != 0 {
+        word_masks[words - 1] = (1u64 << rem) - 1u64;
+    }
+    let mut h_bits = vec![0u64; m * words];
+    let mut l_bits = vec![0u64; m * words];
+    let mut m_bits = vec![0u64; m * words];
+    let mut run = || {
+        h_bits
+            .par_chunks_mut(words)
+            .zip(l_bits.par_chunks_mut(words))
+            .zip(m_bits.par_chunks_mut(words))
+            .enumerate()
+            .for_each(|(row_idx, ((hrow, lrow), mrow))| {
+                let row = &packed_flat[row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
+                for (ld_sample_idx, &sample_idx) in sample_indices.iter().enumerate() {
+                    let code = (row[sample_idx / 4] >> ((sample_idx % 4) * 2)) & 0b11;
+                    let word = ld_sample_idx / 64;
+                    let bit = 1u64 << (ld_sample_idx % 64);
+                    if code & 0b10 != 0 {
+                        hrow[word] |= bit;
+                    }
+                    if code & 0b01 != 0 {
+                        lrow[word] |= bit;
+                    }
+                    if code == 0b01 {
+                        mrow[word] |= bit;
+                    }
+                }
+            });
+    };
+    if let Some(tp) = pool {
+        tp.install(&mut run);
+    } else {
+        run();
+    }
+    (h_bits, l_bits, m_bits, words, word_masks)
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn popcount_u8x32_avx2(
@@ -558,6 +609,55 @@ pub(crate) fn compute_packed_row_stats(
             non_missing: 0usize,
             has_missing: true,
         }
+    }
+}
+
+#[inline]
+pub(crate) fn compute_packed_row_stats_for_samples(
+    row: &[u8],
+    sample_indices: &[usize],
+) -> PackedRowStats {
+    let denom = sample_indices.len().saturating_sub(1).max(1) as f64;
+    let mut non_missing = 0usize;
+    let mut alt_sum = 0usize;
+    let mut sq_sum = 0usize;
+    for &sample_idx in sample_indices {
+        let code = (row[sample_idx / 4] >> ((sample_idx % 4) * 2)) & 0b11;
+        match code {
+            0b00 => non_missing += 1,
+            0b10 => {
+                non_missing += 1;
+                alt_sum += 1;
+                sq_sum += 1;
+            }
+            0b11 => {
+                non_missing += 1;
+                alt_sum += 2;
+                sq_sum += 4;
+            }
+            _ => {}
+        }
+    }
+    if non_missing == 0 {
+        return PackedRowStats {
+            mean: 0.0,
+            std: 1e-6,
+            maf: 0.0,
+            non_missing: 0,
+            has_missing: true,
+        };
+    }
+    let obs_n = non_missing as f64;
+    let sum_g = alt_sum as f64;
+    let sum_g2 = sq_sum as f64;
+    let p = sum_g / (2.0 * obs_n);
+    let ss = (sum_g2 - sum_g * sum_g / obs_n).max(0.0);
+    PackedRowStats {
+        mean: sum_g / obs_n,
+        std: (ss / denom).max(1e-12).sqrt(),
+        maf: p.min(1.0 - p),
+        non_missing,
+        has_missing: non_missing < sample_indices.len(),
     }
 }
 

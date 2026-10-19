@@ -32,7 +32,6 @@ Modules:
     grm           Build genomic relationship matrix
     pca           Principal component analysis for population structure
     gstats        Genotype basic statistics and LD score
-    fst            Compute WC/Hudson population FST from PLINK BED
     reml          Estimate broad/narrow heritability and BLUE by REML
     fastpop       FastPop ancestry inference
     gformat       Convert genotype files across plink/vcf/txt/npy
@@ -148,7 +147,6 @@ _CLI_MODULE_SECTIONS = [
             ("grm", "Build genomic relationship matrix"),
             ("pca", "Principal component analysis for population structure"),
             ("gstats", "Genotype basic statistics and LD score"),
-            ("fst", "Compute WC/Hudson population FST from PLINK BED"),
             ("reml", "Estimate broad/narrow heritability and BLUE by REML"),
             ("fastpop", "FastPop structure, windowed FST, and XP-CLR"),
             ("gformat", "Convert genotype files across plink/vcf/txt/npy"),
@@ -159,7 +157,7 @@ _CLI_MODULE_SECTIONS = [
 
 _MODULE_NAMES = [
     "gwas", "fvlmm2", "postgwas", "postgarfield", "postbsa",
-    "garfield", "grm", "pca", "gstats", "fst", "gs", "reml", "postgs",
+    "garfield", "grm", "pca", "gstats", "gs", "reml", "postgs",
     "sim", "simulation", "gblupbench", "garfieldbench", "fastpop", "adamixture", "tree", "gformat", "gmerge", "hybrid", "webui",
     "fastq2vcf", "fastq2count", "kmer", "kmerge", "kstats", "kformat", "view", "treeplot", "refcheck",
 ]

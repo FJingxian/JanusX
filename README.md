@@ -25,7 +25,7 @@ JanusX (Joint Association and Novel Utility for Selection) is a GWAS and genomic
 **Main capabilities**:
 
 - Genome-Wide Association Study (GWAS): `lm`, `lmm`, `lmm2`, `fvlmm`, SparseLMM (`splmm` / `splmm-exact`), and `farmcpu`
-- Genomic Selection (GS): `BLUP`, `BayesA/B/C`, and ML models (`RF/ET/GBDT/XGB/SVM/ENET`)
+- Genomic Selection (GS): `BLUP`, `BayesA/B/C/R`, and ML models (`RF/ET/GBDT/XGB/SVM/ENET`)
 - Streaming genotype IO for VCF/HMP/PLINK
 - Post-analysis workflows: `postgwas`, `postgs`
 - Utility workflows: `grm`, `pca`, `gformat`, `gmerge`, `fastpop`
@@ -68,17 +68,17 @@ conda create -n janusx \
 ### 1) GWAS
 
 ```Bash
-# Estimate variance for every SNP (exact LMM)
+# Estimate variance for every SNP.
 jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -lmm -o test/
-# Exact LMM with Wald and likelihood-ratio results
+# Exact LMM with Wald and likelihood-ratio results.
 jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -lmm2 -o test/
-# Estimate variance once in NULL model, similar with EMMAX. (Fast)
+# Estimate variance once in NULL model, similar with EMMAX. (fast, recommend)
 jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -fvlmm -o test/
 # SparseLMM with sparse REML null and approximate GRAMMAR-gamma scan.
 jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -splmm -o test/
 # SparseLMM with the exact sparse-Cholesky g'Pg scan denominator.
 jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -splmm-exact -o test/
-# FarmCPU (Fast, and more sites, prepared for biobank cohorts)
+# FarmCPU.
 jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -farmcpu -o test/
 ```
 
@@ -168,10 +168,9 @@ Attribution note:
 - `gs`
 - `postgs` (Visualization)
 
-**GARFIELD**:
+**Epistasis**:
 
 - `garfield` (Based on https://github.com/heroalone/Garfield)
-- `postgarfield`
 
 **Utility**:
 

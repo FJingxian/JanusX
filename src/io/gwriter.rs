@@ -75,6 +75,26 @@ impl SiteRecord for PySiteInfo {
 pub(crate) trait SampleRecord {
     fn fid(&self) -> &str;
     fn iid(&self) -> &str;
+
+    #[inline]
+    fn father_id(&self) -> &str {
+        "0"
+    }
+
+    #[inline]
+    fn mother_id(&self) -> &str {
+        "0"
+    }
+
+    #[inline]
+    fn sex(&self) -> &str {
+        "1"
+    }
+
+    #[inline]
+    fn phenotype(&self) -> &str {
+        "-9"
+    }
 }
 
 struct SampleIdRecord {
@@ -499,9 +519,31 @@ impl PlinkBfileWriter {
             File::create(format!("{prefix}.fam")).map_err(|e| e.to_string())?,
         );
         for (i, sample) in samples.iter().enumerate() {
-            let ph = phenotype.map(|p| p[i]).unwrap_or(-9.0);
-            writeln!(fam, "{}\t{}\t0\t0\t1\t{}", sample.fid(), sample.iid(), ph)
+            if let Some(ph) = phenotype {
+                writeln!(
+                    fam,
+                    "{}\t{}\t{}\t{}\t{}\t{}",
+                    sample.fid(),
+                    sample.iid(),
+                    sample.father_id(),
+                    sample.mother_id(),
+                    sample.sex(),
+                    ph[i]
+                )
                 .map_err(|e| e.to_string())?;
+            } else {
+                writeln!(
+                    fam,
+                    "{}\t{}\t{}\t{}\t{}\t{}",
+                    sample.fid(),
+                    sample.iid(),
+                    sample.father_id(),
+                    sample.mother_id(),
+                    sample.sex(),
+                    sample.phenotype()
+                )
+                .map_err(|e| e.to_string())?;
+            }
         }
         fam.flush().map_err(|e| e.to_string())?;
 

@@ -3,7 +3,7 @@ use pyo3::types::PyDict;
 use pyo3::{prelude::*, BoundObject};
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::BufRead;
 use std::path::Path;
@@ -12,9 +12,7 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 
-use crate::gfcore::{
-    open_text_maybe_gz, process_snp_row, read_bim, read_fam, HmpSnpIter, SiteInfo,
-};
+use crate::gfcore::{open_text_maybe_gz, process_snp_row, read_bim, HmpSnpIter, SiteInfo};
 use crate::gfreader::build_sample_selection;
 use crate::gwriter::{HmpWriter, PlinkBfileWriter, SampleRecord, VcfWriter};
 
@@ -126,6 +124,10 @@ fn apply_snp_name_template(site: &mut SiteInfo, snp_name_template: Option<&str>)
 struct SampleKey {
     fid: String,
     iid: String,
+    father: String,
+    mother: String,
+    sex: String,
+    phenotype: String,
 }
 
 impl SampleKey {
@@ -143,6 +145,32 @@ impl SampleRecord for SampleKey {
     fn iid(&self) -> &str {
         &self.iid
     }
+
+    fn father_id(&self) -> &str {
+        &self.father
+    }
+
+    fn mother_id(&self) -> &str {
+        &self.mother
+    }
+
+    fn sex(&self) -> &str {
+        &self.sex
+    }
+
+    fn phenotype(&self) -> &str {
+        &self.phenotype
+    }
+}
+
+#[derive(Clone, Debug)]
+struct FamSample {
+    fid: String,
+    iid: String,
+    father: String,
+    mother: String,
+    sex: String,
+    phenotype: String,
 }
 
 // ============================================================
@@ -343,6 +371,12 @@ enum AlleleMap {
 }
 
 fn infer_map(dref: &str, dalt: &str, gref: &str, galt: &str) -> Option<AlleleMap> {
+    // A/T and C/G pairs cannot reveal strand orientation from allele labels:
+    // complementing them produces the same unordered pair. Keep the anchor
+    // panel's dosage as-is, but let the caller mark other panels unaligned.
+    if is_palindromic_pair(dref, dalt) || is_palindromic_pair(gref, galt) {
+        return None;
+    }
     if dref == gref && dalt == galt {
         return Some(AlleleMap::Identity);
     }
@@ -359,6 +393,11 @@ fn infer_map(dref: &str, dalt: &str, gref: &str, galt: &str) -> Option<AlleleMap
         return Some(AlleleMap::StrandSwap);
     }
     None
+}
+
+#[inline]
+fn is_palindromic_pair(a: &str, b: &str) -> bool {
+    matches!((a, b), ("A", "T") | ("T", "A") | ("C", "G") | ("G", "C"))
 }
 
 #[inline]
@@ -431,6 +470,7 @@ fn cmp_site(a: &SiteInfo, b: &SiteInfo) -> Ordering {
 
 struct BedSnpIterRaw {
     samples: Vec<String>,
+    sample_metadata: Vec<FamSample>,
     sites: Vec<SiteInfo>,
     mmap: Mmap,
     n_samples: usize,
@@ -440,8 +480,24 @@ struct BedSnpIterRaw {
 
 impl BedSnpIterRaw {
     fn new(prefix: &str) -> Result<Self, String> {
-        let samples = read_fam(prefix)?;
+        let sample_metadata = read_fam_records(prefix)?;
+        let samples = sample_metadata
+            .iter()
+            .map(|sample| sample.iid.clone())
+            .collect::<Vec<_>>();
         let sites = read_bim(prefix)?;
+        for (idx, pair) in sites.windows(2).enumerate() {
+            if cmp_site(&pair[1], &pair[0]) == Ordering::Less {
+                return Err(format!(
+                    "{prefix}.bim is not sorted by chromosome/position at row {}: {}:{} follows {}:{}",
+                    idx + 2,
+                    pair[1].chrom,
+                    pair[1].pos,
+                    pair[0].chrom,
+                    pair[0].pos
+                ));
+            }
+        }
         let n_samples = samples.len();
 
         let bed_path = format!("{prefix}.bed");
@@ -458,6 +514,7 @@ impl BedSnpIterRaw {
         let bytes_per_snp = (n_samples + 3) / 4;
         Ok(Self {
             samples,
+            sample_metadata,
             sites,
             mmap,
             n_samples,
@@ -533,6 +590,41 @@ impl BedSnpIterRaw {
         let row = self.decode_row(idx);
         Some((row, site))
     }
+}
+
+fn read_fam_records(prefix: &str) -> Result<Vec<FamSample>, String> {
+    let fam_path = format!("{prefix}.fam");
+    let file = File::open(&fam_path).map_err(|e| format!("{fam_path}: {e}"))?;
+    let mut samples = Vec::new();
+    for (line_idx, line) in std::io::BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(|e| format!("{fam_path}:{}: {e}", line_idx + 1))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let fid = fields
+            .next()
+            .ok_or_else(|| format!("{fam_path}:{}: missing FID", line_idx + 1))?;
+        let iid = fields
+            .next()
+            .ok_or_else(|| format!("{fam_path}:{}: missing IID", line_idx + 1))?;
+        let father = fields.next().unwrap_or("0");
+        let mother = fields.next().unwrap_or("0");
+        let sex = fields.next().unwrap_or("1");
+        let phenotype = fields.next().unwrap_or("-9");
+        samples.push(FamSample {
+            fid: fid.to_string(),
+            iid: iid.to_string(),
+            father: father.to_string(),
+            mother: mother.to_string(),
+            sex: sex.to_string(),
+            phenotype: phenotype.to_string(),
+        });
+    }
+    if samples.is_empty() {
+        return Err(format!("{fam_path}: no samples found"));
+    }
+    Ok(samples)
 }
 
 struct VcfSnpIterRaw {
@@ -993,6 +1085,13 @@ impl InputIter {
         }
     }
 
+    fn sample_metadata(&self) -> Option<&[FamSample]> {
+        match self {
+            InputIter::Bed(it) => Some(&it.sample_metadata),
+            InputIter::Vcf(_) | InputIter::Hmp(_) => None,
+        }
+    }
+
     fn n_samples(&self) -> usize {
         match self {
             InputIter::Bed(it) => it.n_samples(),
@@ -1335,11 +1434,21 @@ fn process_hmp_line_for_plink_output(
     }
 }
 
+#[derive(Default)]
+struct MergeOrderState {
+    last_chrom: Option<String>,
+    last_chrom_key: Option<(u8, i32, String)>,
+    last_pos: i32,
+    record_count: usize,
+}
+
 fn advance_merge_inputs_with_progress(
     py: Python<'_>,
     iters: &mut [InputIter],
     cur: &mut [Option<(Vec<f32>, SiteInfo)>],
     idxs: &[usize],
+    order_states: &mut [MergeOrderState],
+    input_labels: &[String],
     progress_callback: Option<&Py<PyAny>>,
     progress_total: u64,
     progress_every: u64,
@@ -1347,7 +1456,7 @@ fn advance_merge_inputs_with_progress(
     last_report: &mut u64,
 ) -> PyResult<()> {
     for &i in idxs.iter() {
-        cur[i] = iters[i].next_snp();
+        cur[i] = next_merge_site_checked(&mut iters[i], &mut order_states[i], &input_labels[i])?;
     }
 
     if progress_callback.is_none() || progress_every == 0 {
@@ -1362,6 +1471,43 @@ fn advance_merge_inputs_with_progress(
         *last_report = *progress_done;
     }
     Ok(())
+}
+
+fn next_merge_site_checked(
+    iter: &mut InputIter,
+    order_state: &mut MergeOrderState,
+    input_label: &str,
+) -> PyResult<Option<(Vec<f32>, SiteInfo)>> {
+    let next = iter.next_snp();
+    if let Some((_, site)) = &next {
+        order_state.record_count = order_state.record_count.saturating_add(1);
+        let same_chrom = order_state.last_chrom.as_deref() == Some(site.chrom.as_str());
+        let current_key = (!same_chrom).then(|| chrom_ord_key(&site.chrom));
+        if let Some(previous_key) = order_state.last_chrom_key.as_ref() {
+            let key_order = current_key
+                .as_ref()
+                .map(|key| key.cmp(previous_key))
+                .unwrap_or(Ordering::Equal);
+            let out_of_order = key_order == Ordering::Less
+                || (key_order == Ordering::Equal && site.pos < order_state.last_pos);
+            if out_of_order {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "gmerge input {input_label:?} is not sorted by chromosome/position at parsed record {}: {}:{} follows {}:{}",
+                    order_state.record_count,
+                    site.chrom,
+                    site.pos,
+                    order_state.last_chrom.as_deref().unwrap_or("?"),
+                    order_state.last_pos
+                )));
+            }
+        }
+        if !same_chrom {
+            order_state.last_chrom = Some(site.chrom.clone());
+            order_state.last_chrom_key = current_key;
+        }
+        order_state.last_pos = site.pos;
+    }
+    Ok(next)
 }
 
 // ============================================================
@@ -1438,9 +1584,11 @@ pub fn merge_genotypes(
     let mut sample_counts: Vec<usize> = Vec::with_capacity(iters.len());
 
     for (i, it) in iters.iter().enumerate() {
-        let fid = "0".to_string();
+        let source_metadata = it.sample_metadata();
         sample_counts.push(it.n_samples());
-        for sid in it.sample_ids().iter() {
+        let mut output_iids = Vec::with_capacity(it.n_samples());
+        let mut output_iid_by_source_key: HashMap<(String, String), String> = HashMap::new();
+        for (sample_idx, sid) in it.sample_ids().iter().enumerate() {
             let base_name = if sample_prefix {
                 if has_dataset_prefix(sid) {
                     sid.clone()
@@ -1462,9 +1610,46 @@ pub fn merge_genotypes(
                     k += 1;
                 }
             }
+            let source = source_metadata.and_then(|records| records.get(sample_idx));
+            let source_fid = source.map(|record| record.fid.as_str()).unwrap_or("0");
+            output_iid_by_source_key
+                .entry((source_fid.to_string(), sid.clone()))
+                .or_insert_with(|| out_name.clone());
+            output_iids.push(out_name);
+        }
+        for (sample_idx, sid) in it.sample_ids().iter().enumerate() {
+            let mut record = source_metadata
+                .and_then(|records| records.get(sample_idx))
+                .cloned()
+                .unwrap_or_else(|| FamSample {
+                    fid: "0".to_string(),
+                    iid: sid.clone(),
+                    father: "0".to_string(),
+                    mother: "0".to_string(),
+                    sex: "1".to_string(),
+                    phenotype: "-9".to_string(),
+                });
+            if record.father != "0" {
+                if let Some(parent_iid) =
+                    output_iid_by_source_key.get(&(record.fid.clone(), record.father.clone()))
+                {
+                    record.father = parent_iid.clone();
+                }
+            }
+            if record.mother != "0" {
+                if let Some(parent_iid) =
+                    output_iid_by_source_key.get(&(record.fid.clone(), record.mother.clone()))
+                {
+                    record.mother = parent_iid.clone();
+                }
+            }
             merged_samples.push(SampleKey {
-                fid: fid.clone(),
-                iid: out_name,
+                fid: record.fid,
+                iid: output_iids[sample_idx].clone(),
+                father: record.father,
+                mother: record.mother,
+                sex: record.sex,
+                phenotype: record.phenotype,
             });
         }
     }
@@ -1493,10 +1678,10 @@ pub fn merge_genotypes(
         per_input_absent_sites: vec![0; iters.len()],
     };
 
-    // Keep output unique by genomic coordinate during merge.
-    // Only mark a site as seen after a successful write, so a later valid
-    // record at the same coordinate can still be written if earlier one was dropped.
-    let mut written_site_keys: HashSet<(String, i32)> = HashSet::new();
+    // K-way merge output is coordinate-sorted. Keep only the current coordinate's
+    // allele pairs so duplicate suppression does not grow with genome size.
+    let mut last_written_coordinate: Option<(String, i32)> = None;
+    let mut written_allele_pairs: HashSet<(String, String)> = HashSet::new();
 
     // writers
     let mut vcf_w: Option<VcfWriter> = None;
@@ -1524,8 +1709,17 @@ pub fn merge_genotypes(
     }
 
     // pull first record from each input
-    let mut cur: Vec<Option<(Vec<f32>, SiteInfo)>> =
-        iters.iter_mut().map(|it| it.next_snp()).collect();
+    let mut order_states = (0..iters.len())
+        .map(|_| MergeOrderState::default())
+        .collect::<Vec<_>>();
+    let mut cur: Vec<Option<(Vec<f32>, SiteInfo)>> = Vec::with_capacity(iters.len());
+    for i in 0..iters.len() {
+        cur.push(next_merge_site_checked(
+            &mut iters[i],
+            &mut order_states[i],
+            &inputs[i],
+        )?);
+    }
 
     // k-way merge loop
     loop {
@@ -1566,12 +1760,14 @@ pub fn merge_genotypes(
         // choose candidate allele from first biallelic SNP
         let mut cand_ref: Option<String> = None;
         let mut cand_alt: Option<String> = None;
+        let mut cand_idx: Option<usize> = None;
         for &i in idxs.iter() {
             if let Some((_row, site)) = &cur[i] {
                 match normalize_biallelic_snp(&site.ref_allele, &site.alt_allele) {
                     Some((r, a)) => {
                         cand_ref = Some(r);
                         cand_alt = Some(a);
+                        cand_idx = Some(i);
                         break;
                     }
                     None => {
@@ -1592,6 +1788,8 @@ pub fn merge_genotypes(
                     &mut iters,
                     &mut cur,
                     &idxs,
+                    &mut order_states,
+                    &inputs,
                     progress_callback.as_ref(),
                     progress_total_hint,
                     progress_every as u64,
@@ -1607,7 +1805,11 @@ pub fn merge_genotypes(
         for &i in idxs.iter() {
             if let Some((_row, site)) = &cur[i] {
                 if let Some((r, a)) = normalize_biallelic_snp(&site.ref_allele, &site.alt_allele) {
-                    maps[i] = infer_map(&r, &a, &cand_ref, &cand_alt);
+                    maps[i] = if Some(i) == cand_idx {
+                        Some(AlleleMap::Identity)
+                    } else {
+                        infer_map(&r, &a, &cand_ref, &cand_alt)
+                    };
                 }
             }
         }
@@ -1712,6 +1914,8 @@ pub fn merge_genotypes(
                 &mut iters,
                 &mut cur,
                 &idxs,
+                &mut order_states,
+                &inputs,
                 progress_callback.as_ref(),
                 progress_total_hint,
                 progress_every as u64,
@@ -1738,6 +1942,8 @@ pub fn merge_genotypes(
                     &mut iters,
                     &mut cur,
                     &idxs,
+                    &mut order_states,
+                    &inputs,
                     progress_callback.as_ref(),
                     progress_total_hint,
                     progress_every as u64,
@@ -1749,14 +1955,25 @@ pub fn merge_genotypes(
         }
 
         // write
-        let site_key = (min_site.chrom.clone(), min_site.pos);
-        if written_site_keys.contains(&site_key) {
-            // duplicated coordinate, skip writing this record
+        let coordinate = (min_site.chrom.clone(), min_site.pos);
+        if last_written_coordinate.as_ref() != Some(&coordinate) {
+            last_written_coordinate = Some(coordinate);
+            written_allele_pairs.clear();
+        }
+        let allele_key = if gref <= galt {
+            (gref.clone(), galt.clone())
+        } else {
+            (galt.clone(), gref.clone())
+        };
+        if written_allele_pairs.contains(&allele_key) {
+            // The same biallelic record appeared in more than one input.
             advance_merge_inputs_with_progress(
                 py,
                 &mut iters,
                 &mut cur,
                 &idxs,
+                &mut order_states,
+                &inputs,
                 progress_callback.as_ref(),
                 progress_total_hint,
                 progress_every as u64,
@@ -1788,7 +2005,7 @@ pub fn merge_genotypes(
                     .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
             }
         }
-        written_site_keys.insert(site_key);
+        written_allele_pairs.insert(allele_key);
 
         stats.n_sites_written += 1;
 
@@ -1798,6 +2015,8 @@ pub fn merge_genotypes(
             &mut iters,
             &mut cur,
             &idxs,
+            &mut order_states,
+            &inputs,
             progress_callback.as_ref(),
             progress_total_hint,
             progress_every as u64,
@@ -1954,6 +2173,10 @@ pub fn convert_genotypes(
                 .map(|sid| SampleKey {
                     fid: sid.clone(),
                     iid: sid.clone(),
+                    father: "0".to_string(),
+                    mother: "0".to_string(),
+                    sex: "1".to_string(),
+                    phenotype: "-9".to_string(),
                 })
                 .collect();
             plink_w = Some(

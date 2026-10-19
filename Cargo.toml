@@ -61,3 +61,9 @@ debug = 1
 
 [profile.dev.package.janusx]
 opt-level = 3
+
+[profile.release]
+# Cargo may implicitly strip dependency debuginfo for release builds. rustc's
+# macOS strip=debuginfo path can produce cdylibs rejected by newer dyld loaders.
+# Keep the Mach-O symbol/string tables intact so Git and wheel builds stay loadable.
+strip = "none"

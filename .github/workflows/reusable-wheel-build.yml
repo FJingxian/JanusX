@@ -450,6 +450,12 @@ jobs:
             maturin build --release --out dist --target ${{ matrix.target }} --interpreter python --features blas-openblas,python-extension
           fi
 
+      - name: Check macOS wheel Mach-O LINKEDIT alignment
+        if: ${{ matrix.platform == 'macos' }}
+        shell: bash
+        run: |
+          python scripts/ci/check_macos_linkedit.py dist/*.whl
+
       - name: Clear build-only Windows OpenBLAS hints
         if: ${{ matrix.label == 'windows-x86_64' }}
         shell: bash

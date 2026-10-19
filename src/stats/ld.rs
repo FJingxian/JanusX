@@ -25,11 +25,12 @@ use crate::blas::{
     CBLAS_TRANS, CBLAS_UPPER,
 };
 use crate::math_ld::{
-    build_bitplanes_u64, build_row_bitplanes_u64_with_aux, classify_ld_pair_by_maf,
-    compute_packed_row_stats, dot_nomiss_pair_bitplanes, dot_nomiss_pair_from_packed,
-    dot_nomiss_row_bitplanes, fill_row_bitplanes_hlav_u64,
-    packed_prune_kernel_stats as packed_prune_kernel_stats_core, r2_pairwise_complete_bitplanes,
-    r2_pairwise_complete_bitplanes_cached_masks, r2_pairwise_complete_from_packed, PackedRowStats,
+    build_bitplanes_u64, build_bitplanes_u64_for_samples, build_row_bitplanes_u64_with_aux,
+    classify_ld_pair_by_maf, compute_packed_row_stats, compute_packed_row_stats_for_samples,
+    dot_nomiss_pair_bitplanes, dot_nomiss_pair_from_packed, dot_nomiss_row_bitplanes,
+    fill_row_bitplanes_hlav_u64, packed_prune_kernel_stats as packed_prune_kernel_stats_core,
+    r2_pairwise_complete_bitplanes, r2_pairwise_complete_bitplanes_cached_masks,
+    r2_pairwise_complete_from_packed, PackedRowStats,
 };
 use crate::stats_common::{get_cached_pool, map_err_string_to_py};
 
@@ -88,6 +89,11 @@ fn effective_threads(threads: usize) -> usize {
     }
 }
 
+#[inline]
+fn ld_prune_row_is_noninformative(stats: PackedRowStats, n_samples: usize) -> bool {
+    n_samples >= 2 && !(stats.maf > 0.0)
+}
+
 #[pyfunction]
 #[pyo3(signature = (reset=false))]
 pub fn packed_prune_kernel_stats(
@@ -115,7 +121,10 @@ fn prune_one_chrom_packed(
     mode: LdPruneMode,
 ) -> Vec<bool> {
     let l = idx_list.len();
-    let mut dropped = vec![false; l];
+    let mut dropped: Vec<bool> = idx_list
+        .iter()
+        .map(|&idx| ld_prune_row_is_noninformative(stats[idx], n_samples))
+        .collect();
     if l <= 1 {
         return dropped;
     }
@@ -411,6 +420,7 @@ fn bed_packed_ld_prune_keep(
     m: usize,
     bytes_per_snp: usize,
     n_samples: usize,
+    ld_sample_indices: &[usize],
     chrom_vec: &[i32],
     pos_vec: &[i64],
     window_bp: Option<i64>,
@@ -437,6 +447,14 @@ fn bed_packed_ld_prune_keep(
             packed_flat.len(),
             m.saturating_mul(bytes_per_snp)
         ));
+    }
+    if ld_sample_indices.iter().any(|&idx| idx >= n_samples)
+        || ld_sample_indices.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err("LD sample indices must be unique, increasing, and in range".to_string());
+    }
+    if ld_sample_indices.len() < 2 {
+        return Ok(vec![true; m]);
     }
     if chrom_vec.len() != m {
         return Err(format!(
@@ -470,72 +488,23 @@ fn bed_packed_ld_prune_keep(
         }
     }
 
+    let use_all_samples = ld_sample_indices.len() == n_samples
+        && ld_sample_indices
+            .iter()
+            .enumerate()
+            .all(|(idx, &sample_idx)| idx == sample_idx);
+    let ld_n_samples = ld_sample_indices.len();
     let mut stats = vec![PackedRowStats::default(); m];
     let byte_lut = packed_byte_lut();
-    let full_bytes = n_samples / 4;
-    let rem = n_samples % 4;
-    let denom = (n_samples.saturating_sub(1)).max(1) as f64;
     let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
     {
         let mut run = || {
             stats.par_iter_mut().enumerate().for_each(|(row_idx, st)| {
                 let row = &packed_flat[row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
-                let mut non_missing: usize = 0;
-                let mut alt_sum: usize = 0;
-                let mut sq_sum: usize = 0;
-                for &b in row.iter().take(full_bytes) {
-                    let idx = b as usize;
-                    non_missing += byte_lut.nonmiss[idx] as usize;
-                    alt_sum += byte_lut.alt_sum[idx] as usize;
-                    sq_sum += byte_lut.sq_sum[idx] as usize;
-                }
-                if rem > 0 {
-                    let codes = &byte_lut.code4[row[full_bytes] as usize];
-                    for &code in codes.iter().take(rem) {
-                        match code {
-                            0b00 => {
-                                non_missing += 1;
-                            }
-                            0b10 => {
-                                non_missing += 1;
-                                alt_sum += 1;
-                                sq_sum += 1;
-                            }
-                            0b11 => {
-                                non_missing += 1;
-                                alt_sum += 2;
-                                sq_sum += 4;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-
-                if non_missing > 0 {
-                    let obs_n = non_missing as f64;
-                    let sum_g = alt_sum as f64;
-                    let sum_g2 = sq_sum as f64;
-                    let p = sum_g / (2.0_f64 * obs_n);
-                    let maf = p.min(1.0_f64 - p);
-                    let mean = sum_g / obs_n;
-                    let ss = (sum_g2 - (sum_g * sum_g / obs_n)).max(0.0_f64);
-                    let var = ss / denom;
-                    let std = var.max(1e-12_f64).sqrt();
-                    *st = PackedRowStats {
-                        mean,
-                        std,
-                        maf,
-                        non_missing,
-                        has_missing: non_missing < n_samples,
-                    };
+                if use_all_samples {
+                    *st = compute_packed_row_stats(row, n_samples, byte_lut);
                 } else {
-                    *st = PackedRowStats {
-                        mean: 0.0_f64,
-                        std: 1e-6_f64,
-                        maf: 0.0_f64,
-                        non_missing: 0usize,
-                        has_missing: true,
-                    };
+                    *st = compute_packed_row_stats_for_samples(row, ld_sample_indices);
                 }
             });
         };
@@ -552,8 +521,17 @@ fn bed_packed_ld_prune_keep(
     }
     let chrom_groups: Vec<Vec<usize>> = by_chr.into_values().collect();
 
-    let (bitplane_h, bitplane_l, bitplane_m, bitplane_words, bitplane_masks) =
-        build_bitplanes_u64(packed_flat, m, bytes_per_snp, n_samples, pool.as_ref());
+    let (bitplane_h, bitplane_l, bitplane_m, bitplane_words, bitplane_masks) = if use_all_samples {
+        build_bitplanes_u64(packed_flat, m, bytes_per_snp, n_samples, pool.as_ref())
+    } else {
+        build_bitplanes_u64_for_samples(
+            packed_flat,
+            m,
+            bytes_per_snp,
+            ld_sample_indices,
+            pool.as_ref(),
+        )
+    };
     let mode = resolve_ld_prune_mode();
     let worker_ct = if threads > 0 {
         threads
@@ -576,7 +554,7 @@ fn bed_packed_ld_prune_keep(
                     prune_one_chrom_packed(
                         idx_list,
                         pos_vec,
-                        n_samples,
+                        ld_n_samples,
                         window_bp,
                         window_variants,
                         step_variants,
@@ -619,6 +597,17 @@ fn normalize_plink_prefix(p: &str) -> String {
         return s[..s.len() - 4].to_string();
     }
     s.to_string()
+}
+
+#[pyfunction]
+pub fn bed_fam_founder_indices(prefix: String) -> PyResult<Vec<i64>> {
+    let prefix = normalize_plink_prefix(&prefix);
+    if prefix.is_empty() {
+        return Err(PyRuntimeError::new_err("PLINK prefix must not be empty"));
+    }
+    crate::gfcore::read_fam_founder_indices(&prefix)
+        .map(|indices| indices.into_iter().map(|idx| idx as i64).collect())
+        .map_err(map_err_string_to_py)
 }
 
 #[inline]
@@ -1739,6 +1728,7 @@ struct StreamingPruneBufferedRow {
     chrom_seq: usize,
     first_unchecked_seq: usize,
     packed: Vec<u8>,
+    ld_packed: Vec<u8>,
     bim_line: String,
     stats: PackedRowStats,
     bit_h: Option<Vec<u64>>,
@@ -1755,6 +1745,7 @@ impl StreamingPruneBufferedRow {
         self.dropped = true;
         self.finalized = true;
         self.packed.clear();
+        self.ld_packed.clear();
         self.bim_line.clear();
         self.bit_h = None;
         self.bit_l = None;
@@ -2323,12 +2314,51 @@ fn notify_chrom_prune_progress(
     .map_err(|e| e.to_string())
 }
 
+#[inline]
+fn ld_sample_indices_are_all(indices: &[usize], n_samples: usize) -> bool {
+    indices.len() == n_samples
+        && indices
+            .iter()
+            .enumerate()
+            .all(|(idx, &sample_idx)| idx == sample_idx)
+}
+
+fn pack_plink_sample_subset(row: &[u8], sample_indices: &[usize], out: &mut Vec<u8>) {
+    out.clear();
+    out.resize(sample_indices.len().div_ceil(4), 0u8);
+    for (ld_sample_idx, &sample_idx) in sample_indices.iter().enumerate() {
+        let code = (row[sample_idx / 4] >> ((sample_idx % 4) * 2)) & 0b11;
+        out[ld_sample_idx / 4] |= code << ((ld_sample_idx % 4) * 2);
+    }
+}
+
+fn build_stream_prune_row_state(
+    row: &[u8],
+    n_samples: usize,
+    ld_sample_indices: &[usize],
+    all_samples: bool,
+    ld_row_buf: &mut Vec<u8>,
+    bit_pool: &mut Vec<Vec<u64>>,
+) -> (PackedRowStats, Vec<u64>) {
+    let (ld_row, ld_n_samples) = if all_samples {
+        (row, n_samples)
+    } else {
+        pack_plink_sample_subset(row, ld_sample_indices, ld_row_buf);
+        (ld_row_buf.as_slice(), ld_sample_indices.len())
+    };
+    let stats = compute_packed_row_stats(ld_row, ld_n_samples, packed_byte_lut());
+    let mut bits = bit_pool.pop().unwrap_or_default();
+    fill_row_bitplanes_hlav_u64(ld_row, ld_n_samples, &mut bits);
+    (stats, bits)
+}
+
 fn process_stream_chrom_block(
     src_prefix: &str,
     out_prefix: &str,
     block: &BimChromBlock,
     block_idx: usize,
     n_samples: usize,
+    ld_sample_indices: &[usize],
     bytes_per_snp: usize,
     window_bp: Option<i64>,
     window_variants: Option<usize>,
@@ -2392,9 +2422,10 @@ fn process_stream_chrom_block(
         None => None,
     };
 
-    let byte_lut = packed_byte_lut();
-    let denom = (n_samples.saturating_sub(1)).max(1) as f64;
-    let n_samples_f = n_samples as f64;
+    let ld_n_samples = ld_sample_indices.len();
+    let all_ld_samples = ld_sample_indices_are_all(ld_sample_indices, n_samples);
+    let denom = (ld_n_samples.saturating_sub(1)).max(1) as f64;
+    let n_samples_f = ld_n_samples as f64;
     let step = step_variants.max(1);
     let mut rows: Vec<StreamChromRow> = Vec::new();
     let mut bit_pool: Vec<Vec<u64>> = Vec::new();
@@ -2404,6 +2435,7 @@ fn process_stream_chrom_block(
     let mut bp_scan = 0usize;
     let mut kept = 0usize;
     let mut row_buf = vec![0u8; bytes_per_snp];
+    let mut ld_row_buf = vec![0u8; ld_n_samples.div_ceil(4)];
     let mut line_buf = String::new();
     let mut consumed_bim = block.bim_start;
     let notify_step = if progress_every == 0 {
@@ -2447,9 +2479,14 @@ fn process_stream_chrom_block(
             .read_exact(&mut row_buf)
             .map_err(|e| format!("{src_bed}: row {}: {}", block.start_idx + local_seq + 1, e))?;
 
-        let stats = compute_packed_row_stats(&row_buf, n_samples, byte_lut);
-        let mut bits = bit_pool.pop().unwrap_or_default();
-        fill_row_bitplanes_hlav_u64(&row_buf, n_samples, &mut bits);
+        let (stats, bits) = build_stream_prune_row_state(
+            &row_buf,
+            n_samples,
+            ld_sample_indices,
+            all_ld_samples,
+            &mut ld_row_buf,
+            &mut bit_pool,
+        );
         rows.push(StreamChromRow {
             first_unchecked_seq: seen_count.saturating_add(1),
             pos,
@@ -2465,7 +2502,7 @@ fn process_stream_chrom_block(
             },
             stats,
             bits,
-            dropped: false,
+            dropped: ld_prune_row_is_noninformative(stats, ld_n_samples),
         });
         seen_count = seen_count.saturating_add(1);
         process_stream_chrom_ready_windows(
@@ -2565,6 +2602,7 @@ fn process_stream_masked_chrom_block(
     block_keep: &[bool],
     block_idx: usize,
     n_samples: usize,
+    ld_sample_indices: &[usize],
     bytes_per_snp: usize,
     window_bp: Option<i64>,
     window_variants: Option<usize>,
@@ -2658,9 +2696,10 @@ fn process_stream_masked_chrom_block(
         None => None,
     };
 
-    let byte_lut = packed_byte_lut();
-    let denom = (n_samples.saturating_sub(1)).max(1) as f64;
-    let n_samples_f = n_samples as f64;
+    let ld_n_samples = ld_sample_indices.len();
+    let all_ld_samples = ld_sample_indices_are_all(ld_sample_indices, n_samples);
+    let denom = (ld_n_samples.saturating_sub(1)).max(1) as f64;
+    let n_samples_f = ld_n_samples as f64;
     let step = step_variants.max(1);
     let mut rows: Vec<StreamChromRow> = Vec::new();
     let mut bit_pool: Vec<Vec<u64>> = Vec::new();
@@ -2671,6 +2710,7 @@ fn process_stream_masked_chrom_block(
     let mut kept = 0usize;
     let mut selected_done = 0usize;
     let mut row_buf = vec![0u8; bytes_per_snp];
+    let mut ld_row_buf = vec![0u8; ld_n_samples.div_ceil(4)];
     let mut line_buf = String::new();
     let mut consumed_bim = block.bim_start;
     let notify_step = if progress_every == 0 {
@@ -2709,9 +2749,14 @@ fn process_stream_masked_chrom_block(
         let (_chrom, pos) =
             parse_bim_line_chrom_pos(bim_line_trimmed, block.start_idx + local_seq + 1, &src_bim)?;
 
-        let stats = compute_packed_row_stats(&row_buf, n_samples, byte_lut);
-        let mut bits = bit_pool.pop().unwrap_or_default();
-        fill_row_bitplanes_hlav_u64(&row_buf, n_samples, &mut bits);
+        let (stats, bits) = build_stream_prune_row_state(
+            &row_buf,
+            n_samples,
+            ld_sample_indices,
+            all_ld_samples,
+            &mut ld_row_buf,
+            &mut bit_pool,
+        );
         rows.push(StreamChromRow {
             first_unchecked_seq: seen_count.saturating_add(1),
             pos,
@@ -2727,7 +2772,7 @@ fn process_stream_masked_chrom_block(
             },
             stats,
             bits,
-            dropped: false,
+            dropped: ld_prune_row_is_noninformative(stats, ld_n_samples),
         });
         seen_count = seen_count.saturating_add(1);
         selected_done = selected_done.saturating_add(1);
@@ -2828,6 +2873,7 @@ fn process_stream_selected_chrom_block(
     block: &SelectedBimChromBlock,
     block_idx: usize,
     n_samples: usize,
+    ld_sample_indices: &[usize],
     bytes_per_snp: usize,
     window_bp: Option<i64>,
     window_variants: Option<usize>,
@@ -2902,9 +2948,10 @@ fn process_stream_selected_chrom_block(
         None => None,
     };
 
-    let byte_lut = packed_byte_lut();
-    let denom = (n_samples.saturating_sub(1)).max(1) as f64;
-    let n_samples_f = n_samples as f64;
+    let ld_n_samples = ld_sample_indices.len();
+    let all_ld_samples = ld_sample_indices_are_all(ld_sample_indices, n_samples);
+    let denom = (ld_n_samples.saturating_sub(1)).max(1) as f64;
+    let n_samples_f = ld_n_samples as f64;
     let step = step_variants.max(1);
     let mut rows: Vec<StreamChromRow> = Vec::new();
     let mut bit_pool: Vec<Vec<u64>> = Vec::new();
@@ -2914,6 +2961,7 @@ fn process_stream_selected_chrom_block(
     let mut bp_scan = 0usize;
     let mut kept = 0usize;
     let mut row_buf = vec![0u8; bytes_per_snp];
+    let mut ld_row_buf = vec![0u8; ld_n_samples.div_ceil(4)];
     let mut line_buf = String::new();
     let mut consumed_bim = block.source_bim_start;
     let total_selected = block.source_indices.len();
@@ -3010,9 +3058,14 @@ fn process_stream_selected_chrom_block(
             .map_err(|e| format!("{src_bed}: row {}: {}", source_idx + 1, e))?;
         prev_source_idx_opt = Some(source_idx);
 
-        let stats = compute_packed_row_stats(&row_buf, n_samples, byte_lut);
-        let mut bits = bit_pool.pop().unwrap_or_default();
-        fill_row_bitplanes_hlav_u64(&row_buf, n_samples, &mut bits);
+        let (stats, bits) = build_stream_prune_row_state(
+            &row_buf,
+            n_samples,
+            ld_sample_indices,
+            all_ld_samples,
+            &mut ld_row_buf,
+            &mut bit_pool,
+        );
         rows.push(StreamChromRow {
             first_unchecked_seq: seen_count.saturating_add(1),
             pos,
@@ -3028,7 +3081,7 @@ fn process_stream_selected_chrom_block(
             },
             stats,
             bits,
-            dropped: false,
+            dropped: ld_prune_row_is_noninformative(stats, ld_n_samples),
         });
         seen_count = seen_count.saturating_add(1);
         process_stream_chrom_ready_windows(
@@ -3242,6 +3295,7 @@ fn stream_prune_chrom_blocks_to_plink(
     out_prefix: &str,
     scan: BimStreamScan,
     n_samples: usize,
+    ld_sample_indices: &[usize],
     window_bp: Option<i64>,
     window_variants: Option<usize>,
     step_variants: usize,
@@ -3256,10 +3310,10 @@ fn stream_prune_chrom_blocks_to_plink(
         return Err("no chromosome blocks found in BIM".to_string());
     }
     let bytes_per_snp = (n_samples + 3) / 4;
-    let words = (n_samples + 63) / 64;
+    let words = ld_sample_indices.len().div_ceil(64);
     let mut word_masks = vec![u64::MAX; words];
     if words > 0 {
-        let rem = n_samples % 64;
+        let rem = ld_sample_indices.len() % 64;
         if rem != 0 {
             word_masks[words - 1] = (1u64 << rem) - 1u64;
         }
@@ -3279,6 +3333,7 @@ fn stream_prune_chrom_blocks_to_plink(
                     block,
                     block_idx,
                     n_samples,
+                    ld_sample_indices,
                     bytes_per_snp,
                     window_bp,
                     window_variants,
@@ -3325,6 +3380,7 @@ fn stream_prune_masked_chrom_blocks_to_plink(
     scan: BimStreamScan,
     keep_mask: Vec<bool>,
     n_samples: usize,
+    ld_sample_indices: &[usize],
     window_bp: Option<i64>,
     window_variants: Option<usize>,
     step_variants: usize,
@@ -3351,10 +3407,10 @@ fn stream_prune_masked_chrom_blocks_to_plink(
     }
 
     let bytes_per_snp = (n_samples + 3) / 4;
-    let words = (n_samples + 63) / 64;
+    let words = ld_sample_indices.len().div_ceil(64);
     let mut word_masks = vec![u64::MAX; words];
     if words > 0 {
-        let rem = n_samples % 64;
+        let rem = ld_sample_indices.len() % 64;
         if rem != 0 {
             word_masks[words - 1] = (1u64 << rem) - 1u64;
         }
@@ -3377,6 +3433,7 @@ fn stream_prune_masked_chrom_blocks_to_plink(
                     &keep_mask[block.start_idx..block_end],
                     block_idx,
                     n_samples,
+                    ld_sample_indices,
                     bytes_per_snp,
                     window_bp,
                     window_variants,
@@ -3422,6 +3479,7 @@ fn stream_prune_selected_chrom_blocks_to_plink(
     out_prefix: &str,
     scan: SelectedBimStreamScan,
     n_samples: usize,
+    ld_sample_indices: &[usize],
     window_bp: Option<i64>,
     window_variants: Option<usize>,
     step_variants: usize,
@@ -3436,10 +3494,10 @@ fn stream_prune_selected_chrom_blocks_to_plink(
         return Err("no selected chromosome blocks found in BIM".to_string());
     }
     let bytes_per_snp = (n_samples + 3) / 4;
-    let words = (n_samples + 63) / 64;
+    let words = ld_sample_indices.len().div_ceil(64);
     let mut word_masks = vec![u64::MAX; words];
     if words > 0 {
-        let rem = n_samples % 64;
+        let rem = ld_sample_indices.len() % 64;
         if rem != 0 {
             word_masks[words - 1] = (1u64 << rem) - 1u64;
         }
@@ -3459,6 +3517,7 @@ fn stream_prune_selected_chrom_blocks_to_plink(
                     block,
                     block_idx,
                     n_samples,
+                    ld_sample_indices,
                     bytes_per_snp,
                     window_bp,
                     window_variants,
@@ -3527,6 +3586,7 @@ fn stream_prune_plink_to_plink(
         && (window_bp.is_none() || scan.blocks.iter().all(|b| b.pos_sorted))
     {
         let n_samples = crate::gfcore::read_fam(src_prefix)?.len();
+        let ld_sample_indices = crate::gfcore::read_fam_founder_indices(src_prefix)?;
         if n_samples == 0 || total_snps == 0 {
             return Err("empty PLINK input (no samples or no SNPs)".to_string());
         }
@@ -3535,6 +3595,7 @@ fn stream_prune_plink_to_plink(
             out_prefix,
             scan,
             n_samples,
+            &ld_sample_indices,
             window_bp,
             window_variants,
             step_variants,
@@ -3555,6 +3616,7 @@ fn stream_prune_plink_to_plink(
     }
 
     let n_samples = crate::gfcore::read_fam(src_prefix)?.len();
+    let ld_sample_indices = crate::gfcore::read_fam_founder_indices(src_prefix)?;
     if n_samples == 0 || total_snps == 0 {
         return Err("empty PLINK input (no samples or no SNPs)".to_string());
     }
@@ -3602,8 +3664,11 @@ fn stream_prune_plink_to_plink(
     let byte_lut = packed_byte_lut();
     let pair_lut = packed_pair_lut();
     let code4_lut = &byte_lut.code4;
-    let denom = (n_samples.saturating_sub(1)).max(1) as f64;
-    let n_samples_f = n_samples as f64;
+    let ld_n_samples = ld_sample_indices.len();
+    let all_ld_samples = ld_sample_indices_are_all(&ld_sample_indices, n_samples);
+    let denom = (ld_n_samples.saturating_sub(1)).max(1) as f64;
+    let n_samples_f = ld_n_samples as f64;
+    let mut ld_row_buf = vec![0u8; ld_n_samples.div_ceil(4)];
     let eps = 1e-12_f64;
     let step = step_variants.max(1);
     let notify_step = if progress_every == 0 {
@@ -3612,10 +3677,10 @@ fn stream_prune_plink_to_plink(
         progress_every.max(1)
     };
     let mut last_notified = 0usize;
-    let words = (n_samples + 63) / 64;
+    let words = ld_n_samples.div_ceil(64);
     let mut word_masks = vec![u64::MAX; words];
     if words > 0 {
-        let rem = n_samples % 64;
+        let rem = ld_n_samples % 64;
         if rem != 0 {
             word_masks[words - 1] = (1u64 << rem) - 1u64;
         }
@@ -3699,18 +3764,24 @@ fn stream_prune_plink_to_plink(
                 .read_exact(&mut row_buf)
                 .map_err(|e| format!("{src_bed}: row {}: {}", row_idx + 1, e))?;
 
-            let current_stats = compute_packed_row_stats(&row_buf, n_samples, byte_lut);
+            let ld_row = if all_ld_samples {
+                row_buf.as_slice()
+            } else {
+                pack_plink_sample_subset(&row_buf, &ld_sample_indices, &mut ld_row_buf);
+                ld_row_buf.as_slice()
+            };
+            let current_stats = compute_packed_row_stats(ld_row, ld_n_samples, byte_lut);
             let (h_now, l_now, m_now, a_now, v_now) =
-                build_row_bitplanes_u64_with_aux(&row_buf, n_samples);
+                build_row_bitplanes_u64_with_aux(ld_row, ld_n_samples);
             let current_bit_h = Some(h_now);
             let current_bit_l = Some(l_now);
             let current_bit_m = Some(m_now);
             let current_bit_a = Some(a_now);
             let current_bit_v = Some(v_now);
 
-            let mut current_dropped = false;
+            let mut current_dropped = ld_prune_row_is_noninformative(current_stats, ld_n_samples);
             let mut drop_prior_ids: Vec<usize> = Vec::new();
-            if run_ld_compare {
+            if run_ld_compare && !current_dropped {
                 if let Some(active) = active_by_chrom.get(&chrom) {
                     let classify_prior = |prior: &StreamingPruneBufferedRow| -> Option<u8> {
                         let r2 = match (
@@ -3802,11 +3873,21 @@ fn stream_prune_plink_to_plink(
                                 }
                             }
                             _ => {
+                                let prior_ld_row = if prior.ld_packed.is_empty() {
+                                    prior.packed.as_slice()
+                                } else {
+                                    prior.ld_packed.as_slice()
+                                };
+                                let current_ld_row = if all_ld_samples {
+                                    row_buf.as_slice()
+                                } else {
+                                    ld_row_buf.as_slice()
+                                };
                                 if !prior.stats.has_missing && !current_stats.has_missing {
                                     let dot_imp = dot_nomiss_pair_from_packed(
-                                        &prior.packed,
-                                        &row_buf,
-                                        n_samples,
+                                        prior_ld_row,
+                                        current_ld_row,
+                                        ld_n_samples,
                                         pair_lut,
                                         code4_lut,
                                     );
@@ -3821,9 +3902,9 @@ fn stream_prune_plink_to_plink(
                                     corr * corr
                                 } else {
                                     r2_pairwise_complete_from_packed(
-                                        &prior.packed,
-                                        &row_buf,
-                                        n_samples,
+                                        prior_ld_row,
+                                        current_ld_row,
+                                        ld_n_samples,
                                         pair_lut,
                                         code4_lut,
                                     )
@@ -3910,6 +3991,7 @@ fn stream_prune_plink_to_plink(
                     chrom_seq: current_chrom_seq,
                     first_unchecked_seq: current_chrom_seq.saturating_add(1),
                     packed: Vec::new(),
+                    ld_packed: Vec::new(),
                     bim_line: String::new(),
                     stats: current_stats,
                     bit_h: None,
@@ -3929,6 +4011,13 @@ fn stream_prune_plink_to_plink(
                         row_buf.to_vec()
                     } else {
                         Vec::new()
+                    },
+                    ld_packed: if all_ld_samples && keep_output_payload {
+                        Vec::new()
+                    } else if all_ld_samples {
+                        row_buf.to_vec()
+                    } else {
+                        ld_row_buf.clone()
                     },
                     bim_line: if keep_output_payload {
                         bim_line_trimmed.to_string()
@@ -4020,9 +4109,15 @@ fn stream_prune_plink_to_plink(
                 .read_exact(&mut row_buf)
                 .map_err(|e| format!("{src_bed}: row {}: {}", row_idx + 1, e))?;
 
-            let current_stats = compute_packed_row_stats(&row_buf, n_samples, byte_lut);
+            let ld_row = if all_ld_samples {
+                row_buf.as_slice()
+            } else {
+                pack_plink_sample_subset(&row_buf, &ld_sample_indices, &mut ld_row_buf);
+                ld_row_buf.as_slice()
+            };
+            let current_stats = compute_packed_row_stats(ld_row, ld_n_samples, byte_lut);
             let (h_now, l_now, m_now, a_now, v_now) =
-                build_row_bitplanes_u64_with_aux(&row_buf, n_samples);
+                build_row_bitplanes_u64_with_aux(ld_row, ld_n_samples);
             let current_bit_h = Some(h_now);
             let current_bit_l = Some(l_now);
             let current_bit_m = Some(m_now);
@@ -4039,6 +4134,7 @@ fn stream_prune_plink_to_plink(
                 } else {
                     Vec::new()
                 },
+                ld_packed: Vec::new(),
                 bim_line: if keep_output_payload {
                     bim_line_trimmed.to_string()
                 } else {
@@ -4050,13 +4146,13 @@ fn stream_prune_plink_to_plink(
                 bit_m: current_bit_m,
                 bit_a: current_bit_a,
                 bit_v: current_bit_v,
-                dropped: false,
-                finalized: false,
+                dropped: ld_prune_row_is_noninformative(current_stats, ld_n_samples),
+                finalized: ld_prune_row_is_noninformative(current_stats, ld_n_samples),
             };
             let row_id = rows.len();
             rows.push(Some(stored_row));
 
-            {
+            if !ld_prune_row_is_noninformative(current_stats, ld_n_samples) {
                 let active = active_by_chrom.entry(chrom.clone()).or_default();
                 active.push_back(row_id);
             }
@@ -4380,7 +4476,8 @@ fn stream_prune_plink_to_plink(
     window_variants=None,
     step_variants=1,
     r2_threshold=0.2,
-    threads=0
+    threads=0,
+    founder_indices=None
 ))]
 pub fn bed_packed_ld_prune_maf_priority<'py>(
     py: Python<'py>,
@@ -4393,6 +4490,7 @@ pub fn bed_packed_ld_prune_maf_priority<'py>(
     step_variants: usize,
     r2_threshold: f64,
     threads: usize,
+    founder_indices: Option<PyReadonlyArray1<'py, i64>>,
 ) -> PyResult<Bound<'py, PyArray1<bool>>> {
     let packed_arr = packed.as_array();
     if packed_arr.ndim() != 2 {
@@ -4435,6 +4533,26 @@ pub fn bed_packed_ld_prune_maf_priority<'py>(
             "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps} for n_samples={n_samples}"
         )));
     }
+    let ld_sample_indices: Vec<usize> = if let Some(indices) = founder_indices {
+        let raw: Cow<[i64]> = match crate::stats_common::array_standard_slice(&indices) {
+            Ok(s) => Cow::Borrowed(s),
+            Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
+                &indices.as_array(),
+            )),
+        };
+        let mut parsed = Vec::with_capacity(raw.len());
+        for &idx in raw.iter() {
+            if idx < 0 || idx as u128 >= n_samples as u128 {
+                return Err(PyRuntimeError::new_err(format!(
+                    "founder sample index out of range: {idx} for n_samples={n_samples}"
+                )));
+            }
+            parsed.push(idx as usize);
+        }
+        parsed
+    } else {
+        (0..n_samples).collect()
+    };
     let chrom_vec: Cow<[i32]> = match crate::stats_common::array_standard_slice(&chrom_codes) {
         Ok(s) => Cow::Borrowed(s),
         Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
@@ -4472,6 +4590,7 @@ pub fn bed_packed_ld_prune_maf_priority<'py>(
                 m,
                 bytes_per_snp,
                 n_samples,
+                &ld_sample_indices,
                 &chrom_vec,
                 &pos_vec,
                 window_bp,
@@ -4568,6 +4687,8 @@ pub fn bed_prune_mask_to_plink_rust<'py>(
         let n_samples = crate::gfcore::read_fam(&src)
             .map_err(map_err_string_to_py)?
             .len();
+        let ld_sample_indices =
+            crate::gfcore::read_fam_founder_indices(&src).map_err(map_err_string_to_py)?;
         if n_samples == 0 {
             return Err(PyRuntimeError::new_err("empty PLINK input"));
         }
@@ -4578,6 +4699,7 @@ pub fn bed_prune_mask_to_plink_rust<'py>(
                     &out,
                     source_scan,
                     n_samples,
+                    &ld_sample_indices,
                     window_bp,
                     window_variants,
                     step_variants,
@@ -4596,6 +4718,8 @@ pub fn bed_prune_mask_to_plink_rust<'py>(
     let n_samples = crate::gfcore::read_fam(&src)
         .map_err(map_err_string_to_py)?
         .len();
+    let ld_sample_indices =
+        crate::gfcore::read_fam_founder_indices(&src).map_err(map_err_string_to_py)?;
     if n_samples == 0 {
         return Err(PyRuntimeError::new_err("empty PLINK input"));
     }
@@ -4606,6 +4730,7 @@ pub fn bed_prune_mask_to_plink_rust<'py>(
             source_scan,
             keep_vec,
             n_samples,
+            &ld_sample_indices,
             window_bp,
             window_variants,
             step_variants,
@@ -4704,6 +4829,8 @@ pub fn bed_prune_selected_to_plink_rust<'py>(
     let n_samples = crate::gfcore::read_fam(&src)
         .map_err(map_err_string_to_py)?
         .len();
+    let ld_sample_indices =
+        crate::gfcore::read_fam_founder_indices(&src).map_err(map_err_string_to_py)?;
     if n_samples == 0 || selected_scan.total_snps == 0 {
         return Err(PyRuntimeError::new_err(
             "empty PLINK input or no selected SNPs",
@@ -4716,6 +4843,7 @@ pub fn bed_prune_selected_to_plink_rust<'py>(
             &out,
             selected_scan,
             n_samples,
+            &ld_sample_indices,
             window_bp,
             window_variants,
             step_variants,
@@ -4814,6 +4942,9 @@ pub fn bed_prune_to_plink_rust(
         ));
     }
 
+    let ld_sample_indices =
+        crate::gfcore::read_fam_founder_indices(&src).map_err(map_err_string_to_py)?;
+
     let bed_payload = read_bed_payload(&src, n_samples, n_snps).map_err(map_err_string_to_py)?;
     let bytes_per_snp = (n_samples + 3) / 4;
 
@@ -4824,6 +4955,7 @@ pub fn bed_prune_to_plink_rust(
                 n_snps,
                 bytes_per_snp,
                 n_samples,
+                &ld_sample_indices,
                 &chrom_codes,
                 &positions,
                 window_bp,

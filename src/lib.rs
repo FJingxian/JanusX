@@ -284,9 +284,10 @@ use kmer::{
     kmer_resolve_inputs_py, kmerge_run_py, kstats_run_py, KfileChunkReader,
 };
 use ld::{
-    bed_ld_corr_rust, bed_ldblock_r2_rust, bed_packed_ld_prune_maf_priority,
-    bed_prune_mask_to_plink_rust, bed_prune_selected_to_plink_rust, bed_prune_to_plink_rust,
-    packed_prune_kernel_stats, scan_plink_selected_snp_indices_from_bim_rust,
+    bed_fam_founder_indices, bed_ld_corr_rust, bed_ldblock_r2_rust,
+    bed_packed_ld_prune_maf_priority, bed_prune_mask_to_plink_rust,
+    bed_prune_selected_to_plink_rust, bed_prune_to_plink_rust, packed_prune_kernel_stats,
+    scan_plink_selected_snp_indices_from_bim_rust,
 };
 use lm_trait::{lm_trait_assoc_bed_matrix_to_tsv, lm_trait_assoc_bed_to_tsv};
 use lmm::{
@@ -816,6 +817,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bed_packed_empirical_stats_subset_f64, m)?)?;
     m.add_function(wrap_pyfunction!(bed_stream_empirical_stats_f64, m)?)?;
     m.add_function(wrap_pyfunction!(bed_stream_empirical_stats_subset_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(bed_fam_founder_indices, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_ld_prune_maf_priority, m)?)?;
     m.add_function(wrap_pyfunction!(bed_ldblock_r2_rust, m)?)?;
     m.add_function(wrap_pyfunction!(bed_ld_corr_rust, m)?)?;

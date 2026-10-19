@@ -323,6 +323,41 @@ pub fn read_fam(prefix: &str) -> Result<Vec<String>, String> {
     Ok(samples)
 }
 
+/// Return sample indices which PLINK treats as founders for LD calculations.
+///
+/// A sample is a founder when both parental IDs are missing in the FAM file.
+pub fn read_fam_founder_indices(prefix: &str) -> Result<Vec<usize>, String> {
+    let fam_path = format!("{prefix}.fam");
+    let file = File::open(&fam_path).map_err(|e| format!("{fam_path}: {e}"))?;
+    let reader = BufReader::new(file);
+    let mut founder_indices = Vec::new();
+    let mut sample_idx = 0usize;
+    for (line_idx, line) in reader.lines().enumerate() {
+        let line = line.map_err(|e| format!("{fam_path}:{}: {e}", line_idx + 1))?;
+        let mut fields = line.split_whitespace();
+        let _fid = fields.next();
+        let iid = fields.next();
+        let father = fields.next();
+        let mother = fields.next();
+        if iid.is_none() || father.is_none() || mother.is_none() {
+            return Err(format!(
+                "Malformed FAM line {} (expected FID IID PID MID): {line}",
+                line_idx + 1
+            ));
+        }
+        let father_missing = father == Some("0");
+        let mother_missing = mother == Some("0");
+        if father_missing && mother_missing {
+            founder_indices.push(sample_idx);
+        }
+        sample_idx = sample_idx.saturating_add(1);
+    }
+    if sample_idx == 0 {
+        return Err(format!("FAM contains zero samples: {fam_path}"));
+    }
+    Ok(founder_indices)
+}
+
 #[inline]
 fn count_fam_samples(prefix: &str) -> Result<usize, String> {
     let fam_path = format!("{prefix}.fam");

@@ -148,7 +148,7 @@ fn popcount_packed(bits: &[u64], n_words: usize, tail_mask: u64) -> usize {
 
 /// Sum of y at bit-1 positions in `bits[0..n_words]`.
 ///
-/// Uses the same "pick the sparser side" strategy as the Metal kernel:
+/// Chooses the sparser side of each pair to reduce the bitwise work:
 ///   - popcount ≤ 32 → traverse 1s via ctz
 ///   - popcount > 32 → traverse 0s, subtract from `y_word_sums[w]`
 #[inline]

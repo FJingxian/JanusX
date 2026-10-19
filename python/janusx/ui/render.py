@@ -1001,7 +1001,7 @@ def _load_table(path: Path) -> tuple[pd.DataFrame, dict[str, str]]:
             kwargs["sep"] = ","
             kwargs["engine"] = "c"
         else:
-            kwargs["delim_whitespace"] = True
+            kwargs["sep"] = r"\s+"
             kwargs["engine"] = "c"
         return pd.read_csv(p, **kwargs)
 
@@ -1574,7 +1574,7 @@ def _estimate_n_from_phenofile(phenofile: str) -> int | None:
             kwargs["sep"] = ","
             kwargs["engine"] = "c"
         else:
-            kwargs["delim_whitespace"] = True
+            kwargs["sep"] = r"\s+"
             kwargs["engine"] = "c"
         ids = pd.read_csv(path, **kwargs).iloc[:, 0].astype(str)
         ids = ids[ids.str.strip() != ""]

@@ -2854,7 +2854,7 @@ def load_phenotype(
                 kwargs["sep"] = ","
                 kwargs["engine"] = "c"
             else:
-                kwargs["delim_whitespace"] = True
+                kwargs["sep"] = r"\s+"
                 kwargs["engine"] = "c"
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")

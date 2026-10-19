@@ -4949,34 +4949,56 @@ def _build_rrblup_standardized_grm_once(
     block_mb = float(os.getenv("JX_RRBLUP_STD_GRM_BLOCK_MB", "128").strip() or "128")
     if (not np.isfinite(block_mb)) or (block_mb <= 0.0):
         block_mb = 128.0
-    row_bytes = max(1, n) * np.dtype(np.float32).itemsize
+    # The native DSYRK accumulator keeps one float64 decode block, so size the
+    # marker batch against that actual allocation rather than the old f32
+    # decode plus a separate NumPy f64 copy.
+    row_bytes = max(1, n) * np.dtype(np.float64).itemsize
     block_rows_budget = int(max(1, (block_mb * 1024.0 * 1024.0) // float(row_bytes)))
     block_rows = int(max(1, min(m, block_rows_cfg, block_rows_budget)))
+    if _jxrs is None or not hasattr(_jxrs, "rrblup_standardized_grm_from_source"):
+        raise RuntimeError(
+            "Rust rrBLUP standardized GRM backend is unavailable. Rebuild/install JanusX extension."
+        )
 
-    grm = np.zeros((n, n), dtype=np.float64)
-    for st in range(0, m, block_rows):
-        ed = min(st + block_rows, m)
-        good = np.flatnonzero(
-            np.asarray(row_inv_sd[st:ed], dtype=np.float32).reshape(-1) > 0.0
-        )
-        if int(good.size) <= 0:
-            continue
-        ridx = np.ascontiguousarray(
-            np.asarray(st + good, dtype=np.int64).reshape(-1),
-            dtype=np.int64,
-        )
-        x_blk = _decode_packed_block_standardized(
-            packed_ctx=packed_ctx,
-            row_idx=ridx,
-            sample_indices=sample_idx,
-            row_mean=row_mean,
-            row_inv_sd=row_inv_sd,
-        )
-        x64 = np.ascontiguousarray(np.asarray(x_blk, dtype=np.float64), dtype=np.float64)
-        grm += x64.T @ x64
+    active_rows = np.arange(m, dtype=np.int64)
+    row_indices, row_flip, row_maf, _ = _resolve_packed_decode_rows_and_metadata(
+        packed_ctx,
+        active_rows,
+    )
+    packed_raw = packed_ctx.get("packed", None)
+    packed_payload = None
+    source_prefix = None
+    if packed_raw is not None:
+        packed_payload = np.asarray(packed_raw, dtype=np.uint8)
+        if not packed_payload.flags.c_contiguous:
+            packed_payload = np.ascontiguousarray(packed_payload, dtype=np.uint8)
+    else:
+        source_prefix_raw = packed_ctx.get("source_prefix", None)
+        if source_prefix_raw is None or str(source_prefix_raw).strip() == "":
+            raise ValueError(
+                "rrBLUP standardized GRM requires packed BED data or a source_prefix."
+            )
+        source_prefix = str(source_prefix_raw)
 
-    grm *= 1.0 / float(m_effective)
-    grm = 0.5 * (grm + grm.T)
+    grm_raw = _jxrs.rrblup_standardized_grm_from_source(
+        row_indices,
+        row_flip,
+        row_maf,
+        np.ascontiguousarray(np.asarray(row_mean, dtype=np.float32).reshape(-1)),
+        np.ascontiguousarray(np.asarray(row_inv_sd, dtype=np.float32).reshape(-1)),
+        sample_idx,
+        int(packed_ctx["n_samples"]),
+        prefix=source_prefix,
+        packed=packed_payload,
+        block_rows=int(block_rows),
+        threads=max(1, int(n_jobs)),
+        blas_threads=max(1, int(n_jobs)),
+    )
+    grm = np.asarray(grm_raw, dtype=np.float64)
+    if grm.shape != (n, n):
+        raise ValueError(
+            f"rrBLUP standardized GRM backend returned shape={grm.shape}; expected {(n, n)}."
+        )
     return np.ascontiguousarray(grm, dtype=np.float64)
 
 
@@ -6212,8 +6234,17 @@ def _estimate_rrblup_lambda_subsample_reml(
         )
 
     he_enable = _cfg_truthy(cfg_use.get("he_enable", "on"), default=True)
+    # Select the estimator before doing expensive work. Small-sample
+    # ``he_first`` runs are routed to full GRM+REML below, so an HE estimate
+    # would be discarded; ``reml_first`` likewise must not precompute HE.
+    he_selected_by_strategy = lambda_auto_strategy in {"he_first", "he_only"}
+    he_redundant_for_small_sample = bool(
+        lambda_auto_strategy == "he_first" and small_sample_force_grm_reml
+    )
     can_try_he = bool(
         he_enable
+        and he_selected_by_strategy
+        and not he_redundant_for_small_sample
         and (_jxrs is not None)
         and hasattr(_jxrs, "he_pcg_bed")
         and _looks_like_packed_ctx(packed_ctx)

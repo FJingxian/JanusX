@@ -42,8 +42,8 @@ use crate::bedmath::{
 };
 use crate::blas::{
     cblas_dgemm_dispatch, cblas_dsyrk_dispatch, cblas_sgemm_dispatch,
-    rust_sgemm_prefers_rayon_rowmajor_f32_kernel, CblasInt, OpenBlasThreadGuard, CBLAS_COL_MAJOR,
-    CBLAS_NO_TRANS, CBLAS_ROW_MAJOR, CBLAS_TRANS, CBLAS_UPPER,
+    rust_sgemm_prefers_rayon_rowmajor_f32_kernel, BlasThreadGuard, CblasInt, OpenBlasThreadGuard,
+    CBLAS_COL_MAJOR, CBLAS_NO_TRANS, CBLAS_ROW_MAJOR, CBLAS_TRANS, CBLAS_UPPER,
 };
 use crate::brent::brent_minimize;
 use crate::decode::decode_prepared_additive_block_packed_f32;
@@ -4158,6 +4158,340 @@ pub fn rrblup_pcg_bed<'py>(
     ))
 }
 
+/// Build the rrBLUP standardized sample GRM from packed BED data using the
+/// same per-marker means/scales as the marker-space operator. The dense
+/// accumulation is performed through JanusX's selected Rust BLAS backend
+/// (Accelerate on macOS, OpenBLAS where available elsewhere).
+#[pyfunction]
+#[pyo3(signature = (
+    row_indices,
+    row_flip,
+    row_maf,
+    row_mean,
+    row_inv_sd,
+    sample_indices,
+    n_samples,
+    prefix=None,
+    packed=None,
+    block_rows=4096,
+    threads=0,
+    blas_threads=0
+))]
+pub fn rrblup_standardized_grm_from_source<'py>(
+    py: Python<'py>,
+    row_indices: PyReadonlyArray1<'py, i64>,
+    row_flip: PyReadonlyArray1<'py, bool>,
+    row_maf: PyReadonlyArray1<'py, f32>,
+    row_mean: PyReadonlyArray1<'py, f32>,
+    row_inv_sd: PyReadonlyArray1<'py, f32>,
+    sample_indices: PyReadonlyArray1<'py, i64>,
+    n_samples: usize,
+    prefix: Option<String>,
+    packed: Option<PyReadonlyArray2<'py, u8>>,
+    block_rows: usize,
+    threads: usize,
+    blas_threads: usize,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    if n_samples == 0 {
+        return Err(PyRuntimeError::new_err("n_samples must be > 0."));
+    }
+    if prefix.as_deref().map(str::trim).unwrap_or("").is_empty() == packed.is_none() {
+        return Err(PyRuntimeError::new_err(
+            "Provide exactly one of `prefix` or `packed` to build the rrBLUP GRM.",
+        ));
+    }
+
+    let row_indices_vec = parse_nonnegative_index_vec_i64(row_indices.as_slice()?, "row_indices")
+        .map_err(PyRuntimeError::new_err)?;
+    if row_indices_vec.is_empty() {
+        return Err(PyRuntimeError::new_err("row_indices must not be empty."));
+    }
+    let to_vec_f32 = |values: &PyReadonlyArray1<'py, f32>| -> Vec<f32> {
+        match crate::stats_common::array_standard_slice(values) {
+            Ok(slice) => slice.to_vec(),
+            Err(_) => crate::stats_common::copy_array_standard_layout(&values.as_array()),
+        }
+    };
+    let row_flip_vec = match crate::stats_common::array_standard_slice(&row_flip) {
+        Ok(slice) => slice.to_vec(),
+        Err(_) => crate::stats_common::copy_array_standard_layout(&row_flip.as_array()),
+    };
+    let row_maf_vec = to_vec_f32(&row_maf);
+    let row_mean_vec = to_vec_f32(&row_mean);
+    let row_inv_sd_vec = to_vec_f32(&row_inv_sd);
+    let m = row_indices_vec.len();
+    if row_flip_vec.len() != m
+        || row_maf_vec.len() != m
+        || row_mean_vec.len() != m
+        || row_inv_sd_vec.len() != m
+    {
+        return Err(PyRuntimeError::new_err(format!(
+            "rrBLUP GRM row metadata length mismatch: indices={m}, flip={}, maf={}, mean={}, inv_sd={}",
+            row_flip_vec.len(),
+            row_maf_vec.len(),
+            row_mean_vec.len(),
+            row_inv_sd_vec.len(),
+        )));
+    }
+    let sample_idx = parse_index_vec_i64(sample_indices.as_slice()?, n_samples, "sample_indices")?;
+    if sample_idx.is_empty() {
+        return Err(PyRuntimeError::new_err("sample_indices must not be empty."));
+    }
+
+    let packed_ro = packed;
+    let mut packed_bytes_per_row = n_samples.div_ceil(4);
+    let resident_packed: Option<Cow<[u8]>> = if let Some(packed_view) = packed_ro.as_ref() {
+        let arr = packed_view.as_array();
+        if arr.ndim() != 2 {
+            return Err(PyRuntimeError::new_err(
+                "packed BED payload must be 2D (m, bytes_per_snp).",
+            ));
+        }
+        packed_bytes_per_row = arr.shape()[1];
+        if packed_bytes_per_row != n_samples.div_ceil(4) {
+            return Err(PyRuntimeError::new_err(format!(
+                "packed BED row width mismatch: got {packed_bytes_per_row}, expected {}.",
+                n_samples.div_ceil(4),
+            )));
+        }
+        if row_indices_vec.iter().any(|&i| i >= arr.shape()[0]) {
+            return Err(PyRuntimeError::new_err(
+                "row_indices contain an index outside the packed BED payload.",
+            ));
+        }
+        Some(
+            match crate::stats_common::array_standard_slice(packed_view) {
+                Ok(slice) => Cow::Borrowed(slice),
+                Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&arr)),
+            },
+        )
+    } else {
+        None
+    };
+
+    let source_prefix = prefix.unwrap_or_default();
+    let effective_rows: Vec<usize> = row_inv_sd_vec
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &inv)| {
+            if inv.is_finite() && inv > 0.0 {
+                Some(i)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let m_effective = effective_rows.len();
+    if m_effective == 0 {
+        return Err(PyRuntimeError::new_err(
+            "rrBLUP GRM build found zero effective markers.",
+        ));
+    }
+    let row_step = block_rows.max(1).min(m_effective);
+    let n_out = sample_idx.len();
+    let blas_threads_use = if blas_threads > 0 {
+        blas_threads
+    } else if threads > 0 {
+        threads
+    } else {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+    };
+
+    let grm_vec = py
+        .detach(move || -> Result<Vec<f64>, String> {
+            let mut matrix = if resident_packed.is_none() {
+                let window_mb = rrblup_stream_window_mb(n_samples, row_step);
+                let matrix = WindowedBedMatrix::open(&source_prefix, window_mb)?;
+                if matrix.n_samples_full() != n_samples {
+                    return Err(format!(
+                        "rrBLUP GRM sample count mismatch: BED has {}, metadata says {n_samples}.",
+                        matrix.n_samples_full()
+                    ));
+                }
+                if row_indices_vec.iter().any(|&i| i >= matrix.n_source_snps()) {
+                    return Err("row_indices contain an index outside the BED input.".to_string());
+                }
+                Some(matrix)
+            } else {
+                None
+            };
+            let pool_owned = get_cached_pool(threads).map_err(|e| e.to_string())?;
+            let pool = pool_owned.as_ref();
+            let _blas_guard = BlasThreadGuard::enter(blas_threads_use);
+            let n = n_out;
+            let grm_len = n
+                .checked_mul(n)
+                .ok_or_else(|| "rrBLUP GRM dimensions overflow address space.".to_string())?;
+            let block_len = row_step
+                .checked_mul(n)
+                .ok_or_else(|| "rrBLUP GRM block dimensions overflow address space.".to_string())?;
+            let mut grm = vec![0.0_f64; grm_len];
+            let mut block = vec![0.0_f64; block_len];
+            let mut source_rows = Vec::with_capacity(row_step);
+            let mut relative_rows = Vec::with_capacity(row_step);
+            for start in (0..m_effective).step_by(row_step) {
+                let end = (start + row_step).min(m_effective);
+                let cur_rows = end - start;
+                source_rows.clear();
+                source_rows.extend(
+                    effective_rows[start..end]
+                        .iter()
+                        .map(|&meta_idx| row_indices_vec[meta_idx]),
+                );
+                relative_rows.clear();
+                let packed_slice = if let Some(resident) = resident_packed.as_ref() {
+                    relative_rows.extend_from_slice(source_rows.as_slice());
+                    resident.as_ref()
+                } else {
+                    matrix
+                        .as_mut()
+                        .expect("streamed BED matrix was initialized")
+                        .prepare_source_rows(source_rows.as_slice(), &mut relative_rows)?
+                };
+                let block_slice = &mut block[..cur_rows * n];
+                decode_rrblup_grm_block_f64(
+                    packed_slice,
+                    packed_bytes_per_row,
+                    n_samples,
+                    relative_rows.as_slice(),
+                    &effective_rows[start..end],
+                    row_flip_vec.as_slice(),
+                    row_maf_vec.as_slice(),
+                    row_mean_vec.as_slice(),
+                    row_inv_sd_vec.as_slice(),
+                    sample_idx.as_slice(),
+                    block_slice,
+                    pool,
+                )?;
+                accumulate_rrblup_grm_syrk(block_slice, cur_rows, n, grm.as_mut_slice());
+                check_ctrlc().map_err(|e| e.to_string())?;
+            }
+
+            scale_and_mirror_rrblup_grm(&mut grm, n, 1.0_f64 / m_effective as f64);
+            Ok(grm)
+        })
+        .map_err(map_err_string_to_py)?;
+
+    let n = n_out;
+    let grm_arr = PyArray2::from_owned_array(
+        py,
+        Array2::from_shape_vec((n, n), grm_vec)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+    )
+    .into_bound();
+    Ok(grm_arr)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_rrblup_grm_block_f64(
+    packed: &[u8],
+    bytes_per_snp: usize,
+    n_samples: usize,
+    relative_rows: &[usize],
+    metadata_rows: &[usize],
+    row_flip: &[bool],
+    row_maf: &[f32],
+    row_mean: &[f32],
+    row_inv_sd: &[f32],
+    sample_idx: &[usize],
+    out: &mut [f64],
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Result<(), String> {
+    let n_out = sample_idx.len();
+    let n_rows = relative_rows.len();
+    if n_out == 0 || n_rows == 0 {
+        return Ok(());
+    }
+    if metadata_rows.len() != n_rows || out.len() != n_rows.saturating_mul(n_out) {
+        return Err("rrBLUP GRM decoded block dimensions are inconsistent.".to_string());
+    }
+    if bytes_per_snp < n_samples.div_ceil(4)
+        || relative_rows
+            .iter()
+            .any(|&row| row >= packed.len().saturating_div(bytes_per_snp.max(1)))
+    {
+        return Err("rrBLUP GRM BED row storage is truncated.".to_string());
+    }
+
+    let mut decode = || {
+        out.par_chunks_mut(n_out)
+            .enumerate()
+            .for_each(|(local_row, output)| {
+                let meta = metadata_rows[local_row];
+                let packed_row = relative_rows[local_row];
+                let row = &packed[packed_row * bytes_per_snp..(packed_row + 1) * bytes_per_snp];
+                let mean = row_mean[meta];
+                let inv_sd = row_inv_sd[meta];
+                let missing_mean = (2.0_f32 * row_maf[meta]).max(0.0_f32);
+                let flip = row_flip[meta];
+                let value_lut = if flip {
+                    [
+                        (2.0_f32 - mean) * inv_sd,
+                        (missing_mean - mean) * inv_sd,
+                        (1.0_f32 - mean) * inv_sd,
+                        (0.0_f32 - mean) * inv_sd,
+                    ]
+                } else {
+                    [
+                        (0.0_f32 - mean) * inv_sd,
+                        (missing_mean - mean) * inv_sd,
+                        (1.0_f32 - mean) * inv_sd,
+                        (2.0_f32 - mean) * inv_sd,
+                    ]
+                };
+                for (dst, &sample) in output.iter_mut().zip(sample_idx.iter()) {
+                    let byte = row[sample >> 2];
+                    let code = ((byte >> ((sample & 3) * 2)) & 0b11) as usize;
+                    *dst = value_lut[code] as f64;
+                }
+            });
+    };
+    if let Some(tp) = pool {
+        tp.install(decode);
+    } else {
+        decode();
+    }
+    Ok(())
+}
+
+#[inline]
+fn accumulate_rrblup_grm_syrk(block: &[f64], block_rows: usize, n_samples: usize, grm: &mut [f64]) {
+    unsafe {
+        cblas_dsyrk_dispatch(
+            CBLAS_COL_MAJOR,
+            CBLAS_UPPER,
+            CBLAS_NO_TRANS,
+            n_samples as CblasInt,
+            block_rows as CblasInt,
+            1.0_f64,
+            block.as_ptr(),
+            n_samples as CblasInt,
+            1.0_f64,
+            grm.as_mut_ptr(),
+            n_samples as CblasInt,
+        );
+    }
+}
+
+#[inline]
+fn scale_and_mirror_rrblup_grm(grm: &mut [f64], n: usize, scale: f64) {
+    debug_assert_eq!(grm.len(), n.saturating_mul(n));
+    // DSYRK wrote the upper triangle in column-major view, which is the lower
+    // triangle of this row-major buffer. Mirror it without a dense temporary.
+    for col in 0..n {
+        grm[col * n + col] *= scale;
+        for row in 0..col {
+            let lower_idx = col * n + row;
+            let upper_idx = row * n + col;
+            let value = grm[lower_idx] * scale;
+            grm[lower_idx] = value;
+            grm[upper_idx] = value;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4242,5 +4576,42 @@ mod tests {
         assert!(max_abs_diff(&b_serial, &b_parallel) <= 1e-6_f32);
         assert!(max_abs_diff(&diag_serial, &diag_parallel) <= 1e-6_f32);
         assert!(max_abs_diff(&mean_serial, &mean_parallel) <= 1e-6_f32);
+    }
+
+    #[test]
+    fn rrblup_grm_block_preserves_flip_missing_and_empirical_stats() {
+        // PLINK two-bit order for four samples: 0, missing, 1, 2.
+        let packed = [0b11_10_01_00_u8];
+        let mut decoded = [0.0_f64; 4];
+        decode_rrblup_grm_block_f64(
+            &packed,
+            1,
+            4,
+            &[0],
+            &[0],
+            &[true],
+            &[0.25],
+            &[0.5],
+            &[2.0],
+            &[0, 1, 2, 3],
+            &mut decoded,
+            None,
+        )
+        .expect("decode standardized row");
+        assert_eq!(decoded, [3.0, 0.0, 1.0, -1.0]);
+    }
+
+    #[test]
+    fn rrblup_grm_syrk_accumulates_and_mirrors_in_place() {
+        // Three marker rows by two samples. The row-major buffer can be viewed
+        // as a column-major 2x3 matrix, so DSYRK forms X'X directly.
+        let block = [1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let mut grm = [0.0_f64; 4];
+        accumulate_rrblup_grm_syrk(&block, 3, 2, &mut grm);
+        scale_and_mirror_rrblup_grm(&mut grm, 2, 1.0 / 3.0);
+        let expected = [35.0 / 3.0, 44.0 / 3.0, 44.0 / 3.0, 56.0 / 3.0];
+        for (observed, expected) in grm.iter().zip(expected) {
+            assert!((observed - expected).abs() < 1e-12);
+        }
     }
 }

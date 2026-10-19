@@ -820,12 +820,22 @@ fn write_bim_site_line_with_flip(
     } else {
         (&site.ref_allele, &site.alt_allele)
     };
-    writeln!(
-        w,
-        "{}\t{}_{}\t0\t{}\t{}\t{}",
-        site.chrom, site.chrom, site.pos, site.pos, ref_allele, alt_allele
-    )
-    .map_err(|e| e.to_string())
+    let snp_id = site.snp.trim();
+    if snp_id.is_empty() || snp_id == "." {
+        writeln!(
+            w,
+            "{}\t{}_{}\t0\t{}\t{}\t{}",
+            site.chrom, site.chrom, site.pos, site.pos, ref_allele, alt_allele
+        )
+        .map_err(|e| e.to_string())
+    } else {
+        writeln!(
+            w,
+            "{}\t{}\t0\t{}\t{}\t{}",
+            site.chrom, snp_id, site.pos, ref_allele, alt_allele
+        )
+        .map_err(|e| e.to_string())
+    }
 }
 
 #[inline]

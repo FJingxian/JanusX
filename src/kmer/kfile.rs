@@ -533,6 +533,7 @@ fn full_bitset_presence(row: &[u8], n_samples: usize) -> usize {
 /// arbitrary sample subsets continue to use the grouped scalar decoder.  The
 /// function is kept separate so tests and the GRM decoder can verify the fast
 /// path against the scalar reference directly.
+#[cfg(test)]
 pub(crate) fn decode_centered_row_full_identity_simd(
     packed_row: &[u8],
     n_samples: usize,
@@ -687,6 +688,7 @@ pub(crate) fn prepare_grm_bsite_block(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn decode_grm_prepared_block_into(
     block: &KfileGrmPreparedBlock,
     sample_indices: &[usize],

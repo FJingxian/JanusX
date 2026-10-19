@@ -307,6 +307,7 @@ const BAYES_RHAT_MIN_KEEP: usize = BAYES_RHAT_WINDOW;
 const BAYES_RHAT_CHECK_EVERY: usize = 50;
 const BAYES_RHAT_STABLE_CHECKS: usize = 3;
 const BAYES_MAX_POSTERIOR_RESTARTS: usize = 1;
+#[cfg(test)]
 pub(crate) const BAYES_POSTERIOR_SAMPLES: usize = 1000;
 
 // BayesA/B use marker-specific latent variances.  Their mean `var_b` is an
@@ -733,6 +734,7 @@ pub(crate) struct BayesSamplingController {
 }
 
 impl BayesSamplingController {
+    #[cfg(test)]
     pub(crate) fn new(
         n_iter: usize,
         burnin: Option<usize>,
@@ -950,6 +952,7 @@ pub(crate) struct BayesMultiChainController {
 }
 
 impl BayesMultiChainController {
+    #[cfg(test)]
     pub(crate) fn new(
         chains: usize,
         n_iter: usize,
@@ -960,6 +963,7 @@ impl BayesMultiChainController {
         Self::new_with_monitor(chains, n_iter, burnin, thin, rhat_names, rhat_names)
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_monitor(
         chains: usize,
         n_iter: usize,
@@ -1163,6 +1167,7 @@ impl BayesMultiChainController {
 
     /// Observe one synchronized retained sample. Returns true when model
     /// accumulators must be cleared before the next iteration.
+    #[cfg(test)]
     pub(crate) fn observe(&mut self, values: &[Vec<f64>], retained: bool) -> Result<bool, String> {
         self.observe_with_monitor(values, values, retained)
     }

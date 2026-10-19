@@ -5017,6 +5017,7 @@ fn collect_bed_interval_candidate_rows_and_snp_flags_local(
 enum BedCandidateSites<'a> {
     Borrowed(&'a [core::SiteInfo]),
     CompactMax6NoRetain(&'a CompactMax6SiteMetadata),
+    #[cfg(test)]
     Owned(Vec<core::SiteInfo>),
 }
 
@@ -5025,6 +5026,7 @@ impl BedCandidateSites<'_> {
         match self {
             Self::Borrowed(sites) => sites.len(),
             Self::CompactMax6NoRetain(sites) => sites.len(),
+            #[cfg(test)]
             Self::Owned(sites) => sites.len(),
         }
     }
@@ -5039,6 +5041,7 @@ impl BedCandidateSites<'_> {
                 let site = sites.fields(index)?;
                 Some((site.ref_allele, site.alt_allele))
             }
+            #[cfg(test)]
             Self::Owned(sites) => {
                 let site = sites.get(index)?;
                 Some((site.ref_allele.as_str(), site.alt_allele.as_str()))
@@ -5069,6 +5072,7 @@ fn prepare_bed_logic_meta_owned_for_candidate_rows_pure_line(
     )
 }
 
+#[cfg(test)]
 fn prepare_bed_logic_meta_owned_for_candidate_rows_pure_line_owned(
     prefix: &str,
     maf_threshold: f32,
@@ -5297,6 +5301,7 @@ fn prepare_bed_logic_meta_owned_for_candidate_rows_pure_line_impl(
                     .then(|| site.clone())
             })
             .collect(),
+        #[cfg(test)]
         BedCandidateSites::Owned(mut sites) => {
             let mut index = 0usize;
             sites.retain(|_| {
@@ -5322,6 +5327,7 @@ fn prepare_bed_logic_meta_owned_for_candidate_rows_pure_line_impl(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn prepare_bed_logic_meta_owned_for_source_rows_pure_line(
     prefix: &str,
     maf_threshold: f32,

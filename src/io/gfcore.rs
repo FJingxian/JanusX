@@ -2511,38 +2511,6 @@ impl BedSnpIter {
         Some(self.decode_snp_bytes_into_with_stats(snp_bytes, out))
     }
 
-    /// Decode one SNP for an arbitrary sample subset without requiring BIM
-    /// metadata to be resident in this iterator.  This is used by the
-    /// persistent packed-BED dosage reader, which keeps a compact BIM index
-    /// separately from the bounded BED mmap.
-    pub(crate) fn decode_snp_selected_raw_into_with_counts_at(
-        &self,
-        snp_idx: usize,
-        sample_indices: &[usize],
-        out: &mut [f32],
-    ) -> Option<DecodedSnpRowCounts> {
-        if snp_idx >= self.n_snps || out.len() < sample_indices.len() {
-            return None;
-        }
-        if sample_indices.iter().any(|&idx| idx >= self.n_samples) {
-            return None;
-        }
-        let snp_bytes = self.snp_bytes(snp_idx)?;
-        // The full-row decoder writes samples in BED/FAM order.  It is only
-        // valid for the identity selection; a caller may request all samples
-        // in an arbitrary order, in which case the selected decoder must
-        // preserve that requested order.
-        let identity_selection = sample_indices
-            .iter()
-            .enumerate()
-            .all(|(selected, &source)| selected == source);
-        if sample_indices.len() == self.n_samples && identity_selection {
-            Some(self.decode_snp_bytes_into_with_counts(snp_bytes, out))
-        } else {
-            Some(self.decode_snp_bytes_selected_into_with_counts(snp_bytes, sample_indices, out))
-        }
-    }
-
     fn decode_snp_row_raw(&self, snp_idx: usize) -> Option<(Vec<f32>, SiteInfo)> {
         if snp_idx >= self.n_snps {
             return None;

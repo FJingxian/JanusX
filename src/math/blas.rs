@@ -1910,8 +1910,15 @@ pub(crate) unsafe fn cblas_dtrsm_dispatch(
         return;
     }
     #[cfg(any(
-        target_os = "windows",
-        all(target_os = "linux", not(jx_blas_available))
+        all(
+            target_os = "windows",
+            not(all(feature = "blas-openblas", jx_openblas_available))
+        ),
+        all(
+            target_os = "linux",
+            not(jx_blas_available),
+            not(all(feature = "blas-openblas", jx_openblas_available))
+        )
     ))]
     {
         cblas_dtrsm_rust(order, side, uplo, transa, diag, m, n, alpha, a, lda, b, ldb);

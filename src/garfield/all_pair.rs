@@ -262,6 +262,7 @@ fn validate_scan_inputs(
 /// The historical API keeps XOR disabled; callers that need the optional
 /// canonical XOR gate should use
 /// [`scan_all_pairs_continuous_packed_with_parallel_and_xor`].
+#[cfg(test)]
 pub(crate) fn scan_all_pairs_continuous_packed(
     bits_flat: &[u64],
     row_words: usize,
@@ -279,6 +280,7 @@ pub(crate) fn scan_all_pairs_continuous_packed(
 /// When many windows already run in parallel, callers pass `false` and let
 /// the outer scheduler provide the parallelism; standalone callers retain
 /// the historical parallel default through [`scan_all_pairs_continuous_packed`].
+#[cfg(test)]
 pub(crate) fn scan_all_pairs_continuous_packed_with_parallel(
     bits_flat: &[u64],
     row_words: usize,

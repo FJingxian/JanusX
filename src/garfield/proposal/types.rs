@@ -4,8 +4,6 @@ use std::collections::BTreeMap;
 pub(crate) enum ProposalChannelId {
     Corr,
     Rf,
-    IrfRit,
-    DwpLssfindInspired,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
@@ -14,17 +12,13 @@ pub(crate) struct SourceMask(u8);
 impl SourceMask {
     pub(crate) const CORR: Self = Self(1 << 0);
     pub(crate) const RF: Self = Self(1 << 1);
-    pub(crate) const IRF_RIT: Self = Self(1 << 2);
-    pub(crate) const DWP_LSSFIND_INSPIRED: Self = Self(1 << 3);
 
-    pub(crate) const fn empty() -> Self {
-        Self(0)
-    }
-
+    #[cfg(test)]
     pub(crate) const fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
     }
 
+    #[cfg(test)]
     pub(crate) const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
@@ -35,8 +29,6 @@ impl From<ProposalChannelId> for SourceMask {
         match channel {
             ProposalChannelId::Corr => Self::CORR,
             ProposalChannelId::Rf => Self::RF,
-            ProposalChannelId::IrfRit => Self::IRF_RIT,
-            ProposalChannelId::DwpLssfindInspired => Self::DWP_LSSFIND_INSPIRED,
         }
     }
 }
@@ -45,10 +37,12 @@ impl From<ProposalChannelId> for SourceMask {
 pub(crate) struct SiteSetKey(Vec<usize>);
 
 impl SiteSetKey {
+    #[cfg(test)]
     pub(crate) fn new<const N: usize>(ids: [usize; N]) -> Self {
         Self::from_iter(ids)
     }
 
+    #[cfg(test)]
     pub(crate) fn from_iter<I>(ids: I) -> Self
     where
         I: IntoIterator<Item = usize>,
@@ -58,15 +52,10 @@ impl SiteSetKey {
         ids.dedup();
         Self(ids)
     }
-
-    pub(crate) fn as_slice(&self) -> &[usize] {
-        self.0.as_slice()
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum ChannelEvidence {
-    None,
     Corr {
         score: f64,
     },
@@ -108,6 +97,7 @@ pub(crate) struct ChannelProposalBatch {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum PairSeedReason {
     ExactRank,
+    #[cfg(test)]
     ProposalRescue,
 }
 
@@ -151,24 +141,6 @@ pub(crate) struct ProposalContext<'a> {
     pub(crate) ld_r2: f64,
     pub(crate) max_order: usize,
     pub(crate) replicate_seed: u64,
-    pub(crate) replicate_id: usize,
-    pub(crate) is_null: bool,
-    pub(crate) provenance_token: u64,
-}
-
-impl ProposalContext<'_> {
-    pub(crate) fn cache_key(&self) -> u64 {
-        let mut key = self.provenance_token ^ self.replicate_seed.rotate_left(17);
-        key ^= (self.replicate_id as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        key ^= u64::from(self.is_null).wrapping_mul(0xD1B5_4A32_D192_ED03);
-        for byte in self.window_id.as_bytes() {
-            key = key.rotate_left(5) ^ u64::from(*byte);
-        }
-        for marker_id in self.marker_ids {
-            key = key.rotate_left(7) ^ (*marker_id as u64).wrapping_add(0xA24B_AED4_963E_E407);
-        }
-        key
-    }
 }
 
 pub(crate) trait ProposalChannel: Send + Sync {
@@ -220,9 +192,6 @@ mod tests {
             ld_r2: 0.8,
             max_order: 3,
             replicate_seed: seed,
-            replicate_id: 0,
-            is_null: false,
-            provenance_token: seed,
         }
     }
 

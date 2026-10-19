@@ -202,6 +202,7 @@ impl NoGrmCovariateProjector {
         Ok(projected)
     }
 
+    #[cfg(test)]
     pub(crate) fn projected_dot(&self, left: &[f64], right: &[f64]) -> Result<f64, String> {
         let left_coordinates = self.coordinates(left)?;
         let right_coordinates = self.coordinates(right)?;
@@ -213,6 +214,7 @@ impl NoGrmCovariateProjector {
         Ok(self.projected_dot_from_coordinates(raw, &left_coordinates, &right_coordinates))
     }
 
+    #[cfg(test)]
     #[inline]
     pub(crate) fn projected_dot_from_coordinates(
         &self,

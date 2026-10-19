@@ -37,8 +37,6 @@ pub(crate) fn build_corr_rf_site_pool_from_ranked_corr(
     residual: &[f64],
     ld_r2: f64,
     replicate_seed: u64,
-    replicate_id: usize,
-    is_null: bool,
 ) -> Result<MergedSitePool, String> {
     if !matches!(config.mode, ProposalMode::CorrRf) {
         return Err("packed Corr+RF proposal pool requires CorrRf mode".to_string());
@@ -68,11 +66,6 @@ pub(crate) fn build_corr_rf_site_pool_from_ranked_corr(
         ld_r2,
         max_order: config.max_order,
         replicate_seed,
-        replicate_id,
-        is_null,
-        provenance_token: replicate_seed
-            ^ (replicate_id as u64).rotate_left(11)
-            ^ u64::from(is_null).wrapping_mul(0xD1B5_4A32_D192_ED03),
     };
     let rf_proposals = RfChannel::default().propose(&context)?.site_proposals;
     let mut proposals =
@@ -106,9 +99,8 @@ pub(crate) fn build_corr_rf_site_pool_from_ranked_corr(
     )
 }
 
-/// Execute development proposal channels and return the final LD-
-/// representative site pool. This module owns channel dispatch so the scan
-/// code only sees a stable pool contract.
+/// Execute proposal channels and return the final LD-representative site pool.
+/// This module owns channel dispatch so the scan code sees one stable contract.
 pub(crate) fn build_proposal_site_pool(
     config: ProposalConfig,
     window_id: &str,
@@ -118,32 +110,6 @@ pub(crate) fn build_proposal_site_pool(
     maf: &[f64],
     ld_r2: f64,
     replicate_seed: u64,
-) -> Result<MergedSitePool, String> {
-    build_proposal_site_pool_for_replicate(
-        config,
-        window_id,
-        marker_ids,
-        genotype_rows,
-        residual,
-        maf,
-        ld_r2,
-        replicate_seed,
-        0,
-        false,
-    )
-}
-
-pub(crate) fn build_proposal_site_pool_for_replicate(
-    config: ProposalConfig,
-    window_id: &str,
-    marker_ids: &[usize],
-    genotype_rows: &[Vec<u8>],
-    residual: &[f64],
-    maf: &[f64],
-    ld_r2: f64,
-    replicate_seed: u64,
-    replicate_id: usize,
-    is_null: bool,
 ) -> Result<MergedSitePool, String> {
     if matches!(config.mode, ProposalMode::Off) {
         return Err("proposal site pool requested while proposal mode is off".to_string());
@@ -157,11 +123,6 @@ pub(crate) fn build_proposal_site_pool_for_replicate(
         ld_r2,
         max_order: config.max_order,
         replicate_seed,
-        replicate_id,
-        is_null,
-        provenance_token: replicate_seed
-            ^ (replicate_id as u64).rotate_left(11)
-            ^ u64::from(is_null).wrapping_mul(0xD1B5_4A32_D192_ED03),
     };
     let mut proposals = Vec::<SiteProposal>::new();
     match config.mode {

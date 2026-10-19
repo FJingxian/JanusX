@@ -3175,6 +3175,7 @@ pub(crate) fn candidate_rerank_exact(
 /// API, while the full Max6 -> GRM-Max6 pipeline uses this form to avoid
 /// repeating the same O(n^2) matrix-vector product once per window.
 #[inline(never)]
+#[cfg(test)]
 pub(crate) fn candidate_rerank_exact_with_py(
     x: &[f64],
     n_samples: usize,
@@ -4854,6 +4855,7 @@ fn weighted_interaction_py_minor_support(
     Ok(interaction_py)
 }
 
+#[cfg(test)]
 pub(crate) fn phase1_scores(
     geometry: &Phase1Geometry,
     x: &[f64],
@@ -4866,6 +4868,7 @@ pub(crate) fn phase1_scores(
     Ok(phase1_scores_timed(geometry, x, n_samples, n_markers, p_c, y, target)?.0)
 }
 
+#[cfg(test)]
 pub(crate) fn phase1_scores_timed(
     geometry: &Phase1Geometry,
     x: &[f64],
@@ -4887,6 +4890,7 @@ pub(crate) fn phase1_scores_timed(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn phase1_scores_timed_with_c_kernel(
     geometry: &Phase1Geometry,
     x: &[f64],

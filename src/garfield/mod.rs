@@ -48,8 +48,8 @@ use self::permutation::{
     DEFAULT_RULE_STRUCTURE_BOOTSTRAP_STABLE_REPEATS, DEFAULT_RULE_STRUCTURE_DENSITY_TOPK,
 };
 use self::proposal::{
-    build_proposal_site_pool_for_replicate, merge_and_select_site_pool, resolve_proposal_config,
-    ChannelQuota, CorrChannel, ProposalChannelId, ProposalConfig, ProposalFamily, ProposalMode,
+    build_proposal_site_pool, merge_and_select_site_pool, resolve_proposal_config, ChannelQuota,
+    CorrChannel, ProposalChannelId, ProposalConfig, ProposalFamily, ProposalMode,
     SharedMaxTAccumulator,
 };
 use crate::bedmath::packed_byte_lut;
@@ -10925,8 +10925,6 @@ fn proposal_pool_for_rows(
     genotype_rows: &[Vec<u8>],
     residual: &[f64],
     replicate_seed: u64,
-    replicate_id: usize,
-    is_null: bool,
 ) -> Result<proposal::MergedSitePool, String> {
     let maf = genotype_rows
         .iter()
@@ -10940,7 +10938,7 @@ fn proposal_pool_for_rows(
             }
         })
         .collect::<Vec<_>>();
-    build_proposal_site_pool_for_replicate(
+    build_proposal_site_pool(
         proposal_config,
         window_id,
         marker_ids,
@@ -10949,8 +10947,6 @@ fn proposal_pool_for_rows(
         maf.as_slice(),
         GARFIELD_LD_CLUMP_R2_DEFAULT,
         replicate_seed,
-        replicate_id,
-        is_null,
     )
 }
 
@@ -11078,8 +11074,6 @@ fn packed_corr_rf_proposal_pool(
     stage1_y_lookup: Option<&PackedYSumLookup>,
     allow_parallel: bool,
     replicate_seed: u64,
-    replicate_id: usize,
-    is_null: bool,
     window_id: &str,
 ) -> Result<proposal::MergedSitePool, String> {
     if !matches!(proposal_config.mode, ProposalMode::CorrRf) {
@@ -11118,8 +11112,6 @@ fn packed_corr_rf_proposal_pool(
         y_train,
         GARFIELD_LD_CLUMP_R2_DEFAULT,
         replicate_seed,
-        replicate_id,
-        is_null,
     )
 }
 
@@ -11232,8 +11224,6 @@ fn select_logic_unit_global_rows_with_ld_cache(
                 stage1_y_lookup,
                 allow_parallel,
                 proposal_config.k_site as u64 ^ tree_cfg.seed,
-                0,
-                false,
                 unit.label.as_str(),
             )?;
             garfield_stage_profile_end(pool_t0, &GARFIELD_CORR_STAGE1_POOL_NS);
@@ -11267,8 +11257,6 @@ fn select_logic_unit_global_rows_with_ld_cache(
             genotype_rows.as_slice(),
             y_train,
             proposal_config.k_site as u64 ^ tree_cfg.seed,
-            0,
-            false,
         )?;
         if pool.representatives.is_empty() {
             return Ok(None);
@@ -11756,8 +11744,6 @@ fn prepare_logic_chunk_continuous(
                 None,
                 beam_params.allow_parallel,
                 selection_seed,
-                selection_seed as usize,
-                true,
                 window_id.as_str(),
             )?;
             if pool.representatives.is_empty() {
@@ -11796,8 +11782,6 @@ fn prepare_logic_chunk_continuous(
             genotype_rows.as_slice(),
             y_train,
             selection_seed,
-            selection_seed as usize,
-            true,
         )?;
         if pool.representatives.is_empty() {
             return Ok(None);
@@ -14480,12 +14464,9 @@ const MAX6_GRMMAX6_BONFERRONI_CHANNELS: usize = 6;
 #[derive(Clone, Debug)]
 struct Max6GrmMax6PairOutput {
     unit_index: usize,
-    screen_rank: usize,
     candidate_rank: usize,
     first_global_row: usize,
     second_global_row: usize,
-    screen_score: f64,
-    logic: [f64; 5],
     dosage: f64,
     max6: f64,
     best_channel: &'static str,
@@ -15813,14 +15794,11 @@ fn max6_grm_int_outputs_from_screen(
         let screen_rank = candidate_index + 1;
         outputs.push(Max6GrmMax6PairOutput {
             unit_index,
-            screen_rank,
             // The output's max6_rank column keeps the original Max6 screen
             // rank. Rows themselves are ordered by conditional GRM-INT chi-square.
             candidate_rank: screen_rank,
             first_global_row: selected_global_rows[candidate.first],
             second_global_row: selected_global_rows[candidate.second],
-            screen_score: candidate.proposal_score,
-            logic: std::array::from_fn(|index| candidate.derived.logic5[index].score),
             dosage: chisq[candidate_index],
             max6: candidate.proposal_score,
             best_channel: max6_screen_gate_output_id(candidate.best_gate.gate),
@@ -16390,30 +16368,15 @@ fn scan_max6_grmmax6_unit(
         .collect::<Vec<_>>();
     let final_screen_subset_audit_pairs_checked =
         audit_max6_final_pairs_are_screen_subset(&screen_local_pairs, &final_local_pairs)?;
-    let mut screen_rank =
-        HashMap::<(usize, usize), (usize, f64)>::with_capacity(screen.candidates.len());
-    for (rank, candidate) in screen.candidates.iter().enumerate() {
-        screen_rank.insert(
-            (candidate.first, candidate.second),
-            (rank + 1, candidate.proposal_score),
-        );
-    }
     let mut outputs = Vec::with_capacity(output_order.len());
     for &candidate_index in output_order.iter() {
         let local_first = exact.pair_i[candidate_index];
         let local_second = exact.pair_j[candidate_index];
-        let (screen_rank_value, screen_score) = screen_rank
-            .get(&(local_first, local_second))
-            .copied()
-            .unwrap_or((0, f64::NAN));
         outputs.push(Max6GrmMax6PairOutput {
             unit_index,
-            screen_rank: screen_rank_value,
             candidate_rank: exact.candidate_rank[candidate_index],
             first_global_row: selected[local_first],
             second_global_row: selected[local_second],
-            screen_score,
-            logic: exact.logic[candidate_index],
             dosage: exact.dosage[candidate_index],
             max6: exact.max6[candidate_index],
             best_channel: exact.best_max6_channel[candidate_index],
@@ -16941,40 +16904,6 @@ fn max6_cross_window_union_enabled(
             .unwrap_or(true)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn rerank_max6_grmmax6_screen_batch(
-    scans: &mut [(usize, Max6GrmMax6UnitScan)],
-    logic_bits: &GarfieldLogicBits,
-    p_c: Option<&[f64]>,
-    no_grm_projector: Option<&NoGrmCovariateProjector>,
-    projected_y: &[f64],
-    y: &[f64],
-    score_scale: f64,
-    scaled_total_quadratic: f64,
-    final_top_k: usize,
-    rule_permutation: bool,
-    collect_candidate_pair_keys: bool,
-    collect_candidate_scores: bool,
-    max_workspace_bytes: usize,
-) -> Result<Max6CrossWindowBatchStats, String> {
-    rerank_max6_grmmax6_screen_batch_with_audit(
-        scans,
-        logic_bits,
-        p_c,
-        no_grm_projector,
-        projected_y,
-        y,
-        score_scale,
-        scaled_total_quadratic,
-        final_top_k,
-        rule_permutation,
-        collect_candidate_pair_keys,
-        collect_candidate_scores,
-        false,
-        max_workspace_bytes,
-    )
-}
-
 fn rerank_max6_grmmax6_screen_batch_with_audit(
     scans: &mut [(usize, Max6GrmMax6UnitScan)],
     logic_bits: &GarfieldLogicBits,
@@ -17257,21 +17186,14 @@ fn rerank_max6_grmmax6_screen_batch_with_audit(
             let global_second = screen.selected_global_rows[candidate.second];
             let score = score_by_pair[&pair_key_by_candidate[candidate_index]];
             let same_orientation = output_orientation[candidate_index];
-            let mut logic = score.logic;
-            if !same_orientation {
-                logic.swap(1, 2);
-            }
             let best_channel =
                 max6_cross_window_channel_for_orientation(score.best_channel, same_orientation);
             final_local_pairs.push((candidate.first, candidate.second));
             outputs.push(Max6GrmMax6PairOutput {
                 unit_index: *unit_index,
-                screen_rank: candidate_index + 1,
                 candidate_rank: rank + 1,
                 first_global_row: global_first,
                 second_global_row: global_second,
-                screen_score: candidate.proposal_score,
-                logic,
                 dosage: score.dosage,
                 max6: score.max6,
                 best_channel,
@@ -17393,7 +17315,6 @@ struct Max6ScreenCalibration {
     empirical_threshold: f64,
     gumbel_threshold: Option<f64>,
     pair_universe_size: usize,
-    window_pair_count: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -20986,7 +20907,6 @@ fn calibrate_max6_screen_threshold(
         empirical_threshold,
         gumbel_threshold: thresholds.gumbel,
         pair_universe_size,
-        window_pair_count: universe.window_pair_count,
     })
 }
 
@@ -23495,12 +23415,12 @@ fn run_max6_grmmax6_pipeline(
         for _repeat in 0..permutation_repeats {
             let mut permuted_y = y.to_vec();
             for index in (1..permuted_y.len()).rev() {
-                let swap_index = rng.gen_range(0..=index);
+                let swap_index = rng.random_range(0..=index);
                 permuted_y.swap(index, swap_index);
             }
             let repeat = jobs.len();
             for _ in 0..sample_count {
-                let ordinal = rng.gen_range(0..total_pairs);
+                let ordinal = rng.random_range(0..total_pairs);
                 let pool_index = offsets
                     .partition_point(|&offset| offset <= ordinal)
                     .saturating_sub(1);
@@ -30952,12 +30872,9 @@ mod tests {
         let mut writer = BufWriter::new(File::create(&path).unwrap());
         let row = Max6GrmMax6PairOutput {
             unit_index: 0,
-            screen_rank: 1,
             candidate_rank: 1,
             first_global_row: 0,
             second_global_row: 1,
-            screen_score: 0.0,
-            logic: [f64::NAN; 5],
             dosage: f64::NAN,
             max6: 3.841458820694124,
             best_channel: "AND11",
@@ -31077,12 +30994,9 @@ mod tests {
         let mut spool = BufWriter::new(File::create(&spool_path).unwrap());
         let row = Max6GrmMax6PairOutput {
             unit_index: 0,
-            screen_rank: 4,
             candidate_rank: 6,
             first_global_row: 0,
             second_global_row: 1,
-            screen_score: 17.5,
-            logic: [f64::NAN; 5],
             dosage: 3.841458820694124,
             max6: 101.0,
             best_channel: "AND01",
@@ -31322,17 +31236,14 @@ mod tests {
             vec![(300, 400), (200, 300), (100, 200)]
         );
         assert_eq!(outputs[0].unit_index, 4);
-        assert_eq!(outputs[0].screen_rank, 3);
         assert_eq!(outputs[0].candidate_rank, 3);
         assert_eq!(outputs[0].max6, 7.0);
         assert_eq!(outputs[0].best_channel, "DOSAGE_PRODUCT");
         assert_eq!(outputs[0].dosage, 50.0);
         assert!(outputs[0].pair_pve.is_nan());
-        assert_eq!(outputs[1].screen_rank, 2);
         assert_eq!(outputs[1].best_channel, "XOR");
         assert_eq!(outputs[1].max6, 8.0);
         assert_eq!(outputs[1].dosage, 11.0);
-        assert_eq!(outputs[2].screen_rank, 1);
         assert_eq!(outputs[2].best_channel, "AND10");
         assert_eq!(outputs[2].max6, 9.0);
         assert_eq!(outputs[2].dosage, 2.0);

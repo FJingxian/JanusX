@@ -102,8 +102,6 @@ pub(crate) struct WeightedExceedanceReportPaths {
 pub(crate) struct PotAuditReportPaths {
     pub(crate) manifest_json: String,
     pub(crate) sample_scores_manifest_json: String,
-    pub(crate) expected_peak_memory_bytes: usize,
-    pub(crate) estimated_tail_storage_bytes: u64,
 }
 
 pub(crate) struct SupportAwareTailReportPaths {
@@ -480,6 +478,7 @@ impl BottomKPairSampler {
     }
 }
 
+#[cfg(test)]
 fn bottom_k_pairs(
     pairs: impl IntoIterator<Item = (usize, usize)>,
     seed: u64,
@@ -498,6 +497,7 @@ struct SupportAwarePairPools {
     unique_universe_hash: String,
     universe_stratum_counts: [usize; 5],
     pairs_by_stratum: Vec<Vec<PairPriority>>,
+    #[cfg(test)]
     sample_hashes_by_stratum: Vec<String>,
     storage_capacity_bytes: usize,
     selection_seconds: f64,
@@ -600,6 +600,7 @@ impl StratifiedBottomKPairSampler {
             .map(|heap| heap.capacity().saturating_mul(size_of::<PairPriority>()))
             .sum();
         let mut pairs_by_stratum = Vec::with_capacity(self.heaps.len());
+        #[cfg(test)]
         let mut sample_hashes_by_stratum = Vec::with_capacity(self.heaps.len());
         for heap in self.heaps {
             let mut pairs = heap.into_vec();
@@ -610,6 +611,7 @@ impl StratifiedBottomKPairSampler {
             {
                 return Err("support-aware canonical pair stratum contains a duplicate".to_string());
             }
+            #[cfg(test)]
             sample_hashes_by_stratum.push(sample_set_hash(pairs.as_slice()));
             pairs_by_stratum.push(pairs);
         }
@@ -622,6 +624,7 @@ impl StratifiedBottomKPairSampler {
             ),
             universe_stratum_counts: self.seen_by_stratum,
             pairs_by_stratum,
+            #[cfg(test)]
             sample_hashes_by_stratum,
             storage_capacity_bytes,
             selection_seconds: 0.0,
@@ -2424,6 +2427,7 @@ struct BootstrapThetaInterval {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+#[cfg(test)]
 struct PairedThresholdCountSummary {
     null_count: usize,
     full_fwer: AuditConfidenceInterval,
@@ -2501,6 +2505,7 @@ pub(crate) fn build_exceedance_audit_grid(maxima: &[f64]) -> Result<ExceedanceAu
 }
 
 #[inline]
+#[cfg(test)]
 fn strict_exceedance_count(scores: &[f64], threshold: f64) -> u64 {
     scores.iter().filter(|score| **score > threshold).count() as u64
 }
@@ -2767,6 +2772,7 @@ fn unconditional_uniform_ht_estimate(
     })
 }
 
+#[cfg(test)]
 fn paired_threshold_count_summary(
     full_counts: &[u64],
     sample_counts: &[u64],
@@ -5114,8 +5120,6 @@ pub(crate) fn run_sampled_screen_pot_audit(
     Ok(PotAuditReportPaths {
         manifest_json: pot_manifest_path,
         sample_scores_manifest_json: sample_manifest_path,
-        expected_peak_memory_bytes,
-        estimated_tail_storage_bytes,
     })
 }
 

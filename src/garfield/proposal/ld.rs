@@ -6,8 +6,6 @@ pub(crate) fn channel_priority(channel: ProposalChannelId) -> usize {
     match channel {
         ProposalChannelId::Corr => 0,
         ProposalChannelId::Rf => 1,
-        ProposalChannelId::IrfRit => 2,
-        ProposalChannelId::DwpLssfindInspired => 3,
     }
 }
 

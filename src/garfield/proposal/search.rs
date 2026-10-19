@@ -1,13 +1,16 @@
+#[cfg(test)]
 use std::collections::HashMap;
 
 use super::types::{PairSeed, PairSeedReason, SourceMask};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg(test)]
 pub(crate) struct SignedSiteVariant {
     pub(crate) marker_ids: Vec<usize>,
     pub(crate) negated: Vec<bool>,
 }
 
+#[cfg(test)]
 impl SignedSiteVariant {
     pub(crate) fn lexical_key(&self) -> Vec<(usize, bool)> {
         self.marker_ids
@@ -21,6 +24,7 @@ impl SignedSiteVariant {
 /// Complete an unsigned site set with every 0/2 Boolean polarity.  Marker
 /// IDs are canonicalized before expansion, so a repeated proposal cannot
 /// create duplicate signed rules or inflate a downstream quota.
+#[cfg(test)]
 pub(crate) fn complete_signed_variants(marker_ids: &[usize]) -> Vec<SignedSiteVariant> {
     let mut ids = marker_ids.to_vec();
     ids.sort_unstable();
@@ -40,6 +44,7 @@ pub(crate) fn complete_signed_variants(marker_ids: &[usize]) -> Vec<SignedSiteVa
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct CandidateOutputStatus {
     pub(crate) formal_eligible: bool,
     pub(crate) reported: bool,
@@ -48,6 +53,7 @@ pub(crate) struct CandidateOutputStatus {
 /// Keep statistical eligibility independent from a display/output budget.
 /// `ranked_indices` must already be in final-score order; a zero budget means
 /// no display cap, matching GARFIELD's existing `top_rules_per_unit=0` mode.
+#[cfg(test)]
 pub(crate) fn apply_display_budget(
     formal_eligible: &[bool],
     ranked_indices: &[usize],
@@ -78,6 +84,7 @@ pub(crate) fn apply_display_budget(
 /// Enumerate each unordered pair of distinct marker IDs exactly once.
 /// Duplicate input IDs are removed before enumeration and the result is
 /// lexically ordered so downstream ranks are reproducible across channels.
+#[cfg(test)]
 pub(crate) fn enumerate_unordered_pairs(marker_ids: &[usize]) -> Vec<[usize; 2]> {
     let mut ids = marker_ids.to_vec();
     ids.sort_unstable();
@@ -92,6 +99,7 @@ pub(crate) fn enumerate_unordered_pairs(marker_ids: &[usize]) -> Vec<[usize; 2]>
 }
 
 #[inline]
+#[cfg(test)]
 pub(crate) fn accept_pair_seed(seed: PairSeed) -> bool {
     seed.marker_ids[0] != seed.marker_ids[1]
 }
@@ -146,6 +154,7 @@ pub(crate) fn rank_exact_pair_seeds(
 }
 
 #[inline]
+#[cfg(test)]
 pub(crate) fn exact_pair_seeds(
     pairs: &[[usize; 2]],
     exact_scores: &[f64],
@@ -155,6 +164,7 @@ pub(crate) fn exact_pair_seeds(
     rank_exact_pair_seeds(pairs, exact_scores, k2, sources)
 }
 
+#[cfg(test)]
 fn pair_sort_key(seed: &PairSeed) -> (bool, f64, bool, usize, [usize; 2]) {
     let finite = seed.exact_score.is_finite();
     (
@@ -169,6 +179,7 @@ fn pair_sort_key(seed: &PairSeed) -> (bool, f64, bool, usize, [usize; 2]) {
 /// Merge exact-rank and proposal-rescue pair seeds, preserving provenance and
 /// retaining each unordered pair once.  Exact-ranked seeds take precedence on
 /// duplicate pairs, while a finite exact score is retained if available.
+#[cfg(test)]
 pub(crate) fn merge_pair_seed_sources(
     exact_ranked: &[PairSeed],
     proposal_rescue: &[PairSeed],

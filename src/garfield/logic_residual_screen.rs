@@ -537,6 +537,7 @@ impl ResidualProposalSource {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn four_cell_sufficient_stats_packed(
     first: &[u64],
     second: &[u64],
@@ -562,6 +563,7 @@ pub(crate) fn four_cell_sufficient_stats_packed(
 }
 
 #[inline]
+#[cfg(test)]
 fn validate_packed_cell_rows(
     first: &[u64],
     second: &[u64],
@@ -1487,16 +1489,12 @@ fn push_top_k(
 pub(crate) struct ResidualScreenProfile {
     pub(crate) sample_pairs: usize,
     pub(crate) total_pairs: usize,
-    pub(crate) words_per_pair: usize,
     pub(crate) sample_words: usize,
     pub(crate) nonzero_intersections: usize,
     pub(crate) intersection_popcount_sum: usize,
     pub(crate) lookup_calls: usize,
     pub(crate) lut8_word_calls: usize,
     pub(crate) setbit_calls: usize,
-    pub(crate) scan_seconds: f64,
-    pub(crate) lookup_build_seconds: f64,
-    pub(crate) margin_build_seconds: f64,
     pub(crate) bitset_seconds: f64,
     pub(crate) weighted_y_lookup_seconds: f64,
     pub(crate) margin_recovery_seconds: f64,
@@ -1532,7 +1530,6 @@ pub(crate) fn profile_one_cell_sample(
     if n_rows < 2 || profile_pairs == 0 {
         return Ok(ResidualScreenProfile {
             total_pairs: n_rows.saturating_mul(n_rows.saturating_sub(1)) / 2,
-            words_per_pair: words_for_samples(n_samples),
             ..ResidualScreenProfile::default()
         });
     }
@@ -1568,7 +1565,6 @@ pub(crate) fn profile_one_cell_sample(
     let mut profile = ResidualScreenProfile {
         sample_pairs,
         total_pairs,
-        words_per_pair: needed_words,
         sample_words: sample_pairs.saturating_mul(needed_words),
         ..ResidualScreenProfile::default()
     };
@@ -1703,6 +1699,7 @@ pub(crate) fn profile_one_cell_sample(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn scan_residual_pairs_packed(
     bits_flat: &[u64],
     valid_flat: Option<&[u64]>,
@@ -1730,6 +1727,7 @@ pub(crate) fn scan_residual_pairs_packed(
 /// Standalone Python calls use Rayon; nested callers can pass `false` to keep
 /// one level of thread-local Top-K heaps.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn scan_residual_pairs_packed_with_parallel(
     bits_flat: &[u64],
     valid_flat: Option<&[u64]>,
@@ -1757,6 +1755,7 @@ pub(crate) fn scan_residual_pairs_packed_with_parallel(
 
 /// Internal scanner with an explicit Gate5/Gate6d proposal policy.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(crate) fn scan_residual_pairs_packed_with_mode(
     bits_flat: &[u64],
     valid_flat: Option<&[u64]>,
@@ -3889,277 +3888,6 @@ pub fn garfield_logic_residual_screen_bin_py<'py>(
     Ok(out)
 }
 
-/// Diagnostic-only stage profile for the missing-free one-cell Max6 screen.
-///
-/// The normal scanner is run once with parallelism disabled, then a bounded
-/// sample of pairs is replayed in separate block-level timing sections. This
-/// function is intentionally separate from the production screen API so its
-/// replay work cannot affect normal benchmark timings.
-#[pyfunction(name = "garfield_logic_residual_screen_profile_bin")]
-#[pyo3(signature = (bin_path, residual, top_k=5000, xor_search=true, profile_pairs=8192))]
-pub fn garfield_logic_residual_screen_profile_bin_py<'py>(
-    py: Python<'py>,
-    bin_path: String,
-    residual: PyReadonlyArray1<'py, f64>,
-    top_k: usize,
-    xor_search: bool,
-    profile_pairs: usize,
-) -> PyResult<Bound<'py, PyDict>> {
-    let (bits, row_words, n_rows, n_samples) =
-        load_bin01_as_u64_words(&bin_path, "garfield_logic_residual_screen_profile_bin")
-            .map_err(PyRuntimeError::new_err)?;
-    let residual_slice = residual.as_slice().map_err(|e| {
-        PyValueError::new_err(format!("garfield_logic_residual_screen_profile_bin: {e}"))
-    })?;
-    validate_continuous_y(
-        residual_slice,
-        n_samples,
-        "garfield_logic_residual_screen_profile_bin",
-    )
-    .map_err(PyValueError::new_err)?;
-    let lookup_started = Instant::now();
-    let lookup =
-        PackedYSumLookup::build(residual_slice, n_samples).map_err(PyValueError::new_err)?;
-    let lookup_build_seconds = lookup_started.elapsed().as_secs_f64();
-    let margin_started = Instant::now();
-    let margins =
-        OneCellMargins::build(&bits, row_words, n_rows, residual_slice, n_samples, &lookup)
-            .map_err(PyValueError::new_err)?;
-    let margin_build_seconds = margin_started.elapsed().as_secs_f64();
-
-    // Clone before timing so the measured span contains only pair traversal,
-    // scoring, and candidate retention. The scanner writes its timer immediately
-    // after the pair loop and before finalist-stat reconstruction/sorting.
-    let margins_for_scan = margins.clone();
-    ensure_garfield_blas_backend().map_err(PyRuntimeError::new_err)?;
-    let mut pair_scan_seconds = 0.0f64;
-    let result = scan_residual_pairs_packed_with_mode_options(
-        &bits,
-        None,
-        row_words,
-        n_rows,
-        residual_slice,
-        n_samples,
-        top_k,
-        xor_search,
-        ResidualProposalMode::Max6,
-        ResidualScreenKernel::OneCell,
-        &lookup,
-        Some(margins_for_scan),
-        None,
-        0,
-        PairTraversalMode::CrossGroupOnly,
-        None,
-        false,
-        None,
-        Some(&mut pair_scan_seconds),
-    )
-    .map_err(PyValueError::new_err)?;
-
-    let profile_started = Instant::now();
-    let mut profile = profile_one_cell_sample(
-        &bits,
-        row_words,
-        n_rows,
-        n_samples,
-        top_k,
-        xor_search,
-        profile_pairs,
-        residual_slice,
-        &margins,
-        &lookup,
-    )
-    .map_err(PyValueError::new_err)?;
-    profile.scan_seconds = pair_scan_seconds;
-    profile.lookup_build_seconds = lookup_build_seconds;
-    profile.margin_build_seconds = margin_build_seconds;
-    let profile_extra_seconds = profile_started.elapsed().as_secs_f64();
-
-    let out = PyDict::new(py);
-    out.set_item("pairs_evaluated", result.pairs_evaluated)?;
-    out.set_item("pairs_scored", result.pairs_scored)?;
-    out.set_item(
-        "first",
-        result
-            .candidates
-            .iter()
-            .map(|candidate| candidate.first)
-            .collect::<Vec<_>>(),
-    )?;
-    out.set_item(
-        "second",
-        result
-            .candidates
-            .iter()
-            .map(|candidate| candidate.second)
-            .collect::<Vec<_>>(),
-    )?;
-    set_screen_columns(&out, result.candidates.as_slice())?;
-    out.set_item("n_rows", result.n_rows)?;
-    out.set_item("n_samples", result.n_samples)?;
-    out.set_item("top_k", top_k)?;
-    out.set_item("xor_search", xor_search)?;
-    out.set_item("screen_kernel", "one_cell")?;
-    out.set_item("proposal_mode", "max6")?;
-    // Keep the original diagnostic key for existing profile/benchmark clients.
-    out.set_item("scan_seconds", profile.scan_seconds)?;
-    out.set_item("pair_scan_seconds", profile.scan_seconds)?;
-    out.set_item("profile_extra_seconds", profile_extra_seconds)?;
-    out.set_item("profile_sample_pairs", profile.sample_pairs)?;
-    out.set_item("profile_total_pairs", profile.total_pairs)?;
-    out.set_item("profile_words_per_pair", profile.words_per_pair)?;
-    out.set_item("profile_sample_words", profile.sample_words)?;
-    out.set_item(
-        "profile_nonzero_intersections",
-        profile.nonzero_intersections,
-    )?;
-    out.set_item(
-        "profile_average_intersection_popcount",
-        if profile.sample_words == 0 {
-            0.0
-        } else {
-            profile.intersection_popcount_sum as f64 / profile.sample_words as f64
-        },
-    )?;
-    out.set_item("profile_lookup_calls", profile.lookup_calls)?;
-    out.set_item("profile_lut8_word_calls", profile.lut8_word_calls)?;
-    out.set_item("profile_setbit_calls", profile.setbit_calls)?;
-    out.set_item(
-        "profile_lut8_calls",
-        profile.lut8_word_calls.saturating_mul(8),
-    )?;
-    out.set_item("profile_heap_pushes", profile.heap_pushes)?;
-    out.set_item("profile_heap_replacements", profile.heap_replacements)?;
-    out.set_item("profile_sample_pairs_scored", profile.sample_pairs_scored)?;
-    out.set_item("profile_score_checksum", profile.score_checksum)?;
-    let stage_seconds = PyDict::new(py);
-    stage_seconds.set_item("lookup_table_build", profile.lookup_build_seconds)?;
-    stage_seconds.set_item("margin_build", profile.margin_build_seconds)?;
-    stage_seconds.set_item("bitset_intersection_popcount", profile.bitset_seconds)?;
-    stage_seconds.set_item("weighted_y_lookup", profile.weighted_y_lookup_seconds)?;
-    stage_seconds.set_item("margin_recovery", profile.margin_recovery_seconds)?;
-    stage_seconds.set_item("score_assembly", profile.score_seconds)?;
-    stage_seconds.set_item("heap_topk_update", profile.heap_seconds)?;
-    stage_seconds.set_item("final_topk_sort", profile.final_sort_seconds)?;
-    out.set_item("stage_seconds_sample", stage_seconds)?;
-    Ok(out)
-}
-
-/// Microbenchmark the two exact weighted-sum kernels used by one-cell scan.
-///
-/// The benchmark intentionally varies the mask popcount from 1 through 64
-/// and walks all complete phenotype words.  It is diagnostic-only: it does
-/// not participate in screen scoring or choose a runtime threshold.
-#[pyfunction(name = "garfield_logic_residual_screen_lookup_benchmark")]
-#[pyo3(signature = (residual, repeats=2000))]
-pub fn garfield_logic_residual_screen_lookup_benchmark_py<'py>(
-    py: Python<'py>,
-    residual: PyReadonlyArray1<'py, f64>,
-    repeats: usize,
-) -> PyResult<Bound<'py, PyDict>> {
-    let residual_slice = residual.as_slice().map_err(|e| {
-        PyValueError::new_err(format!(
-            "garfield_logic_residual_screen_lookup_benchmark: {e}"
-        ))
-    })?;
-    let n_samples = residual_slice.len();
-    validate_continuous_y(
-        residual_slice,
-        n_samples,
-        "garfield_logic_residual_screen_lookup_benchmark",
-    )
-    .map_err(PyValueError::new_err)?;
-    let full_words = n_samples / 64;
-    if full_words == 0 {
-        return Err(PyValueError::new_err(
-            "lookup benchmark requires at least 64 phenotype values",
-        ));
-    }
-    if repeats == 0 {
-        return Err(PyValueError::new_err(
-            "lookup benchmark repeats must be positive",
-        ));
-    }
-    let lookup =
-        PackedYSumLookup::build(residual_slice, n_samples).map_err(PyValueError::new_err)?;
-
-    let mut popcounts = Vec::with_capacity(64);
-    let mut lut8_ns_per_word = Vec::with_capacity(64);
-    let mut setbit_ns_per_word = Vec::with_capacity(64);
-    let mut lut8_checksums = Vec::with_capacity(64);
-    let mut setbit_checksums = Vec::with_capacity(64);
-
-    for popcount in 1usize..=64 {
-        let base_mask = if popcount == 64 {
-            u64::MAX
-        } else {
-            (1u64 << popcount) - 1
-        };
-        let mut words = Vec::with_capacity(full_words);
-        for word_idx in 0..full_words {
-            let rotation = ((word_idx.wrapping_mul(29) + popcount.wrapping_mul(7)) & 63) as u32;
-            words.push(base_mask.rotate_left(rotation));
-        }
-
-        let lut_started = Instant::now();
-        let mut lut_sum = 0.0f64;
-        for repeat in 0..repeats {
-            for (word_idx, &word) in words.iter().enumerate() {
-                let word = std::hint::black_box(word ^ ((repeat as u64) & 0));
-                lut_sum += lookup.sum_word(word_idx, word);
-            }
-        }
-        let lut_seconds = lut_started.elapsed().as_secs_f64();
-
-        let scalar_started = Instant::now();
-        let mut scalar_sum = 0.0f64;
-        for repeat in 0..repeats {
-            for (word_idx, &word) in words.iter().enumerate() {
-                let word = std::hint::black_box(word ^ ((repeat as u64) & 0));
-                scalar_sum += lookup.sum_word_scalar(residual_slice, word_idx, word);
-            }
-        }
-        let scalar_seconds = scalar_started.elapsed().as_secs_f64();
-
-        let calls = (repeats * full_words) as f64;
-        popcounts.push(popcount);
-        lut8_ns_per_word.push(lut_seconds * 1.0e9 / calls);
-        setbit_ns_per_word.push(scalar_seconds * 1.0e9 / calls);
-        lut8_checksums.push(std::hint::black_box(lut_sum));
-        setbit_checksums.push(std::hint::black_box(scalar_sum));
-    }
-
-    let first_lut8_wins = lut8_ns_per_word
-        .iter()
-        .zip(setbit_ns_per_word.iter())
-        .position(|(lut, scalar)| lut <= scalar)
-        .map(|idx| idx + 1);
-    let scalar_wins = setbit_ns_per_word
-        .iter()
-        .zip(lut8_ns_per_word.iter())
-        .map(|(scalar, lut)| scalar < lut)
-        .collect::<Vec<_>>();
-
-    let out = PyDict::new(py);
-    out.set_item("n_samples", n_samples)?;
-    out.set_item("full_words", full_words)?;
-    out.set_item("repeats", repeats)?;
-    out.set_item("popcount", popcounts)?;
-    out.set_item("lut8_ns_per_word", lut8_ns_per_word)?;
-    out.set_item("setbit_ns_per_word", setbit_ns_per_word)?;
-    out.set_item("lut8_checksums", lut8_checksums)?;
-    out.set_item("setbit_checksums", setbit_checksums)?;
-    out.set_item("setbit_wins", scalar_wins)?;
-    out.set_item("first_lut8_win_popcount", first_lut8_wins)?;
-    Ok(out)
-}
-
-/// Exact Max6 reranking for a preselected candidate list.
-///
-/// Unlike [`garfield_logic_residual_screen_bin_py`], this function never
-/// materializes or scans all marker rows.  It loads only the two endpoints of
-/// each supplied candidate pair, then applies the reference packed four-cell
-/// accumulation and Max6 ranking to those candidates.
 #[pyfunction(name = "garfield_logic_residual_rerank_candidates_bin")]
 #[pyo3(signature = (bin_path, residual, first, second, top_k=500, valid_bits=None, xor_search=true))]
 pub fn garfield_logic_residual_rerank_candidates_bin_py<'py>(

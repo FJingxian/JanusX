@@ -1,5 +1,3 @@
-use super::types::ProposalContext;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ProposalFamily {
     Singleton,
@@ -41,6 +39,7 @@ impl MaxOnlyReducer {
         self.maxima[family.index()]
     }
 
+    #[cfg(test)]
     pub(crate) fn storage_len(&self) -> usize {
         self.maxima.len()
     }
@@ -140,42 +139,9 @@ fn quantile(values: &[f64], probability: f64) -> Option<f64> {
         .copied()
 }
 
-pub(crate) fn proposal_cache_key(context: &ProposalContext<'_>) -> u64 {
-    context.cache_key()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::garfield::proposal::types::ProposalContext;
-
-    fn context_for_replicate(
-        replicate_id: usize,
-        seed: u64,
-        is_null: bool,
-    ) -> ProposalContext<'static> {
-        ProposalContext {
-            window_id: "null-test",
-            marker_ids: Box::leak(vec![1usize, 2usize].into_boxed_slice()),
-            genotype_rows: Box::leak(vec![vec![0u8, 1], vec![1u8, 0]].into_boxed_slice()),
-            residual: Box::leak(vec![0.0f64, 1.0].into_boxed_slice()),
-            maf: Box::leak(vec![0.5f64, 0.5].into_boxed_slice()),
-            ld_r2: 0.8,
-            max_order: 3,
-            replicate_seed: seed,
-            replicate_id,
-            is_null,
-            provenance_token: seed ^ u64::from(is_null),
-        }
-    }
-
-    #[test]
-    fn null_context_never_reuses_observed_cache_key() {
-        let observed = context_for_replicate(0, 42, false);
-        let null = context_for_replicate(1, 42, true);
-        assert_ne!(observed.provenance_token, null.provenance_token);
-        assert_ne!(proposal_cache_key(&observed), proposal_cache_key(&null));
-    }
 
     #[test]
     fn max_only_reducer_keeps_one_value_per_family() {

@@ -2130,27 +2130,6 @@ fn accumulate_f32_block_into_f64_upper_with_scratch(
     )
 }
 
-fn accumulate_f32_block_into_f64_upper(
-    values: &[f32],
-    rows: usize,
-    n: usize,
-    accum: &mut [f64],
-    first_block: bool,
-) -> Result<(), String> {
-    let scratch_len = n
-        .checked_mul(n)
-        .ok_or_else(|| "kfile GRM temporary matrix size overflow".to_string())?;
-    let mut scratch = vec![0.0_f32; scratch_len];
-    accumulate_f32_block_into_f64_upper_with_scratch(
-        values,
-        rows,
-        n,
-        accum,
-        first_block,
-        scratch.as_mut_slice(),
-    )
-}
-
 fn finalize_grm_f32(mut accum: Vec<f64>, n: usize, denominator: f64) -> Result<Vec<f32>, String> {
     let expected_len = n
         .checked_mul(n)

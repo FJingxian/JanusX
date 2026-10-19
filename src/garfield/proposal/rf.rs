@@ -103,9 +103,6 @@ mod tests {
             ld_r2: 0.8,
             max_order: 3,
             replicate_seed: 23,
-            replicate_id: 0,
-            is_null: false,
-            provenance_token: 23,
         }
     }
 

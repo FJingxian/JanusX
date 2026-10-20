@@ -24223,6 +24223,7 @@ fn garfield_logic_search_bed_owned(
     min_cell: usize,
     min_cell_fraction: f64,
     ld_tag_r2: f64,
+    summary_callback: Option<Py<PyAny>>,
 ) -> Result<GarfieldLogicPipelineResult, String> {
     let total_wall_t0 = Instant::now();
     let search_backend = GarfieldSearchBackend::parse(search_backend.as_str())?;
@@ -25101,6 +25102,14 @@ fn garfield_logic_search_bed_owned(
         "residual_fit_ready",
         Some(&format!("n_selected={n_selected}")),
     )?;
+    garfield_stage_progress_notify(
+        summary_callback.as_ref().or(progress_callback.as_ref()),
+        "garfield_null_summary",
+        1,
+        1,
+        Some(&serde_json::json!({ "full_pve": train_fit.pve }).to_string()),
+    )
+    .map_err(|error| error.to_string())?;
     garfield_stage_progress_notify(
         progress_callback.as_ref(),
         "garfield_projection",
@@ -27356,6 +27365,7 @@ pub fn garfield_debug_probe_single_group_from_files(
         0usize,
         0.0,
         GARFIELD_MAX6_LD_TAG_R2_DEFAULT,
+        None,
     )?;
     Ok(out_tsv)
 }
@@ -27449,7 +27459,8 @@ pub fn garfield_debug_probe_single_group_from_files(
     grm_int_only=None,
     min_cell=10,
     min_cell_fraction=0.0,
-    ld_tag_r2=1.0
+    ld_tag_r2=1.0,
+    summary_callback=None
 ))]
 pub fn garfield_logic_search_bed_py<'py>(
     py: Python<'py>,
@@ -27541,6 +27552,7 @@ pub fn garfield_logic_search_bed_py<'py>(
     min_cell: usize,
     min_cell_fraction: f64,
     ld_tag_r2: f64,
+    summary_callback: Option<Py<PyAny>>,
 ) -> PyResult<Bound<'py, PyDict>> {
     arm_interrupt_trap();
     let grm_int_only =
@@ -27684,6 +27696,7 @@ pub fn garfield_logic_search_bed_py<'py>(
                 min_cell,
                 min_cell_fraction,
                 ld_tag_r2,
+                summary_callback,
             )
         })
         .map_err(map_err_string_to_py)?;

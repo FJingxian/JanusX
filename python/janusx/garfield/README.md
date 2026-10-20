@@ -23,8 +23,14 @@ GRM-INT chi-square statistic, and its one-df p-value. The p-value is an
 unadjusted per-pair value; the printed Bonferroni threshold is a reference for
 the unique-pair family and does not filter rows.
 
-`--min-cell` sets the minimum sample count required in every binary genotype
-cell (default 10); `--min-cell-frac` can impose an additional fraction of the
-effective sample size. `--ld-tag-r2 1` keeps only identical encoded genotypes.
+Every binary genotype cell must contain at least
+`max(10, ceil(0.01 * Neff))` samples by default. `Neff` is the aligned sample
+count actually scored for each phenotype. `--min-cell` overrides the count
+floor (default 10), and `--min-cell-frac` overrides the fractional floor
+(default 0.01). Set `--min-cell-frac 0` to use only the count floor, or also
+set `--min-cell 0` to disable both floors.
+The effective cell threshold and the fitted null-model PVE are reported before
+pair scanning starts.
+`--ld-tag-r2 1` keeps only identical encoded genotypes.
 Lower values enable approximate LD compression and can change which pairs are
 screened.

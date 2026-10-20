@@ -10918,7 +10918,7 @@ def _overlay_postgwas_manhattan_hits(
     ax: plt.Axes,
     plotmodel: GWASPLOT,
     *,
-    threshold: float,
+    threshold: Optional[float],
     draw_threshold_line: bool = True,
     base_size: float,
     marker: str,
@@ -10928,6 +10928,12 @@ def _overlay_postgwas_manhattan_hits(
     max_logp: Optional[float] = None,
     ignore: Optional[list[object]] = None,
 ) -> None:
+    # ``threshold`` is also used internally as a default for QQ sampling and
+    # threshold-based auxiliary outputs.  Manhattan hit coloring, however,
+    # should only happen when the user explicitly requested ``--thr``.
+    if threshold is None or not np.isfinite(threshold):
+        return
+
     if _overlay_manhattan_interaction_padj_points(
         ax,
         plotmodel,
@@ -11549,6 +11555,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             no_logtrans=no_logtrans,
         )
     )
+    highlight_threshold = float(args.thr) if args.thr is not None else None
     draw_threshold_line = _postgwas_should_draw_threshold_line(
         args.thr,
         no_logtrans=no_logtrans,
@@ -11779,7 +11786,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     _overlay_postgwas_manhattan_hits(
                         ax,
                         plotmodel,
-                        threshold=threshold,
+                        threshold=highlight_threshold,
                         draw_threshold_line=draw_threshold_line,
                         base_size=single_scatter_size,
                         marker=single_marker,
@@ -11859,7 +11866,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     _overlay_postgwas_manhattan_hits(
                         ax,
                         plotmodel,
-                        threshold=threshold,
+                        threshold=highlight_threshold,
                         draw_threshold_line=draw_threshold_line,
                         base_size=single_scatter_size,
                         marker=single_marker,
@@ -11889,7 +11896,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 _overlay_postgwas_manhattan_hits(
                     ax,
                     plotmodel,
-                    threshold=threshold,
+                    threshold=highlight_threshold,
                     draw_threshold_line=draw_threshold_line,
                     base_size=single_scatter_size,
                     marker=single_marker,

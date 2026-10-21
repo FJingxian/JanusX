@@ -46,6 +46,65 @@ def _load_openblas_cdll(libpath: str) -> ctypes.CDLL:
     return ctypes.CDLL(libpath)
 
 
+def _validate_macos_extension_bundle_links(
+    extension: str,
+    deps: list[str],
+    libs_dir: str,
+    dylib_names: set[str],
+) -> bool:
+    relative_bundle_dir = Path(
+        os.path.relpath(libs_dir, os.path.dirname(extension))
+    ).as_posix()
+    bundled_dep_prefix = f"@loader_path/{relative_bundle_dir}/"
+    has_bundled_dependency = False
+    for dep in deps:
+        if Path(dep).name == os.path.basename(extension):
+            # `otool -L` also prints the extension's own LC_ID_DYLIB entry.
+            continue
+        if dep.startswith("/usr/lib/") or dep.startswith("/System/Library/"):
+            continue
+        dep_name = Path(dep).name
+        if dep_name not in dylib_names:
+            raise RuntimeError(
+                f"JanusX extension {os.path.basename(extension)} references "
+                f"non-system dylib not bundled in the wheel: {dep}"
+            )
+        expected = f"{bundled_dep_prefix}{dep_name}"
+        if dep != expected:
+            raise RuntimeError(
+                f"JanusX extension {os.path.basename(extension)} must load "
+                f"{dep_name} from the wheel bundle ({expected}), got {dep}"
+            )
+        has_bundled_dependency = True
+    return has_bundled_dependency
+
+
+def _otool_deps(path: str) -> list[str]:
+    proc = subprocess.run(
+        ["otool", "-L", path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=True,
+    )
+    lines = [ln.strip() for ln in (proc.stdout or "").splitlines()[1:]]
+    out: list[str] = []
+    for ln in lines:
+        if ln:
+            out.append(ln.split(" (", 1)[0].strip())
+    id_proc = subprocess.run(
+        ["otool", "-D", path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=True,
+    )
+    id_lines = [ln.strip() for ln in (id_proc.stdout or "").splitlines()[1:] if ln.strip()]
+    if id_lines and out and out[0] == id_lines[0]:
+        out.pop(0)
+    return out
+
+
 def _check_macos_bundled_openblas_signature_and_probe_load() -> None:
     if sys.platform != "darwin":
         raise RuntimeError("--check-macos-bundled-openblas only supports macOS runners")
@@ -74,21 +133,32 @@ def _check_macos_bundled_openblas_signature_and_probe_load() -> None:
                 f"codesign verification failed for {dylib}: {detail}"
             )
 
-    def _otool_deps(path: str) -> list[str]:
-        proc = subprocess.run(
-            ["otool", "-L", path],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=True,
+    extension_paths = sorted(str(path) for path in Path(pkg_dir).rglob("*.so"))
+    if not extension_paths:
+        raise RuntimeError(f"no JanusX extension modules found under {pkg_dir}")
+    for extension in extension_paths:
+        has_bundled_dependency = _validate_macos_extension_bundle_links(
+            extension,
+            _otool_deps(extension),
+            libs_dir,
+            dylib_names,
         )
-        lines = [ln.strip() for ln in (proc.stdout or "").splitlines()[1:]]
-        out: list[str] = []
-        for ln in lines:
-            if not ln:
-                continue
-            out.append(ln.split(" (", 1)[0].strip())
-        return out
+        if has_bundled_dependency:
+            proc = subprocess.run(
+                [codesign_bin, "--verify", "--verbose=2", extension],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            print(
+                "[check_installed_runtime] codesign_verify="
+                f"{os.path.basename(extension)} rc={proc.returncode}"
+            )
+            if proc.returncode != 0:
+                detail = (proc.stdout or "").strip()
+                raise RuntimeError(
+                    f"codesign verification failed for {extension}: {detail}"
+                )
 
     libopenblas_path = _find_bundled_openblas()
     if os.path.basename(libopenblas_path) not in dylib_names:
@@ -165,8 +235,8 @@ def main() -> int:
         action="store_true",
         default=False,
         help=(
-            "On macOS, verify codesign for bundled janusx.libs/*.dylib and probe "
-            "ctypes.CDLL load for bundled OpenBLAS."
+            "On macOS, verify wheel-local extension dylib links, codesign for "
+            "bundled dylibs, and probe ctypes.CDLL load for bundled OpenBLAS."
         ),
     )
     args = parser.parse_args()

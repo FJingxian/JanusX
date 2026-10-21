@@ -360,6 +360,38 @@ def _is_macos_system_lib(dep: str) -> bool:
     return dep.startswith("/usr/lib/") or dep.startswith("/System/Library/")
 
 
+def _run_macos_install_name_tool(args: list[str]) -> None:
+    try:
+        subprocess.run(
+            ["install_name_tool", *args],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        out = str(exc.stderr or exc.stdout or "").strip()
+        raise RuntimeError(f"install_name_tool failed: {' '.join(args)}; {out}") from exc
+
+
+def _codesign_macos_binary(path: Path) -> None:
+    # install_name_tool mutates Mach-O load commands and invalidates signatures.
+    cmd = ["/usr/bin/codesign", "--force", "--sign", "-", str(path)]
+    if not Path(cmd[0]).is_file():
+        cmd[0] = "codesign"
+    try:
+        subprocess.run(
+            cmd,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        out = str(exc.stderr or exc.stdout or "").strip()
+        raise RuntimeError(f"codesign failed for {path.name}: {out}") from exc
+
+
 def _resolve_macos_otool_dep(
     dep: str,
     *,
@@ -540,41 +572,6 @@ def _rewrite_macos_dylib_install_names(extract_root: Path, rel_paths: list[Path]
         if len(omp_candidates) > 0:
             omp_canonical_name = omp_candidates[0]
 
-    def _run_install_name_tool(args: list[str]) -> None:
-        try:
-            subprocess.run(
-                ["install_name_tool", *args],
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-        except subprocess.CalledProcessError as exc:
-            out = str(exc.stderr or exc.stdout or "").strip()
-            raise RuntimeError(
-                f"install_name_tool failed: {' '.join(args)}; {out}"
-            ) from exc
-
-    def _run_codesign(path: Path) -> None:
-        # install_name_tool mutates Mach-O load commands and invalidates the
-        # existing signature; re-sign ad-hoc so dlopen() will not be killed.
-        cmd = ["/usr/bin/codesign", "--force", "--sign", "-", str(path)]
-        if not Path(cmd[0]).is_file():
-            cmd[0] = "codesign"
-        try:
-            subprocess.run(
-                cmd,
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-        except subprocess.CalledProcessError as exc:
-            out = str(exc.stderr or exc.stdout or "").strip()
-            raise RuntimeError(
-                f"codesign failed for {path.name}: {out}"
-            ) from exc
-
     # Normalize dylib id so dependencies can resolve from wheel-local directory.
     for lib in dylibs:
         id_name = lib.name
@@ -582,7 +579,7 @@ def _rewrite_macos_dylib_install_names(extract_root: Path, rel_paths: list[Path]
         # This prevents accidental double-loading of the same runtime family.
         if omp_canonical_name is not None and _is_omp_family(lib.name):
             id_name = omp_canonical_name
-        _run_install_name_tool(["-id", f"@loader_path/{id_name}", str(lib)])
+        _run_macos_install_name_tool(["-id", f"@loader_path/{id_name}", str(lib)])
 
     # Rewrite intra-bundle references to @loader_path/<name>.
     for lib in dylibs:
@@ -591,17 +588,56 @@ def _rewrite_macos_dylib_install_names(extract_root: Path, rel_paths: list[Path]
             if omp_canonical_name is not None and _is_omp_family(dep_name):
                 replacement = f"@loader_path/{omp_canonical_name}"
                 if dep != replacement:
-                    _run_install_name_tool(["-change", dep, replacement, str(lib)])
+                    _run_macos_install_name_tool(["-change", dep, replacement, str(lib)])
                 continue
             if dep_name not in by_name:
                 continue
             replacement = f"@loader_path/{dep_name}"
             if dep == replacement:
                 continue
-            _run_install_name_tool(["-change", dep, replacement, str(lib)])
+            _run_macos_install_name_tool(["-change", dep, replacement, str(lib)])
 
     for lib in dylibs:
-        _run_codesign(lib)
+        _codesign_macos_binary(lib)
+
+
+def _rewrite_macos_extension_install_names(
+    extract_root: Path,
+    bundled_rel_paths: list[Path],
+) -> None:
+    if sys.platform != "darwin" or len(bundled_rel_paths) == 0:
+        return
+
+    bundled_by_name = {
+        rel.name: rel
+        for rel in bundled_rel_paths
+        if rel.suffix.lower() == ".dylib"
+    }
+    if not bundled_by_name:
+        return
+
+    package_dir = extract_root / "janusx"
+    extensions = sorted(package_dir.rglob("*.so")) if package_dir.is_dir() else []
+    if not extensions:
+        raise RuntimeError("macOS wheel contains bundled dylibs but no JanusX extension module")
+
+    for extension in extensions:
+        changed = False
+        for dep in _otool_libraries(extension):
+            bundled_rel = bundled_by_name.get(Path(dep).name)
+            if bundled_rel is None:
+                continue
+            bundled_path = extract_root / bundled_rel
+            relative_dep = Path(os.path.relpath(bundled_path, extension.parent)).as_posix()
+            replacement = f"@loader_path/{relative_dep}"
+            if dep == replacement:
+                continue
+            _run_macos_install_name_tool(
+                ["-change", dep, replacement, str(extension)]
+            )
+            changed = True
+        if changed:
+            _codesign_macos_binary(extension)
 
 
 def _inject_artifacts_into_wheel(
@@ -629,6 +665,7 @@ def _inject_artifacts_into_wheel(
             if rel.as_posix().startswith("janusx.libs/")
         ]
         _rewrite_macos_dylib_install_names(root, mac_rel)
+        _rewrite_macos_extension_install_names(root, mac_rel)
 
         _rewrite_record(root)
 

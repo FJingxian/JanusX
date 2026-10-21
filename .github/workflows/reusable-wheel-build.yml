@@ -100,10 +100,10 @@ jobs:
                   "platform": "macos",
                   "python-version": "3.10",
                   "target": "x86_64-apple-darwin",
-                  "blas_backend": "openblas",
-                  "require_openblas": "1",
-                  "prefer_accelerate": "0",
-                  "expected_backend": "openblas",
+                  "blas_backend": "accelerate",
+                  "require_openblas": "0",
+                  "prefer_accelerate": "1",
+                  "expected_backend": "accelerate",
                   "upload_wheel": "true",
                   "run_smoke_test": "false",
               },
@@ -113,12 +113,12 @@ jobs:
                   "platform": "macos",
                   "python-version": "3.10",
                   "target": "aarch64-apple-darwin",
-                  "blas_backend": "openblas",
-                  "require_openblas": "1",
-                  "prefer_accelerate": "0",
-                  "expected_backend": "openblas",
+                  "blas_backend": "accelerate",
+                  "require_openblas": "0",
+                  "prefer_accelerate": "1",
+                  "expected_backend": "accelerate",
                   "upload_wheel": "true",
-                  "run_smoke_test": "false",
+                  "run_smoke_test": "true",
               },
               {
                   "label": "windows-x86_64",
@@ -175,32 +175,6 @@ jobs:
                   "prefer_accelerate": "0",
                   "expected_backend": "openblas",
                   "upload_wheel": "true",
-                  "run_smoke_test": "false",
-              },
-              {
-                  "label": "macos-x86_64",
-                  "runner": "macos-15-intel",
-                  "platform": "macos",
-                  "python-version": "3.10",
-                  "target": "x86_64-apple-darwin",
-                  "blas_backend": "openblas",
-                  "require_openblas": "1",
-                  "prefer_accelerate": "0",
-                  "expected_backend": "openblas",
-                  "upload_wheel": "false",
-                  "run_smoke_test": "false",
-              },
-              {
-                  "label": "macos-arm64",
-                  "runner": "macos-14",
-                  "platform": "macos",
-                  "python-version": "3.10",
-                  "target": "aarch64-apple-darwin",
-                  "blas_backend": "openblas",
-                  "require_openblas": "1",
-                  "prefer_accelerate": "0",
-                  "expected_backend": "openblas",
-                  "upload_wheel": "false",
                   "run_smoke_test": "false",
               },
               {
@@ -568,28 +542,6 @@ jobs:
             --threads 2 \
             --cv 2 \
             --no-backend-thread-checks
-
-      - name: Verify macOS wheel links OpenBLAS only
-        if: ${{ matrix.platform == 'macos' && matrix.blas_backend == 'openblas' }}
-        shell: bash
-        run: |
-          PY=python
-          command -v python >/dev/null 2>&1 || PY=python3
-          EXT_PATH="$("$PY" - <<'PY'
-          import janusx.janusx as _jx
-          print(_jx.__file__)
-          PY
-          )"
-          echo "[janusx] extension path: ${EXT_PATH}"
-          otool -L "${EXT_PATH}"
-          if ! otool -L "${EXT_PATH}" | grep -qi "libopenblas"; then
-            echo "ERROR: Expected OpenBLAS linkage in macOS wheel."
-            exit 1
-          fi
-          if otool -L "${EXT_PATH}" | grep -q "Accelerate.framework"; then
-            echo "ERROR: Accelerate linkage detected in macOS wheel; expected OpenBLAS-only runtime path."
-            exit 1
-          fi
 
       - name: Verify macOS wheel links Accelerate only
         if: ${{ matrix.platform == 'macos' && matrix.blas_backend == 'accelerate' }}

@@ -39,7 +39,7 @@ use crate::decode::{
 use crate::gfcore;
 use crate::gfcore::BimChunkReader;
 use crate::gfreader::{evaluate_packed_bed_row_qc, is_simple_snp_allele};
-use crate::gload::WindowedBedMatrix;
+use crate::gload::{PackedBedSourceReader, WindowedBedMatrix};
 use crate::kmer::KfileAssocSource;
 use crate::linalg::{
     chi2_sf_df1, cholesky_gram_inplace, cholesky_logdet, cholesky_solve_into, normal_sf,
@@ -790,6 +790,67 @@ fn fvlmm_bed_stage_timing_enabled() -> bool {
     env_truthy("JX_FVLMM_BED_STAGE_TIMING")
 }
 
+#[inline]
+fn choose_fvlmm_bed_pread(value: Option<&str>) -> bool {
+    match value.map(|raw| raw.trim().to_ascii_lowercase()) {
+        None => true,
+        Some(raw) => !matches!(raw.as_str(), "0" | "false" | "no" | "off"),
+    }
+}
+
+#[inline]
+fn fvlmm_bed_pread_enabled() -> bool {
+    choose_fvlmm_bed_pread(std::env::var("JX_FVLMM_BED_PREAD").ok().as_deref())
+}
+
+#[inline]
+fn fvlmm_prepared_scan_chunk_end(
+    source_rows: &[usize],
+    chunk_start: usize,
+    nominal_chunk_end: usize,
+    max_source_span: usize,
+) -> usize {
+    if chunk_start >= nominal_chunk_end || chunk_start >= source_rows.len() {
+        return nominal_chunk_end.min(source_rows.len());
+    }
+    let first_row = source_rows[chunk_start];
+    let max_span = max_source_span.max(1);
+    let mut chunk_end = chunk_start;
+    while chunk_end < nominal_chunk_end.min(source_rows.len())
+        && source_rows[chunk_end].saturating_sub(first_row) < max_span
+    {
+        chunk_end += 1;
+    }
+    chunk_end.max(chunk_start + 1)
+}
+
+fn fvlmm_read_packed_source_block<'a>(
+    reader: &mut PackedBedSourceReader,
+    source_start: usize,
+    source_end: usize,
+    packed: &'a mut [u8],
+) -> Result<&'a [u8], String> {
+    let rows = source_end
+        .checked_sub(source_start)
+        .ok_or_else(|| "BED source range end precedes start".to_string())?;
+    let byte_len = rows
+        .checked_mul(reader.bytes_per_snp())
+        .ok_or_else(|| "BED source range byte length overflow".to_string())?;
+    if packed.len() < byte_len {
+        return Err(format!(
+            "packed BED buffer is too small: got {}, need {byte_len}",
+            packed.len()
+        ));
+    }
+    let got = reader.read_source_block(source_start, rows, &mut packed[..byte_len])?;
+    if got != rows {
+        return Err(format!(
+            "BED source block length mismatch: got {got}, expected {rows}"
+        ));
+    }
+    Ok(&packed[..byte_len])
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_fvlmm_bed_stage_timing(
     total_nanos: u64,
@@ -802,6 +863,7 @@ fn emit_fvlmm_bed_stage_timing(
     n: usize,
     p: usize,
     block_rows: usize,
+    bed_source: &str,
     threads: usize,
     proj_threads: usize,
     assoc_threads: usize,
@@ -825,7 +887,7 @@ fn emit_fvlmm_bed_stage_timing(
         (accounted_nanos as f64) / (total_nanos as f64)
     };
     eprintln!(
-        "FvLMM BED timing: decode={:.3}s ({:.1}%), projection={:.3}s ({:.1}%), association={:.3}s ({:.1}%), tsv={:.3}s ({:.1}%), other={:.3}s ({:.1}%), total={:.3}s, active_over_wall={:.2}x, rows_scanned={}, rows_written={}, n={}, p={}, block_rows={}, backend={}, threads={}, proj_threads={}, assoc_threads={}, pipeline={}",
+        "FvLMM BED timing: decode={:.3}s ({:.1}%), projection={:.3}s ({:.1}%), association={:.3}s ({:.1}%), tsv={:.3}s ({:.1}%), other={:.3}s ({:.1}%), total={:.3}s, active_over_wall={:.2}x, rows_scanned={}, rows_written={}, n={}, p={}, block_rows={}, bed_source={}, backend={}, threads={}, proj_threads={}, assoc_threads={}, pipeline={}",
         (decode_nanos as f64) * 1e-9,
         pct(decode_nanos),
         (projection_nanos as f64) * 1e-9,
@@ -843,6 +905,7 @@ fn emit_fvlmm_bed_stage_timing(
         n,
         p,
         block_rows,
+        bed_source,
         rust_sgemm_backend_tag(),
         threads,
         proj_threads,
@@ -854,9 +917,58 @@ fn emit_fvlmm_bed_stage_timing(
 #[cfg(test)]
 mod tests {
     use super::{
-        choose_fvlmm_blas_tile_rows, fvlmm_bed_other_nanos,
+        choose_fvlmm_bed_pread, choose_fvlmm_blas_tile_rows, fvlmm_bed_other_nanos,
+        fvlmm_prepared_scan_chunk_end, fvlmm_read_packed_source_block,
         normalize_default_assoc_threads_for_backend, rotate_finalize_pipeline_default_for_backend,
     };
+    use crate::gload::PackedBedSourceReader;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn fvlmm_bed_pread_defaults_on_and_can_be_disabled() {
+        assert!(choose_fvlmm_bed_pread(None));
+        assert!(choose_fvlmm_bed_pread(Some("1")));
+        assert!(choose_fvlmm_bed_pread(Some("true")));
+        assert!(!choose_fvlmm_bed_pread(Some("0")));
+        assert!(!choose_fvlmm_bed_pread(Some(" false ")));
+        assert!(!choose_fvlmm_bed_pread(Some("off")));
+        assert!(choose_fvlmm_bed_pread(Some("unexpected")));
+    }
+
+    #[test]
+    fn prepared_scan_chunks_bound_sparse_source_row_span() {
+        let rows = [10, 11, 14, 18, 25, 26, 41];
+        assert_eq!(fvlmm_prepared_scan_chunk_end(&rows, 0, 7, 8), 3);
+        assert_eq!(fvlmm_prepared_scan_chunk_end(&rows, 3, 7, 8), 5);
+        assert_eq!(fvlmm_prepared_scan_chunk_end(&rows, 4, 7, 8), 6);
+        assert_eq!(fvlmm_prepared_scan_chunk_end(&rows, 6, 7, 8), 7);
+    }
+
+    #[test]
+    fn packed_source_reader_fills_exact_bed_row_range() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("janusx_fvlmm_pread_{stamp}"));
+        fs::create_dir_all(&dir).expect("create temporary BED directory");
+        let prefix = dir.join("tiny");
+        fs::write(
+            prefix.with_extension("bed"),
+            [0x6c, 0x1b, 0x01, 0x31, 0x72, 0xB4, 0xA5],
+        )
+        .expect("write BED fixture");
+
+        let mut reader = PackedBedSourceReader::open(prefix.to_str().unwrap(), 4)
+            .expect("open direct packed BED source");
+        let mut out = [0u8; 4];
+        let packed = fvlmm_read_packed_source_block(&mut reader, 1, 4, &mut out)
+            .expect("read source rows [1, 4)");
+        assert_eq!(packed, [0x72, 0xB4, 0xA5]);
+
+        fs::remove_dir_all(dir).expect("remove temporary BED directory");
+    }
 
     #[test]
     fn openblas_caps_default_assoc_threads_to_proj_threads() {
@@ -1137,6 +1249,7 @@ struct SnpCounts {
 /// Double-buffer for the streaming BED → TSV pipeline.
 struct StreamingChunk {
     // Stage 1 output: count + decode
+    packed_block: Vec<u8>,
     g_block: Vec<f32>,
     miss_block: Vec<usize>,
     indices: Vec<usize>,
@@ -1157,8 +1270,19 @@ struct StreamingChunk {
 }
 
 impl StreamingChunk {
-    fn new(capacity: usize, n: usize, out_cols: usize) -> Self {
+    fn new(
+        capacity: usize,
+        n: usize,
+        out_cols: usize,
+        bytes_per_snp: usize,
+        retain_packed: bool,
+    ) -> Self {
         Self {
+            packed_block: if retain_packed {
+                vec![0u8; capacity.saturating_mul(bytes_per_snp)]
+            } else {
+                Vec::new()
+            },
             g_block: vec![0.0_f32; capacity.saturating_mul(n)],
             miss_block: vec![0usize; capacity],
             indices: Vec::with_capacity(capacity),
@@ -2658,12 +2782,30 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                 return Err("bytes_per_snp is zero".to_string());
             }
             let bed_path = format!("{bed_prefix_owned}.bed");
-            let mut bed_window = if let Some(window_mb) = mmap_window_mb.filter(|&v| v > 0) {
-                Some(WindowedBedMatrix::open(&bed_prefix_owned, window_mb)?)
+            // Experimental path for network-backed BED files: explicit
+            // source-order reads avoid faulting mmap pages from Rayon QC tasks.
+            // The existing two-buffer pipeline reuses one packed buffer per
+            // StreamingChunk, so read-ahead overlaps this I/O with projection
+            // and association of the previous block.
+            let use_pread_bed = fvlmm_bed_pread_enabled();
+            let mut bed_window = if !use_pread_bed {
+                if let Some(window_mb) = mmap_window_mb.filter(|&v| v > 0) {
+                    Some(WindowedBedMatrix::open(&bed_prefix_owned, window_mb)?)
+                } else {
+                    None
+                }
             } else {
                 None
             };
-            let full_mmap = if bed_window.is_none() {
+            let mut packed_reader = if use_pread_bed {
+                Some(PackedBedSourceReader::open(
+                    &bed_prefix_owned,
+                    n_samples_full,
+                )?)
+            } else {
+                None
+            };
+            let full_mmap = if bed_window.is_none() && !use_pread_bed {
                 let bed_file =
                     File::open(&bed_path).map_err(|e| format!("open {bed_path}: {e}"))?;
                 let mmap =
@@ -2681,7 +2823,9 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
             } else {
                 None
             };
-            let n_snps = if let Some(window) = bed_window.as_ref() {
+            let n_snps = if let Some(reader) = packed_reader.as_ref() {
+                reader.n_snps()
+            } else if let Some(window) = bed_window.as_ref() {
                 window.n_source_snps()
             } else {
                 let mmap = full_mmap
@@ -2758,6 +2902,13 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
             let stage_projection_nanos = AtomicU64::new(0);
             let stage_association_nanos = AtomicU64::new(0);
             let stage_tsv_nanos = AtomicU64::new(0);
+            let bed_source_mode = if use_pread_bed {
+                "pread"
+            } else if bed_window.is_some() {
+                "windowed-mmap"
+            } else {
+                "mmap"
+            };
 
             let scan_chunk_snps = rotate_block_rows.max(1).min(total_scan_units.max(1));
 
@@ -2802,7 +2953,22 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                 }
                 let decode_t0 = stage_timing.then(Instant::now);
                 chunk.clear();
-                let chunk_end = (chunk_start + scan_chunk_snps).min(total_scan_units);
+                let nominal_chunk_end = (chunk_start + scan_chunk_snps).min(total_scan_units);
+                let chunk_end = if use_pread_bed {
+                    prepared_meta
+                        .as_ref()
+                        .map(|(source_rows, _, _, _)| {
+                            fvlmm_prepared_scan_chunk_end(
+                                source_rows,
+                                chunk_start,
+                                nominal_chunk_end,
+                                scan_chunk_snps,
+                            )
+                        })
+                        .unwrap_or(nominal_chunk_end)
+                } else {
+                    nominal_chunk_end
+                };
                 let prepared_batch = prepared_meta.as_ref().map(
                     |(source_rows, row_flip_all, row_maf_all, miss_count_all)| {
                         (
@@ -2817,12 +2983,44 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                     .as_ref()
                     .and_then(|(source_rows, _, _, _)| source_rows.first().copied());
                 let prepared_uses_window = prepared_batch.is_some() && bed_window.is_some();
-                let chunk_packed = if let Some((source_rows, _, _, _)) = prepared_batch.as_ref() {
-                    if source_rows.is_empty() {
-                        chunk.scanned_to = chunk_end;
-                        chunk_start = chunk_end;
-                        return chunk_start < total_scan_units;
+                if prepared_batch
+                    .as_ref()
+                    .is_some_and(|(source_rows, _, _, _)| source_rows.is_empty())
+                {
+                    chunk.scanned_to = chunk_end;
+                    chunk_start = chunk_end;
+                    return chunk_start < total_scan_units;
+                }
+                let chunk_packed: &[u8] = if use_pread_bed {
+                    let (source_start, source_end) = match prepared_batch.as_ref() {
+                        Some((source_rows, _, _, _)) => (
+                            source_rows[0],
+                            source_rows[source_rows.len() - 1].saturating_add(1),
+                        ),
+                        None => (chunk_start, chunk_end),
+                    };
+                    let reader = match packed_reader.as_mut() {
+                        Some(reader) => reader,
+                        None => {
+                            let _ = producer_err_bg.set(
+                                "internal error: missing packed BED source reader".to_string(),
+                            );
+                            return false;
+                        }
+                    };
+                    match fvlmm_read_packed_source_block(
+                        reader,
+                        source_start,
+                        source_end,
+                        &mut chunk.packed_block,
+                    ) {
+                        Ok(slice) => slice,
+                        Err(e) => {
+                            let _ = producer_err_bg.set(e);
+                            return false;
+                        }
                     }
+                } else if let Some((source_rows, _, _, _)) = prepared_batch.as_ref() {
                     match bed_window.as_mut() {
                         Some(window) => {
                             match window.prepare_source_rows(source_rows, &mut rel_row_indices) {
@@ -3116,7 +3314,7 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
 
             crate::pipeline::run_double_buffer(
                 2,
-                || StreamingChunk::new(scan_chunk_snps, n, out_cols),
+                || StreamingChunk::new(scan_chunk_snps, n, out_cols, bytes_per_snp, use_pread_bed),
                 producer,
                 consumer,
             )?;
@@ -3155,6 +3353,7 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                     n,
                     p,
                     scan_chunk_snps,
+                    bed_source_mode,
                     threads,
                     proj_threads,
                     assoc_threads,

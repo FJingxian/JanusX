@@ -25,6 +25,8 @@ mod bayesr;
 mod bsa;
 #[path = "stats/bstats.rs"]
 mod bstats;
+#[path = "ct/mod.rs"]
+mod ct;
 #[path = "decode/decode.rs"]
 mod decode;
 #[path = "stats/farmcpu.rs"]
@@ -1065,6 +1067,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(nj_newick_from_alignment_u8, m)?)?;
     m.add_function(wrap_pyfunction!(nj_newick_from_distance_matrix, m)?)?;
     m.add_function(wrap_pyfunction!(ml_newick_from_alignment_u8, m)?)?;
+    ct::output::register_py(m)?;
     phylo::register_py(m)?;
     Ok(())
 }

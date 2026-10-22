@@ -115,6 +115,7 @@ _CLI_MODULE_SECTIONS = [
         "Genome-wide Association Studies (GWAS)",
         [
             ("gwas", "Run genome-wide association analysis"),
+            ("ct", "Test cis/trans effects for nearby phased variant pairs"),
             ("postgwas", "Post-process GWAS results and downstream plots"),
         ],
     ),
@@ -156,7 +157,7 @@ _CLI_MODULE_SECTIONS = [
 ]
 
 _MODULE_NAMES = [
-    "gwas", "fvlmm2", "postgwas", "postgarfield", "postbsa",
+    "gwas", "ct", "fvlmm2", "postgwas", "postgarfield", "postbsa",
     "garfield", "grm", "pca", "gstats", "gs", "reml", "postgs",
     "sim", "simulation", "gblupbench", "garfieldbench", "fastpop", "adamixture", "tree", "gformat", "gmerge", "hybrid", "webui",
     "fastq2vcf", "fastq2count", "kmer", "kmerge", "kstats", "kformat", "view", "treeplot", "refcheck",

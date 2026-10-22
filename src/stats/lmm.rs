@@ -1247,7 +1247,7 @@ where
     }
     let bed_path = format!("{bed_prefix}.bed");
     let mut bed_window = if let Some(window_mb) = mmap_window_mb.filter(|&v| v > 0) {
-        Some(WindowedBedMatrix::open(bed_prefix, window_mb)?)
+        Some(WindowedBedMatrix::open_lm_lmm(bed_prefix, window_mb)?)
     } else {
         None
     };

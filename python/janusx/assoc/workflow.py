@@ -15,9 +15,10 @@ Models:
 Execution mode (automatic)
 --------------------------
   - No explicit "low-memory" flag is required.
-  - Default: LM/LMM/FvLMM run in memmap BED mode.
+  - Sequential LM/LM2/LMM/LMM2 BED scans use bounded PREAD buffers by default
+    (set JX_LM_LMM_BED_PREAD=0 to retain the windowed mmap reader).
   - Packed BED preload is reserved for FarmCPU and ALGWAS.
-  - LM/LMM/FvLMM/SparseLMM stay on memmap / streaming BED routes.
+  - FvLMM and SparseLMM remain on their existing streaming/mmap BED routes.
   - FarmCPU runs on the packed BED controller and no longer maintains a Python fallback.
 
 Caching
@@ -7921,7 +7922,10 @@ def parse_args(argv: Optional[list[str]] = None):
     models_group = parser.add_argument_group("Model Arguments (Required: Select at least one)")
     models_group.add_argument(
         "-lm", "--lm", action="store_true", default=False,
-        help="Run the linear model (memmap, low-memory; default: %(default)s).",
+        help=(
+            "Run the linear model (low-memory sequential PREAD scan by default; "
+            "set JX_LM_LMM_BED_PREAD=0 to use windowed mmap; default: %(default)s)."
+        ),
     )
     if enable_lm2_arg:
         models_group.add_argument(
@@ -7938,7 +7942,10 @@ def parse_args(argv: Optional[list[str]] = None):
         )
     models_group.add_argument(
         "-lmm", "--lmm", action="store_true", default=False,
-        help="Run the linear mixed model (memmap, low-memory; default: %(default)s).",
+        help=(
+            "Run the linear mixed model (low-memory sequential PREAD scan by default; "
+            "set JX_LM_LMM_BED_PREAD=0 to use windowed mmap; default: %(default)s)."
+        ),
     )
     if enable_lmm2_arg:
         models_group.add_argument(
@@ -8813,6 +8820,9 @@ def _run_gwas_pipeline(
         qcov_needs_grm = _gwas_qcov_prefers_grm_route(args.qcov, int(len(preinspect_ids)))
 
     if log:
+        lm_lmm_pread_requested = bool(
+            set(requested_stream_models) & {"lm", "lm2", "lmm", "lmm2"}
+        )
         packed_auto_mode = bool(fast_mode)
         packed_route_status_preflight = _format_gwas_packed_route_status(
             gfile=str(gfile),
@@ -8828,14 +8838,23 @@ def _run_gwas_pipeline(
         )
         if file_fast_rust_mode:
             bed_backend_policy = (
-                "mixed (memmap default; packed only for FarmCPU/ALGWAS; FILE->BED cache)"
+                "mixed (PREAD for sequential LM/LMM scans; packed for FarmCPU/ALGWAS; FILE->BED cache)"
+                if lm_lmm_pread_requested
+                else "mixed (memmap default; packed only for FarmCPU/ALGWAS; FILE->BED cache)"
             )
         else:
-            bed_backend_policy = (
-                "mixed (memmap default; packed only for FarmCPU/ALGWAS)"
-                if packed_auto_mode
-                else "memmap (default)"
-            )
+            if packed_auto_mode:
+                bed_backend_policy = (
+                    "mixed (PREAD for sequential LM/LMM scans; packed for FarmCPU/ALGWAS)"
+                    if lm_lmm_pread_requested
+                    else "mixed (memmap default; packed only for FarmCPU/ALGWAS)"
+                )
+            else:
+                bed_backend_policy = (
+                    "PREAD for sequential LM/LMM scans; mmap for other BED paths"
+                    if lm_lmm_pread_requested
+                    else "memmap (default)"
+                )
         cfg_rows: list[tuple[str, object]] = [
             ("Genotype file", gfile),
             ("Phenotype file", args.pheno),
@@ -9037,23 +9056,40 @@ def _run_gwas_pipeline(
     input_is_bed = _as_plink_prefix(gfile) is not None
     memmap_mode = bool(standard_stream_models_requested or (not bool(fast_mode)))
     mmap_limit_effective = bool(memmap_mode)
+    lm_lmm_pread_requested = bool(
+        set(requested_stream_models) & {"lm", "lm2", "lmm", "lmm2"}
+    )
     _append_advanced_note(
         "FILE packed backend policy: Rust packed/stream via PLINK cache."
         if file_fast_rust_mode
         else (
-            "BED backend policy: mixed; memmap default, packed reserved for FarmCPU/ALGWAS."
+            "BED backend policy: mixed; PREAD for sequential LM/LMM scans, packed for FarmCPU/ALGWAS, mmap retained for other BED paths."
+            if fast_mode and lm_lmm_pread_requested
+            else "BED backend policy: mixed; memmap default, packed reserved for FarmCPU/ALGWAS."
             if fast_mode
+            else "BED backend policy: PREAD for sequential LM/LMM scans; mmap retained for other BED paths."
+            if lm_lmm_pread_requested
             else "BED backend policy: memmap (default)."
         )
     )
     if memmap_mode:
-        _append_advanced_note(
-            "Default memmap route enabled: stream-aligned windowed mmap will be used on BED/cache input "
-            "(no temporary mmapbed.* PLINK cache will be created)."
-        )
+        if lm_lmm_pread_requested:
+            _append_advanced_note(
+                "Sequential LM/LMM BED scans use positioned reads into reusable chunk buffers; "
+                "mmap remains available to other BED routes (no temporary mmapbed.* PLINK cache will be created)."
+            )
+        else:
+            _append_advanced_note(
+                "Default memmap route enabled: stream-aligned windowed mmap will be used on BED/cache input "
+                "(no temporary mmapbed.* PLINK cache will be created)."
+            )
     if (not input_is_bed) and memmap_mode:
         _append_advanced_note(
-            "Input is not direct PLINK BED; memmap route will apply after source conversion/cache to BED."
+            (
+                "Input is not direct PLINK BED; the sequential LM/LMM positioned-read route will apply after source conversion/cache to BED."
+                if lm_lmm_pread_requested
+                else "Input is not direct PLINK BED; memmap route will apply after source conversion/cache to BED."
+            )
         )
     if _gwas_splmm_requested(args) and (not bool(fast_mode)):
         _append_advanced_note(

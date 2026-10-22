@@ -535,7 +535,7 @@ pub fn lm2_stream_bed_to_tsv(
     py.detach(move || -> PyResult<(usize, usize)> {
         let mut bim_reader = BimChunkReader::open(&norm_prefix).map_err(PyRuntimeError::new_err)?;
         let mut bed_window =
-            WindowedBedMatrix::open(&norm_prefix, mmap_window_mb.unwrap_or(512usize))
+            WindowedBedMatrix::open_lm_lmm(&norm_prefix, mmap_window_mb.unwrap_or(512usize))
                 .map_err(PyRuntimeError::new_err)?;
         let n_snps = bed_window.n_source_snps();
         let bytes_per_snp = bed_window.bytes_per_snp();

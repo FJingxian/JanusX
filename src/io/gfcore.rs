@@ -10,7 +10,7 @@ use crate::binsidecar::{
     BIN_SITE_HEADER_LEN, BIN_SITE_MAGIC, LEGACY_BSITE_HEADER_LEN, LEGACY_BSITE_MAGIC,
     LEGACY_BSITE_VERSION,
 };
-use crate::gload::load_file_owned;
+use crate::gload::{load_file_owned, read_file_exact_at};
 use flate2::read::MultiGzDecoder;
 use memmap2::{Mmap, MmapOptions};
 
@@ -1951,11 +1951,13 @@ pub struct BedSnpIter {
     pub prefix: String,
     pub samples: Vec<String>,
     pub sites: Vec<SiteInfo>,
-    mmap: Mmap,
+    mmap: Option<Mmap>,
     mmap_offset: usize,
     window_snps: Option<usize>,
     window_start_snp: usize,
     window_len_snps: usize,
+    pread: bool,
+    pread_buffer: Vec<u8>,
     bed_len: usize,
     bed_file: Option<File>,
     n_samples: usize,
@@ -2044,11 +2046,13 @@ impl BedSnpIter {
             prefix: prefix.to_string(),
             samples,
             sites,
-            mmap,
+            mmap: Some(mmap),
             mmap_offset: 0,
             window_snps: None,
             window_start_snp: 0,
             window_len_snps: n_snps,
+            pread: false,
+            pread_buffer: Vec::new(),
             bed_len,
             bed_file: None,
             n_samples,
@@ -2095,11 +2099,65 @@ impl BedSnpIter {
             prefix: prefix.to_string(),
             samples,
             sites,
-            mmap,
+            mmap: Some(mmap),
             mmap_offset,
             window_snps: Some(window_snps),
             window_start_snp: 0,
             window_len_snps,
+            pread: false,
+            pread_buffer: Vec::new(),
+            bed_len,
+            bed_file: Some(file),
+            n_samples,
+            n_snps,
+            bytes_per_snp,
+            cur: 0,
+            maf,
+            miss,
+            fill_missing,
+            apply_het_filter,
+            het_threshold,
+        })
+    }
+
+    /// Sequential BED iterator backed by reusable positioned-read buffers.
+    pub fn new_with_fill_pread_window(
+        prefix: &str,
+        maf: f32,
+        miss: f32,
+        fill_missing: bool,
+        apply_het_filter: bool,
+        het_threshold: f32,
+        window_mb: usize,
+    ) -> Result<Self, String> {
+        if window_mb == 0 {
+            return Err("window_mb must be > 0".into());
+        }
+        let samples = read_fam(prefix)?;
+        let sites = read_bim(prefix)?;
+        let n_samples = samples.len();
+        let (file, bed_len, bytes_per_snp, n_snps) =
+            Self::open_bed_and_infer_shape(prefix, n_samples)?;
+        if n_snps != sites.len() {
+            return Err(format!(
+                "BED/BIM SNP count mismatch: bed={n_snps}, bim={}",
+                sites.len()
+            ));
+        }
+        let window_bytes = window_mb.saturating_mul(1024 * 1024);
+        let window_snps = std::cmp::max(1, window_bytes / bytes_per_snp);
+
+        Ok(Self {
+            prefix: prefix.to_string(),
+            samples,
+            sites,
+            mmap: None,
+            mmap_offset: BED_HEADER_LEN,
+            window_snps: Some(window_snps),
+            window_start_snp: 0,
+            window_len_snps: 0,
+            pread: true,
+            pread_buffer: Vec::new(),
             bed_len,
             bed_file: Some(file),
             n_samples,
@@ -2125,11 +2183,13 @@ impl BedSnpIter {
             prefix: prefix.to_string(),
             samples: Vec::new(),
             sites: Vec::new(),
-            mmap,
+            mmap: Some(mmap),
             mmap_offset: 0,
             window_snps: None,
             window_start_snp: 0,
             window_len_snps: n_snps,
+            pread: false,
+            pread_buffer: Vec::new(),
             bed_len,
             bed_file: None,
             n_samples,
@@ -2161,11 +2221,13 @@ impl BedSnpIter {
             prefix: prefix.to_string(),
             samples: Vec::new(),
             sites: Vec::new(),
-            mmap,
+            mmap: Some(mmap),
             mmap_offset,
             window_snps: Some(window_snps),
             window_start_snp: 0,
             window_len_snps,
+            pread: false,
+            pread_buffer: Vec::new(),
             bed_len,
             bed_file: Some(file),
             n_samples,
@@ -2223,6 +2285,27 @@ impl BedSnpIter {
             .bed_file
             .as_ref()
             .ok_or_else(|| "bed_file not set".to_string())?;
+        if self.pread {
+            let data_len = self
+                .bed_len
+                .checked_sub(BED_HEADER_LEN)
+                .ok_or_else(|| "BED too small".to_string())?;
+            let max_snps = data_len / self.bytes_per_snp;
+            if start_snp >= max_snps {
+                return Err("window start SNP out of range".into());
+            }
+            let window_len_snps = (max_snps - start_snp).min(window_snps);
+            let len = window_len_snps.saturating_mul(self.bytes_per_snp);
+            let offset =
+                BED_HEADER_LEN.saturating_add(start_snp.saturating_mul(self.bytes_per_snp));
+            self.pread_buffer.resize(len, 0);
+            read_file_exact_at(file, &mut self.pread_buffer, offset as u64)?;
+            self.mmap = None;
+            self.mmap_offset = offset;
+            self.window_start_snp = start_snp;
+            self.window_len_snps = window_len_snps;
+            return Ok(());
+        }
         let (mmap, mmap_offset, window_len_snps) = Self::map_window(
             file,
             self.bed_len,
@@ -2230,7 +2313,7 @@ impl BedSnpIter {
             window_snps,
             self.bytes_per_snp,
         )?;
-        self.mmap = mmap;
+        self.mmap = Some(mmap);
         self.mmap_offset = mmap_offset;
         self.window_start_snp = start_snp;
         self.window_len_snps = window_len_snps;
@@ -2247,10 +2330,15 @@ impl BedSnpIter {
         }
         let rel = offset.checked_sub(self.mmap_offset)?;
         let end = rel + self.bytes_per_snp;
-        if end > self.mmap.len() {
+        let data = if self.pread {
+            self.pread_buffer.as_slice()
+        } else {
+            self.mmap.as_ref()?.as_ref()
+        };
+        if end > data.len() {
             return None;
         }
-        Some(&self.mmap[rel..end])
+        Some(&data[rel..end])
     }
 
     #[inline]
@@ -2616,6 +2704,16 @@ impl BedSnpIter {
 
     pub fn is_windowed(&self) -> bool {
         self.window_snps.is_some()
+    }
+
+    /// Keep positioned-read storage bounded by the active scan chunk.
+    pub fn set_pread_window_snps(&mut self, max_rows: usize) {
+        if !self.pread || max_rows == 0 {
+            return;
+        }
+        if let Some(window_snps) = self.window_snps.as_mut() {
+            *window_snps = (*window_snps).min(max_rows);
+        }
     }
 
     pub fn ensure_window_for_snp(&mut self, snp_idx: usize) -> Result<(), String> {
@@ -3501,7 +3599,7 @@ impl TxtSnpIter {
 #[cfg(test)]
 mod tests {
     use super::{
-        process_snp_row_with_stats, process_snp_row_with_stats_preserve_alt, read_bim,
+        process_snp_row_with_stats, process_snp_row_with_stats_preserve_alt, read_bim, BedSnpIter,
         BimChunkReader, TxtSnpIter, BIN01_MAGIC, BIN_SITE_MAGIC, LEGACY_BSITE_HEADER_LEN,
         LEGACY_BSITE_MAGIC, LEGACY_BSITE_VERSION,
     };
@@ -3516,6 +3614,66 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("janusx_{prefix}_{stamp}"));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn bed_snp_iter_pread_window_matches_mmap_and_respects_row_capacity() {
+        let dir = make_temp_dir("bed_iter_pread");
+        let prefix = dir.join("toy");
+        fs::write(
+            prefix.with_extension("fam"),
+            "1 1 0 0 1 -9\n2 2 0 0 1 -9\n3 3 0 0 1 -9\n4 4 0 0 1 -9\n",
+        )
+        .unwrap();
+        fs::write(
+            prefix.with_extension("bim"),
+            "1 rs1 0 10 A G\n1 rs2 0 20 C T\n1 rs3 0 30 G A\n1 rs4 0 40 T C\n",
+        )
+        .unwrap();
+        fs::write(
+            prefix.with_extension("bed"),
+            [0x6c, 0x1b, 0x01, 0xE4, 0x39, 0xB4, 0xA5],
+        )
+        .unwrap();
+
+        let mut mmap = BedSnpIter::new_with_fill_window(
+            prefix.to_str().unwrap(),
+            0.0,
+            1.0,
+            false,
+            false,
+            1.0,
+            1,
+        )
+        .unwrap();
+        let mut pread = BedSnpIter::new_with_fill_pread_window(
+            prefix.to_str().unwrap(),
+            0.0,
+            1.0,
+            false,
+            false,
+            1.0,
+            1,
+        )
+        .unwrap();
+        pread.set_pread_window_snps(2);
+        assert!(pread.mmap.is_none());
+
+        for _ in 0..4 {
+            let expected = mmap.next_snp_raw().unwrap();
+            let observed = pread.next_snp_raw().unwrap();
+            assert_eq!(observed.0, expected.0);
+            assert_eq!(observed.1.chrom, expected.1.chrom);
+            assert_eq!(observed.1.pos, expected.1.pos);
+            assert_eq!(observed.1.snp, expected.1.snp);
+            assert_eq!(observed.1.ref_allele, expected.1.ref_allele);
+            assert_eq!(observed.1.alt_allele, expected.1.alt_allele);
+            assert!(pread.pread_buffer.len() <= 2 * pread.bytes_per_snp);
+        }
+
+        assert!(mmap.next_snp_raw().is_none());
+        assert!(pread.next_snp_raw().is_none());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

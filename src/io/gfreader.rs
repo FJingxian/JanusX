@@ -3360,6 +3360,7 @@ impl BedChunkReader {
         model=None,
         het_threshold=None,
         preserve_alt_orientation=None,
+        pread=None,
     ))]
     fn new(
         prefix: String,
@@ -3380,6 +3381,7 @@ impl BedChunkReader {
         model: Option<String>,
         het_threshold: Option<f32>,
         preserve_alt_orientation: Option<bool>,
+        pread: Option<bool>,
     ) -> PyResult<Self> {
         let maf = maf_threshold.unwrap_or(0.0);
         let miss = max_missing_rate.unwrap_or(1.0);
@@ -3387,6 +3389,7 @@ impl BedChunkReader {
         validate_additive_model(model.as_deref(), "model")?;
         let het = het_threshold.unwrap_or(1.0);
         let preserve_alt_orientation = preserve_alt_orientation.unwrap_or(false);
+        let pread = pread.unwrap_or(false);
         if !(0.0..=1.0).contains(&het) {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "het_threshold must be within [0, 1.0]",
@@ -3401,8 +3404,14 @@ impl BedChunkReader {
             ));
         }
         let it = if let Some(window_mb) = mmap_window_mb {
-            BedSnpIter::new_with_fill_window(&prefix, 0.0, 1.0, false, false, het, window_mb)
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?
+            if pread {
+                BedSnpIter::new_with_fill_pread_window(
+                    &prefix, 0.0, 1.0, false, false, het, window_mb,
+                )
+            } else {
+                BedSnpIter::new_with_fill_window(&prefix, 0.0, 1.0, false, false, het, window_mb)
+            }
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?
         } else {
             BedSnpIter::new_with_fill(&prefix, 0.0, 1.0, false, false, het)
                 .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))?
@@ -3482,6 +3491,7 @@ impl BedChunkReader {
         if n == 0 {
             return Ok(None);
         }
+        self.it.set_pread_window_snps(chunk_size);
         let mut data: Vec<f32> = Vec::with_capacity(chunk_size * n);
         let mut sites: Vec<SiteInfo> = Vec::with_capacity(chunk_size);
         let full_samples = self.sample_indices.len() == self.it.n_samples();
@@ -3771,6 +3781,7 @@ impl BedChunkReader {
         if n == 0 {
             return Ok(None);
         }
+        self.it.set_pread_window_snps(chunk_size);
 
         let full_samples = self.sample_indices.len() == self.it.n_samples();
         let windowed_mode = self.it.is_windowed();
@@ -8930,7 +8941,7 @@ impl BedChunkReaderFromMeta {
                 .map(|v| v.ceil().max(1.0_f64) as usize)
             })
             .unwrap_or(128usize);
-        let matrix = WindowedBedMatrix::open(&norm_prefix, window_mb)
+        let matrix = WindowedBedMatrix::open_lm_lmm(&norm_prefix, window_mb)
             .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
         let decode_threads = core::parse_positive_env_usize(&[
             "JX_MLM_RUST_THREADS",
@@ -10579,6 +10590,7 @@ mod tests {
                 None,
                 Some(1.0),
                 Some(true),
+                None,
             )
             .expect("construct windowed BED reader with BIM ranges");
             assert_eq!(reader.n_snps(), 1);

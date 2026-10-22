@@ -234,14 +234,14 @@ fn system_page_size() -> usize {
 }
 
 #[cfg(unix)]
-fn read_file_exact_at(file: &File, buf: &mut [u8], offset: u64) -> Result<(), String> {
+pub(crate) fn read_file_exact_at(file: &File, buf: &mut [u8], offset: u64) -> Result<(), String> {
     use std::os::unix::fs::FileExt;
     file.read_exact_at(buf, offset)
         .map_err(|e| format!("BED positioned read: {e}"))
 }
 
 #[cfg(windows)]
-fn read_file_exact_at(file: &File, buf: &mut [u8], offset: u64) -> Result<(), String> {
+pub(crate) fn read_file_exact_at(file: &File, buf: &mut [u8], offset: u64) -> Result<(), String> {
     use std::os::windows::fs::FileExt;
 
     let mut done = 0usize;
@@ -258,7 +258,7 @@ fn read_file_exact_at(file: &File, buf: &mut [u8], offset: u64) -> Result<(), St
 }
 
 #[cfg(not(any(unix, windows)))]
-fn read_file_exact_at(file: &File, buf: &mut [u8], offset: u64) -> Result<(), String> {
+pub(crate) fn read_file_exact_at(file: &File, buf: &mut [u8], offset: u64) -> Result<(), String> {
     use std::io::{Read, Seek, SeekFrom};
 
     let mut file = file
@@ -601,7 +601,7 @@ impl GenotypeMatrix for StreamingBedMatrix {
 
 #[cfg(test)]
 mod packed_source_tests {
-    use super::PackedBedSourceReader;
+    use super::{choose_lm_lmm_bed_pread, PackedBedSourceReader, WindowedBedMatrix};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -635,11 +635,73 @@ mod packed_source_tests {
 
         fs::remove_dir_all(dir).expect("remove temporary BED directory");
     }
+
+    #[test]
+    fn lm_lmm_pread_switch_defaults_on_and_accepts_explicit_disable() {
+        assert!(choose_lm_lmm_bed_pread(None));
+        assert!(choose_lm_lmm_bed_pread(Some("1")));
+        assert!(choose_lm_lmm_bed_pread(Some(" true ")));
+        assert!(!choose_lm_lmm_bed_pread(Some("0")));
+        assert!(!choose_lm_lmm_bed_pread(Some(" off ")));
+    }
+
+    #[test]
+    fn pread_window_returns_the_same_raw_rows_as_mmap_window() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("janusx_window_pread_{stamp}"));
+        fs::create_dir_all(&dir).expect("create temporary BED directory");
+        let prefix = dir.join("tiny");
+        fs::write(
+            prefix.with_extension("bed"),
+            [0x6c, 0x1b, 0x01, 0x31, 0x72, 0xB4, 0xA5],
+        )
+        .expect("write BED fixture");
+        fs::write(
+            prefix.with_extension("fam"),
+            "1 1 0 0 1 -9\n2 2 0 0 1 -9\n3 3 0 0 1 -9\n4 4 0 0 1 -9\n",
+        )
+        .expect("write FAM fixture");
+
+        let mut mmap =
+            WindowedBedMatrix::open(prefix.to_str().unwrap(), 1).expect("open mmap BED window");
+        let mut pread = WindowedBedMatrix::open_pread(prefix.to_str().unwrap(), 1)
+            .expect("open positioned-read BED window");
+        assert_eq!(
+            mmap.read_source_range(1, 4).unwrap(),
+            pread.read_source_range(1, 4).unwrap()
+        );
+        let mut mmap_rows = Vec::new();
+        let mut pread_rows = Vec::new();
+        let mmap_block = mmap
+            .prepare_source_rows(&[0, 2, 3], &mut mmap_rows)
+            .unwrap()
+            .to_vec();
+        let pread_block = pread
+            .prepare_source_rows(&[0, 2, 3], &mut pread_rows)
+            .unwrap()
+            .to_vec();
+        assert_eq!(pread_rows, mmap_rows);
+        assert_eq!(pread_block, mmap_block);
+
+        fs::remove_dir_all(dir).expect("remove temporary BED directory");
+    }
 }
 
 // ---------------------------------------------------------------------------
-// WindowedBedMatrix — remapped mmap windows for sequential BED scans
+// WindowedBedMatrix — bounded mmap or positioned-read blocks for BED scans
 // ---------------------------------------------------------------------------
+
+/// Use positioned reads for sequential LM/LMM BED scans by default.
+/// Set `JX_LM_LMM_BED_PREAD=0` to retain the windowed mmap reader.
+pub(crate) fn choose_lm_lmm_bed_pread(value: Option<&str>) -> bool {
+    !matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("0" | "false" | "no" | "off")
+    )
+}
 
 #[allow(dead_code)]
 pub struct WindowedBedMatrix {
@@ -647,17 +709,35 @@ pub struct WindowedBedMatrix {
     n_samples_full: usize,
     bytes_per_snp: usize,
     bed_len: usize,
-    mmap: Mmap,
+    mmap: Option<Mmap>,
     mmap_offset: usize,
     window_start_snp: usize,
     window_len_snps: usize,
     target_window_snps: usize,
+    pread: bool,
     scratch: Vec<u8>,
+    pread_buffer: Vec<u8>,
 }
 
 #[allow(dead_code)]
 impl WindowedBedMatrix {
     pub fn open(prefix: &str, mmap_window_mb: usize) -> Result<Self, String> {
+        Self::open_inner(prefix, mmap_window_mb, false)
+    }
+
+    pub fn open_pread(prefix: &str, window_mb: usize) -> Result<Self, String> {
+        Self::open_inner(prefix, window_mb, true)
+    }
+
+    pub fn open_lm_lmm(prefix: &str, window_mb: usize) -> Result<Self, String> {
+        if choose_lm_lmm_bed_pread(std::env::var("JX_LM_LMM_BED_PREAD").ok().as_deref()) {
+            Self::open_pread(prefix, window_mb)
+        } else {
+            Self::open(prefix, window_mb)
+        }
+    }
+
+    fn open_inner(prefix: &str, mmap_window_mb: usize, pread: bool) -> Result<Self, String> {
         if mmap_window_mb == 0 {
             return Err("mmap_window_mb must be > 0".to_string());
         }
@@ -692,8 +772,13 @@ impl WindowedBedMatrix {
         }
         let window_bytes = mmap_window_mb.saturating_mul(1024 * 1024);
         let target_window_snps = std::cmp::max(1, window_bytes / bytes_per_snp);
-        let (mmap, mmap_offset, window_len_snps) =
-            Self::map_window(&file, bed_len, 0, target_window_snps, bytes_per_snp)?;
+        let (mmap, mmap_offset, window_len_snps) = if pread {
+            (None, 0, 0)
+        } else {
+            let (mmap, mmap_offset, window_len_snps) =
+                Self::map_window(&file, bed_len, 0, target_window_snps, bytes_per_snp)?;
+            (Some(mmap), mmap_offset, window_len_snps)
+        };
         Ok(Self {
             file,
             n_samples_full,
@@ -704,7 +789,9 @@ impl WindowedBedMatrix {
             window_start_snp: 0,
             window_len_snps,
             target_window_snps,
+            pread,
             scratch: Vec::new(),
+            pread_buffer: Vec::new(),
         })
     }
 
@@ -716,6 +803,22 @@ impl WindowedBedMatrix {
     /// underlying BED pages remain shared by the operating system.
     pub fn duplicate(&self) -> Result<Self, String> {
         let file = self.file.try_clone().map_err(|e| e.to_string())?;
+        if self.pread {
+            return Ok(Self {
+                file,
+                n_samples_full: self.n_samples_full,
+                bytes_per_snp: self.bytes_per_snp,
+                bed_len: self.bed_len,
+                mmap: None,
+                mmap_offset: 0,
+                window_start_snp: 0,
+                window_len_snps: 0,
+                target_window_snps: self.target_window_snps,
+                pread: true,
+                scratch: Vec::new(),
+                pread_buffer: Vec::new(),
+            });
+        }
         // Every Bayesian scan starts at marker zero.  Do not inherit the
         // caller's last window (which is usually near the end of the BED
         // file), otherwise the worker would immediately remap before its
@@ -732,12 +835,14 @@ impl WindowedBedMatrix {
             n_samples_full: self.n_samples_full,
             bytes_per_snp: self.bytes_per_snp,
             bed_len: self.bed_len,
-            mmap,
+            mmap: Some(mmap),
             mmap_offset,
             window_start_snp: 0,
             window_len_snps,
             target_window_snps: self.target_window_snps,
+            pread: false,
             scratch: Vec::new(),
+            pread_buffer: Vec::new(),
         })
     }
 
@@ -804,7 +909,7 @@ impl WindowedBedMatrix {
             window_snps,
             self.bytes_per_snp,
         )?;
-        self.mmap = mmap;
+        self.mmap = Some(mmap);
         self.mmap_offset = mmap_offset;
         self.window_start_snp = start_snp;
         self.window_len_snps = window_len_snps;
@@ -814,6 +919,20 @@ impl WindowedBedMatrix {
     pub fn read_source_range(&mut self, start: usize, end: usize) -> Result<&[u8], String> {
         if end <= start {
             return Ok(&[]);
+        }
+        if self.pread {
+            if end > self.n_source_snps() {
+                return Err(format!(
+                    "BED positioned-read range out of bounds: start={start}, end={end}, n_snps={}",
+                    self.n_source_snps()
+                ));
+            }
+            let len = (end - start).saturating_mul(self.bytes_per_snp);
+            self.pread_buffer.resize(len, 0);
+            let offset =
+                BED_HEADER_LEN.saturating_add(start.saturating_mul(self.bytes_per_snp)) as u64;
+            read_file_exact_at(&self.file, &mut self.pread_buffer, offset)?;
+            return Ok(&self.pread_buffer);
         }
         let window_end = self.window_start_snp + self.window_len_snps;
         if start < self.window_start_snp || end > window_end {
@@ -825,13 +944,17 @@ impl WindowedBedMatrix {
             .ok_or_else(|| "BED window local offset underflow".to_string())?;
         let len = (end - start).saturating_mul(self.bytes_per_snp);
         let end_offset = local_offset.saturating_add(len);
-        if end_offset > self.mmap.len() {
+        let mmap = self
+            .mmap
+            .as_ref()
+            .ok_or_else(|| "internal error: mmap BED window is unavailable".to_string())?;
+        if end_offset > mmap.len() {
             return Err(format!(
                 "BED window slice out of bounds: local_offset={local_offset}, len={len}, mmap_len={}",
-                self.mmap.len()
+                mmap.len()
             ));
         }
-        Ok(&self.mmap[local_offset..end_offset])
+        Ok(&mmap[local_offset..end_offset])
     }
 
     fn decode_sparse_rows_to_scratch(

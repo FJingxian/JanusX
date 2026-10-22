@@ -479,6 +479,14 @@ def _new_bed_chunk_reader_for_stream(
     )
     if mmap_window_mb is not None:
         base_kwargs["mmap_window_mb"] = int(max(1, int(mmap_window_mb)))
+        pread_override = os.environ.get("JX_LM_LMM_BED_PREAD")
+        if str(pread_override or "1").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }:
+            base_kwargs["pread"] = True
     if bimranges:
         base_kwargs["ranges"] = [
             (str(chrom), int(start), int(end))
@@ -489,8 +497,14 @@ def _new_bed_chunk_reader_for_stream(
         return jxrs.BedChunkReader(**base_kwargs)
     except TypeError as ex:
         mmap_req = ("mmap_window_mb" in base_kwargs)
+        pread_req = bool(base_kwargs.get("pread", False))
         msg = str(ex).lower()
         kw_err = ("mmap_window_mb" in msg) or ("unexpected keyword argument" in msg)
+        if pread_req and kw_err:
+            raise RuntimeError(
+                "Rust-only GWAS mode requires BedChunkReader(..., pread=...) support. "
+                "Rebuild/reinstall JanusX extension."
+            ) from ex
         if mmap_req and kw_err:
             raise RuntimeError(
                 "Rust-only GWAS mode requires BedChunkReader(..., mmap_window_mb=...) support. "
@@ -1168,7 +1182,7 @@ def run_chunked_gwas_lmm_lm(
                 logger,
                 logging.INFO,
                 "LM route: using rust single-entry BED streaming pipeline "
-                "(mmap window handled automatically by the default memmap backend).",
+                "(positioned reads handled automatically by the default PREAD backend).",
             )
             run_lm_stream_bed_single_entry(
                 genofile=genofile,

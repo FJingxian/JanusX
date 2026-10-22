@@ -1260,7 +1260,7 @@ pub(crate) fn lm_stream_bed_additive_windowed_unified(
         }
     }
 
-    let mut bed_window = WindowedBedMatrix::open(norm_prefix, mmap_window_mb)?;
+    let mut bed_window = WindowedBedMatrix::open_lm_lmm(norm_prefix, mmap_window_mb)?;
     if bed_window.n_samples_full() != n_samples_full {
         return Err(format!(
             "BED/FAM sample count mismatch: window={}, fam={n_samples_full}",
@@ -1682,7 +1682,7 @@ fn lm_stream_bed_segments_compact_windowed_unified(
         }
     }
 
-    let mut bed_window = WindowedBedMatrix::open(norm_prefix, mmap_window_mb)?;
+    let mut bed_window = WindowedBedMatrix::open_lm_lmm(norm_prefix, mmap_window_mb)?;
     let bytes_per_snp = bed_window.bytes_per_snp();
     let n_snps = bed_window.n_source_snps();
     let mut bim_reader = BimChunkReader::open(norm_prefix)?;
@@ -2063,7 +2063,7 @@ pub(crate) fn lm_stream_bed_additive_prepared_unified(
     }
     let bed_path = format!("{norm_prefix}.bed");
     let mut bed_window = if let Some(window_mb) = mmap_window_mb.filter(|&v| v > 0) {
-        Some(WindowedBedMatrix::open(norm_prefix, window_mb)?)
+        Some(WindowedBedMatrix::open_lm_lmm(norm_prefix, window_mb)?)
     } else {
         None
     };

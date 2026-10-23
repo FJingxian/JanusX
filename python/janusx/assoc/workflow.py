@@ -2510,6 +2510,9 @@ def _read_cov_file_flexible(
     sample_ids: Union[np.ndarray, None],
     logger,
     label: str = "Covariate",
+    allow_missing: bool = False,
+    allow_partial_samples: bool = False,
+    preserve_precision: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Read covariate file.
@@ -2546,7 +2549,7 @@ def _read_cov_file_flexible(
 
     if sid is not None:
         sid_set = set(sid)
-        need = max(1, int(0.9 * len(sid)))
+        need = 1 if allow_partial_samples else max(1, int(0.9 * len(sid)))
         overlap = len(set(col0) & sid_set)
         if overlap < need and df.shape[0] > 1:
             # Header-tolerant fallback for small tables:
@@ -2564,7 +2567,8 @@ def _read_cov_file_flexible(
                 f"(numeric-only matrix is not supported): {path}"
             )
 
-    data = df_use.iloc[:, 1:].apply(pd.to_numeric, errors="coerce").to_numpy(dtype="float32")
+    data_dtype = "float64" if preserve_precision else "float32"
+    data = df_use.iloc[:, 1:].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=data_dtype)
     if data.ndim == 1:
         data = data.reshape(-1, 1)
     ids_out = np.asarray(ids, dtype=str)
@@ -2579,7 +2583,7 @@ def _read_cov_file_flexible(
             f"{label} file contains duplicate sample IDs: {duplicates[:5]}"
         )
     bad = np.argwhere(~np.isfinite(data))
-    if bad.size > 0:
+    if bad.size > 0 and not allow_missing:
         row_i, col_i = (int(x) for x in bad[0])
         sid_i = ids_out[row_i] if row_i < ids_out.shape[0] else "?"
         raise ValueError(
@@ -2686,6 +2690,9 @@ def _load_covariates_for_models(
     context: str,
     use_spinner: bool = False,
     snps_only: bool = True,
+    allow_missing: bool = False,
+    allow_partial_samples: bool = False,
+    preserve_precision: bool = False,
 ) -> tuple[Union[np.ndarray, None], Union[np.ndarray, None]]:
     inputs = _normalize_cov_inputs(cov_inputs)
     if len(inputs) == 0:
@@ -2699,6 +2706,7 @@ def _load_covariates_for_models(
 
     cov_files, cov_sites = _split_cov_sources(inputs)
     parts: list[tuple[np.ndarray, np.ndarray, str]] = []
+    value_dtype = "float64" if preserve_precision else "float32"
 
     for path in cov_files:
         if not os.path.isfile(path):
@@ -2706,7 +2714,15 @@ def _load_covariates_for_models(
         src = _basename_only(path)
         with CliStatus(f"Loading covariate from {src}...", enabled=bool(use_spinner)) as task:
             try:
-                ids_i, cov_i = _read_cov_file_flexible(path, sample_ids, logger, label="Covariate")
+                ids_i, cov_i = _read_cov_file_flexible(
+                    path,
+                    sample_ids,
+                    logger,
+                    label="Covariate",
+                    allow_missing=allow_missing,
+                    allow_partial_samples=allow_partial_samples,
+                    preserve_precision=preserve_precision,
+                )
                 if cov_i.ndim == 1:
                     cov_i = cov_i.reshape(-1, 1)
             except Exception:
@@ -2715,7 +2731,7 @@ def _load_covariates_for_models(
             task.complete(
                 f"Loading covariate from {src} (n={cov_i.shape[0]}, ncov={cov_i.shape[1]}) ...Finished"
             )
-        parts.append((np.asarray(ids_i, dtype=str), np.asarray(cov_i, dtype="float32"), src))
+        parts.append((np.asarray(ids_i, dtype=str), np.asarray(cov_i, dtype=value_dtype), src))
 
     if len(cov_sites) > 0:
         for chrom, pos in cov_sites:
@@ -2745,7 +2761,7 @@ def _load_covariates_for_models(
                 task.complete(
                     f"Loading covariate from {token} (n={cov_site.shape[0]}, ncov={cov_site.shape[1]}) ...Finished"
                 )
-            parts.append((np.asarray(sample_ids, dtype=str), cov_site, token))
+            parts.append((np.asarray(sample_ids, dtype=str), np.asarray(cov_site, dtype=value_dtype), token))
 
     if len(parts) == 0:
         logger.warning(f"All covariate inputs are empty/unavailable for {context}; skipping.")
@@ -2764,9 +2780,9 @@ def _load_covariates_for_models(
         idx_map = {sid: i for i, sid in enumerate(ids_i.astype(str))}
         take = [idx_map[sid] for sid in ordered_ids]
         sub = cov_i[take]
-        mats.append(sub.astype("float32", copy=False))
+        mats.append(sub.astype(value_dtype, copy=False))
 
-    cov_all = np.concatenate(mats, axis=1).astype("float32", copy=False)
+    cov_all = np.concatenate(mats, axis=1).astype(value_dtype, copy=False)
     cov_ids = np.asarray(ordered_ids, dtype=str)
     return cov_all, cov_ids
 

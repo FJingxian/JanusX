@@ -70,6 +70,7 @@ struct PcgLambdaEstimate {
     sigma_g2: f64,
     sigma_e2: f64,
     pve: f64,
+    no_grm_boundary: bool,
     lambda_converged: bool,
     lambda_iters: usize,
     lambda_rel_res: f64,
@@ -521,10 +522,15 @@ fn estimate_lambda(
             reml.sigma_g2,
             reml.sigma_e2,
             reml.pve,
+            reml.no_grm_boundary,
             reml.converged,
             reml.iters,
             reml.rel_res,
-            "small_n_grm_eigh_brent_reml".to_string(),
+            if reml.no_grm_boundary {
+                "small_n_grm_eigh_reml_boundary_no_grm".to_string()
+            } else {
+                "small_n_grm_eigh_brent_reml".to_string()
+            },
             reml.eigh_backend,
             reml.eigh_elapsed,
         )
@@ -557,6 +563,7 @@ fn estimate_lambda(
             he.sigma_g2,
             he.sigma_e2,
             he.h2,
+            false,
             he.converged,
             he.iters,
             he.rel_res,
@@ -570,6 +577,7 @@ fn estimate_lambda(
         sigma_g2,
         sigma_e2,
         pve,
+        no_grm_boundary,
         lambda_converged,
         lambda_iters,
         lambda_rel_res,
@@ -588,6 +596,7 @@ fn estimate_lambda(
         sigma_g2,
         sigma_e2,
         pve,
+        no_grm_boundary,
         lambda_converged,
         lambda_iters,
         lambda_rel_res,
@@ -780,7 +789,7 @@ pub(crate) fn garfield_residualize_pcg_from_bed(
         lambda_marker: lambda.lambda_marker,
         residualization_method: "rrblup_pcg_additive_projection".to_string(),
         lambda_source: lambda.source,
-        no_grm_boundary: false,
+        no_grm_boundary: lambda.no_grm_boundary,
         pcg_converged: fit.converged,
         pcg_iters: fit.iters,
         pcg_rel_res: fit.rel_res,

@@ -8663,6 +8663,10 @@ def _postgwas_resolve_input_pvalue_column(
     candidates = [
         requested,
         "pwald",
+        # CT emits separate contrast and joint tests. Preserve the former
+        # default behavior by preferring the joint test when pwald is absent.
+        "pwald2",
+        "pwald1",
         "padj",
         "p",
         "P",
@@ -14873,7 +14877,10 @@ def main(argv: Optional[list[str]] = None):
     )
     common_group.add_argument(
         "-pvalue", "--pvalue", type=str, default="pwald",
-        help="Column name for p-value (default: %(default)s).",
+        help=(
+            "Column name for p-value (default: %(default)s; if absent, CT columns "
+            "pwald2 then pwald1 are tried)."
+        ),
     )
     common_group.add_argument(
         "--no-logtrans",

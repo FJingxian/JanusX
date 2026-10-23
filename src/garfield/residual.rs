@@ -934,6 +934,7 @@ pub(crate) struct GarfieldLmmLambdaEstimate {
     pub sigma_g2: f64,
     pub sigma_e2: f64,
     pub pve: f64,
+    pub no_grm_boundary: bool,
     pub converged: bool,
     pub iters: usize,
     pub rel_res: f64,
@@ -984,7 +985,12 @@ pub(crate) fn estimate_lmm_lambda_from_grm_rust(
         }
     }
     validate_grm(grm_vec, n)?;
-    let (x_full, p) = build_design_matrix(x_cov_vec, n, q_cov, add_intercept)?;
+    let (original_design, original_p) = build_design_matrix(x_cov_vec, n, q_cov, add_intercept)?;
+    // Fix the fixed-effect column space before rotating into the GRM basis.
+    // Raw covariate units and large offsets otherwise make the weighted
+    // normal-equation rank threshold depend on the chosen parameterization.
+    let fixed_design = rank_aware_fixed_design(&original_design, n, original_p)?;
+    let (x_full, p) = (&fixed_design.x, fixed_design.rank);
     if n <= p {
         return Err(format!(
             "REML lambda selection requires n > rank(C): n={n}, p={p}"
@@ -1014,7 +1020,7 @@ pub(crate) fn estimate_lmm_lambda_from_grm_rust(
             }
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let (x_rot, y_rot) = rotate_design_and_response(&evecs, &x_full, y_vec, n, p, threads)?;
+    let (x_rot, y_rot) = rotate_design_and_response(&evecs, x_full, y_vec, n, p, threads)?;
     let brent = brent_minimize_with_diagnostics(
         |log10_lbd| -exact_reml_loglike_from_rotated(&s_vec, &x_rot, &y_rot, n, p, log10_lbd),
         low,
@@ -1022,8 +1028,17 @@ pub(crate) fn estimate_lmm_lambda_from_grm_rust(
         tol,
         max_iter,
     );
-    let fit = exact_lmm_null_fit_from_rotated(&s_vec, &x_rot, &y_rot, n, p, brent.x)
+    let finite_fit = exact_lmm_null_fit_from_rotated(&s_vec, &x_rot, &y_rot, n, p, brent.x)
         .ok_or_else(|| "failed to evaluate small-sample REML lambda estimate".to_string())?;
+    let boundary_fit = exact_no_grm_fit_from_rotated(&x_rot, &y_rot, n, p)
+        .ok_or_else(|| "failed to evaluate no-GRM REML boundary".to_string())?;
+    let boundary_tolerance = 1.0e-10 * (1.0 + finite_fit.reml.abs().max(boundary_fit.reml.abs()));
+    let no_grm_boundary = boundary_fit.reml + boundary_tolerance >= finite_fit.reml;
+    let fit = if no_grm_boundary {
+        boundary_fit
+    } else {
+        finite_fit
+    };
     let mean_s = s_vec.iter().copied().sum::<f64>() / n as f64;
     let var_g = fit.sigma_g2 * mean_s.max(0.0);
     let denom = var_g + fit.sigma_e2;
@@ -1037,7 +1052,8 @@ pub(crate) fn estimate_lmm_lambda_from_grm_rust(
         sigma_g2: fit.sigma_g2,
         sigma_e2: fit.sigma_e2,
         pve,
-        converged: brent.converged,
+        no_grm_boundary,
+        converged: brent.converged || no_grm_boundary,
         iters: brent.iterations,
         rel_res: brent.relative_bracket_width,
         eigh_backend: evd_backend.to_string(),

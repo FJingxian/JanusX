@@ -14,6 +14,8 @@ mod sampled_screen;
 mod sampling;
 mod score;
 
+pub(crate) use self::residual::estimate_lmm_lambda_from_grm_rust;
+
 // GARFIELD runtime note (2026-08):
 // - Active BIN search uses packed 0/1 homozygote bits only:
 //   0 -> 0, 2 -> 1, and 1/NA are treated as missing then mode-imputed.

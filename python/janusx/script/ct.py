@@ -135,11 +135,16 @@ def build_parser() -> CliArgumentParser:
         help=(
             "add-dom conditions on per-site additive/dominance effects plus the shared "
             "double-heterozygote indicator H; genotype uses all eight unphased background "
-            "terms, including H. Both estimate separate cis/trans deviations; pwald jointly "
-            "tests whether both deviations are zero."
+            "terms, including H. Both estimate separate cis/trans deviations; pwald1 tests "
+            "whether their effects are equal, and pwald2 jointly tests whether both are zero."
         ),
     )
-    scan.add_argument("--alpha", type=float, default=0.05, help="Alpha used only for the JSON Bonferroni reference threshold.")
+    scan.add_argument(
+        "--alpha",
+        type=float,
+        default=0.05,
+        help="Family alpha used for JSON Bonferroni references based on all eligible pairs.",
+    )
 
     runtime = parser.add_argument_group("Runtime and Output")
     add_common_thread_arg(

@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 const OUTPUT_HEADER: &[&str] = &[
     "snp1", "snp2", "chrom1", "pos1", "chrom2", "pos2", "n_cis", "n_trans", "beta_a1", "beta_d1",
-    "beta_a2", "beta_d2", "beta_c", "se_c", "beta_t", "se_t", "pwald",
+    "beta_a2", "beta_d2", "beta_c", "se_c", "beta_t", "se_t", "pwald1", "pwald2",
 ];
 
 // Keep enough right-hand sides per solve to reuse the covariance factor, then
@@ -39,6 +39,7 @@ const OUTPUT_HEADER: &[&str] = &[
 // cohorts do not create unbounded transient allocations.
 const MAX_PAIR_WHITENING_RHS: usize = 192;
 const MAX_PAIR_WHITENING_MATRIX_BYTES: usize = 16 * 1024 * 1024;
+const MAX_PENDING_CANDIDATE_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Default)]
 struct CandidateProfileStats {
@@ -438,7 +439,8 @@ fn row_for_candidate(
         format_effect(fit.se_cis),
         format_effect(fit.beta_trans),
         format_effect(fit.se_trans),
-        format_pvalue(fit.pwald),
+        format_pvalue(fit.pwald1),
+        format_pvalue(fit.pwald2),
     ];
     if fields.len() != output_header().len() {
         return Err(format!(
@@ -457,7 +459,7 @@ fn finish_candidate_fit(
     design_build: Duration,
     conditional_fit: ConditionalFitTimings,
     profile_timings: bool,
-) -> Result<((f64, usize, Vec<String>, bool), CandidateTaskTimings), String> {
+) -> Result<((f64, usize, Vec<String>, bool, bool), CandidateTaskTimings), String> {
     let row_format_started = profile_timings.then(Instant::now);
     let fields = row_for_candidate(candidate, &fit)?;
     let row_format_elapsed = row_format_started
@@ -473,7 +475,8 @@ fn finish_candidate_fit(
             sort_stat,
             candidate.screen_rank,
             fields,
-            fit.pwald.is_finite(),
+            fit.pwald1.is_finite(),
+            fit.pwald2.is_finite(),
         ),
         CandidateTaskTimings {
             elapsed: elapsed_before_format + row_format_elapsed,
@@ -484,7 +487,68 @@ fn finish_candidate_fit(
     ))
 }
 
-type FittedCandidate = ((f64, usize, Vec<String>, bool), CandidateTaskTimings);
+type FittedCandidate = ((f64, usize, Vec<String>, bool, bool), CandidateTaskTimings);
+
+fn whitening_pairs_per_batch(n_samples: usize, condition_mode: ConditionMode) -> usize {
+    let columns_per_pair = match condition_mode {
+        ConditionMode::AddDom => 6,
+        ConditionMode::Genotype => 9,
+    };
+    let bytes_per_rhs = n_samples.saturating_mul(std::mem::size_of::<f64>()).max(1);
+    let rhs_by_workspace = MAX_PAIR_WHITENING_MATRIX_BYTES / bytes_per_rhs;
+    let rhs_budget = MAX_PAIR_WHITENING_RHS
+        .min(rhs_by_workspace.max(columns_per_pair))
+        .max(columns_per_pair);
+    (rhs_budget / columns_per_pair).max(1)
+}
+
+fn conditional_batch_target(
+    n_samples: usize,
+    threads: usize,
+    condition_mode: ConditionMode,
+) -> usize {
+    let work_target =
+        whitening_pairs_per_batch(n_samples, condition_mode).saturating_mul(threads.max(1));
+    // FilledPair owns four sample-sized byte vectors. Limit how many cores
+    // wait for fitting as well as the per-worker whitening workspace.
+    let bytes_per_candidate = n_samples
+        .saturating_mul(4)
+        .saturating_add(std::mem::size_of::<ScreenCandidate>());
+    let memory_target = MAX_PENDING_CANDIDATE_BYTES / bytes_per_candidate.max(1);
+    work_target.min(memory_target.max(1)).max(1)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fit_candidate_cores(
+    cores: &[CoreCandidates],
+    prepared: &PreparedConditionalFit,
+    condition_mode: ConditionMode,
+    metric: &CovarianceMetric,
+    inference: InferenceKind,
+    profile_timings: bool,
+    fit_pool: &rayon::ThreadPool,
+) -> Result<Vec<Vec<FittedCandidate>>, String> {
+    // Rayon shares the inner whitening jobs across the same fit pool. Keep
+    // each core's original solve dimensions to preserve its numerical path,
+    // while allowing jobs from other cores to occupy otherwise idle workers.
+    // Indexed collection preserves core/candidate order, including empty cores.
+    fit_pool.install(|| {
+        cores
+            .par_iter()
+            .map(|core| {
+                fit_core_candidates(
+                    core,
+                    prepared,
+                    condition_mode,
+                    metric,
+                    inference,
+                    profile_timings,
+                    fit_pool,
+                )
+            })
+            .collect()
+    })
+}
 
 fn fit_core_candidates(
     core: &CoreCandidates,
@@ -538,7 +602,7 @@ fn fit_core_candidates(
                     let fit = fit_result.map_err(|error| {
                         format!(
                             "fit pair {}:{}-{}:{}: {error}",
-                            core.chrom,
+                            candidate.left.chrom,
                             candidate.left.pos,
                             candidate.right.chrom,
                             candidate.right.pos
@@ -567,18 +631,7 @@ fn fit_core_candidates(
         ConditionMode::AddDom => 5,
         ConditionMode::Genotype => 8,
     };
-    let columns_per_pair = q_b
-        .checked_add(1)
-        .ok_or_else(|| "pair design width overflow".to_string())?;
-    let bytes_per_rhs = metric
-        .n()
-        .checked_mul(std::mem::size_of::<f64>())
-        .ok_or_else(|| "pair whitening workspace size overflow".to_string())?;
-    let rhs_by_workspace = MAX_PAIR_WHITENING_MATRIX_BYTES / bytes_per_rhs.max(1);
-    let rhs_budget = MAX_PAIR_WHITENING_RHS
-        .min(rhs_by_workspace.max(columns_per_pair))
-        .max(columns_per_pair);
-    let max_pairs_per_batch = (rhs_budget / columns_per_pair).max(1);
+    let max_pairs_per_batch = whitening_pairs_per_batch(metric.n(), condition_mode);
     let mut fitted_rows = Vec::with_capacity(core.candidates.len());
     let batch_rows = fit_pool.install(|| {
         core.candidates
@@ -643,7 +696,7 @@ fn fit_core_candidates(
                         let fit = fit_result.map_err(|error| {
                             format!(
                                 "fit pair {}:{}-{}:{}: {error}",
-                                core.chrom,
+                                candidate.left.chrom,
                                 candidate.left.pos,
                                 candidate.right.chrom,
                                 candidate.right.pos
@@ -716,7 +769,8 @@ fn build_summary(
     global_null: &crate::ct::null::GlobalNullFit,
     scan: Option<&ScanStats>,
     n_rows: usize,
-    n_testable: usize,
+    n_pwald1_testable: usize,
+    n_pwald2_testable: usize,
     elapsed_seconds: f64,
     timings: Option<Value>,
 ) -> Value {
@@ -727,8 +781,9 @@ fn build_summary(
     } else {
         None
     };
+    let combined_bonferroni = bonferroni.map(|threshold| threshold / 2.0);
     let mut summary = json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "status": status,
         "error": error,
         "model": match model { ModelKind::Lm => "lm", ModelKind::FvLmm => "fvlmm" },
@@ -760,7 +815,7 @@ fn build_summary(
             "no_grm_boundary": global_null.no_grm_boundary
         },
         "phase_model": {
-            "version": 3,
+            "version": 4,
             "parameterization": "eta*H + theta*Z",
             "H": "1 for cis or trans (double heterozygotes), 0 otherwise",
             "Z": "cis=1, trans=-1, other=0",
@@ -769,8 +824,13 @@ fn build_summary(
                 ConditionMode::AddDom => "g_i,g_j,h_i,h_j,H",
                 ConditionMode::Genotype => "g_i,g_j,h_i,h_j,g_i*g_j,g_i*h_j,h_i*g_j,H"
             },
-            "null_hypothesis": "beta_cis = beta_trans = 0 (eta = theta = 0), 2 degrees of freedom",
-            "pwald": match model {
+            "null_hypothesis_pwald1": "beta_cis = beta_trans (theta = 0), 1 degree of freedom",
+            "pwald1": match model {
+                ModelKind::Lm => "1-df Wald t test with residual degrees of freedom",
+                ModelKind::FvLmm => "1-df Wald chi-square test under fixed global covariance",
+            },
+            "null_hypothesis_pwald2": "beta_cis = beta_trans = 0 (eta = theta = 0), 2 degrees of freedom",
+            "pwald2": match model {
                 ModelKind::Lm => "joint 2-df Wald F test with residual degrees of freedom",
                 ModelKind::FvLmm => "joint 2-df Wald chi-square test under fixed global covariance",
             },
@@ -778,7 +838,7 @@ fn build_summary(
             "beta_trans": "eta - theta",
             "main_effects": "beta_a1/beta_d1 and beta_a2/beta_d2 are conditional additive/dominance coefficients from the full pair model",
             "effect_reference": "deviations from the remaining background terms, not absolute group means",
-            "unidentifiable_shared_effect": "if H is collinear with other fixed effects, beta_c, beta_t, and pwald are NA because the two-degree phase test is not identifiable"
+            "unidentifiable_shared_effect": "if H is collinear with other fixed effects, beta_c, beta_t, and pwald2 are NA because the joint two-degree phase test is not identifiable; pwald1 can remain estimable if Z is identifiable"
         },
         "screening": {
             "method": match model {
@@ -804,12 +864,19 @@ fn build_summary(
         })),
         "results": {
             "rows_written": n_rows,
-            "testable_rows": n_testable,
-            "non_testable_rows": n_rows.saturating_sub(n_testable)
+            "testable_rows": n_pwald2_testable,
+            "pwald1_testable_rows": n_pwald1_testable,
+            "pwald2_testable_rows": n_pwald2_testable,
+            "non_testable_rows": n_rows.saturating_sub(n_pwald2_testable)
         },
         "bonferroni_reference_threshold": bonferroni,
+        "bonferroni_reference_thresholds": {
+            "pwald1_per_test_family": bonferroni,
+            "pwald2_per_test_family": bonferroni,
+            "both_test_families_combined": combined_bonferroni
+        },
         "elapsed_seconds": elapsed_seconds,
-        "calibration_note": "Screen scores are used only for Top-K ranking. Final conditional p-values use the requested LM or fixed-covariance GLS model. The Bonferroni value is a reference threshold; no post-selection calibration is claimed."
+        "calibration_note": "Screen scores are used only for Top-K ranking, so nominal conditional p-values are not calibrated within the selected set. Bonferroni references use the full eligible-pair count M (not the number of returned Top-K rows) and control family-wise error across all eligible pairs when the per-pair tests are calibrated; when treating pwald1 and pwald2 as one combined discovery family, use alpha/(2M)."
     });
     if let Some(timings) = timings {
         summary["timings"] = timings;
@@ -1146,16 +1213,17 @@ pub(crate) fn ct_run<'py>(
     write_tsv_header(&mut writer).map_err(rust_error)?;
 
     let mut n_rows = 0usize;
-    let mut n_testable = 0usize;
+    let mut n_pwald1_testable = 0usize;
+    let mut n_pwald2_testable = 0usize;
     let mut candidate_profile = CandidateProfileStats::default();
     let scan_started = Instant::now();
     let scan_result = {
-        let mut process_core = |core: CoreCandidates| {
+        let mut process_batch = |cores: &[CoreCandidates]| {
             let callback_started = profile_timings.then(Instant::now);
             let callback_result = (|| -> Result<(), String> {
                 let parallel_fit_started = profile_timings.then(Instant::now);
-                let fitted_rows_result = fit_core_candidates(
-                    &core,
+                let fitted_cores_result = fit_candidate_cores(
+                    cores,
                     &prepared_fit,
                     condition_mode,
                     &global_null.metric,
@@ -1166,47 +1234,49 @@ pub(crate) fn ct_run<'py>(
                 if let Some(started) = parallel_fit_started {
                     candidate_profile.parallel_fit_wall += started.elapsed();
                 }
-                let fitted_rows = fitted_rows_result?;
-                for (_, timing) in &fitted_rows {
-                    candidate_profile.candidates += 1;
-                    candidate_profile.candidate_work_thread += timing.elapsed;
-                    candidate_profile.design_build_thread += timing.design_build;
-                    candidate_profile.conditional_fit_thread.joint_design_whiten +=
-                        timing.conditional_fit.joint_design_whiten;
-                    candidate_profile.conditional_fit_thread.nuisance_projection +=
-                        timing.conditional_fit.nuisance_projection;
-                    candidate_profile.conditional_fit_thread.phase_test +=
-                        timing.conditional_fit.phase_test;
-                    candidate_profile.conditional_fit_thread.main_effects +=
-                        timing.conditional_fit.main_effects;
-                    candidate_profile.conditional_fit_thread.phase_effects +=
-                        timing.conditional_fit.phase_effects;
-                    candidate_profile.row_format_thread += timing.row_format;
-                }
-                let sort_started = profile_timings.then(Instant::now);
-                let mut rows = fitted_rows
-                    .into_iter()
-                    .map(|(row, _)| row)
-                    .collect::<Vec<_>>();
-                rows.sort_by(|left, right| {
-                    right
-                        .0
-                        .total_cmp(&left.0)
-                        .then_with(|| left.1.cmp(&right.1))
-                });
-                if let Some(started) = sort_started {
-                    candidate_profile.sort_wall += started.elapsed();
-                }
-                let write_started = profile_timings.then(Instant::now);
-                for (_, _, fields, joint_testable) in rows {
-                    writer
-                        .write_record(&fields)
-                        .map_err(|error| format!("write CT TSV row: {error}"))?;
-                    n_rows += 1;
-                    n_testable += usize::from(joint_testable);
-                }
-                if let Some(started) = write_started {
-                    candidate_profile.tsv_write_wall += started.elapsed();
+                for fitted_rows in fitted_cores_result? {
+                    for (_, timing) in &fitted_rows {
+                        candidate_profile.candidates += 1;
+                        candidate_profile.candidate_work_thread += timing.elapsed;
+                        candidate_profile.design_build_thread += timing.design_build;
+                        candidate_profile.conditional_fit_thread.joint_design_whiten +=
+                            timing.conditional_fit.joint_design_whiten;
+                        candidate_profile.conditional_fit_thread.nuisance_projection +=
+                            timing.conditional_fit.nuisance_projection;
+                        candidate_profile.conditional_fit_thread.phase_test +=
+                            timing.conditional_fit.phase_test;
+                        candidate_profile.conditional_fit_thread.main_effects +=
+                            timing.conditional_fit.main_effects;
+                        candidate_profile.conditional_fit_thread.phase_effects +=
+                            timing.conditional_fit.phase_effects;
+                        candidate_profile.row_format_thread += timing.row_format;
+                    }
+                    let sort_started = profile_timings.then(Instant::now);
+                    let mut rows = fitted_rows
+                        .into_iter()
+                        .map(|(row, _)| row)
+                        .collect::<Vec<_>>();
+                    rows.sort_by(|left, right| {
+                        right
+                            .0
+                            .total_cmp(&left.0)
+                            .then_with(|| left.1.cmp(&right.1))
+                    });
+                    if let Some(started) = sort_started {
+                        candidate_profile.sort_wall += started.elapsed();
+                    }
+                    let write_started = profile_timings.then(Instant::now);
+                    for (_, _, fields, contrast_testable, joint_testable) in rows {
+                        writer
+                            .write_record(&fields)
+                            .map_err(|error| format!("write CT TSV row: {error}"))?;
+                        n_rows += 1;
+                        n_pwald1_testable += usize::from(contrast_testable);
+                        n_pwald2_testable += usize::from(joint_testable);
+                    }
+                    if let Some(started) = write_started {
+                        candidate_profile.tsv_write_wall += started.elapsed();
+                    }
                 }
                 let core_flush_started = profile_timings.then(Instant::now);
                 writer
@@ -1222,7 +1292,28 @@ pub(crate) fn ct_run<'py>(
             }
             callback_result
         };
-        match model_kind {
+        // A single Top50 core provides only two 192-RHS whitening jobs in
+        // add-dom mode. Accumulate consecutive cores so the same large solves
+        // can occupy the fit pool, without changing core ownership or TopK.
+        let batch_target = if global_null.metric.has_cholesky_factor() {
+            conditional_batch_target(n, threads, condition_mode)
+        } else {
+            1
+        };
+        let max_pending_cores = threads.saturating_mul(2).max(1);
+        let mut pending_cores = Vec::new();
+        let mut pending_candidates = 0usize;
+        let mut process_core = |core: CoreCandidates| {
+            pending_candidates = pending_candidates.saturating_add(core.candidates.len());
+            pending_cores.push(core);
+            if pending_candidates >= batch_target || pending_cores.len() >= max_pending_cores {
+                process_batch(&pending_cores)?;
+                pending_cores.clear();
+                pending_candidates = 0;
+            }
+            Ok(())
+        };
+        let result = match model_kind {
             ModelKind::Lm => scan_source_lm(
                 &mut source,
                 scan_config,
@@ -1245,7 +1336,14 @@ pub(crate) fn ct_run<'py>(
                     &mut process_core,
                 )
             }
-        }
+        };
+        drop(process_core);
+        result.and_then(|stats| {
+            if !pending_cores.is_empty() {
+                process_batch(&pending_cores)?;
+            }
+            Ok(stats)
+        })
     };
     let scan_duration = scan_started.elapsed();
     let final_flush_started = profile_timings.then(Instant::now);
@@ -1288,7 +1386,8 @@ pub(crate) fn ct_run<'py>(
                 &global_null,
                 Some(&scan_stats),
                 n_rows,
-                n_testable,
+                n_pwald1_testable,
+                n_pwald2_testable,
                 started.elapsed().as_secs_f64(),
                 timings,
             );
@@ -1299,7 +1398,9 @@ pub(crate) fn ct_run<'py>(
             result.set_item("json_path", json_path.to_string_lossy().as_ref())?;
             result.set_item("M", scan_stats.eligible_hypotheses)?;
             result.set_item("rows_written", n_rows)?;
-            result.set_item("testable_rows", n_testable)?;
+            result.set_item("testable_rows", n_pwald2_testable)?;
+            result.set_item("pwald1_testable_rows", n_pwald1_testable)?;
+            result.set_item("pwald2_testable_rows", n_pwald2_testable)?;
             Ok(result)
         }
         Err(error) => {
@@ -1332,7 +1433,8 @@ pub(crate) fn ct_run<'py>(
                 &global_null,
                 None,
                 n_rows,
-                n_testable,
+                n_pwald1_testable,
+                n_pwald2_testable,
                 started.elapsed().as_secs_f64(),
                 timings,
             );
@@ -1356,17 +1458,169 @@ mod tests {
     use crate::ct::packed::FilledPair;
 
     #[test]
+    fn conditional_batch_target_supplies_multiple_workers_with_bounded_sample_storage() {
+        for condition in [super::ConditionMode::AddDom, super::ConditionMode::Genotype] {
+            let pairs = super::whitening_pairs_per_batch(5831, condition);
+            assert_eq!(
+                super::conditional_batch_target(5831, 8, condition),
+                pairs * 8
+            );
+            let target = super::conditional_batch_target(1_000_000, 64, condition);
+            assert!(target > 0);
+            assert!(
+                target * (4_000_000 + std::mem::size_of::<super::ScreenCandidate>())
+                    <= super::MAX_PENDING_CANDIDATE_BYTES
+            );
+        }
+    }
+
+    #[test]
+    fn cross_core_fits_preserve_rows_empty_cores_and_partial_whitening_batches() {
+        use crate::ct::conditional::{prepare_conditional_fit, ConditionMode, InferenceKind};
+        use crate::ct::packed::PairCounts;
+        use crate::ct::screen::{CoreCandidates, PairQc, ScreenCandidate, VariantMeta};
+
+        let n = 80;
+        let gi = [0, 0, 0, 1, 1, 1, 1, 2, 2, 2];
+        let gj = [0, 1, 2, 0, 1, 1, 2, 0, 1, 2];
+        let phase = [0, 0, 0, 0, 1, -1, 0, 0, 0, 0];
+        let y = (0..n)
+            .map(|row| {
+                4.0 + 0.2 * gi[row % 10] as f64
+                    + 0.7 * phase[row % 10] as f64
+                    + (row as f64 * 0.71).sin()
+            })
+            .collect::<Vec<_>>();
+        let mut cores = Vec::new();
+        let mut index = 0;
+        for (core_index, count) in [4, 0, 36, 7].into_iter().enumerate() {
+            let chrom = (core_index + 1).to_string();
+            let mut candidates = Vec::new();
+            for rank in 0..count {
+                let left = VariantMeta {
+                    index,
+                    chrom: chrom.clone(),
+                    pos: index as i64 + 1,
+                    id: format!("left_{index}"),
+                    allele0: "A".into(),
+                    allele1: "C".into(),
+                    snp_maf: 0.3,
+                    snp_geno: 0.0,
+                };
+                let mut right = left.clone();
+                right.pos += 100;
+                right.id = format!("right_{index}");
+                let raw_counts = PairCounts {
+                    category_counts: [8; 10],
+                    genotype_missing: 0,
+                    phase_unknown: 0,
+                    n_total: n,
+                };
+                candidates.push(ScreenCandidate {
+                    left,
+                    right,
+                    distance_bp: 100,
+                    pair_qc: PairQc::from_counts(&raw_counts),
+                    raw_counts,
+                    filled: FilledPair {
+                        g_i: (0..n).map(|row| gi[(row + index) % 10]).collect(),
+                        g_j: (0..n).map(|row| gj[(row + index) % 10]).collect(),
+                        z: (0..n).map(|row| phase[(row + index) % 10]).collect(),
+                        imputed: vec![false; n],
+                        n_imputed: 0,
+                    },
+                    screen_score: rank as f64,
+                    screen_rank: rank + 1,
+                });
+                index += 1;
+            }
+            cores.push(CoreCandidates {
+                chrom,
+                start: 1,
+                end: 1000,
+                candidates,
+            });
+        }
+        let mut covariance = vec![0.0; n * n];
+        for row in 0..n {
+            covariance[row * n + row] = 1.2;
+            if row > 0 {
+                covariance[row * n + row - 1] = 0.1;
+                covariance[(row - 1) * n + row] = 0.1;
+            }
+        }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        for (metric, inference) in [
+            (CovarianceMetric::identity(n), InferenceKind::LinearModel),
+            (
+                CovarianceMetric::from_dense(&covariance, n).unwrap(),
+                InferenceKind::FixedCovariance,
+            ),
+        ] {
+            let prepared = prepare_conditional_fit(&y, &vec![1.0; n], 1, &metric).unwrap();
+            for condition in [ConditionMode::AddDom, ConditionMode::Genotype] {
+                let batched = super::fit_candidate_cores(
+                    &cores, &prepared, condition, &metric, inference, false, &pool,
+                )
+                .unwrap();
+                assert_eq!(
+                    batched.iter().map(Vec::len).collect::<Vec<_>>(),
+                    vec![4, 0, 36, 7]
+                );
+                for (core, rows) in cores.iter().zip(batched) {
+                    let reference = super::fit_candidate_cores(
+                        std::slice::from_ref(core),
+                        &prepared,
+                        condition,
+                        &metric,
+                        inference,
+                        false,
+                        &pool,
+                    )
+                    .unwrap()
+                    .pop()
+                    .unwrap();
+                    for (actual, expected) in rows.iter().zip(reference) {
+                        assert_eq!(actual.0 .2, expected.0 .2);
+                        assert_eq!(actual.0 .1, expected.0 .1);
+                        assert!((actual.0 .0 - expected.0 .0).abs() < 1.0e-9);
+                    }
+                }
+            }
+        }
+        assert!(super::fit_candidate_cores(
+            &[],
+            &prepare_conditional_fit(&y, &vec![1.0; n], 1, &CovarianceMetric::identity(n)).unwrap(),
+            ConditionMode::AddDom,
+            &CovarianceMetric::identity(n),
+            InferenceKind::LinearModel,
+            false,
+            &pool,
+        )
+        .unwrap()
+        .is_empty());
+    }
+
+    #[test]
     fn output_header_contains_requested_minimal_model_statistics() {
         let header = output_header();
         for required in [
             "snp1", "snp2", "chrom1", "pos1", "chrom2", "pos2", "n_cis", "n_trans", "beta_a1",
-            "beta_d1", "beta_a2", "beta_d2", "beta_c", "se_c", "beta_t", "se_t", "pwald",
+            "beta_d1", "beta_a2", "beta_d2", "beta_c", "se_c", "beta_t", "se_t", "pwald1",
+            "pwald2",
         ] {
             assert!(
                 header.contains(&required),
                 "missing output column {required}"
             );
         }
+        assert!(
+            !header.contains(&"pwald"),
+            "the retired pwald column must not be present"
+        );
     }
 
     #[test]
@@ -1444,6 +1698,7 @@ mod tests {
             4,
             &global_null,
             None,
+            0,
             0,
             0,
             1.0,

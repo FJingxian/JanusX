@@ -1,7 +1,7 @@
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 use crate::blas::{
-    cblas_dtrsm_dispatch, CblasInt, CBLAS_DIAG_NON_UNIT, CBLAS_LEFT, CBLAS_LOWER, CBLAS_NO_TRANS,
-    CBLAS_ROW_MAJOR,
+    cblas_dgemm_dispatch, cblas_dtrsm_dispatch, CblasInt, CBLAS_DIAG_NON_UNIT, CBLAS_LEFT,
+    CBLAS_LOWER, CBLAS_NO_TRANS, CBLAS_ROW_MAJOR, CBLAS_TRANS,
 };
 use crate::ct::packed::FilledPair;
 use std::time::{Duration, Instant};
@@ -57,9 +57,9 @@ pub(crate) struct ConditionalFit {
     pub(crate) beta_d2: f64,
     pub(crate) shared_effect_identifiable: bool,
     pub(crate) statistic: f64,
-    pub(crate) pvalue: f64,
+    pub(crate) pwald1: f64,
     pub(crate) phase_wald_statistic: f64,
-    pub(crate) pwald: f64,
+    pub(crate) pwald2: f64,
     pub(crate) fixed_effect_rank: usize,
     pub(crate) residual_df: usize,
 }
@@ -82,7 +82,15 @@ impl CovarianceMetric {
         }
         validate_symmetric(matrix, n, "covariance matrix")?;
         let mut lower = matrix.to_vec();
-        cholesky_relative(&mut lower, n).ok_or_else(|| {
+        let cholesky_profile = std::env::var_os("JX_CT_PROFILE").map(|_| Instant::now());
+        let cholesky = cholesky_relative(&mut lower, n);
+        if let Some(started) = cholesky_profile {
+            eprintln!(
+                "CT_PROFILE covariance_cholesky_seconds={:.6}",
+                started.elapsed().as_secs_f64()
+            );
+        }
+        cholesky.ok_or_else(|| {
             "covariance matrix is not positive definite at its numerical scale".to_string()
         })?;
         Ok(Self::Cholesky { n, lower })
@@ -309,9 +317,26 @@ pub(crate) fn whiten_pair_design_batch(
         }
     }
 
-    let mut columns = metric
-        .whiten_row_major_columns(&combined, n_columns)?
-        .into_iter();
+    let (combined, column_mapping) = if metric.has_cholesky_factor() && n > 0 {
+        deduplicate_row_major_columns(combined, n, n_columns)?
+    } else {
+        (combined, (0..n_columns).collect())
+    };
+    let n_unique_columns = if n == 0 {
+        n_columns
+    } else {
+        combined.len() / n
+    };
+    let unique_columns = metric.whiten_row_major_columns(&combined, n_unique_columns)?;
+    let whitened_columns = if n_unique_columns == n_columns {
+        unique_columns
+    } else {
+        column_mapping
+            .iter()
+            .map(|&column| unique_columns[column].clone())
+            .collect()
+    };
+    let mut columns = whitened_columns.into_iter();
     let mut whitened = Vec::with_capacity(designs.len());
     for _ in designs {
         let background_columns = (0..q_b)
@@ -324,6 +349,72 @@ pub(crate) fn whiten_pair_design_batch(
         });
     }
     Ok(whitened)
+}
+
+/// Collapse bitwise-identical RHS columns before the expensive Cholesky solve.
+/// The returned mapping restores the original column order after whitening.
+fn deduplicate_row_major_columns(
+    values: Vec<f64>,
+    n: usize,
+    n_columns: usize,
+) -> Result<(Vec<f64>, Vec<usize>), String> {
+    let expected_len = n
+        .checked_mul(n_columns)
+        .ok_or_else(|| "covariance whitening matrix dimensions overflow".to_string())?;
+    if n == 0 || n_columns == 0 || values.len() != expected_len {
+        return Err("covariance whitening matrix shape mismatch or empty matrix".to_string());
+    }
+
+    let mut hashes = vec![0xcbf29ce484222325_u64; n_columns];
+    for row in 0..n {
+        let row_start = row * n_columns;
+        for column in 0..n_columns {
+            hashes[column] =
+                (hashes[column] ^ values[row_start + column].to_bits()).wrapping_mul(0x100000001b3);
+        }
+    }
+
+    let mut unique_source_columns: Vec<usize> = Vec::with_capacity(n_columns);
+    let mut mapping: Vec<usize> = Vec::with_capacity(n_columns);
+    for column in 0..n_columns {
+        let mut matched = None;
+        'candidate: for (unique_index, &source_column) in unique_source_columns.iter().enumerate() {
+            if hashes[source_column] != hashes[column] {
+                continue;
+            }
+            for row in 0..n {
+                let left = values[row * n_columns + column].to_bits();
+                let right = values[row * n_columns + source_column].to_bits();
+                if left != right {
+                    continue 'candidate;
+                }
+            }
+            matched = Some(unique_index);
+            break;
+        }
+        if let Some(unique_index) = matched {
+            mapping.push(unique_index);
+        } else {
+            unique_source_columns.push(column);
+            mapping.push(unique_source_columns.len() - 1);
+        }
+    }
+
+    if unique_source_columns.len() == n_columns {
+        return Ok((values, mapping));
+    }
+
+    let compact_len = n
+        .checked_mul(unique_source_columns.len())
+        .ok_or_else(|| "deduplicated whitening matrix dimensions overflow".to_string())?;
+    let mut compact = Vec::with_capacity(compact_len);
+    for row in 0..n {
+        let row_start = row * n_columns;
+        for &column in &unique_source_columns {
+            compact.push(values[row_start + column]);
+        }
+    }
+    Ok((compact, mapping))
 }
 
 fn validate_symmetric(matrix: &[f64], n: usize, label: &str) -> Result<(), String> {
@@ -355,10 +446,136 @@ fn cholesky_relative(matrix: &mut [f64], n: usize) -> Option<()> {
     if !scale.is_finite() || scale == 0.0 {
         return None;
     }
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    if n >= CHOLESKY_BLOCK_SIZE {
+        return cholesky_blocked(matrix, n, threshold);
+    }
+    cholesky_unblocked(matrix, n, threshold)
+}
+
+const CHOLESKY_BLOCK_SIZE: usize = 128;
+
+fn cholesky_unblocked(matrix: &mut [f64], n: usize, threshold: f64) -> Option<()> {
     for row in 0..n {
         for col in 0..=row {
             let mut value = matrix[row * n + col];
             for inner in 0..col {
+                value -= matrix[row * n + inner] * matrix[col * n + inner];
+            }
+            if row == col {
+                if !value.is_finite() || value <= threshold {
+                    return None;
+                }
+                matrix[row * n + col] = value.sqrt();
+            } else {
+                matrix[row * n + col] = value / matrix[col * n + col];
+            }
+        }
+        for col in (row + 1)..n {
+            matrix[row * n + col] = 0.0;
+        }
+    }
+    Some(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn cholesky_blocked(matrix: &mut [f64], n: usize, threshold: f64) -> Option<()> {
+    if n == 0 || matrix.len() != n.checked_mul(n)? {
+        return None;
+    }
+    let n_blas = CblasInt::try_from(n).ok()?;
+    let mut panel_rhs = Vec::new();
+
+    for block_start in (0..n).step_by(CHOLESKY_BLOCK_SIZE) {
+        let block_end = (block_start + CHOLESKY_BLOCK_SIZE).min(n);
+        let block_size = block_end - block_start;
+        cholesky_diagonal_block(matrix, n, block_start, block_end, threshold)?;
+
+        let below = n - block_end;
+        if below == 0 {
+            continue;
+        }
+        let block_blas = CblasInt::try_from(block_size).ok()?;
+        let below_blas = CblasInt::try_from(below).ok()?;
+        panel_rhs.resize(block_size.checked_mul(below)?, 0.0);
+        for row_offset in 0..below {
+            let row = block_end + row_offset;
+            for col_offset in 0..block_size {
+                panel_rhs[col_offset * below + row_offset] =
+                    matrix[row * n + block_start + col_offset];
+            }
+        }
+
+        // Solve L_kk * panel_rhs = A_ik^T, then transpose the result back
+        // into the lower panel A_ik = A_ik * L_kk^-T.
+        unsafe {
+            cblas_dtrsm_dispatch(
+                CBLAS_ROW_MAJOR,
+                CBLAS_LEFT,
+                CBLAS_LOWER,
+                CBLAS_NO_TRANS,
+                CBLAS_DIAG_NON_UNIT,
+                block_blas,
+                below_blas,
+                1.0,
+                matrix.as_ptr().add(block_start * n + block_start),
+                n_blas,
+                panel_rhs.as_mut_ptr(),
+                below_blas,
+            );
+        }
+        for row_offset in 0..below {
+            let row = block_end + row_offset;
+            for col_offset in 0..block_size {
+                matrix[row * n + block_start + col_offset] =
+                    panel_rhs[col_offset * below + row_offset];
+            }
+        }
+
+        for row_start in (block_end..n).step_by(CHOLESKY_BLOCK_SIZE) {
+            let rows = (row_start + CHOLESKY_BLOCK_SIZE).min(n) - row_start;
+            let rows_blas = CblasInt::try_from(rows).ok()?;
+            for col_start in (block_end..=row_start).step_by(CHOLESKY_BLOCK_SIZE) {
+                let cols = (col_start + CHOLESKY_BLOCK_SIZE).min(n) - col_start;
+                let cols_blas = CblasInt::try_from(cols).ok()?;
+                // The input panel occupies columns before block_end, while
+                // the output tile starts at or after block_end; these regions
+                // are disjoint even when row_start == col_start.
+                unsafe {
+                    cblas_dgemm_dispatch(
+                        CBLAS_ROW_MAJOR,
+                        CBLAS_NO_TRANS,
+                        CBLAS_TRANS,
+                        rows_blas,
+                        cols_blas,
+                        block_blas,
+                        -1.0,
+                        matrix.as_ptr().add(row_start * n + block_start),
+                        n_blas,
+                        matrix.as_ptr().add(col_start * n + block_start),
+                        n_blas,
+                        1.0,
+                        matrix.as_mut_ptr().add(row_start * n + col_start),
+                        n_blas,
+                    );
+                }
+            }
+        }
+    }
+    Some(())
+}
+
+fn cholesky_diagonal_block(
+    matrix: &mut [f64],
+    n: usize,
+    block_start: usize,
+    block_end: usize,
+    threshold: f64,
+) -> Option<()> {
+    for row in block_start..block_end {
+        for col in block_start..=row {
+            let mut value = matrix[row * n + col];
+            for inner in block_start..col {
                 value -= matrix[row * n + inner] * matrix[col * n + inner];
             }
             if row == col {
@@ -753,7 +970,7 @@ fn fit_conditional_prepared_whitened_inner(
         InferenceKind::LinearModel => (beta_z / se_z).powi(2),
         InferenceKind::FixedCovariance => beta_z * beta_z / (se_z * se_z),
     };
-    let pvalue = match inference {
+    let pwald1 = match inference {
         InferenceKind::LinearModel => {
             crate::linalg::student_t_p_two_sided(statistic.sqrt(), residual_df as i32)
         }
@@ -789,7 +1006,7 @@ fn fit_conditional_prepared_whitened_inner(
     let mut se_trans = f64::NAN;
     let shared_effect_identifiable = shared_projection.is_some();
     let mut phase_wald_statistic = f64::NAN;
-    let mut pwald = f64::NAN;
+    let mut pwald2 = f64::NAN;
     let phase_effects_started = profile.then(Instant::now);
     if let Some((information_h, eta_without_z, z_loading, _)) = shared_projection {
         let scale = match inference {
@@ -799,7 +1016,7 @@ fn fit_conditional_prepared_whitened_inner(
         let var_eta_without_z = scale / information_h;
         let var_z = se_z * se_z;
         phase_wald_statistic = eta_without_z.powi(2) / var_eta_without_z + beta_z.powi(2) / var_z;
-        pwald = match inference {
+        pwald2 = match inference {
             InferenceKind::LinearModel => (residual_df as f64
                 / (residual_df as f64 + phase_wald_statistic))
                 .powf(residual_df as f64 / 2.0),
@@ -834,9 +1051,9 @@ fn fit_conditional_prepared_whitened_inner(
         beta_d2,
         shared_effect_identifiable,
         statistic,
-        pvalue,
+        pwald1,
         phase_wald_statistic,
-        pwald,
+        pwald2,
         fixed_effect_rank: rank,
         residual_df,
     })
@@ -861,9 +1078,9 @@ fn non_testable(status: FitStatus, fixed_effect_rank: usize, residual_df: usize)
         beta_d2: f64::NAN,
         shared_effect_identifiable: false,
         statistic: f64::NAN,
-        pvalue: f64::NAN,
+        pwald1: f64::NAN,
         phase_wald_statistic: f64::NAN,
-        pwald: f64::NAN,
+        pwald2: f64::NAN,
         fixed_effect_rank,
         residual_df,
     }
@@ -1143,6 +1360,8 @@ fn dot(left: &[f64], right: &[f64]) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    use super::cholesky_blocked;
     use super::{
         build_background, fit_conditional, fit_conditional_prepared,
         fit_conditional_prepared_whitened, partial_regression_coefficient, pivoted_qr_coefficients,
@@ -1151,6 +1370,69 @@ mod tests {
     };
     use crate::ct::packed::FilledPair;
     use nalgebra::DMatrix;
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn blocked_cholesky_recovers_known_lower_factor_across_tiles() {
+        let n = 257;
+        let mut expected = vec![0.0; n * n];
+        for row in 0..n {
+            for col in 0..=row {
+                expected[row * n + col] = if row == col {
+                    1.4 + (row % 7) as f64 * 0.03
+                } else {
+                    ((row * 37 + col * 19) % 29) as f64 * 0.0005 - 0.007
+                };
+            }
+        }
+        let mut matrix = vec![0.0; n * n];
+        for row in 0..n {
+            for col in 0..=row {
+                let value = (0..=col)
+                    .map(|inner| expected[row * n + inner] * expected[col * n + inner])
+                    .sum::<f64>();
+                matrix[row * n + col] = value;
+                matrix[col * n + row] = value;
+            }
+        }
+        let scale = (0..n)
+            .map(|i| matrix[i * n + i].abs())
+            .fold(0.0_f64, f64::max);
+        let threshold = scale * f64::EPSILON * n as f64 * 8.0;
+
+        cholesky_blocked(&mut matrix, n, threshold)
+            .expect("constructed matrix must be positive definite");
+        for row in 0..n {
+            for col in 0..=row {
+                assert!(
+                    (matrix[row * n + col] - expected[row * n + col]).abs() < 2.0e-11,
+                    "factor mismatch at ({row}, {col}): {} vs {}",
+                    matrix[row * n + col],
+                    expected[row * n + col]
+                );
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn blocked_cholesky_keeps_relative_pivot_rejection() {
+        let n = 129;
+        let threshold = f64::EPSILON * n as f64 * 8.0;
+        let mut near_singular = vec![0.0; n * n];
+        for i in 0..n {
+            near_singular[i * n + i] = 1.0;
+        }
+        near_singular[(n - 1) * n + (n - 1)] = threshold * 0.5;
+        assert!(cholesky_blocked(&mut near_singular, n, threshold).is_none());
+
+        let mut indefinite = vec![0.0; n * n];
+        for i in 0..n {
+            indefinite[i * n + i] = 1.0;
+        }
+        indefinite[(n - 1) * n + (n - 1)] = -0.25;
+        assert!(cholesky_blocked(&mut indefinite, n, threshold).is_none());
+    }
 
     #[test]
     fn pivoted_qr_matches_independent_partial_regression_coefficients() {
@@ -1320,7 +1602,8 @@ mod tests {
                     ("beta_d1", scalar_fit.beta_d1, batched_fit.beta_d1),
                     ("beta_a2", scalar_fit.beta_a2, batched_fit.beta_a2),
                     ("beta_d2", scalar_fit.beta_d2, batched_fit.beta_d2),
-                    ("pwald", scalar_fit.pwald, batched_fit.pwald),
+                    ("pwald1", scalar_fit.pwald1, batched_fit.pwald1),
+                    ("pwald2", scalar_fit.pwald2, batched_fit.pwald2),
                 ] {
                     let equal = (scalar.is_nan() && batch.is_nan())
                         || (scalar - batch).abs()
@@ -1329,6 +1612,92 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn row_major_column_dedup_preserves_first_seen_order_and_mapping() {
+        let n = 3;
+        let n_columns = 5;
+        let matrix = vec![
+            1.0, 4.0, 1.0, 7.0, 4.0, // row 0
+            2.0, 5.0, 2.0, 8.0, 5.0, // row 1
+            3.0, 6.0, 3.0, 9.0, 6.0, // row 2
+        ];
+
+        let (unique, mapping) = super::deduplicate_row_major_columns(matrix, n, n_columns).unwrap();
+        assert_eq!(mapping, vec![0, 1, 0, 2, 1]);
+        assert_eq!(unique, vec![1.0, 4.0, 7.0, 2.0, 5.0, 8.0, 3.0, 6.0, 9.0]);
+    }
+
+    #[test]
+    fn duplicate_pair_columns_whiten_to_the_same_restored_outputs() {
+        let n = 11;
+        let q_b = 2;
+        let base = PairDesign {
+            background: (0..n)
+                .flat_map(|row| [((row * 3 % 7) as f64) - 2.0, ((row * 5 % 9) as f64) - 4.0])
+                .collect(),
+            phase: (0..n)
+                .map(|row| if row % 3 == 0 { 1.0 } else { -1.0 })
+                .collect(),
+        };
+        let other = PairDesign {
+            background: (0..n)
+                .flat_map(|row| [((row * 7 % 11) as f64) - 5.0, base.background[row * q_b]])
+                .collect(),
+            phase: base
+                .background
+                .chunks_exact(q_b)
+                .map(|row| row[1])
+                .collect(),
+        };
+        let designs = vec![base.clone(), other, base.clone(), base.clone()];
+
+        let mut lower = vec![0.0; n * n];
+        for row in 0..n {
+            lower[row * n + row] = 1.2 + row as f64 * 0.04;
+            for col in 0..row {
+                lower[row * n + col] = ((row * 5 + col * 3) % 13) as f64 * 0.01;
+            }
+        }
+        let mut covariance = vec![0.0; n * n];
+        for row in 0..n {
+            for col in 0..n {
+                for inner in 0..=row.min(col) {
+                    covariance[row * n + col] += lower[row * n + inner] * lower[col * n + inner];
+                }
+            }
+        }
+        let metric = CovarianceMetric::from_dense(&covariance, n).unwrap();
+        let whitened = whiten_pair_design_batch(&designs, q_b, &metric).unwrap();
+
+        for (input, output) in designs.iter().zip(&whitened) {
+            for column in 0..q_b {
+                let raw = (0..n)
+                    .map(|row| input.background[row * q_b + column])
+                    .collect::<Vec<_>>();
+                let expected = metric.whiten(&raw).unwrap();
+                assert!(output.background_columns[column]
+                    .iter()
+                    .zip(expected)
+                    .all(|(actual, expected)| (actual - expected).abs() < 1.0e-12));
+            }
+            assert!(output
+                .phase
+                .iter()
+                .zip(metric.whiten(&input.phase).unwrap())
+                .all(|(actual, expected)| (actual - expected).abs() < 1.0e-12));
+        }
+        assert_eq!(
+            whitened[0].background_columns,
+            whitened[2].background_columns
+        );
+        assert_eq!(whitened[0].phase, whitened[2].phase);
+        assert_eq!(
+            whitened[0].background_columns,
+            whitened[3].background_columns
+        );
+        assert_eq!(whitened[0].phase, whitened[3].phase);
     }
 
     fn dense_ols_oracle(
@@ -1714,7 +2083,7 @@ mod tests {
         .unwrap();
         assert_eq!(fit.status, FitStatus::UnidentifiablePhase);
         assert!(fit.beta_z.is_nan());
-        assert!(fit.pvalue.is_nan());
+        assert!(fit.pwald1.is_nan());
     }
 
     #[test]
@@ -1806,7 +2175,7 @@ mod tests {
         assert_eq!(shifted.residual_df, centered.residual_df);
         assert!((shifted.beta_z - centered.beta_z).abs() < 1.0e-10);
         assert!((shifted.se_z - centered.se_z).abs() < 1.0e-10);
-        assert!((shifted.pvalue - centered.pvalue).abs() < 1.0e-9);
+        assert!((shifted.pwald1 - centered.pwald1).abs() < 1.0e-9);
     }
 
     #[test]

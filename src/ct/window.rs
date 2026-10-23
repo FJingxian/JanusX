@@ -1,7 +1,7 @@
 use crate::ct::input::{GenotypeCall, Site, SiteSource};
 use crate::ct::packed::{
-    materialize_encoded_pair_optional, prepare_pair_for_screen_optional, PackedGenotypes,
-    PairQcThresholds, PairScreenPreparation,
+    materialize_encoded_pair_optional, prepare_pair_for_screen_with_scratch_optional,
+    PackedGenotypes, PairQcThresholds, PairScreenPreparation, PairScreenScratch,
 };
 use crate::ct::screen::{
     joint_rank_score_phase_masks, passes_snp_qc, summarize_snp_packed, CoreCandidates, PairQc,
@@ -191,6 +191,7 @@ where
     let mut cores = VecDeque::<CoreState>::new();
     let mut previous: Option<(String, i64)> = None;
     let mut seen_chromosomes = HashSet::new();
+    let mut pair_scratch = PairScreenScratch::default();
 
     loop {
         let source_started = config.profile_timings.then(Instant::now);
@@ -326,12 +327,13 @@ where
             let prepare_started = config.profile_timings.then(Instant::now);
             let left_calls = (!left.calls.is_empty()).then_some(left.calls.as_slice());
             let right_calls = (!site.calls.is_empty()).then_some(site.calls.as_slice());
-            let pair_preparation = prepare_pair_for_screen_optional(
+            let pair_preparation = prepare_pair_for_screen_with_scratch_optional(
                 left_calls,
                 right_calls,
                 &left.packed_calls,
                 &packed_calls,
                 config.pair_qc,
+                &mut pair_scratch,
             )?;
             if let Some(started) = prepare_started {
                 stats.timings.pair_prepare_qc_impute += started.elapsed();
@@ -350,6 +352,7 @@ where
                             joint_rank_score_phase_masks(&phase_masks, context)
                         }
                     };
+                    pair_scratch.recycle_phase_masks(phase_masks);
                     if let Some(started) = score_started {
                         stats.timings.screen_score += started.elapsed();
                     }
@@ -642,7 +645,9 @@ where
         let mut results = pool.install(|| {
             target_starts
                 .par_iter()
-                .map(|&start| scan_one_core(start, pending_sites, config, scoring))
+                .map_init(PairScreenScratch::default, |scratch, &start| {
+                    scan_one_core(start, pending_sites, config, scoring, scratch)
+                })
                 .collect::<Result<Vec<_>, _>>()
         })?;
         if let Some(started) = pair_batch_started {
@@ -691,6 +696,7 @@ fn scan_one_core(
     sites: &[BufferedSite],
     config: ScanConfig,
     scoring: &ScanScoring,
+    pair_scratch: &mut PairScreenScratch,
 ) -> Result<CoreScanResult, String> {
     let worker_index = rayon::current_thread_index();
     let first_left = sites.partition_point(|site| site.core_start < core_start);
@@ -725,12 +731,13 @@ fn scan_one_core(
             let prepare_started = config.profile_timings.then(Instant::now);
             let left_calls = (!left.calls.is_empty()).then_some(left.calls.as_slice());
             let right_calls = (!right.calls.is_empty()).then_some(right.calls.as_slice());
-            let pair_preparation = prepare_pair_for_screen_optional(
+            let pair_preparation = prepare_pair_for_screen_with_scratch_optional(
                 left_calls,
                 right_calls,
                 &left.packed_calls,
                 &right.packed_calls,
                 config.pair_qc,
+                pair_scratch,
             )?;
             if let Some(started) = prepare_started {
                 stats.timings.pair_prepare_qc_impute += started.elapsed();
@@ -749,6 +756,7 @@ fn scan_one_core(
                             joint_rank_score_phase_masks(&phase_masks, &context)
                         }
                     };
+                    pair_scratch.recycle_phase_masks(phase_masks);
                     if let Some(started) = score_started {
                         stats.timings.screen_score += started.elapsed();
                     }

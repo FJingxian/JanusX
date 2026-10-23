@@ -362,11 +362,12 @@ pub(crate) enum EncodedPairPreparation {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct PairPhaseMasks {
     n_samples: usize,
     cis: Vec<u64>,
     trans: Vec<u64>,
+    #[cfg(test)]
     unknown: Vec<u64>,
     // Count once after imputation so every ranked pair can reuse its support.
     n_cis: usize,
@@ -386,6 +387,7 @@ impl PairPhaseMasks {
         &self.trans
     }
 
+    #[cfg(test)]
     fn unknown_mask(&self) -> &[u64] {
         &self.unknown
     }
@@ -396,6 +398,17 @@ impl PairPhaseMasks {
 
     pub(crate) fn n_trans(&self) -> usize {
         self.n_trans
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct PairScreenScratch {
+    phase_masks: PairPhaseMasks,
+}
+
+impl PairScreenScratch {
+    pub(crate) fn recycle_phase_masks(&mut self, phase_masks: PairPhaseMasks) {
+        self.phase_masks = phase_masks;
     }
 }
 
@@ -554,27 +567,20 @@ fn count_pair_packed_optional(
     Ok(counts)
 }
 
-/// Count a pair's full genotype categories after the inexpensive phase QC
-/// pass has accepted it. Loading all endpoint masks per word avoids rescanning
-/// every word once for each of the eight non-double-heterozygote categories.
+/// Count the eight non-phase genotype categories after early phase QC has
+/// accepted the pair. Reuse that pass's cis/trans, missing, and unknown counts.
 fn count_pair_for_screen_optional(
     left: Option<&[GenotypeCall]>,
     right: Option<&[GenotypeCall]>,
     left_packed: &PackedGenotypes,
     right_packed: &PackedGenotypes,
+    phase_counts: &PairCounts,
 ) -> Result<PairCounts, String> {
     // The early phase-support pass already validated the invalid masks. Keep
     // the lightweight shape checks here, then count all categories per word.
     validate_packed_pair_shapes_optional(left, right, left_packed, right_packed)?;
-    let mut counts = PairCounts {
-        category_counts: [0; 10],
-        genotype_missing: 0,
-        phase_unknown: 0,
-        n_total: left_packed.n_samples,
-    };
+    let mut counts = phase_counts.clone();
     let n_words = left_packed.missing.len();
-    let explicit_phase = left_packed.has_explicit_phase || right_packed.has_explicit_phase;
-    let mut double_heterozygotes = 0usize;
 
     for word in 0..n_words {
         let left_dosage = [
@@ -603,50 +609,7 @@ fn count_pair_for_screen_optional(
             (left_dosage[2] & right_dosage[1]).count_ones() as usize;
         counts.category_counts[PairCategory::D22.index()] +=
             (left_dosage[2] & right_dosage[2]).count_ones() as usize;
-        counts.genotype_missing +=
-            (left_packed.missing[word] | right_packed.missing[word]).count_ones() as usize;
-
-        let both_het = left_dosage[1] & right_dosage[1];
-        double_heterozygotes += both_het.count_ones() as usize;
-        if !explicit_phase {
-            let comparable =
-                both_het & left_packed.implicit_phase[word] & right_packed.implicit_phase[word];
-            let phase_discordant = left_packed.alt_on_hap0[word] ^ right_packed.alt_on_hap0[word];
-            let cis = comparable & !phase_discordant;
-            let trans = comparable & phase_discordant;
-            counts.category_counts[PairCategory::Cis.index()] += cis.count_ones() as usize;
-            counts.category_counts[PairCategory::Trans.index()] += trans.count_ones() as usize;
-            counts.phase_unknown += (both_het & !(cis | trans)).count_ones() as usize;
-            continue;
-        }
-
-        let (Some(left), Some(right)) = (left, right) else {
-            return Err("explicit VCF phase requires calls for both pair endpoints".to_string());
-        };
-        let mut bits = both_het;
-        while bits != 0 {
-            let bit = bits.trailing_zeros() as usize;
-            let sample = word * u64::BITS as usize + bit;
-            match pair_observation(&left[sample], &right[sample])? {
-                PairObservation::Observed(PairCategory::Cis) => {
-                    counts.category_counts[PairCategory::Cis.index()] += 1;
-                }
-                PairObservation::Observed(PairCategory::Trans) => {
-                    counts.category_counts[PairCategory::Trans.index()] += 1;
-                }
-                PairObservation::PhaseUnknown => counts.phase_unknown += 1,
-                PairObservation::Observed(_) | PairObservation::GenotypeMissing => {
-                    return Err("internal packed double-heterozygote mismatch".to_string());
-                }
-            }
-            bits &= bits - 1;
-        }
     }
-
-    debug_assert_eq!(
-        double_heterozygotes,
-        counts.cis_observed() + counts.trans_observed() + counts.phase_unknown
-    );
     Ok(counts)
 }
 
@@ -799,6 +762,7 @@ fn build_pair_phase_masks_optional(
         n_samples: left_packed.n_samples,
         cis: vec![0; n_words],
         trans: vec![0; n_words],
+        #[cfg(test)]
         unknown: vec![0; n_words],
         n_cis: 0,
         n_trans: 0,
@@ -920,20 +884,25 @@ fn build_compatible_phase_masks_optional(
     left_packed: &PackedGenotypes,
     right_packed: &PackedGenotypes,
     counts: &PairCounts,
-) -> Result<Option<PairPhaseMasks>, String> {
+    masks: &mut PairPhaseMasks,
+) -> Result<bool, String> {
     // The phase-support QC pass already checked invalid dosage combinations.
     validate_packed_pair_shapes_optional(left, right, left_packed, right_packed)?;
     let n_words = left_packed.missing.len();
-    let mut masks = PairPhaseMasks {
-        n_samples: left_packed.n_samples,
-        cis: vec![0; n_words],
-        trans: vec![0; n_words],
-        unknown: vec![0; n_words],
-        n_cis: 0,
-        n_trans: 0,
-    };
+    masks.n_samples = left_packed.n_samples;
+    masks.cis.resize(n_words, 0);
+    masks.trans.resize(n_words, 0);
+    masks.cis.fill(0);
+    masks.trans.fill(0);
+    #[cfg(test)]
+    {
+        masks.unknown.resize(n_words, 0);
+        masks.unknown.fill(0);
+    }
+    masks.n_cis = 0;
+    masks.n_trans = 0;
     let explicit_phase = left_packed.has_explicit_phase || right_packed.has_explicit_phase;
-    let modes = compatible_mode_table(counts);
+    let mut modes = None;
 
     for word in 0..n_words {
         let both_het = left_packed.dosage[1][word] & right_packed.dosage[1][word];
@@ -969,9 +938,16 @@ fn build_compatible_phase_masks_optional(
         };
         masks.cis[word] = cis;
         masks.trans[word] = trans;
-        masks.unknown[word] =
-            left_packed.missing[word] | right_packed.missing[word] | phase_unknown;
-
+        let unknown = left_packed.missing[word] | right_packed.missing[word] | phase_unknown;
+        #[cfg(test)]
+        {
+            masks.unknown[word] = unknown;
+        }
+        if unknown == 0 {
+            masks.n_cis += masks.cis[word].count_ones() as usize;
+            masks.n_trans += masks.trans[word].count_ones() as usize;
+            continue;
+        }
         let left_patterns = [
             left_packed.dosage[0][word],
             left_packed.dosage[1][word],
@@ -986,22 +962,23 @@ fn build_compatible_phase_masks_optional(
         ];
         for (left_pattern, &left_mask) in left_patterns.iter().enumerate() {
             for (right_pattern, &right_mask) in right_patterns.iter().enumerate() {
-                let imputed = masks.unknown[word] & left_mask & right_mask;
+                let imputed = unknown & left_mask & right_mask;
                 if imputed == 0 {
                     continue;
                 }
+                let modes = modes.get_or_insert_with(|| compatible_mode_table(counts));
                 match modes[left_pattern][right_pattern] {
                     Some(PairCategory::Cis) => masks.cis[word] |= imputed,
                     Some(PairCategory::Trans) => masks.trans[word] |= imputed,
                     Some(_) => {}
-                    None => return Ok(None),
+                    None => return Ok(false),
                 }
             }
         }
         masks.n_cis += masks.cis[word].count_ones() as usize;
         masks.n_trans += masks.trans[word].count_ones() as usize;
     }
-    Ok(Some(masks))
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -1049,20 +1026,46 @@ pub(crate) fn prepare_pair_for_screen_optional(
     right_packed: &PackedGenotypes,
     thresholds: PairQcThresholds,
 ) -> Result<PairScreenPreparation, String> {
+    let mut scratch = PairScreenScratch::default();
+    prepare_pair_for_screen_with_scratch_optional(
+        left,
+        right,
+        left_packed,
+        right_packed,
+        thresholds,
+        &mut scratch,
+    )
+}
+
+pub(crate) fn prepare_pair_for_screen_with_scratch_optional(
+    left: Option<&[GenotypeCall]>,
+    right: Option<&[GenotypeCall]>,
+    left_packed: &PackedGenotypes,
+    right_packed: &PackedGenotypes,
+    thresholds: PairQcThresholds,
+    scratch: &mut PairScreenScratch,
+) -> Result<PairScreenPreparation, String> {
     let phase_counts = count_pair_phase_support_optional(left, right, left_packed, right_packed)?;
     if !passes_pair_qc(&phase_counts, thresholds) {
         return Ok(PairScreenPreparation::QcRejected);
     }
 
-    let counts = count_pair_for_screen_optional(left, right, left_packed, right_packed)?;
+    let counts =
+        count_pair_for_screen_optional(left, right, left_packed, right_packed, &phase_counts)?;
     if !passes_pair_qc(&counts, thresholds) {
         return Err("pair QC support changed between packed passes".to_string());
     }
-    let Some(phase_masks) =
-        build_compatible_phase_masks_optional(left, right, left_packed, right_packed, &counts)?
-    else {
+    if !build_compatible_phase_masks_optional(
+        left,
+        right,
+        left_packed,
+        right_packed,
+        &counts,
+        &mut scratch.phase_masks,
+    )? {
         return Ok(PairScreenPreparation::NoCompatibleDonor);
-    };
+    }
+    let phase_masks = std::mem::take(&mut scratch.phase_masks);
     Ok(PairScreenPreparation::Ready {
         counts,
         phase_masks,
@@ -1341,6 +1344,8 @@ fn dose_pattern(dosage: Option<u8>) -> usize {
 }
 
 fn compatible_mode_table(counts: &PairCounts) -> [[Option<PairCategory>; 4]; 4] {
+    #[cfg(test)]
+    COMPATIBLE_MODE_TABLE_BUILDS.with(|builds| builds.set(builds.get() + 1));
     std::array::from_fn(|left_pattern| {
         std::array::from_fn(|right_pattern| {
             let left_dose = (left_pattern < 3).then_some(left_pattern as u8);
@@ -1348,6 +1353,11 @@ fn compatible_mode_table(counts: &PairCounts) -> [[Option<PairCategory>; 4]; 4] 
             compatible_mode_for_dosages(left_dose, right_dose, counts)
         })
     })
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static COMPATIBLE_MODE_TABLE_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn compatible_mode_for_dosages(
@@ -1384,11 +1394,13 @@ fn compatible_mode_for_dosages(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_pair_phase_masks_optional, count_pair, count_pair_packed_optional,
-        count_pair_phase_support_optional, has_compatible_imputation,
+        build_pair_phase_masks_optional, count_pair, count_pair_for_screen_optional,
+        count_pair_packed_optional, count_pair_phase_support_optional, has_compatible_imputation,
         materialize_encoded_pair_optional, mode_fill_pair, passes_pair_qc, prepare_pair,
-        prepare_pair_encoded, prepare_pair_for_screen_optional, EncodedPairPreparation,
-        PackedGenotypes, PairCategory, PairPreparation, PairQcThresholds, PairScreenPreparation,
+        prepare_pair_encoded, prepare_pair_for_screen_optional,
+        prepare_pair_for_screen_with_scratch_optional, EncodedPairPreparation, PackedGenotypes,
+        PairCategory, PairCounts, PairPreparation, PairQcThresholds, PairScreenPreparation,
+        PairScreenScratch, COMPATIBLE_MODE_TABLE_BUILDS,
     };
     use crate::ct::input::{GenotypeCall, PhaseSet};
 
@@ -1630,6 +1642,258 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn screen_phase_mask_scratch_reuses_storage_and_clears_word_tail_on_resize() {
+        let thresholds = PairQcThresholds {
+            min_phase_minor_freq: 0.0,
+            max_unknown_rate: 1.0,
+            min_cis: 0,
+            min_trans: 0,
+        };
+        let mut scratch = PairScreenScratch::default();
+        let mut previous_cis_ptr: *const u64 = std::ptr::null();
+        let mut previous_trans_ptr: *const u64 = std::ptr::null();
+
+        for (n_samples, pattern) in [(129, 0), (65, 1)] {
+            let left = (0..n_samples)
+                .map(|_| phased(true, PhaseSet::Implicit))
+                .collect::<Vec<_>>();
+            let right = (0..n_samples)
+                .map(|sample| {
+                    let is_cis = if pattern == 0 {
+                        sample < 64
+                    } else {
+                        sample == 64
+                    };
+                    phased(is_cis, PhaseSet::Implicit)
+                })
+                .collect::<Vec<_>>();
+            let left_packed = PackedGenotypes::from_calls(&left);
+            let right_packed = PackedGenotypes::from_calls(&right);
+            let expected = reference_screen_preparation(
+                Some(&left),
+                Some(&right),
+                &left_packed,
+                &right_packed,
+                thresholds,
+            )
+            .unwrap();
+            let observed = prepare_pair_for_screen_with_scratch_optional(
+                Some(&left),
+                Some(&right),
+                &left_packed,
+                &right_packed,
+                thresholds,
+                &mut scratch,
+            )
+            .unwrap();
+            assert_eq!(observed, expected);
+
+            let phase_masks = match observed {
+                PairScreenPreparation::Ready { phase_masks, .. } => phase_masks,
+                other => panic!("expected a screenable pair, got {other:?}"),
+            };
+            assert_eq!(phase_masks.n_samples(), n_samples);
+            assert_eq!(phase_masks.n_cis(), if n_samples == 129 { 64 } else { 1 });
+            assert_eq!(phase_masks.n_trans(), n_samples - phase_masks.n_cis());
+            if !previous_cis_ptr.is_null() {
+                assert_eq!(phase_masks.cis.as_ptr(), previous_cis_ptr);
+                assert_eq!(phase_masks.trans.as_ptr(), previous_trans_ptr);
+            }
+            previous_cis_ptr = phase_masks.cis.as_ptr();
+            previous_trans_ptr = phase_masks.trans.as_ptr();
+            scratch.recycle_phase_masks(phase_masks);
+        }
+    }
+
+    #[test]
+    fn screen_skips_mode_table_without_unknowns_and_preserves_donor_rejection() {
+        let thresholds = PairQcThresholds {
+            min_phase_minor_freq: 0.0,
+            max_unknown_rate: 1.0,
+            min_cis: 0,
+            min_trans: 0,
+        };
+        let mut scratch = PairScreenScratch::default();
+
+        let complete_left = vec![
+            known(0),
+            phased(true, PhaseSet::Implicit),
+            phased(true, PhaseSet::Implicit),
+        ];
+        let complete_right = vec![
+            known(0),
+            phased(true, PhaseSet::Implicit),
+            phased(false, PhaseSet::Implicit),
+        ];
+        let complete_left_packed = PackedGenotypes::from_calls(&complete_left);
+        let complete_right_packed = PackedGenotypes::from_calls(&complete_right);
+        let expected_complete = reference_screen_preparation(
+            Some(&complete_left),
+            Some(&complete_right),
+            &complete_left_packed,
+            &complete_right_packed,
+            thresholds,
+        )
+        .unwrap();
+        let builds_before_complete = COMPATIBLE_MODE_TABLE_BUILDS.with(|builds| builds.get());
+        let observed_complete = prepare_pair_for_screen_with_scratch_optional(
+            Some(&complete_left),
+            Some(&complete_right),
+            &complete_left_packed,
+            &complete_right_packed,
+            thresholds,
+            &mut scratch,
+        )
+        .unwrap();
+        let builds_after_complete = COMPATIBLE_MODE_TABLE_BUILDS.with(|builds| builds.get());
+        assert_eq!(observed_complete, expected_complete);
+        assert_eq!(builds_after_complete - builds_before_complete, 0);
+        if let PairScreenPreparation::Ready { phase_masks, .. } = observed_complete {
+            scratch.recycle_phase_masks(phase_masks);
+        } else {
+            panic!("complete pair unexpectedly failed screen QC");
+        }
+
+        let missing_left = vec![
+            known(0),
+            phased(true, PhaseSet::Implicit),
+            phased(true, PhaseSet::Implicit),
+            call(None, None, PhaseSet::Unknown),
+        ];
+        let missing_right = vec![
+            known(0),
+            phased(true, PhaseSet::Implicit),
+            phased(false, PhaseSet::Implicit),
+            known(0),
+        ];
+        let missing_left_packed = PackedGenotypes::from_calls(&missing_left);
+        let missing_right_packed = PackedGenotypes::from_calls(&missing_right);
+        let expected_missing = reference_screen_preparation(
+            Some(&missing_left),
+            Some(&missing_right),
+            &missing_left_packed,
+            &missing_right_packed,
+            thresholds,
+        )
+        .unwrap();
+        let builds_before_missing = COMPATIBLE_MODE_TABLE_BUILDS.with(|builds| builds.get());
+        let observed_missing = prepare_pair_for_screen_with_scratch_optional(
+            Some(&missing_left),
+            Some(&missing_right),
+            &missing_left_packed,
+            &missing_right_packed,
+            thresholds,
+            &mut scratch,
+        )
+        .unwrap();
+        let builds_after_missing = COMPATIBLE_MODE_TABLE_BUILDS.with(|builds| builds.get());
+        assert_eq!(observed_missing, expected_missing);
+        assert_eq!(builds_after_missing - builds_before_missing, 1);
+        if let PairScreenPreparation::Ready { phase_masks, .. } = observed_missing {
+            scratch.recycle_phase_masks(phase_masks);
+        } else {
+            panic!("pair with a compatible missing donor was rejected");
+        }
+
+        let no_donor_left = vec![
+            phased(true, PhaseSet::Implicit),
+            phased(true, PhaseSet::Implicit),
+            call(None, None, PhaseSet::Unknown),
+        ];
+        let no_donor_right = vec![
+            phased(true, PhaseSet::Implicit),
+            phased(false, PhaseSet::Implicit),
+            known(0),
+        ];
+        let no_donor_left_packed = PackedGenotypes::from_calls(&no_donor_left);
+        let no_donor_right_packed = PackedGenotypes::from_calls(&no_donor_right);
+        let expected_no_donor = reference_screen_preparation(
+            Some(&no_donor_left),
+            Some(&no_donor_right),
+            &no_donor_left_packed,
+            &no_donor_right_packed,
+            thresholds,
+        )
+        .unwrap();
+        let builds_before_no_donor = COMPATIBLE_MODE_TABLE_BUILDS.with(|builds| builds.get());
+        let observed_no_donor = prepare_pair_for_screen_with_scratch_optional(
+            Some(&no_donor_left),
+            Some(&no_donor_right),
+            &no_donor_left_packed,
+            &no_donor_right_packed,
+            thresholds,
+            &mut scratch,
+        )
+        .unwrap();
+        let builds_after_no_donor = COMPATIBLE_MODE_TABLE_BUILDS.with(|builds| builds.get());
+        assert_eq!(observed_no_donor, expected_no_donor);
+        assert_eq!(builds_after_no_donor - builds_before_no_donor, 1);
+        assert!(matches!(
+            observed_no_donor,
+            PairScreenPreparation::NoCompatibleDonor
+        ));
+    }
+
+    #[test]
+    fn full_screen_counts_reuse_phase_support_without_double_counting() {
+        let left = vec![
+            known(0),
+            known(0),
+            known(0),
+            known(1),
+            phased(true, PhaseSet::Implicit),
+            phased(true, PhaseSet::Implicit),
+            known(1),
+            known(2),
+            known(2),
+            known(2),
+            call(None, None, PhaseSet::Unknown),
+            phased(true, PhaseSet::Unknown),
+        ];
+        let right = vec![
+            known(0),
+            known(1),
+            known(2),
+            known(0),
+            phased(true, PhaseSet::Implicit),
+            phased(false, PhaseSet::Implicit),
+            known(2),
+            known(0),
+            known(1),
+            known(2),
+            known(0),
+            phased(false, PhaseSet::Unknown),
+        ];
+        let left_packed = PackedGenotypes::from_calls(&left);
+        let right_packed = PackedGenotypes::from_calls(&right);
+        let phase_counts = count_pair_phase_support_optional(
+            Some(&left),
+            Some(&right),
+            &left_packed,
+            &right_packed,
+        )
+        .unwrap();
+        let counts = count_pair_for_screen_optional(
+            Some(&left),
+            Some(&right),
+            &left_packed,
+            &right_packed,
+            &phase_counts,
+        )
+        .unwrap();
+
+        assert_eq!(
+            counts,
+            PairCounts {
+                category_counts: [1; 10],
+                genotype_missing: 1,
+                phase_unknown: 1,
+                n_total: 12,
+            }
+        );
     }
 
     #[test]

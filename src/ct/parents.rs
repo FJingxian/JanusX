@@ -42,6 +42,12 @@ struct ChildParents {
     mother_index: usize,
 }
 
+#[derive(Clone, Copy)]
+struct ParentBedCodeIndex {
+    byte_index: usize,
+    shift: u32,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ParentLink {
     pub(crate) child_id: String,
@@ -53,8 +59,10 @@ pub(crate) struct ParentBedSource {
     father_bed: BedMmapMatrix,
     mother_bed: BedMmapMatrix,
     sample_ids: Vec<String>,
-    father_parent_indices: Vec<usize>,
-    mother_parent_indices: Vec<usize>,
+    father_parent_indices: Vec<ParentBedCodeIndex>,
+    mother_parent_indices: Vec<ParentBedCodeIndex>,
+    father_codes: Vec<u8>,
+    mother_codes: Vec<u8>,
     children: Vec<ChildParents>,
     markers: Vec<CommonMarker>,
     next_marker: usize,
@@ -257,7 +265,11 @@ impl ParentBedSource {
                 mother_index,
             });
         }
-        let (father_parent_indices, mother_parent_indices) = compact_parent_indices(&mut children);
+        let (father_indices, mother_indices) = compact_parent_indices(&mut children);
+        let father_parent_indices = parent_bed_code_indices(father_indices);
+        let mother_parent_indices = parent_bed_code_indices(mother_indices);
+        let father_codes = vec![0; father_parent_indices.len()];
+        let mother_codes = vec![0; mother_parent_indices.len()];
 
         let mut stats = ParentBedStats {
             father_markers: father_markers.len(),
@@ -321,6 +333,8 @@ impl ParentBedSource {
             sample_ids,
             father_parent_indices,
             mother_parent_indices,
+            father_codes,
+            mother_codes,
             children,
             markers,
             next_marker: 0,
@@ -360,54 +374,61 @@ impl ParentBedSource {
         let source_index = marker.father.source_index;
         let father_row = self.father_bed.source_row_bytes(source_index);
         let mother_row = self.mother_bed.source_row_bytes(marker.mother.source_index);
-        let father_codes = self
-            .father_parent_indices
-            .iter()
-            .map(|&index| decode_parent_code(father_row, index))
-            .collect::<Vec<_>>();
-        let mother_codes = self
-            .mother_parent_indices
-            .iter()
-            .map(|&index| decode_parent_code(mother_row, index))
-            .collect::<Vec<_>>();
-        let mut calls = materialize_calls.then(|| Vec::with_capacity(self.children.len()));
-        let mut packed_builder =
-            (!materialize_calls).then(|| PackedGenotypesBuilder::new(self.children.len()));
-
-        for child in &self.children {
-            let father_code = father_codes[child.father_index];
-            let mother_code = mother_codes[child.mother_index];
-            let (dosage, alt_on_hap0, phase_set) = if father_code <= 1 && mother_code <= 1 {
-                let father_alt = father_code;
-                let mother_alt = marker.mother_alleles_to_canonical[mother_code as usize];
-                let dosage = father_alt + mother_alt;
-                (
-                    Some(dosage),
-                    (dosage == 1).then_some(father_alt == 1),
-                    if dosage == 1 {
-                        PhaseSet::Implicit
-                    } else {
-                        PhaseSet::Unknown
-                    },
-                )
-            } else {
-                if father_code == 2 || mother_code == 2 {
-                    self.stats.child_calls_from_heterozygous_parent += 1;
+        decode_parent_codes_into(
+            father_row,
+            &self.father_parent_indices,
+            &mut self.father_codes,
+        );
+        decode_parent_codes_into(
+            mother_row,
+            &self.mother_parent_indices,
+            &mut self.mother_codes,
+        );
+        let mut calls = Vec::new();
+        let packed_calls;
+        if materialize_calls {
+            calls.reserve(self.children.len());
+            for child in &self.children {
+                let father_code = self.father_codes[child.father_index];
+                let mother_code = self.mother_codes[child.mother_index];
+                if father_code <= 1 && mother_code <= 1 {
+                    let father_alt = father_code;
+                    let mother_alt = marker.mother_alleles_to_canonical[mother_code as usize];
+                    let dosage = father_alt + mother_alt;
+                    calls.push(GenotypeCall {
+                        dosage: Some(dosage),
+                        alt_on_hap0: (dosage == 1).then_some(father_alt == 1),
+                        phase_set: if dosage == 1 {
+                            PhaseSet::Implicit
+                        } else {
+                            PhaseSet::Unknown
+                        },
+                    });
                 } else {
-                    self.stats.child_calls_from_missing_parent += 1;
+                    record_parent_missing(&mut self.stats, father_code, mother_code);
+                    calls.push(GenotypeCall {
+                        dosage: None,
+                        alt_on_hap0: None,
+                        phase_set: PhaseSet::Unknown,
+                    });
                 }
-                (None, None, PhaseSet::Unknown)
-            };
-            if let Some(calls) = calls.as_mut() {
-                calls.push(GenotypeCall {
-                    dosage,
-                    alt_on_hap0,
-                    phase_set: phase_set.clone(),
-                });
             }
-            if let Some(builder) = packed_builder.as_mut() {
-                builder.push(dosage, alt_on_hap0, &phase_set);
+            packed_calls = None;
+        } else {
+            let mut builder = PackedGenotypesBuilder::new(self.children.len());
+            for child in &self.children {
+                let father_code = self.father_codes[child.father_index];
+                let mother_code = self.mother_codes[child.mother_index];
+                if father_code <= 1 && mother_code <= 1 {
+                    let father_alt = father_code;
+                    let mother_alt = marker.mother_alleles_to_canonical[mother_code as usize];
+                    builder.push_parent_call(Some(father_alt + mother_alt), father_alt == 1);
+                } else {
+                    record_parent_missing(&mut self.stats, father_code, mother_code);
+                    builder.push_parent_call(None, false);
+                }
             }
+            packed_calls = Some(builder.finish());
         }
 
         let site = Site {
@@ -417,9 +438,8 @@ impl ParentBedSource {
             id: marker.father.info.snp.clone(),
             allele0: marker.father.allele0.clone(),
             allele1: marker.father.allele1.clone(),
-            calls: calls.unwrap_or_default(),
+            calls,
         };
-        let packed_calls = packed_builder.map(PackedGenotypesBuilder::finish);
         self.next_marker += 1;
         Ok(Some((site, packed_calls)))
     }
@@ -648,14 +668,32 @@ impl SiteSource for ParentBedSource {
     }
 }
 
-fn decode_parent_code(row: &[u8], sample_index: usize) -> u8 {
-    let code = (row[sample_index / 4] >> (2 * (sample_index % 4))) & 0b11;
-    match code {
-        0b00 => 0,
-        0b01 => 3,
-        0b10 => 2,
-        0b11 => 1,
-        _ => unreachable!(),
+fn parent_bed_code_indices(sample_indices: Vec<usize>) -> Vec<ParentBedCodeIndex> {
+    sample_indices
+        .into_iter()
+        .map(|sample_index| ParentBedCodeIndex {
+            byte_index: sample_index / 4,
+            shift: (2 * (sample_index % 4)) as u32,
+        })
+        .collect()
+}
+
+#[inline]
+fn decode_parent_codes_into(row: &[u8], indices: &[ParentBedCodeIndex], decoded: &mut [u8]) {
+    const BED_CODE_TO_DOSAGE: [u8; 4] = [0, 3, 2, 1];
+    debug_assert_eq!(indices.len(), decoded.len());
+    for (decoded_code, index) in decoded.iter_mut().zip(indices) {
+        let bed_code = (row[index.byte_index] >> index.shift) & 0b11;
+        *decoded_code = BED_CODE_TO_DOSAGE[bed_code as usize];
+    }
+}
+
+#[inline]
+fn record_parent_missing(stats: &mut ParentBedStats, father_code: u8, mother_code: u8) {
+    if father_code == 2 || mother_code == 2 {
+        stats.child_calls_from_heterozygous_parent += 1;
+    } else {
+        stats.child_calls_from_missing_parent += 1;
     }
 }
 

@@ -37,7 +37,7 @@ const OUTPUT_HEADER: &[&str] = &[
 // Keep enough right-hand sides per solve to reuse the covariance factor, then
 // run independent pair batches concurrently. Cap each work matrix so large
 // cohorts do not create unbounded transient allocations.
-const MAX_PAIR_WHITENING_RHS: usize = 192;
+const MAX_PAIR_WHITENING_RHS: usize = 336;
 const MAX_PAIR_WHITENING_MATRIX_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PENDING_CANDIDATE_BYTES: usize = 32 * 1024 * 1024;
 

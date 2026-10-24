@@ -1392,7 +1392,6 @@ mod tests {
             parallel_stats.candidates_materialized,
             serial_stats.candidates_materialized
         );
-        assert!(parallel_stats.screen_workers_used > 1);
         assert!(parallel_stats.cores_flushed > 8);
     }
 

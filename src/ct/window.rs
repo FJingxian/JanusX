@@ -1,7 +1,7 @@
 use crate::ct::input::{GenotypeCall, Site, SiteSource};
 use crate::ct::packed::{
     materialize_encoded_pair_optional, prepare_pair_for_screen_with_scratch_optional,
-    PackedGenotypes, PairQcThresholds, PairScreenPreparation, PairScreenScratch,
+    PackedGenotypes, PairCounts, PairQcThresholds, PairScreenPreparation, PairScreenScratch,
 };
 use crate::ct::screen::{
     joint_rank_score_phase_masks, passes_snp_qc, summarize_snp_packed, CoreCandidates, PairQc,
@@ -10,7 +10,14 @@ use crate::ct::screen::{
 use rayon::prelude::*;
 use rayon::ThreadPool;
 use std::collections::{HashSet, VecDeque};
+use std::sync::mpsc::{sync_channel, Receiver};
+use std::thread;
 use std::time::{Duration, Instant};
+
+const SOURCE_PREFETCH_MAX_BYTES: usize = 64 << 20;
+const SOURCE_PREFETCH_MAX_SITES: usize = 16_384;
+const LEFT_MARKERS_PER_SCAN_SHARD: usize = 16;
+const MAX_SCAN_SHARDS_PER_CORE: usize = 4;
 
 pub(crate) struct FvLmmScanContext<'a> {
     pub(crate) fixed_effect_basis: &'a [Vec<f64>],
@@ -461,11 +468,70 @@ fn scan_source_parallel<S, F>(
     snp_thresholds: SnpQcThresholds,
     scoring: ScanScoring,
     pool: ThreadPool,
+    stats: ScanStats,
+    on_core: F,
+) -> Result<ScanStats, String>
+where
+    S: SiteSource,
+    F: FnMut(CoreCandidates) -> Result<(), String>,
+{
+    let queue_capacity = source_prefetch_capacity(source.prefetch_site_bytes_hint());
+    let (sender, receiver) = sync_channel(queue_capacity);
+    thread::scope(|scope| {
+        let producer = scope.spawn(move || loop {
+            let started = Instant::now();
+            let result = source.next_scanned_site();
+            let decode_elapsed = started.elapsed();
+            let finished = !matches!(&result, Ok(Some(_)));
+            if sender
+                .send(PrefetchedSite {
+                    result,
+                    decode_elapsed,
+                })
+                .is_err()
+                || finished
+            {
+                break;
+            }
+        });
+        let scan_result = scan_prefetched_source_parallel(
+            &receiver,
+            config,
+            n_samples,
+            snp_thresholds,
+            scoring,
+            pool,
+            stats,
+            on_core,
+        );
+        drop(receiver);
+        if producer.join().is_err() {
+            return Err("CT source prefetch worker panicked".to_string());
+        }
+        scan_result
+    })
+}
+
+fn source_prefetch_capacity(site_bytes_hint: usize) -> usize {
+    (SOURCE_PREFETCH_MAX_BYTES / site_bytes_hint.max(1)).clamp(1, SOURCE_PREFETCH_MAX_SITES)
+}
+
+struct PrefetchedSite {
+    result: Result<Option<crate::ct::input::ScannedSite>, String>,
+    decode_elapsed: Duration,
+}
+
+fn scan_prefetched_source_parallel<F>(
+    receiver: &Receiver<PrefetchedSite>,
+    config: ScanConfig,
+    n_samples: usize,
+    snp_thresholds: SnpQcThresholds,
+    scoring: ScanScoring,
+    pool: ThreadPool,
     mut stats: ScanStats,
     mut on_core: F,
 ) -> Result<ScanStats, String>
 where
-    S: SiteSource,
     F: FnMut(CoreCandidates) -> Result<(), String>,
 {
     let mut pending_sites = Vec::<BufferedSite>::new();
@@ -475,11 +541,13 @@ where
     let mut workers_used = HashSet::new();
 
     loop {
-        let source_started = config.profile_timings.then(Instant::now);
-        let scanned_site_result = source.next_scanned_site();
-        if let Some(started) = source_started {
-            stats.timings.source_next_scanned_site += started.elapsed();
+        let received = receiver
+            .recv()
+            .map_err(|_| "CT source prefetch worker stopped unexpectedly".to_string())?;
+        if config.profile_timings {
+            stats.timings.source_next_scanned_site += received.decode_elapsed;
         }
+        let scanned_site_result = received.result;
         let Some(scanned_site) = scanned_site_result? else {
             break;
         };
@@ -620,7 +688,9 @@ fn flush_parallel_batches<F>(
 where
     F: FnMut(CoreCandidates) -> Result<(), String>,
 {
-    let batch_core_limit = config.threads.saturating_mul(2).max(1);
+    // Keep four core waves available so uneven marker density does not leave
+    // Rayon workers idle while a batch waits for its slowest core.
+    let batch_core_limit = config.threads.saturating_mul(4).max(1);
     loop {
         let target_count = if drain_all {
             pending_core_starts.len().min(batch_core_limit)
@@ -641,12 +711,19 @@ where
         }
 
         let target_starts = pending_core_starts[..target_count].to_vec();
+        let scan_shards = target_starts
+            .iter()
+            .map(|&start| core_scan_shards(start, pending_sites, config.threads))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
         let pair_batch_started = config.profile_timings.then(Instant::now);
         let mut results = pool.install(|| {
-            target_starts
+            scan_shards
                 .par_iter()
-                .map_init(PairScreenScratch::default, |scratch, &start| {
-                    scan_one_core(start, pending_sites, config, scoring, scratch)
+                .map_init(PairScreenScratch::default, |scratch, &shard| {
+                    scan_one_core_shard(shard, pending_sites, config, scoring, scratch)
                 })
                 .collect::<Result<Vec<_>, _>>()
         })?;
@@ -658,11 +735,62 @@ where
                 .chrom
                 .cmp(&right.core.chrom)
                 .then_with(|| left.core.start.cmp(&right.core.start))
+                .then_with(|| left.left_range_start.cmp(&right.left_range_start))
         });
 
-        for result in results {
+        let mut merged_results = Vec::<CoreScanResult>::new();
+        for mut result in results {
             if let Some(worker_index) = result.worker_index {
                 workers_used.insert(worker_index);
+            }
+            if let Some(previous) = merged_results.last_mut().filter(|previous| {
+                previous.core.chrom == result.core.chrom && previous.core.start == result.core.start
+            }) {
+                previous.core.candidates.append(&mut result.core.candidates);
+                previous
+                    .scored_candidates
+                    .append(&mut result.scored_candidates);
+                add_pair_stats(&mut previous.stats, &result.stats);
+            } else {
+                merged_results.push(result);
+            }
+        }
+
+        for mut result in merged_results {
+            result.scored_candidates.sort_by(scored_candidate_order);
+            result.scored_candidates.truncate(config.topk);
+            let encode_started = config.profile_timings.then(Instant::now);
+            for (rank, scored) in result.scored_candidates.drain(..).enumerate() {
+                let left = &pending_sites[scored.left_site];
+                let right = &pending_sites[scored.right_site];
+                let left_calls = (!left.calls.is_empty()).then_some(left.calls.as_slice());
+                let right_calls = (!right.calls.is_empty()).then_some(right.calls.as_slice());
+                let encoded = materialize_encoded_pair_optional(
+                    left_calls,
+                    right_calls,
+                    &left.packed_calls,
+                    &right.packed_calls,
+                    &scored.counts,
+                )
+                .ok_or_else(|| {
+                    format!(
+                        "screened pair {}:{}-{}:{} lost a compatible imputation donor",
+                        left.meta.chrom, left.meta.pos, right.meta.chrom, right.meta.pos
+                    )
+                })?;
+                result.core.candidates.push(RankedCandidate {
+                    left: left.meta.clone(),
+                    right: right.meta.clone(),
+                    distance_bp: right.meta.pos - left.meta.pos,
+                    pair_qc: PairQc::from_counts(&scored.counts),
+                    raw_counts: scored.counts,
+                    encoded,
+                    screen_score: scored.screen_score,
+                    screen_rank: rank + 1,
+                });
+            }
+            if let Some(started) = encode_started {
+                result.stats.timings.candidate_materialize += started.elapsed();
             }
             add_pair_stats(stats, &result.stats);
             let mut cores = VecDeque::from([result.core]);
@@ -687,37 +815,84 @@ where
 
 struct CoreScanResult {
     core: CoreState,
+    scored_candidates: Vec<ScoredCandidate>,
     stats: ScanStats,
     worker_index: Option<usize>,
+    left_range_start: usize,
 }
 
-fn scan_one_core(
+struct ScoredCandidate {
+    left_site: usize,
+    right_site: usize,
+    left_index: usize,
+    right_index: usize,
+    counts: PairCounts,
+    screen_score: f64,
+}
+
+#[derive(Clone, Copy)]
+struct CoreScanShard {
     core_start: i64,
+    left_start: usize,
+    left_end: usize,
+}
+
+fn core_scan_shards(
+    core_start: i64,
+    sites: &[BufferedSite],
+    thread_count: usize,
+) -> Result<Vec<CoreScanShard>, String> {
+    let first_left = sites.partition_point(|site| site.core_start < core_start);
+    let left_end = sites.partition_point(|site| site.core_start <= core_start);
+    if first_left >= left_end {
+        return Err(format!("internal scan error: empty core {core_start}"));
+    }
+    let n_left = left_end - first_left;
+    let max_shards = thread_count.min(MAX_SCAN_SHARDS_PER_CORE).max(1);
+    let n_shards = n_left
+        .div_ceil(LEFT_MARKERS_PER_SCAN_SHARD)
+        .clamp(1, max_shards);
+    let chunk_size = n_left.div_ceil(n_shards);
+    let mut shards = Vec::with_capacity(n_shards);
+    let mut start = first_left;
+    while start < left_end {
+        let end = (start + chunk_size).min(left_end);
+        shards.push(CoreScanShard {
+            core_start,
+            left_start: start,
+            left_end: end,
+        });
+        start = end;
+    }
+    Ok(shards)
+}
+
+fn scan_one_core_shard(
+    shard: CoreScanShard,
     sites: &[BufferedSite],
     config: ScanConfig,
     scoring: &ScanScoring,
     pair_scratch: &mut PairScreenScratch,
 ) -> Result<CoreScanResult, String> {
     let worker_index = rayon::current_thread_index();
-    let first_left = sites.partition_point(|site| site.core_start < core_start);
-    let left_end = sites.partition_point(|site| site.core_start <= core_start);
-    if first_left >= left_end {
-        return Err(format!("internal scan error: empty core {core_start}"));
-    }
+    let first_left = shard.left_start;
+    let left_end = shard.left_end;
+    let core_start = shard.core_start;
     let chrom = sites[first_left].meta.chrom.clone();
     let (start, end) = core_bounds(core_start, config.core_bp)?;
-    let mut core = CoreState {
+    let core = CoreState {
         chrom,
         start,
         end,
         end_plus_window: (end as u64).saturating_add(config.window_bp),
         candidates: Vec::new(),
     };
+    let mut scored_candidates = Vec::<ScoredCandidate>::new();
     let mut stats = ScanStats::default();
     let pair_loop_started = config.profile_timings.then(Instant::now);
     for left_index in first_left..left_end {
         let left = &sites[left_index];
-        for right in sites.iter().skip(left_index + 1) {
+        for (right_index, right) in sites.iter().enumerate().skip(left_index + 1) {
             if right.meta.pos as u64 - left.meta.pos as u64 > config.window_bp {
                 break;
             }
@@ -765,40 +940,25 @@ fn scan_one_core(
                         continue;
                     };
                     let topk_started = config.profile_timings.then(Instant::now);
-                    if let Some(insertion) = topk_insertion_index(
-                        &core.candidates,
+                    if let Some(insertion) = scored_topk_insertion_index(
+                        &scored_candidates,
                         screen_score,
                         left.meta.index,
                         right.meta.index,
                         config.topk,
                     ) {
-                        let pair = materialize_encoded_pair_optional(
-                            left_calls,
-                            right_calls,
-                            &left.packed_calls,
-                            &right.packed_calls,
-                            &counts,
-                        )
-                        .ok_or_else(|| {
-                            format!(
-                                "screened pair {}:{}-{}:{} lost a compatible imputation donor",
-                                left.meta.chrom, left.meta.pos, right.meta.chrom, right.meta.pos
-                            )
-                        })?;
-                        core.candidates.insert(
+                        scored_candidates.insert(
                             insertion,
-                            RankedCandidate {
-                                left: left.meta.clone(),
-                                right: right.meta.clone(),
-                                distance_bp: right.meta.pos - left.meta.pos,
-                                pair_qc: PairQc::from_counts(&counts),
-                                raw_counts: counts,
-                                encoded: pair,
+                            ScoredCandidate {
+                                left_site: left_index,
+                                right_site: right_index,
+                                left_index: left.meta.index,
+                                right_index: right.meta.index,
+                                counts,
                                 screen_score,
-                                screen_rank: 0,
                             },
                         );
-                        core.candidates.truncate(config.topk);
+                        scored_candidates.truncate(config.topk);
                     }
                     if let Some(started) = topk_started {
                         stats.timings.topk_update += started.elapsed();
@@ -816,8 +976,10 @@ fn scan_one_core(
     }
     Ok(CoreScanResult {
         core,
+        scored_candidates,
         stats,
         worker_index,
+        left_range_start: shard.left_start,
     })
 }
 
@@ -831,6 +993,7 @@ fn add_pair_stats(total: &mut ScanStats, source: &ScanStats) {
     total.timings.screen_score += source.timings.screen_score;
     total.timings.topk_update += source.timings.topk_update;
     total.timings.pair_enumeration_bookkeeping += source.timings.pair_enumeration_bookkeeping;
+    total.timings.candidate_materialize += source.timings.candidate_materialize;
 }
 
 fn validate_config(config: ScanConfig) -> Result<(), String> {
@@ -944,6 +1107,39 @@ fn candidate_order(left: &RankedCandidate, right: &RankedCandidate) -> std::cmp:
         .then_with(|| left.right.index.cmp(&right.right.index))
 }
 
+fn scored_topk_insertion_index(
+    candidates: &[ScoredCandidate],
+    score: f64,
+    left_index: usize,
+    right_index: usize,
+    topk: usize,
+) -> Option<usize> {
+    if topk == 0 {
+        return None;
+    }
+    let insertion = candidates
+        .iter()
+        .position(|candidate| {
+            score.total_cmp(&candidate.screen_score).is_gt()
+                || (score.total_cmp(&candidate.screen_score).is_eq()
+                    && (left_index, right_index) < (candidate.left_index, candidate.right_index))
+        })
+        .unwrap_or(candidates.len());
+    if insertion >= topk && candidates.len() >= topk {
+        None
+    } else {
+        Some(insertion)
+    }
+}
+
+fn scored_candidate_order(left: &ScoredCandidate, right: &ScoredCandidate) -> std::cmp::Ordering {
+    right
+        .screen_score
+        .total_cmp(&left.screen_score)
+        .then_with(|| left.left_index.cmp(&right.left_index))
+        .then_with(|| left.right_index.cmp(&right.right_index))
+}
+
 fn flush_ready<F>(
     cores: &mut VecDeque<CoreState>,
     chrom: &str,
@@ -1025,6 +1221,10 @@ mod tests {
     use crate::ct::input::{GenotypeCall, PhaseSet, Site, SiteSource};
     use crate::ct::packed::PairQcThresholds;
     use crate::ct::screen::CoreCandidates;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
 
     #[derive(Clone)]
     struct VecSource {
@@ -1043,6 +1243,29 @@ mod tests {
                 return Ok(None);
             };
             self.cursor += 1;
+            Ok(Some(site))
+        }
+    }
+
+    struct SlowVecSource {
+        ids: Vec<String>,
+        sites: Vec<Site>,
+        cursor: usize,
+        sites_returned: Arc<AtomicUsize>,
+    }
+
+    impl SiteSource for SlowVecSource {
+        fn sample_ids(&self) -> &[String] {
+            &self.ids
+        }
+
+        fn next_site(&mut self) -> Result<Option<Site>, String> {
+            thread::sleep(Duration::from_millis(1));
+            let Some(site) = self.sites.get(self.cursor).cloned() else {
+                return Ok(None);
+            };
+            self.cursor += 1;
+            self.sites_returned.fetch_add(1, Ordering::SeqCst);
             Ok(Some(site))
         }
     }
@@ -1171,6 +1394,78 @@ mod tests {
         );
         assert!(parallel_stats.screen_workers_used > 1);
         assert!(parallel_stats.cores_flushed > 8);
+    }
+
+    #[test]
+    fn parallel_scan_splits_dense_core_and_preserves_exact_topk() {
+        let sites = (0..128)
+            .map(|index| {
+                let phase = match index % 4 {
+                    0 => [true, false, true, false],
+                    1 => [false, true, false, true],
+                    2 => [true, true, false, false],
+                    _ => [false, false, true, true],
+                };
+                site(index, "1", index as i64 + 1, phase)
+            })
+            .collect::<Vec<_>>();
+        let residuals = [1.0, -1.0, 0.5, -0.5];
+        let mut serial_config = config(7, 0.0);
+        serial_config.core_bp = 256;
+        serial_config.window_bp = 256;
+        let (serial_stats, serial_cores) = run(sites.clone(), serial_config, &residuals);
+        let mut parallel_config = serial_config;
+        parallel_config.threads = 4;
+        let (parallel_stats, parallel_cores) = run(sites, parallel_config, &residuals);
+
+        assert_eq!(parallel_cores, serial_cores);
+        assert_eq!(
+            parallel_stats.pairs_enumerated,
+            serial_stats.pairs_enumerated
+        );
+        assert_eq!(
+            parallel_stats.eligible_hypotheses,
+            serial_stats.eligible_hypotheses
+        );
+        assert_eq!(
+            parallel_stats.candidates_materialized,
+            serial_stats.candidates_materialized
+        );
+        assert!(parallel_stats.screen_workers_used > 1);
+    }
+
+    #[test]
+    fn parallel_scan_prefetches_sites_while_a_core_callback_runs() {
+        let sites = (0..5_000)
+            .map(|index| site(index, "1", index as i64 + 1, [true, false, true, false]))
+            .collect();
+        let sites_returned = Arc::new(AtomicUsize::new(0));
+        let mut source = SlowVecSource {
+            ids: (0..4).map(|i| format!("s{i}")).collect(),
+            sites,
+            cursor: 0,
+            sites_returned: Arc::clone(&sites_returned),
+        };
+        let mut scan_config = config(1, 0.0);
+        scan_config.core_bp = 1;
+        scan_config.window_bp = 1;
+        scan_config.threads = 2;
+        let mut checked_overlap = false;
+        scan_source(&mut source, scan_config, &[1.0, -1.0, 0.5, -0.5], |_| {
+            if !checked_overlap {
+                checked_overlap = true;
+                let before = sites_returned.load(Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(200));
+                let after = sites_returned.load(Ordering::SeqCst);
+                assert!(
+                    after > before + 80,
+                    "the bounded source queue advanced from {before} to {after}, not enough to overlap the core batch"
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(checked_overlap);
     }
 
     #[test]

@@ -564,6 +564,11 @@ impl SiteSource for ParentBedListSource {
         &self.sample_ids
     }
 
+    fn prefetch_site_bytes_hint(&self) -> usize {
+        PackedGenotypes::estimated_storage_bytes_for_samples(self.sample_ids.len())
+            .saturating_add(512)
+    }
+
     fn next_site(&mut self) -> Result<Option<Site>, String> {
         self.next_site_impl()
     }
@@ -657,6 +662,11 @@ fn read_parent_bfile_manifest(path: &str) -> Result<Vec<ParentBfileEntry>, Strin
 impl SiteSource for ParentBedSource {
     fn sample_ids(&self) -> &[String] {
         &self.sample_ids
+    }
+
+    fn prefetch_site_bytes_hint(&self) -> usize {
+        PackedGenotypes::estimated_storage_bytes_for_samples(self.sample_ids.len())
+            .saturating_add(512)
     }
 
     fn next_site(&mut self) -> Result<Option<Site>, String> {

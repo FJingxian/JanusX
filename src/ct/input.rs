@@ -28,9 +28,18 @@ pub(crate) struct Site {
     pub(crate) calls: Vec<GenotypeCall>,
 }
 
-pub(crate) trait SiteSource {
+pub(crate) trait SiteSource: Send {
     fn sample_ids(&self) -> &[String];
     fn next_site(&mut self) -> Result<Option<Site>, String>;
+
+    /// Conservative in-memory estimate for one site from this source. The
+    /// parallel scanner uses it to keep source prefetch within a byte budget.
+    fn prefetch_site_bytes_hint(&self) -> usize {
+        self.sample_ids()
+            .len()
+            .saturating_mul(std::mem::size_of::<GenotypeCall>() + 32)
+            .saturating_add(512)
+    }
 
     fn next_scanned_site(&mut self) -> Result<Option<ScannedSite>, String> {
         let Some(site) = self.next_site()? else {

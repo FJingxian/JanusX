@@ -366,6 +366,17 @@ impl SiteSource for OpenedSource {
         }
     }
 
+    fn prefetch_site_bytes_hint(&self) -> usize {
+        match self {
+            Self::Vcf { source, .. } => source.prefetch_site_bytes_hint(),
+            Self::Hmp { source, .. } => source.prefetch_site_bytes_hint(),
+            Self::ParentVcf { source, .. } => source.prefetch_site_bytes_hint(),
+            Self::ParentHmp { source, .. } => source.prefetch_site_bytes_hint(),
+            Self::Parents { source, .. } => source.prefetch_site_bytes_hint(),
+            Self::ParentBfileList { source, .. } => source.prefetch_site_bytes_hint(),
+        }
+    }
+
     fn next_site(&mut self) -> Result<Option<crate::ct::input::Site>, String> {
         match self {
             Self::Vcf { source, .. } => source.next_site(),
@@ -1024,7 +1035,7 @@ fn rust_error(error: String) -> PyErr {
 #[pyo3(signature = (
     source_kind, sample_ids, y, covariates, output_prefix,
     vcf_path=None, hmp_path=None, father_prefix=None, mother_prefix=None, cross_path=None,
-    grm=None, grm_ids=None, model="lm", condition="add-dom", phenotype="trait",
+    grm=None, grm_ids=None, model="lm", phenotype="trait",
     window_bp=50_000, core_bp=50_000, topk=100, snp_maf=0.0, snp_geno=0.05,
     phase_minor_freq=0.0, pair_geno=0.05, min_cis=0, min_trans=0, alpha=0.05,
     threads=1
@@ -1044,7 +1055,6 @@ pub(crate) fn ct_run<'py>(
     grm: Option<PyReadonlyArray2<'py, f64>>,
     grm_ids: Option<Vec<String>>,
     model: &str,
-    condition: &str,
     phenotype: &str,
     window_bp: u64,
     core_bp: u64,
@@ -1065,15 +1075,7 @@ pub(crate) fn ct_run<'py>(
         "fvlmm" => ModelKind::FvLmm,
         _ => return Err(PyValueError::new_err("model must be 'lm' or 'fvlmm'")),
     };
-    let condition_mode = match condition.trim().to_ascii_lowercase().as_str() {
-        "add-dom" => ConditionMode::AddDom,
-        "genotype" => ConditionMode::Genotype,
-        _ => {
-            return Err(PyValueError::new_err(
-                "condition must be 'add-dom' or 'genotype'",
-            ));
-        }
-    };
+    let condition_mode = ConditionMode::AddDom;
     if !(alpha.is_finite() && alpha > 0.0 && alpha < 1.0) {
         return Err(PyValueError::new_err(
             "alpha must be finite and between 0 and 1",

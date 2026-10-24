@@ -111,6 +111,15 @@ impl PackedGenotypes {
         self.n_samples
     }
 
+    pub(crate) fn estimated_storage_bytes_for_samples(n_samples: usize) -> usize {
+        let n_words = n_samples.div_ceil(u64::BITS as usize);
+        std::mem::size_of::<Self>().saturating_add(
+            n_words
+                .saturating_mul(7)
+                .saturating_mul(std::mem::size_of::<u64>()),
+        )
+    }
+
     pub(crate) fn dosage_count(&self, dosage: u8) -> usize {
         self.dosage[dosage as usize]
             .iter()

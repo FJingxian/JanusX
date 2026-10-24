@@ -30,7 +30,9 @@ def build_parser() -> CliArgumentParser:
         formatter_class=cli_help_formatter(),
         description=(
             "Screen nearby phased variant pairs for cis/trans effects, then fit "
-            "conditional LM or fixed-covariance FvLMM models."
+            "conditional LM or fixed-covariance FvLMM models with per-site "
+            "additive/dominance effects. pwald1 tests equal cis/trans effects; "
+            "pwald2 jointly tests whether both effects are zero."
         ),
         epilog=minimal_help_epilog(
             [
@@ -128,17 +130,6 @@ def build_parser() -> CliArgumentParser:
     scan.add_argument("--min-trans", type=int, default=0, help="Additional minimum raw trans support.")
     scan.add_argument("--snp-maf", type=float, default=0.0, help="Minimum raw genotype MAF per endpoint SNP.")
     scan.add_argument("--snp-geno", type=float, default=0.05, help="Maximum raw missing genotype rate per endpoint SNP.")
-    scan.add_argument(
-        "--condition",
-        choices=("add-dom", "genotype"),
-        default="add-dom",
-        help=(
-            "add-dom conditions on per-site additive/dominance effects plus the shared "
-            "double-heterozygote indicator H; genotype uses all eight unphased background "
-            "terms, including H. Both estimate separate cis/trans deviations; pwald1 tests "
-            "whether their effects are equal, and pwald2 jointly tests whether both are zero."
-        ),
-    )
     scan.add_argument(
         "--alpha",
         type=float,
@@ -584,7 +575,6 @@ def _run(args: argparse.Namespace, logger: logging.Logger) -> int:
             grm=aligned_grm,
             grm_ids=sample_ids if aligned_grm is not None else None,
             model=args.model,
-            condition=args.condition,
             phenotype=str(trait),
             window_bp=args.window_bp,
             core_bp=args.core_bp,

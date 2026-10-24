@@ -834,7 +834,7 @@ fn fit_conditional_prepared_inner(
 #[allow(clippy::too_many_arguments)]
 fn fit_conditional_prepared_whitened_inner(
     prepared: &PreparedConditionalFit,
-    mut b_w: Vec<Vec<f64>>,
+    b_w: Vec<Vec<f64>>,
     q_b: usize,
     z_w: Vec<f64>,
     inference: InferenceKind,
@@ -863,47 +863,65 @@ fn fit_conditional_prepared_whitened_inner(
 
     let y_w = &prepared.y_w;
     let c_w = &prepared.c_w;
-    let b_w_full = b_w.clone();
     let nuisance_projection_started = profile.then(Instant::now);
-    let shared_column = shared_background_column.map(|index| b_w.remove(index));
-    let mut nuisance_columns = c_w.clone();
-    nuisance_columns.extend(b_w);
+    let shared_column = shared_background_column.map(|index| b_w[index].clone());
+    let shared_norm2 = shared_column.as_ref().map(|column| dot(column, column));
+    let mut base_design = Vec::with_capacity(c_w.len() + b_w.len());
+    base_design.extend(c_w.iter().map(Vec::as_slice));
+    base_design.extend(
+        b_w.iter()
+            .enumerate()
+            .filter(|(index, _)| Some(*index) != shared_background_column)
+            .map(|(_, column)| column.as_slice()),
+    );
+    let nuisance_columns = base_design.iter().map(|column| column.to_vec()).collect();
     let base_basis = orthonormal_basis(nuisance_columns);
-    let y_after_base = project_off(y_w, &base_basis);
-    let z_after_base = project_off(&z_w, &base_basis);
+    let mut projection_values = vec![y_w.to_vec(), z_w.clone()];
+    if let Some(column) = shared_column {
+        projection_values.push(column);
+    }
+    project_off_many(&mut projection_values, &base_basis);
+    let mut projected_values = projection_values.into_iter();
+    let mut y_after_base = projected_values
+        .next()
+        .expect("joint projection includes the response");
+    let mut z_after_base = projected_values
+        .next()
+        .expect("joint projection includes the phase vector");
+    let shared_residual = shared_norm2.map(|_| {
+        projected_values
+            .next()
+            .expect("joint projection includes the shared background column")
+    });
     // Orthogonalize H after the other background columns. Center the response
     // against that same base first, so roundoff from a large intercept cannot
     // leak into the separate cis/trans effects.
-    let shared_projection = shared_column.and_then(|column| {
-        let norm2 = dot(&column, &column);
-        let residual = project_off(&column, &base_basis);
-        let information = dot(&residual, &residual);
-        if !information.is_finite() || information <= norm2 * 1.0e-24 {
-            return None;
-        }
-        let eta_without_z = dot(&residual, &y_after_base) / information;
-        let z_loading = dot(&residual, &z_after_base) / information;
-        let mut unit = residual;
-        let scale = information.sqrt();
-        for value in &mut unit {
-            *value /= scale;
-        }
-        Some((information, eta_without_z, z_loading, unit))
-    });
+    let shared_projection = shared_norm2
+        .zip(shared_residual)
+        .and_then(|(norm2, residual)| {
+            let information = dot(&residual, &residual);
+            if !information.is_finite() || information <= norm2 * 1.0e-24 {
+                return None;
+            }
+            let eta_without_z = dot(&residual, &y_after_base) / information;
+            let z_loading = dot(&residual, &z_after_base) / information;
+            let mut unit = residual;
+            let scale = information.sqrt();
+            for value in &mut unit {
+                *value /= scale;
+            }
+            Some((information, eta_without_z, z_loading, unit))
+        });
     let (y_after_nuisance, z_after) = if let Some((_, _, _, h_unit)) = shared_projection.as_ref() {
         let y_loading = dot(&y_after_base, h_unit);
         let z_loading = dot(&z_after_base, h_unit);
-        let y_residual = y_after_base
-            .iter()
-            .zip(h_unit)
-            .map(|(&value, &h)| value - y_loading * h)
-            .collect::<Vec<_>>();
-        let z_residual = z_after_base
-            .iter()
-            .zip(h_unit)
-            .map(|(&value, &h)| value - z_loading * h)
-            .collect::<Vec<_>>();
-        (y_residual, z_residual)
+        for (value, &h) in y_after_base.iter_mut().zip(h_unit) {
+            *value -= y_loading * h;
+        }
+        for (value, &h) in z_after_base.iter_mut().zip(h_unit) {
+            *value -= z_loading * h;
+        }
+        (y_after_base, z_after_base)
     } else {
         (y_after_base, z_after_base)
     };
@@ -979,25 +997,6 @@ fn fit_conditional_prepared_whitened_inner(
     if let Some(started) = phase_test_started {
         timings.phase_test += started.elapsed();
     }
-    let mut beta_a1 = f64::NAN;
-    let mut beta_d1 = f64::NAN;
-    let mut beta_a2 = f64::NAN;
-    let mut beta_d2 = f64::NAN;
-    let main_effects_started = profile.then(Instant::now);
-    if b_w_full.len() >= 4 {
-        let mut full_design = c_w.clone();
-        full_design.extend(b_w_full.iter().cloned());
-        full_design.push(z_w.clone());
-        let target_indices = (c_w.len()..c_w.len() + 4).collect::<Vec<_>>();
-        let coefficients = design_coefficients_for_targets(&full_design, y_w, &target_indices);
-        beta_a1 = coefficients[0];
-        beta_a2 = coefficients[1];
-        beta_d1 = coefficients[2];
-        beta_d2 = coefficients[3];
-    }
-    if let Some(started) = main_effects_started {
-        timings.main_effects += started.elapsed();
-    }
     let mut beta_shared = f64::NAN;
     let mut se_shared = f64::NAN;
     let mut beta_cis = f64::NAN;
@@ -1032,6 +1031,44 @@ fn fit_conditional_prepared_whitened_inner(
     }
     if let Some(started) = phase_effects_started {
         timings.phase_effects += started.elapsed();
+    }
+    let mut beta_a1 = f64::NAN;
+    let mut beta_d1 = f64::NAN;
+    let mut beta_a2 = f64::NAN;
+    let mut beta_d2 = f64::NAN;
+    let main_effects_started = profile.then(Instant::now);
+    if b_w.len() >= 4 {
+        let target_indices = (c_w.len()..c_w.len() + 4).collect::<Vec<_>>();
+        let basis_coefficients = shared_background_column
+            .filter(|&shared_index| shared_index >= 4)
+            .filter(|_| shared_effect_identifiable && beta_shared.is_finite())
+            .and_then(|shared_index| {
+                let base_targets = (c_w.len()..c_w.len() + 4).collect::<Vec<_>>();
+                coefficients_from_basis_with_extra_terms(
+                    &base_basis,
+                    &base_design,
+                    y_w,
+                    &[
+                        (b_w[shared_index].as_slice(), beta_shared),
+                        (z_w.as_slice(), beta_z),
+                    ],
+                    &base_targets,
+                )
+            });
+        let coefficients = basis_coefficients.unwrap_or_else(|| {
+            let mut full_design = Vec::with_capacity(c_w.len() + b_w.len() + 1);
+            full_design.extend(c_w.iter().map(Vec::as_slice));
+            full_design.extend(b_w.iter().map(Vec::as_slice));
+            full_design.push(z_w.as_slice());
+            design_coefficients_for_targets(&full_design, y_w, &target_indices)
+        });
+        beta_a1 = coefficients[0];
+        beta_a2 = coefficients[1];
+        beta_d1 = coefficients[2];
+        beta_d2 = coefficients[3];
+    }
+    if let Some(started) = main_effects_started {
+        timings.main_effects += started.elapsed();
     }
     Ok(ConditionalFit {
         status: FitStatus::Testable,
@@ -1114,8 +1151,8 @@ fn partial_regression_coefficient(target: &[f64], response: &[f64], others: Vec<
     }
 }
 
-fn design_coefficients_for_targets(
-    design: &[Vec<f64>],
+fn design_coefficients_for_targets<C: AsRef<[f64]>>(
+    design: &[C],
     response: &[f64],
     targets: &[usize],
 ) -> Vec<f64> {
@@ -1135,22 +1172,80 @@ fn design_coefficients_for_targets(
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| *index != target)
-                .map(|(_, column)| column.clone())
+                .map(|(_, column)| column.as_ref().to_vec())
                 .collect::<Vec<_>>();
-            partial_regression_coefficient(column, response, others)
+            partial_regression_coefficient(column.as_ref(), response, others)
         })
         .collect()
+}
+
+fn coefficients_from_basis_with_extra_terms(
+    basis: &[Vec<f64>],
+    design: &[&[f64]],
+    response: &[f64],
+    extra_terms: &[(&[f64], f64)],
+    targets: &[usize],
+) -> Option<Vec<f64>> {
+    let n = response.len();
+    if n == 0
+        || basis.is_empty()
+        || basis.len() != design.len()
+        || response.iter().any(|value| !value.is_finite())
+        || basis
+            .iter()
+            .any(|column| column.len() != n || column.iter().any(|value| !value.is_finite()))
+        || design
+            .iter()
+            .any(|column| column.len() != n || column.iter().any(|value| !value.is_finite()))
+        || extra_terms.iter().any(|(column, coefficient)| {
+            column.len() != n
+                || column.iter().any(|value| !value.is_finite())
+                || !coefficient.is_finite()
+        })
+    {
+        return None;
+    }
+
+    // The basis spans the nuisance design. Projecting each original column
+    // and the response into those coordinates gives a small, equivalent
+    // least-squares system without refactorizing all sample-sized columns.
+    let coordinate_design = design
+        .iter()
+        .map(|column| {
+            basis
+                .iter()
+                .map(|basis_column| dot(basis_column, column))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let coordinate_response = basis
+        .iter()
+        .map(|basis_column| {
+            extra_terms.iter().fold(
+                dot(basis_column, response),
+                |value, (column, coefficient)| value - coefficient * dot(basis_column, column),
+            )
+        })
+        .collect::<Vec<_>>();
+    let coefficients = pivoted_qr_coefficients(&coordinate_design, &coordinate_response)?;
+    Some(
+        targets
+            .iter()
+            .map(|&target| coefficients.get(target).copied().unwrap_or(f64::NAN))
+            .collect(),
+    )
 }
 
 /// Full-rank, column-pivoted modified Gram-Schmidt solve. Scaling the source
 /// columns before pivoting makes rank decisions independent of predictor units;
 /// rank-deficient designs return `None` so callers can preserve their per-term
 /// estimability behavior with a fallback.
-fn pivoted_qr_coefficients(columns: &[Vec<f64>], response: &[f64]) -> Option<Vec<f64>> {
+fn pivoted_qr_coefficients<C: AsRef<[f64]>>(columns: &[C], response: &[f64]) -> Option<Vec<f64>> {
     if columns.is_empty()
         || response.is_empty()
         || response.iter().any(|value| !value.is_finite())
         || columns.iter().any(|column| {
+            let column = column.as_ref();
             column.len() != response.len() || column.iter().any(|value| !value.is_finite())
         })
         || columns.len() > response.len()
@@ -1161,6 +1256,7 @@ fn pivoted_qr_coefficients(columns: &[Vec<f64>], response: &[f64]) -> Option<Vec
     let mut residual_columns = Vec::with_capacity(n_columns);
     let mut source_norms = Vec::with_capacity(n_columns);
     for column in columns {
+        let column = column.as_ref();
         let scale = column
             .iter()
             .map(|value| value.abs())
@@ -1353,6 +1449,32 @@ pub(crate) fn project_off(values: &[f64], basis: &[Vec<f64>]) -> Vec<f64> {
     out
 }
 
+fn project_off_many(values: &mut [Vec<f64>], basis: &[Vec<f64>]) {
+    if values.is_empty() || basis.is_empty() {
+        return;
+    }
+    let n = values[0].len();
+    debug_assert!(values.iter().all(|column| column.len() == n));
+    debug_assert!(basis.iter().all(|column| column.len() == n));
+    // `orthonormal_basis` has already reorthogonalized its columns. Compute
+    // all Qᵀx coefficients from the same original x, then apply x - Q(Qᵀx)
+    // in one pass. This is the standard orthogonal projector and avoids a
+    // second full traversal over every sample vector.
+    let mut coefficients = vec![vec![0.0; basis.len()]; values.len()];
+    for (basis_index, basis_column) in basis.iter().enumerate() {
+        for (value_index, values_column) in values.iter().enumerate() {
+            coefficients[value_index][basis_index] = dot(values_column, basis_column);
+        }
+    }
+    for (value_index, values_column) in values.iter_mut().enumerate() {
+        for (coefficient, basis_column) in coefficients[value_index].iter().zip(basis) {
+            for (value, &basis_value) in values_column.iter_mut().zip(basis_column) {
+                *value -= coefficient * basis_value;
+            }
+        }
+    }
+}
+
 #[inline]
 fn dot(left: &[f64], right: &[f64]) -> f64 {
     left.iter().zip(right).map(|(a, b)| a * b).sum()
@@ -1466,6 +1588,180 @@ mod tests {
                 "target={target}: pivoted QR={}, partial regression={reference}",
                 observed[target]
             );
+        }
+    }
+
+    #[test]
+    fn target_coefficients_accept_borrowed_design_columns() {
+        let n = 40;
+        let columns = vec![
+            vec![1.0; n],
+            (0..n).map(|i| i as f64).collect(),
+            (0..n).map(|i| (i * i) as f64).collect(),
+            (0..n).map(|i| ((i * 13 % 17) as f64) / 17.0).collect(),
+            (0..n).map(|i| ((i as f64) * 0.37).sin()).collect(),
+        ];
+        let response = (0..n)
+            .map(|i| {
+                0.75 + 0.2 * columns[1][i] - 0.04 * columns[2][i] + 1.1 * columns[3][i]
+                    - 0.6 * columns[4][i]
+            })
+            .collect::<Vec<_>>();
+        let expected = pivoted_qr_coefficients(&columns, &response).unwrap();
+        let borrowed = columns.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let observed = super::design_coefficients_for_targets(&borrowed, &response, &[1, 3, 4]);
+
+        for (target, actual) in [1, 3, 4].into_iter().zip(observed) {
+            assert!(
+                (actual - expected[target]).abs() < 1.0e-10,
+                "target={target}: borrowed={actual}, owned={}",
+                expected[target]
+            );
+        }
+    }
+
+    #[test]
+    fn borrowed_target_coefficients_keep_partial_regression_fallback() {
+        let n = 32;
+        let x = (0..n).map(|i| i as f64 - 12.0).collect::<Vec<_>>();
+        let columns = vec![
+            vec![1.0; n],
+            x.clone(),
+            x,
+            (0..n).map(|i| ((i as f64) * 0.41).sin()).collect(),
+        ];
+        let response = (0..n)
+            .map(|i| 0.8 + 2.0 * columns[1][i] + 0.5 * columns[3][i])
+            .collect::<Vec<_>>();
+        let borrowed = columns.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let targets = [1, 2, 3];
+        let observed = super::design_coefficients_for_targets(&borrowed, &response, &targets);
+
+        for (&target, actual) in targets.iter().zip(observed) {
+            let others = borrowed
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != target)
+                .map(|(_, column)| column.to_vec())
+                .collect();
+            let expected =
+                super::partial_regression_coefficient(borrowed[target], &response, others);
+            assert!(
+                (actual.is_nan() && expected.is_nan()) || (actual - expected).abs() < 1.0e-10,
+                "target={target}: borrowed={actual}, fallback={expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn nuisance_basis_coordinate_coefficients_match_full_design_qr() {
+        let n = 48;
+        let nuisance = vec![
+            vec![1.0; n],
+            (0..n).map(|i| ((i * 7 % 19) as f64 - 9.0) / 9.0).collect(),
+            (0..n)
+                .map(|i| ((i * i % 37) as f64 - 18.0) / 18.0)
+                .collect(),
+            (0..n).map(|i| ((i as f64) * 0.31).sin()).collect(),
+        ];
+        let shared = (0..n)
+            .map(|i| if i % 3 == 0 { 1.0 } else { 0.0 })
+            .collect::<Vec<_>>();
+        let phase = (0..n)
+            .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+            .collect::<Vec<_>>();
+        let response = (0..n)
+            .map(|i| {
+                0.75 + 0.2 * nuisance[1][i] - 0.04 * nuisance[2][i]
+                    + 1.1 * nuisance[3][i]
+                    + 0.35 * shared[i]
+                    - 0.6 * phase[i]
+            })
+            .collect::<Vec<_>>();
+        let basis = super::orthonormal_basis(nuisance.clone());
+        let nuisance_refs = nuisance.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let full_design = nuisance_refs
+            .iter()
+            .copied()
+            .chain([shared.as_slice(), phase.as_slice()])
+            .collect::<Vec<_>>();
+        let targets = [1, 2, 3];
+        let expected = super::design_coefficients_for_targets(&full_design, &response, &targets);
+        let observed = super::coefficients_from_basis_with_extra_terms(
+            &basis,
+            &nuisance_refs,
+            &response,
+            &[(shared.as_slice(), 0.35), (phase.as_slice(), -0.6)],
+            &targets,
+        )
+        .expect("full-rank nuisance basis must solve the projected system");
+
+        for (target, (actual, expected)) in
+            targets.into_iter().zip(observed.into_iter().zip(expected))
+        {
+            assert!(
+                (actual - expected).abs() < 1.0e-9,
+                "target={target}: basis={actual}, full QR={expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn nuisance_basis_coordinate_coefficients_reject_rank_deficient_bases() {
+        let n = 16;
+        let x = (0..n).map(|i| i as f64).collect::<Vec<_>>();
+        let design = vec![vec![1.0; n], x.clone(), x];
+        let basis = super::orthonormal_basis(design.clone());
+        let refs = design.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        assert!(super::coefficients_from_basis_with_extra_terms(
+            &basis,
+            &refs,
+            &vec![0.0; n],
+            &[],
+            &[1]
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn multi_vector_projection_matches_reorthogonalized_projection() {
+        let n = 67;
+        let basis = super::orthonormal_basis(vec![
+            vec![1.0; n],
+            (0..n)
+                .map(|i| ((i * 11 % 23) as f64 - 11.0) / 11.0)
+                .collect(),
+            (0..n).map(|i| ((i as f64) * 0.27).sin()).collect(),
+        ]);
+        let inputs = (0..3)
+            .map(|column| {
+                (0..n)
+                    .map(|row| ((row * 7 + column * 5) % 31) as f64 - 15.0)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let expected = inputs
+            .iter()
+            .map(|values| super::project_off(values, &basis))
+            .collect::<Vec<_>>();
+        let input_norms = inputs
+            .iter()
+            .map(|values| super::dot(values, values).sqrt().max(1.0))
+            .collect::<Vec<_>>();
+        let mut observed = inputs;
+        super::project_off_many(&mut observed, &basis);
+
+        for ((actual, expected), input_norm) in observed.iter().zip(&expected).zip(input_norms) {
+            let difference_norm = actual
+                .iter()
+                .zip(expected)
+                .map(|(actual, expected)| (actual - expected).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            assert!(difference_norm <= 1.0e-12 * input_norm);
+            for basis_column in &basis {
+                assert!(super::dot(actual, basis_column).abs() <= 1.0e-12 * input_norm);
+            }
         }
     }
 

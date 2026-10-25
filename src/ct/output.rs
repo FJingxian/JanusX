@@ -1,8 +1,9 @@
 use crate::ct::conditional::{
     build_background, fit_conditional_prepared, fit_conditional_prepared_profiled,
     fit_conditional_prepared_whitened, fit_conditional_prepared_whitened_profiled,
-    prepare_conditional_fit, whiten_pair_design_batch, ConditionMode, ConditionalFitTimings,
-    CovarianceMetric, FitStatus, InferenceKind, PairDesign, PreparedConditionalFit,
+    prepare_conditional_fit, whiten_pair_design_batch_profiled, ConditionMode,
+    ConditionalFitTimings, CovarianceMetric, FitStatus, InferenceKind, PairDesign,
+    PreparedConditionalFit, WhiteningStageTimings,
 };
 use crate::ct::hmp::HmpSource;
 use crate::ct::input::SiteSource;
@@ -47,6 +48,7 @@ struct CandidateProfileStats {
     candidate_work_thread: Duration,
     design_build_thread: Duration,
     conditional_fit_thread: ConditionalFitTimings,
+    whitening_thread: WhiteningStageTimings,
     row_format_thread: Duration,
     callback_wall: Duration,
     parallel_fit_wall: Duration,
@@ -59,6 +61,7 @@ struct CandidateTaskTimings {
     elapsed: Duration,
     design_build: Duration,
     conditional_fit: ConditionalFitTimings,
+    whitening: WhiteningStageTimings,
     row_format: Duration,
 }
 
@@ -469,6 +472,7 @@ fn finish_candidate_fit(
     elapsed_before_format: Duration,
     design_build: Duration,
     conditional_fit: ConditionalFitTimings,
+    whitening: WhiteningStageTimings,
     profile_timings: bool,
 ) -> Result<((f64, usize, Vec<String>, bool, bool), CandidateTaskTimings), String> {
     let row_format_started = profile_timings.then(Instant::now);
@@ -493,6 +497,7 @@ fn finish_candidate_fit(
             elapsed: elapsed_before_format + row_format_elapsed,
             design_build,
             conditional_fit,
+            whitening,
             row_format: row_format_elapsed,
         },
     ))
@@ -539,10 +544,8 @@ fn fit_candidate_cores(
     profile_timings: bool,
     fit_pool: &rayon::ThreadPool,
 ) -> Result<Vec<Vec<FittedCandidate>>, String> {
-    // Rayon shares the inner whitening jobs across the same fit pool. Keep
-    // each core's original solve dimensions to preserve its numerical path,
-    // while allowing jobs from other cores to occupy otherwise idle workers.
-    // Indexed collection preserves core/candidate order, including empty cores.
+    // Keep each core's original solve dimensions; fit cores concurrently and
+    // preserve their order, including empty cores.
     fit_pool.install(|| {
         cores
             .par_iter()
@@ -628,6 +631,7 @@ fn fit_core_candidates(
                         elapsed,
                         design_build,
                         conditional_timings,
+                        WhiteningStageTimings::default(),
                         profile_timings,
                     )
                 })
@@ -673,17 +677,16 @@ fn fit_core_candidates(
                     );
                 }
 
-                let batch_whiten_started = profile_timings.then(Instant::now);
-                let whitened = whiten_pair_design_batch(&designs, q_b, metric)?;
-                let batch_whiten = batch_whiten_started
-                    .map(|started| started.elapsed())
-                    .unwrap_or_default();
-                let whiten_share = batch_whiten / candidates.len() as u32;
+                let (whitened, batch_whitening_timings) =
+                    whiten_pair_design_batch_profiled(&designs, q_b, metric, profile_timings)?;
+                let whitening_share = batch_whitening_timings.share(candidates.len());
+                let whiten_share = whitening_share.total;
                 candidates
                     .par_iter()
                     .zip(whitened.into_par_iter())
                     .zip(design_build_times.into_par_iter())
-                    .map(|((candidate, design), design_build)| {
+                    .enumerate()
+                    .map(|(candidate_index, ((candidate, design), design_build))| {
                         let fit_started = profile_timings.then(Instant::now);
                         let mut conditional_timings = ConditionalFitTimings::default();
                         let fit_result = if profile_timings {
@@ -717,12 +720,20 @@ fn fit_core_candidates(
                             .map(|started| started.elapsed())
                             .unwrap_or_default();
                         conditional_timings.joint_design_whiten += whiten_share;
+                        let mut candidate_whitening = whitening_share;
+                        if candidate_index == 0 {
+                            candidate_whitening.rhs_columns_total =
+                                batch_whitening_timings.rhs_columns_total;
+                            candidate_whitening.rhs_columns_unique =
+                                batch_whitening_timings.rhs_columns_unique;
+                        }
                         finish_candidate_fit(
                             candidate,
                             fit,
                             design_build + whiten_share + fit_elapsed,
                             design_build,
                             conditional_timings,
+                            candidate_whitening,
                             profile_timings,
                         )
                     })
@@ -948,6 +959,13 @@ fn make_profile_timings(
         + candidate_materialize;
     let site_window_bookkeeping = quick_scan.saturating_sub(measured_scan_wall_stages);
     let other_scan_engine_wall = pair_screen_wall + site_window_bookkeeping;
+    let whitening_rhs_total = candidate_profile.whitening_thread.rhs_columns_total;
+    let whitening_rhs_unique = candidate_profile.whitening_thread.rhs_columns_unique;
+    let whitening_rhs_duplicate_fraction = if whitening_rhs_total == 0 {
+        0.0
+    } else {
+        1.0 - whitening_rhs_unique as f64 / whitening_rhs_total as f64
+    };
 
     Some(json!({
         "profile_enabled_by": "JX_CT_PROFILE",
@@ -967,6 +985,25 @@ fn make_profile_timings(
             "total_candidate_work_seconds": candidate_profile.candidate_work_thread.as_secs_f64(),
             "design_build_background_and_z_seconds": candidate_profile.design_build_thread.as_secs_f64(),
             "conditional_joint_design_whitening_seconds": candidate_profile.conditional_fit_thread.joint_design_whiten.as_secs_f64(),
+            "conditional_joint_design_whitening_stages_seconds": {
+                "rhs_columns_total": whitening_rhs_total,
+                "rhs_columns_unique": whitening_rhs_unique,
+                "rhs_duplicate_fraction": whitening_rhs_duplicate_fraction,
+                "matrix_assembly": candidate_profile.whitening_thread.matrix_assembly.as_secs_f64(),
+                "column_deduplication": candidate_profile.whitening_thread.column_deduplication.as_secs_f64(),
+                "row_matrix_copy": candidate_profile.whitening_thread.row_matrix_copy.as_secs_f64(),
+                "solve_or_scale": candidate_profile.whitening_thread.solve_or_scale.as_secs_f64(),
+                "column_unpack": candidate_profile.whitening_thread.column_unpack.as_secs_f64(),
+                "duplicate_restore_and_pair_pack": candidate_profile.whitening_thread.duplicate_restore_and_pair_pack.as_secs_f64(),
+                "unattributed": candidate_profile.whitening_thread.total.saturating_sub(
+                    candidate_profile.whitening_thread.matrix_assembly
+                        + candidate_profile.whitening_thread.column_deduplication
+                        + candidate_profile.whitening_thread.row_matrix_copy
+                        + candidate_profile.whitening_thread.solve_or_scale
+                        + candidate_profile.whitening_thread.column_unpack
+                        + candidate_profile.whitening_thread.duplicate_restore_and_pair_pack
+                ).as_secs_f64()
+            },
             "conditional_nuisance_projection_and_basis_seconds": candidate_profile.conditional_fit_thread.nuisance_projection.as_secs_f64(),
             "conditional_phase_test_seconds": candidate_profile.conditional_fit_thread.phase_test.as_secs_f64(),
             "conditional_main_effect_estimation_seconds": candidate_profile.conditional_fit_thread.main_effects.as_secs_f64(),
@@ -1251,6 +1288,9 @@ pub(crate) fn ct_run<'py>(
                             timing.conditional_fit.main_effects;
                         candidate_profile.conditional_fit_thread.phase_effects +=
                             timing.conditional_fit.phase_effects;
+                        candidate_profile
+                            .whitening_thread
+                            .add_assign(timing.whitening);
                         candidate_profile.row_format_thread += timing.row_format;
                     }
                     let sort_started = profile_timings.then(Instant::now);

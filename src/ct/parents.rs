@@ -597,6 +597,9 @@ fn read_parent_bfile_manifest(path: &str) -> Result<Vec<ParentBfileEntry>, Strin
         .filter(|parent| !parent.as_os_str().is_empty());
     let mut reader = ReaderBuilder::new()
         .delimiter(b'\t')
+        // One-column manifests are valid and commonly headerless. Letting the
+        // CSV reader assume a header silently drops the first chromosome.
+        .has_headers(false)
         .flexible(true)
         .comment(Some(b'#'))
         .from_path(manifest)

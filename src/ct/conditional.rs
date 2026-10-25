@@ -4,6 +4,7 @@ use crate::blas::{
     CBLAS_LOWER, CBLAS_NO_TRANS, CBLAS_ROW_MAJOR, CBLAS_TRANS,
 };
 use crate::ct::packed::FilledPair;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,6 +37,48 @@ pub(crate) struct PairDesign {
 pub(crate) struct WhitenedPairDesign {
     pub(crate) background_columns: Vec<Vec<f64>>,
     pub(crate) phase: Vec<f64>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct WhiteningStageTimings {
+    pub(crate) total: Duration,
+    pub(crate) rhs_columns_total: usize,
+    pub(crate) rhs_columns_unique: usize,
+    pub(crate) matrix_assembly: Duration,
+    pub(crate) column_deduplication: Duration,
+    pub(crate) row_matrix_copy: Duration,
+    pub(crate) solve_or_scale: Duration,
+    pub(crate) column_unpack: Duration,
+    pub(crate) duplicate_restore_and_pair_pack: Duration,
+}
+
+impl WhiteningStageTimings {
+    pub(crate) fn add_assign(&mut self, other: Self) {
+        self.total += other.total;
+        self.rhs_columns_total += other.rhs_columns_total;
+        self.rhs_columns_unique += other.rhs_columns_unique;
+        self.matrix_assembly += other.matrix_assembly;
+        self.column_deduplication += other.column_deduplication;
+        self.row_matrix_copy += other.row_matrix_copy;
+        self.solve_or_scale += other.solve_or_scale;
+        self.column_unpack += other.column_unpack;
+        self.duplicate_restore_and_pair_pack += other.duplicate_restore_and_pair_pack;
+    }
+
+    pub(crate) fn share(self, divisor: usize) -> Self {
+        let divisor = u32::try_from(divisor.max(1)).unwrap_or(u32::MAX);
+        Self {
+            total: self.total / divisor,
+            rhs_columns_total: 0,
+            rhs_columns_unique: 0,
+            matrix_assembly: self.matrix_assembly / divisor,
+            column_deduplication: self.column_deduplication / divisor,
+            row_matrix_copy: self.row_matrix_copy / divisor,
+            solve_or_scale: self.solve_or_scale / divisor,
+            column_unpack: self.column_unpack / divisor,
+            duplicate_restore_and_pair_pack: self.duplicate_restore_and_pair_pack / divisor,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -178,6 +221,17 @@ impl CovarianceMetric {
         values: &[f64],
         n_columns: usize,
     ) -> Result<Vec<Vec<f64>>, String> {
+        self.whiten_row_major_columns_profiled(values, n_columns, false)
+            .map(|(columns, _)| columns)
+    }
+
+    fn whiten_row_major_columns_profiled(
+        &self,
+        values: &[f64],
+        n_columns: usize,
+        profile: bool,
+    ) -> Result<(Vec<Vec<f64>>, WhiteningStageTimings), String> {
+        let mut timings = WhiteningStageTimings::default();
         let n = self.n();
         if n_columns == 0 || values.len() != n.saturating_mul(n_columns) {
             return Err("covariance whitening matrix shape mismatch or empty matrix".to_string());
@@ -186,7 +240,12 @@ impl CovarianceMetric {
             return Err("covariance whitening input contains non-finite values".to_string());
         }
 
+        let copy_started = profile.then(Instant::now);
         let mut row_major = values.to_vec();
+        if let Some(started) = copy_started {
+            timings.row_matrix_copy = started.elapsed();
+        }
+        let solve_started = profile.then(Instant::now);
         match self {
             Self::Identity { .. } => {}
             Self::Diagonal {
@@ -234,14 +293,21 @@ impl CovarianceMetric {
                 }
             }
         }
+        if let Some(started) = solve_started {
+            timings.solve_or_scale = started.elapsed();
+        }
 
+        let unpack_started = profile.then(Instant::now);
         let mut columns = vec![vec![0.0; n]; n_columns];
         for row in 0..n {
             for column in 0..n_columns {
                 columns[column][row] = row_major[row * n_columns + column];
             }
         }
-        Ok(columns)
+        if let Some(started) = unpack_started {
+            timings.column_unpack = started.elapsed();
+        }
+        Ok((columns, timings))
     }
 
     pub(crate) fn solve_lower_transpose(&self, values: &[f64]) -> Result<Vec<f64>, String> {
@@ -276,16 +342,28 @@ impl CovarianceMetric {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn whiten_pair_design_batch(
     designs: &[PairDesign],
     q_b: usize,
     metric: &CovarianceMetric,
 ) -> Result<Vec<WhitenedPairDesign>, String> {
+    whiten_pair_design_batch_profiled(designs, q_b, metric, false).map(|(designs, _)| designs)
+}
+
+pub(crate) fn whiten_pair_design_batch_profiled(
+    designs: &[PairDesign],
+    q_b: usize,
+    metric: &CovarianceMetric,
+    profile: bool,
+) -> Result<(Vec<WhitenedPairDesign>, WhiteningStageTimings), String> {
+    let total_started = profile.then(Instant::now);
+    let mut timings = WhiteningStageTimings::default();
     if q_b == 0 {
         return Err("pair design batch must have at least one background column".to_string());
     }
     if designs.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), timings));
     }
 
     let n = metric.n();
@@ -305,9 +383,13 @@ pub(crate) fn whiten_pair_design_batch(
         .len()
         .checked_mul(columns_per_pair)
         .ok_or_else(|| "pair design batch dimensions overflow".to_string())?;
+    if profile {
+        timings.rhs_columns_total = n_columns;
+    }
     let matrix_len = n
         .checked_mul(n_columns)
         .ok_or_else(|| "pair design batch dimensions overflow".to_string())?;
+    let assembly_started = profile.then(Instant::now);
     let mut combined = Vec::with_capacity(matrix_len);
     for row in 0..n {
         let row_start = row * q_b;
@@ -316,18 +398,34 @@ pub(crate) fn whiten_pair_design_batch(
             combined.push(design.phase[row]);
         }
     }
+    if let Some(started) = assembly_started {
+        timings.matrix_assembly = started.elapsed();
+    }
 
+    let deduplicate_started = profile.then(Instant::now);
     let (combined, column_mapping) = if metric.has_cholesky_factor() && n > 0 {
         deduplicate_row_major_columns(combined, n, n_columns)?
     } else {
         (combined, (0..n_columns).collect())
     };
+    if let Some(started) = deduplicate_started {
+        timings.column_deduplication = started.elapsed();
+    }
     let n_unique_columns = if n == 0 {
         n_columns
     } else {
         combined.len() / n
     };
-    let unique_columns = metric.whiten_row_major_columns(&combined, n_unique_columns)?;
+    if profile {
+        timings.rhs_columns_unique = n_unique_columns;
+    }
+    let (unique_columns, solve_timings) =
+        metric.whiten_row_major_columns_profiled(&combined, n_unique_columns, profile)?;
+    timings.row_matrix_copy = solve_timings.row_matrix_copy;
+    timings.solve_or_scale = solve_timings.solve_or_scale;
+    timings.column_unpack = solve_timings.column_unpack;
+
+    let restore_started = profile.then(Instant::now);
     let whitened_columns = if n_unique_columns == n_columns {
         unique_columns
     } else {
@@ -348,7 +446,13 @@ pub(crate) fn whiten_pair_design_batch(
             phase,
         });
     }
-    Ok(whitened)
+    if let Some(started) = restore_started {
+        timings.duplicate_restore_and_pair_pack = started.elapsed();
+    }
+    if let Some(started) = total_started {
+        timings.total = started.elapsed();
+    }
+    Ok((whitened, timings))
 }
 
 /// Collapse bitwise-identical RHS columns before the expensive Cholesky solve.
@@ -365,38 +469,66 @@ fn deduplicate_row_major_columns(
         return Err("covariance whitening matrix shape mismatch or empty matrix".to_string());
     }
 
+    let packed = pack_discrete_row_major_columns(&values, n, n_columns);
     let mut hashes = vec![0xcbf29ce484222325_u64; n_columns];
-    for row in 0..n {
-        let row_start = row * n_columns;
+    if let Some((packed_values, words_per_column)) = &packed {
         for column in 0..n_columns {
-            hashes[column] =
-                (hashes[column] ^ values[row_start + column].to_bits()).wrapping_mul(0x100000001b3);
+            let mut hash = 0xcbf29ce484222325_u64;
+            for word in 0..*words_per_column {
+                hash =
+                    (hash ^ packed_values[word * n_columns + column]).wrapping_mul(0x100000001b3);
+            }
+            hashes[column] = hash;
+        }
+    } else {
+        for row in 0..n {
+            let row_start = row * n_columns;
+            for column in 0..n_columns {
+                hashes[column] = (hashes[column] ^ values[row_start + column].to_bits())
+                    .wrapping_mul(0x100000001b3);
+            }
         }
     }
 
     let mut unique_source_columns: Vec<usize> = Vec::with_capacity(n_columns);
     let mut mapping: Vec<usize> = Vec::with_capacity(n_columns);
+    let mut unique_by_hash: HashMap<u64, Vec<usize>> = HashMap::with_capacity(n_columns);
     for column in 0..n_columns {
         let mut matched = None;
-        'candidate: for (unique_index, &source_column) in unique_source_columns.iter().enumerate() {
-            if hashes[source_column] != hashes[column] {
-                continue;
-            }
-            for row in 0..n {
-                let left = values[row * n_columns + column].to_bits();
-                let right = values[row * n_columns + source_column].to_bits();
-                if left != right {
-                    continue 'candidate;
+        if let Some(candidates) = unique_by_hash.get(&hashes[column]) {
+            'candidate: for &unique_index in candidates {
+                let source_column = unique_source_columns[unique_index];
+                if let Some((packed_values, words_per_column)) = &packed {
+                    for word in 0..*words_per_column {
+                        if packed_values[word * n_columns + column]
+                            != packed_values[word * n_columns + source_column]
+                        {
+                            continue 'candidate;
+                        }
+                    }
+                } else {
+                    for row in 0..n {
+                        let left = values[row * n_columns + column].to_bits();
+                        let right = values[row * n_columns + source_column].to_bits();
+                        if left != right {
+                            continue 'candidate;
+                        }
+                    }
                 }
+                matched = Some(unique_index);
+                break;
             }
-            matched = Some(unique_index);
-            break;
         }
         if let Some(unique_index) = matched {
             mapping.push(unique_index);
         } else {
             unique_source_columns.push(column);
-            mapping.push(unique_source_columns.len() - 1);
+            let unique_index = unique_source_columns.len() - 1;
+            mapping.push(unique_index);
+            unique_by_hash
+                .entry(hashes[column])
+                .or_default()
+                .push(unique_index);
         }
     }
 
@@ -415,6 +547,39 @@ fn deduplicate_row_major_columns(
         }
     }
     Ok((compact, mapping))
+}
+
+/// Pack CT design columns, whose values are integer dosages/phase codes, into
+/// two bits per sample. This makes content hashing and exact duplicate checks
+/// cheaper while retaining a full bitwise equality check before deduplication.
+fn pack_discrete_row_major_columns(
+    values: &[f64],
+    n: usize,
+    n_columns: usize,
+) -> Option<(Vec<u64>, usize)> {
+    if n_columns == 0 || values.len() != n.checked_mul(n_columns)? {
+        return None;
+    }
+    let words_per_column = n.saturating_add(31) / 32;
+    let packed_len = words_per_column.checked_mul(n_columns)?;
+    let mut packed = vec![0_u64; packed_len];
+    for row in 0..n {
+        let word = row / 32;
+        let shift = (row % 32) * 2;
+        let row_start = row * n_columns;
+        let packed_start = word * n_columns;
+        for column in 0..n_columns {
+            let code = match values[row_start + column].to_bits() {
+                bits if bits == 0.0_f64.to_bits() => 0,
+                bits if bits == 1.0_f64.to_bits() => 1,
+                bits if bits == 2.0_f64.to_bits() => 2,
+                bits if bits == (-1.0_f64).to_bits() => 3,
+                _ => return None,
+            };
+            packed[packed_start + column] |= code << shift;
+        }
+    }
+    Some((packed, words_per_column))
 }
 
 fn validate_symmetric(matrix: &[f64], n: usize, label: &str) -> Result<(), String> {
@@ -866,16 +1031,14 @@ fn fit_conditional_prepared_whitened_inner(
     let nuisance_projection_started = profile.then(Instant::now);
     let shared_column = shared_background_column.map(|index| b_w[index].clone());
     let shared_norm2 = shared_column.as_ref().map(|column| dot(column, column));
-    let mut base_design = Vec::with_capacity(c_w.len() + b_w.len());
-    base_design.extend(c_w.iter().map(Vec::as_slice));
-    base_design.extend(
+    let mut nuisance_columns = c_w.clone();
+    nuisance_columns.extend(
         b_w.iter()
             .enumerate()
             .filter(|(index, _)| Some(*index) != shared_background_column)
-            .map(|(_, column)| column.as_slice()),
+            .map(|(_, column)| column.clone()),
     );
-    let nuisance_columns = base_design.iter().map(|column| column.to_vec()).collect();
-    let base_basis = orthonormal_basis(nuisance_columns);
+    let (base_basis, base_factor) = orthonormal_basis_with_factor(nuisance_columns);
     let mut projection_values = vec![y_w.to_vec(), z_w.clone()];
     if let Some(column) = shared_column {
         projection_values.push(column);
@@ -1043,16 +1206,16 @@ fn fit_conditional_prepared_whitened_inner(
             .filter(|&shared_index| shared_index >= 4)
             .filter(|_| shared_effect_identifiable && beta_shared.is_finite())
             .and_then(|shared_index| {
-                let base_targets = (c_w.len()..c_w.len() + 4).collect::<Vec<_>>();
-                coefficients_from_basis_with_extra_terms(
+                let factor = base_factor.as_ref()?;
+                coefficients_from_mgs_factor_with_extra_terms(
                     &base_basis,
-                    &base_design,
+                    factor,
                     y_w,
                     &[
                         (b_w[shared_index].as_slice(), beta_shared),
                         (z_w.as_slice(), beta_z),
                     ],
-                    &base_targets,
+                    &target_indices,
                 )
             });
         let coefficients = basis_coefficients.unwrap_or_else(|| {
@@ -1179,6 +1342,7 @@ fn design_coefficients_for_targets<C: AsRef<[f64]>>(
         .collect()
 }
 
+#[cfg(test)]
 fn coefficients_from_basis_with_extra_terms(
     basis: &[Vec<f64>],
     design: &[&[f64]],
@@ -1228,6 +1392,90 @@ fn coefficients_from_basis_with_extra_terms(
         })
         .collect::<Vec<_>>();
     let coefficients = pivoted_qr_coefficients(&coordinate_design, &coordinate_response)?;
+    Some(
+        targets
+            .iter()
+            .map(|&target| coefficients.get(target).copied().unwrap_or(f64::NAN))
+            .collect(),
+    )
+}
+
+fn coefficients_from_mgs_factor_with_extra_terms(
+    basis: &[Vec<f64>],
+    factor: &PivotedMgsFactor,
+    response: &[f64],
+    extra_terms: &[(&[f64], f64)],
+    targets: &[usize],
+) -> Option<Vec<f64>> {
+    let n = response.len();
+    let n_columns = factor.pivot_order.len();
+    if n == 0
+        || n_columns == 0
+        || basis.len() != n_columns
+        || factor.source_norms.len() != n_columns
+        || factor.r_by_source.len() != n_columns
+        || factor.r_by_source.iter().any(|row| row.len() != n_columns)
+        || factor
+            .source_norms
+            .iter()
+            .any(|scale| !scale.is_finite() || *scale <= 0.0)
+        || basis
+            .iter()
+            .any(|column| column.len() != n || column.iter().any(|value| !value.is_finite()))
+        || response.iter().any(|value| !value.is_finite())
+        || extra_terms.iter().any(|(column, coefficient)| {
+            column.len() != n
+                || column.iter().any(|value| !value.is_finite())
+                || !coefficient.is_finite()
+        })
+    {
+        return None;
+    }
+
+    // The MGS pass already formed R while orthogonalizing the original
+    // nuisance columns. Reuse it to back-solve instead of rebuilding QᵀA and
+    // factoring that small matrix for every candidate.
+    let coordinate_response = basis
+        .iter()
+        .map(|basis_column| {
+            extra_terms.iter().fold(
+                dot(basis_column, response),
+                |value, (column, coefficient)| value - coefficient * dot(basis_column, column),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut pivoted_coefficients = vec![0.0; n_columns];
+    for row in (0..n_columns).rev() {
+        let source_column = factor.pivot_order[row];
+        if source_column >= n_columns {
+            return None;
+        }
+        let mut value = coordinate_response[row];
+        for column in (row + 1)..n_columns {
+            let later_source = factor.pivot_order[column];
+            if later_source >= n_columns {
+                return None;
+            }
+            value -= factor.r_by_source[row][later_source] * pivoted_coefficients[column];
+        }
+        let diagonal = factor.r_by_source[row][source_column];
+        if !(diagonal.is_finite() && diagonal > 0.0) {
+            return None;
+        }
+        pivoted_coefficients[row] = value / diagonal;
+        if !pivoted_coefficients[row].is_finite() {
+            return None;
+        }
+    }
+
+    let mut coefficients = vec![f64::NAN; n_columns];
+    for (pivoted_index, &source_column) in factor.pivot_order.iter().enumerate() {
+        if source_column >= n_columns {
+            return None;
+        }
+        coefficients[source_column] =
+            pivoted_coefficients[pivoted_index] / factor.source_norms[source_column];
+    }
     Some(
         targets
             .iter()
@@ -1376,13 +1624,41 @@ pub(crate) fn centered_design_columns(matrix: &[f64], n: usize, n_columns: usize
         .collect()
 }
 
-pub(crate) fn orthonormal_basis(mut residual_columns: Vec<Vec<f64>>) -> Vec<Vec<f64>> {
+pub(crate) fn orthonormal_basis(residual_columns: Vec<Vec<f64>>) -> Vec<Vec<f64>> {
+    orthonormal_basis_impl(residual_columns, false).0
+}
+
+#[derive(Debug)]
+struct PivotedMgsFactor {
+    // R is indexed by original source columns; pivot_order maps triangular
+    // solve positions back to those source columns.
+    r_by_source: Vec<Vec<f64>>,
+    source_norms: Vec<f64>,
+    pivot_order: Vec<usize>,
+}
+
+fn orthonormal_basis_with_factor(
+    residual_columns: Vec<Vec<f64>>,
+) -> (Vec<Vec<f64>>, Option<PivotedMgsFactor>) {
+    orthonormal_basis_impl(residual_columns, true)
+}
+
+fn orthonormal_basis_impl(
+    mut residual_columns: Vec<Vec<f64>>,
+    retain_factor: bool,
+) -> (Vec<Vec<f64>>, Option<PivotedMgsFactor>) {
     if residual_columns.is_empty() {
-        return Vec::new();
+        return (Vec::new(), None);
     }
+    let n_columns = residual_columns.len();
+    let mut source_indices = (0..n_columns).collect::<Vec<_>>();
+    let mut source_norms = retain_factor.then(|| vec![f64::NAN; n_columns]);
+    let mut r_by_source = retain_factor.then(|| vec![vec![0.0; n_columns]; n_columns]);
+    let mut pivot_order = Vec::with_capacity(n_columns);
+
     // Scale every source column before pivoting. Rank is a property of the
     // design span, so the decision must not depend on a covariate's units.
-    for column in &mut residual_columns {
+    for (source_index, column) in residual_columns.iter_mut().enumerate() {
         let scale = column
             .iter()
             .map(|value| value.abs())
@@ -1399,12 +1675,16 @@ pub(crate) fn orthonormal_basis(mut residual_columns: Vec<Vec<f64>>) -> Vec<Vec<
             column.fill(0.0);
             continue;
         }
+        if let Some(source_norms) = source_norms.as_mut() {
+            source_norms[source_index] = scale * norm;
+        }
         for value in column.iter_mut() {
             *value /= norm;
         }
     }
+
     let cutoff = 1.0e-12;
-    let mut basis = Vec::with_capacity(residual_columns.len());
+    let mut basis = Vec::with_capacity(n_columns);
     loop {
         let best = residual_columns
             .iter()
@@ -1419,21 +1699,43 @@ pub(crate) fn orthonormal_basis(mut residual_columns: Vec<Vec<f64>>) -> Vec<Vec<
             break;
         }
         let mut column = residual_columns.swap_remove(best_index);
+        let source_index = source_indices.swap_remove(best_index);
+        let basis_index = basis.len();
+        pivot_order.push(source_index);
         for value in column.iter_mut() {
             *value /= best_norm;
         }
+        if let Some(r_by_source) = r_by_source.as_mut() {
+            r_by_source[basis_index][source_index] = best_norm;
+        }
         basis.push(column);
         let last = basis.last().expect("basis has the appended column");
-        for other in residual_columns.iter_mut() {
+        for (other_index, other) in residual_columns.iter_mut().enumerate() {
+            let mut coefficient = 0.0;
             for _ in 0..2 {
-                let coefficient = dot(other, last);
+                let correction = dot(other, last);
+                coefficient += correction;
                 for (value, &q) in other.iter_mut().zip(last) {
-                    *value -= coefficient * q;
+                    *value -= correction * q;
                 }
+            }
+            if let Some(r_by_source) = r_by_source.as_mut() {
+                r_by_source[basis_index][source_indices[other_index]] = coefficient;
             }
         }
     }
-    basis
+
+    let factor = match (source_norms, r_by_source) {
+        (Some(source_norms), Some(r_by_source)) if basis.len() == n_columns => {
+            Some(PivotedMgsFactor {
+                r_by_source,
+                source_norms,
+                pivot_order,
+            })
+        }
+        _ => None,
+    };
+    (basis, factor)
 }
 
 pub(crate) fn project_off(values: &[f64], basis: &[Vec<f64>]) -> Vec<f64> {
@@ -1487,8 +1789,8 @@ mod tests {
     use super::{
         build_background, fit_conditional, fit_conditional_prepared,
         fit_conditional_prepared_whitened, partial_regression_coefficient, pivoted_qr_coefficients,
-        prepare_conditional_fit, whiten_pair_design_batch, ConditionMode, CovarianceMetric,
-        FitStatus, InferenceKind, PairDesign,
+        prepare_conditional_fit, whiten_pair_design_batch, whiten_pair_design_batch_profiled,
+        ConditionMode, CovarianceMetric, FitStatus, InferenceKind, PairDesign,
     };
     use crate::ct::packed::FilledPair;
     use nalgebra::DMatrix;
@@ -1707,6 +2009,68 @@ mod tests {
     }
 
     #[test]
+    fn nuisance_mgs_factor_coefficients_match_full_design_qr() {
+        let n = 72;
+        let nuisance = vec![
+            vec![1.0; n],
+            (0..n)
+                .map(|i| ((i * 7 % 31) as f64 - 15.0) / 15.0)
+                .collect(),
+            (0..n).map(|i| ((i as f64) * 0.43).sin()).collect(),
+            (0..n).map(|i| ((i as f64) * 0.17).cos()).collect(),
+            (0..n)
+                .map(|i| if i % 3 == 0 { -0.8 } else { 0.4 })
+                .collect(),
+        ];
+        let shared = (0..n)
+            .map(|i| if i % 5 < 2 { 1.0 } else { 0.0 })
+            .collect::<Vec<_>>();
+        let phase = (0..n)
+            .map(|i| match i % 3 {
+                0 => 1.0,
+                1 => -1.0,
+                _ => 0.0,
+            })
+            .collect::<Vec<_>>();
+        let response = (0..n)
+            .map(|i| {
+                0.75 + 0.2 * nuisance[1][i] - 0.04 * nuisance[2][i]
+                    + 1.1 * nuisance[3][i]
+                    + 0.3 * nuisance[4][i]
+                    + 0.35 * shared[i]
+                    - 0.6 * phase[i]
+            })
+            .collect::<Vec<_>>();
+        let nuisance_refs = nuisance.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let full_design = nuisance_refs
+            .iter()
+            .copied()
+            .chain([shared.as_slice(), phase.as_slice()])
+            .collect::<Vec<_>>();
+        let targets = [1, 2, 3, 4];
+        let expected = super::design_coefficients_for_targets(&full_design, &response, &targets);
+        let (basis, factor) = super::orthonormal_basis_with_factor(nuisance.clone());
+        let factor = factor.expect("full-rank nuisance design must have an MGS factor");
+        let observed = super::coefficients_from_mgs_factor_with_extra_terms(
+            &basis,
+            &factor,
+            &response,
+            &[(shared.as_slice(), 0.35), (phase.as_slice(), -0.6)],
+            &targets,
+        )
+        .expect("full-rank nuisance design must solve from its reusable QR factor");
+
+        for (target, (actual, expected)) in
+            targets.into_iter().zip(observed.into_iter().zip(expected))
+        {
+            assert!(
+                (actual - expected).abs() < 1.0e-9,
+                "target={target}: MGS factor={actual}, full QR={expected}"
+            );
+        }
+    }
+
+    #[test]
     fn nuisance_basis_coordinate_coefficients_reject_rank_deficient_bases() {
         let n = 16;
         let x = (0..n).map(|i| i as f64).collect::<Vec<_>>();
@@ -1837,6 +2201,25 @@ mod tests {
         for metric in &metrics {
             let batched = whiten_pair_design_batch(&designs, q_b, metric).unwrap();
             assert_eq!(batched.len(), designs.len());
+            let (profiled, timing) =
+                whiten_pair_design_batch_profiled(&designs, q_b, metric, true).unwrap();
+            assert_eq!(profiled.len(), batched.len());
+            for (expected, observed) in batched.iter().zip(&profiled) {
+                assert_eq!(expected.background_columns, observed.background_columns);
+                assert_eq!(expected.phase, observed.phase);
+            }
+            let accounted = timing.matrix_assembly
+                + timing.column_deduplication
+                + timing.row_matrix_copy
+                + timing.solve_or_scale
+                + timing.column_unpack
+                + timing.duplicate_restore_and_pair_pack;
+            assert!(timing.total >= accounted);
+            assert_eq!(timing.rhs_columns_total, designs.len() * (q_b + 1));
+            assert!(timing.rhs_columns_unique <= timing.rhs_columns_total);
+            if metric.has_cholesky_factor() {
+                assert!(timing.solve_or_scale > std::time::Duration::ZERO);
+            }
             let c = (0..n)
                 .flat_map(|row| [1.0, ((row * 5 % 13) as f64 - 6.0) / 6.0])
                 .collect::<Vec<_>>();
@@ -1923,6 +2306,35 @@ mod tests {
         let (unique, mapping) = super::deduplicate_row_major_columns(matrix, n, n_columns).unwrap();
         assert_eq!(mapping, vec![0, 1, 0, 2, 1]);
         assert_eq!(unique, vec![1.0, 4.0, 7.0, 2.0, 5.0, 8.0, 3.0, 6.0, 9.0]);
+    }
+
+    #[test]
+    fn packed_column_fingerprints_keep_tail_values_and_exact_duplicate_mapping() {
+        let n = 37;
+        let n_columns = 4;
+        let mut matrix = Vec::with_capacity(n * n_columns);
+        for row in 0..n {
+            let value = (row % 3) as f64;
+            matrix.push(value);
+            matrix.push(value);
+            matrix.push(if row + 1 == n { 2.0 } else { value });
+            matrix.push(if row % 2 == 0 { -1.0 } else { 1.0 });
+        }
+
+        let (packed, words_per_column) =
+            super::pack_discrete_row_major_columns(&matrix, n, n_columns).unwrap();
+        assert_eq!(words_per_column, 2);
+        for word in 0..words_per_column {
+            assert_eq!(packed[word * n_columns], packed[word * n_columns + 1]);
+        }
+        assert_ne!(
+            packed[(words_per_column - 1) * n_columns],
+            packed[(words_per_column - 1) * n_columns + 2]
+        );
+
+        let (unique, mapping) = super::deduplicate_row_major_columns(matrix, n, n_columns).unwrap();
+        assert_eq!(mapping, vec![0, 0, 1, 2]);
+        assert_eq!(unique.len(), n * 3);
     }
 
     #[test]

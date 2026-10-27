@@ -255,6 +255,8 @@ def _read_table_with_optional_header(path: str) -> pd.DataFrame:
             kwargs: dict[str, object] = {
                 "header": None,
                 "low_memory": False,
+                # Sample/line names are labels; do not normalize e.g. 0077 to 77.
+                "dtype": {0: str},
             }
             if mode == "tab":
                 kwargs["sep"] = "\t"

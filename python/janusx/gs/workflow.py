@@ -4493,6 +4493,8 @@ def _load_phenotype_flexible(path: str) -> pd.DataFrame:
             kwargs: dict[str, typing.Any] = {}
             kwargs["header"] = None
             kwargs["low_memory"] = False
+            # Keep numeric-looking sample identifiers as their original text.
+            kwargs["dtype"] = {0: str}
             if mode == "tab":
                 kwargs["sep"] = "\t"
                 kwargs["engine"] = "c"

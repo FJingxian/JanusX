@@ -2849,6 +2849,11 @@ def load_phenotype(
         offset = 1 if int(id_col) == 0 else 2
         try:
             wanted = [int(id_col)] + [int(i) + offset for i in ncol_requested]
+            # Keep the FID column in a PLINK FID/IID table so downstream
+            # positional handling still sees IID at position 1 and can drop
+            # FID explicitly. Without it, usecols shifts every column left.
+            if int(id_col) == 1:
+                wanted.append(0)
             usecols = sorted(set(wanted))
         except Exception:
             usecols = None
@@ -2860,6 +2865,10 @@ def load_phenotype(
     for mode in _candidate_orders(sniffed):
         try:
             kwargs: dict[str, object] = {"header": None}
+            # Sample identifiers are labels, even when they look numeric.
+            # Parsing an empty header cell as a data row otherwise promotes
+            # values such as 77 to 77.0 and breaks matching against BED/VCF IDs.
+            kwargs["dtype"] = {0: str, int(id_col): str}
             if usecols is not None:
                 kwargs["usecols"] = usecols
             # Keep dtype inference in one pass and avoid chunked mixed-type warnings.

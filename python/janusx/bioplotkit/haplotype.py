@@ -352,6 +352,10 @@ def _load_phenotype_from_file(
     sep: Optional[str] = None,
 ) -> pd.DataFrame:
     read_kwargs: dict[str, object] = {"engine": "python"}
+    sample_key: object = sample_col if sample_col is not None else 0
+    read_kwargs["converters"] = {
+        sample_key: lambda value: "" if pd.isna(value) else str(value).strip()
+    }
     if sep is None:
         read_kwargs["sep"] = None
     else:

@@ -566,7 +566,11 @@ def _run_timed(
     return int(rc_final), float(elapsed), float(rss)
 
 
-def _read_table_guess(path: Path) -> pd.DataFrame:
+def _read_table_guess(
+    path: Path,
+    *,
+    converters: Optional[dict[object, object]] = None,
+) -> pd.DataFrame:
     tries = [
         dict(sep="\t", engine="python"),
         dict(sep=",", engine="python"),
@@ -576,7 +580,10 @@ def _read_table_guess(path: Path) -> pd.DataFrame:
     last_err: Optional[Exception] = None
     for kw in tries:
         try:
-            df = pd.read_csv(path, **kw)
+            read_kw = dict(kw)
+            if converters is not None:
+                read_kw["converters"] = converters
+            df = pd.read_csv(path, **read_kw)
             if df.shape[1] >= 1:
                 return df
         except Exception as e:
@@ -587,7 +594,8 @@ def _read_table_guess(path: Path) -> pd.DataFrame:
 
 
 def _read_pheno(path: Path, ncol: Optional[list[object]]) -> tuple[pd.DataFrame, str]:
-    df = _read_table_guess(path)
+    # Taxa IDs must remain exact strings (including leading zeros).
+    df = _read_table_guess(path, converters={0: str})
     if df.shape[1] < 2:
         raise ValueError("Phenotype file must contain sample ID and at least one trait column.")
     id_col = df.columns[0]

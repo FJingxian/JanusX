@@ -15,7 +15,8 @@ use crate::ct::parents::{
 use crate::ct::screen::{CoreCandidates, ScreenCandidate};
 use crate::ct::vcf::VcfSource;
 use crate::ct::window::{
-    scan_source_fvlmm, scan_source_lm, FvLmmScanContext, ScanConfig, ScanStats,
+    scan_source_dxd_fvlmm, scan_source_dxd_lm, scan_source_fvlmm, scan_source_lm, FvLmmScanContext,
+    ScanConfig, ScanStats,
 };
 use csv::WriterBuilder;
 use numpy::{PyReadonlyArray1, PyReadonlyArray2};
@@ -32,7 +33,20 @@ use std::time::{Duration, Instant};
 
 const OUTPUT_HEADER: &[&str] = &[
     "snp1", "snp2", "chrom1", "pos1", "chrom2", "pos2", "n_cis", "n_trans", "beta_a1", "beta_d1",
-    "beta_a2", "beta_d2", "beta_c", "se_c", "beta_t", "se_t", "pwald1", "pwald2",
+    "beta_a2", "beta_d2", "beta_c", "se_c", "beta_t", "se_t", "pwald1", "pwald2", "beta_dd",
+    "se_dd", "pwald_dd",
+];
+const DXD_OUTPUT_HEADER: &[&str] = &[
+    "snp1",
+    "snp2",
+    "chrom1",
+    "pos1",
+    "chrom2",
+    "pos2",
+    "n_double_het",
+    "beta_dd",
+    "se_dd",
+    "pwald_dd",
 ];
 
 // Keep enough right-hand sides per solve to reuse the covariance factor, then
@@ -75,6 +89,10 @@ pub(crate) struct FilledCategoryCounts {
 
 pub(crate) fn output_header() -> &'static [&'static str] {
     OUTPUT_HEADER
+}
+
+pub(crate) fn dxd_output_header() -> &'static [&'static str] {
+    DXD_OUTPUT_HEADER
 }
 
 pub(crate) fn validate_sample_ids(target: &[String], observed: &[String]) -> Result<(), String> {
@@ -409,7 +427,7 @@ fn required_path<'a>(path: Option<&'a str>, label: &str) -> Result<&'a str, Stri
         .ok_or_else(|| format!("{label} is required for this CT source"))
 }
 
-fn output_paths(prefix: &str) -> Result<(PathBuf, PathBuf), String> {
+fn output_paths(prefix: &str, dxd: bool) -> Result<(PathBuf, PathBuf), String> {
     let prefix = prefix.trim();
     if prefix.is_empty() {
         return Err("CT output prefix must not be empty".to_string());
@@ -419,9 +437,10 @@ fn output_paths(prefix: &str) -> Result<(PathBuf, PathBuf), String> {
     if let Some(parent) = parent {
         fs::create_dir_all(parent).map_err(|e| format!("create output directory: {e}"))?;
     }
+    let suffix = if dxd { "dxd" } else { "ct" };
     Ok((
-        PathBuf::from(format!("{prefix}.ct.tsv")),
-        PathBuf::from(format!("{prefix}.ct.json")),
+        PathBuf::from(format!("{prefix}.{suffix}.tsv")),
+        PathBuf::from(format!("{prefix}.{suffix}.json")),
     ))
 }
 
@@ -429,6 +448,12 @@ fn write_tsv_header<W: Write>(writer: &mut csv::Writer<W>) -> Result<(), String>
     writer
         .write_record(output_header())
         .map_err(|e| format!("write CT TSV header: {e}"))
+}
+
+fn write_dxd_tsv_header<W: Write>(writer: &mut csv::Writer<W>) -> Result<(), String> {
+    writer
+        .write_record(dxd_output_header())
+        .map_err(|e| format!("write CT D×D TSV header: {e}"))
 }
 
 fn row_for_candidate(
@@ -455,12 +480,45 @@ fn row_for_candidate(
         format_effect(fit.se_trans),
         format_pvalue(fit.pwald1),
         format_pvalue(fit.pwald2),
+        format_effect(fit.beta_dd),
+        format_effect(fit.se_dd),
+        format_pvalue(fit.pwald_dd),
     ];
     if fields.len() != output_header().len() {
         return Err(format!(
             "internal CT TSV field count mismatch: got {}, expected {}",
             fields.len(),
             output_header().len()
+        ));
+    }
+    Ok(fields)
+}
+
+fn row_for_dxd_candidate(
+    candidate: &ScreenCandidate,
+    fit: &crate::ct::conditional::ConditionalFit,
+) -> Result<Vec<String>, String> {
+    if candidate.filled.z.iter().any(|&value| value != 0) {
+        return Err("D×D candidate unexpectedly carries a phase label".to_string());
+    }
+    let n_double_het = candidate.raw_counts.phase_unknown;
+    let fields = vec![
+        candidate.left.id.clone(),
+        candidate.right.id.clone(),
+        candidate.left.chrom.clone(),
+        candidate.left.pos.to_string(),
+        candidate.right.chrom.clone(),
+        candidate.right.pos.to_string(),
+        n_double_het.to_string(),
+        format_effect(fit.beta_dd),
+        format_effect(fit.se_dd),
+        format_pvalue(fit.pwald_dd),
+    ];
+    if fields.len() != dxd_output_header().len() {
+        return Err(format!(
+            "internal CT D×D TSV field count mismatch: got {}, expected {}",
+            fields.len(),
+            dxd_output_header().len()
         ));
     }
     Ok(fields)
@@ -474,13 +532,30 @@ fn finish_candidate_fit(
     conditional_fit: ConditionalFitTimings,
     whitening: WhiteningStageTimings,
     profile_timings: bool,
-) -> Result<((f64, usize, Vec<String>, bool, bool), CandidateTaskTimings), String> {
+    dxd: bool,
+) -> Result<
+    (
+        (f64, usize, Vec<String>, bool, bool, bool),
+        CandidateTaskTimings,
+    ),
+    String,
+> {
     let row_format_started = profile_timings.then(Instant::now);
-    let fields = row_for_candidate(candidate, &fit)?;
+    let fields = if dxd {
+        row_for_dxd_candidate(candidate, &fit)?
+    } else {
+        row_for_candidate(candidate, &fit)?
+    };
     let row_format_elapsed = row_format_started
         .map(|started| started.elapsed())
         .unwrap_or_default();
-    let sort_stat = if fit.status == FitStatus::Testable && fit.phase_wald_statistic.is_finite() {
+    let sort_stat = if dxd {
+        if fit.beta_dd.is_finite() && fit.se_dd.is_finite() && fit.se_dd > 0.0 {
+            (fit.beta_dd / fit.se_dd).powi(2)
+        } else {
+            f64::NEG_INFINITY
+        }
+    } else if fit.status == FitStatus::Testable && fit.phase_wald_statistic.is_finite() {
         fit.phase_wald_statistic
     } else {
         f64::NEG_INFINITY
@@ -490,8 +565,9 @@ fn finish_candidate_fit(
             sort_stat,
             candidate.screen_rank,
             fields,
-            fit.pwald1.is_finite(),
-            fit.pwald2.is_finite(),
+            !dxd && fit.pwald1.is_finite(),
+            !dxd && fit.pwald2.is_finite(),
+            fit.pwald_dd.is_finite(),
         ),
         CandidateTaskTimings {
             elapsed: elapsed_before_format + row_format_elapsed,
@@ -503,7 +579,10 @@ fn finish_candidate_fit(
     ))
 }
 
-type FittedCandidate = ((f64, usize, Vec<String>, bool, bool), CandidateTaskTimings);
+type FittedCandidate = (
+    (f64, usize, Vec<String>, bool, bool, bool),
+    CandidateTaskTimings,
+);
 
 fn whitening_pairs_per_batch(n_samples: usize, condition_mode: ConditionMode) -> usize {
     let columns_per_pair = match condition_mode {
@@ -539,6 +618,7 @@ fn fit_candidate_cores(
     cores: &[CoreCandidates],
     prepared: &PreparedConditionalFit,
     condition_mode: ConditionMode,
+    dxd: bool,
     metric: &CovarianceMetric,
     inference: InferenceKind,
     profile_timings: bool,
@@ -554,6 +634,7 @@ fn fit_candidate_cores(
                     core,
                     prepared,
                     condition_mode,
+                    dxd,
                     metric,
                     inference,
                     profile_timings,
@@ -568,6 +649,7 @@ fn fit_core_candidates(
     core: &CoreCandidates,
     prepared: &PreparedConditionalFit,
     condition_mode: ConditionMode,
+    dxd: bool,
     metric: &CovarianceMetric,
     inference: InferenceKind,
     profile_timings: bool,
@@ -633,6 +715,7 @@ fn fit_core_candidates(
                         conditional_timings,
                         WhiteningStageTimings::default(),
                         profile_timings,
+                        dxd,
                     )
                 })
                 .collect::<Result<Vec<_>, String>>()
@@ -735,6 +818,7 @@ fn fit_core_candidates(
                             conditional_timings,
                             candidate_whitening,
                             profile_timings,
+                            dxd,
                         )
                     })
                     .collect::<Result<Vec<_>, String>>()
@@ -777,6 +861,7 @@ fn build_summary(
     error: Option<&str>,
     model: ModelKind,
     condition: ConditionMode,
+    dxd: bool,
     phenotype: &str,
     source: Value,
     sample_ids: &[String],
@@ -793,6 +878,7 @@ fn build_summary(
     n_rows: usize,
     n_pwald1_testable: usize,
     n_pwald2_testable: usize,
+    n_pwald_dd_testable: usize,
     elapsed_seconds: f64,
     timings: Option<Value>,
 ) -> Value {
@@ -803,9 +889,10 @@ fn build_summary(
     } else {
         None
     };
-    let combined_bonferroni = bonferroni.map(|threshold| threshold / 2.0);
+    let p1_p2_bonferroni = bonferroni.map(|threshold| threshold / 2.0);
+    let all_three_bonferroni = bonferroni.map(|threshold| threshold / 3.0);
     let mut summary = json!({
-        "schema_version": 3,
+        "schema_version": 4,
         "status": status,
         "error": error,
         "model": match model { ModelKind::Lm => "lm", ModelKind::FvLmm => "fvlmm" },
@@ -856,8 +943,14 @@ fn build_summary(
                 ModelKind::Lm => "joint 2-df Wald F test with residual degrees of freedom",
                 ModelKind::FvLmm => "joint 2-df Wald chi-square test under fixed global covariance",
             },
+            "null_hypothesis_pwald_dd": "beta_dd = 0 in the reduced model with the configured non-H background and H, but no Z, 1 degree of freedom",
+            "pwald_dd": match model {
+                ModelKind::Lm => "1-df Wald t test in the reduced no-phase D×D model, with reduced-model residual degrees of freedom",
+                ModelKind::FvLmm => "1-df Wald chi-square test under the fixed global covariance in the reduced no-phase D×D model",
+            },
             "beta_cis": "eta + theta",
             "beta_trans": "eta - theta",
+            "beta_dd": "coefficient of H in the reduced model with the configured non-H background and H, but no phase term Z",
             "main_effects": "beta_a1/beta_d1 and beta_a2/beta_d2 are conditional additive/dominance coefficients from the full pair model",
             "effect_reference": "deviations from the remaining background terms, not absolute group means",
             "unidentifiable_shared_effect": "if H is collinear with other fixed effects, beta_c, beta_t, and pwald2 are NA because the joint two-degree phase test is not identifiable; pwald1 can remain estimable if Z is identifiable"
@@ -889,17 +982,54 @@ fn build_summary(
             "testable_rows": n_pwald2_testable,
             "pwald1_testable_rows": n_pwald1_testable,
             "pwald2_testable_rows": n_pwald2_testable,
+            "pwald_dd_testable_rows": n_pwald_dd_testable,
             "non_testable_rows": n_rows.saturating_sub(n_pwald2_testable)
         },
         "bonferroni_reference_threshold": bonferroni,
         "bonferroni_reference_thresholds": {
             "pwald1_per_test_family": bonferroni,
             "pwald2_per_test_family": bonferroni,
-            "both_test_families_combined": combined_bonferroni
+            "pwald_dd_per_test_family": bonferroni,
+            "pwald1_pwald2_combined": p1_p2_bonferroni,
+            "all_three_test_families_combined": all_three_bonferroni
         },
         "elapsed_seconds": elapsed_seconds,
-        "calibration_note": "Screen scores are used only for Top-K ranking, so nominal conditional p-values are not calibrated within the selected set. Bonferroni references use the full eligible-pair count M (not the number of returned Top-K rows) and control family-wise error across all eligible pairs when the per-pair tests are calibrated; when treating pwald1 and pwald2 as one combined discovery family, use alpha/(2M)."
+        "calibration_note": "Screen scores are used only for Top-K ranking, so nominal conditional p-values are not calibrated within the selected set. Bonferroni references use the full eligible-pair count M (not the number of returned Top-K rows) and control family-wise error across all eligible pairs when the per-pair tests are calibrated. Use alpha/(2M) for pwald1+pwald2 jointly, or alpha/(3M) if pwald_dd is included as a third discovery family."
     });
+    if dxd {
+        summary["schema_version"] = json!(1);
+        summary["scan_mode"] = json!("dxd");
+        summary["phase_model"] = json!({
+            "version": 1,
+            "parameterization": "beta_dd * H",
+            "H": "1 when both endpoint dosages are 1, regardless of phase; 0 otherwise",
+            "background": "g_i,g_j,h_i,h_j",
+            "n_double_het": "raw observed (1,1) count before missing-value imputation",
+            "null_hypothesis": "beta_dd = 0, 1 degree of freedom",
+            "pwald_dd": match model {
+                ModelKind::Lm => "1-df Wald t test with residual degrees of freedom",
+                ModelKind::FvLmm => "1-df Wald chi-square test under the fixed global covariance",
+            },
+            "pair_imputation": "modal unphased dosage pair across the 9 genotype categories; cis/trans labels are collapsed into (1,1)"
+        });
+        summary["screening"] = json!({
+            "method": match model {
+                ModelKind::Lm => "double_heterozygote_h_only_score",
+                ModelKind::FvLmm => "fvlmm_double_heterozygote_h_only_rank",
+            },
+            "score_note": "Ranks H after global fixed-effect projection; Top-K ranking only, not a calibrated p-value",
+            "phase_support_required": false
+        });
+        summary["parameters"]["phase_minor_freq"] = Value::Null;
+        summary["parameters"]["min_cis"] = Value::Null;
+        summary["parameters"]["min_trans"] = Value::Null;
+        summary["results"]["testable_rows"] = json!(n_pwald_dd_testable);
+        summary["results"]["non_testable_rows"] = json!(n_rows.saturating_sub(n_pwald_dd_testable));
+        summary["bonferroni_reference_thresholds"]["pwald1_pwald2_combined"] = Value::Null;
+        summary["bonferroni_reference_thresholds"]["all_three_test_families_combined"] =
+            Value::Null;
+        summary["calibration_note"] = json!("The H-only screen and per-core Top-K use the same phenotype, so returned pwald_dd values are subject to selection and are not calibrated discovery p-values. The Bonferroni reference uses all eligible pairs M, not only returned Top-K rows, and applies only if per-pair tests are calibrated.");
+    }
     if let Some(timings) = timings {
         summary["timings"] = timings;
     }
@@ -1075,7 +1205,7 @@ fn rust_error(error: String) -> PyErr {
     grm=None, grm_ids=None, model="lm", phenotype="trait",
     window_bp=50_000, core_bp=50_000, topk=100, snp_maf=0.0, snp_geno=0.05,
     phase_minor_freq=0.0, pair_geno=0.05, min_cis=0, min_trans=0, alpha=0.05,
-    threads=1
+    threads=1, scan_mode="phase"
 ))]
 pub(crate) fn ct_run<'py>(
     py: Python<'py>,
@@ -1104,6 +1234,7 @@ pub(crate) fn ct_run<'py>(
     min_trans: usize,
     alpha: f64,
     threads: usize,
+    scan_mode: &str,
 ) -> PyResult<Bound<'py, PyDict>> {
     let started = Instant::now();
     let profile_timings = std::env::var_os("JX_CT_PROFILE").is_some();
@@ -1111,6 +1242,11 @@ pub(crate) fn ct_run<'py>(
         "lm" => ModelKind::Lm,
         "fvlmm" => ModelKind::FvLmm,
         _ => return Err(PyValueError::new_err("model must be 'lm' or 'fvlmm'")),
+    };
+    let dxd_mode = match scan_mode.trim().to_ascii_lowercase().as_str() {
+        "phase" => false,
+        "dxd" => true,
+        _ => return Err(PyValueError::new_err("scan_mode must be 'phase' or 'dxd'")),
     };
     let condition_mode = ConditionMode::AddDom;
     if !(alpha.is_finite() && alpha > 0.0 && alpha < 1.0) {
@@ -1242,18 +1378,23 @@ pub(crate) fn ct_run<'py>(
             min_trans,
         },
     };
-    let (tsv_path, json_path) = output_paths(output_prefix).map_err(rust_error)?;
+    let (tsv_path, json_path) = output_paths(output_prefix, dxd_mode).map_err(rust_error)?;
     let tsv_file = File::create(&tsv_path).map_err(|e| {
         PyRuntimeError::new_err(format!("create CT TSV {}: {e}", tsv_path.display()))
     })?;
     let mut writer = WriterBuilder::new()
         .delimiter(b'\t')
         .from_writer(BufWriter::new(tsv_file));
-    write_tsv_header(&mut writer).map_err(rust_error)?;
+    if dxd_mode {
+        write_dxd_tsv_header(&mut writer).map_err(rust_error)?;
+    } else {
+        write_tsv_header(&mut writer).map_err(rust_error)?;
+    }
 
     let mut n_rows = 0usize;
     let mut n_pwald1_testable = 0usize;
     let mut n_pwald2_testable = 0usize;
+    let mut n_pwald_dd_testable = 0usize;
     let mut candidate_profile = CandidateProfileStats::default();
     let scan_started = Instant::now();
     let scan_result = {
@@ -1265,6 +1406,7 @@ pub(crate) fn ct_run<'py>(
                     cores,
                     &prepared_fit,
                     condition_mode,
+                    dxd_mode,
                     &global_null.metric,
                     inference,
                     profile_timings,
@@ -1308,13 +1450,14 @@ pub(crate) fn ct_run<'py>(
                         candidate_profile.sort_wall += started.elapsed();
                     }
                     let write_started = profile_timings.then(Instant::now);
-                    for (_, _, fields, contrast_testable, joint_testable) in rows {
+                    for (_, _, fields, contrast_testable, joint_testable, dd_testable) in rows {
                         writer
                             .write_record(&fields)
                             .map_err(|error| format!("write CT TSV row: {error}"))?;
                         n_rows += 1;
                         n_pwald1_testable += usize::from(contrast_testable);
                         n_pwald2_testable += usize::from(joint_testable);
+                        n_pwald_dd_testable += usize::from(dd_testable);
                     }
                     if let Some(started) = write_started {
                         candidate_profile.tsv_write_wall += started.elapsed();
@@ -1355,15 +1498,22 @@ pub(crate) fn ct_run<'py>(
             }
             Ok(())
         };
-        let result = match model_kind {
-            ModelKind::Lm => scan_source_lm(
+        let result = match (model_kind, dxd_mode) {
+            (ModelKind::Lm, false) => scan_source_lm(
                 &mut source,
                 scan_config,
                 &global_null.screen_residuals,
                 &global_null.screen_covariate_basis,
                 &mut process_core,
             ),
-            ModelKind::FvLmm => {
+            (ModelKind::Lm, true) => scan_source_dxd_lm(
+                &mut source,
+                scan_config,
+                &global_null.screen_residuals,
+                &global_null.screen_covariate_basis,
+                &mut process_core,
+            ),
+            (ModelKind::FvLmm, false) => {
                 let context = FvLmmScanContext {
                     fixed_effect_basis: &global_null.screen_covariate_basis,
                     sigma_e2: global_null
@@ -1371,6 +1521,21 @@ pub(crate) fn ct_run<'py>(
                         .expect("FvLMM global null returns sigma_e2"),
                 };
                 scan_source_fvlmm(
+                    &mut source,
+                    scan_config,
+                    &global_null.screen_residuals,
+                    &context,
+                    &mut process_core,
+                )
+            }
+            (ModelKind::FvLmm, true) => {
+                let context = FvLmmScanContext {
+                    fixed_effect_basis: &global_null.screen_covariate_basis,
+                    sigma_e2: global_null
+                        .sigma_e2
+                        .expect("FvLMM global null returns sigma_e2"),
+                };
+                scan_source_dxd_fvlmm(
                     &mut source,
                     scan_config,
                     &global_null.screen_residuals,
@@ -1414,6 +1579,7 @@ pub(crate) fn ct_run<'py>(
                 None,
                 model_kind,
                 condition_mode,
+                dxd_mode,
                 phenotype,
                 source_summary,
                 &sample_ids,
@@ -1430,6 +1596,7 @@ pub(crate) fn ct_run<'py>(
                 n_rows,
                 n_pwald1_testable,
                 n_pwald2_testable,
+                n_pwald_dd_testable,
                 started.elapsed().as_secs_f64(),
                 timings,
             );
@@ -1440,9 +1607,17 @@ pub(crate) fn ct_run<'py>(
             result.set_item("json_path", json_path.to_string_lossy().as_ref())?;
             result.set_item("M", scan_stats.eligible_hypotheses)?;
             result.set_item("rows_written", n_rows)?;
-            result.set_item("testable_rows", n_pwald2_testable)?;
+            result.set_item(
+                "testable_rows",
+                if dxd_mode {
+                    n_pwald_dd_testable
+                } else {
+                    n_pwald2_testable
+                },
+            )?;
             result.set_item("pwald1_testable_rows", n_pwald1_testable)?;
             result.set_item("pwald2_testable_rows", n_pwald2_testable)?;
+            result.set_item("pwald_dd_testable_rows", n_pwald_dd_testable)?;
             Ok(result)
         }
         Err(error) => {
@@ -1461,6 +1636,7 @@ pub(crate) fn ct_run<'py>(
                 Some(&error),
                 model_kind,
                 condition_mode,
+                dxd_mode,
                 phenotype,
                 source_summary,
                 &sample_ids,
@@ -1477,6 +1653,7 @@ pub(crate) fn ct_run<'py>(
                 n_rows,
                 n_pwald1_testable,
                 n_pwald2_testable,
+                n_pwald_dd_testable,
                 started.elapsed().as_secs_f64(),
                 timings,
             );
@@ -1494,7 +1671,10 @@ pub(crate) fn register_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_summary, filled_category_counts, output_header, validate_sample_ids};
+    use super::{
+        build_summary, dxd_output_header, filled_category_counts, output_header,
+        validate_sample_ids,
+    };
     use crate::ct::conditional::CovarianceMetric;
     use crate::ct::null::{GlobalNullFit, ModelKind};
     use crate::ct::packed::FilledPair;
@@ -1605,7 +1785,7 @@ mod tests {
             let prepared = prepare_conditional_fit(&y, &vec![1.0; n], 1, &metric).unwrap();
             for condition in [ConditionMode::AddDom, ConditionMode::Genotype] {
                 let batched = super::fit_candidate_cores(
-                    &cores, &prepared, condition, &metric, inference, false, &pool,
+                    &cores, &prepared, condition, false, &metric, inference, false, &pool,
                 )
                 .unwrap();
                 assert_eq!(
@@ -1617,6 +1797,7 @@ mod tests {
                         std::slice::from_ref(core),
                         &prepared,
                         condition,
+                        false,
                         &metric,
                         inference,
                         false,
@@ -1637,6 +1818,7 @@ mod tests {
             &[],
             &prepare_conditional_fit(&y, &vec![1.0; n], 1, &CovarianceMetric::identity(n)).unwrap(),
             ConditionMode::AddDom,
+            false,
             &CovarianceMetric::identity(n),
             InferenceKind::LinearModel,
             false,
@@ -1652,7 +1834,7 @@ mod tests {
         for required in [
             "snp1", "snp2", "chrom1", "pos1", "chrom2", "pos2", "n_cis", "n_trans", "beta_a1",
             "beta_d1", "beta_a2", "beta_d2", "beta_c", "se_c", "beta_t", "se_t", "pwald1",
-            "pwald2",
+            "pwald2", "beta_dd", "se_dd", "pwald_dd",
         ] {
             assert!(
                 header.contains(&required),
@@ -1662,6 +1844,25 @@ mod tests {
         assert!(
             !header.contains(&"pwald"),
             "the retired pwald column must not be present"
+        );
+    }
+
+    #[test]
+    fn dxd_header_contains_only_unphased_pair_test_columns() {
+        assert_eq!(
+            dxd_output_header(),
+            [
+                "snp1",
+                "snp2",
+                "chrom1",
+                "pos1",
+                "chrom2",
+                "pos2",
+                "n_double_het",
+                "beta_dd",
+                "se_dd",
+                "pwald_dd",
+            ]
         );
     }
 
@@ -1722,6 +1923,7 @@ mod tests {
             None,
             ModelKind::FvLmm,
             super::ConditionMode::AddDom,
+            false,
             "trait",
             serde_json::json!({}),
             &sample_ids,
@@ -1743,11 +1945,62 @@ mod tests {
             0,
             0,
             0,
+            0,
             1.0,
             None,
         );
 
+        assert_eq!(summary["schema_version"], 4);
+        assert_eq!(
+            summary["phase_model"]["null_hypothesis_pwald_dd"],
+            "beta_dd = 0 in the reduced model with the configured non-H background and H, but no Z, 1 degree of freedom"
+        );
+        assert_eq!(
+            summary["bonferroni_reference_thresholds"]["all_three_test_families_combined"],
+            serde_json::Value::Null
+        );
         assert_eq!(summary["parameters"]["screen_threads"], 4);
         assert_eq!(summary["parameters"]["conditional_fit_threads"], 4);
+        assert_eq!(summary["results"]["pwald_dd_testable_rows"], 0);
+
+        let dxd_summary = build_summary(
+            "complete",
+            None,
+            ModelKind::FvLmm,
+            super::ConditionMode::AddDom,
+            true,
+            "trait",
+            serde_json::json!({}),
+            &sample_ids,
+            50_000,
+            50_000,
+            50,
+            0.02,
+            0.05,
+            crate::ct::packed::PairQcThresholds {
+                min_phase_minor_freq: 0.02,
+                max_unknown_rate: 0.05,
+                min_cis: 10,
+                min_trans: 10,
+            },
+            0.05,
+            12,
+            &global_null,
+            None,
+            3,
+            0,
+            0,
+            2,
+            1.0,
+            None,
+        );
+        assert_eq!(dxd_summary["schema_version"], 1);
+        assert_eq!(dxd_summary["scan_mode"], "dxd");
+        assert_eq!(dxd_summary["screening"]["phase_support_required"], false);
+        assert_eq!(
+            dxd_summary["parameters"]["phase_minor_freq"],
+            serde_json::Value::Null
+        );
+        assert_eq!(dxd_summary["results"]["testable_rows"], 2);
     }
 }

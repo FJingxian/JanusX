@@ -1,11 +1,14 @@
 use crate::ct::input::{GenotypeCall, Site, SiteSource};
 use crate::ct::packed::{
-    materialize_encoded_pair_optional, prepare_pair_for_screen_with_scratch_optional,
-    PackedGenotypes, PairCounts, PairQcThresholds, PairScreenPreparation, PairScreenScratch,
+    materialize_encoded_pair_dxd_optional, materialize_encoded_pair_optional,
+    prepare_pair_for_dxd_screen_with_scratch_optional,
+    prepare_pair_for_screen_with_scratch_optional, PackedGenotypes, PairCounts,
+    PairDxdScreenPreparation, PairQcThresholds, PairScreenPreparation, PairScreenScratch,
 };
 use crate::ct::screen::{
-    joint_rank_score_phase_masks, passes_snp_qc, summarize_snp_packed, CoreCandidates, PairQc,
-    PairRankContext, RankedCandidate, SnpQcThresholds, VariantMeta,
+    double_dominance_rank_score_mask, joint_rank_score_phase_masks, passes_snp_qc,
+    summarize_snp_packed, CoreCandidates, PairQc, PairRankContext, RankedCandidate,
+    SnpQcThresholds, VariantMeta,
 };
 use rayon::prelude::*;
 use rayon::ThreadPool;
@@ -83,6 +86,22 @@ struct CoreState {
 
 enum ScanScoring {
     Joint(PairRankContext),
+    DoubleDominance(PairRankContext),
+}
+
+#[derive(Clone, Copy)]
+enum ScanMode {
+    Phase,
+    DoubleDominance,
+}
+
+enum PairScorePreparation {
+    QcRejected,
+    NoCompatibleDonor,
+    Ready {
+        counts: PairCounts,
+        score: Option<f64>,
+    },
 }
 
 #[cfg(test)]
@@ -96,7 +115,15 @@ where
     S: SiteSource,
     F: FnMut(CoreCandidates) -> Result<(), String>,
 {
-    scan_source_impl(source, config, residuals, &[], 1.0, on_core)
+    scan_source_impl(
+        source,
+        config,
+        residuals,
+        &[],
+        1.0,
+        ScanMode::Phase,
+        on_core,
+    )
 }
 
 pub(crate) fn scan_source_lm<S, F>(
@@ -110,7 +137,37 @@ where
     S: SiteSource,
     F: FnMut(CoreCandidates) -> Result<(), String>,
 {
-    scan_source_impl(source, config, residuals, fixed_effect_basis, 1.0, on_core)
+    scan_source_impl(
+        source,
+        config,
+        residuals,
+        fixed_effect_basis,
+        1.0,
+        ScanMode::Phase,
+        on_core,
+    )
+}
+
+pub(crate) fn scan_source_dxd_lm<S, F>(
+    source: &mut S,
+    config: ScanConfig,
+    residuals: &[f64],
+    fixed_effect_basis: &[Vec<f64>],
+    on_core: F,
+) -> Result<ScanStats, String>
+where
+    S: SiteSource,
+    F: FnMut(CoreCandidates) -> Result<(), String>,
+{
+    scan_source_impl(
+        source,
+        config,
+        residuals,
+        fixed_effect_basis,
+        1.0,
+        ScanMode::DoubleDominance,
+        on_core,
+    )
 }
 
 pub(crate) fn scan_source_fvlmm<S, F>(
@@ -133,6 +190,32 @@ where
         residuals,
         context.fixed_effect_basis,
         context.sigma_e2,
+        ScanMode::Phase,
+        on_core,
+    )
+}
+
+pub(crate) fn scan_source_dxd_fvlmm<S, F>(
+    source: &mut S,
+    config: ScanConfig,
+    residuals: &[f64],
+    context: &FvLmmScanContext<'_>,
+    on_core: F,
+) -> Result<ScanStats, String>
+where
+    S: SiteSource,
+    F: FnMut(CoreCandidates) -> Result<(), String>,
+{
+    if !(context.sigma_e2.is_finite() && context.sigma_e2 > 0.0) {
+        return Err("FvLMM D×D rank scan requires positive finite sigma_e2".to_string());
+    }
+    scan_source_impl(
+        source,
+        config,
+        residuals,
+        context.fixed_effect_basis,
+        context.sigma_e2,
+        ScanMode::DoubleDominance,
         on_core,
     )
 }
@@ -143,6 +226,7 @@ fn scan_source_impl<S, F>(
     residuals: &[f64],
     fixed_effect_basis: &[Vec<f64>],
     sigma_e2: f64,
+    mode: ScanMode,
     mut on_core: F,
 ) -> Result<ScanStats, String>
 where
@@ -167,11 +251,11 @@ where
     };
     let mut stats = ScanStats::default();
     let scoring_context_started = config.profile_timings.then(Instant::now);
-    let scoring = ScanScoring::Joint(PairRankContext::new(
-        residuals,
-        fixed_effect_basis,
-        sigma_e2,
-    )?);
+    let rank_context = PairRankContext::new(residuals, fixed_effect_basis, sigma_e2)?;
+    let scoring = match mode {
+        ScanMode::Phase => ScanScoring::Joint(rank_context),
+        ScanMode::DoubleDominance => ScanScoring::DoubleDominance(rank_context),
+    };
     if let Some(started) = scoring_context_started {
         stats.timings.scoring_context_prepare += started.elapsed();
     }
@@ -332,38 +416,31 @@ where
             }
             stats.pairs_enumerated += 1;
             let prepare_started = config.profile_timings.then(Instant::now);
+            let mut score_elapsed = Duration::default();
             let left_calls = (!left.calls.is_empty()).then_some(left.calls.as_slice());
             let right_calls = (!site.calls.is_empty()).then_some(site.calls.as_slice());
-            let pair_preparation = prepare_pair_for_screen_with_scratch_optional(
+            let pair_preparation = prepare_and_score_pair(
                 left_calls,
                 right_calls,
                 &left.packed_calls,
                 &packed_calls,
                 config.pair_qc,
+                &scoring,
+                config.profile_timings,
+                &mut score_elapsed,
                 &mut pair_scratch,
             )?;
             if let Some(started) = prepare_started {
-                stats.timings.pair_prepare_qc_impute += started.elapsed();
+                stats.timings.pair_prepare_qc_impute +=
+                    started.elapsed().saturating_sub(score_elapsed);
             }
+            stats.timings.screen_score += score_elapsed;
             match pair_preparation {
-                PairScreenPreparation::QcRejected => stats.pair_qc_rejected += 1,
-                PairScreenPreparation::NoCompatibleDonor => stats.no_compatible_donor += 1,
-                PairScreenPreparation::Ready {
-                    counts,
-                    phase_masks,
-                } => {
+                PairScorePreparation::QcRejected => stats.pair_qc_rejected += 1,
+                PairScorePreparation::NoCompatibleDonor => stats.no_compatible_donor += 1,
+                PairScorePreparation::Ready { counts, score } => {
                     stats.eligible_hypotheses += 1;
-                    let score_started = config.profile_timings.then(Instant::now);
-                    let screen_score = match &scoring {
-                        ScanScoring::Joint(context) => {
-                            joint_rank_score_phase_masks(&phase_masks, context)
-                        }
-                    };
-                    pair_scratch.recycle_phase_masks(phase_masks);
-                    if let Some(started) = score_started {
-                        stats.timings.screen_score += started.elapsed();
-                    }
-                    let Some(screen_score) = screen_score else {
+                    let Some(screen_score) = score else {
                         stats.nonfinite_screen_scores += 1;
                         continue;
                     };
@@ -384,12 +461,13 @@ where
                         current_meta.index,
                         config.topk,
                     ) {
-                        let pair = materialize_encoded_pair_optional(
+                        let pair = materialize_scan_pair(
                             left_calls,
                             right_calls,
                             &left.packed_calls,
                             &packed_calls,
                             &counts,
+                            &scoring,
                         )
                         .ok_or_else(|| {
                             format!(
@@ -765,12 +843,13 @@ where
                 let right = &pending_sites[scored.right_site];
                 let left_calls = (!left.calls.is_empty()).then_some(left.calls.as_slice());
                 let right_calls = (!right.calls.is_empty()).then_some(right.calls.as_slice());
-                let encoded = materialize_encoded_pair_optional(
+                let encoded = materialize_scan_pair(
                     left_calls,
                     right_calls,
                     &left.packed_calls,
                     &right.packed_calls,
                     &scored.counts,
+                    scoring,
                 )
                 .ok_or_else(|| {
                     format!(
@@ -904,38 +983,31 @@ fn scan_one_core_shard(
             }
             stats.pairs_enumerated += 1;
             let prepare_started = config.profile_timings.then(Instant::now);
+            let mut score_elapsed = Duration::default();
             let left_calls = (!left.calls.is_empty()).then_some(left.calls.as_slice());
             let right_calls = (!right.calls.is_empty()).then_some(right.calls.as_slice());
-            let pair_preparation = prepare_pair_for_screen_with_scratch_optional(
+            let pair_preparation = prepare_and_score_pair(
                 left_calls,
                 right_calls,
                 &left.packed_calls,
                 &right.packed_calls,
                 config.pair_qc,
+                scoring,
+                config.profile_timings,
+                &mut score_elapsed,
                 pair_scratch,
             )?;
             if let Some(started) = prepare_started {
-                stats.timings.pair_prepare_qc_impute += started.elapsed();
+                stats.timings.pair_prepare_qc_impute +=
+                    started.elapsed().saturating_sub(score_elapsed);
             }
+            stats.timings.screen_score += score_elapsed;
             match pair_preparation {
-                PairScreenPreparation::QcRejected => stats.pair_qc_rejected += 1,
-                PairScreenPreparation::NoCompatibleDonor => stats.no_compatible_donor += 1,
-                PairScreenPreparation::Ready {
-                    counts,
-                    phase_masks,
-                } => {
+                PairScorePreparation::QcRejected => stats.pair_qc_rejected += 1,
+                PairScorePreparation::NoCompatibleDonor => stats.no_compatible_donor += 1,
+                PairScorePreparation::Ready { counts, score } => {
                     stats.eligible_hypotheses += 1;
-                    let score_started = config.profile_timings.then(Instant::now);
-                    let screen_score = match scoring {
-                        ScanScoring::Joint(context) => {
-                            joint_rank_score_phase_masks(&phase_masks, &context)
-                        }
-                    };
-                    pair_scratch.recycle_phase_masks(phase_masks);
-                    if let Some(started) = score_started {
-                        stats.timings.screen_score += started.elapsed();
-                    }
-                    let Some(screen_score) = screen_score else {
+                    let Some(screen_score) = score else {
                         stats.nonfinite_screen_scores += 1;
                         continue;
                     };
@@ -994,6 +1066,97 @@ fn add_pair_stats(total: &mut ScanStats, source: &ScanStats) {
     total.timings.topk_update += source.timings.topk_update;
     total.timings.pair_enumeration_bookkeeping += source.timings.pair_enumeration_bookkeeping;
     total.timings.candidate_materialize += source.timings.candidate_materialize;
+}
+
+fn prepare_and_score_pair(
+    left: Option<&[GenotypeCall]>,
+    right: Option<&[GenotypeCall]>,
+    left_packed: &PackedGenotypes,
+    right_packed: &PackedGenotypes,
+    thresholds: PairQcThresholds,
+    scoring: &ScanScoring,
+    profile_timings: bool,
+    score_elapsed: &mut Duration,
+    scratch: &mut PairScreenScratch,
+) -> Result<PairScorePreparation, String> {
+    match scoring {
+        ScanScoring::Joint(context) => {
+            let prepared = prepare_pair_for_screen_with_scratch_optional(
+                left,
+                right,
+                left_packed,
+                right_packed,
+                thresholds,
+                scratch,
+            )?;
+            match prepared {
+                PairScreenPreparation::QcRejected => Ok(PairScorePreparation::QcRejected),
+                PairScreenPreparation::NoCompatibleDonor => {
+                    Ok(PairScorePreparation::NoCompatibleDonor)
+                }
+                PairScreenPreparation::Ready {
+                    counts,
+                    phase_masks,
+                } => {
+                    let started = profile_timings.then(Instant::now);
+                    let score = joint_rank_score_phase_masks(&phase_masks, context);
+                    if let Some(started) = started {
+                        *score_elapsed += started.elapsed();
+                    }
+                    scratch.recycle_phase_masks(phase_masks);
+                    Ok(PairScorePreparation::Ready { counts, score })
+                }
+            }
+        }
+        ScanScoring::DoubleDominance(context) => {
+            let prepared = prepare_pair_for_dxd_screen_with_scratch_optional(
+                left,
+                right,
+                left_packed,
+                right_packed,
+                thresholds,
+                scratch,
+            )?;
+            match prepared {
+                PairDxdScreenPreparation::QcRejected => Ok(PairScorePreparation::QcRejected),
+                PairDxdScreenPreparation::NoCompatibleDonor => {
+                    Ok(PairScorePreparation::NoCompatibleDonor)
+                }
+                PairDxdScreenPreparation::Ready { counts, masks } => {
+                    let started = profile_timings.then(Instant::now);
+                    let score = double_dominance_rank_score_mask(
+                        left_packed.n_samples(),
+                        masks.double_het_mask(),
+                        masks.n_double_het(),
+                        context,
+                    );
+                    if let Some(started) = started {
+                        *score_elapsed += started.elapsed();
+                    }
+                    scratch.recycle_dxd_masks(masks);
+                    Ok(PairScorePreparation::Ready { counts, score })
+                }
+            }
+        }
+    }
+}
+
+fn materialize_scan_pair(
+    left: Option<&[GenotypeCall]>,
+    right: Option<&[GenotypeCall]>,
+    left_packed: &PackedGenotypes,
+    right_packed: &PackedGenotypes,
+    counts: &PairCounts,
+    scoring: &ScanScoring,
+) -> Option<crate::ct::packed::EncodedPair> {
+    match scoring {
+        ScanScoring::Joint(_) => {
+            materialize_encoded_pair_optional(left, right, left_packed, right_packed, counts)
+        }
+        ScanScoring::DoubleDominance(_) => {
+            materialize_encoded_pair_dxd_optional(left, right, left_packed, right_packed, counts)
+        }
+    }
 }
 
 fn validate_config(config: ScanConfig) -> Result<(), String> {
@@ -1217,6 +1380,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::scan_source_dxd_lm;
     use super::{scan_source, scan_source_fvlmm, FvLmmScanContext, ScanConfig};
     use crate::ct::input::{GenotypeCall, PhaseSet, Site, SiteSource};
     use crate::ct::packed::PairQcThresholds;
@@ -1289,6 +1453,34 @@ mod tests {
         }
     }
 
+    fn genotype_site(
+        index: usize,
+        chrom: &str,
+        pos: i64,
+        heterozygous: [bool; 4],
+        alt_on_hap0: [bool; 4],
+    ) -> Site {
+        Site {
+            index,
+            chrom: chrom.into(),
+            pos,
+            id: format!("s{index}"),
+            allele0: "A".into(),
+            allele1: "G".into(),
+            calls: (0..4)
+                .map(|sample| GenotypeCall {
+                    dosage: Some(u8::from(heterozygous[sample])),
+                    alt_on_hap0: heterozygous[sample].then_some(alt_on_hap0[sample]),
+                    phase_set: if heterozygous[sample] {
+                        PhaseSet::Implicit
+                    } else {
+                        PhaseSet::Unknown
+                    },
+                })
+                .collect(),
+        }
+    }
+
     fn run(
         sites: Vec<Site>,
         config: ScanConfig,
@@ -1301,6 +1493,25 @@ mod tests {
         };
         let mut cores = Vec::new();
         let stats = scan_source(&mut source, config, residuals, |core| {
+            cores.push(core);
+            Ok(())
+        })
+        .unwrap();
+        (stats, cores)
+    }
+
+    fn run_dxd(
+        sites: Vec<Site>,
+        config: ScanConfig,
+        residuals: &[f64],
+    ) -> (super::ScanStats, Vec<CoreCandidates>) {
+        let mut source = VecSource {
+            ids: (0..4).map(|i| format!("s{i}")).collect(),
+            sites,
+            cursor: 0,
+        };
+        let mut cores = Vec::new();
+        let stats = scan_source_dxd_lm(&mut source, config, residuals, &[], |core| {
             cores.push(core);
             Ok(())
         })
@@ -1324,6 +1535,93 @@ mod tests {
             },
             profile_timings: false,
         }
+    }
+
+    #[test]
+    fn dxd_screen_ranks_double_het_mask_without_phase_labels() {
+        let sites = vec![
+            genotype_site(0, "1", 1, [true, true, false, false], [true; 4]),
+            genotype_site(
+                1,
+                "1",
+                2,
+                [true, true, false, false],
+                [true, false, false, false],
+            ),
+            genotype_site(2, "1", 3, [false, false, true, true], [true; 4]),
+            genotype_site(
+                3,
+                "1",
+                4,
+                [false, false, true, true],
+                [false, false, true, false],
+            ),
+        ];
+        let y = [1.0, 1.0, 2.0, -2.0];
+        let mut scan_config = config(1, 0.0);
+        scan_config.window_bp = 10;
+        scan_config.core_bp = 10;
+
+        let (_, ct_cores) = run(sites.clone(), scan_config, &y);
+        let (_, dxd_cores) = run_dxd(sites, scan_config, &y);
+        let ct_top = &ct_cores[0].candidates[0];
+        let dxd_top = &dxd_cores[0].candidates[0];
+
+        assert_eq!((ct_top.left.index, ct_top.right.index), (2, 3));
+        assert_eq!((dxd_top.left.index, dxd_top.right.index), (0, 1));
+        assert_eq!(dxd_top.pair_qc.n_cis_observed, 0);
+        assert_eq!(dxd_top.pair_qc.n_trans_observed, 0);
+        assert_eq!(dxd_top.pair_qc.phase_unknown, 2);
+        assert!(dxd_top.filled.z.iter().all(|&value| value == 0));
+    }
+
+    #[test]
+    fn dxd_parallel_scan_matches_serial_topk_across_core_windows() {
+        let masks = [
+            [true, true, false, false],
+            [false, false, true, true],
+            [true, false, true, false],
+            [false, true, false, true],
+        ];
+        let sites = (0..160)
+            .map(|index| {
+                let mask = masks[index % masks.len()];
+                let phase = [
+                    index % 2 == 0,
+                    index % 3 == 0,
+                    index % 5 == 0,
+                    index % 7 == 0,
+                ];
+                genotype_site(index, "1", index as i64 + 1, mask, phase)
+            })
+            .collect::<Vec<_>>();
+        let residuals = [1.0, -1.0, 0.5, -0.5];
+        let mut serial_config = config(5, 0.0);
+        serial_config.core_bp = 20;
+        serial_config.window_bp = 5;
+        let (serial_stats, serial_cores) = run_dxd(sites.clone(), serial_config, &residuals);
+        let mut parallel_config = serial_config;
+        parallel_config.threads = 4;
+        let (parallel_stats, parallel_cores) = run_dxd(sites, parallel_config, &residuals);
+
+        assert_eq!(parallel_cores, serial_cores);
+        assert_eq!(
+            parallel_stats.pairs_enumerated,
+            serial_stats.pairs_enumerated
+        );
+        assert_eq!(
+            parallel_stats.eligible_hypotheses,
+            serial_stats.eligible_hypotheses
+        );
+        assert_eq!(
+            parallel_stats.nonfinite_screen_scores,
+            serial_stats.nonfinite_screen_scores
+        );
+        assert_eq!(
+            parallel_stats.candidates_materialized,
+            serial_stats.candidates_materialized
+        );
+        assert!(parallel_stats.screen_workers_used > 0);
     }
 
     #[test]

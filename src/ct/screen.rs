@@ -481,6 +481,58 @@ pub(crate) fn joint_rank_score_phase_masks(
     )
 }
 
+/// Rank the no-phase D×D term H alone after projection on the global null
+/// fixed-effect basis. The pair-specific single-site terms are fitted only
+/// for TopK candidates, as in the existing CT screen.
+pub(crate) fn double_dominance_rank_score_mask(
+    n_samples: usize,
+    double_het_mask: &[u64],
+    n_double_het: usize,
+    context: &PairRankContext,
+) -> Option<f64> {
+    if context.projected_y_lookup.n_samples != n_samples
+        || double_het_mask.len() != n_samples.div_ceil(u64::BITS as usize)
+        || n_double_het == 0
+    {
+        return None;
+    }
+    let raw_information = n_double_het as f64;
+    let h_dot_y = context.projected_y_lookup.sum_mask_adaptive(
+        double_het_mask,
+        n_double_het,
+        &context.projected_precision_y,
+    )?;
+    let (information, score) = if context.intercept_only {
+        let n = n_samples as f64;
+        let h_sum = raw_information;
+        (
+            h_sum - h_sum * h_sum / n,
+            h_dot_y - h_sum * context.projected_y_sum / n,
+        )
+    } else {
+        let basis_dots = context
+            .basis_lookups
+            .iter()
+            .map(|lookup| lookup.sum_mask(double_het_mask))
+            .collect::<Option<Vec<_>>>()?;
+        let coefficients = context.projection_coefficients(&basis_dots);
+        let information = context.residual_cross(
+            raw_information,
+            &basis_dots,
+            &basis_dots,
+            &coefficients,
+            &coefficients,
+        );
+        let score = context.residual_y_dot(h_dot_y, &coefficients);
+        (information, score)
+    };
+    if !(information.is_finite() && information > 1.0e-12 * raw_information && score.is_finite()) {
+        return None;
+    }
+    let value = score * score / (information * context.sigma_e2);
+    value.is_finite().then_some(value)
+}
+
 fn joint_rank_score_masks(
     n_samples: usize,
     n_cis: usize,
@@ -1032,5 +1084,61 @@ mod tests {
         let expected = joint_rank_score(&pair.materialize(), &y, &intercept, 0.73).unwrap();
         let observed = joint_rank_score_encoded(&pair, &context).unwrap();
         assert!((observed - expected).abs() < 1.0e-10);
+    }
+
+    #[test]
+    fn double_dominance_rank_score_matches_materialized_h_only_projection() {
+        let n = 8;
+        let h = [0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0];
+        let y = [0.2, 1.3, -0.7, 0.9, 0.1, -0.4, 1.1, 0.2];
+        let x = [-3.0, -1.0, 1.0, 3.0, -3.0, -1.0, 1.0, 3.0];
+        let intercept = vec![1.0 / (n as f64).sqrt(); n];
+        let covariate = x
+            .iter()
+            .map(|value| value / 40.0_f64.sqrt())
+            .collect::<Vec<_>>();
+        let masks = [0b1001_0110_u64];
+        let sigma_e2 = 0.73;
+
+        for basis in [vec![intercept.clone()], vec![intercept.clone(), covariate]] {
+            let context = PairRankContext::new(&y, &basis, sigma_e2).unwrap();
+            let observed = super::double_dominance_rank_score_mask(n, &masks, 4, &context)
+                .expect("estimable H-only screen score");
+            let mut h_residual = h.to_vec();
+            let mut y_residual = y.to_vec();
+            for column in &basis {
+                let h_loading = h_residual
+                    .iter()
+                    .zip(column)
+                    .map(|(a, b)| a * b)
+                    .sum::<f64>();
+                let y_loading = y_residual
+                    .iter()
+                    .zip(column)
+                    .map(|(a, b)| a * b)
+                    .sum::<f64>();
+                for row in 0..n {
+                    h_residual[row] -= h_loading * column[row];
+                    y_residual[row] -= y_loading * column[row];
+                }
+            }
+            let score = h_residual
+                .iter()
+                .zip(&y_residual)
+                .map(|(a, b)| a * b)
+                .sum::<f64>();
+            let information = h_residual.iter().map(|value| value * value).sum::<f64>();
+            let expected = score * score / (information * sigma_e2);
+            assert!(
+                (observed - expected).abs() < 1.0e-10,
+                "observed={observed}, expected={expected}"
+            );
+        }
+
+        let all_h = [(1_u64 << n) - 1];
+        let intercept_context = PairRankContext::new(&y, &[intercept], sigma_e2).unwrap();
+        assert!(
+            super::double_dominance_rank_score_mask(n, &all_h, n, &intercept_context).is_none()
+        );
     }
 }

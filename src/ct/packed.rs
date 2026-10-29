@@ -279,6 +279,7 @@ pub(crate) struct EncodedPair {
     category_masks: [Vec<u64>; 10],
     imputed_mask: Vec<u64>,
     pub(crate) n_imputed: usize,
+    phase_independent: bool,
 }
 
 impl EncodedPair {
@@ -317,6 +318,9 @@ impl EncodedPair {
                 }
                 bits &= bits - 1;
             }
+        }
+        if self.phase_independent {
+            z.fill(0);
         }
         FilledPair {
             z,
@@ -410,14 +414,37 @@ impl PairPhaseMasks {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PairDxdMasks {
+    /// Filled H mask used by both the fast score and final conditional model.
+    double_het: Vec<u64>,
+    /// Number of set bits in `double_het`, including H calls imputed to (1,1).
+    n_double_het: usize,
+}
+
+impl PairDxdMasks {
+    pub(crate) fn double_het_mask(&self) -> &[u64] {
+        &self.double_het
+    }
+
+    pub(crate) fn n_double_het(&self) -> usize {
+        self.n_double_het
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct PairScreenScratch {
     phase_masks: PairPhaseMasks,
+    double_het_mask: Vec<u64>,
 }
 
 impl PairScreenScratch {
     pub(crate) fn recycle_phase_masks(&mut self, phase_masks: PairPhaseMasks) {
         self.phase_masks = phase_masks;
+    }
+
+    pub(crate) fn recycle_dxd_masks(&mut self, masks: PairDxdMasks) {
+        self.double_het_mask = masks.double_het;
     }
 }
 
@@ -428,6 +455,16 @@ pub(crate) enum PairScreenPreparation {
     Ready {
         counts: PairCounts,
         phase_masks: PairPhaseMasks,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PairDxdScreenPreparation {
+    QcRejected,
+    NoCompatibleDonor,
+    Ready {
+        counts: PairCounts,
+        masks: PairDxdMasks,
     },
 }
 
@@ -1081,6 +1118,52 @@ pub(crate) fn prepare_pair_for_screen_with_scratch_optional(
     })
 }
 
+/// Phase-independent pair preparation for the D×D genome scan. The H mask
+/// includes observed double heterozygotes, regardless of phase, and missing
+/// pairs imputed to dosage pair (1,1), matching the final conditional design.
+pub(crate) fn prepare_pair_for_dxd_screen_with_scratch_optional(
+    left: Option<&[GenotypeCall]>,
+    right: Option<&[GenotypeCall]>,
+    left_packed: &PackedGenotypes,
+    right_packed: &PackedGenotypes,
+    thresholds: PairQcThresholds,
+    scratch: &mut PairScreenScratch,
+) -> Result<PairDxdScreenPreparation, String> {
+    validate_packed_pair_shapes_optional(left, right, left_packed, right_packed)?;
+    if left_packed.has_invalid_dosage() || right_packed.has_invalid_dosage() {
+        validate_packed_pair_invalid_masks_optional(left, right, left_packed, right_packed)?;
+    }
+    let phase_agnostic_counts = count_pair_dxd_packed(left_packed, right_packed);
+    if !passes_pair_dxd_qc(&phase_agnostic_counts, thresholds) {
+        return Ok(PairDxdScreenPreparation::QcRejected);
+    }
+    let counts = count_pair_for_screen_optional(
+        left,
+        right,
+        left_packed,
+        right_packed,
+        &phase_agnostic_counts,
+    )?;
+    scratch.double_het_mask.resize(left_packed.missing.len(), 0);
+    if !build_dxd_double_het_mask(
+        left_packed,
+        right_packed,
+        &counts,
+        &mut scratch.double_het_mask,
+    ) {
+        return Ok(PairDxdScreenPreparation::NoCompatibleDonor);
+    }
+    let mut n_double_het = 0usize;
+    for mask in &scratch.double_het_mask {
+        n_double_het += mask.count_ones() as usize;
+    }
+    let masks = PairDxdMasks {
+        double_het: std::mem::take(&mut scratch.double_het_mask),
+        n_double_het,
+    };
+    Ok(PairDxdScreenPreparation::Ready { counts, masks })
+}
+
 pub(crate) fn materialize_encoded_pair_optional(
     left: Option<&[GenotypeCall]>,
     right: Option<&[GenotypeCall]>,
@@ -1089,6 +1172,23 @@ pub(crate) fn materialize_encoded_pair_optional(
     counts: &PairCounts,
 ) -> Option<EncodedPair> {
     encode_pair(left, right, left_packed, right_packed, counts)
+}
+
+/// Encode a pair for the reduced no-phase model. Cis and trans are collapsed
+/// into the same `(1,1)` genotype category for mode imputation; the materialized
+/// phase vector is all zero because this candidate is not a phase test.
+pub(crate) fn materialize_encoded_pair_dxd_optional(
+    left: Option<&[GenotypeCall]>,
+    right: Option<&[GenotypeCall]>,
+    left_packed: &PackedGenotypes,
+    right_packed: &PackedGenotypes,
+    counts: &PairCounts,
+) -> Option<EncodedPair> {
+    validate_packed_pair_shapes_optional(left, right, left_packed, right_packed).ok()?;
+    if left_packed.has_invalid_dosage() || right_packed.has_invalid_dosage() {
+        validate_packed_pair_invalid_masks_optional(left, right, left_packed, right_packed).ok()?;
+    }
+    encode_pair_dxd(left_packed, right_packed, counts)
 }
 
 fn encode_pair(
@@ -1204,6 +1304,94 @@ fn encode_pair(
         category_masks,
         imputed_mask,
         n_imputed,
+        phase_independent: false,
+    })
+}
+
+fn encode_pair_dxd(
+    left_packed: &PackedGenotypes,
+    right_packed: &PackedGenotypes,
+    counts: &PairCounts,
+) -> Option<EncodedPair> {
+    let n_samples = left_packed.n_samples;
+    let n_words = left_packed.missing.len();
+    let mut category_masks = std::array::from_fn(|_| vec![0_u64; n_words]);
+    let mut imputed_mask = vec![0_u64; n_words];
+
+    for dose_i in 0..=2_usize {
+        for dose_j in 0..=2_usize {
+            let category = if dose_i == 1 && dose_j == 1 {
+                PairCategory::Cis
+            } else {
+                category_from_dosages(dose_i as u8, dose_j as u8).ok()?
+            };
+            for word in 0..n_words {
+                category_masks[category.index()][word] |=
+                    left_packed.dosage[dose_i][word] & right_packed.dosage[dose_j][word];
+            }
+        }
+    }
+
+    let modes = unphased_mode_table(counts);
+    let mut n_imputed = 0usize;
+    for word in 0..n_words {
+        let unknown = left_packed.missing[word]
+            | right_packed.missing[word]
+            | left_packed.invalid[word]
+            | right_packed.invalid[word];
+        if unknown == 0 {
+            continue;
+        }
+        let left_patterns = [
+            left_packed.dosage[0][word],
+            left_packed.dosage[1][word],
+            left_packed.dosage[2][word],
+            left_packed.missing[word] | left_packed.invalid[word],
+        ];
+        let right_patterns = [
+            right_packed.dosage[0][word],
+            right_packed.dosage[1][word],
+            right_packed.dosage[2][word],
+            right_packed.missing[word] | right_packed.invalid[word],
+        ];
+        for (left_pattern, left_mask) in left_patterns.iter().enumerate() {
+            for (right_pattern, right_mask) in right_patterns.iter().enumerate() {
+                let imputed = unknown & left_mask & right_mask;
+                if imputed == 0 {
+                    continue;
+                }
+                let (dose_i, dose_j) = modes[left_pattern][right_pattern]?;
+                let category = if dose_i == 1 && dose_j == 1 {
+                    PairCategory::Cis
+                } else {
+                    category_from_dosages(dose_i, dose_j).ok()?
+                };
+                category_masks[category.index()][word] |= imputed;
+                imputed_mask[word] |= imputed;
+                n_imputed += imputed.count_ones() as usize;
+            }
+        }
+    }
+
+    let expected = sample_tail_mask(n_samples);
+    for word in 0..n_words {
+        let covered = category_masks
+            .iter()
+            .fold(0_u64, |union, mask| union | mask[word]);
+        let target = if word + 1 == n_words {
+            expected
+        } else {
+            u64::MAX
+        };
+        debug_assert_eq!(covered, target, "encoded D×D pair must assign every sample");
+    }
+
+    Some(EncodedPair {
+        n_samples,
+        category_masks,
+        imputed_mask,
+        n_imputed,
+        phase_independent: true,
     })
 }
 
@@ -1285,6 +1473,111 @@ pub(crate) fn passes_pair_qc(counts: &PairCounts, thresholds: PairQcThresholds) 
         && unknown_rate <= thresholds.max_unknown_rate
         && n_cis >= thresholds.min_cis
         && n_trans >= thresholds.min_trans
+}
+
+fn count_pair_dxd_packed(left: &PackedGenotypes, right: &PackedGenotypes) -> PairCounts {
+    let mut counts = PairCounts {
+        category_counts: [0; 10],
+        genotype_missing: 0,
+        // In this phase-independent view, this field carries the full dosage
+        // (1,1) count, including calls that happened to have known phase.
+        phase_unknown: 0,
+        n_total: left.n_samples,
+    };
+    for word in 0..left.missing.len() {
+        counts.genotype_missing += (left.missing[word] | right.missing[word]).count_ones() as usize;
+        counts.phase_unknown +=
+            (left.dosage[1][word] & right.dosage[1][word]).count_ones() as usize;
+    }
+    counts
+}
+
+fn passes_pair_dxd_qc(counts: &PairCounts, thresholds: PairQcThresholds) -> bool {
+    thresholds.max_unknown_rate.is_finite()
+        && (0.0..=1.0).contains(&thresholds.max_unknown_rate)
+        && counts.n_total > 0
+        && counts.genotype_missing < counts.n_total
+        && counts.phase_unknown > 0
+        && counts.genotype_missing as f64 / counts.n_total as f64 <= thresholds.max_unknown_rate
+}
+
+fn unphased_genotype_pair_count(counts: &PairCounts, left: u8, right: u8) -> usize {
+    match (left, right) {
+        (1, 1) => counts.cis_observed() + counts.trans_observed() + counts.phase_unknown,
+        (1, 0) => counts.category_counts[PairCategory::D10.index()],
+        _ => category_from_dosages(left, right)
+            .map(|category| counts.category_counts[category.index()])
+            .unwrap_or(0),
+    }
+}
+
+/// Deterministic modal donors for four genotype states per site: 0, 1, 2,
+/// missing. Iterating dosage pairs in row-major order makes ties stable and
+/// folds all double heterozygotes into one `(1,1)` donor count.
+fn unphased_mode_table(counts: &PairCounts) -> [[Option<(u8, u8)>; 4]; 4] {
+    let mut table = [[None; 4]; 4];
+    for (left_pattern, row) in table.iter_mut().enumerate() {
+        for (right_pattern, slot) in row.iter_mut().enumerate() {
+            let mut best: Option<((u8, u8), usize)> = None;
+            for left in 0..=2_u8 {
+                if left_pattern != 3 && left_pattern != left as usize {
+                    continue;
+                }
+                for right in 0..=2_u8 {
+                    if right_pattern != 3 && right_pattern != right as usize {
+                        continue;
+                    }
+                    let count = unphased_genotype_pair_count(counts, left, right);
+                    if count > 0 && best.is_none_or(|(_, best_count)| count > best_count) {
+                        best = Some(((left, right), count));
+                    }
+                }
+            }
+            *slot = best.map(|(pair, _)| pair);
+        }
+    }
+    table
+}
+
+fn build_dxd_double_het_mask(
+    left: &PackedGenotypes,
+    right: &PackedGenotypes,
+    counts: &PairCounts,
+    double_het_mask: &mut Vec<u64>,
+) -> bool {
+    let modes = unphased_mode_table(counts);
+    double_het_mask.resize(left.missing.len(), 0);
+    for word in 0..left.missing.len() {
+        let mut h_mask = left.dosage[1][word] & right.dosage[1][word];
+        let unknown =
+            left.missing[word] | right.missing[word] | left.invalid[word] | right.invalid[word];
+        let left_patterns = [
+            left.dosage[0][word],
+            left.dosage[1][word],
+            left.dosage[2][word],
+            left.missing[word] | left.invalid[word],
+        ];
+        let right_patterns = [
+            right.dosage[0][word],
+            right.dosage[1][word],
+            right.dosage[2][word],
+            right.missing[word] | right.invalid[word],
+        ];
+        for (left_pattern, left_mask) in left_patterns.iter().enumerate() {
+            for (right_pattern, right_mask) in right_patterns.iter().enumerate() {
+                let imputed = unknown & left_mask & right_mask;
+                if imputed != 0 {
+                    match modes[left_pattern][right_pattern] {
+                        Some((1, 1)) => h_mask |= imputed,
+                        Some(_) => {}
+                        None => return false,
+                    }
+                }
+            }
+        }
+        double_het_mask[word] = h_mask;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -1405,11 +1698,12 @@ mod tests {
     use super::{
         build_pair_phase_masks_optional, count_pair, count_pair_for_screen_optional,
         count_pair_packed_optional, count_pair_phase_support_optional, has_compatible_imputation,
-        materialize_encoded_pair_optional, mode_fill_pair, passes_pair_qc, prepare_pair,
-        prepare_pair_encoded, prepare_pair_for_screen_optional,
+        materialize_encoded_pair_dxd_optional, materialize_encoded_pair_optional, mode_fill_pair,
+        passes_pair_qc, prepare_pair, prepare_pair_encoded,
+        prepare_pair_for_dxd_screen_with_scratch_optional, prepare_pair_for_screen_optional,
         prepare_pair_for_screen_with_scratch_optional, EncodedPairPreparation, PackedGenotypes,
-        PairCategory, PairCounts, PairPreparation, PairQcThresholds, PairScreenPreparation,
-        PairScreenScratch, COMPATIBLE_MODE_TABLE_BUILDS,
+        PairCategory, PairCounts, PairDxdScreenPreparation, PairPreparation, PairQcThresholds,
+        PairScreenPreparation, PairScreenScratch, COMPATIBLE_MODE_TABLE_BUILDS,
     };
     use crate::ct::input::{GenotypeCall, PhaseSet};
 
@@ -1544,6 +1838,82 @@ mod tests {
                 assert_eq!(phase_masks.n_trans(), encoded.n_trans());
             }
             other => panic!("expected a screenable pair, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dxd_prep_ignores_phase_support_and_imputes_over_nine_unphased_categories() {
+        let left = vec![
+            phased(true, PhaseSet::Implicit),
+            phased(true, PhaseSet::Implicit),
+            known(1),
+            known(0),
+            known(2),
+            known(0),
+            call(None, None, PhaseSet::Unknown),
+            known(0),
+        ];
+        let right = vec![
+            phased(true, PhaseSet::Implicit),
+            phased(false, PhaseSet::Implicit),
+            known(1),
+            known(0),
+            known(0),
+            known(2),
+            call(None, None, PhaseSet::Unknown),
+            call(None, None, PhaseSet::Unknown),
+        ];
+        let thresholds = PairQcThresholds {
+            min_phase_minor_freq: 0.5,
+            max_unknown_rate: 0.25,
+            min_cis: 1,
+            min_trans: 1,
+        };
+        let left_packed = PackedGenotypes::from_calls(&left);
+        let right_packed = PackedGenotypes::from_calls(&right);
+        let mut scratch = PairScreenScratch::default();
+        let prepared = prepare_pair_for_dxd_screen_with_scratch_optional(
+            Some(&left),
+            Some(&right),
+            &left_packed,
+            &right_packed,
+            thresholds,
+            &mut scratch,
+        )
+        .unwrap();
+        let (counts, masks) = match prepared {
+            PairDxdScreenPreparation::Ready { counts, masks } => (counts, masks),
+            other => panic!("phase-independent pair should pass D×D QC: {other:?}"),
+        };
+        assert_eq!(counts.cis_observed(), 0);
+        assert_eq!(counts.trans_observed(), 0);
+        assert_eq!(counts.phase_unknown, 3);
+        assert_eq!(counts.genotype_missing, 2);
+        // The screen mask includes the one missing pair imputed to (1,1),
+        // matching the H column materialized for the conditional model.
+        assert_eq!(masks.n_double_het(), 4);
+        assert_eq!(masks.double_het_mask()[0] & 0xff, 0b0100_0111);
+
+        let encoded = materialize_encoded_pair_dxd_optional(
+            Some(&left),
+            Some(&right),
+            &left_packed,
+            &right_packed,
+            &counts,
+        )
+        .expect("unphased dosage-pair donors exist");
+        let filled = encoded.materialize();
+        assert_eq!(filled.n_imputed, 2);
+        assert_eq!(filled.g_i, vec![1, 1, 1, 0, 2, 0, 1, 0]);
+        assert_eq!(filled.g_j, vec![1, 1, 1, 0, 0, 2, 1, 0]);
+        assert_eq!(filled.z, vec![0; 8]);
+        for sample in 0..filled.g_i.len() {
+            let mask_has_h = (masks.double_het_mask()[sample / 64] & (1_u64 << (sample % 64))) != 0;
+            assert_eq!(
+                mask_has_h,
+                filled.g_i[sample] == 1 && filled.g_j[sample] == 1,
+                "D×D screen H differs from filled conditional H at sample {sample}"
+            );
         }
     }
 

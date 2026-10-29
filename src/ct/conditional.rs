@@ -98,6 +98,9 @@ pub(crate) struct ConditionalFit {
     pub(crate) beta_d1: f64,
     pub(crate) beta_a2: f64,
     pub(crate) beta_d2: f64,
+    pub(crate) beta_dd: f64,
+    pub(crate) se_dd: f64,
+    pub(crate) pwald_dd: f64,
     pub(crate) shared_effect_identifiable: bool,
     pub(crate) statistic: f64,
     pub(crate) pwald1: f64,
@@ -105,6 +108,69 @@ pub(crate) struct ConditionalFit {
     pub(crate) pwald2: f64,
     pub(crate) fixed_effect_rank: usize,
     pub(crate) residual_df: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NoPhaseDdFit {
+    beta: f64,
+    se: f64,
+    p: f64,
+}
+
+impl NoPhaseDdFit {
+    fn unavailable(beta: f64) -> Self {
+        Self {
+            beta,
+            se: f64::NAN,
+            p: f64::NAN,
+        }
+    }
+}
+
+/// Fit the unphased D×D coefficient after the nuisance terms, without Z.
+/// `target_residual` and `response_residual` are already whitened and projected
+/// off every other fixed-effect column, so this costs only vector reductions.
+fn no_phase_dd_fit(
+    target_residual: &[f64],
+    response_residual: &[f64],
+    information: f64,
+    base_rank: usize,
+    inference: InferenceKind,
+) -> NoPhaseDdFit {
+    let beta = dot(target_residual, response_residual) / information;
+    if !(beta.is_finite() && information.is_finite() && information > 0.0) {
+        return NoPhaseDdFit::unavailable(f64::NAN);
+    }
+    match inference {
+        InferenceKind::LinearModel => {
+            let residual_df = response_residual
+                .len()
+                .saturating_sub(base_rank.saturating_add(1));
+            if residual_df == 0 {
+                return NoPhaseDdFit::unavailable(beta);
+            }
+            let rss = response_residual
+                .iter()
+                .zip(target_residual)
+                .map(|(&response, &target)| (response - beta * target).powi(2))
+                .sum::<f64>();
+            if !(rss.is_finite() && rss > 0.0) {
+                return NoPhaseDdFit::unavailable(beta);
+            }
+            let se = (rss / residual_df as f64 / information).sqrt();
+            if !(se.is_finite() && se > 0.0) {
+                return NoPhaseDdFit::unavailable(beta);
+            }
+            let p = crate::linalg::student_t_p_two_sided(beta.abs() / se, residual_df as i32);
+            NoPhaseDdFit { beta, se, p }
+        }
+        InferenceKind::FixedCovariance => {
+            let se = (1.0 / information).sqrt();
+            let statistic = beta * beta / (se * se);
+            let p = crate::linalg::chi2_sf_df1(statistic);
+            NoPhaseDdFit { beta, se, p }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1066,16 +1132,35 @@ fn fit_conditional_prepared_whitened_inner(
             if !information.is_finite() || information <= norm2 * 1.0e-24 {
                 return None;
             }
-            let eta_without_z = dot(&residual, &y_after_base) / information;
+            let dd_fit = no_phase_dd_fit(
+                &residual,
+                &y_after_base,
+                information,
+                base_basis.len(),
+                inference,
+            );
+            let eta_without_z = dd_fit.beta;
             let z_loading = dot(&residual, &z_after_base) / information;
             let mut unit = residual;
             let scale = information.sqrt();
             for value in &mut unit {
                 *value /= scale;
             }
-            Some((information, eta_without_z, z_loading, unit))
+            Some((information, eta_without_z, z_loading, unit, dd_fit))
         });
-    let (y_after_nuisance, z_after) = if let Some((_, _, _, h_unit)) = shared_projection.as_ref() {
+    let dd_fit = shared_projection
+        .as_ref()
+        .map(|(_, _, _, _, dd_fit)| *dd_fit)
+        .unwrap_or_else(|| NoPhaseDdFit::unavailable(f64::NAN));
+    let non_testable_with_dd = |status, fixed_effect_rank, residual_df| {
+        let mut fit = non_testable(status, fixed_effect_rank, residual_df);
+        fit.beta_dd = dd_fit.beta;
+        fit.se_dd = dd_fit.se;
+        fit.pwald_dd = dd_fit.p;
+        fit
+    };
+    let (y_after_nuisance, z_after) = if let Some((_, _, _, h_unit, _)) = shared_projection.as_ref()
+    {
         let y_loading = dot(&y_after_base, h_unit);
         let z_loading = dot(&z_after_base, h_unit);
         for (value, &h) in y_after_base.iter_mut().zip(h_unit) {
@@ -1100,14 +1185,18 @@ fn fit_conditional_prepared_whitened_inner(
         if let Some(started) = phase_test_started {
             timings.phase_test += started.elapsed();
         }
-        return Ok(non_testable(FitStatus::UnidentifiablePhase, rank - 1, 0));
+        return Ok(non_testable_with_dd(
+            FitStatus::UnidentifiablePhase,
+            rank - 1,
+            0,
+        ));
     }
     let residual_df = n.saturating_sub(rank);
     if residual_df == 0 {
         if let Some(started) = phase_test_started {
             timings.phase_test += started.elapsed();
         }
-        return Ok(non_testable(
+        return Ok(non_testable_with_dd(
             FitStatus::InsufficientDegreesOfFreedom,
             rank,
             residual_df,
@@ -1127,7 +1216,7 @@ fn fit_conditional_prepared_whitened_inner(
                 if let Some(started) = phase_test_started {
                     timings.phase_test += started.elapsed();
                 }
-                return Ok(non_testable(
+                return Ok(non_testable_with_dd(
                     FitStatus::ZeroResidualVariance,
                     rank,
                     residual_df,
@@ -1141,7 +1230,7 @@ fn fit_conditional_prepared_whitened_inner(
         if let Some(started) = phase_test_started {
             timings.phase_test += started.elapsed();
         }
-        return Ok(non_testable(
+        return Ok(non_testable_with_dd(
             FitStatus::UnidentifiablePhase,
             rank,
             residual_df,
@@ -1170,7 +1259,7 @@ fn fit_conditional_prepared_whitened_inner(
     let mut phase_wald_statistic = f64::NAN;
     let mut pwald2 = f64::NAN;
     let phase_effects_started = profile.then(Instant::now);
-    if let Some((information_h, eta_without_z, z_loading, _)) = shared_projection {
+    if let Some((information_h, eta_without_z, z_loading, _, _)) = shared_projection {
         let scale = match inference {
             InferenceKind::LinearModel => rss / residual_df as f64,
             InferenceKind::FixedCovariance => 1.0,
@@ -1249,6 +1338,9 @@ fn fit_conditional_prepared_whitened_inner(
         beta_d1,
         beta_a2,
         beta_d2,
+        beta_dd: dd_fit.beta,
+        se_dd: dd_fit.se,
+        pwald_dd: dd_fit.p,
         shared_effect_identifiable,
         statistic,
         pwald1,
@@ -1276,6 +1368,9 @@ fn non_testable(status: FitStatus, fixed_effect_rank: usize, residual_df: usize)
         beta_d1: f64::NAN,
         beta_a2: f64::NAN,
         beta_d2: f64::NAN,
+        beta_dd: f64::NAN,
+        se_dd: f64::NAN,
+        pwald_dd: f64::NAN,
         shared_effect_identifiable: false,
         statistic: f64::NAN,
         pwald1: f64::NAN,
@@ -1794,6 +1889,95 @@ mod tests {
     };
     use crate::ct::packed::FilledPair;
     use nalgebra::DMatrix;
+
+    #[test]
+    fn no_phase_dd_test_matches_reduced_model_without_phase_term() {
+        let n = 180;
+        let metric = CovarianceMetric::identity(n);
+        let mut c = Vec::with_capacity(n * 2);
+        let mut b = Vec::with_capacity(n * 5);
+        let mut z = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        let mut h = Vec::with_capacity(n);
+        for i in 0..n {
+            let gi = (i % 3) as f64;
+            let gj = ((i / 3) % 3) as f64;
+            let hi = if gi == 1.0 { 1.0 } else { 0.0 };
+            let hj = if gj == 1.0 { 1.0 } else { 0.0 };
+            let dd = hi * hj;
+            let phase = if dd == 0.0 {
+                0.0
+            } else if (i / 9) % 2 == 0 {
+                1.0
+            } else {
+                -1.0
+            };
+            let x = ((i * 7 % 29) as f64 - 14.0) / 14.0;
+            let noise = ((i * 17 % 31) as f64 - 15.0) * 0.02;
+            c.extend([1.0, x]);
+            b.extend([gi, gj, hi, hj, dd]);
+            z.push(phase);
+            h.push(dd);
+            y.push(0.6 + 0.2 * x + 0.3 * gi - 0.15 * gj + 0.1 * hi + 0.05 * hj + 0.85 * dd + noise);
+        }
+
+        let prepared = prepare_conditional_fit(&y, &c, 2, &metric).unwrap();
+        let fit = fit_conditional(
+            &y,
+            &c,
+            2,
+            &b,
+            5,
+            &z,
+            &metric,
+            InferenceKind::LinearModel,
+            Some(4),
+        )
+        .unwrap();
+
+        let mut nuisance = prepared.c_w.clone();
+        for column in 0..4 {
+            let values = (0..n).map(|row| b[row * 5 + column]).collect::<Vec<_>>();
+            nuisance.push(metric.whiten(&values).unwrap());
+        }
+        let base_basis = super::orthonormal_basis(nuisance);
+        let h_w = metric.whiten(&h).unwrap();
+        let h_residual = super::project_off(&h_w, &base_basis);
+        let y_residual = super::project_off(&prepared.y_w, &base_basis);
+        let information = super::dot(&h_residual, &h_residual);
+        let beta_dd = super::dot(&h_residual, &y_residual) / information;
+        let rss_dd = y_residual
+            .iter()
+            .zip(&h_residual)
+            .map(|(&response, &h)| (response - beta_dd * h).powi(2))
+            .sum::<f64>();
+        let df_dd = n - base_basis.len() - 1;
+        let se_dd = (rss_dd / df_dd as f64 / information).sqrt();
+        let p_dd = crate::linalg::student_t_p_two_sided(beta_dd / se_dd, df_dd as i32);
+
+        assert!((fit.beta_dd - beta_dd).abs() < 1.0e-12);
+        assert!((fit.se_dd - se_dd).abs() < 1.0e-12);
+        assert!((fit.pwald_dd - p_dd).abs() < 1.0e-12);
+        assert!(fit.pwald_dd < 0.05);
+
+        let fixed_fit = fit_conditional(
+            &y,
+            &c,
+            2,
+            &b,
+            5,
+            &z,
+            &metric,
+            InferenceKind::FixedCovariance,
+            Some(4),
+        )
+        .unwrap();
+        let fixed_se = (1.0 / information).sqrt();
+        let fixed_p = crate::linalg::chi2_sf_df1(beta_dd * beta_dd / (fixed_se * fixed_se));
+        assert!((fixed_fit.beta_dd - beta_dd).abs() < 1.0e-12);
+        assert!((fixed_fit.se_dd - fixed_se).abs() < 1.0e-12);
+        assert!((fixed_fit.pwald_dd - fixed_p).abs() < 1.0e-12);
+    }
 
     #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     #[test]

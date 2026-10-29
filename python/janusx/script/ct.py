@@ -31,8 +31,10 @@ def build_parser() -> CliArgumentParser:
         description=(
             "Screen nearby phased variant pairs for cis/trans effects, then fit "
             "conditional LM or fixed-covariance FvLMM models with per-site "
-            "additive/dominance effects. pwald1 tests equal cis/trans effects; "
-            "pwald2 jointly tests whether both effects are zero."
+            "additive/dominance effects. pwald1 tests whether cis/trans effects "
+            "are equal; pwald2 tests whether both are zero; pwald_dd tests the "
+            "shared double-dominance term in the reduced no-phase model. "
+            "Use --dxd for a separate full-window phase-independent D×D scan."
         ),
         epilog=minimal_help_epilog(
             [
@@ -115,6 +117,14 @@ def build_parser() -> CliArgumentParser:
     )
 
     scan = parser.add_argument_group("Pair Scan and QC")
+    scan.add_argument(
+        "--dxd",
+        action="store_true",
+        help=(
+            "Run a separate phase-independent double-heterozygote H scan and "
+            "conditional D×D test; writes .dxd.tsv/.dxd.json."
+        ),
+    )
     scan.add_argument("--window-bp", type=int, default=50_000, help="Maximum same-chromosome pair distance in bp.")
     scan.add_argument("--core-bp", type=int, default=50_000, help="Left-endpoint core width in bp.")
     scan.add_argument("--topk", type=int, default=100, help="Maximum screened pairs retained per core.")
@@ -123,11 +133,24 @@ def build_parser() -> CliArgumentParser:
         "--maf",
         type=float,
         default=0.0,
-        help="Minimum raw cis/trans phase-minor frequency among informative double heterozygotes.",
+        help=(
+            "Phase CT only: minimum raw cis/trans phase-minor frequency among informative "
+            "double heterozygotes (ignored by --dxd)."
+        ),
     )
     scan.add_argument("-geno", "--geno", type=float, default=0.05, help="Maximum raw pair unknown rate before imputation.")
-    scan.add_argument("--min-cis", type=int, default=0, help="Additional minimum raw cis support.")
-    scan.add_argument("--min-trans", type=int, default=0, help="Additional minimum raw trans support.")
+    scan.add_argument(
+        "--min-cis",
+        type=int,
+        default=0,
+        help="Phase CT only: minimum raw cis support (ignored by --dxd).",
+    )
+    scan.add_argument(
+        "--min-trans",
+        type=int,
+        default=0,
+        help="Phase CT only: minimum raw trans support (ignored by --dxd).",
+    )
     scan.add_argument("--snp-maf", type=float, default=0.0, help="Minimum raw genotype MAF per endpoint SNP.")
     scan.add_argument("--snp-geno", type=float, default=0.05, help="Maximum raw missing genotype rate per endpoint SNP.")
     scan.add_argument(
@@ -147,8 +170,8 @@ def build_parser() -> CliArgumentParser:
         runtime,
         default="ct",
         help_text=(
-            "Writes <prefix>.ct.tsv and <prefix>.ct.json; multiple traits add a "
-            "numbered trait suffix."
+            "Phase mode writes <prefix>.ct.tsv/.ct.json; --dxd writes "
+            "<prefix>.dxd.tsv/.dxd.json. Multiple traits add a numbered trait suffix."
         ),
     )
     return parser
@@ -587,6 +610,7 @@ def _run(args: argparse.Namespace, logger: logging.Logger) -> int:
             min_trans=args.min_trans,
             alpha=args.alpha,
             threads=args.thread,
+            scan_mode="dxd" if args.dxd else "phase",
         )
         logger.info(
             "CT complete: M=%s, rows=%s, TSV=%s, JSON=%s",

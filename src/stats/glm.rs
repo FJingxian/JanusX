@@ -855,6 +855,203 @@ impl LmUnifiedStreamingChunk {
     }
 }
 
+const LM_TSV_QUEUE_DEPTH: usize = 2;
+
+struct LmOutputBlock {
+    chrom: Vec<String>,
+    pos: Vec<i64>,
+    snp: Vec<String>,
+    a0: Vec<String>,
+    a1: Vec<String>,
+    maf: Vec<f32>,
+    missing: Vec<usize>,
+    results: Vec<f64>,
+    rows: usize,
+}
+
+impl LmOutputBlock {
+    fn new(capacity: usize) -> Self {
+        Self {
+            chrom: Vec::with_capacity(capacity),
+            pos: Vec::with_capacity(capacity),
+            snp: Vec::with_capacity(capacity),
+            a0: Vec::with_capacity(capacity),
+            a1: Vec::with_capacity(capacity),
+            maf: Vec::with_capacity(capacity),
+            missing: vec![0; capacity],
+            results: vec![0.0; capacity.saturating_mul(5)],
+            rows: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.chrom.clear();
+        self.pos.clear();
+        self.snp.clear();
+        self.a0.clear();
+        self.a1.clear();
+        self.maf.clear();
+        self.rows = 0;
+    }
+}
+
+struct AsyncLmTsvWriter {
+    path: String,
+    tx: Option<mpsc::SyncSender<LmOutputBlock>>,
+    free_rx: mpsc::Receiver<LmOutputBlock>,
+    handle: Option<thread::JoinHandle<Result<(), String>>>,
+}
+
+impl AsyncLmTsvWriter {
+    fn with_config(path: &str, block_capacity: usize, n_samples: usize) -> Result<Self, String> {
+        let path_owned = path.to_owned();
+        let (tx, rx) = mpsc::sync_channel::<LmOutputBlock>(LM_TSV_QUEUE_DEPTH);
+        let (free_tx, free_rx) = mpsc::sync_channel::<LmOutputBlock>(LM_TSV_QUEUE_DEPTH);
+        for _ in 0..LM_TSV_QUEUE_DEPTH {
+            free_tx
+                .send(LmOutputBlock::new(block_capacity))
+                .map_err(|e| format!("initialize LM TSV buffer pool: {e}"))?;
+        }
+
+        let path_for_writer = path_owned.clone();
+        let header = b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n";
+        let free_tx_worker = free_tx.clone();
+        let handle = thread::Builder::new()
+            .name("lm-tsv-format-write".to_owned())
+            .spawn(move || -> Result<(), String> {
+                let writer =
+                    AsyncTsvWriter::with_config(&path_for_writer, header, 64 * 1024 * 1024, 16)?;
+
+                let mut text_buf = String::with_capacity(block_capacity.saturating_mul(112));
+                for mut block in rx {
+                    text_buf.clear();
+                    append_assoc_block_from_arrays(
+                        &mut text_buf,
+                        AssocResultLayout::PrecomputedChisqBasic3 {
+                            row_stride: 5,
+                            beta_col: 0,
+                            se_col: 1,
+                            chisq_col: 2,
+                            raw_p_col: 3,
+                        },
+                        "add",
+                        AssocArraysBlock {
+                            chrom: &block.chrom,
+                            pos: &block.pos,
+                            snp: &block.snp,
+                            allele0: &block.a0,
+                            allele1: &block.a1,
+                            maf: &block.maf,
+                            miss: AssocMissBlock::CountUsize {
+                                values: &block.missing[..block.rows],
+                                n_samples,
+                            },
+                        },
+                        &block.results[..block.rows.saturating_mul(5)],
+                    )
+                    .map_err(|e| format!("format LM TSV {path_for_writer}: {e}"))?;
+                    send_text_buf(&writer, &mut text_buf)
+                        .map_err(|e| format!("write LM TSV {path_for_writer}: {e}"))?;
+                    block.clear();
+                    if free_tx_worker.send(block).is_err() {
+                        break;
+                    }
+                }
+
+                writer
+                    .finish()
+                    .map_err(|e| format!("finish LM TSV {path_for_writer}: {e}"))
+            })
+            .map_err(|e| format!("spawn LM TSV worker for {path_owned}: {e}"))?;
+        drop(free_tx);
+
+        Ok(Self {
+            path: path_owned,
+            tx: Some(tx),
+            free_rx,
+            handle: Some(handle),
+        })
+    }
+
+    fn send_chunk(&self, chunk: &mut LmUnifiedStreamingChunk, rows: usize) -> Result<(), String> {
+        if rows == 0 {
+            return Ok(());
+        }
+        if rows > chunk.chrom.len()
+            || rows > chunk.pos.len()
+            || rows > chunk.snp.len()
+            || rows > chunk.a0.len()
+            || rows > chunk.a1.len()
+            || rows > chunk.maf.len()
+            || rows > chunk.miss_block.len()
+            || rows.saturating_mul(5) > chunk.out_block.len()
+        {
+            return Err(format!(
+                "LM TSV block is shorter than requested rows={rows}"
+            ));
+        }
+
+        let mut block = self
+            .free_rx
+            .recv()
+            .map_err(|e| format!("LM TSV output worker stopped for {}: {e}", self.path))?;
+        exchange_lm_output_buffers(chunk, &mut block);
+        block.chrom.truncate(rows);
+        block.pos.truncate(rows);
+        block.snp.truncate(rows);
+        block.a0.truncate(rows);
+        block.a1.truncate(rows);
+        block.maf.truncate(rows);
+        block.rows = rows;
+
+        let send_result = self
+            .tx
+            .as_ref()
+            .ok_or_else(|| format!("LM TSV writer already closed for {}", self.path))?
+            .send(block);
+        if let Err(e) = send_result {
+            let mut block = e.0;
+            exchange_lm_output_buffers(chunk, &mut block);
+            return Err(format!(
+                "send LM TSV block for {}: channel closed",
+                self.path
+            ));
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(), String> {
+        self.tx.take();
+        if let Some(handle) = self.handle.take() {
+            handle
+                .join()
+                .map_err(|_| format!("LM TSV worker panicked for {}", self.path))?
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for AsyncLmTsvWriter {
+    fn drop(&mut self) {
+        self.tx.take();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn exchange_lm_output_buffers(chunk: &mut LmUnifiedStreamingChunk, block: &mut LmOutputBlock) {
+    std::mem::swap(&mut chunk.chrom, &mut block.chrom);
+    std::mem::swap(&mut chunk.pos, &mut block.pos);
+    std::mem::swap(&mut chunk.snp, &mut block.snp);
+    std::mem::swap(&mut chunk.a0, &mut block.a0);
+    std::mem::swap(&mut chunk.a1, &mut block.a1);
+    std::mem::swap(&mut chunk.maf, &mut block.maf);
+    std::mem::swap(&mut chunk.miss_block, &mut block.missing);
+    std::mem::swap(&mut chunk.out_block, &mut block.results);
+}
+
 #[derive(Clone, Debug)]
 struct LmStage2CompactContext {
     col_indices: Vec<usize>,
@@ -1300,7 +1497,6 @@ pub(crate) fn lm_stream_bed_additive_windowed_unified(
     let output_row_limit = lm_max_output_rows_env();
     let mut written_total = 0usize;
     let mut kept_total = 0usize;
-    let mut text = String::with_capacity(scan_chunk_snps * 112);
     let mut xts_tmp = vec![0.0_f64; q_rank.max(1)];
 
     let lm_parallel_rhs =
@@ -1312,12 +1508,7 @@ pub(crate) fn lm_stream_bed_additive_windowed_unified(
     };
     let _blas_guard = BlasThreadGuard::enter(blas_threads);
 
-    let writer = AsyncTsvWriter::with_config(
-        out_tsv_path,
-        b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n",
-        64 * 1024 * 1024,
-        16,
-    )?;
+    let writer = AsyncLmTsvWriter::with_config(out_tsv_path, scan_chunk_snps, n)?;
 
     let mut chunk_start = 0usize;
     let producer_err = Arc::new(OnceLock::<String>::new());
@@ -1483,35 +1674,7 @@ pub(crate) fn lm_stream_bed_additive_windowed_unified(
                 .map(|limit| limit.saturating_sub(written_total).min(rows))
                 .unwrap_or(rows);
             if write_rows > 0 {
-                text.clear();
-                if text.capacity() < write_rows * 112 {
-                    text.reserve(write_rows * 112 - text.capacity());
-                }
-                append_assoc_block_from_arrays(
-                    &mut text,
-                    AssocResultLayout::PrecomputedChisqBasic3 {
-                        row_stride: 5,
-                        beta_col: 0,
-                        se_col: 1,
-                        chisq_col: 2,
-                        raw_p_col: 3,
-                    },
-                    "add",
-                    AssocArraysBlock {
-                        chrom: &chunk.chrom[..write_rows],
-                        pos: &chunk.pos[..write_rows],
-                        snp: &chunk.snp[..write_rows],
-                        allele0: &chunk.a0[..write_rows],
-                        allele1: &chunk.a1[..write_rows],
-                        maf: &chunk.maf[..write_rows],
-                        miss: AssocMissBlock::CountUsize {
-                            values: &chunk.miss_block[..write_rows],
-                            n_samples: n,
-                        },
-                    },
-                    &chunk.out_block[..write_rows * 5],
-                )?;
-                send_text_buf(&writer, &mut text)?;
+                writer.send_chunk(chunk, write_rows)?;
                 written_total = written_total.saturating_add(write_rows);
             }
         }
@@ -4535,4 +4698,46 @@ pub fn lm_block_assoc_f32<'py>(
     })?;
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod async_lm_tsv_tests {
+    use super::{AsyncLmTsvWriter, LmUnifiedStreamingChunk};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn async_lm_tsv_writer_formats_precomputed_result_block() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "janusx-lm-async-tsv-{}-{nonce}.tsv",
+            std::process::id()
+        ));
+
+        let mut chunk = LmUnifiedStreamingChunk::new(1, 20, 0);
+        chunk.chrom.push("1".to_owned());
+        chunk.pos.push(10);
+        chunk.snp.push("rs1".to_owned());
+        chunk.a0.push("A".to_owned());
+        chunk.a1.push("G".to_owned());
+        chunk.maf.push(0.123456);
+        chunk.miss_block[0] = 2;
+        chunk.out_block[..5].copy_from_slice(&[0.25, 0.125, 4.0, 0.03, 0.0]);
+        chunk.rows = 1;
+
+        let writer = AsyncLmTsvWriter::with_config(path.to_str().unwrap(), 1, 20).unwrap();
+        writer.send_chunk(&mut chunk, 1).unwrap();
+        writer.finish().unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            contents,
+            "chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n\
+             1\t10\trs1\tA\tG\t0.1235\t0.1000\t0.2500\t0.1250\t4.0000e0\t3.0000e-2\n"
+        );
+        fs::remove_file(path).unwrap();
+    }
 }

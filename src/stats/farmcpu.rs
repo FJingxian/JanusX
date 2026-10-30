@@ -1826,6 +1826,67 @@ impl FarmcpuScanBlock {
     }
 }
 
+struct FarmcpuOutputBlock {
+    row_start: usize,
+    rows: usize,
+    snp: Vec<String>,
+    allele0: Vec<String>,
+    allele1: Vec<String>,
+    stats: Vec<f64>,
+}
+
+fn append_farmcpu_output_row(
+    text_buf: &mut String,
+    qtn_text_buf: Option<&mut String>,
+    chrom: &str,
+    pos: i64,
+    snp: &str,
+    allele0: &str,
+    allele1: &str,
+    maf: f32,
+    miss_count: usize,
+    n: usize,
+    beta: f64,
+    se: f64,
+    pwald: f64,
+    source_row: Option<usize>,
+) {
+    let chisq_txt = format_chisq_value(chisq_from_beta_se_and_optional_plrt(beta, se, None));
+    let _ = write!(
+        text_buf,
+        "{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t{:.4e}\n",
+        chrom,
+        pos,
+        snp,
+        allele0,
+        allele1,
+        maf,
+        miss_count as f64 / n as f64,
+        beta,
+        se,
+        chisq_txt,
+        pwald
+    );
+    if let (Some(qtn_text_buf), Some(source_row)) = (qtn_text_buf, source_row) {
+        let _ = write!(
+            qtn_text_buf,
+            "{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{}\n",
+            chrom,
+            pos,
+            snp,
+            allele0,
+            allele1,
+            maf,
+            miss_count as f64 / n as f64,
+            beta,
+            se,
+            chisq_txt,
+            pwald,
+            source_row
+        );
+    }
+}
+
 struct FarmcpuQtnColumnCache {
     n: usize,
     columns: HashMap<usize, Vec<f64>>,
@@ -2799,8 +2860,8 @@ fn farmcpu_bim_rows_for_chunk<'a>(
 
 #[allow(clippy::too_many_arguments)]
 fn write_farmcpu_packed_main_scan(
-    out_writer: &AsyncTsvWriter,
-    qtn_writer: Option<&AsyncTsvWriter>,
+    out_writer: AsyncTsvWriter,
+    qtn_writer: Option<AsyncTsvWriter>,
     qtn_path_for_err: &str,
     y: &[f64],
     x_qtn: &[f64],
@@ -2917,15 +2978,6 @@ fn write_farmcpu_packed_main_scan(
     let blas_threads = farmcpu_scan_blas_threads(threads);
     let row_block = farmcpu_scan_row_block_size(n, m);
     let row_stride = 3usize;
-    let mut text_buf = String::with_capacity(row_block * 128);
-    let mut qtn_text_buf_opt = if qtn_writer.is_some() {
-        Some(String::with_capacity(
-            row_block.min(qtn_lookup.len().max(1)) * 128,
-        ))
-    } else {
-        None
-    };
-    let mut qtn_rows_written = 0usize;
     let producer_err = std::sync::Arc::new(std::sync::OnceLock::<String>::new());
     let producer_err_bg = std::sync::Arc::clone(&producer_err);
     let mut next_row_start = 0usize;
@@ -2974,7 +3026,12 @@ fn write_farmcpu_packed_main_scan(
         next_row_start = row_end;
         next_row_start < m
     };
-    let consumer = |chunk: &mut FarmcpuScanBlock| -> Result<(), String> {
+    let (output_tx, output_rx) = std::sync::mpsc::sync_channel::<FarmcpuOutputBlock>(2);
+    let output_tx_consumer = output_tx.clone();
+    drop(output_tx);
+    let qtn_path_for_err_owned = qtn_path_for_err.to_owned();
+    let pool_for_consumer = pool.as_ref();
+    let consumer = move |chunk: &mut FarmcpuScanBlock| -> Result<(), String> {
         let row_start = chunk.row_start;
         let n_block = chunk.rows;
         if n_block == 0 {
@@ -3072,16 +3129,12 @@ fn write_farmcpu_packed_main_scan(
                     stat_out[2] = student_t_p_two_sided(t, df_row);
                 });
         };
-        if let Some(p) = &pool {
+        if let Some(p) = pool_for_consumer {
             p.install(&mut stat_runner);
         } else {
             stat_runner();
         }
 
-        text_buf.clear();
-        if let Some(ref mut qtn_text_buf) = qtn_text_buf_opt {
-            qtn_text_buf.clear();
-        }
         for local_idx in 0..n_block {
             let i = row_start + local_idx;
             let stat_base = local_idx * row_stride;
@@ -3103,58 +3156,22 @@ fn write_farmcpu_packed_main_scan(
                     pwald = 1.0;
                 }
             }
-            let chisq = chisq_from_beta_se_and_optional_plrt(beta, se, None);
-            let chisq_txt = format_chisq_value(chisq);
-            let _ = write!(
-                text_buf,
-                "{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t{:.4e}\n",
-                chrom[i],
-                pos[i],
-                snp_block[local_idx],
-                allele0_block[local_idx],
-                allele1_block[local_idx],
-                row_maf[i],
-                miss_counts[i] as f64 / n as f64,
-                beta,
-                se,
-                chisq_txt,
-                pwald
-            );
-            if let Some(ref mut qtn_text_buf) = qtn_text_buf_opt {
-                if qtn_lookup.contains_key(&i) {
-                    qtn_rows_written += 1;
-                    let _ = write!(
-                        qtn_text_buf,
-                        "{}\t{}\t{}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t{:.4e}\t{}\n",
-                        chrom[i],
-                        pos[i],
-                        snp_block[local_idx],
-                        allele0_block[local_idx],
-                        allele1_block[local_idx],
-                        row_maf[i],
-                        miss_counts[i] as f64 / n as f64,
-                        beta,
-                        se,
-                        chisq_txt,
-                        pwald,
-                        row_indices.map(|v| v[i]).unwrap_or(i)
-                    );
-                }
-            }
+            stats_slice[stat_base] = beta;
+            stats_slice[stat_base + 1] = se;
+            stats_slice[stat_base + 2] = pwald;
         }
 
-        if !text_buf.is_empty() {
-            out_writer
-                .send_text(&mut text_buf)
-                .map_err(|e| e.to_string())?;
-        }
-        if let (Some(q_writer), Some(qtn_text_buf)) = (qtn_writer, qtn_text_buf_opt.as_mut()) {
-            if !qtn_text_buf.is_empty() {
-                q_writer
-                    .send_text(qtn_text_buf)
-                    .map_err(|e| format!("{qtn_path_for_err}: {e}"))?;
-            }
-        }
+        let block = FarmcpuOutputBlock {
+            row_start,
+            rows: n_block,
+            snp: snp_block,
+            allele0: allele0_block,
+            allele1: allele1_block,
+            stats: stats_slice.to_vec(),
+        };
+        output_tx_consumer
+            .send(block)
+            .map_err(|e| format!("queue FarmCPU output block: {e}"))?;
         if let Some(cb) = scan_progress_callback {
             Python::attach(|py2| -> PyResult<()> {
                 py2.check_signals()?;
@@ -3165,12 +3182,88 @@ fn write_farmcpu_packed_main_scan(
         }
         Ok(())
     };
-    crate::pipeline::run_double_buffer(
-        2usize,
-        || FarmcpuScanBlock::new(row_block, n, q0, row_stride),
-        producer,
-        consumer,
-    )?;
+    let (scan_result, output_result) = std::thread::scope(|scope| {
+        let output_worker = scope.spawn(move || -> Result<usize, String> {
+            let mut qtn_rows_written = 0usize;
+            let mut text_buf = String::with_capacity(row_block.saturating_mul(128));
+            let mut qtn_text_buf_opt = if qtn_writer.is_some() {
+                Some(String::with_capacity(
+                    row_block.min(qtn_lookup.len().max(1)).saturating_mul(128),
+                ))
+            } else {
+                None
+            };
+
+            for block in output_rx {
+                text_buf.clear();
+                if let Some(qtn_text_buf) = qtn_text_buf_opt.as_mut() {
+                    qtn_text_buf.clear();
+                }
+                for local_idx in 0..block.rows {
+                    let i = block.row_start + local_idx;
+                    let stat_base = local_idx * row_stride;
+                    let qtn_source = if qtn_text_buf_opt.is_some() && qtn_lookup.contains_key(&i) {
+                        qtn_rows_written = qtn_rows_written.saturating_add(1);
+                        Some(row_indices.map(|v| v[i]).unwrap_or(i))
+                    } else {
+                        None
+                    };
+                    append_farmcpu_output_row(
+                        &mut text_buf,
+                        qtn_text_buf_opt.as_mut(),
+                        &chrom[i],
+                        pos[i],
+                        &block.snp[local_idx],
+                        &block.allele0[local_idx],
+                        &block.allele1[local_idx],
+                        row_maf[i],
+                        miss_counts[i],
+                        n,
+                        block.stats[stat_base],
+                        block.stats[stat_base + 1],
+                        block.stats[stat_base + 2],
+                        qtn_source,
+                    );
+                }
+
+                if !text_buf.is_empty() {
+                    out_writer.send_text(&mut text_buf)?;
+                }
+                if let (Some(q_writer), Some(qtn_text_buf)) =
+                    (qtn_writer.as_ref(), qtn_text_buf_opt.as_mut())
+                {
+                    if !qtn_text_buf.is_empty() {
+                        q_writer
+                            .send_text(qtn_text_buf)
+                            .map_err(|e| format!("{qtn_path_for_err_owned}: {e}"))?;
+                    }
+                }
+            }
+
+            out_writer.finish()?;
+            if let Some(q_writer) = qtn_writer {
+                q_writer
+                    .finish()
+                    .map_err(|e| format!("{qtn_path_for_err_owned}: {e}"))?;
+            }
+            Ok(qtn_rows_written)
+        });
+
+        let scan_result = crate::pipeline::run_double_buffer(
+            2usize,
+            || FarmcpuScanBlock::new(row_block, n, q0, row_stride),
+            producer,
+            consumer,
+        );
+        let output_result = output_worker
+            .join()
+            .map_err(|_| "FarmCPU output worker panicked".to_string())
+            .and_then(|result| result);
+        (scan_result, output_result)
+    });
+
+    let qtn_rows_written = output_result?;
+    scan_result?;
     if let Some(err) = producer_err.get() {
         return Err(err.clone());
     }
@@ -4520,8 +4613,8 @@ pub fn farmcpu_packed_to_tsv(
                 BimSelectedFieldStream::open(prefix_for_stream).map_err(PyRuntimeError::new_err)?;
 
             let (written_rows, qtn_rows_written) = write_farmcpu_packed_main_scan(
-                &writer,
-                qtn_writer_opt.as_ref(),
+                writer,
+                qtn_writer_opt,
                 &qtn_path_for_err,
                 y,
                 &x_qtn,
@@ -4545,12 +4638,6 @@ pub fn farmcpu_packed_to_tsv(
                 &mut bim_stream,
             )
             .map_err(PyRuntimeError::new_err)?;
-            writer.finish().map_err(PyRuntimeError::new_err)?;
-            if let Some(q_writer) = qtn_writer_opt.take() {
-                q_writer
-                    .finish()
-                    .map_err(|e| PyRuntimeError::new_err(format!("{qtn_path_for_err}: {e}")))?;
-            }
             let stage2_scan_secs = stage2_scan_t0.elapsed().as_secs_f64();
             return Ok((
                 written_rows,
@@ -4932,5 +5019,40 @@ mod tests {
         let later_iter =
             farmcpu_raw_prepare_seq_qtn(&qtn_saved, &opt_lead, &femp, &global_pos, 1.0e-2, true);
         assert_eq!(later_iter, vec![11usize, 3usize, 5usize, 9usize]);
+    }
+}
+
+#[cfg(test)]
+mod farmcpu_output_format_tests {
+    use super::append_farmcpu_output_row;
+
+    #[test]
+    fn formats_main_and_pseudo_qtn_rows_identically() {
+        let mut main = String::new();
+        let mut qtn = String::new();
+        append_farmcpu_output_row(
+            &mut main,
+            Some(&mut qtn),
+            "1",
+            10,
+            "rs1",
+            "A",
+            "G",
+            0.123456,
+            2,
+            20,
+            0.25,
+            0.125,
+            0.03,
+            Some(19),
+        );
+        assert_eq!(
+            main,
+            "1\t10\trs1\tA\tG\t0.1235\t0.1000\t0.2500\t0.1250\t4.0000e0\t3.0000e-2\n"
+        );
+        assert_eq!(
+            qtn,
+            "1\t10\trs1\tA\tG\t0.1235\t0.1000\t0.2500\t0.1250\t4.0000e0\t3.0000e-2\t19\n"
+        );
     }
 }

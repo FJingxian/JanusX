@@ -17,6 +17,7 @@ use rayon::prelude::*;
 use std::borrow::Cow;
 use std::f64::consts::PI;
 use std::fmt::Write as FmtWrite;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
@@ -914,6 +915,296 @@ fn emit_fvlmm_bed_stage_timing(
     );
 }
 
+const FVLMM_TSV_QUEUE_DEPTH: usize = 2;
+
+struct FvLmmOutputBlock {
+    chrom: Vec<String>,
+    pos: Vec<i64>,
+    snp: Vec<String>,
+    a0: Vec<String>,
+    a1: Vec<String>,
+    maf: Vec<f32>,
+    missing: Vec<usize>,
+    results: Vec<f64>,
+    rows: usize,
+}
+
+impl FvLmmOutputBlock {
+    fn new(capacity: usize, out_cols: usize) -> Self {
+        Self {
+            chrom: Vec::with_capacity(capacity),
+            pos: Vec::with_capacity(capacity),
+            snp: Vec::with_capacity(capacity),
+            a0: Vec::with_capacity(capacity),
+            a1: Vec::with_capacity(capacity),
+            maf: Vec::with_capacity(capacity),
+            missing: vec![0; capacity],
+            results: vec![0.0; capacity.saturating_mul(out_cols)],
+            rows: 0,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.chrom.clear();
+        self.pos.clear();
+        self.snp.clear();
+        self.a0.clear();
+        self.a1.clear();
+        self.maf.clear();
+        self.rows = 0;
+    }
+}
+
+#[derive(Default)]
+struct FvLmmTsvTiming {
+    queue_wait_nanos: AtomicU64,
+    format_nanos: AtomicU64,
+    write_nanos: AtomicU64,
+    worker_nanos: AtomicU64,
+    rows: AtomicU64,
+    blocks: AtomicU64,
+    bytes: AtomicU64,
+}
+
+struct AsyncFvLmmTsvWriter {
+    path: String,
+    tx: Option<mpsc::SyncSender<FvLmmOutputBlock>>,
+    free_rx: mpsc::Receiver<FvLmmOutputBlock>,
+    handle: Option<thread::JoinHandle<Result<(), String>>>,
+    timing: Arc<FvLmmTsvTiming>,
+    profiling: bool,
+}
+
+impl AsyncFvLmmTsvWriter {
+    fn with_config(
+        path: &str,
+        block_capacity: usize,
+        n_samples: usize,
+        schema: AssocResultCols,
+        profiling: bool,
+    ) -> Result<Self, String> {
+        let path_owned = path.to_owned();
+        let out_cols = schema.as_usize();
+        let (tx, rx) = mpsc::sync_channel::<FvLmmOutputBlock>(FVLMM_TSV_QUEUE_DEPTH);
+        let (free_tx, free_rx) = mpsc::sync_channel::<FvLmmOutputBlock>(FVLMM_TSV_QUEUE_DEPTH);
+        for _ in 0..FVLMM_TSV_QUEUE_DEPTH {
+            free_tx
+                .send(FvLmmOutputBlock::new(block_capacity, out_cols))
+                .map_err(|e| format!("initialize FvLMM TSV buffer pool: {e}"))?;
+        }
+
+        let path_for_writer = path_owned.clone();
+        let header = schema.header().to_vec();
+        let timing = Arc::new(FvLmmTsvTiming::default());
+        let worker_timing = Arc::clone(&timing);
+        let free_tx_worker = free_tx.clone();
+        let handle = thread::Builder::new()
+            .name("fvlmm-tsv-format-write".to_owned())
+            .spawn(move || -> Result<(), String> {
+                let worker_t0 = Instant::now();
+                let mut error: Option<String> = None;
+                let mut writer = match File::create(&path_for_writer) {
+                    Ok(file) => Some(BufWriter::with_capacity(64 * 1024 * 1024, file)),
+                    Err(e) => {
+                        error = Some(format!("create {path_for_writer}: {e}"));
+                        None
+                    }
+                };
+                if let Some(output) = writer.as_mut() {
+                    let write_t0 = Instant::now();
+                    if let Err(e) = output.write_all(&header) {
+                        error = Some(format!("write header {path_for_writer}: {e}"));
+                    } else if let Err(e) = output.flush() {
+                        error = Some(format!("flush header {path_for_writer}: {e}"));
+                    }
+                    record_elapsed_nanos(&worker_timing.write_nanos, write_t0);
+                }
+
+                let mut text_buf = String::with_capacity(block_capacity.saturating_mul(128));
+                let mut miss_rate_buf = Vec::with_capacity(block_capacity);
+                for mut block in rx {
+                    if error.is_none() {
+                        text_buf.clear();
+                        let format_t0 = Instant::now();
+                        miss_rate_buf.clear();
+                        miss_rate_buf.extend(
+                            block.missing[..block.rows]
+                                .iter()
+                                .map(|&count| missing_rate_from_count(count, n_samples)),
+                        );
+                        let formatted = append_assoc_block_from_arrays(
+                            &mut text_buf,
+                            AssocResultLayout::ResultCols {
+                                schema,
+                                row_stride: out_cols,
+                            },
+                            "add",
+                            AssocArraysBlock {
+                                chrom: &block.chrom,
+                                pos: &block.pos,
+                                snp: &block.snp,
+                                allele0: &block.a0,
+                                allele1: &block.a1,
+                                maf: &block.maf,
+                                miss: AssocMissBlock::Rate(&miss_rate_buf),
+                            },
+                            &block.results[..block.rows.saturating_mul(out_cols)],
+                        );
+                        record_elapsed_nanos(&worker_timing.format_nanos, format_t0);
+                        if let Err(e) = formatted {
+                            error = Some(format!("format FvLMM TSV {path_for_writer}: {e}"));
+                        } else if let Some(output) = writer.as_mut() {
+                            worker_timing
+                                .rows
+                                .fetch_add(block.rows as u64, Ordering::Relaxed);
+                            worker_timing.blocks.fetch_add(1, Ordering::Relaxed);
+                            worker_timing
+                                .bytes
+                                .fetch_add(text_buf.len() as u64, Ordering::Relaxed);
+                            let write_t0 = Instant::now();
+                            if let Err(e) = output.write_all(text_buf.as_bytes()) {
+                                error = Some(format!("write {path_for_writer}: {e}"));
+                            }
+                            record_elapsed_nanos(&worker_timing.write_nanos, write_t0);
+                        }
+                    }
+                    block.clear();
+                    if free_tx_worker.send(block).is_err() {
+                        break;
+                    }
+                }
+
+                if error.is_none() {
+                    if let Some(output) = writer.as_mut() {
+                        let write_t0 = Instant::now();
+                        if let Err(e) = output.flush() {
+                            error = Some(format!("flush {path_for_writer}: {e}"));
+                        }
+                        record_elapsed_nanos(&worker_timing.write_nanos, write_t0);
+                    }
+                }
+                record_elapsed_nanos(&worker_timing.worker_nanos, worker_t0);
+                match error {
+                    Some(e) => Err(e),
+                    None => Ok(()),
+                }
+            })
+            .map_err(|e| format!("spawn FvLMM TSV worker for {path_owned}: {e}"))?;
+        drop(free_tx);
+
+        Ok(Self {
+            path: path_owned,
+            tx: Some(tx),
+            free_rx,
+            handle: Some(handle),
+            timing,
+            profiling,
+        })
+    }
+
+    fn send_chunk(&self, chunk: &mut StreamingChunk, rows: usize) -> Result<(), String> {
+        if rows == 0 {
+            return Ok(());
+        }
+        let out_cols = if chunk.out_block.is_empty() {
+            return Err("FvLMM TSV chunk has no result buffer".to_owned());
+        } else if chunk.out_block.len() % chunk.miss_block.len().max(1) == 0 {
+            chunk.out_block.len() / chunk.miss_block.len().max(1)
+        } else {
+            return Err("FvLMM TSV result buffer has an invalid stride".to_owned());
+        };
+        if rows > chunk.chrom.len()
+            || rows > chunk.pos.len()
+            || rows > chunk.snp.len()
+            || rows > chunk.a0.len()
+            || rows > chunk.a1.len()
+            || rows > chunk.maf.len()
+            || rows > chunk.miss_block.len()
+            || rows.saturating_mul(out_cols) > chunk.out_block.len()
+        {
+            return Err(format!(
+                "FvLMM TSV block is shorter than requested rows={rows}"
+            ));
+        }
+
+        let queue_t0 = Instant::now();
+        let mut block = self
+            .free_rx
+            .recv()
+            .map_err(|e| format!("FvLMM TSV output worker stopped for {}: {e}", self.path))?;
+        exchange_fvlmm_output_buffers(chunk, &mut block);
+        block.chrom.truncate(rows);
+        block.pos.truncate(rows);
+        block.snp.truncate(rows);
+        block.a0.truncate(rows);
+        block.a1.truncate(rows);
+        block.maf.truncate(rows);
+        block.rows = rows;
+        let send_result = self
+            .tx
+            .as_ref()
+            .ok_or_else(|| format!("FvLMM TSV writer already closed for {}", self.path))?
+            .send(block);
+        if let Err(e) = send_result {
+            let mut block = e.0;
+            exchange_fvlmm_output_buffers(chunk, &mut block);
+            return Err(format!(
+                "send FvLMM TSV block for {}: channel closed",
+                self.path
+            ));
+        }
+        record_elapsed_nanos(&self.timing.queue_wait_nanos, queue_t0);
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(), String> {
+        self.tx.take();
+        let finish_t0 = Instant::now();
+        let worker_result = if let Some(handle) = self.handle.take() {
+            handle
+                .join()
+                .map_err(|_| format!("FvLMM TSV worker panicked for {}", self.path))?
+        } else {
+            Ok(())
+        };
+        let finish_wait = finish_t0.elapsed().as_secs_f64();
+        if self.profiling {
+            eprintln!(
+                "FvLMM TSV pipeline: queue_wait={:.3}s, format={:.3}s, write={:.3}s, finish_wait={:.3}s, worker={:.3}s, rows={}, blocks={}, bytes={}, format_threads=1, queue_depth={}",
+                elapsed_nanos_to_secs(&self.timing.queue_wait_nanos),
+                elapsed_nanos_to_secs(&self.timing.format_nanos),
+                elapsed_nanos_to_secs(&self.timing.write_nanos),
+                finish_wait,
+                elapsed_nanos_to_secs(&self.timing.worker_nanos),
+                self.timing.rows.load(Ordering::Relaxed),
+                self.timing.blocks.load(Ordering::Relaxed),
+                self.timing.bytes.load(Ordering::Relaxed),
+                FVLMM_TSV_QUEUE_DEPTH,
+            );
+        }
+        worker_result
+    }
+}
+
+impl Drop for AsyncFvLmmTsvWriter {
+    fn drop(&mut self) {
+        self.tx.take();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn exchange_fvlmm_output_buffers(chunk: &mut StreamingChunk, block: &mut FvLmmOutputBlock) {
+    std::mem::swap(&mut chunk.chrom, &mut block.chrom);
+    std::mem::swap(&mut chunk.pos, &mut block.pos);
+    std::mem::swap(&mut chunk.snp, &mut block.snp);
+    std::mem::swap(&mut chunk.a0, &mut block.a0);
+    std::mem::swap(&mut chunk.a1, &mut block.a1);
+    std::mem::swap(&mut chunk.maf, &mut block.maf);
+    std::mem::swap(&mut chunk.miss_block, &mut block.missing);
+    std::mem::swap(&mut chunk.out_block, &mut block.results);
+}
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2915,18 +3206,23 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
             // ============================================================
             // TSV writer
             // ============================================================
-            let header: &[u8] = if with_plrt {
-                b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\tplrt\n"
+            let output_schema = if with_plrt {
+                AssocResultCols::Plrt4
             } else {
-                b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n"
+                AssocResultCols::Basic3
             };
-            let writer = AsyncTsvWriter::with_config(&out_tsv_owned, header, 64 * 1024 * 1024, 16)?;
+            let writer = AsyncFvLmmTsvWriter::with_config(
+                &out_tsv_owned,
+                scan_chunk_snps,
+                n,
+                output_schema,
+                stage_timing,
+            )?;
 
             // ============================================================
             // Double-buffer pipeline: count+decode (bg) || rotate+assoc+write (main)
             // Uses generic pipeline from src/io/pipeline.rs.
             // ============================================================
-            let mut text_buf = String::with_capacity(scan_chunk_snps * 128);
             let mut total_rows = 0usize;
             let output_row_limit = gwas_max_output_rows_env();
             let mut written_total = 0usize;
@@ -3209,7 +3505,7 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                 chunk_start < total_scan_units
             };
 
-            // --- Consumer: Rotate + assoc + format TSV + write ---
+            // --- Consumer: Rotate + assoc + enqueue TSV block ---
             let consumer = |chunk: &mut StreamingChunk| {
                 let rows = chunk.rows;
                 if rows > 0 {
@@ -3244,45 +3540,13 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                         record_elapsed_nanos(&stage_association_nanos, t0);
                     }
 
-                    // Format TSV and write
+                    // Hand the result buffers to the bounded formatter/writer queue.
                     let tsv_t0 = stage_timing.then(Instant::now);
                     let write_rows = output_row_limit
                         .map(|limit| limit.saturating_sub(written_total).min(rows))
                         .unwrap_or(rows);
                     if write_rows > 0 {
-                        text_buf.clear();
-                        if text_buf.capacity() < write_rows * 128 {
-                            text_buf.reserve(write_rows * 128 - text_buf.capacity());
-                        }
-                    }
-                    let miss_rate_buf: Vec<f32> = chunk.miss_block[..write_rows]
-                        .iter()
-                        .map(|&v| missing_rate_from_count(v, n))
-                        .collect();
-                    append_assoc_block_from_arrays(
-                        &mut text_buf,
-                        AssocResultLayout::ResultCols {
-                            schema: if with_plrt {
-                                AssocResultCols::Plrt4
-                            } else {
-                                AssocResultCols::Basic3
-                            },
-                            row_stride: out_cols,
-                        },
-                        "add",
-                        AssocArraysBlock {
-                            chrom: &chunk.chrom[..write_rows],
-                            pos: &chunk.pos[..write_rows],
-                            snp: &chunk.snp[..write_rows],
-                            allele0: &chunk.a0[..write_rows],
-                            allele1: &chunk.a1[..write_rows],
-                            maf: &chunk.maf[..write_rows],
-                            miss: AssocMissBlock::Rate(miss_rate_buf.as_slice()),
-                        },
-                        &chunk.out_block[..write_rows * out_cols],
-                    )?;
-                    if write_rows > 0 {
-                        send_text_buf(&writer, &mut text_buf)?;
+                        writer.send_chunk(chunk, write_rows)?;
                         written_total = written_total.saturating_add(write_rows);
                     }
                     if let Some(t0) = tsv_t0 {

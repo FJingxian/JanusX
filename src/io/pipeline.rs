@@ -68,7 +68,7 @@ where
             .expect("pipeline seed free channel");
     }
 
-    thread::scope(|scope| {
+    thread::scope(move |scope| {
         // Background producer
         scope.spawn(move || {
             while let Ok(mut buf) = free_rx.recv() {
@@ -81,7 +81,14 @@ where
 
         // Foreground consumer
         while let Ok(mut buf) = ready_rx.recv() {
-            consumer(&mut buf)?;
+            if let Err(error) = consumer(&mut buf) {
+                // Close both channels before the scope waits for the producer.
+                // It may be blocked sending a full ready queue or waiting for a
+                // buffer that can no longer be returned by this consumer.
+                drop(free_tx);
+                drop(ready_rx);
+                return Err(error);
+            }
             let _ = free_tx.send(buf);
         }
 

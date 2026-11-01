@@ -371,17 +371,17 @@ enum AlleleMap {
 }
 
 fn infer_map(dref: &str, dalt: &str, gref: &str, galt: &str) -> Option<AlleleMap> {
-    // A/T and C/G pairs cannot reveal strand orientation from allele labels:
-    // complementing them produces the same unordered pair. Keep the anchor
-    // panel's dosage as-is, but let the caller mark other panels unaligned.
-    if is_palindromic_pair(dref, dalt) || is_palindromic_pair(gref, galt) {
-        return None;
-    }
+    // Honor the explicit allele labels and their order first. Palindromic
+    // pairs are ambiguous only when strand-complement inference is needed.
     if dref == gref && dalt == galt {
         return Some(AlleleMap::Identity);
     }
     if dref == galt && dalt == gref {
         return Some(AlleleMap::Swap);
+    }
+
+    if is_palindromic_pair(dref, dalt) || is_palindromic_pair(gref, galt) {
+        return None;
     }
 
     let cr = complement_base(dref)?;
@@ -438,6 +438,48 @@ fn dosage_to_i8_rounded(g: f32) -> i8 {
         1 => 1,
         2 => 2,
         _ => -9,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{infer_map, AlleleMap};
+
+    #[test]
+    fn palindromic_alleles_are_mapped_by_exact_order() {
+        assert!(matches!(
+            infer_map("A", "T", "A", "T"),
+            Some(AlleleMap::Identity)
+        ));
+        assert!(matches!(
+            infer_map("A", "T", "T", "A"),
+            Some(AlleleMap::Swap)
+        ));
+        assert!(matches!(
+            infer_map("C", "G", "C", "G"),
+            Some(AlleleMap::Identity)
+        ));
+        assert!(matches!(
+            infer_map("C", "G", "G", "C"),
+            Some(AlleleMap::Swap)
+        ));
+    }
+
+    #[test]
+    fn different_palindromic_pairs_remain_unaligned() {
+        assert!(infer_map("A", "T", "C", "G").is_none());
+    }
+
+    #[test]
+    fn non_palindromic_strand_mapping_remains_supported() {
+        assert!(matches!(
+            infer_map("A", "C", "T", "G"),
+            Some(AlleleMap::StrandIdentity)
+        ));
+        assert!(matches!(
+            infer_map("A", "C", "G", "T"),
+            Some(AlleleMap::StrandSwap)
+        ));
     }
 }
 

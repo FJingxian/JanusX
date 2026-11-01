@@ -1354,7 +1354,12 @@ fn parse_hmp_line_to_selected_row(
     let site = SiteInfo {
         chrom: chrom.clone(),
         pos,
-        snp: format!("{}_{}", chrom, pos),
+        snp: parts
+            .first()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty() && *value != ".")
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{}_{}", chrom, pos)),
         ref_allele: ref_c.to_string(),
         alt_allele: alt_c.to_string(),
     };

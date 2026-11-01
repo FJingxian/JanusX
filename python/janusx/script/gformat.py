@@ -14,7 +14,7 @@ Supported outputs
 -----------------
 - `-fmt plink` : PLINK bed/bim/fam
 - `-fmt vcf`   : bgzipped VCF
-- `-fmt hmp`   : HapMap text (.hmp)
+- `-fmt hmp`   : gzipped HapMap text (.hmp.gz)
 - `-fmt txt`   : `prefix.txt` + `prefix.id` + `prefix.site`
 - `-fmt npy`   : `prefix.npy` + `prefix.id` + `prefix.site`
 - `-fmt kfile` : `prefix.bsite` + `prefix.idv` + `prefix.bim` + `prefix.meta.json`
@@ -66,7 +66,7 @@ from janusx.janusx import (
     count_hmp_snps,
 )
 from ._common.outprefix import apply_output_prefix_compat
-from janusx.gfreader.gfreader import _resolve_input
+from janusx.gfreader.gfreader import _is_pgen_prefix, _resolve_input
 
 try:
     from janusx.janusx import bed_packed_ld_prune_maf_priority as _bed_packed_ld_prune_maf_priority
@@ -481,10 +481,18 @@ def _read_keep_samples(path: str) -> list[str]:
 
 def _select_keep_samples_from_fam(prefix: str, keep_file: str) -> list[str]:
     """
-    Build keep-sample IDs in FAM order (PLINK-compatible ordering).
+    Build keep-sample IDs in FAM/PSAM order (PLINK-compatible ordering).
     """
     keep_list = _read_keep_samples(str(keep_file))
     keep_set = set(keep_list)
+    if _is_pgen_prefix(str(prefix)):
+        sample_ids, _ = inspect_genotype_file(str(prefix))
+        out = [str(sid) for sid in sample_ids if str(sid) in keep_set]
+        if not out:
+            miss_preview = ", ".join(keep_list[:10])
+            raise ValueError(f"--keep selected 0 samples. Missing examples: {miss_preview}")
+        return out
+
     out: list[str] = []
     fam_path = f"{str(prefix)}.fam"
     with open(fam_path, "r", encoding="utf-8", errors="replace") as f:
@@ -723,8 +731,12 @@ def _resolve_prune_mask_mmap_window_mb() -> int | None:
 
 def _inspect_plink_prefix_light(prefix: str) -> tuple[list[str], int]:
     p = str(prefix)
-    if p.lower().endswith((".bed", ".bim", ".fam")):
+    if p.lower().endswith((".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam")):
         p = str(Path(p).with_suffix(""))
+    if _is_pgen_prefix(p):
+        sample_ids, n_sites = inspect_genotype_file(p)
+        return [str(sid) for sid in sample_ids], int(n_sites)
+
     fam_path = f"{p}.fam"
     bim_path = f"{p}.bim"
 
@@ -1217,7 +1229,7 @@ def _resolve_output_target(args) -> tuple[str, str, str]:
     if fmt == "vcf":
         return fmt, base, f"{base}.vcf.gz"
     if fmt == "hmp":
-        return fmt, base, f"{base}.hmp"
+        return fmt, base, f"{base}.hmp.gz"
     if fmt == "txt":
         return fmt, base, f"{base}.txt"
     if fmt == "npy":
@@ -2397,7 +2409,7 @@ def build_parser() -> CliArgumentParser:
         dest="format",
         choices=["plink", "vcf", "hmp", "txt", "npy", "kfile"],
         default="plink",
-        help="Output genotype format: plink, vcf, hmp, txt, npy, kfile (default: plink).",
+        help="Output genotype format: plink, vcf, hmp (.hmp.gz), txt, npy, kfile (default: plink).",
     )
     add_common_out_arg(opt, default=".", help_profile="converted_results")
     add_common_prefix_arg(opt, default=None, help_profile="input_basename")
@@ -2656,6 +2668,9 @@ def main() -> None:
         )
 
     source_kind, _source_prefix, source_path = _resolve_input(gfile)
+    source_is_pgen = bool(
+        source_kind == "plink" and _is_pgen_prefix(str(_source_prefix))
+    )
     use_direct_no_cache = bool(source_kind in {"vcf", "hmp", "txt"})
     txt_matrix_path: str | None = None
     txt_id_path: str | None = None
@@ -2722,6 +2737,7 @@ def main() -> None:
     if (
         prune_spec is None
         and source_kind == "plink"
+        and (not source_is_pgen)
         and out_fmt == "plink"
         and (not bool(args.snps_only))
         and (not bool(args.biallelic_only))
@@ -2888,7 +2904,7 @@ def main() -> None:
                 _ = (txt_matrix_path, txt_id_path, txt_site_path)
                 sample_ids, n_sites = inspect_genotype_file(gfile)
             elif source_kind == "plink":
-                sample_ids, n_sites = _inspect_plink_prefix_light(str(gfile))
+                sample_ids, n_sites = _inspect_plink_prefix_light(str(_source_prefix))
             else:
                 sample_ids, n_sites = inspect_genotype_file(gfile)
         except Exception:
@@ -2922,6 +2938,7 @@ def main() -> None:
     use_rust_convert_direct = bool(
         _rust_convert_fastpath_enabled()
         and prune_spec is None
+        and (not source_is_pgen)
         and source_kind in {"plink", "vcf", "hmp"}
         and out_fmt in {"plink", "vcf", "hmp"}
         and push_snp_sites is None
@@ -3155,6 +3172,7 @@ def main() -> None:
         )
         use_packed_prune_fastpath = bool(
             source_kind == "plink"
+            and (not source_is_pgen)
             and _bed_packed_ld_prune_maf_priority is not None
             and keep_sample_ids is None
             and push_snp_sites is None
@@ -3167,6 +3185,7 @@ def main() -> None:
         )
         use_selected_stream_prune_direct = bool(
             source_kind == "plink"
+            and (not source_is_pgen)
             and out_fmt == "plink"
             and keep_sample_ids is None
             and has_prune_prefilters
@@ -3175,6 +3194,7 @@ def main() -> None:
         )
         use_masked_stream_prune_direct = bool(
             source_kind == "plink"
+            and (not source_is_pgen)
             and out_fmt == "plink"
             and keep_sample_ids is None
             and has_prune_prefilters
@@ -3199,6 +3219,7 @@ def main() -> None:
         )
         use_rust_prune_filtered_direct = bool(
             source_kind == "plink"
+            and (not source_is_pgen)
             and out_fmt == "plink"
             and has_prune_prefilters
             and (not bool(site_type_snps_only))

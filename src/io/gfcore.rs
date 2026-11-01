@@ -3983,7 +3983,12 @@ impl HmpSnpIter {
                 row.push(g);
             }
 
-            let snp = format!("{}_{}", chrom, pos);
+            let snp = parts
+                .first()
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty() && *value != ".")
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("{}_{}", chrom, pos));
             let site = SiteInfo {
                 chrom,
                 pos,

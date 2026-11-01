@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::bedmath::packed_byte_lut;
 use crate::bincore::parse_bin01_header as parse_bin01_header_ctx;
@@ -113,16 +114,65 @@ pub struct BimChunkReader {
     path: PathBuf,
     reader: BufReader<File>,
     next_row: usize,
+    pvar_columns: Option<Vec<String>>,
 }
 
 impl BimChunkReader {
     pub fn open(prefix: &str) -> Result<Self, String> {
-        let path = PathBuf::from(format!("{prefix}.bim"));
+        let pgen_source = genotype_prefix_uses_pgen(prefix);
+        let prefix = normalize_genotype_prefix(prefix);
+        let path = if pgen_source {
+            PathBuf::from(format!("{prefix}.pvar"))
+        } else {
+            PathBuf::from(format!("{prefix}.bim"))
+        };
         let file = File::open(&path).map_err(|e| e.to_string())?;
+        let mut reader = BufReader::new(file);
+        let pvar_columns = if pgen_source {
+            Some({
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    if reader
+                        .read_line(&mut line)
+                        .map_err(|e| format!("{}: {e}", path.display()))?
+                        == 0
+                    {
+                        return Err(format!("{}: missing #CHROM PVAR header", path.display()));
+                    }
+                    let trimmed = line.trim();
+                    if trimmed.starts_with("##") || trimmed.is_empty() {
+                        continue;
+                    }
+                    if trimmed.starts_with('#') {
+                        let columns = trimmed
+                            .split_whitespace()
+                            .map(|field| field.trim_start_matches('#').to_ascii_uppercase())
+                            .collect::<Vec<_>>();
+                        for required in ["CHROM", "POS", "ID", "REF", "ALT"] {
+                            if !columns.iter().any(|field| field == required) {
+                                return Err(format!(
+                                    "{}: PVAR header is missing {required}",
+                                    path.display()
+                                ));
+                            }
+                        }
+                        break columns;
+                    }
+                    return Err(format!(
+                        "{}: PVAR data appears before #CHROM header",
+                        path.display()
+                    ));
+                }
+            })
+        } else {
+            None
+        };
         Ok(Self {
             path,
-            reader: BufReader::new(file),
+            reader,
             next_row: 0usize,
+            pvar_columns,
         })
     }
 
@@ -211,10 +261,13 @@ impl BimChunkReader {
                 )
             })?;
             let line = line.trim_end();
-            if selected {
-                sites.push(parse_bim_line(&self.path, row_idx + 1, line)?);
+            let site = if let Some(columns) = self.pvar_columns.as_deref() {
+                parse_pvar_line(&self.path, row_idx + 1, line, columns)?
             } else {
-                validate_bim_line_shape(&self.path, row_idx + 1, line)?;
+                parse_bim_line(&self.path, row_idx + 1, line)?
+            };
+            if selected {
+                sites.push(site);
             }
         }
         Ok(sites)
@@ -263,48 +316,75 @@ impl BimChunkReader {
     }
 
     pub fn ensure_exhausted(&mut self, expected_rows: usize) -> Result<(), String> {
-        let mut line = String::new();
-        let bytes = self
-            .reader
-            .read_line(&mut line)
-            .map_err(|e| format!("{}:{}: {}", self.path.display(), self.next_row + 1, e))?;
-        if bytes == 0 {
-            return Ok(());
+        if self.read_next_line()?.is_none() {
+            Ok(())
+        } else {
+            Err(format!(
+                "site count exceeds genotype variant count: expected {expected_rows}, saw extra row {} in {}",
+                self.next_row,
+                self.path.display()
+            ))
         }
-        Err(format!(
-            "BIM site count exceeds BED SNP count: expected {expected_rows}, saw extra row {} in {}",
-            self.next_row + 1,
-            self.path.display()
-        ))
     }
 
     fn read_next_line(&mut self) -> Result<Option<(usize, String)>, String> {
-        let mut line = String::new();
-        let line_no = self.next_row + 1;
-        let bytes = self
-            .reader
-            .read_line(&mut line)
-            .map_err(|e| format!("{}:{}: {}", self.path.display(), line_no, e))?;
-        if bytes == 0 {
-            return Ok(None);
+        loop {
+            let mut line = String::new();
+            let line_no = self.next_row + 1;
+            let bytes = self
+                .reader
+                .read_line(&mut line)
+                .map_err(|e| format!("{}:{}: {}", self.path.display(), line_no, e))?;
+            if bytes == 0 {
+                return Ok(None);
+            }
+            if self.pvar_columns.is_some()
+                && (line.trim().is_empty() || line.trim_start().starts_with('#'))
+            {
+                continue;
+            }
+            let row_idx = self.next_row;
+            self.next_row = self.next_row.saturating_add(1);
+            return Ok(Some((row_idx, line)));
         }
-        let row_idx = self.next_row;
-        self.next_row = self.next_row.saturating_add(1);
-        Ok(Some((row_idx, line)))
     }
 
     fn read_next_site(&mut self) -> Result<Option<SiteInfo>, String> {
         let Some((row_idx, line)) = self.read_next_line()? else {
             return Ok(None);
         };
-        parse_bim_line(&self.path, row_idx + 1, line.trim_end()).map(Some)
+        if let Some(columns) = self.pvar_columns.as_deref() {
+            parse_pvar_line(&self.path, row_idx + 1, line.trim_end(), columns).map(Some)
+        } else {
+            parse_bim_line(&self.path, row_idx + 1, line.trim_end()).map(Some)
+        }
     }
 }
 
 // ---------------------------
 // PLINK helpers
 // ---------------------------
+fn normalize_genotype_prefix(path_or_prefix: &str) -> String {
+    let mut prefix = path_or_prefix.trim().to_string();
+    let lower = prefix.to_ascii_lowercase();
+    for suffix in [".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"] {
+        if lower.ends_with(suffix) {
+            prefix.truncate(prefix.len().saturating_sub(suffix.len()));
+            break;
+        }
+    }
+    prefix
+}
+
+fn genotype_prefix_uses_pgen(path_or_prefix: &str) -> bool {
+    crate::pgen::path_uses_pgen(path_or_prefix)
+}
+
 pub fn read_fam(prefix: &str) -> Result<Vec<String>, String> {
+    if genotype_prefix_uses_pgen(prefix) {
+        return crate::pgen::read_psam_iids(prefix);
+    }
+    let prefix = normalize_genotype_prefix(prefix);
     let fam_path = format!("{prefix}.fam");
     let file = File::open(&fam_path).map_err(|e| e.to_string())?;
     let reader = BufReader::new(file);
@@ -327,6 +407,56 @@ pub fn read_fam(prefix: &str) -> Result<Vec<String>, String> {
 ///
 /// A sample is a founder when both parental IDs are missing in the FAM file.
 pub fn read_fam_founder_indices(prefix: &str) -> Result<Vec<usize>, String> {
+    if genotype_prefix_uses_pgen(prefix) {
+        let pgen_prefix = normalize_genotype_prefix(prefix);
+        let psam_path = format!("{pgen_prefix}.psam");
+        let file = File::open(&psam_path).map_err(|e| format!("{psam_path}: {e}"))?;
+        let reader = BufReader::new(file);
+        let mut header: Option<Vec<String>> = None;
+        let mut founder_indices = Vec::new();
+        let mut sample_idx = 0usize;
+        for (line_idx, line) in reader.lines().enumerate() {
+            let line = line.map_err(|e| format!("{psam_path}:{}: {e}", line_idx + 1))?;
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with("##") {
+                continue;
+            }
+            let fields = trimmed.split_whitespace().collect::<Vec<_>>();
+            if trimmed.starts_with('#') {
+                header = Some(
+                    fields
+                        .iter()
+                        .map(|field| field.trim_start_matches('#').to_ascii_uppercase())
+                        .collect(),
+                );
+                continue;
+            }
+            let (father_idx, mother_idx) = if let Some(columns) = header.as_ref() {
+                let father = columns.iter().position(|col| col == "PAT");
+                let mother = columns.iter().position(|col| col == "MAT");
+                (father, mother)
+            } else if fields.len() >= 4 {
+                (Some(2), Some(3))
+            } else {
+                (None, None)
+            };
+            let founder = match (father_idx, mother_idx) {
+                (Some(father), Some(mother)) => {
+                    fields.get(father).is_some_and(|value| *value == "0")
+                        && fields.get(mother).is_some_and(|value| *value == "0")
+                }
+                _ => true,
+            };
+            if founder {
+                founder_indices.push(sample_idx);
+            }
+            sample_idx = sample_idx.saturating_add(1);
+        }
+        if sample_idx == 0 {
+            return Err(format!("PSAM contains zero samples: {psam_path}"));
+        }
+        return Ok(founder_indices);
+    }
     let fam_path = format!("{prefix}.fam");
     let file = File::open(&fam_path).map_err(|e| format!("{fam_path}: {e}"))?;
     let reader = BufReader::new(file);
@@ -360,6 +490,10 @@ pub fn read_fam_founder_indices(prefix: &str) -> Result<Vec<usize>, String> {
 
 #[inline]
 fn count_fam_samples(prefix: &str) -> Result<usize, String> {
+    if genotype_prefix_uses_pgen(prefix) {
+        return crate::pgen::count_psam_samples(prefix);
+    }
+    let prefix = normalize_genotype_prefix(prefix);
     let fam_path = format!("{prefix}.fam");
     let file = File::open(&fam_path).map_err(|e| e.to_string())?;
     let reader = BufReader::new(file);
@@ -378,6 +512,21 @@ fn count_fam_samples(prefix: &str) -> Result<usize, String> {
 }
 
 pub fn read_bim(prefix: &str) -> Result<Vec<SiteInfo>, String> {
+    if genotype_prefix_uses_pgen(prefix) {
+        return crate::pgen::read_pvar_sites(prefix).map(|sites| {
+            sites
+                .into_iter()
+                .map(|site| SiteInfo {
+                    chrom: site.chrom,
+                    pos: site.pos,
+                    snp: site.id,
+                    ref_allele: site.ref_allele,
+                    alt_allele: site.alt_allele,
+                })
+                .collect()
+        });
+    }
+    let prefix = normalize_genotype_prefix(prefix);
     let bim_path = PathBuf::from(format!("{prefix}.bim"));
     read_bim_file(&bim_path)
 }
@@ -386,6 +535,37 @@ pub fn read_bim_columns(
     prefix: &str,
     row_indices: Option<&[usize]>,
 ) -> Result<(Vec<String>, Vec<i32>, Vec<String>, Vec<String>, Vec<String>), String> {
+    if genotype_prefix_uses_pgen(prefix) {
+        let sites = read_bim(prefix)?;
+        let selected: Vec<SiteInfo> = if let Some(rows) = row_indices {
+            let mut selected = Vec::with_capacity(rows.len());
+            for &idx in rows {
+                selected.push(sites.get(idx).cloned().ok_or_else(|| {
+                    format!(
+                        "PVAR row index {idx} is out of range ({} variants)",
+                        sites.len()
+                    )
+                })?);
+            }
+            selected
+        } else {
+            sites
+        };
+        return Ok((
+            selected.iter().map(|site| site.chrom.clone()).collect(),
+            selected.iter().map(|site| site.pos).collect(),
+            selected.iter().map(|site| site.snp.clone()).collect(),
+            selected
+                .iter()
+                .map(|site| site.ref_allele.clone())
+                .collect(),
+            selected
+                .iter()
+                .map(|site| site.alt_allele.clone())
+                .collect(),
+        ));
+    }
+    let prefix = normalize_genotype_prefix(prefix);
     let bim_path = PathBuf::from(format!("{prefix}.bim"));
     read_bim_columns_file(&bim_path, row_indices)
 }
@@ -1513,16 +1693,48 @@ fn parse_bim_line(path: &Path, line_no: usize, line: &str) -> Result<SiteInfo, S
 }
 
 #[inline]
-fn validate_bim_line_shape(path: &Path, line_no: usize, line: &str) -> Result<(), String> {
-    let mut cols = line.split_whitespace();
-    if (0..6).any(|_| cols.next().is_none()) {
+fn parse_pvar_line(
+    path: &Path,
+    line_no: usize,
+    line: &str,
+    columns: &[String],
+) -> Result<SiteInfo, String> {
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    let field = |name: &str| -> Result<&str, String> {
+        let idx = columns
+            .iter()
+            .position(|column| column == name)
+            .ok_or_else(|| format!("{}: PVAR header is missing {name}", path.display()))?;
+        fields.get(idx).copied().ok_or_else(|| {
+            format!(
+                "Malformed PVAR line at {}:{}: {line}",
+                path.display(),
+                line_no
+            )
+        })
+    };
+    let alt = field("ALT")?;
+    if alt == "." || alt.contains(',') {
         return Err(format!(
-            "Malformed BIM line at {}:{}: {line}",
+            "{}:{}: only biallelic PGEN variants are supported; ALT={alt}",
             path.display(),
             line_no
         ));
     }
-    Ok(())
+    let pos = field("POS")?.parse::<i32>().map_err(|e| {
+        format!(
+            "{}:{}: invalid PVAR POS value: {e}",
+            path.display(),
+            line_no
+        )
+    })?;
+    Ok(SiteInfo {
+        chrom: field("CHROM")?.to_string(),
+        pos,
+        snp: field("ID")?.to_string(),
+        ref_allele: field("REF")?.to_string(),
+        alt_allele: alt.to_string(),
+    })
 }
 
 fn read_bim_columns_file(
@@ -1960,6 +2172,11 @@ pub struct BedSnpIter {
     pread_buffer: Vec<u8>,
     bed_len: usize,
     bed_file: Option<File>,
+    pgen_source: Option<Arc<Mutex<PgenIterSource>>>,
+    pgen_window: Vec<u8>,
+    pgen_window_start: usize,
+    pgen_window_rows: usize,
+    pgen_window_max_rows: usize,
     n_samples: usize,
     n_snps: usize,
     bytes_per_snp: usize,
@@ -1976,6 +2193,76 @@ pub struct BedSnpIter {
     het_threshold: f32,
 }
 
+const PGEN_ITER_PACKED_WINDOW_TARGET_BYTES: usize = 16 * 1024 * 1024;
+const PGEN_ITER_PACKED_WINDOW_MAX_ROWS: usize = 1 << 15;
+
+#[inline]
+fn pgen_iter_packed_window_rows(bytes_per_variant: usize, n_variants: usize) -> usize {
+    if bytes_per_variant == 0 || n_variants == 0 {
+        return 0;
+    }
+    (PGEN_ITER_PACKED_WINDOW_TARGET_BYTES / bytes_per_variant)
+        .max(1)
+        .min(PGEN_ITER_PACKED_WINDOW_MAX_ROWS)
+        .min(n_variants)
+}
+
+pub(crate) struct PgenIterSource {
+    reader: crate::pgen::PgenReader,
+    cached_source_row: Option<usize>,
+    packed_row: Vec<u8>,
+}
+
+pub(crate) enum PackedRowBytes<'a> {
+    Bed(&'a [u8]),
+    PgenWindow(&'a [u8]),
+    Pgen(MutexGuard<'a, PgenIterSource>),
+}
+
+impl std::ops::Deref for PackedRowBytes<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Bed(bytes) => bytes,
+            Self::PgenWindow(bytes) => bytes,
+            Self::Pgen(source) => source.packed_row.as_slice(),
+        }
+    }
+}
+
+impl AsRef<[u8]> for PackedRowBytes<'_> {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+fn open_pgen_iter_source(
+    path_or_prefix: &str,
+    n_samples: usize,
+) -> Result<Option<(Arc<Mutex<PgenIterSource>>, usize, usize)>, String> {
+    if !genotype_prefix_uses_pgen(path_or_prefix) {
+        return Ok(None);
+    }
+    let prefix = normalize_genotype_prefix(path_or_prefix);
+    let psam_samples = crate::pgen::count_psam_samples(&prefix)?;
+    if psam_samples != n_samples {
+        return Err(format!(
+            "PGEN/PSAM sample count mismatch: expected {n_samples}, found {psam_samples}"
+        ));
+    }
+    let n_variants = crate::pgen::count_pvar_variants(&prefix)?;
+    let path = PathBuf::from(format!("{prefix}.pgen"));
+    let reader = crate::pgen::PgenReader::open(&path, n_samples, n_variants)?;
+    let bytes_per_variant = n_samples.div_ceil(4);
+    let source = Arc::new(Mutex::new(PgenIterSource {
+        reader,
+        cached_source_row: None,
+        packed_row: vec![0; bytes_per_variant],
+    }));
+    Ok(Some((source, n_variants, bytes_per_variant)))
+}
+
 #[inline]
 fn bed_code_to_dosage(code: u8) -> f32 {
     match code {
@@ -1988,6 +2275,61 @@ fn bed_code_to_dosage(code: u8) -> f32 {
 }
 
 impl BedSnpIter {
+    fn try_new_pgen(
+        prefix: &str,
+        samples: &[String],
+        sites: &[SiteInfo],
+        maf: f32,
+        miss: f32,
+        fill_missing: bool,
+        apply_het_filter: bool,
+        het_threshold: f32,
+    ) -> Result<Option<Self>, String> {
+        let n_samples = if samples.is_empty() {
+            count_fam_samples(prefix)?
+        } else {
+            samples.len()
+        };
+        let Some((pgen_source, n_snps, bytes_per_snp)) = open_pgen_iter_source(prefix, n_samples)?
+        else {
+            return Ok(None);
+        };
+        if !sites.is_empty() && n_snps != sites.len() {
+            return Err(format!(
+                "PGEN/PVAR variant count mismatch: pgen={n_snps}, pvar={}",
+                sites.len()
+            ));
+        }
+        Ok(Some(Self {
+            prefix: normalize_genotype_prefix(prefix),
+            samples: samples.to_vec(),
+            sites: sites.to_vec(),
+            mmap: None,
+            mmap_offset: 0,
+            window_snps: None,
+            window_start_snp: 0,
+            window_len_snps: n_snps,
+            pread: false,
+            pread_buffer: Vec::new(),
+            bed_len: 0,
+            bed_file: None,
+            pgen_source: Some(pgen_source),
+            pgen_window: Vec::new(),
+            pgen_window_start: 0,
+            pgen_window_rows: 0,
+            pgen_window_max_rows: pgen_iter_packed_window_rows(bytes_per_snp, n_snps),
+            n_samples,
+            n_snps,
+            bytes_per_snp,
+            cur: 0,
+            maf,
+            miss,
+            fill_missing,
+            apply_het_filter,
+            het_threshold,
+        }))
+    }
+
     #[inline]
     fn open_bed_and_infer_shape(
         prefix: &str,
@@ -2031,6 +2373,18 @@ impl BedSnpIter {
     ) -> Result<Self, String> {
         let samples = read_fam(prefix)?;
         let sites = read_bim(prefix)?;
+        if let Some(iter) = Self::try_new_pgen(
+            prefix,
+            &samples,
+            &sites,
+            maf,
+            miss,
+            fill_missing,
+            apply_het_filter,
+            het_threshold,
+        )? {
+            return Ok(iter);
+        }
         let n_samples = samples.len();
         let (file, bed_len, bytes_per_snp, n_snps) =
             Self::open_bed_and_infer_shape(prefix, n_samples)?;
@@ -2055,6 +2409,11 @@ impl BedSnpIter {
             pread_buffer: Vec::new(),
             bed_len,
             bed_file: None,
+            pgen_source: None,
+            pgen_window: Vec::new(),
+            pgen_window_start: 0,
+            pgen_window_rows: 0,
+            pgen_window_max_rows: 0,
             n_samples,
             n_snps,
             bytes_per_snp,
@@ -2081,6 +2440,18 @@ impl BedSnpIter {
         }
         let samples = read_fam(prefix)?;
         let sites = read_bim(prefix)?;
+        if let Some(iter) = Self::try_new_pgen(
+            prefix,
+            &samples,
+            &sites,
+            maf,
+            miss,
+            fill_missing,
+            apply_het_filter,
+            het_threshold,
+        )? {
+            return Ok(iter);
+        }
         let n_samples = samples.len();
         let (file, bed_len, bytes_per_snp, n_snps) =
             Self::open_bed_and_infer_shape(prefix, n_samples)?;
@@ -2108,6 +2479,11 @@ impl BedSnpIter {
             pread_buffer: Vec::new(),
             bed_len,
             bed_file: Some(file),
+            pgen_source: None,
+            pgen_window: Vec::new(),
+            pgen_window_start: 0,
+            pgen_window_rows: 0,
+            pgen_window_max_rows: 0,
             n_samples,
             n_snps,
             bytes_per_snp,
@@ -2135,6 +2511,18 @@ impl BedSnpIter {
         }
         let samples = read_fam(prefix)?;
         let sites = read_bim(prefix)?;
+        if let Some(iter) = Self::try_new_pgen(
+            prefix,
+            &samples,
+            &sites,
+            maf,
+            miss,
+            fill_missing,
+            apply_het_filter,
+            het_threshold,
+        )? {
+            return Ok(iter);
+        }
         let n_samples = samples.len();
         let (file, bed_len, bytes_per_snp, n_snps) =
             Self::open_bed_and_infer_shape(prefix, n_samples)?;
@@ -2160,6 +2548,11 @@ impl BedSnpIter {
             pread_buffer: Vec::new(),
             bed_len,
             bed_file: Some(file),
+            pgen_source: None,
+            pgen_window: Vec::new(),
+            pgen_window_start: 0,
+            pgen_window_rows: 0,
+            pgen_window_max_rows: 0,
             n_samples,
             n_snps,
             bytes_per_snp,
@@ -2176,6 +2569,9 @@ impl BedSnpIter {
     /// parses FAM count and BED shape, skips full BIM metadata parse.
     pub fn new_for_grm(prefix: &str) -> Result<Self, String> {
         let n_samples = count_fam_samples(prefix)?;
+        if let Some(iter) = Self::try_new_pgen(prefix, &[], &[], 0.0, 1.0, false, false, 0.02)? {
+            return Ok(iter);
+        }
         let (file, bed_len, bytes_per_snp, n_snps) =
             Self::open_bed_and_infer_shape(prefix, n_samples)?;
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
@@ -2192,6 +2588,11 @@ impl BedSnpIter {
             pread_buffer: Vec::new(),
             bed_len,
             bed_file: None,
+            pgen_source: None,
+            pgen_window: Vec::new(),
+            pgen_window_start: 0,
+            pgen_window_rows: 0,
+            pgen_window_max_rows: 0,
             n_samples,
             n_snps,
             bytes_per_snp,
@@ -2211,6 +2612,9 @@ impl BedSnpIter {
             return Err("mmap_window_mb must be > 0".into());
         }
         let n_samples = count_fam_samples(prefix)?;
+        if let Some(iter) = Self::try_new_pgen(prefix, &[], &[], 0.0, 1.0, false, false, 0.02)? {
+            return Ok(iter);
+        }
         let (file, bed_len, bytes_per_snp, n_snps) =
             Self::open_bed_and_infer_shape(prefix, n_samples)?;
         let window_bytes = mmap_window_mb.saturating_mul(1024 * 1024);
@@ -2230,6 +2634,11 @@ impl BedSnpIter {
             pread_buffer: Vec::new(),
             bed_len,
             bed_file: Some(file),
+            pgen_source: None,
+            pgen_window: Vec::new(),
+            pgen_window_start: 0,
+            pgen_window_rows: 0,
+            pgen_window_max_rows: 0,
             n_samples,
             n_snps,
             bytes_per_snp,
@@ -2320,7 +2729,7 @@ impl BedSnpIter {
         Ok(())
     }
 
-    fn snp_bytes(&self, snp_idx: usize) -> Option<&[u8]> {
+    fn bed_snp_bytes(&self, snp_idx: usize) -> Option<&[u8]> {
         let offset = BED_HEADER_LEN + snp_idx * self.bytes_per_snp;
         if let Some(_window_snps) = self.window_snps {
             let window_end = self.window_start_snp + self.window_len_snps;
@@ -2339,6 +2748,34 @@ impl BedSnpIter {
             return None;
         }
         Some(&data[rel..end])
+    }
+
+    fn snp_bytes(&self, snp_idx: usize) -> Option<PackedRowBytes<'_>> {
+        if let Some(pgen_source) = self.pgen_source.as_ref() {
+            let window_end = self.pgen_window_start.saturating_add(self.pgen_window_rows);
+            if snp_idx >= self.pgen_window_start && snp_idx < window_end {
+                let row_start =
+                    (snp_idx - self.pgen_window_start).checked_mul(self.bytes_per_snp)?;
+                let row_end = row_start.checked_add(self.bytes_per_snp)?;
+                return self
+                    .pgen_window
+                    .get(row_start..row_end)
+                    .map(PackedRowBytes::PgenWindow);
+            }
+            let mut source = pgen_source.lock().ok()?;
+            if source.cached_source_row != Some(snp_idx) {
+                let PgenIterSource {
+                    reader,
+                    packed_row,
+                    cached_source_row,
+                } = &mut *source;
+                reader.read_source_block(snp_idx, 1, packed_row).ok()?;
+                *cached_source_row = Some(snp_idx);
+            }
+            Some(PackedRowBytes::Pgen(source))
+        } else {
+            self.bed_snp_bytes(snp_idx).map(PackedRowBytes::Bed)
+        }
     }
 
     #[inline]
@@ -2553,7 +2990,7 @@ impl BedSnpIter {
             return None;
         }
         let snp_bytes = self.snp_bytes(snp_idx)?;
-        Some(self.decode_snp_bytes_counts_only(snp_bytes))
+        Some(self.decode_snp_bytes_counts_only(&snp_bytes))
     }
 
     pub fn decode_snp_pure_line_counts_only_at(
@@ -2564,7 +3001,7 @@ impl BedSnpIter {
             return None;
         }
         let snp_bytes = self.snp_bytes(snp_idx)?;
-        Some(self.decode_snp_bytes_pure_line_counts_only(snp_bytes))
+        Some(self.decode_snp_bytes_pure_line_counts_only(&snp_bytes))
     }
 
     pub fn decode_snp_selected_counts_only_at(
@@ -2578,7 +3015,7 @@ impl BedSnpIter {
         }
         let snp_bytes = self.snp_bytes(snp_idx)?;
         Some(self.decode_snp_bytes_selected_counts_only_with_excluded(
-            snp_bytes,
+            &snp_bytes,
             sample_indices,
             excluded_sample_indices,
         ))
@@ -2596,7 +3033,7 @@ impl BedSnpIter {
             return None;
         }
         let snp_bytes = self.snp_bytes(snp_idx)?;
-        Some(self.decode_snp_bytes_into_with_stats(snp_bytes, out))
+        Some(self.decode_snp_bytes_into_with_stats(&snp_bytes, out))
     }
 
     fn decode_snp_row_raw(&self, snp_idx: usize) -> Option<(Vec<f32>, SiteInfo)> {
@@ -2706,6 +3143,102 @@ impl BedSnpIter {
         self.window_snps.is_some()
     }
 
+    #[inline]
+    pub fn is_pgen_source(&self) -> bool {
+        self.pgen_source.is_some()
+    }
+
+    /// Decode the next sequential PGEN block directly into row-major f32
+    /// dosages. This bypasses the intermediate BED-compatible packed row.
+    pub fn read_next_pgen_block_f32(
+        &mut self,
+        requested_rows: usize,
+        out: &mut [f32],
+    ) -> Result<usize, String> {
+        let Some(pgen_source) = self.pgen_source.as_ref() else {
+            return Err("direct PGEN dosage reads require a PGEN source".to_string());
+        };
+        let rows = requested_rows.min(self.n_snps.saturating_sub(self.cur));
+        let required_values = rows
+            .checked_mul(self.n_samples)
+            .ok_or_else(|| "PGEN dosage block size overflow".to_string())?;
+        if out.len() < required_values {
+            return Err(format!(
+                "PGEN dosage destination is too small: got {}, need {required_values}",
+                out.len()
+            ));
+        }
+        if rows == 0 {
+            return Ok(0);
+        }
+
+        let source_start = self.cur;
+        let mut source = pgen_source
+            .lock()
+            .map_err(|_| "PGEN iterator reader lock was poisoned".to_string())?;
+        let PgenIterSource {
+            reader,
+            cached_source_row,
+            ..
+        } = &mut *source;
+        let rows_read =
+            reader.read_source_block_f32(source_start, rows, &mut out[..required_values])?;
+        if rows_read != rows {
+            return Err(format!(
+                "PGEN dosage reader returned {rows_read} rows; requested {rows} starting at {source_start}"
+            ));
+        }
+        *cached_source_row = None;
+        self.cur += rows;
+        Ok(rows)
+    }
+
+    /// Decode the next sequential PGEN block directly into row-major f64
+    /// dosages for consumers whose genotype workspace uses double precision.
+    #[allow(dead_code)] // Rust streaming API for future f64 consumers.
+    pub fn read_next_pgen_block_f64(
+        &mut self,
+        requested_rows: usize,
+        out: &mut [f64],
+    ) -> Result<usize, String> {
+        let Some(pgen_source) = self.pgen_source.as_ref() else {
+            return Err("direct PGEN dosage reads require a PGEN source".to_string());
+        };
+        let rows = requested_rows.min(self.n_snps.saturating_sub(self.cur));
+        let required_values = rows
+            .checked_mul(self.n_samples)
+            .ok_or_else(|| "PGEN dosage block size overflow".to_string())?;
+        if out.len() < required_values {
+            return Err(format!(
+                "PGEN dosage destination is too small: got {}, need {required_values}",
+                out.len()
+            ));
+        }
+        if rows == 0 {
+            return Ok(0);
+        }
+
+        let source_start = self.cur;
+        let mut source = pgen_source
+            .lock()
+            .map_err(|_| "PGEN iterator reader lock was poisoned".to_string())?;
+        let PgenIterSource {
+            reader,
+            cached_source_row,
+            ..
+        } = &mut *source;
+        let rows_read =
+            reader.read_source_block_f64(source_start, rows, &mut out[..required_values])?;
+        if rows_read != rows {
+            return Err(format!(
+                "PGEN dosage reader returned {rows_read} rows; requested {rows} starting at {source_start}"
+            ));
+        }
+        *cached_source_row = None;
+        self.cur += rows;
+        Ok(rows)
+    }
+
     /// Keep positioned-read storage bounded by the active scan chunk.
     pub fn set_pread_window_snps(&mut self, max_rows: usize) {
         if !self.pread || max_rows == 0 {
@@ -2720,6 +3253,41 @@ impl BedSnpIter {
         if snp_idx >= self.n_snps {
             return Err("SNP index out of range".to_string());
         }
+        if let Some(pgen_source) = self.pgen_source.as_ref() {
+            let cached_end = self.pgen_window_start.saturating_add(self.pgen_window_rows);
+            if snp_idx >= self.pgen_window_start && snp_idx < cached_end {
+                return Ok(());
+            }
+            let rows_per_window = self.pgen_window_max_rows.max(1);
+            let window_start = (snp_idx / rows_per_window) * rows_per_window;
+            let window_rows = (self.n_snps - window_start).min(rows_per_window);
+            let output_len = window_rows
+                .checked_mul(self.bytes_per_snp)
+                .ok_or_else(|| "PGEN packed window size overflow".to_string())?;
+            self.pgen_window.resize(output_len, 0);
+            let mut source = pgen_source
+                .lock()
+                .map_err(|_| "PGEN iterator reader lock was poisoned".to_string())?;
+            let PgenIterSource {
+                reader,
+                cached_source_row,
+                ..
+            } = &mut *source;
+            let rows_read = reader.read_source_block(
+                window_start,
+                window_rows,
+                self.pgen_window.as_mut_slice(),
+            )?;
+            if rows_read != window_rows {
+                return Err(format!(
+                    "PGEN packed window reader returned {rows_read} rows; requested {window_rows} starting at {window_start}"
+                ));
+            }
+            *cached_source_row = None;
+            self.pgen_window_start = window_start;
+            self.pgen_window_rows = window_rows;
+            return Ok(());
+        }
         if self.window_snps.is_some() {
             let window_end = self.window_start_snp + self.window_len_snps;
             if snp_idx < self.window_start_snp || snp_idx >= window_end {
@@ -2732,6 +3300,13 @@ impl BedSnpIter {
     pub fn mapped_contiguous_snps_from(&self, snp_idx: usize) -> usize {
         if snp_idx >= self.n_snps {
             return 0;
+        }
+        if self.pgen_source.is_some() {
+            let window_end = self.pgen_window_start.saturating_add(self.pgen_window_rows);
+            if snp_idx >= self.pgen_window_start && snp_idx < window_end {
+                return window_end.saturating_sub(snp_idx);
+            }
+            return 1;
         }
         if self.window_snps.is_some() {
             let window_end = self.window_start_snp + self.window_len_snps;
@@ -2746,7 +3321,7 @@ impl BedSnpIter {
     }
 
     #[inline]
-    pub fn packed_snp_bytes_at(&self, snp_idx: usize) -> Option<&[u8]> {
+    pub(crate) fn packed_snp_bytes_at(&self, snp_idx: usize) -> Option<PackedRowBytes<'_>> {
         if snp_idx >= self.n_snps {
             return None;
         }
@@ -2785,7 +3360,7 @@ impl BedSnpIter {
                 None => return None,
             };
 
-            let (alt_sum, non_missing) = self.decode_snp_bytes_into_with_stats(snp_bytes, out);
+            let (alt_sum, non_missing) = self.decode_snp_bytes_into_with_stats(&snp_bytes, out);
             return Some((snp_idx, alt_sum, non_missing));
         }
         None
@@ -2815,7 +3390,7 @@ impl BedSnpIter {
                 Some(bytes) => bytes,
                 None => return None,
             };
-            let counts = self.decode_snp_bytes_into_with_counts(snp_bytes, out);
+            let counts = self.decode_snp_bytes_into_with_counts(&snp_bytes, out);
             let site = self.sites[snp_idx].clone();
             return Some((snp_idx, site, counts));
         }
@@ -2851,7 +3426,7 @@ impl BedSnpIter {
                 None => return None,
             };
             let counts =
-                self.decode_snp_bytes_selected_into_with_counts(snp_bytes, sample_indices, out);
+                self.decode_snp_bytes_selected_into_with_counts(&snp_bytes, sample_indices, out);
             let site = self.sites[snp_idx].clone();
             return Some((snp_idx, site, counts));
         }
@@ -2879,7 +3454,7 @@ impl BedSnpIter {
                 None => return None,
             };
 
-            let (alt_sum, non_missing) = self.decode_snp_bytes_stats_only(snp_bytes);
+            let (alt_sum, non_missing) = self.decode_snp_bytes_stats_only(&snp_bytes);
             return Some((snp_idx, alt_sum, non_missing));
         }
         None
@@ -3673,6 +4248,80 @@ mod tests {
 
         assert!(mmap.next_snp_raw().is_none());
         assert!(pread.next_snp_raw().is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pgen_iter_reads_sequential_dosage_blocks_directly() {
+        let dir = make_temp_dir("pgen_iter_f32");
+        let prefix = dir.join("toy");
+        let mut pgen = vec![0x6c, 0x1b, 0x02];
+        pgen.extend_from_slice(&2u32.to_le_bytes());
+        pgen.extend_from_slice(&5u32.to_le_bytes());
+        pgen.push(0); // fixed hard-call storage flags
+        pgen.extend_from_slice(&[0xc4, 0x01, 0xaa, 0x02]);
+        fs::write(prefix.with_extension("pgen"), pgen).unwrap();
+        fs::write(
+            prefix.with_extension("psam"),
+            "#FID IID\nf1 s1\nf1 s2\nf1 s3\nf1 s4\nf1 s5\n",
+        )
+        .unwrap();
+        fs::write(
+            prefix.with_extension("pvar"),
+            "#CHROM POS ID REF ALT\n1 10 rs1 A G\n1 20 rs2 C T\n",
+        )
+        .unwrap();
+
+        let mut iter =
+            BedSnpIter::new_with_fill(prefix.to_str().unwrap(), 0.0, 1.0, false, false, 1.0)
+                .unwrap();
+        assert!(iter.is_pgen_source());
+        let mut values = [99.0_f32; 10];
+        assert_eq!(iter.read_next_pgen_block_f32(3, &mut values).unwrap(), 2);
+        assert_eq!(values, [0.0, 1.0, 0.0, -9.0, 1.0, 2.0, 2.0, 2.0, 2.0, 2.0]);
+        assert_eq!(iter.cursor(), 2);
+        assert_eq!(iter.read_next_pgen_block_f32(1, &mut [0.0; 5]).unwrap(), 0);
+        iter.set_cursor(0);
+        let mut values_f64 = [99.0_f64; 10];
+        assert_eq!(
+            iter.read_next_pgen_block_f64(2, &mut values_f64).unwrap(),
+            2
+        );
+        assert_eq!(
+            values_f64,
+            [0.0, 1.0, 0.0, -9.0, 1.0, 2.0, 2.0, 2.0, 2.0, 2.0]
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pgen_grm_window_batches_rows_and_preserves_packed_calls() {
+        let dir = make_temp_dir("pgen_iter_packed_window");
+        let prefix = dir.join("toy");
+        let mut pgen = vec![0x6c, 0x1b, 0x02];
+        pgen.extend_from_slice(&2u32.to_le_bytes());
+        pgen.extend_from_slice(&5u32.to_le_bytes());
+        pgen.push(0); // fixed hard-call storage flags
+        pgen.extend_from_slice(&[0xc4, 0x01, 0xaa, 0x02]);
+        fs::write(prefix.with_extension("pgen"), pgen).unwrap();
+        fs::write(
+            prefix.with_extension("psam"),
+            "#FID IID\nf1 s1\nf1 s2\nf1 s3\nf1 s4\nf1 s5\n",
+        )
+        .unwrap();
+        fs::write(
+            prefix.with_extension("pvar"),
+            "#CHROM POS ID REF ALT\n1 10 rs1 A G\n1 20 rs2 C T\n",
+        )
+        .unwrap();
+
+        let mut iter = BedSnpIter::new_for_grm_window(prefix.to_str().unwrap(), 1).unwrap();
+        assert!(iter.is_pgen_source());
+        iter.ensure_window_for_snp(0).unwrap();
+        assert_eq!(iter.mapped_contiguous_snps_from(0), 2);
+
+        assert_eq!(iter.packed_snp_bytes_at(0).unwrap().as_ref(), &[0x48, 0x02]);
+        assert_eq!(iter.packed_snp_bytes_at(1).unwrap().as_ref(), &[0xff, 0x03]);
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -133,7 +133,21 @@ def _normalize_genotype_cache_stem(genofile: str) -> str:
     elif low.endswith(".hmp.gz"):
         base = base[: -len(".hmp.gz")]
     else:
-        for ext in (".vcf", ".hmp", ".bed", ".bim", ".fam", ".txt", ".tsv", ".csv", ".npy", ".bin"):
+        for ext in (
+            ".vcf",
+            ".hmp",
+            ".bed",
+            ".bim",
+            ".fam",
+            ".pgen",
+            ".pvar",
+            ".psam",
+            ".txt",
+            ".tsv",
+            ".csv",
+            ".npy",
+            ".bin",
+        ):
             if low.endswith(ext):
                 base = base[: -len(ext)]
                 break
@@ -343,15 +357,20 @@ def latest_genotype_mtime(genofile: str) -> float | None:
     """
     Return the latest modification time of genotype input files.
 
-    - PLINK prefix: max mtime of .bed/.bim/.fam (if all exist)
+    - PLINK prefix: max mtime of .bed/.bim/.fam or .pgen/.pvar/.psam
     - FILE prefix : max mtime of matrix file, prefix.id, and optional site metadata
     - File input  : mtime of the file path itself
     """
-    bed = f"{genofile}.bed"
-    bim = f"{genofile}.bim"
-    fam = f"{genofile}.fam"
-    if all(os.path.isfile(p) for p in (bed, bim, fam)):
-        return max(os.path.getmtime(bed), os.path.getmtime(bim), os.path.getmtime(fam))
+    raw = str(genofile).strip()
+    low = raw.lower()
+    for suffix in (".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"):
+        if low.endswith(suffix):
+            raw = raw[: -len(suffix)]
+            break
+    for extensions in (("bed", "bim", "fam"), ("pgen", "pvar", "psam")):
+        paths = [f"{raw}.{ext}" for ext in extensions]
+        if all(os.path.isfile(path) for path in paths):
+            return max(os.path.getmtime(path) for path in paths)
 
     file_prefix, matrix_path = _resolve_file_input_matrix(genofile)
     if file_prefix and matrix_path:

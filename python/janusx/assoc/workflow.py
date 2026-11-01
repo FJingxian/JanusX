@@ -62,7 +62,7 @@ from dataclasses import dataclass
 from shutil import get_terminal_size
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator, Union, Optional, Callable
+from typing import Any, Iterator, Union, Optional, Callable, Sequence
 import uuid
 from contextlib import contextmanager
 
@@ -316,7 +316,7 @@ def _kinship_fused_qc_eligible(
     route_name: str,
     genetic_model: str,
     row_stat_mode: str,
-    bed_exists: bool,
+    source_available: bool,
     prepared_meta_ready: bool,
     fused_binding_available: bool,
 ) -> bool:
@@ -353,7 +353,7 @@ def _kinship_fused_qc_eligible(
         enabled
         and str(genetic_model).strip().lower() == "add"
         and str(row_stat_mode).strip().lower() == "strict-train"
-        and bool(bed_exists)
+        and bool(source_available)
         and not bool(prepared_meta_ready)
         and bool(fused_binding_available)
     )
@@ -370,6 +370,9 @@ def _packed_model_fused_qc_eligible(
     fused_binding_available: bool,
     memory_budget_mb: Union[float, None],
     snps_only: bool,
+    n_samples: Union[int, None] = None,
+    n_snps: Union[int, None] = None,
+    bimranges: Optional[Sequence[tuple[str, int, int]]] = None,
 ) -> bool:
     """Gate full packed QC loads; fused loading stays off unless explicitly enabled."""
     model_key = str(model_token).strip().lower()
@@ -396,8 +399,8 @@ def _packed_model_fused_qc_eligible(
         or str(genetic_model).strip().lower() != "add"
         or str(row_stat_mode).strip().lower() not in {"strict-train", "global"}
         or not bed_prefix
-        or not os.path.isfile(f"{str(bed_prefix)}.bed")
         or bool(packed_preload_ready)
+        or bool(bimranges)
     ):
         return False
 
@@ -405,11 +408,47 @@ def _packed_model_fused_qc_eligible(
         budget_mb = float(memory_budget_mb)
         if not np.isfinite(budget_mb) or budget_mb <= 0.0:
             return False
-        bed_bytes = max(0, int(os.path.getsize(f"{str(bed_prefix)}.bed")) - 3)
-        required_bytes = int(np.ceil(float(bed_bytes) * 1.06))
-        if bool(snps_only):
-            bim_bytes = int(os.path.getsize(f"{str(bed_prefix)}.bim"))
-            required_bytes += int(np.ceil(float(bim_bytes) * 1.5))
+        bed_path = f"{str(bed_prefix)}.bed"
+        pgen_path = f"{str(bed_prefix)}.pgen"
+        if os.path.isfile(bed_path):
+            packed_bytes = max(0, int(os.path.getsize(bed_path)) - 3)
+            required_bytes = int(np.ceil(float(packed_bytes) * 1.06))
+            if bool(snps_only):
+                bim_bytes = int(os.path.getsize(f"{str(bed_prefix)}.bim"))
+                required_bytes += int(np.ceil(float(bim_bytes) * 1.5))
+        elif (
+            os.path.isfile(pgen_path)
+            and os.path.isfile(f"{str(bed_prefix)}.pvar")
+            and os.path.isfile(f"{str(bed_prefix)}.psam")
+            and n_snps is not None
+            and int(n_snps) > 0
+        ):
+            if n_samples is None or int(n_samples) <= 0:
+                # Explicit -mem skips the early genotype inspection. In that
+                # case, count the full PGEN sample table rather than using the
+                # phenotype/GRM intersection, which can understate the packed
+                # matrix size FarmCPU will retain.
+                try:
+                    n_samples = len(_plink_fam_sample_ids(str(bed_prefix)))
+                except (OSError, TypeError, ValueError, OverflowError):
+                    return False
+            if int(n_samples) <= 0:
+                return False
+            # PGEN can be substantially smaller on disk than its decoded
+            # packed hard-call matrix. Budget against the unpacked matrix, the
+            # compact QC metadata, a decode block, and Vec growth headroom.
+            packed_bytes = ((int(n_samples) + 3) // 4) * int(n_snps)
+            pvar_mask_bytes = int(n_snps) if bool(snps_only) else 0
+            packed_metadata_bytes = 17 * int(n_snps)
+            decode_workspace_bytes = 32 * 1024 * 1024
+            required_bytes = (
+                2 * packed_bytes
+                + packed_metadata_bytes
+                + pvar_mask_bytes
+                + decode_workspace_bytes
+            )
+        else:
+            return False
         budget_bytes = budget_mb * 1024.0 * 1024.0
     except (OSError, TypeError, ValueError, OverflowError):
         return False
@@ -2132,15 +2171,20 @@ def latest_genotype_mtime(genofile: str) -> Union[float, None]:
     """
     Return the latest modification time of genotype input files.
 
-    - PLINK prefix: max mtime of .bed/.bim/.fam (if all exist)
+    - PLINK prefix: max mtime of .bed/.bim/.fam or .pgen/.pvar/.psam
     - FILE prefix : max mtime of matrix file, prefix.id, and optional site metadata
     - File input  : mtime of the file path itself
     """
-    bed = f"{genofile}.bed"
-    bim = f"{genofile}.bim"
-    fam = f"{genofile}.fam"
-    if all(os.path.isfile(p) for p in (bed, bim, fam)):
-        return max(os.path.getmtime(bed), os.path.getmtime(bim), os.path.getmtime(fam))
+    raw = str(genofile).strip()
+    low = raw.lower()
+    for suffix in (".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"):
+        if low.endswith(suffix):
+            raw = raw[: -len(suffix)]
+            break
+    for extensions in (("bed", "bim", "fam"), ("pgen", "pvar", "psam")):
+        paths = [f"{raw}.{ext}" for ext in extensions]
+        if all(os.path.isfile(path) for path in paths):
+            return max(os.path.getmtime(path) for path in paths)
 
     file_prefix, matrix_path = _resolve_file_input_matrix(genofile)
     if file_prefix and matrix_path:
@@ -4972,11 +5016,15 @@ def _as_plink_prefix(path_or_prefix: str) -> Union[str, None]:
     if p == "":
         return None
     low = p.lower()
-    if low.endswith(".bed") or low.endswith(".bim") or low.endswith(".fam"):
-        p = p[:-4]
-    if all(os.path.isfile(f"{p}.{ext}") for ext in ("bed", "bim", "fam")):
-        return p
-    return None
+    for suffix in (".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"):
+        if low.endswith(suffix):
+            p = p[: -len(suffix)]
+            break
+    if os.path.isfile(f"{p}.bed"):
+        complete = all(os.path.isfile(f"{p}.{ext}") for ext in ("bed", "bim", "fam"))
+    else:
+        complete = all(os.path.isfile(f"{p}.{ext}") for ext in ("pgen", "pvar", "psam"))
+    return p if complete else None
 
 
 def _is_kfile_prefix(path_or_prefix: object) -> bool:
@@ -5640,23 +5688,59 @@ def _split_gwas_sites(
 
 def _read_bim_sites(prefix: str) -> list[tuple[str, int, str, str, str]]:
     out: list[tuple[str, int, str, str, str]] = []
-    bim_path = f"{prefix}.bim"
-    with open(bim_path, "r", encoding="utf-8", errors="ignore") as fh:
+    raw_prefix = str(prefix).strip()
+    low = raw_prefix.lower()
+    for suffix in (".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"):
+        if low.endswith(suffix):
+            raw_prefix = raw_prefix[: -len(suffix)]
+            break
+    is_pgen = (
+        not os.path.isfile(f"{raw_prefix}.bed")
+        and all(os.path.isfile(f"{raw_prefix}.{ext}") for ext in ("pgen", "pvar", "psam"))
+    )
+    variant_path = f"{raw_prefix}.pvar" if is_pgen else f"{raw_prefix}.bim"
+    columns: list[str] | None = None
+    with open(variant_path, "r", encoding="utf-8", errors="ignore") as fh:
         for ln, line in enumerate(fh, start=1):
             s = line.strip()
-            if s == "":
+            if s == "" or s.startswith("##"):
+                continue
+            if is_pgen and s.startswith("#"):
+                columns = [value.lstrip("#").upper() for value in s.split()]
+                continue
+            if s.startswith("#"):
                 continue
             toks = s.split()
-            if len(toks) < 6:
-                raise ValueError(f"Malformed BIM line at {bim_path}:{ln}")
-            chrom = str(toks[0])
+            if is_pgen:
+                if columns is None:
+                    raise ValueError(f"PVAR header is missing: {variant_path}")
+                try:
+                    chrom_i, pos_i, snp_i, allele0_i, allele1_i = (
+                        columns.index("CHROM"),
+                        columns.index("POS"),
+                        columns.index("ID"),
+                        columns.index("REF"),
+                        columns.index("ALT"),
+                    )
+                    chrom, pos_text, snp_raw, allele0, allele1 = (
+                        toks[chrom_i], toks[pos_i], toks[snp_i], toks[allele0_i], toks[allele1_i]
+                    )
+                except (ValueError, IndexError) as exc:
+                    raise ValueError(f"Malformed PVAR row at {variant_path}:{ln}") from exc
+            else:
+                if len(toks) < 6:
+                    raise ValueError(f"Malformed BIM line at {variant_path}:{ln}")
+                chrom, pos_text, snp_raw, allele0, allele1 = (
+                    str(toks[0]), toks[3], toks[1], str(toks[4]), str(toks[5])
+                )
+            chrom = str(chrom)
             try:
-                pos = int(float(toks[3]))
+                pos = int(float(pos_text))
             except Exception as e:
-                raise ValueError(f"Invalid BIM POS at {bim_path}:{ln}") from e
-            snp = _normalize_snp_name(toks[1], chrom, pos)
-            a0 = str(toks[4])
-            a1 = str(toks[5])
+                raise ValueError(f"Invalid variant POS at {variant_path}:{ln}") from e
+            snp = _normalize_snp_name(snp_raw, chrom, pos)
+            a0 = str(allele0)
+            a1 = str(allele1)
             out.append((chrom, pos, a0, a1, snp))
     return out
 
@@ -8244,7 +8328,7 @@ def parse_args(argv: Optional[list[str]] = None):
     if (not has_pheno) and (not has_genotype):
         parser.error(
             "the following arguments are required: -p/--pheno & "
-            "(-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE | -kfile KFILE)"
+            "(-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE | -pfile PFILE | -kfile KFILE)"
         )
     if not has_pheno:
         parser.error("the following arguments are required: -p/--pheno")
@@ -8256,7 +8340,7 @@ def parse_args(argv: Optional[list[str]] = None):
     if not has_genotype:
         parser.error(
             "the following arguments are required: "
-            "(-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE | -kfile KFILE)"
+            "(-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE | -pfile PFILE | -kfile KFILE)"
         )
     if len(extras) > 0:
         parser.error("unrecognized arguments: " + " ".join(extras))
@@ -10598,15 +10682,30 @@ def _run_gwas_pipeline(
                             )
                         else:
                             binding_available = False
+                        packed_source_available = bool(
+                            prefix_meta is not None
+                            and os.path.isfile(f"{str(prefix_meta)}.bed")
+                        )
+                        if (
+                            not packed_source_available
+                            and model_key == "fvlmm"
+                            and prefix_meta is not None
+                            and all(
+                                os.path.isfile(f"{str(prefix_meta)}.{suffix}")
+                                for suffix in ("pgen", "pvar", "psam")
+                            )
+                        ):
+                            # FvLMM's PREAD source reader natively accepts PGEN;
+                            # its mmap/window readers are BED-only.
+                            packed_source_available = str(
+                                os.environ.get("JX_FVLMM_BED_PREAD", "1")
+                            ).strip().lower() not in {"0", "false", "no", "off"}
                         return _kinship_fused_qc_eligible(
                             model_token=model_key,
                             route_name=route_key,
                             genetic_model=str(args.model),
                             row_stat_mode=gwas_row_stat_mode,
-                            bed_exists=bool(
-                                prefix_meta is not None
-                                and os.path.exists(f"{str(prefix_meta)}.bed")
-                            ),
+                            source_available=packed_source_available,
                             prepared_meta_ready=(
                                 str(trait_token) in trait_shared_meta_cache
                             ),
@@ -10642,6 +10741,13 @@ def _run_gwas_pipeline(
                             ),
                             memory_budget_mb=getattr(args, "_memory_mb", None),
                             snps_only=bool(args.snps_only),
+                            n_samples=(
+                                None
+                                if full_ids_meta is None
+                                else int(len(full_ids_meta))
+                            ),
+                            n_snps=(None if n_snps is None else int(n_snps)),
+                            bimranges=scan_bimranges,
                         )
                         if not eligible:
                             return False
@@ -11672,6 +11778,13 @@ def _run_gwas_pipeline(
                         ),
                         memory_budget_mb=getattr(args, "_memory_mb", None),
                         snps_only=bool(args.snps_only),
+                        n_samples=(
+                            None
+                            if preinspect_ids is None
+                            else int(len(preinspect_ids))
+                        ),
+                        n_snps=(None if n_snps is None else int(n_snps)),
+                        bimranges=scan_bimranges,
                     )
                 )
                 if global_prefix_meta is not None:
@@ -11748,6 +11861,9 @@ def _run_gwas_pipeline(
                                 ),
                                 memory_budget_mb=getattr(args, "_memory_mb", None),
                                 snps_only=bool(args.snps_only),
+                                n_samples=int(len(strict_full_ids_meta)),
+                                n_snps=(None if n_snps is None else int(n_snps)),
+                                bimranges=scan_bimranges,
                             )
                         )
                         if fused_qc_load_single:

@@ -16,11 +16,15 @@ def _as_plink_prefix(path_or_prefix: str) -> Optional[str]:
     if p == "":
         return None
     low = p.lower()
-    if low.endswith(".bed") or low.endswith(".bim") or low.endswith(".fam"):
-        p = p[:-4]
-    if all(os.path.isfile(f"{p}.{ext}") for ext in ("bed", "bim", "fam")):
-        return p
-    return None
+    for suffix in (".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"):
+        if low.endswith(suffix):
+            p = p[: -len(suffix)]
+            break
+    if os.path.isfile(f"{p}.bed"):
+        complete = all(os.path.isfile(f"{p}.{ext}") for ext in ("bed", "bim", "fam"))
+    else:
+        complete = all(os.path.isfile(f"{p}.{ext}") for ext in ("pgen", "pvar", "psam"))
+    return p if complete else None
 
 
 def _detect_genotype_cli_flag(path_or_prefix: str) -> tuple[str, str]:
@@ -32,6 +36,8 @@ def _detect_genotype_cli_flag(path_or_prefix: str) -> tuple[str, str]:
         return "-hmp", src
     prefix = _as_plink_prefix(src)
     if prefix is not None:
+        if os.path.isfile(f"{prefix}.pgen") and not os.path.isfile(f"{prefix}.bed"):
+            return "-pfile", prefix
         return "-bfile", prefix
     return "-file", src
 

@@ -387,15 +387,41 @@ pub trait GenotypeMatrix: Send + Sync {
 /// It validates the file header and row shape once, then reads only requested
 /// source rows into the supplied buffer.
 pub(crate) struct PackedBedSourceReader {
-    file: File,
+    source: PackedBedSource,
     n_samples_full: usize,
     bytes_per_snp: usize,
     n_snps: usize,
+    qc_scratch: Vec<u8>,
+}
+
+enum PackedBedSource {
+    Bed(File),
+    Pgen(crate::pgen::PgenReader),
 }
 
 impl PackedBedSourceReader {
     pub(crate) fn open(prefix: &str, n_samples_full: usize) -> Result<Self, String> {
+        let pgen_source = crate::pgen::path_uses_pgen(prefix);
         let bed_prefix = normalize_plink_prefix(prefix);
+        if pgen_source {
+            let pgen_prefix = crate::pgen::normalize_pgen_prefix(prefix);
+            let psam_samples = crate::pgen::count_psam_samples(&pgen_prefix)?;
+            if psam_samples != n_samples_full {
+                return Err(format!(
+                    "PGEN/PSAM sample count mismatch: reader was given {n_samples_full}, PSAM has {psam_samples}"
+                ));
+            }
+            let n_snps = crate::pgen::count_pvar_variants(&pgen_prefix)?;
+            let pgen_path = Path::new(&format!("{pgen_prefix}.pgen")).to_path_buf();
+            let reader = crate::pgen::PgenReader::open(&pgen_path, n_samples_full, n_snps)?;
+            return Ok(Self {
+                source: PackedBedSource::Pgen(reader),
+                n_samples_full,
+                bytes_per_snp: n_samples_full.div_ceil(4),
+                n_snps,
+                qc_scratch: Vec::new(),
+            });
+        }
         let bed_path = format!("{bed_prefix}.bed");
         let info = read_plink_bed_header_info(Path::new(&bed_path), n_samples_full)?;
         if info.n_snps_total == 0 {
@@ -403,10 +429,11 @@ impl PackedBedSourceReader {
         }
         let file = File::open(&bed_path).map_err(|e| format!("open {bed_path}: {e}"))?;
         Ok(Self {
-            file,
+            source: PackedBedSource::Bed(file),
             n_samples_full,
             bytes_per_snp: info.bytes_per_snp,
             n_snps: info.n_snps_total,
+            qc_scratch: Vec::new(),
         })
     }
 
@@ -446,13 +473,306 @@ impl PackedBedSourceReader {
             ));
         }
         if rows > 0 {
-            let offset = (BED_HEADER_LEN as u64)
-                .saturating_add((source_start.saturating_mul(self.bytes_per_snp)) as u64);
-            read_file_exact_at(&self.file, &mut out[..byte_len], offset)
-                .map_err(|e| format!("read BED source rows [{source_start}..): {e}"))?;
+            match &mut self.source {
+                PackedBedSource::Bed(file) => {
+                    let offset = (BED_HEADER_LEN as u64)
+                        .saturating_add((source_start.saturating_mul(self.bytes_per_snp)) as u64);
+                    read_file_exact_at(file, &mut out[..byte_len], offset)
+                        .map_err(|e| format!("read BED source rows [{source_start}..): {e}"))?;
+                }
+                PackedBedSource::Pgen(reader) => {
+                    let rows_read =
+                        reader.read_source_block(source_start, rows, &mut out[..byte_len])?;
+                    if rows_read != rows {
+                        return Err(format!(
+                            "PGEN reader returned {rows_read} rows; requested {rows} starting at {source_start}"
+                        ));
+                    }
+                }
+            }
         }
         Ok(rows)
     }
+
+    /// Reads a row-major f32 hard-call matrix, decoding PGEN category bytes
+    /// directly to dosages instead of passing through BED-packed rows.
+    #[allow(dead_code)] // Shared Rust streaming API for future genotype consumers.
+    pub(crate) fn read_source_block_f32(
+        &mut self,
+        source_start: usize,
+        requested_rows: usize,
+        out: &mut [f32],
+    ) -> Result<usize, String> {
+        self.read_source_block_values_f32(source_start, requested_rows, out)
+    }
+
+    /// f64 counterpart for streaming consumers that need double-precision
+    /// genotype rows.
+    #[allow(dead_code)] // Shared Rust streaming API for future genotype consumers.
+    pub(crate) fn read_source_block_f64(
+        &mut self,
+        source_start: usize,
+        requested_rows: usize,
+        out: &mut [f64],
+    ) -> Result<usize, String> {
+        self.read_source_block_values_f64(source_start, requested_rows, out)
+    }
+
+    #[allow(dead_code)]
+    fn read_source_block_values_f32(
+        &mut self,
+        source_start: usize,
+        requested_rows: usize,
+        out: &mut [f32],
+    ) -> Result<usize, String> {
+        if source_start > self.n_snps {
+            return Err(format!(
+                "genotype source row {source_start} exceeds marker count {}",
+                self.n_snps
+            ));
+        }
+        match &mut self.source {
+            PackedBedSource::Pgen(reader) => {
+                reader.read_source_block_f32(source_start, requested_rows, out)
+            }
+            PackedBedSource::Bed(file) => read_bed_source_block_values(
+                file,
+                self.n_samples_full,
+                self.bytes_per_snp,
+                self.n_snps,
+                &mut self.qc_scratch,
+                source_start,
+                requested_rows,
+                out,
+            ),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn read_source_block_values_f64(
+        &mut self,
+        source_start: usize,
+        requested_rows: usize,
+        out: &mut [f64],
+    ) -> Result<usize, String> {
+        if source_start > self.n_snps {
+            return Err(format!(
+                "genotype source row {source_start} exceeds marker count {}",
+                self.n_snps
+            ));
+        }
+        match &mut self.source {
+            PackedBedSource::Pgen(reader) => {
+                reader.read_source_block_f64(source_start, requested_rows, out)
+            }
+            PackedBedSource::Bed(file) => read_bed_source_block_values(
+                file,
+                self.n_samples_full,
+                self.bytes_per_snp,
+                self.n_snps,
+                &mut self.qc_scratch,
+                source_start,
+                requested_rows,
+                out,
+            ),
+        }
+    }
+
+    /// Shared QC-aware read contract for BED and PGEN consumers. `stats_out`
+    /// and `keep_out` are indexed by source row; rejected packed rows are
+    /// zeroed and must be ignored by callers. The predicate is intentionally
+    /// caller-defined so GWAS, GS, and GARFIELD can share decode/QC mechanics
+    /// while retaining their own filtering rules.
+    pub(crate) fn read_source_block_with_qc<F>(
+        &mut self,
+        source_start: usize,
+        requested_rows: usize,
+        sample_selection: crate::pgen::GenotypeSampleSelection<'_>,
+        out_packed: &mut [u8],
+        stats_out: &mut [crate::pgen::GenotypeRowStats],
+        keep_out: &mut [bool],
+        keep_variant: &F,
+    ) -> Result<usize, String>
+    where
+        F: Fn(usize, crate::pgen::GenotypeRowStats) -> bool + Sync,
+    {
+        if source_start > self.n_snps {
+            return Err(format!(
+                "BED source row {source_start} exceeds marker count {}",
+                self.n_snps
+            ));
+        }
+        let rows = requested_rows.min(self.n_snps - source_start);
+        let byte_len = rows
+            .checked_mul(self.bytes_per_snp)
+            .ok_or_else(|| "packed genotype QC block size overflow".to_string())?;
+        if out_packed.len() < byte_len {
+            return Err(format!(
+                "packed genotype QC destination is too small: got {}, need {byte_len}",
+                out_packed.len()
+            ));
+        }
+        if stats_out.len() < rows || keep_out.len() < rows {
+            return Err(format!(
+                "genotype QC metadata destination too small: stats={}, keep={}, need {rows}",
+                stats_out.len(),
+                keep_out.len()
+            ));
+        }
+        if rows == 0 {
+            return Ok(0);
+        }
+
+        match &mut self.source {
+            PackedBedSource::Pgen(reader) => reader.read_source_block_with_qc(
+                source_start,
+                rows,
+                sample_selection,
+                &mut out_packed[..byte_len],
+                &mut stats_out[..rows],
+                &mut keep_out[..rows],
+                keep_variant,
+            ),
+            PackedBedSource::Bed(file) => {
+                sample_selection.validate(self.n_samples_full)?;
+                let offset = (BED_HEADER_LEN as u64)
+                    .saturating_add((source_start.saturating_mul(self.bytes_per_snp)) as u64);
+                read_file_exact_at(file, &mut out_packed[..byte_len], offset)
+                    .map_err(|e| format!("read BED source rows [{source_start}..): {e}"))?;
+                for row_idx in 0..rows {
+                    let row_start = row_idx * self.bytes_per_snp;
+                    let row_end = row_start + self.bytes_per_snp;
+                    let stats = crate::pgen::count_bed_genotype_row(
+                        &out_packed[row_start..row_end],
+                        self.n_samples_full,
+                        sample_selection,
+                    );
+                    let keep = keep_variant(source_start + row_idx, stats);
+                    stats_out[row_idx] = stats;
+                    keep_out[row_idx] = keep;
+                    if !keep {
+                        out_packed[row_start..row_end].fill(0);
+                    }
+                }
+                Ok(rows)
+            }
+        }
+    }
+
+    /// Shared QC-only read contract. PGEN rows are counted while decoding and
+    /// are not converted to packed BED; BED input is scanned through a reusable
+    /// packed scratch block. Consumers receive per-source-row statistics and a
+    /// keep mask without allocating a packed output matrix.
+    pub(crate) fn read_source_block_qc_only<F>(
+        &mut self,
+        source_start: usize,
+        requested_rows: usize,
+        sample_selection: crate::pgen::GenotypeSampleSelection<'_>,
+        stats_out: &mut [crate::pgen::GenotypeRowStats],
+        keep_out: &mut [bool],
+        keep_variant: &F,
+    ) -> Result<usize, String>
+    where
+        F: Fn(usize, crate::pgen::GenotypeRowStats) -> bool + Sync,
+    {
+        if source_start > self.n_snps {
+            return Err(format!(
+                "BED source row {source_start} exceeds marker count {}",
+                self.n_snps
+            ));
+        }
+        let rows = requested_rows.min(self.n_snps - source_start);
+        if stats_out.len() < rows || keep_out.len() < rows {
+            return Err(format!(
+                "genotype QC metadata destination too small: stats={}, keep={}, need {rows}",
+                stats_out.len(),
+                keep_out.len()
+            ));
+        }
+        if rows == 0 {
+            return Ok(0);
+        }
+
+        match &mut self.source {
+            PackedBedSource::Pgen(reader) => reader.read_source_block_qc_only(
+                source_start,
+                rows,
+                sample_selection,
+                &mut stats_out[..rows],
+                &mut keep_out[..rows],
+                keep_variant,
+            ),
+            PackedBedSource::Bed(file) => {
+                sample_selection.validate(self.n_samples_full)?;
+                let byte_len = rows
+                    .checked_mul(self.bytes_per_snp)
+                    .ok_or_else(|| "packed genotype QC scratch size overflow".to_string())?;
+                self.qc_scratch.resize(byte_len, 0);
+                let offset = (BED_HEADER_LEN as u64)
+                    .saturating_add((source_start.saturating_mul(self.bytes_per_snp)) as u64);
+                read_file_exact_at(file, &mut self.qc_scratch, offset)
+                    .map_err(|e| format!("read BED source rows [{source_start}..): {e}"))?;
+                for row_idx in 0..rows {
+                    let row_start = row_idx * self.bytes_per_snp;
+                    let row_end = row_start + self.bytes_per_snp;
+                    let stats = crate::pgen::count_bed_genotype_row(
+                        &self.qc_scratch[row_start..row_end],
+                        self.n_samples_full,
+                        sample_selection,
+                    );
+                    stats_out[row_idx] = stats;
+                    keep_out[row_idx] = keep_variant(source_start + row_idx, stats);
+                }
+                Ok(rows)
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn read_bed_source_block_values<T: crate::pgen::PgenDosageValue>(
+    file: &File,
+    n_samples: usize,
+    bytes_per_snp: usize,
+    n_snps: usize,
+    scratch: &mut Vec<u8>,
+    source_start: usize,
+    requested_rows: usize,
+    out: &mut [T],
+) -> Result<usize, String> {
+    let rows = requested_rows.min(n_snps - source_start);
+    let value_len = rows
+        .checked_mul(n_samples)
+        .ok_or_else(|| "genotype dosage block size overflow".to_string())?;
+    if out.len() < value_len {
+        return Err(format!(
+            "genotype dosage destination is too small: got {}, need {value_len}",
+            out.len()
+        ));
+    }
+    if rows == 0 {
+        return Ok(0);
+    }
+    let byte_len = rows
+        .checked_mul(bytes_per_snp)
+        .ok_or_else(|| "packed genotype dosage scratch size overflow".to_string())?;
+    scratch.resize(byte_len, 0);
+    let offset =
+        (BED_HEADER_LEN as u64).saturating_add((source_start.saturating_mul(bytes_per_snp)) as u64);
+    read_file_exact_at(file, scratch, offset)
+        .map_err(|e| format!("read BED source rows [{source_start}..): {e}"))?;
+    for row_idx in 0..rows {
+        let packed_start = row_idx * bytes_per_snp;
+        let packed_end = packed_start + bytes_per_snp;
+        let values_start = row_idx * n_samples;
+        let values_end = values_start + n_samples;
+        crate::pgen::decode_bed_row_to_values(
+            &scratch[packed_start..packed_end],
+            n_samples,
+            &mut out[values_start..values_end],
+        );
+    }
+    Ok(rows)
 }
 
 // StreamingBedMatrix — chunked file I/O, no mmap
@@ -632,6 +952,124 @@ mod packed_source_tests {
         assert_eq!(short[0], 0xA5);
         assert_eq!(reader.read_source_block(4, 1, &mut short).unwrap(), 0);
         assert!(reader.read_source_block(5, 1, &mut short).is_err());
+
+        fs::remove_dir_all(dir).expect("remove temporary BED directory");
+    }
+
+    #[test]
+    fn shared_qc_reader_applies_subset_stats_and_returns_keep_mask_for_bed() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("janusx_qc_source_{stamp}"));
+        fs::create_dir_all(&dir).expect("create temporary BED directory");
+        let prefix = dir.join("tiny");
+        fs::write(
+            prefix.with_extension("bed"),
+            [0x6c, 0x1b, 0x01, 0x78, 0x02, 0x00, 0x00],
+        )
+        .expect("write BED fixture");
+
+        let mut reader =
+            PackedBedSourceReader::open(prefix.to_str().unwrap(), 5).expect("open packed source");
+        let sample_indices = [1usize, 2, 4];
+        let mut packed = [0xaau8; 4];
+        let mut stats = [crate::pgen::GenotypeRowStats::default(); 2];
+        let mut keep = [true; 2];
+        assert_eq!(
+            reader
+                .read_source_block_with_qc(
+                    0,
+                    2,
+                    crate::pgen::GenotypeSampleSelection::include(&sample_indices),
+                    &mut packed,
+                    &mut stats,
+                    &mut keep,
+                    &|source_idx, _| source_idx == 1,
+                )
+                .unwrap(),
+            2
+        );
+        assert_eq!(stats[0].sample_count, 3);
+        assert_eq!(stats[0].missing_count, 0);
+        assert_eq!(stats[0].heterozygote_count, 2);
+        assert_eq!(stats[0].homozygous_alt_count, 1);
+        assert_eq!(
+            stats[1],
+            crate::pgen::GenotypeRowStats {
+                sample_count: 3,
+                ..crate::pgen::GenotypeRowStats::default()
+            }
+        );
+        assert_eq!(keep, [false, true]);
+        assert_eq!(packed, [0, 0, 0, 0]);
+
+        let mut exclude_reader =
+            PackedBedSourceReader::open(prefix.to_str().unwrap(), 5).expect("reopen packed source");
+        let excluded = [0usize, 3];
+        let mut exclude_packed = [0xaau8; 4];
+        let mut exclude_stats = [crate::pgen::GenotypeRowStats::default(); 2];
+        let mut exclude_keep = [true; 2];
+        exclude_reader
+            .read_source_block_with_qc(
+                0,
+                2,
+                crate::pgen::GenotypeSampleSelection::Exclude(&excluded),
+                &mut exclude_packed,
+                &mut exclude_stats,
+                &mut exclude_keep,
+                &|source_idx, _| source_idx == 1,
+            )
+            .unwrap();
+        assert_eq!(exclude_stats, stats);
+        assert_eq!(exclude_keep, keep);
+        assert_eq!(exclude_packed, packed);
+
+        let mut stats_reader =
+            PackedBedSourceReader::open(prefix.to_str().unwrap(), 5).expect("reopen packed source");
+        let mut stats_only = [crate::pgen::GenotypeRowStats::default(); 2];
+        let mut stats_only_keep = [false; 2];
+        stats_reader
+            .read_source_block_qc_only(
+                0,
+                2,
+                crate::pgen::GenotypeSampleSelection::include(&sample_indices),
+                &mut stats_only,
+                &mut stats_only_keep,
+                &|source_idx, _| source_idx == 1,
+            )
+            .unwrap();
+        assert_eq!(stats_only, stats);
+        assert_eq!(stats_only_keep, keep);
+
+        let mut float_reader =
+            PackedBedSourceReader::open(prefix.to_str().unwrap(), 5).expect("reopen BED source");
+        let mut values_f32 = [0.0_f32; 10];
+        assert_eq!(
+            float_reader
+                .read_source_block_f32(0, 2, &mut values_f32)
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            values_f32,
+            [0.0, 1.0, 2.0, -9.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        );
+
+        let mut double_reader =
+            PackedBedSourceReader::open(prefix.to_str().unwrap(), 5).expect("reopen BED source");
+        let mut values_f64 = [0.0_f64; 10];
+        assert_eq!(
+            double_reader
+                .read_source_block_f64(0, 2, &mut values_f64)
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            values_f64,
+            [0.0, 1.0, 2.0, -9.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        );
 
         fs::remove_dir_all(dir).expect("remove temporary BED directory");
     }
@@ -1343,8 +1781,11 @@ pub fn open_bed_mmap_unified(
 fn normalize_plink_prefix(prefix: &str) -> String {
     let mut out = prefix.trim().to_string();
     let lower = out.to_ascii_lowercase();
-    if lower.ends_with(".bed") || lower.ends_with(".bim") || lower.ends_with(".fam") {
-        out.truncate(out.len().saturating_sub(4));
+    for suffix in [".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"] {
+        if lower.ends_with(suffix) {
+            out.truncate(out.len().saturating_sub(suffix.len()));
+            break;
+        }
     }
     out
 }

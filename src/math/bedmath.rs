@@ -26,6 +26,23 @@ pub(crate) fn decode_plink_bed_hardcall(code: u8) -> Option<f64> {
     }
 }
 
+#[inline]
+pub(crate) fn additive_missing_impute_value(mean_g: f64, impute_major: bool) -> f64 {
+    if !impute_major {
+        return mean_g;
+    }
+    if mean_g > 1.0_f64 {
+        2.0_f64
+    } else if mean_g < 1.0_f64 {
+        0.0_f64
+    } else {
+        // At a 0.5 allele frequency there is no major allele. Mean dosage is
+        // the only encoding-invariant imputation for complementary allele
+        // representations.
+        1.0_f64
+    }
+}
+
 pub(crate) struct PackedByteLut {
     pub(crate) nonmiss: [u8; 256],
     pub(crate) alt_sum: [u8; 256],
@@ -1114,15 +1131,7 @@ pub(crate) fn decode_mean_imputed_additive_packed_block_rows_f64_stats(
         let row =
             &packed_flat[row_idx_packed * bytes_per_snp..(row_idx_packed + 1) * bytes_per_snp];
         let mean_g = (2.0_f64 * row_maf[row_idx_local] as f64).clamp(0.0_f64, 2.0_f64);
-        let missing_g = if impute_major {
-            if mean_g > 1.0_f64 {
-                2.0_f64
-            } else {
-                0.0_f64
-            }
-        } else {
-            mean_g
-        };
+        let missing_g = additive_missing_impute_value(mean_g, impute_major);
         let value_lut: [f64; 4] = if row_flip[row_idx_local] {
             [2.0_f64, missing_g, 1.0_f64, 0.0_f64]
         } else {
@@ -1644,6 +1653,53 @@ mod tests {
         )
         .unwrap();
         assert_eq!(one, block);
+    }
+
+    #[test]
+    fn major_imputation_at_half_frequency_is_allele_coding_invariant() {
+        // These rows encode complementary alleles with identical missingness.
+        // At AF=0.5 neither allele is major, so major-imputation must preserve
+        // the complement relation by imputing the mean dosage (1) for missing.
+        let codes_a = [0u8, 0, 3, 3, 1];
+        let codes_b = [3u8, 3, 0, 0, 1];
+        let packed_a = pack_codes(&codes_a);
+        let packed_b = pack_codes(&codes_b);
+        let sample_idx = [0usize, 1, 2, 3, 4];
+        let row_flip = [false];
+        let row_maf = [0.5_f32];
+        let rhs = [1.0_f64; 5];
+
+        let decode = |packed: &[u8]| {
+            let mut out = [0.0_f64; 5];
+            let mut rhs_dot = [0.0_f64; 1];
+            let mut ss = [0.0_f64; 1];
+            decode_mean_imputed_additive_packed_block_rows_f64_stats(
+                packed,
+                packed.len(),
+                codes_a.len(),
+                &row_flip,
+                &row_maf,
+                true,
+                &sample_idx,
+                true,
+                None,
+                0,
+                &rhs,
+                &mut out,
+                &mut rhs_dot,
+                &mut ss,
+                &packed_byte_lut().code4,
+                None,
+            )
+            .expect("packed decode should succeed");
+            out
+        };
+
+        let decoded_a = decode(&packed_a);
+        let decoded_b = decode(&packed_b);
+        for (&a, &b) in decoded_a.iter().zip(decoded_b.iter()) {
+            assert_eq!(a + b, 2.0);
+        }
     }
 
     #[test]

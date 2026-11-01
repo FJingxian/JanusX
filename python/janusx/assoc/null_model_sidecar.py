@@ -203,12 +203,9 @@ def build_fvlmm_sidecar(
         raise ValueError("FvLMM sidecar sample IDs must not be empty")
 
     genotype_prefix = Path(context.genotype_prefix).expanduser()
-    genotype_prefix_text = str(genotype_prefix)
-    if genotype_prefix_text.lower().endswith(".bed"):
-        genotype_prefix = Path(genotype_prefix_text[:-4])
-    genotype_paths = tuple(
-        Path(f"{genotype_prefix}{suffix}") for suffix in (".bed", ".bim", ".fam")
-    )
+    genotype_prefix = _normalize_genotype_prefix(genotype_prefix)
+    genotype_suffixes = _plink_source_suffixes(genotype_prefix)
+    genotype_paths = tuple(Path(f"{genotype_prefix}{suffix}") for suffix in genotype_suffixes)
 
     kinship_id_path = Path(context.kinship_id_file).expanduser()
     kinship_shape_n = _count_nonempty_lines(kinship_id_path)
@@ -528,11 +525,23 @@ def validate_sidecar_dependencies(
 
     requested_prefix = _normalize_genotype_prefix(bfile)
 
-    genotype_suffixes = (".bed", ".bim", ".fam")
-    if len(record.genotype_files) != len(genotype_suffixes):
+    if len(record.genotype_files) != 3:
         raise FineMapSkip(
-            "sidecar genotype fingerprint set must contain BED/BIM/FAM files"
+            "sidecar genotype fingerprint set must contain a BED/BIM/FAM or PGEN/PVAR/PSAM triplet"
         )
+    genotype_suffixes = tuple(
+        Path(item.basename).suffix.lower() for item in record.genotype_files
+    )
+    if genotype_suffixes not in (
+        (".bed", ".bim", ".fam"),
+        (".pgen", ".pvar", ".psam"),
+    ):
+        raise FineMapSkip(
+            "sidecar genotype fingerprint set must contain a BED/BIM/FAM or PGEN/PVAR/PSAM triplet"
+        )
+    current_suffixes = _plink_source_suffixes(requested_prefix)
+    if genotype_suffixes != current_suffixes:
+        raise FineMapSkip("sidecar PLINK source format differs from the current genotype input")
     for suffix, expected in zip(genotype_suffixes, record.genotype_files):
         genotype_path = Path(f"{requested_prefix}{suffix}")
         _validate_current_fingerprint(
@@ -605,11 +614,20 @@ def validate_sidecar_dependencies(
 def _normalize_genotype_prefix(path: str | Path) -> Path:
     text = str(Path(path).expanduser())
     lower = text.lower()
-    for suffix in (".bed", ".bim", ".fam"):
+    for suffix in (".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"):
         if lower.endswith(suffix):
             text = text[: -len(suffix)]
             break
     return Path(text).resolve()
+
+
+def _plink_source_suffixes(genotype_prefix: str | Path) -> tuple[str, str, str]:
+    prefix = str(genotype_prefix)
+    if Path(f"{prefix}.bed").is_file():
+        return (".bed", ".bim", ".fam")
+    if Path(f"{prefix}.pgen").is_file():
+        return (".pgen", ".pvar", ".psam")
+    raise FileNotFoundError(f"No PLINK BED or PGEN source found at prefix: {prefix}")
 
 
 def _dependency_search_roots(

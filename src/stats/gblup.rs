@@ -57,7 +57,7 @@ use crate::eigh::{
     symmetric_eigh_f64_row_major,
 };
 use crate::fast_math::gblup_marker_fast_packed;
-use crate::gload::WindowedBedMatrix;
+use crate::gload::{PackedBedSourceReader, WindowedBedMatrix};
 use crate::grm::{self, grm_rankk_update_raw_mixed_f32_to_f64, GrmAccumMode};
 use crate::packed::{
     bed_packed_row_flip_mask, cross_grm_times_alpha_packed_f64, packed_malpha_f64,
@@ -70,6 +70,77 @@ use crate::stats_common::{
 pub(crate) enum StreamKernelMode {
     Additive,
     StandardizedAdditive,
+}
+
+enum GblupPackedMatrix {
+    Bed(WindowedBedMatrix),
+    Pgen {
+        reader: PackedBedSourceReader,
+        scratch: Vec<u8>,
+        n_snps: usize,
+        bytes_per_snp: usize,
+    },
+}
+
+impl GblupPackedMatrix {
+    fn open(prefix: &str, n_samples: usize, window_mb: usize) -> Result<Self, String> {
+        if crate::pgen::path_uses_pgen(prefix) {
+            let reader = PackedBedSourceReader::open(prefix, n_samples)?;
+            let n_snps = reader.n_snps();
+            let bytes_per_snp = reader.bytes_per_snp();
+            return Ok(Self::Pgen {
+                reader,
+                scratch: Vec::new(),
+                n_snps,
+                bytes_per_snp,
+            });
+        }
+        Ok(Self::Bed(WindowedBedMatrix::open(prefix, window_mb)?))
+    }
+
+    fn prepare_source_rows<'a>(
+        &'a mut self,
+        source_indices: &[usize],
+        rel_indices_out: &mut Vec<usize>,
+    ) -> Result<&'a [u8], String> {
+        match self {
+            Self::Bed(matrix) => matrix.prepare_source_rows(source_indices, rel_indices_out),
+            Self::Pgen {
+                reader,
+                scratch,
+                n_snps,
+                bytes_per_snp,
+            } => {
+                if source_indices.is_empty() {
+                    rel_indices_out.clear();
+                    return Ok(&[]);
+                }
+                let source_start = source_indices[0];
+                let source_end = source_indices[source_indices.len() - 1]
+                    .checked_add(1)
+                    .ok_or_else(|| "PGEN source row index overflow".to_string())?;
+                if source_end > *n_snps || source_indices.windows(2).any(|pair| pair[0] > pair[1]) {
+                    return Err(
+                        "PGEN source rows must be sorted and within the variant range".into(),
+                    );
+                }
+                let source_rows = source_end - source_start;
+                let byte_len = source_rows
+                    .checked_mul(*bytes_per_snp)
+                    .ok_or_else(|| "PGEN packed block size overflow".to_string())?;
+                scratch.resize(byte_len, 0);
+                let rows_read = reader.read_source_block(source_start, source_rows, scratch)?;
+                if rows_read != source_rows {
+                    return Err(format!(
+                        "PGEN source returned {rows_read} rows, expected {source_rows}"
+                    ));
+                }
+                rel_indices_out.clear();
+                rel_indices_out.extend(source_indices.iter().map(|&idx| idx - source_start));
+                Ok(&scratch[..byte_len])
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -353,7 +424,7 @@ where
     }
     let bytes_per_snp = n_samples.div_ceil(4);
     let window_mb = gblup_stream_window_mb(block_rows, bytes_per_snp, mmap_window_mb);
-    let mut matrix = WindowedBedMatrix::open(prefix, window_mb)?;
+    let mut matrix = GblupPackedMatrix::open(prefix, n_samples, window_mb)?;
     let pool_owned = get_cached_pool(threads).map_err(|e| e.to_string())?;
     let pool_ref = pool_owned.as_ref();
     let full_sample_fast = is_identity_indices(train_idx, n_samples);
@@ -3212,4 +3283,51 @@ pub fn farmcpu_q_packed_grm_pca_f32<'py>(
     )
     .into_bound();
     Ok((grm_arr, q_arr, evd_backend, evd_elapsed))
+}
+
+#[cfg(test)]
+mod pgen_stream_tests {
+    use super::GblupPackedMatrix;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn gblup_pgen_reader_returns_selected_bed_compatible_rows() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("janusx_gblup_pgen_{stamp}"));
+        fs::create_dir_all(&dir).expect("create temporary PGEN directory");
+        let prefix = dir.join("tiny");
+
+        let mut pgen = vec![0x6c, 0x1b, 0x02];
+        pgen.extend_from_slice(&3u32.to_le_bytes());
+        pgen.extend_from_slice(&4u32.to_le_bytes());
+        pgen.push(0); // fixed hard-call storage flags
+        pgen.extend_from_slice(&[0xe4, 0xe4, 0x00]);
+        fs::write(prefix.with_extension("pgen"), pgen).expect("write PGEN");
+        fs::write(
+            prefix.with_extension("pvar"),
+            "#CHROM POS ID REF ALT\n1 10 rs1 A G\n1 20 rs2 C T\n1 30 rs3 G A\n",
+        )
+        .expect("write PVAR");
+        fs::write(
+            prefix.with_extension("psam"),
+            "#FID IID PAT MAT SEX PHENOTYPE\n1 s1 0 0 1 -9\n1 s2 0 0 1 -9\n1 s3 0 0 1 -9\n1 s4 0 0 1 -9\n",
+        )
+        .expect("write PSAM");
+
+        let mut matrix =
+            GblupPackedMatrix::open(prefix.to_str().unwrap(), 4, 1).expect("open PGEN row source");
+        let mut rel = Vec::new();
+        let rows = matrix
+            .prepare_source_rows(&[0, 2], &mut rel)
+            .expect("read selected PGEN source rows")
+            .to_vec();
+        assert_eq!(rel, [0, 2]);
+        assert_eq!(rows, [0x78, 0x78, 0x00]);
+
+        fs::remove_dir_all(dir).expect("remove temporary PGEN directory");
+    }
 }

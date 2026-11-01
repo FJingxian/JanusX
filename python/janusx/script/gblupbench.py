@@ -232,7 +232,7 @@ def _determine_genotype_source_from_args(args: argparse.Namespace) -> tuple[str,
         gfile = str(bfile)
         auto_prefix = os.path.basename(gfile.rstrip("/\\"))
     else:
-        raise ValueError("No genotype input specified. Use -vcf, -hmp, -file or -bfile.")
+        raise ValueError("No genotype input specified. Use -vcf, -hmp, -file, -bfile or -pfile.")
     return gfile, auto_prefix
 
 
@@ -793,14 +793,14 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         if (not has_pheno) and (not has_genotype):
             p.error(
                 "the following arguments are required: -p/--pheno & "
-                "(-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE)"
+                "(-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE | -pfile PFILE)"
             )
         if not has_pheno:
             p.error("the following arguments are required: -p/--pheno")
         if not has_genotype:
             p.error(
                 "the following arguments are required: "
-                "(-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE)"
+                "(-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE | -pfile PFILE)"
             )
 
     try:

@@ -24,7 +24,7 @@ Supported models
 Genotype input formats
 ----------------------
   - VCF   : .vcf or .vcf.gz (using gfreader.vcfreader)
-  - PLINK : Binary PLINK (.bed/.bim/.fam) via prefix (using gfreader.breader)
+  - PLINK : BED/BIM/FAM or PGEN/PVAR/PSAM via prefix (using gfreader.breader)
 
 Phenotype input format
 ----------------------
@@ -1909,8 +1909,9 @@ def _load_legacy_text_effect_jxmodel(path: str) -> dict[str, typing.Any]:
 def _strip_plink_suffix(path_or_prefix: str) -> str:
     p = str(path_or_prefix).strip()
     low = p.lower()
-    if low.endswith(".bed") or low.endswith(".bim") or low.endswith(".fam"):
-        return p[:-4]
+    for suffix in (".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"):
+        if low.endswith(suffix):
+            return p[: -len(suffix)]
     return p
 
 
@@ -1925,34 +1926,72 @@ def _read_plink_bim_marker_meta(
     prefix_or_bim: str,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     prefix = _strip_plink_suffix(str(prefix_or_bim))
-    bim_path = prefix if str(prefix).lower().endswith(".bim") else f"{prefix}.bim"
-    if not os.path.isfile(bim_path):
-        raise FileNotFoundError(f"Cannot find BIM file: {bim_path}")
+    is_pgen = (
+        not os.path.isfile(f"{prefix}.bed")
+        and all(os.path.isfile(f"{prefix}.{ext}") for ext in ("pgen", "pvar", "psam"))
+    )
+    if is_pgen:
+        variant_path = f"{prefix}.pvar"
+        columns: list[str] | None = None
+    else:
+        variant_path = prefix if str(prefix).lower().endswith(".bim") else f"{prefix}.bim"
+        columns = None
+    if not os.path.isfile(variant_path):
+        label = "PVAR" if is_pgen else "BIM"
+        raise FileNotFoundError(f"Cannot find {label} file: {variant_path}")
 
     chrom: list[str] = []
     pos: list[int] = []
     snp: list[str] = []
     ref: list[str] = []
     alt: list[str] = []
-    with open(bim_path, "r", encoding="utf-8", errors="replace") as fh:
+    with open(variant_path, "r", encoding="utf-8", errors="replace") as fh:
         for line_no, line in enumerate(fh, start=1):
             s = str(line).strip()
-            if s == "" or s.startswith("#"):
+            if s == "":
+                continue
+            if is_pgen and s.startswith("##"):
                 continue
             parts = s.split()
-            if len(parts) < 6:
+            if is_pgen and s.startswith("#"):
+                columns = [value.lstrip("#").upper() for value in parts]
+                continue
+            if s.startswith("#"):
+                continue
+            min_fields = 5 if is_pgen else 6
+            if len(parts) < min_fields:
                 raise ValueError(
-                    f"Invalid BIM row at {bim_path}:{line_no} (expected >= 6 columns)."
+                    f"Invalid {'PVAR' if is_pgen else 'BIM'} row at {variant_path}:{line_no}."
                 )
-            chrom.append(str(parts[0]))
+            if is_pgen:
+                if columns is None:
+                    raise ValueError(f"PVAR header is missing: {variant_path}")
+                try:
+                    chrom_idx = columns.index("CHROM")
+                    pos_idx = columns.index("POS")
+                    snp_idx = columns.index("ID")
+                    ref_idx = columns.index("REF")
+                    alt_idx = columns.index("ALT")
+                    chrom_value = parts[chrom_idx]
+                    pos_value = parts[pos_idx]
+                    snp_value = parts[snp_idx]
+                    ref_value = parts[ref_idx]
+                    alt_value = parts[alt_idx]
+                except (ValueError, IndexError) as exc:
+                    raise ValueError(f"Malformed PVAR row at {variant_path}:{line_no}.") from exc
+            else:
+                chrom_value, pos_value, snp_value, ref_value, alt_value = (
+                    parts[0], parts[3], parts[1], parts[4], parts[5]
+                )
+            chrom.append(str(chrom_value))
             try:
-                p = int(parts[3])
+                p = int(pos_value)
             except Exception:
-                p = int(float(parts[3]))
+                p = int(float(pos_value))
             pos.append(int(p))
-            snp.append(str(parts[1]))
-            ref.append(str(parts[4]))
-            alt.append(str(parts[5]))
+            snp.append(str(snp_value))
+            ref.append(str(ref_value))
+            alt.append(str(alt_value))
     return (
         np.asarray(chrom, dtype=object),
         np.asarray(pos, dtype=np.int64),
@@ -3282,10 +3321,12 @@ def _parse_ld_prune_args(values: list[str] | None) -> _GsLdPruneSpec | None:
 
 
 def _is_plink_prefix(path_or_prefix: str) -> bool:
-    p = str(path_or_prefix).strip()
+    p = _strip_plink_suffix(str(path_or_prefix))
     if p == "":
         return False
-    return all(os.path.isfile(f"{p}.{ext}") for ext in ("bed", "bim", "fam"))
+    if os.path.isfile(f"{p}.bed"):
+        return all(os.path.isfile(f"{p}.{ext}") for ext in ("bed", "bim", "fam"))
+    return all(os.path.isfile(f"{p}.{ext}") for ext in ("pgen", "pvar", "psam"))
 
 
 def _is_txt_like_input(path_or_prefix: str) -> bool:
@@ -16918,7 +16959,9 @@ def _load_plink_packed_for_lmm(
                 n_samples=n_samples,
                 n_snps=int(n_total_sites),
             )
-            packed_storage = "memmap"
+            packed_storage = (
+                "memmap" if isinstance(packed_payload, np.memmap) else "owned"
+            )
         packed_ctx: dict[str, typing.Any] = {
             "packed": packed_payload,
             "missing_rate": miss_arr,
@@ -16943,11 +16986,14 @@ def _load_plink_packed_for_lmm(
         n_snps=int(n_total_sites),
     )
     if bool(np.all(site_keep)):
-        packed = load_plink_bed_payload_owned(
-            str(genotype_prefix),
-            n_samples=n_samples,
-            n_snps=int(n_total_sites),
-        )
+        if isinstance(packed_memmap, np.memmap):
+            packed = load_plink_bed_payload_owned(
+                str(genotype_prefix),
+                n_samples=n_samples,
+                n_snps=int(n_total_sites),
+            )
+        else:
+            packed = packed_memmap
     else:
         packed = np.ascontiguousarray(
             np.asarray(packed_memmap[site_keep], dtype=np.uint8),
@@ -18713,10 +18759,10 @@ def parse_args(argv: typing.Optional[list[str]] = None):
     if (not has_pheno) and (not has_model) and (not has_genotype):
         parser.error(
             "the following arguments are required: (-p/--pheno | -model/--model) & "
-            "(-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE)"
+            "(-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE | -pfile PFILE)"
         )
     if not has_genotype:
-        parser.error("the following arguments are required: (-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE)")
+        parser.error("the following arguments are required: (-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE | -pfile PFILE)")
     if (not has_pheno) and (not has_model):
         parser.error("the following arguments are required: (-p/--pheno | -model/--model)")
     if has_pheno and len(model_paths) > 1:
@@ -18897,7 +18943,7 @@ def _resolve_gs_pipeline_paths(
         gfile = str(args.bfile)
         auto_prefix = os.path.basename(gfile)
     else:
-        raise ValueError("No genotype input detected. Use -vcf, -hmp, -file or -bfile.")
+        raise ValueError("No genotype input detected. Use -vcf, -hmp, -file, -bfile or -pfile.")
 
     out_dir, outprefix, out_stem = apply_output_prefix_compat(args, auto_prefix, argv=argv)
     gs_model_dir = os.path.join(str(out_dir), f"{out_stem}.gs.model")

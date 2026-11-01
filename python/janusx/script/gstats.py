@@ -863,9 +863,9 @@ def main() -> None:
     args = parser.parse_args()
 
     if not any((args.bfile, args.vcf, args.hmp, args.file)):
-        parser.error("one genotype input is required: -bfile / -vcf / -hmp / -file")
+        parser.error("one genotype input is required: -bfile / -pfile / -vcf / -hmp / -file")
     if sum(bool(x) for x in (args.bfile, args.vcf, args.hmp, args.file)) != 1:
-        parser.error("provide exactly one genotype input among -bfile / -vcf / -hmp / -file")
+        parser.error("provide exactly one genotype input among -bfile / -pfile / -vcf / -hmp / -file")
     if not any((bool(args.freq), bool(args.miss), bool(args.het), args.ldsc is not None)):
         parser.error("select at least one statistic: -freq / -miss / -het / -ldsc")
     if int(args.threads) <= 0:

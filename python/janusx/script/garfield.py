@@ -1190,6 +1190,19 @@ def _normalize_scan_chrom(chrom: object) -> str:
     return text
 
 
+def _infer_plink_input_kind(genotype_input: str) -> str:
+    """Report whether a packed PLINK prefix resolves to PGEN or BED files."""
+    prefix = str(genotype_input)
+    lowered = prefix.lower()
+    for suffix in (".pgen", ".pvar", ".psam", ".bed", ".bim", ".fam"):
+        if lowered.endswith(suffix):
+            prefix = prefix[: -len(suffix)]
+            break
+    if os.path.isfile(f"{prefix}.pgen") and not os.path.isfile(f"{prefix}.bed"):
+        return "pfile"
+    return "bfile"
+
+
 def _count_window_scan_units_from_bim(
     prefix: str,
     *,
@@ -1197,31 +1210,65 @@ def _count_window_scan_units_from_bim(
     step: int,
     site_keep: Optional[np.ndarray] = None,
 ) -> int:
-    bim_path = f"{prefix}.bim"
-    if not os.path.exists(bim_path):
+    raw_prefix = str(prefix).strip()
+    low = raw_prefix.lower()
+    for suffix in (".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"):
+        if low.endswith(suffix):
+            raw_prefix = raw_prefix[: -len(suffix)]
+            break
+    is_pgen = (
+        not os.path.isfile(f"{raw_prefix}.bed")
+        and all(os.path.isfile(f"{raw_prefix}.{ext}") for ext in ("pgen", "pvar", "psam"))
+    )
+    variant_path = f"{raw_prefix}.pvar" if is_pgen else f"{raw_prefix}.bim"
+    if not os.path.exists(variant_path):
         return 0
 
     groups: dict[str, list[int]] = {}
     chrom_order: list[str] = []
     keep_mask = None if site_keep is None else np.asarray(site_keep, dtype=np.bool_).reshape(-1)
 
-    with open(bim_path, "r", encoding="utf-8") as f:
-        for row_idx, line in enumerate(f):
+    chrom_index = 0
+    pos_index = 3
+    row_idx = 0
+    with open(variant_path, "r", encoding="utf-8") as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if is_pgen and stripped.startswith("##"):
+                continue
+            if is_pgen and stripped.startswith("#"):
+                header = [field.lstrip("#").upper() for field in stripped.split()]
+                try:
+                    chrom_index = header.index("CHROM")
+                    pos_index = header.index("POS")
+                except ValueError as exc:
+                    raise ValueError(
+                        f"PVAR header is missing CHROM or POS: {variant_path}"
+                    ) from exc
+                continue
+            if stripped.startswith("#"):
+                continue
             if keep_mask is not None:
                 if row_idx >= int(keep_mask.shape[0]) or not bool(keep_mask[row_idx]):
+                    row_idx += 1
                     continue
-            tok = line.rstrip("\n").split()
-            if len(tok) < 4:
+            tok = stripped.split()
+            if len(tok) <= max(chrom_index, pos_index):
+                row_idx += 1
                 continue
-            chrom = _normalize_scan_chrom(tok[0])
+            chrom = _normalize_scan_chrom(tok[chrom_index])
             try:
-                pos = int(tok[3])
+                pos = int(tok[pos_index])
             except Exception:
+                row_idx += 1
                 continue
             if chrom not in groups:
                 groups[chrom] = []
                 chrom_order.append(chrom)
             groups[chrom].append(pos)
+            row_idx += 1
 
     total_windows = 0
     ext = max(1, int(extension))
@@ -2240,9 +2287,9 @@ def main() -> None:
         else (10 if _is_max6_grm_backend(args.search_backend) else 0)
     )
     if not has_genotype and not has_pheno:
-        parser.error("the following arguments are required: -p/--pheno and -bfile/--bfile")
+        parser.error("the following arguments are required: -p/--pheno and -bfile/--bfile or -pfile/--pfile")
     if not has_genotype:
-        parser.error("the following arguments are required: -bfile/--bfile")
+        parser.error("the following arguments are required: -bfile/--bfile or -pfile/--pfile")
     if not has_pheno:
         parser.error("the following arguments are required: -p/--pheno")
     if len(extras) > 0:
@@ -4207,8 +4254,8 @@ def main() -> None:
                 "log_file": log_path,
                 "output_prefix": outprefix,
                 "genotype_input": gfile,
-                "input_kind": "bfile",
-                "execution_route": "direct Rust BED pipeline",
+                "input_kind": _infer_plink_input_kind(gfile),
+                "execution_route": "direct Rust packed PLINK pipeline",
                 "encoding": "bin",
                 "phenotype_file": args.pheno,
                 "gene_files": list(args.genefiles),

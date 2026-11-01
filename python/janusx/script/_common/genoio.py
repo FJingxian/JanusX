@@ -15,6 +15,7 @@ import pandas as pd
 from janusx.gfreader import (
     SiteInfo,
     inspect_genotype_file,
+    load_bed_2bit_packed,
     prepare_bed_logic_meta_selected,
     prepare_cli_input_cache,
 )
@@ -377,9 +378,14 @@ def packed_no_snps_after_filter_message() -> str:
 def normalize_plink_prefix(path_or_prefix: str) -> str:
     p = str(path_or_prefix).strip()
     low = p.lower()
-    if low.endswith(".bed") or low.endswith(".bim") or low.endswith(".fam"):
-        return p[:-4]
+    for suffix in (".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"):
+        if low.endswith(suffix):
+            return p[: -len(suffix)]
     return p
+
+
+def _is_pgen_prefix(prefix: str) -> bool:
+    return os.path.isfile(f"{prefix}.pgen") and not os.path.isfile(f"{prefix}.bed")
 
 
 def _is_simple_snp_allele(allele: str) -> bool:
@@ -389,17 +395,33 @@ def _is_simple_snp_allele(allele: str) -> bool:
 
 def plink_snp_mask(prefix: str) -> np.ndarray:
     mask: list[bool] = []
-    bim_path = f"{normalize_plink_prefix(prefix)}.bim"
-    with open(bim_path, "r", encoding="utf-8", errors="ignore") as fh:
+    plink_prefix = normalize_plink_prefix(prefix)
+    is_pgen = _is_pgen_prefix(plink_prefix)
+    variant_path = f"{plink_prefix}.pvar" if is_pgen else f"{plink_prefix}.bim"
+    columns: list[str] | None = None
+    with open(variant_path, "r", encoding="utf-8", errors="ignore") as fh:
         for ln, line in enumerate(fh, start=1):
             s = line.strip()
-            if s == "":
+            if s == "" or s.startswith("##"):
+                continue
+            if is_pgen and s.startswith("#"):
+                columns = [value.lstrip("#").upper() for value in s.split()]
+                continue
+            if s.startswith("#"):
                 continue
             toks = s.split()
-            if len(toks) < 6:
-                raise ValueError(f"Malformed BIM line at {bim_path}:{ln}")
-            a0 = str(toks[4])
-            a1 = str(toks[5])
+            if is_pgen:
+                if columns is None:
+                    raise ValueError(f"PVAR header is missing: {variant_path}")
+                try:
+                    ref_idx, alt_idx = columns.index("REF"), columns.index("ALT")
+                    a0, a1 = str(toks[ref_idx]), str(toks[alt_idx])
+                except (ValueError, IndexError) as exc:
+                    raise ValueError(f"Malformed PVAR row at {variant_path}:{ln}") from exc
+            else:
+                if len(toks) < 6:
+                    raise ValueError(f"Malformed BIM line at {variant_path}:{ln}")
+                a0, a1 = str(toks[4]), str(toks[5])
             mask.append(_is_simple_snp_allele(a0) and _is_simple_snp_allele(a1))
     return np.asarray(mask, dtype=np.bool_)
 
@@ -409,9 +431,22 @@ def open_plink_bed_payload_memmap(
     *,
     n_samples: int,
     n_snps: int,
-) -> np.memmap:
+) -> np.ndarray:
+    plink_prefix = normalize_plink_prefix(prefix)
+    if _is_pgen_prefix(plink_prefix):
+        packed, _missing, _maf, _std, packed_n = load_bed_2bit_packed(plink_prefix)
+        payload = np.ascontiguousarray(np.asarray(packed, dtype=np.uint8))
+        expected_shape = (int(n_snps), (int(n_samples) + 3) // 4)
+        if int(packed_n) != int(n_samples) or payload.shape != expected_shape:
+            raise ValueError(
+                f"PGEN packed payload shape mismatch: got {payload.shape} for n={packed_n}, "
+                f"expected {expected_shape} for n={n_samples}"
+            )
+        # PGEN has no BED payload to mmap. Keep the same packed-row interface
+        # and materialize only the 2-bit representation directly from Rust.
+        return payload
     bed_path, bytes_per_snp, _expected_size = inspect_plink_bed_payload_layout(
-        prefix,
+        plink_prefix,
         n_samples=n_samples,
         n_snps=n_snps,
     )
@@ -452,8 +487,19 @@ def load_plink_bed_payload_owned(
     n_samples: int,
     n_snps: int,
 ) -> np.ndarray:
+    plink_prefix = normalize_plink_prefix(prefix)
+    if _is_pgen_prefix(plink_prefix):
+        packed, _missing, _maf, _std, packed_n = load_bed_2bit_packed(plink_prefix)
+        payload = np.ascontiguousarray(np.asarray(packed, dtype=np.uint8))
+        expected_shape = (int(n_snps), (int(n_samples) + 3) // 4)
+        if int(packed_n) != int(n_samples) or payload.shape != expected_shape:
+            raise ValueError(
+                f"PGEN packed payload shape mismatch: got {payload.shape} for n={packed_n}, "
+                f"expected {expected_shape} for n={n_samples}"
+            )
+        return payload
     bed_path, bytes_per_snp, expected_size = inspect_plink_bed_payload_layout(
-        prefix,
+        plink_prefix,
         n_samples=n_samples,
         n_snps=n_snps,
     )
@@ -1345,7 +1391,7 @@ def prepare_packed_ctx_from_plink(
             lazy_keep_ratio = min(1.0, max(0.0, lazy_keep_ratio))
             use_lazy = bool(keep_ratio >= lazy_keep_ratio)
 
-        packed_memmap: np.memmap | None = None
+        packed_memmap: np.ndarray | None = None
         if filter_mode_key != "lazy_owned":
             packed_memmap = open_plink_bed_payload_memmap(
                 str(plink_prefix),
@@ -1363,7 +1409,9 @@ def prepare_packed_ctx_from_plink(
             else:
                 assert packed_memmap is not None
                 packed_payload = packed_memmap
-                packed_storage = "memmap"
+                packed_storage = (
+                    "memmap" if isinstance(packed_payload, np.memmap) else "owned"
+                )
             packed_ctx = dict(meta_ctx)
             packed_ctx["packed"] = packed_payload
             packed_ctx["packed_filter_mode"] = "lazy_full"
@@ -1377,11 +1425,15 @@ def prepare_packed_ctx_from_plink(
                 n_snps=int(meta_ctx["n_total_sites"]),
             )
         if bool(np.all(site_keep)):
-            packed = load_plink_bed_payload_owned(
-                str(plink_prefix),
-                n_samples=int(meta_ctx["n_samples"]),
-                n_snps=int(meta_ctx["n_total_sites"]),
-            )
+            if isinstance(packed_memmap, np.memmap):
+                packed = load_plink_bed_payload_owned(
+                    str(plink_prefix),
+                    n_samples=int(meta_ctx["n_samples"]),
+                    n_snps=int(meta_ctx["n_total_sites"]),
+                )
+            else:
+                assert packed_memmap is not None
+                packed = packed_memmap
             packed_ctx = dict(meta_ctx)
         else:
             packed = np.ascontiguousarray(

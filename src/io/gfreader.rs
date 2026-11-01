@@ -230,10 +230,35 @@ pub(crate) fn build_snp_indices(
 fn normalize_plink_prefix_local(p: &str) -> String {
     let s = p.trim();
     let low = s.to_ascii_lowercase();
-    if low.ends_with(".bed") || low.ends_with(".bim") || low.ends_with(".fam") {
-        return s[..s.len() - 4].to_string();
+    for suffix in [".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"] {
+        if low.ends_with(suffix) {
+            return s[..s.len() - suffix.len()].to_string();
+        }
     }
     s.to_string()
+}
+
+#[inline]
+fn is_plink_path_or_prefix_local(path_or_prefix: &str) -> bool {
+    let p = path_or_prefix.trim();
+    let lower = p.to_ascii_lowercase();
+    if [".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"]
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+    {
+        return true;
+    }
+    let prefix = normalize_plink_prefix_local(p);
+    let bed_exists = [".bed", ".bim", ".fam"]
+        .iter()
+        .all(|suffix| Path::new(&format!("{prefix}{suffix}")).is_file());
+    if bed_exists {
+        return true;
+    }
+    !Path::new(&format!("{prefix}.bed")).exists()
+        && [".pgen", ".pvar", ".psam"]
+            .iter()
+            .all(|suffix| Path::new(&format!("{prefix}{suffix}")).is_file())
 }
 
 #[inline]
@@ -3499,7 +3524,48 @@ impl BedChunkReader {
         let can_parallel_random = !windowed_mode;
         let mut m: usize = 0;
 
-        if let Some(ref snp_indices) = self.snp_indices {
+        let sample_identity = full_samples
+            && self
+                .sample_indices
+                .iter()
+                .enumerate()
+                .all(|(index, &sample)| index == sample);
+        if self.snp_indices.is_none() && sample_identity && self.it.is_pgen_source() {
+            let mut raw_block = vec![0.0_f32; chunk_size.saturating_mul(n)];
+            while m < chunk_size {
+                let source_start = self.it.cursor();
+                let rows_read = self
+                    .it
+                    .read_next_pgen_block_f32(chunk_size - m, &mut raw_block)
+                    .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+                if rows_read == 0 {
+                    break;
+                }
+                for row_idx in 0..rows_read {
+                    let source_row = source_start + row_idx;
+                    let row_start = data.len();
+                    let raw_start = row_idx * n;
+                    data.extend_from_slice(&raw_block[raw_start..raw_start + n]);
+                    let mut site = self.it.sites[source_row].clone();
+                    let keep = process_bed_chunk_row(
+                        &mut data[row_start..],
+                        &mut site,
+                        self.maf,
+                        self.miss,
+                        self.fill_missing,
+                        self.apply_het_filter,
+                        self.het_threshold,
+                        self.preserve_alt_orientation,
+                    );
+                    if keep {
+                        sites.push(site.into());
+                        m += 1;
+                    } else {
+                        data.truncate(row_start);
+                    }
+                }
+            }
+        } else if let Some(ref snp_indices) = self.snp_indices {
             while m < chunk_size && self.snp_pos < snp_indices.len() {
                 let need = chunk_size - m;
                 let end = (self.snp_pos + need).min(snp_indices.len());
@@ -4545,6 +4611,100 @@ impl TxtChunkReader {
     }
 }
 
+const PGEN_PACKED_READ_TARGET_BYTES: usize = 16 * 1024 * 1024;
+const PGEN_PACKED_READ_MAX_ROWS: usize = 1 << 15;
+
+#[inline]
+fn pgen_packed_read_rows(n_samples: usize, n_variants: usize) -> usize {
+    let bytes_per_snp = n_samples.div_ceil(4).max(1);
+    let target_rows = (PGEN_PACKED_READ_TARGET_BYTES / bytes_per_snp)
+        .max(1)
+        .next_power_of_two()
+        .min(PGEN_PACKED_READ_MAX_ROWS);
+    target_rows.min(n_variants.max(1))
+}
+
+fn read_pgen_packed_rows(
+    prefix: &str,
+    n_samples: usize,
+) -> Result<(Vec<u8>, usize, usize), String> {
+    let mut reader = crate::gload::PackedBedSourceReader::open(prefix, n_samples)?;
+    let n_snps = reader.n_snps();
+    let bytes_per_snp = reader.bytes_per_snp();
+    let packed_len = n_snps
+        .checked_mul(bytes_per_snp)
+        .ok_or_else(|| "PGEN packed matrix size overflow".to_string())?;
+    let read_rows = pgen_packed_read_rows(n_samples, n_snps);
+    let mut packed = vec![0u8; packed_len];
+    for source_start in (0..n_snps).step_by(read_rows) {
+        let rows = (n_snps - source_start).min(read_rows);
+        let start = source_start * bytes_per_snp;
+        let end = start + rows * bytes_per_snp;
+        let rows_read = reader.read_source_block(source_start, rows, &mut packed[start..end])?;
+        if rows_read != rows {
+            return Err(format!(
+                "PGEN packed read returned {rows_read} rows, expected {rows} at source row {source_start}"
+            ));
+        }
+    }
+    Ok((packed, n_snps, bytes_per_snp))
+}
+
+fn scan_pgen_packed_stats(
+    prefix: &str,
+    n_samples: usize,
+) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<bool>, Vec<f32>, usize), String> {
+    let mut source = crate::gload::PackedBedSourceReader::open(prefix, n_samples)?;
+    let n_snps = source.n_snps();
+    let read_rows = pgen_packed_read_rows(n_samples, n_snps);
+    let mut stats_block = vec![crate::pgen::GenotypeRowStats::default(); read_rows];
+    let mut keep_block = vec![false; read_rows];
+    let mut missing_rate = vec![0.0_f32; n_snps];
+    let mut maf = vec![0.0_f32; n_snps];
+    let mut std_denom = vec![0.0_f32; n_snps];
+    let mut row_flip = vec![false; n_snps];
+    let mut het_rate = vec![0.0_f32; n_snps];
+
+    for source_start in (0..n_snps).step_by(read_rows) {
+        let rows = (n_snps - source_start).min(read_rows);
+        let rows_read = source.read_source_block_qc_only(
+            source_start,
+            rows,
+            crate::pgen::GenotypeSampleSelection::all(),
+            &mut stats_block[..rows],
+            &mut keep_block[..rows],
+            &|_, _| true,
+        )?;
+        if rows_read != rows {
+            return Err(format!(
+                "PGEN stats read returned {rows_read} rows, expected {rows} at source row {source_start}"
+            ));
+        }
+        let row_end = source_start + rows;
+        stats_block[..rows]
+            .par_iter()
+            .zip(missing_rate[source_start..row_end].par_iter_mut())
+            .zip(maf[source_start..row_end].par_iter_mut())
+            .zip(std_denom[source_start..row_end].par_iter_mut())
+            .zip(row_flip[source_start..row_end].par_iter_mut())
+            .zip(het_rate[source_start..row_end].par_iter_mut())
+            .for_each(
+                |(((((stats, miss_dst), maf_dst), std_dst), flip_dst), het_dst)| {
+                    *miss_dst = stats.missing_rate().unwrap_or(0.0_f32);
+                    if let Some(p_alt) = stats.alternate_allele_frequency() {
+                        *maf_dst = stats.minor_allele_frequency().unwrap_or(0.0_f32);
+                        let denom = (2.0_f32 * p_alt * (1.0_f32 - p_alt)).sqrt();
+                        *std_dst = if denom.is_finite() { denom } else { 0.0 };
+                        *flip_dst = p_alt > 0.5_f32;
+                        *het_dst = stats.heterozygosity_rate().unwrap_or(0.0_f32);
+                    }
+                },
+            );
+    }
+
+    Ok((missing_rate, maf, std_denom, row_flip, het_rate, n_snps))
+}
+
 // -------- count_vcf_snps (Py function) --------
 #[pyfunction]
 pub fn load_bed_2bit_packed<'py>(
@@ -4576,6 +4736,40 @@ pub fn load_bed_2bit_packed<'py>(
                 "load_bed_2bit_packed/read_fam",
                 &format!("prefix={bed_prefix} n_samples={n_samples}"),
             );
+
+            if crate::pgen::path_uses_pgen(&bed_prefix) {
+                let (packed, n_snps, bytes_per_snp) =
+                    read_pgen_packed_rows(&bed_prefix, n_samples)?;
+                let mut missing_rate = vec![0.0f32; n_snps];
+                let mut maf = vec![0.0f32; n_snps];
+                let mut std_denom = vec![0.0f32; n_snps];
+                packed
+                    .par_chunks(bytes_per_snp)
+                    .zip(missing_rate.par_iter_mut())
+                    .zip(maf.par_iter_mut())
+                    .zip(std_denom.par_iter_mut())
+                    .for_each(|(((row, miss_dst), maf_dst), std_dst)| {
+                        let (missing, het, hom_alt) = count_packed_row_counts(row, n_samples);
+                        let non_missing = n_samples.saturating_sub(missing);
+                        let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
+                        *miss_dst = missing as f32 / n_samples as f32;
+                        if non_missing > 0 {
+                            let p = alt_sum as f32 / (2.0_f32 * non_missing as f32);
+                            *maf_dst = p.min(1.0_f32 - p);
+                            let denom = (2.0_f32 * p * (1.0_f32 - p)).sqrt();
+                            *std_dst = if denom.is_finite() { denom } else { 0.0 };
+                        }
+                    });
+                return Ok((
+                    packed,
+                    missing_rate,
+                    maf,
+                    std_denom,
+                    n_samples,
+                    n_snps,
+                    bytes_per_snp,
+                ));
+            }
 
             let bed_path = format!("{bed_prefix}.bed");
             let bed_file = File::open(&bed_path)
@@ -5207,10 +5401,10 @@ fn prepare_bed_logic_meta_owned_for_candidate_rows_pure_line_impl(
                     .packed_snp_bytes_at(src_row)
                     .expect("validated candidate BED row must be in mapped window");
                 let (missing, het, hom_alt) = if stats_identity {
-                    count_packed_row_counts(row, n_samples)
+                    count_packed_row_counts(&row, n_samples)
                 } else {
                     count_packed_row_counts_selected_with_excluded(
-                        row,
+                        &row,
                         n_samples,
                         stats_sample_indices,
                         stats_excluded_sample_indices.as_deref(),
@@ -5965,9 +6159,21 @@ pub(crate) fn prepare_bed_logic_meta_and_packed_owned_for_stats_samples(
     snps_only: bool,
     stats_sample_indices: Option<&[usize]>,
 ) -> Result<PreparedBedLogicMetaAndPackedOwned, String> {
+    let normalized_prefix = normalize_plink_prefix_local(prefix);
+    if crate::pgen::path_uses_pgen(&normalized_prefix) {
+        return prepare_pgen_fused_qc_packed_owned_for_stats_samples(
+            &normalized_prefix,
+            maf_threshold,
+            max_missing_rate,
+            het_threshold,
+            snps_only,
+            stats_sample_indices,
+        );
+    }
+
     let (meta, packed_all_rows) =
         prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window_internal(
-            prefix,
+            &normalized_prefix,
             maf_threshold,
             max_missing_rate,
             het_threshold,
@@ -5982,6 +6188,208 @@ pub(crate) fn prepare_bed_logic_meta_and_packed_owned_for_stats_samples(
         .ok_or_else(|| "fused packed BED loader did not materialize genotype bytes".to_string())?;
     Ok(PreparedBedLogicMetaAndPackedOwned {
         meta,
+        packed_all_rows,
+    })
+}
+
+fn prepare_pgen_fused_qc_packed_owned_for_stats_samples(
+    prefix: &str,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
+    stats_sample_indices: Option<&[usize]>,
+) -> Result<PreparedBedLogicMetaAndPackedOwned, String> {
+    if !(0.0..=0.5).contains(&maf_threshold) {
+        return Err("maf_threshold must be within [0, 0.5]".to_string());
+    }
+    if !(0.0..=1.0).contains(&max_missing_rate) {
+        return Err("max_missing_rate must be within [0, 1.0]".to_string());
+    }
+    if !(0.0..=1.0).contains(&het_threshold) {
+        return Err("het_threshold must be within [0, 1.0]".to_string());
+    }
+
+    let total_t0 = Instant::now();
+    let prefix = normalize_plink_prefix_local(prefix);
+    let read_fam_t0 = Instant::now();
+    let n_samples = core::read_fam(&prefix)?.len();
+    let read_fam_secs = read_fam_t0.elapsed().as_secs_f64();
+    if n_samples == 0 {
+        return Err("no samples found in PGEN input".to_string());
+    }
+
+    let selected_samples = stats_sample_indices.unwrap_or(&[]);
+    if selected_samples.iter().any(|&index| index >= n_samples) {
+        return Err("selected sample index out of range for PGEN fused QC".to_string());
+    }
+    let stats_identity = selected_samples.is_empty()
+        || (selected_samples.len() == n_samples && sample_indices_are_identity(selected_samples));
+    let stats_n_samples = if stats_identity {
+        n_samples
+    } else {
+        selected_samples.len()
+    };
+    if stats_n_samples == 0 {
+        return Err("selected sample set for PGEN fused QC is empty".to_string());
+    }
+    let sample_selection = if stats_identity {
+        crate::pgen::GenotypeSampleSelection::all()
+    } else {
+        crate::pgen::GenotypeSampleSelection::include(selected_samples)
+    };
+
+    let pvar_t0 = Instant::now();
+    let simple_snp_mask = if snps_only {
+        Some(read_pvar_simple_snp_allele_mask(&prefix)?)
+    } else {
+        None
+    };
+    let pvar_secs = pvar_t0.elapsed().as_secs_f64();
+
+    let mut source = crate::gload::PackedBedSourceReader::open(&prefix, n_samples)?;
+    let n_snps_total = source.n_snps();
+    let bytes_per_snp = source.bytes_per_snp();
+    if bytes_per_snp != n_samples.div_ceil(4) {
+        return Err(format!(
+            "PGEN packed row width mismatch: got {bytes_per_snp}, expected {}",
+            n_samples.div_ceil(4)
+        ));
+    }
+    if let Some(mask) = simple_snp_mask.as_ref() {
+        if mask.len() != n_snps_total {
+            return Err(format!(
+                "PGEN/PVAR variant count mismatch: pgen={n_snps_total}, pvar={}",
+                mask.len()
+            ));
+        }
+    }
+
+    let read_rows = pgen_packed_read_rows(n_samples, n_snps_total);
+    let block_bytes = read_rows
+        .checked_mul(bytes_per_snp)
+        .ok_or_else(|| "PGEN fused QC block size overflow".to_string())?;
+    let mut source_block = vec![0u8; block_bytes];
+    let mut stats_block = vec![crate::pgen::GenotypeRowStats::default(); read_rows];
+    let mut keep_block = vec![false; read_rows];
+    let mut packed_all_rows = Vec::<u8>::new();
+    let mut row_source_indices = Vec::<usize>::new();
+    let mut missing_rate = Vec::<f32>::new();
+    let mut maf = Vec::<f32>::new();
+    let mut row_flip = Vec::<bool>::new();
+    let row_stats_t0 = Instant::now();
+    let mut pack_kept_secs = 0.0_f64;
+
+    for source_start in (0..n_snps_total).step_by(read_rows) {
+        let rows = (n_snps_total - source_start).min(read_rows);
+        let rows_bytes = rows
+            .checked_mul(bytes_per_snp)
+            .ok_or_else(|| "PGEN fused QC block size overflow".to_string())?;
+        let rows_read = source.read_source_block_with_qc(
+            source_start,
+            rows,
+            sample_selection,
+            &mut source_block[..rows_bytes],
+            &mut stats_block[..rows],
+            &mut keep_block[..rows],
+            &|source_idx, stats| {
+                if stats.sample_count == 0 {
+                    return false;
+                }
+                if snps_only
+                    && simple_snp_mask
+                        .as_ref()
+                        .is_none_or(|mask| mask[source_idx] == 0)
+                {
+                    return false;
+                }
+                let missing_rate = stats.missing_rate().unwrap_or(1.0_f32);
+                if missing_rate > max_missing_rate {
+                    return false;
+                }
+                let non_missing = stats.sample_count.saturating_sub(stats.missing_count);
+                if non_missing == 0 {
+                    return maf_threshold <= 0.0_f32;
+                }
+                if het_threshold > 0.0_f32
+                    && (stats.heterozygote_count as f64) / (non_missing as f64)
+                        > het_threshold as f64
+                {
+                    return false;
+                }
+                let alt_sum = stats
+                    .heterozygote_count
+                    .saturating_add(stats.homozygous_alt_count.saturating_mul(2));
+                maf_passes_threshold_from_counts(alt_sum as f64, non_missing, maf_threshold)
+            },
+        )?;
+        if rows_read != rows {
+            return Err(format!(
+                "PGEN fused read returned {rows_read} rows, expected {rows} at source row {source_start}"
+            ));
+        }
+
+        let pack_t0 = Instant::now();
+        for (local_row, &keep) in keep_block[..rows].iter().enumerate() {
+            if !keep {
+                continue;
+            }
+            let stats = stats_block[local_row];
+            let non_missing = stats.sample_count.saturating_sub(stats.missing_count);
+            let alt_sum = stats
+                .heterozygote_count
+                .saturating_add(stats.homozygous_alt_count.saturating_mul(2));
+            let alt_freq = if non_missing > 0 {
+                alt_sum as f32 / (2.0_f32 * non_missing as f32)
+            } else {
+                0.0_f32
+            };
+            let row_start = local_row * bytes_per_snp;
+            packed_all_rows.extend_from_slice(&source_block[row_start..row_start + bytes_per_snp]);
+            row_source_indices.push(source_start + local_row);
+            missing_rate.push(stats.missing_rate().unwrap_or(1.0_f32));
+            // Packed hard calls retain ALT orientation, matching the fused BED
+            // path's metadata contract; downstream code uses row_flip=false.
+            maf.push(alt_freq);
+            row_flip.push(false);
+        }
+        pack_kept_secs += pack_t0.elapsed().as_secs_f64();
+    }
+    let row_stats_secs = row_stats_t0.elapsed().as_secs_f64();
+    if row_source_indices.is_empty() {
+        return Err(
+            "No SNPs left after fused PGEN filtering. Please relax thresholds.".to_string(),
+        );
+    }
+
+    emit_bed_logic_meta_timing(
+        "prepare_pgen_fused_qc_packed",
+        read_fam_secs,
+        pvar_secs,
+        0.0,
+        row_stats_secs,
+        0.0,
+        pack_kept_secs,
+        total_t0.elapsed().as_secs_f64(),
+        n_samples,
+        stats_n_samples,
+        n_snps_total,
+        row_source_indices.len(),
+        true,
+    );
+
+    Ok(PreparedBedLogicMetaAndPackedOwned {
+        meta: PreparedBedLogicMetaOwned {
+            site_keep: Vec::new(),
+            row_flip,
+            row_source_indices,
+            missing_rate,
+            maf,
+            sites: Vec::new(),
+            n_samples,
+            n_snps_total,
+            bytes_per_snp,
+        },
         packed_all_rows,
     })
 }
@@ -6007,6 +6415,9 @@ pub(crate) fn prepare_bed_logic_meta_and_packed_owned_for_stats_samples_with_ran
     }
 
     let bed_prefix = normalize_plink_prefix_local(prefix);
+    if crate::pgen::path_uses_pgen(&bed_prefix) {
+        return Err("Fused PGEN loading does not support BIM range filters".to_string());
+    }
     let mut normalized_ranges = Vec::<(String, i32, i32)>::with_capacity(bimranges.len());
     for (index, (chrom, start, end)) in bimranges.iter().enumerate() {
         if chrom.trim().is_empty() {
@@ -6189,10 +6600,10 @@ fn prepare_bed_logic_meta_and_packed_owned_for_candidate_rows(
                     .packed_snp_bytes_at(source_row)
                     .expect("validated BIM range BED row must be in mapped window");
                 let (missing, het, hom_alt) = if stats_identity {
-                    count_packed_row_counts(row, n_samples)
+                    count_packed_row_counts(&row, n_samples)
                 } else {
                     count_packed_row_counts_selected_with_excluded(
-                        row,
+                        &row,
                         n_samples,
                         selected_samples,
                         excluded_samples.as_deref(),
@@ -6234,7 +6645,7 @@ fn prepare_bed_logic_meta_and_packed_owned_for_candidate_rows(
             let source_bytes = bed_iter
                 .packed_snp_bytes_at(source_row)
                 .ok_or_else(|| format!("BIM range BED row {source_row} left its mapped window"))?;
-            packed_all_rows.extend_from_slice(source_bytes);
+            packed_all_rows.extend_from_slice(&source_bytes);
             row_source_kept.push(source_row);
             missing_rate_kept.push(missing_rate);
             // Preserve the fused packed loader's A2-frequency orientation.
@@ -6879,7 +7290,7 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_pure_line_sparse_wi
                     {
                         let (raw_missing, het, hom_alt) =
                             count_packed_row_counts_selected_with_excluded(
-                                it_ref
+                                &it_ref
                                     .packed_snp_bytes_at(snp_idx)
                                     .expect("windowed pure-line selected SNP index out of range"),
                                 n_samples,
@@ -7410,6 +7821,151 @@ pub(crate) fn prepare_bed_logic_meta_owned_pure_line(
     )
 }
 
+fn load_pgen_2bit_packed_subset_owned_for_stats_samples(
+    prefix: &str,
+    n_samples: usize,
+    site_keep: &[bool],
+    stats_sample_indices: &[usize],
+    stats_excluded_sample_indices: Option<&[usize]>,
+    stats_identity: bool,
+    stats_n_samples: usize,
+    pure_line: bool,
+) -> Result<PackedBedSubsetOwned, String> {
+    let mut source = crate::gload::PackedBedSourceReader::open(prefix, n_samples)?;
+    let n_snps_total = source.n_snps();
+    let bytes_per_snp = source.bytes_per_snp();
+    if site_keep.len() != n_snps_total {
+        return Err(format!(
+            "site_keep length mismatch: got {}, expected {n_snps_total}",
+            site_keep.len()
+        ));
+    }
+    let kept_n = site_keep.iter().filter(|&&keep| keep).count();
+    if kept_n == 0 {
+        return Err("No SNPs remained after applying site_keep mask.".to_string());
+    }
+    let packed_len = kept_n
+        .checked_mul(bytes_per_snp)
+        .ok_or_else(|| "PGEN packed subset size overflow".to_string())?;
+    let read_rows = pgen_packed_read_rows(n_samples, n_snps_total);
+    let block_bytes = read_rows
+        .checked_mul(bytes_per_snp)
+        .ok_or_else(|| "PGEN packed read block size overflow".to_string())?;
+    let mut packed_keep = vec![0u8; packed_len];
+    let mut source_block = vec![0u8; block_bytes];
+    let mut stats_block = vec![crate::pgen::GenotypeRowStats::default(); read_rows];
+    let mut keep_block = vec![false; read_rows];
+    let qc_sample_selection = if stats_identity {
+        crate::pgen::GenotypeSampleSelection::all()
+    } else if let Some(excluded) = stats_excluded_sample_indices {
+        crate::pgen::GenotypeSampleSelection::from_selected_and_excluded(
+            stats_sample_indices,
+            excluded,
+        )
+    } else {
+        crate::pgen::GenotypeSampleSelection::include(stats_sample_indices)
+    };
+    let mut missing_rate = vec![0.0_f32; kept_n];
+    let mut maf = vec![0.0_f32; kept_n];
+    let mut std_denom = vec![0.0_f32; kept_n];
+    let mut keep_cursor = 0usize;
+    for source_start in (0..n_snps_total).step_by(read_rows) {
+        let rows = (n_snps_total - source_start).min(read_rows);
+        let rows_bytes = rows * bytes_per_snp;
+        let rows_read = source.read_source_block_with_qc(
+            source_start,
+            rows,
+            qc_sample_selection,
+            &mut source_block[..rows_bytes],
+            &mut stats_block[..rows],
+            &mut keep_block[..rows],
+            &|source_idx, _| site_keep[source_idx],
+        )?;
+        if rows_read != rows {
+            return Err(format!(
+                "PGEN subset read returned {rows_read} rows, expected {rows} at source row {source_start}"
+            ));
+        }
+        let compact_rows = keep_block[..rows]
+            .iter()
+            .enumerate()
+            .filter_map(|(local_row, &keep)| keep.then_some(local_row))
+            .collect::<Vec<_>>();
+        let kept_in_block = compact_rows.len();
+        let compact_end = keep_cursor + kept_in_block;
+        for (rank, &local_row) in compact_rows.iter().enumerate() {
+            let src_start = local_row * bytes_per_snp;
+            let dst_start = (keep_cursor + rank) * bytes_per_snp;
+            packed_keep[dst_start..dst_start + bytes_per_snp]
+                .copy_from_slice(&source_block[src_start..src_start + bytes_per_snp]);
+        }
+        compact_rows
+            .par_iter()
+            .zip(
+                missing_rate[keep_cursor..compact_end]
+                    .par_iter_mut()
+                    .zip(maf[keep_cursor..compact_end].par_iter_mut())
+                    .zip(std_denom[keep_cursor..compact_end].par_iter_mut()),
+            )
+            .for_each(|(&local_row, ((miss_v, maf_v), std_v))| {
+                let stats = stats_block[local_row];
+                if pure_line {
+                    let logic_missing =
+                        stats.missing_count.saturating_add(stats.heterozygote_count);
+                    let miss = logic_missing.min(stats_n_samples) as f32 / stats_n_samples as f32;
+                    let usable_homo =
+                        stats_n_samples.saturating_sub(logic_missing.min(stats_n_samples));
+                    let af = if usable_homo > 0 {
+                        stats.homozygous_alt_count as f32 / usable_homo as f32
+                    } else {
+                        0.0_f32
+                    };
+                    *miss_v = miss;
+                    *maf_v = af.clamp(0.0, 1.0);
+                    *std_v = (af * (1.0_f32 - af)).max(0.0_f32).sqrt();
+                } else {
+                    let non_missing = stats_n_samples.saturating_sub(stats.missing_count);
+                    let alt_sum = stats
+                        .heterozygote_count
+                        .saturating_add(stats.homozygous_alt_count.saturating_mul(2));
+                    let (miss, _maf, std) =
+                        packed_row_stats_from_counts(stats_n_samples, non_missing, alt_sum);
+                    let af = if non_missing > 0 {
+                        alt_sum as f32 / (2.0_f32 * non_missing as f32)
+                    } else {
+                        0.0_f32
+                    };
+                    *miss_v = miss;
+                    *maf_v = af.clamp(0.0, 1.0);
+                    *std_v = std;
+                }
+            });
+        keep_cursor = compact_end;
+        if keep_cursor > kept_n {
+            return Err(format!(
+                "PGEN kept-row count exceeded expected {kept_n} while processing rows [{source_start}..{})",
+                source_start + rows
+            ));
+        }
+    }
+    if keep_cursor != kept_n {
+        return Err(format!(
+            "PGEN kept-row count mismatch: copied {keep_cursor}, expected {kept_n}"
+        ));
+    }
+
+    let row_flip = vec![false; kept_n];
+    Ok(PackedBedSubsetOwned {
+        packed: packed_keep,
+        missing_rate,
+        maf,
+        std_denom,
+        row_flip,
+        n_samples,
+        bytes_per_snp,
+    })
+}
+
 pub(crate) fn load_bed_2bit_packed_subset_owned_for_stats_samples(
     prefix: &str,
     site_keep: &[bool],
@@ -7451,6 +8007,19 @@ pub(crate) fn load_bed_2bit_packed_subset_owned_for_stats_samples(
         "load_bed_2bit_packed_subset_owned/read_fam",
         &format!("prefix={bed_prefix} n_samples={n_samples}"),
     );
+
+    if crate::pgen::path_uses_pgen(&bed_prefix) {
+        return load_pgen_2bit_packed_subset_owned_for_stats_samples(
+            &bed_prefix,
+            n_samples,
+            site_keep,
+            stats_sample_indices,
+            stats_excluded_sample_indices.as_deref(),
+            stats_identity,
+            stats_n_samples,
+            false,
+        );
+    }
 
     let bed_path = format!("{bed_prefix}.bed");
     let bed_file = File::open(&bed_path).map_err(|e| format!("failed to open {bed_path}: {e}"))?;
@@ -7663,6 +8232,108 @@ pub(crate) fn compute_bed_row_meta_owned_for_source_rows(
         return Err("row_source_indices must not be empty".to_string());
     }
 
+    if crate::pgen::path_uses_pgen(prefix) {
+        if row_source_indices.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err("PGEN row_source_indices must be strictly increasing".to_string());
+        }
+        let mut reader = crate::gload::PackedBedSourceReader::open(prefix, n_samples)?;
+        let n_snps_total = reader.n_snps();
+        let bytes_per_snp = reader.bytes_per_snp();
+        if bytes_per_snp != n_samples.div_ceil(4) {
+            return Err(format!(
+                "PGEN packed row width mismatch: got {bytes_per_snp}, expected {}",
+                n_samples.div_ceil(4)
+            ));
+        }
+        if let Some(&bad_idx) = row_source_indices
+            .iter()
+            .find(|&&source_row| source_row >= n_snps_total)
+        {
+            return Err(format!(
+                "row_source_indices contains out-of-range PGEN row {bad_idx} for n_snps={n_snps_total}"
+            ));
+        }
+
+        let target_bytes = 32usize * 1024 * 1024;
+        let rows_per_block = (target_bytes / bytes_per_snp.max(1))
+            .max(1)
+            .min(n_snps_total.max(1));
+        let mut packed_block = vec![0u8; rows_per_block * bytes_per_snp];
+        let kept_n = row_source_indices.len();
+        let mut maf_keep = vec![0.0_f32; kept_n];
+        let mut row_flip_keep = vec![false; kept_n];
+        let mut active_cursor = 0usize;
+
+        for source_start in (0..n_snps_total).step_by(rows_per_block) {
+            let requested_rows = (n_snps_total - source_start).min(rows_per_block);
+            let byte_len = requested_rows
+                .checked_mul(bytes_per_snp)
+                .ok_or_else(|| "PGEN packed row metadata buffer size overflow".to_string())?;
+            let rows_read = reader.read_source_block(
+                source_start,
+                requested_rows,
+                &mut packed_block[..byte_len],
+            )?;
+            if rows_read != requested_rows {
+                return Err(format!(
+                    "PGEN metadata reader returned {rows_read} rows, expected {requested_rows} at source row {source_start}"
+                ));
+            }
+
+            let source_end = source_start + requested_rows;
+            let active_start = active_cursor;
+            while active_cursor < kept_n && row_source_indices[active_cursor] < source_end {
+                if row_source_indices[active_cursor] < source_start {
+                    return Err("PGEN source rows are not in scan order".to_string());
+                }
+                active_cursor += 1;
+            }
+            if active_cursor > active_start {
+                let active_rows = &row_source_indices[active_start..active_cursor];
+                maf_keep[active_start..active_cursor]
+                    .par_iter_mut()
+                    .zip(row_flip_keep[active_start..active_cursor].par_iter_mut())
+                    .zip(active_rows.par_iter())
+                    .for_each(|((maf_v, row_flip_v), &source_row)| {
+                        let local_row = source_row - source_start;
+                        let byte_start = local_row * bytes_per_snp;
+                        let row = &packed_block[byte_start..byte_start + bytes_per_snp];
+                        let (missing, het, hom_alt) = if stats_identity {
+                            count_packed_row_counts(row, n_samples)
+                        } else {
+                            count_packed_row_counts_selected_with_excluded(
+                                row,
+                                n_samples,
+                                stats_sample_indices,
+                                stats_excluded_sample_indices.as_deref(),
+                            )
+                        };
+                        let non_missing = stats_n_samples.saturating_sub(missing);
+                        let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
+                        let (_, maf, _) =
+                            packed_row_stats_from_counts(stats_n_samples, non_missing, alt_sum);
+                        // PVAR ALT is not guaranteed to be the minor allele.
+                        // The downstream decoder flips rows when ALT AF > 0.5,
+                        // so its centering frequency must always be MAF.
+                        *maf_v = maf;
+                        *row_flip_v = alt_sum > non_missing;
+                    });
+            }
+        }
+        if active_cursor != kept_n {
+            return Err(format!(
+                "PGEN row metadata found {active_cursor} of {kept_n} requested source rows"
+            ));
+        }
+
+        return Ok(PackedBedRowMetaOwned {
+            maf: maf_keep,
+            row_flip: row_flip_keep,
+            n_samples,
+            bytes_per_snp,
+        });
+    }
+
     let bed_path = format!("{bed_prefix}.bed");
     let bed_file = File::open(&bed_path).map_err(|e| format!("failed to open {bed_path}: {e}"))?;
     let mmap =
@@ -7711,13 +8382,11 @@ pub(crate) fn compute_bed_row_meta_owned_for_source_rows(
             };
             let non_missing = stats_n_samples.saturating_sub(missing);
             let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
-            let af = if non_missing > 0 {
-                (alt_sum as f32) / (2.0_f32 * non_missing as f32)
-            } else {
-                0.0_f32
-            };
-            *maf_v = af.clamp(0.0, 1.0);
-            *row_flip_v = af > 0.5_f32;
+            let (_, maf, _) = packed_row_stats_from_counts(stats_n_samples, non_missing, alt_sum);
+            // BED bit 11 counts the second BIM allele, which need not be the
+            // minor allele. Rows flipped below must be centered at MAF.
+            *maf_v = maf;
+            *row_flip_v = alt_sum > non_missing;
         });
 
     Ok(PackedBedRowMetaOwned {
@@ -8098,6 +8767,20 @@ pub fn scan_bed_2bit_packed_stats<'py>(
                 &format!("prefix={bed_prefix} n_samples={n_samples}"),
             );
 
+            if crate::pgen::path_uses_pgen(&bed_prefix) {
+                let (missing_rate, maf, std_denom, row_flip, het_rate, n_snps) =
+                    scan_pgen_packed_stats(&bed_prefix, n_samples)?;
+                return Ok((
+                    missing_rate,
+                    maf,
+                    std_denom,
+                    row_flip,
+                    het_rate,
+                    n_samples,
+                    n_snps,
+                ));
+            }
+
             let bed_path = format!("{bed_prefix}.bed");
             let bed_file = File::open(&bed_path)
                 .map_err(|e| format!("failed to open {bed_path}: {e}"))?;
@@ -8222,6 +8905,76 @@ pub(crate) fn is_simple_snp_allele(a: &str) -> bool {
             bytes[0],
             b'A' | b'C' | b'G' | b'T' | b'a' | b'c' | b'g' | b't'
         )
+}
+
+fn read_pvar_simple_snp_allele_mask(prefix: &str) -> Result<Vec<u8>, String> {
+    let path = PathBuf::from(format!("{prefix}.pvar"));
+    let file = File::open(&path).map_err(|error| format!("open {}: {error}", path.display()))?;
+    let mut reader = BufReader::with_capacity(1 << 20, file);
+    let mut line = String::new();
+    let mut line_no = 0usize;
+    let mut ref_idx = None;
+    let mut alt_idx = None;
+    let mut mask = Vec::new();
+    loop {
+        line.clear();
+        let bytes_read = reader
+            .read_line(&mut line)
+            .map_err(|error| format!("{}:{}: {error}", path.display(), line_no + 1))?;
+        if bytes_read == 0 {
+            break;
+        }
+        line_no += 1;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("##") {
+            continue;
+        }
+        let fields = trimmed.split_whitespace().collect::<Vec<_>>();
+        if trimmed.starts_with('#') {
+            let columns = fields
+                .iter()
+                .map(|field| field.trim_start_matches('#').to_ascii_uppercase())
+                .collect::<Vec<_>>();
+            ref_idx = columns.iter().position(|column| column == "REF");
+            alt_idx = columns.iter().position(|column| column == "ALT");
+            if ref_idx.is_none() || alt_idx.is_none() {
+                return Err(format!(
+                    "{}:{}: PVAR header must contain REF and ALT columns",
+                    path.display(),
+                    line_no
+                ));
+            }
+            continue;
+        }
+        let ref_idx = ref_idx.ok_or_else(|| {
+            format!(
+                "{}:{}: PVAR must include a #CHROM header",
+                path.display(),
+                line_no
+            )
+        })?;
+        let alt_idx = alt_idx.expect("REF and ALT header positions are validated together");
+        let ref_allele = fields
+            .get(ref_idx)
+            .ok_or_else(|| format!("{}:{}: PVAR row is missing REF", path.display(), line_no))?;
+        let alt_allele = fields
+            .get(alt_idx)
+            .ok_or_else(|| format!("{}:{}: PVAR row is missing ALT", path.display(), line_no))?;
+        if *alt_allele == "." || alt_allele.contains(',') {
+            return Err(format!(
+                "{}:{}: only biallelic PGEN variants are supported; ALT={alt_allele}",
+                path.display(),
+                line_no
+            ));
+        }
+        mask.push(u8::from(
+            is_simple_snp_allele(ref_allele) && is_simple_snp_allele(alt_allele),
+        ));
+    }
+    if mask.is_empty() {
+        return Err(format!("{} contains zero variants", path.display()));
+    }
+    Ok(mask)
 }
 
 #[inline]
@@ -10048,13 +10801,7 @@ pub fn load_site_info(
         return Err(PyValueError::new_err("path_or_prefix must not be empty"));
     }
 
-    let lower = p.to_ascii_lowercase();
-    let is_plink_explicit =
-        lower.ends_with(".bed") || lower.ends_with(".bim") || lower.ends_with(".fam");
-    let is_plink_prefix = Path::new(&(p.clone() + ".bed")).exists()
-        && Path::new(&(p.clone() + ".bim")).exists()
-        && Path::new(&(p.clone() + ".fam")).exists();
-    if is_plink_explicit || is_plink_prefix {
+    if is_plink_path_or_prefix_local(&p) {
         let prefix = normalize_plink_prefix_local(&p);
         let sites = core::read_bim(&prefix).map_err(PyRuntimeError::new_err)?;
         return Ok(sites.into_iter().map(Into::into).collect());
@@ -10075,15 +10822,9 @@ pub fn load_bim_columns<'py>(
         return Err(PyValueError::new_err("path_or_prefix must not be empty"));
     }
 
-    let lower = p.to_ascii_lowercase();
-    let is_plink_explicit =
-        lower.ends_with(".bed") || lower.ends_with(".bim") || lower.ends_with(".fam");
-    let is_plink_prefix = Path::new(&(p.clone() + ".bed")).exists()
-        && Path::new(&(p.clone() + ".bim")).exists()
-        && Path::new(&(p.clone() + ".fam")).exists();
-    if !(is_plink_explicit || is_plink_prefix) {
+    if !is_plink_path_or_prefix_local(&p) {
         return Err(PyValueError::new_err(
-            "load_bim_columns requires a PLINK BED/BIM/FAM prefix or explicit PLINK file path",
+            "load_bim_columns requires a PLINK BED/BIM/FAM or PGEN/PVAR/PSAM prefix",
         ));
     }
 
@@ -10607,6 +11348,273 @@ mod tests {
         });
 
         fs::remove_dir_all(dir).expect("remove temporary BED directory");
+    }
+
+    #[test]
+    fn pgen_bed_chunk_reader_uses_direct_dosage_blocks() {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        pyo3::Python::initialize();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("janusx_pgen_chunk_f32_{stamp}"));
+        fs::create_dir_all(&dir).expect("create temporary PGEN directory");
+        let prefix = dir.join("tiny");
+        let mut pgen = vec![0x6c, 0x1b, 0x02];
+        pgen.extend_from_slice(&2u32.to_le_bytes());
+        pgen.extend_from_slice(&5u32.to_le_bytes());
+        pgen.push(0); // fixed hard-call storage flags
+        pgen.extend_from_slice(&[0xc4, 0x01, 0xaa, 0x02]);
+        fs::write(prefix.with_extension("pgen"), pgen).expect("write PGEN");
+        fs::write(
+            prefix.with_extension("psam"),
+            "#FID IID\nf1 s1\nf1 s2\nf1 s3\nf1 s4\nf1 s5\n",
+        )
+        .expect("write PSAM");
+        fs::write(
+            prefix.with_extension("pvar"),
+            "#CHROM POS ID REF ALT\n1 10 rs1 A G\n1 20 rs2 C T\n",
+        )
+        .expect("write PVAR");
+
+        pyo3::Python::attach(|py| {
+            use numpy::PyArrayMethods;
+
+            let mut reader = BedChunkReader::new(
+                prefix.to_string_lossy().into_owned(),
+                Some(0.0),
+                Some(1.0),
+                Some(false),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(1.0),
+                Some(true),
+                None,
+            )
+            .expect("construct PGEN chunk reader");
+            assert_eq!(reader.sample_ids(), vec!["s1", "s2", "s3", "s4", "s5"]);
+            assert_eq!(reader.n_snps(), 2);
+            let (genotypes, sites) = reader
+                .next_chunk(py, 3)
+                .expect("read PGEN chunk")
+                .expect("PGEN chunk should contain variants");
+            assert_eq!(
+                sites
+                    .iter()
+                    .map(|site| site.snp.as_str())
+                    .collect::<Vec<_>>(),
+                ["rs1", "rs2"]
+            );
+            assert_eq!(
+                genotypes
+                    .readonly()
+                    .as_array()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                vec![0.0_f32, 1.0, 0.0, -9.0, 1.0, 2.0, 2.0, 2.0, 2.0, 2.0]
+            );
+            assert!(reader
+                .next_chunk(py, 3)
+                .expect("finish PGEN reader")
+                .is_none());
+        });
+
+        fs::remove_dir_all(dir).expect("remove temporary PGEN directory");
+    }
+
+    #[test]
+    fn pgen_prefix_is_recognized_by_site_metadata_entrypoints() {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("janusx_pgen_metadata_{stamp}"));
+        fs::create_dir_all(&dir).expect("create temporary PGEN directory");
+        let prefix = dir.join("tiny");
+        fs::write(prefix.with_extension("pgen"), [0x6c, 0x1b, 0x02])
+            .expect("write minimal PGEN marker");
+        fs::write(prefix.with_extension("psam"), "#IID\ns1\n").expect("write PSAM");
+        fs::write(
+            prefix.with_extension("pvar"),
+            "#CHROM POS ID REF ALT\n1 10 rs1 A G\n",
+        )
+        .expect("write PVAR");
+
+        let prefix_text = prefix.to_string_lossy().into_owned();
+        assert!(super::is_plink_path_or_prefix_local(&prefix_text));
+        assert!(super::is_plink_path_or_prefix_local(&format!(
+            "{prefix_text}.pgen"
+        )));
+        let sites = crate::gfcore::read_bim_columns(&prefix_text, Some(&[0]))
+            .expect("read selected PVAR metadata");
+        assert_eq!(sites.0, vec!["1"]);
+        assert_eq!(sites.1, vec![10]);
+        assert_eq!(sites.2, vec!["rs1"]);
+        assert_eq!(sites.3, vec!["A"]);
+        assert_eq!(sites.4, vec!["G"]);
+
+        fs::remove_dir_all(dir).expect("remove temporary PGEN directory");
+    }
+
+    #[test]
+    fn row_meta_for_pgen_reads_selected_source_rows_and_sample_subset() {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("janusx_pgen_row_meta_{stamp}"));
+        fs::create_dir_all(&dir).expect("create temporary PGEN directory");
+        let prefix = dir.join("tiny");
+        let mut pgen = vec![0x6c, 0x1b, 0x02];
+        pgen.extend_from_slice(&2u32.to_le_bytes());
+        pgen.extend_from_slice(&5u32.to_le_bytes());
+        pgen.push(0); // fixed hard-call storage flags
+        pgen.extend_from_slice(&[0xc4, 0x01, 0xaa, 0x02]);
+        fs::write(prefix.with_extension("pgen"), pgen).expect("write PGEN");
+        fs::write(
+            prefix.with_extension("psam"),
+            "#FID IID\nf1 s1\nf1 s2\nf1 s3\nf1 s4\nf1 s5\n",
+        )
+        .expect("write PSAM");
+        fs::write(
+            prefix.with_extension("pvar"),
+            "#CHROM POS ID REF ALT\n1 10 rs1 A G\n1 20 rs2 C T\n",
+        )
+        .expect("write PVAR");
+
+        let stats_samples = [0usize, 2, 4];
+        let meta = super::compute_bed_row_meta_owned_for_source_rows(
+            prefix.to_str().unwrap(),
+            &[0, 1],
+            Some(&stats_samples),
+        )
+        .expect("compute PGEN row metadata");
+
+        assert_eq!(meta.n_samples, 5);
+        assert_eq!(meta.bytes_per_snp, 2);
+        assert!((meta.maf[0] - (1.0 / 6.0)).abs() < 1e-6);
+        assert!((meta.maf[1] - 0.0).abs() < 1e-6);
+        assert_eq!(meta.row_flip, [false, true]);
+
+        let bed_prefix = dir.join("tiny_bed");
+        fs::write(
+            bed_prefix.with_extension("fam"),
+            "f1 s1 0 0 1 -9\nf1 s2 0 0 1 -9\nf1 s3 0 0 1 -9\nf1 s4 0 0 1 -9\nf1 s5 0 0 1 -9\n",
+        )
+        .expect("write FAM");
+        let mut bed = vec![0x6c, 0x1b, 0x01];
+        bed.extend(pack_plink_codes(&[0b11, 0b10, 0b11, 0b01, 0b10]));
+        bed.extend(pack_plink_codes(&[0b00, 0b00, 0b00, 0b00, 0b00]));
+        fs::write(bed_prefix.with_extension("bed"), bed).expect("write BED");
+
+        let bed_meta = super::compute_bed_row_meta_owned_for_source_rows(
+            bed_prefix.to_str().unwrap(),
+            &[0, 1],
+            Some(&stats_samples),
+        )
+        .expect("compute reverse-encoded BED row metadata");
+        assert_eq!(bed_meta.maf, meta.maf);
+        assert_eq!(bed_meta.row_flip, [true, false]);
+        fs::remove_dir_all(dir).expect("remove temporary PGEN directory");
+    }
+
+    #[test]
+    fn fused_pgen_qc_load_matches_selected_hard_calls_and_pvar_snp_filter() {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("janusx_pgen_fused_qc_{stamp}"));
+        fs::create_dir_all(&dir).expect("create temporary PGEN directory");
+        let prefix = dir.join("tiny");
+        let prefix_text = prefix.to_string_lossy().into_owned();
+
+        // Two fixed hard-call rows, five samples; row 0 is a simple SNP and
+        // row 1 is indel-like and should be removed when snps_only is enabled.
+        let mut pgen = vec![0x6c, 0x1b, 0x02];
+        pgen.extend_from_slice(&2u32.to_le_bytes());
+        pgen.extend_from_slice(&5u32.to_le_bytes());
+        pgen.push(0);
+        pgen.extend_from_slice(&[0xc4, 0x01, 0xaa, 0x02]);
+        fs::write(prefix.with_extension("pgen"), pgen).expect("write PGEN");
+        fs::write(
+            prefix.with_extension("psam"),
+            "#FID IID\nf1 s1\nf1 s2\nf1 s3\nf1 s4\nf1 s5\n",
+        )
+        .expect("write PSAM");
+        fs::write(
+            prefix.with_extension("pvar"),
+            "#CHROM POS ID REF ALT\n1 10 rs1 A G\n1 20 rs2 AT C\n",
+        )
+        .expect("write PVAR");
+
+        let selected = [0usize, 2, 4];
+        let fused = super::prepare_pgen_fused_qc_packed_owned_for_stats_samples(
+            prefix_text.as_str(),
+            0.1,
+            1.0,
+            1.0,
+            true,
+            Some(&selected),
+        )
+        .expect("fused PGEN QC and packed load");
+
+        let mut source = crate::gload::PackedBedSourceReader::open(prefix_text.as_str(), 5)
+            .expect("open PGEN source reference");
+        let mut source_rows = vec![0u8; 2 * 2];
+        let mut source_stats = [crate::pgen::GenotypeRowStats::default(); 2];
+        let mut source_keep = [false; 2];
+        source
+            .read_source_block_with_qc(
+                0,
+                2,
+                crate::pgen::GenotypeSampleSelection::include(&selected),
+                &mut source_rows,
+                &mut source_stats,
+                &mut source_keep,
+                &|_, _| true,
+            )
+            .expect("read reference packed rows and stats");
+
+        assert_eq!(fused.meta.row_source_indices, [0]);
+        assert_eq!(fused.meta.n_samples, 5);
+        assert_eq!(fused.meta.n_snps_total, 2);
+        assert_eq!(fused.meta.bytes_per_snp, 2);
+        assert_eq!(fused.packed_all_rows, source_rows[..2]);
+        assert_eq!(fused.meta.row_flip, [false]);
+        assert_eq!(
+            fused.meta.missing_rate[0],
+            source_stats[0].missing_rate().unwrap()
+        );
+        assert_eq!(
+            fused.meta.maf[0],
+            source_stats[0].alternate_allele_frequency().unwrap()
+        );
+
+        fs::remove_dir_all(dir).expect("remove temporary PGEN directory");
     }
 
     #[test]

@@ -7,13 +7,14 @@ Design overview
 Input:
   - VCF   : genotype in VCF/VCF.GZ format
   - BFILE : genotype in PLINK binary format (.bed/.bim/.fam prefix)
+  - PFILE : genotype in PLINK 2 format (.pgen/.pvar/.psam prefix)
   - FILE  : genotype numeric matrix (.txt/.tsv/.csv/.npy) with sibling prefix.id
 
 Implementation:
   - GRM construction is executed by Rust kernels:
-      * `grm_stream_bed_f32` (memmap/windowed BED)
-      * `grm_packed_bed_f32` (packed BED)
-  - For VCF/HMP/TXT-like input, CLI materializes PLINK BED cache first.
+      * `grm_stream_bed_f32` (streamed packed PLINK genotypes)
+      * `grm_packed_bed_f32` (packed PLINK genotypes)
+  - For VCF/HMP/TXT-like input, CLI materializes a PLINK BED cache first.
   - SNPs are filtered by MAF and missing rate inside Rust kernels.
 
 Output:
@@ -148,14 +149,23 @@ _GRM_WORKING_BUFFERS_DENSE = 2
 _GRM_WORKING_BUFFERS_SPARSE = 2
 
 
-def _is_plink_prefix_path(path_or_prefix: str) -> bool:
+def _normalize_plink_prefix_path(path_or_prefix: str) -> str:
     p = str(path_or_prefix).strip()
+    low = p.lower()
+    for suffix in (".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"):
+        if low.endswith(suffix):
+            return p[: -len(suffix)]
+    return p
+
+
+def _is_plink_prefix_path(path_or_prefix: str) -> bool:
+    p = _normalize_plink_prefix_path(path_or_prefix)
     if p == "":
         return False
-    low = p.lower()
-    if low.endswith(".bed") or low.endswith(".bim") or low.endswith(".fam"):
-        p = p[:-4]
-    return all(os.path.isfile(f"{p}.{ext}") for ext in ("bed", "bim", "fam"))
+    return any(
+        all(os.path.isfile(f"{p}.{ext}") for ext in extensions)
+        for extensions in (("bed", "bim", "fam"), ("pgen", "pvar", "psam"))
+    )
 
 
 def _log_file_only(
@@ -315,7 +325,7 @@ def _emit_grm_configuration(
         auto_requested=bool(auto_memory_requested),
         resolved=bool(memory_resolved),
     )
-    bed_backend_policy = "auto: memmap primary, packed fallback"
+    plink_backend_policy = "auto: streaming primary, packed fallback"
     general_rows = (
         [
             ("Dense GRM file", gfile),
@@ -352,7 +362,7 @@ def _emit_grm_configuration(
                     detected_threads=int(detected_threads),
                 ),
             ),
-            ("BED backend", bed_backend_policy),
+            ("PLINK backend", plink_backend_policy),
             ("Save as text", args.txt),
         ]
     )
@@ -433,13 +443,11 @@ def _resolve_rust_grm_input(
     threads: int = 0,
 ) -> str:
     if _is_plink_prefix_path(str(genofile)):
-        p = str(genofile).strip()
-        low = p.lower()
-        return p[:-4] if (low.endswith(".bed") or low.endswith(".bim") or low.endswith(".fam")) else p
+        return _normalize_plink_prefix_path(str(genofile))
 
     if not bool(from_vcf or from_hmp or from_file):
         raise RuntimeError(
-            f"Rust GRM backend requires PLINK BED input, got: {genofile}"
+            f"Rust GRM backend requires PLINK BED/PGEN input, got: {genofile}"
         )
 
     delim = "," if (from_file and str(genofile).lower().endswith(".csv")) else None
@@ -452,7 +460,7 @@ def _resolve_rust_grm_input(
     )
     if not _is_plink_prefix_path(str(cached)):
         raise RuntimeError(
-            "Rust GRM backend requires PLINK BED-compatible input. "
+            "Rust GRM backend requires PLINK BED/PGEN-compatible input. "
             f"Failed to materialize BED cache from: {genofile}"
     )
     return str(cached)
@@ -2625,7 +2633,7 @@ def main(log: bool = True):
         return
 
     # ------------------------------------------------------------------
-    # Resolve Rust GRM input (PLINK BED or cache-converted BED)
+    # Resolve Rust GRM input (PLINK BED/PGEN or cache-converted BED)
     # ------------------------------------------------------------------
     grm_input = str(gfile)
     if (_grm_stream_bed_f32 is not None) or (_grm_packed_bed_f32 is not None):
@@ -2645,7 +2653,7 @@ def main(log: bool = True):
                 )
         except Exception as ex:
             raise RuntimeError(
-                "Unable to route GRM build to Rust BED backend. "
+                "Unable to route GRM build to Rust PLINK backend. "
                 f"source={gfile}; reason={ex}"
             ) from ex
 
@@ -3144,7 +3152,7 @@ def main(log: bool = True):
                     logger=logger,
                 )
         elif (grm is None) and (grm_path is None):
-            logger.info("Memmap GRM kernel unavailable; using Rust Packed BED backend.")
+            logger.info("Memmap GRM kernel unavailable; using Rust packed PLINK backend.")
             grm, eff_m = build_grm_packed_bed(
                 genofile=grm_input,
                 n_samples=n_samples,

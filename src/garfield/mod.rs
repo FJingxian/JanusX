@@ -2000,11 +2000,12 @@ fn write_subset_id_sidecar(
 fn normalize_plink_prefix(path_or_prefix: &str) -> String {
     let s = path_or_prefix.trim();
     let low = s.to_ascii_lowercase();
-    if low.ends_with(".bed") || low.ends_with(".bim") || low.ends_with(".fam") {
-        s[..s.len() - 4].to_string()
-    } else {
-        s.to_string()
+    for suffix in [".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"] {
+        if low.ends_with(suffix) {
+            return s[..s.len() - suffix.len()].to_string();
+        }
     }
+    s.to_string()
 }
 
 fn make_input_reader(
@@ -9296,7 +9297,7 @@ fn convert_bed_prefix_to_logic_bits(
                     let row = bed_ref
                         .packed_snp_bytes_at(src_row)
                         .expect("windowed BED logic conversion row should be mapped");
-                    fill_bin_logic_row_bits_identity(row, n_samples, flip, dst_rows);
+                    fill_bin_logic_row_bits_identity(&row, n_samples, flip, dst_rows);
                 });
         } else {
             dst_lo.par_chunks_mut(row_words).enumerate().for_each_init(
@@ -9309,7 +9310,7 @@ fn convert_bed_prefix_to_logic_bits(
                         .packed_snp_bytes_at(src_row)
                         .expect("windowed BED logic conversion row should be mapped");
                     fill_bin_logic_row_bits_one_pass(
-                        row,
+                        &row,
                         flip,
                         sample_plan.as_slice(),
                         dst_rows,
@@ -15394,7 +15395,12 @@ fn build_max6_prepared_input_fingerprint(
     config: &Max6PreparationConfigFingerprint,
 ) -> Result<Max6PreparedInputFingerprint, String> {
     let base = normalize_plink_prefix(prefix);
-    let files = ["bed", "bim", "fam"]
+    let input_extensions = if crate::pgen::path_uses_pgen(base.as_str()) {
+        ["pgen", "pvar", "psam"]
+    } else {
+        ["bed", "bim", "fam"]
+    };
+    let files = input_extensions
         .into_iter()
         .map(|extension| {
             Max6PreparedFileFingerprint::from_path(Path::new(
@@ -18980,7 +18986,7 @@ fn prepare_max6_global_qc_and_logic_bits(
         bed_iter.ensure_window_for_snp(base)?;
         let mapped_rows = bed_iter.mapped_contiguous_snps_from(base);
         if mapped_rows == 0 {
-            return Err("Max6 fused BED scan reached an empty mmap window".to_string());
+            return Err("Max6 fused genotype scan reached an empty input window".to_string());
         }
         let scan_rows = mapped_rows.min(max_batch_rows);
         let batch_words = scan_rows
@@ -18988,9 +18994,31 @@ fn prepare_max6_global_qc_and_logic_bits(
             .ok_or_else(|| "Max6 fused logic batch size overflow".to_string())?;
         let mut qc_batch = vec![Max6FusedRowQc::default(); scan_rows];
         let mut row_bits = vec![0u64; batch_words];
-        let it_ref: &BedSnpIter = &bed_iter;
         let sites_all_ref = sites_all.as_ref();
-        let mut run = || {
+        let process_row =
+            |source_row: usize, row: &[u8], dst_words: &mut [u64], missing_words: &mut [u64]| {
+                let simple_snp_alleles = sites_all_ref
+                    .map(|sites| {
+                        let site = &sites[source_row];
+                        is_simple_snp_allele(&site.ref_allele)
+                            && is_simple_snp_allele(&site.alt_allele)
+                    })
+                    .unwrap_or(true);
+                scan_max6_row_qc_and_pack_logic(
+                    row,
+                    n_samples,
+                    sample_identity,
+                    sample_plan.as_slice(),
+                    maf_threshold,
+                    max_missing_rate,
+                    simple_snp_alleles,
+                    dst_words,
+                    missing_words,
+                )
+            };
+
+        let it_ref: &BedSnpIter = &bed_iter;
+        let mut run_rows = || {
             row_bits
                 .par_chunks_mut(row_words)
                 .zip(qc_batch.par_iter_mut())
@@ -19001,32 +19029,16 @@ fn prepare_max6_global_qc_and_logic_bits(
                         let source_row = base + off;
                         let row = it_ref
                             .packed_snp_bytes_at(source_row)
-                            .expect("Max6 fused BED row should be mapped");
-                        let simple_snp_alleles = sites_all_ref
-                            .map(|sites| {
-                                let site = &sites[source_row];
-                                is_simple_snp_allele(&site.ref_allele)
-                                    && is_simple_snp_allele(&site.alt_allele)
-                            })
-                            .unwrap_or(true);
-                        *qc_dst = scan_max6_row_qc_and_pack_logic(
-                            row,
-                            n_samples,
-                            sample_identity,
-                            sample_plan.as_slice(),
-                            maf_threshold,
-                            max_missing_rate,
-                            simple_snp_alleles,
-                            dst_words,
-                            missing_words.as_mut_slice(),
-                        );
+                            .expect("Max6 fused packed row should be mapped");
+                        *qc_dst =
+                            process_row(source_row, &row, dst_words, missing_words.as_mut_slice());
                     },
                 );
         };
         if let Some(pool) = pool.as_ref() {
-            pool.install(&mut run);
+            pool.install(&mut run_rows);
         } else {
-            run();
+            run_rows();
         }
         check_ctrlc()?;
 
@@ -29864,6 +29876,91 @@ mod tests {
     use super::*;
 
     #[test]
+    fn max6_pgen_row_path_matches_equivalent_bed_input() {
+        let pgen_dir = make_temp_dir("max6_pgen_row_path");
+        let bed_dir = make_temp_dir("max6_bed_row_path");
+        let pgen_prefix = pgen_dir.join("toy");
+        let bed_prefix = bed_dir.join("toy");
+
+        let mut pgen = vec![0x6c, 0x1b, 0x10];
+        pgen.extend_from_slice(&2u32.to_le_bytes());
+        pgen.extend_from_slice(&5u32.to_le_bytes());
+        pgen.push(0); // 4-bit record types and 1-byte record lengths.
+        pgen.extend_from_slice(&23u64.to_le_bytes()); // first record block.
+        pgen.extend_from_slice(&[0x00, 2, 2]); // two type-0 records, each two bytes.
+        pgen.extend_from_slice(&[0xc4, 0x01, 0xaa, 0x02]);
+        fs::write(pgen_prefix.with_extension("pgen"), pgen).unwrap();
+        fs::write(
+            pgen_prefix.with_extension("psam"),
+            "#FID IID\nf s1\nf s2\nf s3\nf s4\nf s5\n",
+        )
+        .unwrap();
+        fs::write(
+            pgen_prefix.with_extension("pvar"),
+            "#CHROM POS ID REF ALT\n1 10 rs1 A G\n1 20 rs2 C T\n",
+        )
+        .unwrap();
+
+        let mut bed = vec![0x6c, 0x1b, 0x01];
+        bed.extend_from_slice(&[0x48, 0x02, 0xff, 0x03]);
+        fs::write(bed_prefix.with_extension("bed"), bed).unwrap();
+        fs::write(
+            bed_prefix.with_extension("fam"),
+            "f s1 0 0 0 -9\nf s2 0 0 0 -9\nf s3 0 0 0 -9\nf s4 0 0 0 -9\nf s5 0 0 0 -9\n",
+        )
+        .unwrap();
+        fs::write(
+            bed_prefix.with_extension("bim"),
+            "1 rs1 0 10 A G\n1 rs2 0 20 C T\n",
+        )
+        .unwrap();
+
+        let sample_ids = (1..=5).map(|idx| format!("s{idx}")).collect::<Vec<_>>();
+        let sample_indices = (0..5).collect::<Vec<_>>();
+        let run = |prefix: &Path| {
+            prepare_max6_global_qc_and_logic_bits(
+                prefix.to_str().unwrap(),
+                &sample_ids,
+                &sample_indices,
+                0.0,
+                1.0,
+                1.0,
+                true,
+                2,
+                1_000_000,
+                None,
+            )
+            .unwrap()
+        };
+
+        let (pgen_keep, pgen_rows, pgen_logic) = run(&pgen_prefix);
+        let (bed_keep, bed_rows, bed_logic) = run(&bed_prefix);
+        assert_eq!(pgen_keep, bed_keep);
+        assert_eq!(pgen_rows, bed_rows);
+        assert_eq!(pgen_logic.bits(), bed_logic.bits());
+        let site_metadata = |logic: &GarfieldLogicBits| {
+            logic
+                .sites
+                .iter()
+                .map(|site| {
+                    (
+                        site.chrom().to_string(),
+                        site.snp().to_string(),
+                        site.pos,
+                        site.ref_allele().to_string(),
+                        site.alt_allele().to_string(),
+                        site.mode,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(site_metadata(&pgen_logic), site_metadata(&bed_logic));
+
+        let _ = fs::remove_dir_all(pgen_dir);
+        let _ = fs::remove_dir_all(bed_dir);
+    }
+
+    #[test]
     fn max6_cross_window_order_uses_score_then_window_pair_tie_key() {
         let scores = [4.0, 9.0, 9.0, 4.0];
         let tie_keys = [7, 12, 3, 2];
@@ -30426,6 +30523,57 @@ mod tests {
                 .collect(),
             config_fingerprint,
         }
+    }
+
+    #[test]
+    fn max6_prepared_fingerprint_tracks_pgen_file_trio() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "janusx-max6-pgen-fingerprint-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let prefix = dir.join("tiny");
+        for extension in ["pgen", "pvar", "psam"] {
+            fs::write(prefix.with_extension(extension), b"test").unwrap();
+        }
+        let config = Max6PreparationConfigFingerprint::new(
+            "window",
+            None,
+            None,
+            5000,
+            Some(10000),
+            None,
+            &[0, 1],
+            0.02,
+            0.05,
+            1.0,
+            false,
+            GARFIELD_MAX6_LD_TAG_R2_DEFAULT,
+        );
+
+        let fingerprint = build_max6_prepared_input_fingerprint(
+            prefix.to_str().unwrap(),
+            vec!["s1".to_string(), "s2".to_string()],
+            &config,
+        )
+        .unwrap();
+        let fingerprint_with_suffix = build_max6_prepared_input_fingerprint(
+            format!("{}.pgen", prefix.display()).as_str(),
+            vec!["s1".to_string(), "s2".to_string()],
+            &config,
+        )
+        .unwrap();
+
+        assert_eq!(fingerprint.files.len(), 3);
+        assert_eq!(fingerprint.files, fingerprint_with_suffix.files);
+        assert!(fingerprint.files[0].path.ends_with("tiny.pgen"));
+        assert!(fingerprint.files[1].path.ends_with("tiny.pvar"));
+        assert!(fingerprint.files[2].path.ends_with("tiny.psam"));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

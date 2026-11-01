@@ -127,6 +127,8 @@ mod gwasio;
 mod gwriter;
 #[path = "kmer/mod.rs"]
 pub mod kmer;
+#[path = "io/pgen.rs"]
+mod pgen;
 #[path = "io/pipeline.rs"]
 mod pipeline;
 #[path = "io/sim.rs"]

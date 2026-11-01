@@ -107,12 +107,8 @@ def ensure_file_exists(logger, path: str, label: str) -> bool:
     p = safe_expanduser(path)
     if p.is_file():
         return True
-    # Accept PLINK prefix paths (prefix + .bed/.bim/.fam) for
-    # genotype inputs that are normalized to cache-backed BED prefixes.
-    if p.suffix == "":
-        required = [Path(f"{p}{ext}") for ext in (".bed", ".bim", ".fam")]
-        if all(r.is_file() for r in required):
-            return True
+    if _plink_prefix_paths(p) is not None:
+        return True
     logger.error(f"{label} not found: {_norm(str(p))}")
     return False
 
@@ -207,14 +203,56 @@ def ensure_file_input_site_metadata_exists(
 
 def ensure_plink_prefix_exists(logger, prefix: str, label: str = "PLINK prefix") -> bool:
     pfx = safe_expanduser(prefix)
-    required = [Path(f"{pfx}{ext}") for ext in (".bed", ".bim", ".fam")]
-    missing = [p for p in required if not p.is_file()]
-    if not missing:
+    paths = _plink_prefix_paths(pfx)
+    if paths is not None:
         return True
+    raw = str(pfx)
+    lower = raw.lower()
+    selected = None
+    for suffix, family in (
+        (".bed", (".bed", ".bim", ".fam")),
+        (".bim", (".bed", ".bim", ".fam")),
+        (".fam", (".bed", ".bim", ".fam")),
+        (".pgen", (".pgen", ".pvar", ".psam")),
+        (".pvar", (".pgen", ".pvar", ".psam")),
+        (".psam", (".pgen", ".pvar", ".psam")),
+    ):
+        if lower.endswith(suffix):
+            raw = raw[: -len(suffix)]
+            selected = family
+            break
+    if selected is None:
+        selected = (
+            (".pgen", ".pvar", ".psam")
+            if any(Path(f"{raw}{ext}").exists() for ext in (".pgen", ".pvar", ".psam"))
+            else (".bed", ".bim", ".fam")
+        )
+    missing = [Path(f"{raw}{ext}") for ext in selected if not Path(f"{raw}{ext}").is_file()]
     logger.error(f"{label} is incomplete: {_norm(str(pfx))}")
     for p in missing:
         logger.error(f"Missing file: {_norm(str(p))}")
     return False
+
+
+def _plink_prefix_paths(path: Path) -> list[Path] | None:
+    raw = str(path)
+    lower = raw.lower()
+    prefix = raw
+    for suffix in (".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"):
+        if lower.endswith(suffix):
+            prefix = raw[: -len(suffix)]
+            break
+    if Path(f"{prefix}.bed").exists():
+        families = ((".bed", ".bim", ".fam"),)
+    elif any(Path(f"{prefix}{ext}").exists() for ext in (".pgen", ".pvar", ".psam")):
+        families = ((".pgen", ".pvar", ".psam"),)
+    else:
+        families = ((".bed", ".bim", ".fam"),)
+    for family in families:
+        required = [Path(f"{prefix}{ext}") for ext in family]
+        if all(item.is_file() for item in required):
+            return required
+    return None
 
 
 def ensure_all_true(results: Iterable[bool]) -> bool:

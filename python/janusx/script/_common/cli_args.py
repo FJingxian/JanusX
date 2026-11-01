@@ -74,6 +74,8 @@ def _resolve_genotype_source_help(
     kind: str,
     profile: str,
 ) -> str:
+    if str(kind) == "pfile":
+        return "PLINK 2 PGEN prefix (.pgen/.pvar/.psam)."
     key = str(profile).strip().lower()
     table: dict[str, dict[str, str]] = {
         "default": {
@@ -83,7 +85,7 @@ def _resolve_genotype_source_help(
                 "Input genotype numeric matrix (.txt/.tsv/.csv/.npy) or prefix. "
                 "Requires sibling prefix.id. Optional site metadata: prefix.site or prefix.bim."
             ),
-            "bfile": "Input genotype in PLINK binary format (prefix for .bed, .bim, .fam).",
+            "bfile": "PLINK BED prefix (.bed/.bim/.fam).",
         },
         "gstats": {
             "vcf": "Input VCF/VCF.GZ; will be cached as BED before statistics.",
@@ -92,19 +94,19 @@ def _resolve_genotype_source_help(
                 "Input genotype numeric matrix (.txt/.tsv/.csv/.npy/.bin) or prefix. "
                 "Requires sibling prefix.id; BED caching also requires prefix.site or prefix.bim."
             ),
-            "bfile": "PLINK prefix (.bed/.bim/.fam).",
+            "bfile": "PLINK BED prefix (.bed/.bim/.fam).",
         },
         "admixture": {
             "vcf": "VCF/VCF.GZ genotype file.",
             "hmp": "HMP/HMP.GZ genotype file.",
             "file": "Text/NumPy genotype matrix prefix (requires sidecar .id).",
-            "bfile": "PLINK prefix (.bed/.bim/.fam).",
+            "bfile": "PLINK BED prefix (.bed/.bim/.fam).",
         },
         "fastpop": {
             "vcf": "VCF/VCF.GZ genotype file.",
             "hmp": "HMP/HMP.GZ genotype file.",
             "file": "Text/NumPy genotype matrix prefix (requires sidecar .id).",
-            "bfile": "PLINK prefix (.bed/.bim/.fam).",
+            "bfile": "PLINK BED prefix (.bed/.bim/.fam).",
         },
         "gformat": {
             "vcf": "Input genotype file in VCF format (.vcf or .vcf.gz).",
@@ -113,7 +115,7 @@ def _resolve_genotype_source_help(
                 "Input genotype numeric matrix (.txt/.tsv/.csv/.npy) or prefix. "
                 "Requires sibling prefix.id. Optional site metadata: prefix.bsite/prefix.site or prefix.bim."
             ),
-            "bfile": "Input genotype in PLINK binary format (prefix for .bed/.bim/.fam).",
+            "bfile": "Input PLINK BED prefix (.bed/.bim/.fam).",
         },
         "hybrid": {
             "vcf": "Input genotype file in VCF format (.vcf or .vcf.gz).",
@@ -122,10 +124,10 @@ def _resolve_genotype_source_help(
                 "Requires sibling prefix.id. Optional site metadata: prefix.site or prefix.bim. "
                 "When prefix-matched .npy exists, it is preferred."
             ),
-            "bfile": "Input PLINK prefix (.bed/.bim/.fam).",
+            "bfile": "Input PLINK BED prefix (.bed/.bim/.fam).",
         },
         "plink_prefix_short": {
-            "bfile": "PLINK prefix (.bed/.bim/.fam).",
+            "bfile": "PLINK BED prefix (.bed/.bim/.fam).",
         },
     }
     selected = table.get(key, table["default"])
@@ -170,6 +172,14 @@ def add_common_genotype_source_args(
             "--bfile",
             type=str,
             help=_resolve_genotype_source_help(kind="bfile", profile=help_profile),
+        )
+        group.add_argument(
+            "-pfile",
+            "--pfile",
+            dest="bfile",
+            type=str,
+            metavar="PFILE",
+            help=_resolve_genotype_source_help(kind="pfile", profile=help_profile),
         )
 
 

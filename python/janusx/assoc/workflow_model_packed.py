@@ -35,9 +35,13 @@ from janusx.script._common.genoio import (
     packed_preload_reason,
     prepare_packed_ctx_from_plink,
     _scan_bed_2bit_packed_stats_fallback,
+    _is_pgen_prefix,
     normalize_plink_prefix,
     plink_snp_mask,
     scan_bed_2bit_packed_stats,
+)
+from janusx.gfreader.gfreader import (
+    _read_plink_fam_sample_ids as _read_plink_sample_ids,
 )
 
 from .workflow import (
@@ -1344,7 +1348,10 @@ def _build_gwas_global_logic_meta(
     if n_expected <= 0:
         raise ValueError("GWAS global scan metadata requires non-empty PLINK samples.")
 
-    if hasattr(jxrs, "prepare_bed_logic_meta_selected"):
+    # This specialized metadata routine directly opens BED/BIM/FAM files.
+    # PGEN uses the streaming packed-stats reader below, which dispatches to
+    # the native PGEN decoder and then applies the same QC thresholds here.
+    if hasattr(jxrs, "prepare_bed_logic_meta_selected") and not _is_pgen_prefix(str(plink_prefix)):
         threads_use = int(max(1, detect_effective_threads()))
         mmap_window_mb = int(max(1, _current_bed_memory_mb()))
         row_idx, miss, af, row_flip, _site_keep, n_samples_full, n_snps_total = jxrs.prepare_bed_logic_meta_selected(
@@ -2277,14 +2284,7 @@ def _prepare_packed_bed_once_for_gwas(
 
 
 def _read_bed_fam_iids(prefix: str) -> np.ndarray:
-    fam_path = f"{prefix}.fam"
-    ids: list[str] = []
-    with open(fam_path, "r", encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            parts = line.rstrip("\n").split()
-            if len(parts) >= 2:
-                ids.append(str(parts[1]))
-    return np.asarray(ids, dtype=str)
+    return np.asarray(_read_plink_sample_ids(str(prefix)), dtype=str)
 
 
 def _iter_bim_active_rows(prefix: str, active_row_idx: np.ndarray):
@@ -3085,16 +3085,7 @@ def _splmm_sparse_grid_local_summary(null_fit: dict, window: int = 2) -> Optiona
 
 
 def _plink_fam_sample_ids(prefix: str) -> np.ndarray:
-    fam_path = f"{prefix}.fam"
-    fam = pd.read_csv(
-        fam_path,
-        sep=r"\s+",
-        header=None,
-        engine="python",
-        usecols=[1],
-        dtype=str,
-    )
-    return np.asarray(fam.iloc[:, 0].astype(str), dtype=str)
+    return np.asarray(_read_plink_sample_ids(str(prefix)), dtype=str)
 
 
 def _write_splmm_assoc_tsv(

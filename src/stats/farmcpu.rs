@@ -46,8 +46,8 @@ using the final background design and writes pseudo-QTN rows.
 
 use crate::assoc2tsv::resolve_assoc_tsv_metadata;
 use crate::bedmath::{
-    decode_mean_imputed_additive_packed_block_rows_f64_stats, decode_plink_bed_hardcall,
-    packed_byte_lut, packed_row_missing_count_selected,
+    additive_missing_impute_value, decode_mean_imputed_additive_packed_block_rows_f64_stats,
+    decode_plink_bed_hardcall, packed_byte_lut, packed_row_missing_count_selected,
 };
 use crate::blas::{
     cblas_dgemm_dispatch, CblasInt, OpenBlasThreadGuard, CBLAS_NO_TRANS, CBLAS_ROW_MAJOR,
@@ -160,19 +160,6 @@ fn farmcpu_raw_major_impute_enabled() -> bool {
             true
         }
     })
-}
-
-#[inline]
-fn farmcpu_missing_impute_value(mean_g: f64, impute_major: bool) -> f64 {
-    if impute_major {
-        if mean_g > 1.0_f64 {
-            2.0_f64
-        } else {
-            0.0_f64
-        }
-    } else {
-        mean_g
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -523,6 +510,176 @@ struct FarmcpuExactRemPrepared {
     y_resid_ss: f64,
 }
 
+#[derive(Clone, Copy)]
+struct PvarColumnIndices {
+    chrom: usize,
+    pos: usize,
+    snp: usize,
+    allele0: usize,
+    allele1: usize,
+}
+
+fn read_pvar_header(
+    reader: &mut BufReader<File>,
+    path: &str,
+) -> Result<(PvarColumnIndices, usize), String> {
+    let mut line = String::new();
+    let mut line_no = 0usize;
+    loop {
+        line.clear();
+        let n_read = reader
+            .read_line(&mut line)
+            .map_err(|e| format!("{path}:{}: {e}", line_no + 1))?;
+        if n_read == 0 {
+            return Err(format!("{path}: missing #CHROM PVAR header"));
+        }
+        line_no += 1;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("##") {
+            continue;
+        }
+        if !trimmed.starts_with('#') {
+            return Err(format!(
+                "{path}:{line_no}: PVAR data appears before #CHROM header"
+            ));
+        }
+        let columns = trimmed
+            .split_whitespace()
+            .map(|field| field.trim_start_matches('#').to_ascii_uppercase())
+            .collect::<Vec<_>>();
+        let index = |name: &str| {
+            columns
+                .iter()
+                .position(|column| column == name)
+                .ok_or_else(|| format!("{path}: PVAR header is missing {name}"))
+        };
+        return Ok((
+            PvarColumnIndices {
+                chrom: index("CHROM")?,
+                pos: index("POS")?,
+                snp: index("ID")?,
+                allele0: index("REF")?,
+                allele1: index("ALT")?,
+            },
+            line_no,
+        ));
+    }
+}
+
+fn normalize_farmcpu_prefix(prefix: &str) -> String {
+    let mut normalized = prefix.trim().to_string();
+    let lower = normalized.to_ascii_lowercase();
+    for suffix in [".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"] {
+        if lower.ends_with(suffix) {
+            normalized.truncate(normalized.len().saturating_sub(suffix.len()));
+            break;
+        }
+    }
+    normalized
+}
+
+fn read_pvar_chrom_pos_selected(
+    prefix: &str,
+    row_indices: Option<&[usize]>,
+    expected_len: usize,
+) -> Result<(Vec<String>, Vec<i64>), String> {
+    let prefix = crate::pgen::normalize_pgen_prefix(prefix);
+    let path = format!("{prefix}.pvar");
+    let file = File::open(&path).map_err(|e| format!("{path}: {e}"))?;
+    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, file);
+    let (columns, mut line_no) = read_pvar_header(&mut reader, &path)?;
+
+    let mut requested = row_indices
+        .map(|indices| {
+            indices
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(out_idx, source_idx)| (source_idx, out_idx))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    requested.sort_unstable_by_key(|&(source_idx, _)| source_idx);
+
+    let mut chrom_out = if row_indices.is_some() {
+        vec![String::new(); expected_len]
+    } else {
+        Vec::with_capacity(expected_len)
+    };
+    let mut pos_out = if row_indices.is_some() {
+        vec![0i64; expected_len]
+    } else {
+        Vec::with_capacity(expected_len)
+    };
+    let mut requested_ptr = 0usize;
+    let mut variant_idx = 0usize;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n_read = reader
+            .read_line(&mut line)
+            .map_err(|e| format!("{path}:{}: {e}", line_no + 1))?;
+        if n_read == 0 {
+            break;
+        }
+        line_no += 1;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("##") || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let selected_here = if row_indices.is_some() {
+            requested_ptr < requested.len() && requested[requested_ptr].0 == variant_idx
+        } else {
+            true
+        };
+        if selected_here {
+            let fields = trimmed.split_whitespace().collect::<Vec<_>>();
+            let needed = [columns.chrom, columns.pos].into_iter().max().unwrap_or(0);
+            if fields.len() <= needed {
+                return Err(format!("{path}:{line_no}: malformed PVAR row"));
+            }
+            let chrom = fields[columns.chrom].to_string();
+            let pos = fields[columns.pos].parse::<i64>().map_err(|e| {
+                format!(
+                    "{path}:{line_no}: invalid POS '{}': {e}",
+                    fields[columns.pos]
+                )
+            })?;
+            if row_indices.is_some() {
+                while requested_ptr < requested.len() && requested[requested_ptr].0 == variant_idx {
+                    let out_idx = requested[requested_ptr].1;
+                    chrom_out[out_idx] = chrom.clone();
+                    pos_out[out_idx] = pos;
+                    requested_ptr += 1;
+                }
+            } else {
+                chrom_out.push(chrom);
+                pos_out.push(pos);
+            }
+        }
+        variant_idx = variant_idx.saturating_add(1);
+        if row_indices.is_some() && requested_ptr == requested.len() {
+            break;
+        }
+    }
+
+    if row_indices.is_some() && requested_ptr != requested.len() {
+        return Err(format!(
+            "PVAR ended early: needed row {} but only resolved {} selected rows from {path}",
+            requested[requested_ptr].0, requested_ptr
+        ));
+    }
+    if chrom_out.len() != expected_len || pos_out.len() != expected_len {
+        return Err(format!(
+            "PVAR chrom/pos metadata length mismatch: expected={expected_len}, chrom={}, pos={}",
+            chrom_out.len(),
+            pos_out.len(),
+        ));
+    }
+    Ok((chrom_out, pos_out))
+}
+
 fn resolve_assoc_chrom_pos_metadata(
     bed_prefix: Option<&str>,
     chrom: Vec<String>,
@@ -546,6 +703,9 @@ fn resolve_assoc_chrom_pos_metadata(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "empty chrom/pos metadata requires non-empty bed_prefix".to_string())?;
+    if crate::pgen::path_uses_pgen(prefix) {
+        return read_pvar_chrom_pos_selected(prefix, row_indices, expected_len);
+    }
     let bim_path = format!("{prefix}.bim");
     let select = match row_indices {
         Some(idx) if idx.is_empty() => return Ok((Vec::new(), Vec::new())),
@@ -623,19 +783,40 @@ fn resolve_assoc_chrom_pos_metadata(
 }
 
 struct BimSelectedFieldStream {
-    bim_path: String,
+    metadata_path: String,
     reader: BufReader<File>,
     next_line_no: usize,
+    next_row_idx: usize,
+    pvar_columns: Option<PvarColumnIndices>,
 }
 
 impl BimSelectedFieldStream {
     fn open(prefix: &str) -> Result<Self, String> {
-        let bim_path = format!("{prefix}.bim");
-        let file = File::open(&bim_path).map_err(|e| format!("{bim_path}: {e}"))?;
+        let is_pgen = crate::pgen::path_uses_pgen(prefix);
+        let normalized_prefix = if is_pgen {
+            crate::pgen::normalize_pgen_prefix(prefix)
+        } else {
+            normalize_farmcpu_prefix(prefix)
+        };
+        let metadata_path = if is_pgen {
+            format!("{normalized_prefix}.pvar")
+        } else {
+            format!("{normalized_prefix}.bim")
+        };
+        let file = File::open(&metadata_path).map_err(|e| format!("{metadata_path}: {e}"))?;
+        let mut reader = BufReader::with_capacity(8 * 1024 * 1024, file);
+        let (pvar_columns, next_line_no) = if is_pgen {
+            let (columns, line_no) = read_pvar_header(&mut reader, &metadata_path)?;
+            (Some(columns), line_no)
+        } else {
+            (None, 0usize)
+        };
         Ok(Self {
-            bim_path,
-            reader: BufReader::with_capacity(8 * 1024 * 1024, file),
-            next_line_no: 0usize,
+            metadata_path,
+            reader,
+            next_line_no,
+            next_row_idx: 0usize,
+            pvar_columns,
         })
     }
 
@@ -647,7 +828,7 @@ impl BimSelectedFieldStream {
             return Ok((Vec::new(), Vec::new(), Vec::new()));
         }
         if !source_rows.windows(2).all(|w| w[0] <= w[1]) {
-            return Err("BIM field stream requires sorted source_rows".to_string());
+            return Err("variant metadata stream requires sorted source_rows".to_string());
         }
         let mut snp = Vec::<String>::with_capacity(source_rows.len());
         let mut allele0 = Vec::<String>::with_capacity(source_rows.len());
@@ -659,37 +840,65 @@ impl BimSelectedFieldStream {
             let n_read = self
                 .reader
                 .read_line(&mut line)
-                .map_err(|e| format!("{}:{}: {}", self.bim_path, self.next_line_no + 1, e))?;
+                .map_err(|e| format!("{}:{}: {}", self.metadata_path, self.next_line_no + 1, e))?;
             if n_read == 0 {
                 return Err(format!(
-                    "BIM ended early: needed row {} but only resolved {} selected rows from {}",
-                    source_rows[want_ptr], want_ptr, self.bim_path
+                    "variant metadata ended early: needed row {} but only resolved {} selected rows from {}",
+                    source_rows[want_ptr], want_ptr, self.metadata_path
                 ));
             }
-            let cur_line_no = self.next_line_no;
             self.next_line_no += 1;
-            let want_row = source_rows[want_ptr];
-            if cur_line_no < want_row {
+            let trimmed = line.trim();
+            if trimmed.is_empty()
+                || (self.pvar_columns.is_some()
+                    && (trimmed.starts_with("##") || trimmed.starts_with('#')))
+            {
                 continue;
             }
-            if cur_line_no > want_row {
+            let cur_row_idx = self.next_row_idx;
+            self.next_row_idx = self.next_row_idx.saturating_add(1);
+            let want_row = source_rows[want_ptr];
+            if cur_row_idx < want_row {
+                continue;
+            }
+            if cur_row_idx > want_row {
                 return Err(format!(
                     "BIM stream advanced past requested row: current={}, requested={} ({})",
-                    cur_line_no, want_row, self.bim_path
+                    cur_row_idx, want_row, self.metadata_path
                 ));
             }
-            let toks: Vec<&str> = line.split_whitespace().collect();
-            if toks.len() < 6 {
-                return Err(format!(
-                    "{}:{}: malformed BIM row (need >=6 columns)",
-                    self.bim_path,
-                    cur_line_no + 1
-                ));
+            let fields: Vec<&str> = trimmed.split_whitespace().collect();
+            if let Some(columns) = self.pvar_columns {
+                let needed = [columns.snp, columns.allele0, columns.allele1]
+                    .into_iter()
+                    .max()
+                    .unwrap_or(0);
+                if fields.len() <= needed {
+                    return Err(format!(
+                        "{}:{}: malformed PVAR row",
+                        self.metadata_path, self.next_line_no
+                    ));
+                }
+                while want_ptr < source_rows.len() && source_rows[want_ptr] == cur_row_idx {
+                    snp.push(fields[columns.snp].to_string());
+                    allele0.push(fields[columns.allele0].to_string());
+                    allele1.push(fields[columns.allele1].to_string());
+                    want_ptr += 1;
+                }
+            } else {
+                if fields.len() < 6 {
+                    return Err(format!(
+                        "{}:{}: malformed BIM row (need >=6 columns)",
+                        self.metadata_path, self.next_line_no
+                    ));
+                }
+                while want_ptr < source_rows.len() && source_rows[want_ptr] == cur_row_idx {
+                    snp.push(fields[1].to_string());
+                    allele0.push(fields[4].to_string());
+                    allele1.push(fields[5].to_string());
+                    want_ptr += 1;
+                }
             }
-            snp.push(toks[1].to_string());
-            allele0.push(toks[4].to_string());
-            allele1.push(toks[5].to_string());
-            want_ptr += 1;
         }
         Ok((snp, allele0, allele1))
     }
@@ -759,7 +968,7 @@ pub(crate) fn decode_packed_rows_to_sample_major(
             &packed_flat[packed_row_idx * bytes_per_snp..(packed_row_idx + 1) * bytes_per_snp];
         let flip = row_flip[local_row_idx];
         let mean_g = 2.0_f64 * row_maf[local_row_idx] as f64;
-        let missing_g = farmcpu_missing_impute_value(mean_g, impute_major);
+        let missing_g = additive_missing_impute_value(mean_g, impute_major);
         for (i, &sidx) in sample_idx.iter().enumerate() {
             let b = row[sidx >> 2];
             let code = (b >> ((sidx & 3) * 2)) & 0b11;
@@ -1835,6 +2044,18 @@ struct FarmcpuOutputBlock {
     stats: Vec<f64>,
 }
 
+#[inline]
+fn farmcpu_qtn_source_row(
+    row: usize,
+    row_indices: Option<&[usize]>,
+    source_row_indices: Option<&[usize]>,
+) -> Option<usize> {
+    source_row_indices
+        .and_then(|indices| indices.get(row).copied())
+        .or_else(|| row_indices.and_then(|indices| indices.get(row).copied()))
+        .or(Some(row))
+}
+
 fn append_farmcpu_output_row(
     text_buf: &mut String,
     qtn_text_buf: Option<&mut String>,
@@ -2458,7 +2679,7 @@ fn scan_packed_full_matrix(
                 let row = &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
                 let flip = row_flip[idx];
                 let mean_g = (2.0_f64 * row_maf[idx] as f64).max(0.0);
-                let missing_g = farmcpu_missing_impute_value(mean_g, impute_major);
+                let missing_g = additive_missing_impute_value(mean_g, impute_major);
                 let mut sy = 0.0_f64;
                 let mut ss = 0.0_f64;
                 for (k, &sidx) in sample_idx.iter().enumerate() {
@@ -3204,7 +3425,7 @@ fn write_farmcpu_packed_main_scan(
                     let stat_base = local_idx * row_stride;
                     let qtn_source = if qtn_text_buf_opt.is_some() && qtn_lookup.contains_key(&i) {
                         qtn_rows_written = qtn_rows_written.saturating_add(1);
-                        Some(row_indices.map(|v| v[i]).unwrap_or(i))
+                        farmcpu_qtn_source_row(i, row_indices, bim_row_indices)
                     } else {
                         None
                     };
@@ -4912,6 +5133,53 @@ mod tests {
     }
 
     #[test]
+    fn farmcpu_metadata_stream_reads_selected_pvar_rows() {
+        let root = std::env::temp_dir().join(format!("janusx_farmcpu_pvar_{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("create temporary test directory");
+        let prefix = root.join("cohort").to_string_lossy().into_owned();
+        std::fs::write(format!("{prefix}.pgen"), b"test").expect("write PGEN marker");
+        std::fs::write(
+            format!("{prefix}.pvar"),
+            "##fileformat= some metadata\n#CHROM POS ID REF ALT INFO\n1 100 rs1 A G .\n1 250 rs2 C T .\n2 900 rs3 G A .\n",
+        )
+        .expect("write PVAR metadata");
+
+        let selected_rows = [0usize, 2usize];
+        let (chrom, pos) = resolve_assoc_chrom_pos_metadata(
+            Some(&prefix),
+            Vec::new(),
+            Vec::new(),
+            Some(&selected_rows),
+            selected_rows.len(),
+        )
+        .expect("read selected PVAR coordinates");
+        assert_eq!(chrom, ["1", "2"]);
+        assert_eq!(pos, [100, 900]);
+
+        let unsorted_rows = [2usize, 0usize];
+        let (chrom, pos) = resolve_assoc_chrom_pos_metadata(
+            Some(&prefix),
+            Vec::new(),
+            Vec::new(),
+            Some(&unsorted_rows),
+            unsorted_rows.len(),
+        )
+        .expect("read unsorted selected PVAR coordinates");
+        assert_eq!(chrom, ["2", "1"]);
+        assert_eq!(pos, [900, 100]);
+
+        let mut stream = BimSelectedFieldStream::open(&prefix).expect("open PVAR field stream");
+        let (snp, allele0, allele1) = stream
+            .read_block(&[1usize, 2usize])
+            .expect("read selected PVAR fields");
+        assert_eq!(snp, ["rs2", "rs3"]);
+        assert_eq!(allele0, ["C", "G"]);
+        assert_eq!(allele1, ["T", "A"]);
+
+        std::fs::remove_dir_all(root).expect("remove temporary test directory");
+    }
+
+    #[test]
     fn reduced_packed_scan_matches_full_scan_reference() {
         let y = vec![1.2, -0.4, 0.8, 2.1, -1.3];
         let x_flat = vec![
@@ -5024,7 +5292,28 @@ mod tests {
 
 #[cfg(test)]
 mod farmcpu_output_format_tests {
-    use super::append_farmcpu_output_row;
+    use super::{append_farmcpu_output_row, farmcpu_qtn_source_row};
+
+    #[test]
+    fn qtn_source_row_prefers_original_source_mapping_over_compact_row_index() {
+        let row_indices = [0_usize, 1, 2];
+        let source_row_indices = [1242_usize, 41360, 56619];
+
+        assert_eq!(
+            farmcpu_qtn_source_row(0, Some(&row_indices), Some(&source_row_indices)),
+            Some(1242)
+        );
+        assert_eq!(
+            farmcpu_qtn_source_row(2, Some(&row_indices), Some(&source_row_indices)),
+            Some(56619)
+        );
+    }
+
+    #[test]
+    fn qtn_source_row_falls_back_to_row_index_without_source_mapping() {
+        assert_eq!(farmcpu_qtn_source_row(7, Some(&[3, 7, 9]), None), Some(7));
+        assert_eq!(farmcpu_qtn_source_row(7, None, None), Some(7));
+    }
 
     #[test]
     fn formats_main_and_pseudo_qtn_rows_identically() {

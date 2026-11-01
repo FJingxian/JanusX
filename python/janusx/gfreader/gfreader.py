@@ -490,10 +490,22 @@ def _cache_lock(lock_key: str, timeout_s: float = 7200.0, poll_s: float = 0.2):
             pass
 
 
-def _is_plink_prefix(path_or_prefix: str) -> bool:
+def _is_bed_prefix(path_or_prefix: str) -> bool:
     return all(
-        os.path.exists(f"{path_or_prefix}.{ext}") for ext in ("bed", "bim", "fam")
+        os.path.isfile(f"{path_or_prefix}.{ext}") for ext in ("bed", "bim", "fam")
     )
+
+
+def _is_pgen_prefix(path_or_prefix: str) -> bool:
+    return os.path.isfile(f"{path_or_prefix}.pgen") and not os.path.isfile(
+        f"{path_or_prefix}.bed"
+    ) and all(
+        os.path.isfile(f"{path_or_prefix}.{ext}") for ext in ("pvar", "psam")
+    )
+
+
+def _is_plink_prefix(path_or_prefix: str) -> bool:
+    return _is_bed_prefix(path_or_prefix) or _is_pgen_prefix(path_or_prefix)
 
 
 def _strip_known_suffix(path_or_prefix: str) -> str:
@@ -503,7 +515,21 @@ def _strip_known_suffix(path_or_prefix: str) -> str:
         return p[: -len(".hmp.gz")]
     if low.endswith(".vcf.gz"):
         return p[: -len(".vcf.gz")]
-    for ext in (".hmp", ".vcf", ".txt", ".tsv", ".csv", ".npy", ".bin"):
+    for ext in (
+        ".bed",
+        ".bim",
+        ".fam",
+        ".pgen",
+        ".pvar",
+        ".psam",
+        ".hmp",
+        ".vcf",
+        ".txt",
+        ".tsv",
+        ".csv",
+        ".npy",
+        ".bin",
+    ):
         if low.endswith(ext):
             return p[: -len(ext)]
     return p
@@ -529,16 +555,22 @@ def _normalize_matrix_prefix(prefix: str, kind: str) -> str:
 
 
 def _plink_missing_files(prefix: str) -> list[str]:
+    extensions = (
+        ("pgen", "pvar", "psam")
+        if not os.path.exists(f"{prefix}.bed")
+        and any(os.path.exists(f"{prefix}.{ext}") for ext in ("pgen", "pvar", "psam"))
+        else ("bed", "bim", "fam")
+    )
     return [
         f"{prefix}.{ext}"
-        for ext in ("bed", "bim", "fam")
+        for ext in extensions
         if not os.path.isfile(f"{prefix}.{ext}")
     ]
 
 
 def _raise_plink_prefix_error(prefix: str) -> None:
     missing = _plink_missing_files(prefix)
-    lines = [f"PLINK BED prefix is incomplete or not found: {prefix}"]
+    lines = [f"PLINK BED/PGEN prefix is incomplete or not found: {prefix}"]
     for path in missing:
         lines.append(f"Missing file: {path}")
     raise ValueError("\n".join(lines))
@@ -685,7 +717,7 @@ def _resolve_input(path_or_prefix: str, force_kind: Union[str, None] = None):
     fk = str(force_kind or "").strip().lower()
     if fk in {"vcf", "hmp", "txt", "file", "npy", "bin", "plink", "bfile"}:
         if fk in {"plink", "bfile"}:
-            prefix = p[:-4] if p.lower().endswith((".bed", ".bim", ".fam")) else p
+            prefix = _strip_known_suffix(p)
             missing = _plink_missing_files(prefix)
             if missing:
                 _raise_plink_prefix_error(prefix)
@@ -739,6 +771,10 @@ def _resolve_input(path_or_prefix: str, force_kind: Union[str, None] = None):
 
     if _is_plink_prefix(p):
         return "plink", p, None
+
+    stripped_plink_prefix = _strip_known_suffix(p)
+    if stripped_plink_prefix != p and _is_plink_prefix(stripped_plink_prefix):
+        return "plink", stripped_plink_prefix, None
 
     if low.endswith(".vcf.gz") or low.endswith(".vcf"):
         return "vcf", _strip_known_suffix(p), p
@@ -832,7 +868,7 @@ def _ensure_plink_cache_from_source_at(
         cache_present = any(os.path.exists(p) for p in cache_files)
         if cache_present:
             rebuild_reason = None
-            if not _is_plink_prefix(cache_prefix):
+            if not _is_bed_prefix(cache_prefix):
                 rebuild_reason = (
                     f"Incomplete {source_label} cache detected for '{prefix}' at '{cache_prefix}'. "
                     "Removing cache files and rebuilding."
@@ -900,7 +936,7 @@ def _ensure_plink_cache_from_source_at(
                 )
             else:
                 raise
-        if not _is_plink_prefix(cache_prefix):
+        if not _is_bed_prefix(cache_prefix):
             raise RuntimeError(
                 f"PLINK cache not created: {cache_prefix}.bed/.bim/.fam"
             )
@@ -1379,6 +1415,33 @@ def _prepare_txtlike_input_for_cache(kind: str, prefix: str, src_path: Union[str
 
 
 def _read_plink_fam_sample_ids(prefix: str) -> list[str]:
+    if _is_pgen_prefix(prefix):
+        psam_path = f"{prefix}.psam"
+        sample_ids: list[str] = []
+        header: list[str] | None = None
+        with open(psam_path, "r", encoding="utf-8", errors="replace") as handle:
+            for line_no, line in enumerate(handle, start=1):
+                row = line.strip()
+                if not row or row.startswith("##"):
+                    continue
+                cols = row.split()
+                if row.startswith("#"):
+                    header = [value.lstrip("#").upper() for value in cols]
+                    if "IID" not in header:
+                        raise ValueError(f"PSAM header has no IID column: {psam_path}:{line_no}")
+                    continue
+                iid_index = (
+                    header.index("IID")
+                    if header is not None
+                    else (1 if len(cols) >= 6 else 0)
+                )
+                if iid_index >= len(cols):
+                    raise ValueError(f"Malformed PSAM line at {psam_path}:{line_no}: {row}")
+                sample_ids.append(cols[iid_index])
+        if not sample_ids:
+            raise ValueError(f"PSAM contains zero samples: {psam_path}")
+        return sample_ids
+
     fam_path = f"{prefix}.fam"
     sample_ids: list[str] = []
     with open(fam_path, "r", encoding="utf-8", errors="replace") as handle:
@@ -1396,14 +1459,19 @@ def _read_plink_fam_sample_ids(prefix: str) -> list[str]:
 
 
 def _count_plink_bim_rows(prefix: str) -> int:
-    bim_path = f"{prefix}.bim"
+    if _is_pgen_prefix(prefix):
+        variant_path = f"{prefix}.pvar"
+    else:
+        variant_path = f"{prefix}.bim"
     n_snps = 0
-    with open(bim_path, "r", encoding="utf-8", errors="replace") as handle:
+    with open(variant_path, "r", encoding="utf-8", errors="replace") as handle:
         for line in handle:
-            if line.strip():
+            row = line.strip()
+            if row and not row.startswith("#"):
                 n_snps += 1
     if n_snps <= 0:
-        raise ValueError(f"BIM contains zero variants: {bim_path}")
+        label = "PVAR" if variant_path.endswith(".pvar") else "BIM"
+        raise ValueError(f"{label} contains zero variants: {variant_path}")
     return n_snps
 
 
@@ -1523,7 +1591,7 @@ def bed_chunk_reader(
     mmap_window_mb: Union[int , None] = None,
 ):
     """
-    Stream PLINK BED/BIM/FAM chunks with optional SNP/sample selection.
+    Stream PLINK BED/BIM/FAM or PGEN/PVAR/PSAM chunks with optional selection.
 
     Selection (mutually exclusive):
       - snp_range   : (start, end) with end exclusive (0-based)
@@ -1532,7 +1600,7 @@ def bed_chunk_reader(
       - snp_sites   : list of (chrom, pos), preserving input order
 
     Samples (mutually exclusive):
-      - sample_ids     : list of IID strings from .fam
+      - sample_ids     : list of IID strings from .fam or .psam
       - sample_indices : explicit 0-based sample indices
     mmap_window_mb:
       - limit BED mmap window size (MB); disables snp_range/snp_indices/bim_range
@@ -2170,7 +2238,7 @@ def load_genotype_chunks(
     raise ValueError(
         "Unable to infer genotype input type. Provide a VCF path, "
         "an HMP path (.hmp/.hmp.gz), "
-        "a PLINK prefix (.bed/.bim/.fam), or a FILE prefix/path "
+        "a PLINK prefix (.bed/.bim/.fam or .pgen/.pvar/.psam), or a FILE prefix/path "
         "(prefix.id/.fam + prefix.npy/.txt/.tsv/.csv/.bin)."
     )
 
@@ -2297,7 +2365,7 @@ def inspect_genotype_file(
     raise ValueError(
         "Unable to infer genotype input type. Provide a VCF path, "
         "an HMP path (.hmp/.hmp.gz), "
-        "a PLINK prefix (.bed/.bim/.fam), or a FILE prefix/path "
+        "a PLINK prefix (.bed/.bim/.fam or .pgen/.pvar/.psam), or a FILE prefix/path "
         "(prefix.id/.fam + prefix.npy/.txt/.tsv/.csv/.bin)."
     )
 

@@ -6,7 +6,8 @@ Supported inputs
 ----------------
 - `-vcf/--vcf`    : VCF / VCF.GZ genotype file
 - `-hmp/--hmp`    : HMP / HMP.GZ genotype file
-- `-bfile/--bfile`: PLINK prefix (.bed/.bim/.fam)
+- `-bfile/--bfile`: PLINK BED prefix (.bed/.bim/.fam)
+- `-pfile/--pfile`: PLINK 2 PGEN prefix (.pgen/.pvar/.psam)
 - `-file/--file`  : text / npy genotype matrix or prefix
 
 Supported outputs

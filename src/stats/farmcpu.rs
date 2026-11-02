@@ -137,15 +137,25 @@ fn farmcpu_emit_mem_debug(stage: &str, detail: &str) {
 }
 
 #[inline]
-fn farmcpu_scan_blas_threads(_total_threads: usize) -> usize {
-    if let Ok(raw) = std::env::var("JX_FARMCPU_BLAS_THREADS") {
-        if let Ok(parsed) = raw.trim().parse::<usize>() {
-            if parsed > 0 {
-                return parsed;
-            }
-        }
+fn farmcpu_scan_blas_threads(total_threads: usize) -> usize {
+    let raw_override = std::env::var("JX_FARMCPU_BLAS_THREADS").ok();
+    farmcpu_scan_blas_threads_from_override(total_threads, raw_override.as_deref())
+}
+
+#[inline]
+fn farmcpu_scan_blas_threads_from_override(
+    total_threads: usize,
+    raw_override: Option<&str>,
+) -> usize {
+    let fallback = total_threads.max(1);
+    let Some(raw) = raw_override else {
+        return fallback;
+    };
+
+    match raw.trim().parse::<usize>() {
+        Ok(parsed) if parsed > 0 => parsed,
+        _ => fallback,
     }
-    1usize
 }
 
 #[inline]
@@ -5078,6 +5088,22 @@ pub fn farmcpu_write_assoc_tsv(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn farmcpu_scan_blas_threads_defaults_to_requested_thread_count() {
+        assert_eq!(farmcpu_scan_blas_threads_from_override(8, None), 8);
+        assert_eq!(farmcpu_scan_blas_threads_from_override(0, None), 1);
+    }
+
+    #[test]
+    fn farmcpu_scan_blas_threads_override_is_preserved_and_invalid_values_fall_back() {
+        assert_eq!(farmcpu_scan_blas_threads_from_override(24, Some("12")), 12);
+        assert_eq!(farmcpu_scan_blas_threads_from_override(24, Some("0")), 24);
+        assert_eq!(
+            farmcpu_scan_blas_threads_from_override(24, Some("invalid")),
+            24
+        );
+    }
 
     fn encode_bed_code(call: Option<u8>) -> u8 {
         match call {

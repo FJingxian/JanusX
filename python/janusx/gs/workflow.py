@@ -5893,6 +5893,21 @@ def _rrblup_lambda_equation_to_raw(
     return float(lam_eq)
 
 
+def _select_rrblup_pcg_pve(
+    *,
+    pve_mode: str,
+    pve_lambda: float,
+    pve_trainvar: float,
+    pve_vc: float,
+) -> float:
+    mode = str(pve_mode).strip().lower()
+    if mode == "trainvar":
+        return float(pve_trainvar)
+    if np.isfinite(float(pve_vc)):
+        return float(pve_vc)
+    return float(pve_lambda)
+
+
 def _resolve_rrblup_operator_mode(
     cfg: dict[str, typing.Any] | None = None,
 ) -> str:
@@ -6453,6 +6468,13 @@ def _estimate_rrblup_lambda_subsample_reml(
                     blas_threads=int(he_thread_spec["blas_threads"]),
                     rayon_threads=int(he_thread_spec["rayon_threads"]),
                 ):
+                    he_row_mean, he_row_inv_sd = _ensure_packed_rrblup_operator_stats_cached(
+                        packed_ctx,
+                        operator_mode,
+                        std_eps=float(std_eps),
+                        sample_indices=train_abs,
+                        std_mode=rr_std_mode,
+                    )
                     he_call_kwargs = dict(
                         trace_samples=int(he_trace_samples),
                         trace_probe_batch=int(he_trace_probe_batch),
@@ -6466,6 +6488,9 @@ def _estimate_rrblup_lambda_subsample_reml(
                         seed=int(he_seed),
                         maf=maf_arg,
                         row_flip=row_flip_arg,
+                        row_mean=he_row_mean,
+                        row_inv_sd=he_row_inv_sd,
+                        grm_scale=float(m_scale),
                     )
                     he_call_kwargs["row_source_indices"] = row_source_indices_arg
                     he_call_kwargs["mmap_window_mb"] = int(he_mmap_window_mb)
@@ -6551,8 +6576,11 @@ def _estimate_rrblup_lambda_subsample_reml(
                 if (not np.isfinite(he_lambda_k)) and np.isfinite(sigma_g2) and np.isfinite(sigma_e2) and sigma_g2 > 0.0:
                     he_lambda_k = float(sigma_e2 / sigma_g2)
                 he_m_for_eq = int(max(1, he_m_eff if he_m_eff > 0 else int(m_effective)))
+                he_equation_scale = float(
+                    m_scale if np.isfinite(float(m_scale)) and float(m_scale) > 0.0 else he_m_for_eq
+                )
                 he_lambda_eq = (
-                    float(he_lambda_k * float(he_m_for_eq))
+                    float(he_lambda_k * he_equation_scale)
                     if np.isfinite(he_lambda_k) and he_lambda_k >= 0.0
                     else float("nan")
                 )
@@ -6562,7 +6590,7 @@ def _estimate_rrblup_lambda_subsample_reml(
                     else float("nan")
                 )
                 he_lambda_k_sel = (
-                    float(he_lambda_eq_sel / float(max(1, he_m_for_eq)))
+                    float(he_lambda_eq_sel / he_equation_scale)
                     if np.isfinite(he_lambda_eq_sel)
                     else float("nan")
                 )
@@ -9492,7 +9520,6 @@ def GSapi(
                     if np.isfinite(float(pve_lambda_trace))
                     else float(pve_lambda_formula)
                 )
-                pve = float(pve_lambda if pve_mode == "lambda" else float(pve_trainvar))
                 pve_vc = float("nan")
                 lambda_reml_vc = float("nan")
                 vc_sigma_g2 = float("nan")
@@ -9507,10 +9534,12 @@ def GSapi(
                 if (not np.isfinite(lambda_reml_vc)) and np.isfinite(float(lambda_equation)) and (m_eff > 0):
                     lambda_reml_vc = float(float(lambda_equation) / float(m_eff))
                 pve_trainvar_report = float(pve_trainvar)
-                if (not np.isfinite(pve_trainvar_report)) and np.isfinite(pve_vc):
-                    pve_trainvar_report = float(pve_vc)
-                if np.isfinite(pve_vc):
-                    pve = float(pve_vc)
+                pve = _select_rrblup_pcg_pve(
+                    pve_mode=pve_mode,
+                    pve_lambda=float(pve_lambda),
+                    pve_trainvar=float(pve_trainvar),
+                    pve_vc=float(pve_vc),
+                )
 
                 _set_rrblup_solver_state("pcg")
                 if rrblup_runtime_state is not None:
@@ -11818,12 +11847,12 @@ def _run_method_task(
                     pve_vc_f = _float_or_nan(
                         rr_state_call.get(
                             "pve_pheno_scale_vc",
-                            rr_state_call.get("pve_vc", rr_state_call.get("pve_pheno_scale", rr_state_call.get("pve_used", np.nan))),
+                            rr_state_call.get("pve_vc", np.nan),
                         )
                     )
-                    if (not np.isfinite(pve_trainvar_f)) and rr_cfg_mode == "trainvar":
+                    if ("pve_trainvar" not in rr_state_call) and rr_cfg_mode == "trainvar":
                         pve_trainvar_f = pve_used_f
-                    if (not np.isfinite(pve_lambda_f)) and rr_cfg_mode == "lambda":
+                    if ("pve_lambda" not in rr_state_call) and rr_cfg_mode == "lambda":
                         pve_lambda_f = pve_used_f
                     iter_like = _float_or_nan(rr_state_call.get("pcg_iters", np.nan))
                     if not np.isfinite(iter_like):
@@ -12459,11 +12488,11 @@ def _run_method_task(
             pve_trainvar_f = _float_or_nan(rr_state_final.get("pve_trainvar", np.nan))
             pve_lambda_f = _float_or_nan(rr_state_final.get("pve_lambda", np.nan))
             pve_vc_f = _float_or_nan(
-                rr_state_final.get("pve_vc", rr_state_final.get("pve_used", np.nan))
+                rr_state_final.get("pve_pheno_scale_vc", rr_state_final.get("pve_vc", np.nan))
             )
-            if (not np.isfinite(pve_trainvar_f)) and mode_used == "trainvar":
+            if ("pve_trainvar" not in rr_state_final) and mode_used == "trainvar":
                 pve_trainvar_f = pve_used_f
-            if (not np.isfinite(pve_lambda_f)) and mode_used == "lambda":
+            if ("pve_lambda" not in rr_state_final) and mode_used == "lambda":
                 pve_lambda_f = pve_used_f
             solver_req_final = str(
                 rr_state_final.get("solver_requested", str(rrblup_solver).strip().lower())
@@ -14259,13 +14288,13 @@ def _run_methods_parallel(
                 )
                 pve_vc = float(
                     rr_pve_final.get(
-                        "pve_pheno_scale_vc",
+                        "pve_pheno_scale",
                         rr_pve_final.get(
-                            "pve_vc",
+                            "pve_used",
                             rr_pve_final.get(
-                                "pve_pheno_scale",
+                                "pve_pheno_scale_vc",
                                 rr_pve_final.get(
-                                    "pve_used",
+                                    "pve_vc",
                                     rr_pve_final.get(
                                         "pve_pheno_scale_trainvar",
                                         rr_pve_final.get(
@@ -21936,13 +21965,13 @@ def _run_gs_pipeline_impl(
                         )
                         pve_vc = _detail_float_or_nan(
                             rr_pve_final.get(
-                                "pve_pheno_scale_vc",
+                                "pve_pheno_scale",
                                 rr_pve_final.get(
-                                    "pve_vc",
+                                    "pve_used",
                                     rr_pve_final.get(
-                                        "pve_pheno_scale",
+                                        "pve_pheno_scale_vc",
                                         rr_pve_final.get(
-                                            "pve_used",
+                                            "pve_vc",
                                             rr_pve_final.get(
                                                 "pve_pheno_scale_trainvar",
                                                 rr_pve_final.get(

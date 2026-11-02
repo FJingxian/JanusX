@@ -557,6 +557,9 @@ fn estimate_lambda(
             256,
             None,
             pool.as_ref(),
+            None,
+            None,
+            None,
         )?;
         (
             he.lambda,

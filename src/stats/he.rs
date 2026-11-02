@@ -1478,6 +1478,7 @@ fn apply_grm_to_mat_f32_with_workspace_from_source(
     pool: Option<&Arc<rayon::ThreadPool>>,
     workspace: &mut GrmApplyWorkspace,
     timing: Option<&mut HeApplyTiming>,
+    mut trace_sum_squares: Option<&mut f64>,
     out: &mut [f32], // row-major (n_out, n_rhs)
 ) -> Result<(), String> {
     let m = row_flip.len();
@@ -1588,6 +1589,12 @@ fn apply_grm_to_mat_f32_with_workspace_from_source(
             }
         }
         decode_acc += t_decode.elapsed().as_secs_f64();
+        if let Some(trace_sum) = trace_sum_squares.as_mut() {
+            **trace_sum += blk_slice
+                .iter()
+                .map(|&value| (value as f64) * (value as f64))
+                .sum::<f64>();
+        }
         let tmp_slice = &mut workspace.tmp[..cur_rows * n_rhs];
         let t_xmul = Instant::now();
         row_major_block_mul_mat_f32(blk_slice, cur_rows, n_out, rhs, n_rhs, tmp_slice, pool);
@@ -1651,6 +1658,7 @@ pub(crate) fn apply_grm_to_mat_f32_with_workspace(
         pool,
         workspace,
         timing,
+        None,
         out,
     )
 }
@@ -1672,6 +1680,7 @@ fn apply_grm_to_vec_f32_with_workspace_from_source(
     pool: Option<&Arc<rayon::ThreadPool>>,
     workspace: &mut GrmApplyWorkspace,
     timing: Option<&mut HeApplyTiming>,
+    trace_sum_squares: Option<&mut f64>,
 ) -> Result<Vec<f32>, String> {
     let n_out = sample_idx.len();
     if vec_in.len() != n_out {
@@ -1698,6 +1707,7 @@ fn apply_grm_to_vec_f32_with_workspace_from_source(
         pool,
         workspace,
         timing,
+        trace_sum_squares,
         &mut out,
     )?;
     Ok(out)
@@ -1743,6 +1753,7 @@ pub(crate) fn apply_grm_to_vec_f32_with_workspace(
         pool,
         workspace,
         timing,
+        None,
     )
 }
 
@@ -1839,6 +1850,9 @@ pub fn he_variance_components_packed_with_covariates(
         exact_trace_debug,
         exact_trace_max_n,
         pool,
+        None,
+        None,
+        None,
     )
 }
 
@@ -1864,6 +1878,9 @@ pub(crate) fn he_variance_components_meta_stream_with_covariates(
     exact_trace_max_n: usize,
     mmap_window_mb: Option<usize>,
     pool: Option<&Arc<rayon::ThreadPool>>,
+    row_mean_override: Option<&[f32]>,
+    row_inv_sd_override: Option<&[f32]>,
+    grm_scale_override: Option<f64>,
 ) -> Result<HePcgResult, String> {
     let n_samples = crate::gfcore::read_fam(prefix)?.len();
     if n_samples == 0 {
@@ -1897,6 +1914,9 @@ pub(crate) fn he_variance_components_meta_stream_with_covariates(
         exact_trace_debug,
         exact_trace_max_n,
         pool,
+        row_mean_override,
+        row_inv_sd_override,
+        grm_scale_override,
     )
 }
 
@@ -1922,6 +1942,9 @@ fn he_variance_components_with_source(
     exact_trace_debug: bool,
     exact_trace_max_n: usize,
     pool: Option<&Arc<rayon::ThreadPool>>,
+    row_mean_override: Option<&[f32]>,
+    row_inv_sd_override: Option<&[f32]>,
+    grm_scale_override: Option<f64>,
 ) -> Result<HePcgResult, String> {
     let stage_timing = env_truthy("JX_GS_HE_STAGE_TIMING");
     let stage_log_every = std::env::var("JX_GS_HE_STAGE_LOG_EVERY")
@@ -1986,6 +2009,17 @@ fn he_variance_components_with_source(
     if !(std_eps.is_finite() && std_eps > 0.0_f64) {
         return Err("std_eps must be finite and > 0".to_string());
     }
+    if row_mean_override.is_some() != row_inv_sd_override.is_some() {
+        return Err("row_mean and row_inv_sd overrides must be provided together".to_string());
+    }
+    if let Some(scale) = grm_scale_override {
+        if !(scale.is_finite() && scale > 0.0) {
+            return Err("grm_scale override must be finite and > 0".to_string());
+        }
+        if row_mean_override.is_none() {
+            return Err("grm_scale override requires row_mean/row_inv_sd overrides".to_string());
+        }
+    }
     if max_iter == 0 {
         return Err("max_iter must be > 0".to_string());
     }
@@ -1995,18 +2029,43 @@ fn he_variance_components_with_source(
 
     let std_eps32 = std_eps.max(1e-12_f64) as f32;
     let train_maf_t0 = Instant::now();
-    let row_stats = build_row_standardization_stats_from_source(
-        source,
-        row_flip,
-        row_maf,
-        sample_idx,
-        row_source_indices,
-        block_rows,
-        std_eps32,
-        use_train_maf,
-        false,
-        pool,
-    )?;
+    let row_stats = if let (Some(mean), Some(inv_sd)) = (row_mean_override, row_inv_sd_override) {
+        if mean.len() != m || inv_sd.len() != m {
+            return Err(format!(
+                "external row stats length mismatch: row_mean={}, row_inv_sd={}, expected={m}",
+                mean.len(),
+                inv_sd.len()
+            ));
+        }
+        if mean.iter().any(|value| !value.is_finite())
+            || inv_sd
+                .iter()
+                .any(|value| !value.is_finite() || *value < 0.0_f32)
+        {
+            return Err(
+                "external row stats must be finite and row_inv_sd non-negative".to_string(),
+            );
+        }
+        RowStdStats {
+            row_mean: mean.to_vec(),
+            row_inv_sd: inv_sd.to_vec(),
+            m_effective: inv_sd.iter().filter(|&&value| value > 0.0_f32).count(),
+            sample_diag_sum: None,
+        }
+    } else {
+        build_row_standardization_stats_from_source(
+            source,
+            row_flip,
+            row_maf,
+            sample_idx,
+            row_source_indices,
+            block_rows,
+            std_eps32,
+            use_train_maf,
+            false,
+            pool,
+        )?
+    };
     let train_maf_secs = train_maf_t0.elapsed().as_secs_f64();
     if stage_timing {
         emit_he_stage_timing(
@@ -2028,7 +2087,7 @@ fn he_variance_components_with_source(
 
     let n = sample_idx.len();
     let full_sample_fast = is_identity_indices(sample_idx, n_samples);
-    let m_scale = m_effective as f32;
+    let m_scale = grm_scale_override.unwrap_or(m_effective as f64) as f32;
     let projector = CovariateProjector::from_optional_covariates(n, x_cov, p_cov)?;
     let mut proj_ws = ProjectionWorkspace::new(projector.p);
     let mut y_proj = y.to_vec();
@@ -2037,6 +2096,7 @@ fn he_variance_components_with_source(
     let code4_lut = &packed_byte_lut().code4;
     let mut grm_ws = GrmApplyWorkspace::new();
     let mut ky_apply_t = HeApplyTiming::default();
+    let mut k_diag_sum_squares = 0.0_f64;
 
     let k_y = apply_grm_to_vec_f32_with_workspace_from_source(
         source,
@@ -2058,7 +2118,13 @@ fn he_variance_components_with_source(
         } else {
             None
         },
+        Some(&mut k_diag_sum_squares),
     )?;
+    let mean_k_diag = if m_scale.is_finite() && m_scale > 0.0_f32 && n > 0 {
+        k_diag_sum_squares / (m_scale as f64 * n as f64)
+    } else {
+        f64::NAN
+    };
     let y_ky = dot_f32_f64(&y_f32, &k_y);
     let y_y = dot_f32_f64(&y_f32, &y_f32);
 
@@ -2109,6 +2175,7 @@ fn he_variance_components_with_source(
                 } else {
                     None
                 },
+                None,
                 &mut kv_batch,
             )?;
             projector.project_mat_f32_in_place(&mut kv_batch, batch_cols, &mut proj_ws)?;
@@ -2184,6 +2251,7 @@ fn he_variance_components_with_source(
                 } else {
                     None
                 },
+                None,
                 &mut kv_batch,
             )?;
             projector.project_mat_f32_in_place(&mut kv_batch, batch_cols, &mut proj_ws)?;
@@ -2290,10 +2358,16 @@ fn he_variance_components_with_source(
         ((res0 * res0 + res1 * res1).sqrt()) / rhs_norm
     };
     let converged = rel_res.is_finite() && rel_res <= tol.max(1e-12_f64);
+    // `sigma_g2` multiplies the actual GRM, whose mean diagonal need not be
+    // exactly one after genotype filtering, missing-value imputation, or
+    // non-HWE genotype frequencies. Convert its variance contribution to
+    // phenotype scale before reporting PVE.
     let h2 = {
-        let denom = sigma_g2 + sigma_e2;
-        if denom.is_finite() && denom > 0.0_f64 {
-            sigma_g2 / denom
+        let var_g_pheno = sigma_g2 * mean_k_diag;
+        let denom = var_g_pheno + sigma_e2;
+        if var_g_pheno.is_finite() && var_g_pheno >= 0.0_f64 && denom.is_finite() && denom > 0.0_f64
+        {
+            var_g_pheno / denom
         } else {
             f64::NAN
         }
@@ -2364,6 +2438,9 @@ fn he_variance_components_with_source(
     maf=None,
     row_flip=None,
     row_source_indices=None,
+    row_mean=None,
+    row_inv_sd=None,
+    grm_scale=None,
     x_cov=None,
     blas_threads=0,
     mmap_window_mb=None
@@ -2391,6 +2468,9 @@ pub fn he_pcg_bed<'py>(
     maf: Option<PyReadonlyArray1<'py, f32>>,
     row_flip: Option<PyReadonlyArray1<'py, bool>>,
     row_source_indices: Option<PyReadonlyArray1<'py, i64>>,
+    row_mean: Option<PyReadonlyArray1<'py, f32>>,
+    row_inv_sd: Option<PyReadonlyArray1<'py, f32>>,
+    grm_scale: Option<f64>,
     x_cov: Option<PyReadonlyArray2<'py, f64>>,
     blas_threads: usize,
     mmap_window_mb: Option<usize>,
@@ -2426,6 +2506,35 @@ pub fn he_pcg_bed<'py>(
 
     let external_packed_requested = packed.is_some() || packed_n_samples > 0;
     let metadata_stream_requested = row_source_indices.is_some();
+    let (row_mean_override, row_inv_sd_override): (Option<Vec<f32>>, Option<Vec<f32>>) =
+        match (row_mean.as_ref(), row_inv_sd.as_ref()) {
+            (Some(mean), Some(inv_sd)) => (
+                Some(match crate::stats_common::array_standard_slice(mean) {
+                    Ok(values) => values.to_vec(),
+                    Err(_) => crate::stats_common::copy_array_standard_layout(&mean.as_array()),
+                }),
+                Some(match crate::stats_common::array_standard_slice(inv_sd) {
+                    Ok(values) => values.to_vec(),
+                    Err(_) => crate::stats_common::copy_array_standard_layout(&inv_sd.as_array()),
+                }),
+            ),
+            (None, None) => (None, None),
+            _ => {
+                return Err(PyRuntimeError::new_err(
+                    "row_mean and row_inv_sd must be provided together.",
+                ));
+            }
+        };
+    if grm_scale.is_some() && row_mean_override.is_none() {
+        return Err(PyRuntimeError::new_err(
+            "grm_scale requires row_mean and row_inv_sd overrides.",
+        ));
+    }
+    if (row_mean_override.is_some() || grm_scale.is_some()) && !metadata_stream_requested {
+        return Err(PyRuntimeError::new_err(
+            "external row stats and grm_scale are supported only with metadata streaming inputs.",
+        ));
+    }
     if external_packed_requested && metadata_stream_requested {
         return Err(PyRuntimeError::new_err(
             "he_pcg_bed: provide either packed payload inputs or row_source_indices metadata streaming inputs, not both.",
@@ -2622,6 +2731,15 @@ pub fn he_pcg_bed<'py>(
         stream_row_source_indices = Some(row_source_vec);
         stream_maf = Some(maf_vec);
         stream_row_flip = Some(row_flip_vec);
+        if let (Some(mean), Some(inv_sd)) = (&row_mean_override, &row_inv_sd_override) {
+            if mean.len() != eff_m || inv_sd.len() != eff_m {
+                return Err(PyRuntimeError::new_err(format!(
+                    "external row stats length mismatch: row_mean={}, row_inv_sd={}, expected={eff_m}",
+                    mean.len(),
+                    inv_sd.len(),
+                )));
+            }
+        }
     } else {
         let (packed_arr, _miss_arr, maf_arr, _std_arr, n_samples_loaded) =
             crate::gfreader::load_bed_2bit_packed(py, prefix.clone())?;
@@ -2809,6 +2927,9 @@ pub fn he_pcg_bed<'py>(
             .expect("stream row source indices must exist");
         let maf_keep = stream_maf.take().expect("stream maf must exist");
         let row_flip_keep = stream_row_flip.take().expect("stream row_flip must exist");
+        let row_mean_keep = row_mean_override;
+        let row_inv_sd_keep = row_inv_sd_override;
+        let grm_scale_keep = grm_scale;
         py.detach(move || {
             let blas_threads_effective = if blas_threads > 0 {
                 blas_threads.max(1)
@@ -2843,6 +2964,9 @@ pub fn he_pcg_bed<'py>(
                 exact_trace_max_n,
                 mmap_window_mb,
                 pool_ref,
+                row_mean_keep.as_deref(),
+                row_inv_sd_keep.as_deref(),
+                grm_scale_keep,
             )
         })
     } else {

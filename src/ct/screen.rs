@@ -453,6 +453,7 @@ impl PairRankContext {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn joint_rank_score_encoded(
     pair: &EncodedPair,
     context: &PairRankContext,

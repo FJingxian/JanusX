@@ -1208,7 +1208,7 @@ fn compile_fasttree_executable() {
         .unwrap_or(false);
     let native_tuning = env_flag("JANUSX_FASTTREE_NATIVE");
     if native_tuning {
-        println!("cargo:warning=FastTree native CPU tuning enabled (JANUSX_FASTTREE_NATIVE=1).");
+        emit_verbose_note("FastTree native CPU tuning enabled (JANUSX_FASTTREE_NATIVE=1).");
     }
     let explicit_omp_include = env::var_os("JANUSX_FASTTREE_OPENMP_INCLUDE_DIR").map(PathBuf::from);
     let explicit_omp_lib = env::var_os("JANUSX_FASTTREE_OPENMP_LIB_DIR").map(PathBuf::from);
@@ -1449,14 +1449,12 @@ fn compile_fasttree_executable() {
     ));
     if openmp_enabled {
         if target_os == "windows" {
-            println!(
-                "cargo:warning=FastTree OpenMP enabled; emitted FastTreeMP.exe and FastTree.exe."
-            );
+            emit_verbose_note("FastTree OpenMP enabled; emitted FastTreeMP.exe and FastTree.exe.");
         } else {
-            println!("cargo:warning=FastTree OpenMP enabled.");
+            emit_verbose_note("FastTree OpenMP enabled.");
         }
     } else {
-        println!("cargo:warning=FastTree built without OpenMP support.");
+        emit_verbose_note("FastTree built without OpenMP support.");
     }
 }
 
@@ -1490,11 +1488,11 @@ fn emit_bed_decode_simd_defaults() {
     );
 
     if let Some(kind) = simd_cap {
-        println!(
-            "cargo:warning=JanusX BED decode runtime SIMD compiled in ({kind}); full-row default={}, subset default={}. Override with JX_BED_DECODE_SIMD / JX_BED_SUBSET_SIMD.",
+        emit_verbose_note(format!(
+            "JanusX BED decode runtime SIMD compiled in ({kind}); full-row default={}, subset default={}. Override with JX_BED_DECODE_SIMD / JX_BED_SUBSET_SIMD.",
             if full_default { "on" } else { "off" },
             if subset_default { "on" } else { "off" }
-        );
+        ));
     }
 }
 
@@ -1582,6 +1580,7 @@ fn configure_openblas_from_dir(lib_dir_s: &str, source_label: &str) -> bool {
 
 fn main() {
     println!("cargo:rerun-if-env-changed=PYO3_BUILD_EXTENSION_MODULE");
+    println!("cargo:rerun-if-env-changed=JANUSX_BUILD_VERBOSE");
     let build_extension_module = env_value("PYO3_BUILD_EXTENSION_MODULE")
         .as_deref()
         .and_then(parse_boolish)
@@ -1638,7 +1637,7 @@ Enable default features or pass --features blas-openblas."
                     println!("cargo:rustc-link-search=native={lib_dir_s}");
                     println!("cargo:rustc-link-arg=-Wl,-rpath,{lib_dir_s}");
                     println!("cargo:rustc-cfg=jx_blas_available");
-                    println!("cargo:warning=BLAS enabled via BLAS_LIB_DIR.");
+                    emit_verbose_note("BLAS enabled via BLAS_LIB_DIR.");
                     return;
                 }
             }
@@ -1648,7 +1647,7 @@ Enable default features or pass --features blas-openblas."
                 .is_ok()
             {
                 println!("cargo:rustc-cfg=jx_blas_available");
-                println!("cargo:warning=BLAS detected by pkg-config.");
+                emit_verbose_note("BLAS detected by pkg-config.");
             } else {
                 println!(
                     "cargo:warning=No BLAS/OpenBLAS detected on Linux; falling back to pure Rust SGEMM."
@@ -1659,9 +1658,8 @@ Enable default features or pass --features blas-openblas."
     }
 
     if should_prefer_accelerate_on_macos(require_openblas) {
-        println!(
-            "cargo:warning=macOS build: prefer Accelerate backend by default \
-(set JANUSX_MACOS_PREFER_ACCELERATE=0 or JANUSX_REQUIRE_OPENBLAS=1 to enable OpenBLAS probing)."
+        emit_verbose_note(
+            "macOS build: prefer Accelerate backend by default (set JANUSX_MACOS_PREFER_ACCELERATE=0 or JANUSX_REQUIRE_OPENBLAS=1 to enable OpenBLAS probing).",
         );
         return;
     }
@@ -1754,7 +1752,7 @@ Enable default features or pass --features blas-openblas."
                     "OpenBLAS detected by pkg-config, but LAPACK symbols are treated as unavailable.",
                 );
             }
-            println!("cargo:warning=OpenBLAS detected by pkg-config.");
+            emit_verbose_note("OpenBLAS detected by pkg-config.");
         }
         Err(err) => {
             if require_openblas {

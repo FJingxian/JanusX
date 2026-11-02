@@ -283,6 +283,7 @@ pub(crate) struct EncodedPair {
 }
 
 impl EncodedPair {
+    #[cfg(test)]
     pub(crate) fn n_samples(&self) -> usize {
         self.n_samples
     }
@@ -331,14 +332,17 @@ impl EncodedPair {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn cis_mask(&self) -> &[u64] {
         &self.category_masks[PairCategory::Cis.index()]
     }
 
+    #[cfg(test)]
     pub(crate) fn trans_mask(&self) -> &[u64] {
         &self.category_masks[PairCategory::Trans.index()]
     }
 
+    #[cfg(test)]
     pub(crate) fn n_cis(&self) -> usize {
         self.cis_mask()
             .iter()
@@ -346,6 +350,7 @@ impl EncodedPair {
             .sum()
     }
 
+    #[cfg(test)]
     pub(crate) fn n_trans(&self) -> usize {
         self.trans_mask()
             .iter()
@@ -366,6 +371,7 @@ pub(crate) enum PairPreparation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(test)]
 pub(crate) enum EncodedPairPreparation {
     QcRejected(PairCounts),
     NoCompatibleDonor(PairCounts),
@@ -496,6 +502,7 @@ pub(crate) fn count_pair(
     Ok(counts)
 }
 
+#[cfg(test)]
 fn count_pair_packed_optional(
     left: Option<&[GenotypeCall]>,
     right: Option<&[GenotypeCall]>,
@@ -659,6 +666,7 @@ fn count_pair_for_screen_optional(
     Ok(counts)
 }
 
+#[cfg(test)]
 fn validate_packed_pair_optional(
     left: Option<&[GenotypeCall]>,
     right: Option<&[GenotypeCall]>,
@@ -1044,6 +1052,7 @@ pub(crate) fn prepare_pair_encoded(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn prepare_pair_encoded_optional(
     left: Option<&[GenotypeCall]>,
     right: Option<&[GenotypeCall]>,
@@ -1065,6 +1074,7 @@ pub(crate) fn prepare_pair_encoded_optional(
 /// missingness first, then retain only the H/Z masks needed by the screen.
 /// The full ten-category genotype vectors are created only after TopK chooses
 /// the pair.
+#[cfg(test)]
 pub(crate) fn prepare_pair_for_screen_optional(
     left: Option<&[GenotypeCall]>,
     right: Option<&[GenotypeCall]>,

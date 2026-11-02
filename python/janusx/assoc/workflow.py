@@ -167,7 +167,8 @@ _GWAS_AUTO_MEM_GRM_BLOCK_ROWS = 4096
 _GWAS_AUTO_MEM_COPY_DECODE_BLOCK_ROWS = 8192
 _GWAS_AUTO_MEM_PACKED_BLOCK_ROWS = 4096
 _GWAS_AUTO_MEM_SPLMM_EXACT_BLOCK_ROWS = 8192
-_GWAS_WORKING_BUFFERS_LM = 1
+# LM and LM2 allocate two decoded genotype chunks in the Rust scan pipeline.
+_GWAS_WORKING_BUFFERS_LM = 2
 _GWAS_WORKING_BUFFERS_GRM = 2
 _GWAS_WORKING_BUFFERS_PACKED = 2
 _GWAS_WORKING_BUFFERS_COPY = 3
@@ -6761,9 +6762,9 @@ def _resolve_fvlmm_scan_stage_mode() -> str:
         return "full"
     if raw in {"generic", "scan", "blas_1_rayon_t"}:
         return "generic"
-    # Dense FvLMM projection is the dominant BLAS workload. Give it the
-    # requested thread budget and keep association single-threaded on every
-    # backend; explicit modes above retain the legacy scheduling alternatives.
+    # Dense FvLMM projection and the per-marker association scan both benefit
+    # from the requested thread budget. Keep the outer Rayon runtime at one
+    # thread to avoid adding a second, unconstrained layer of parallelism.
     # Accelerate controls single/multi-thread mode, not an exact core cap.
     return "blas_t_rayon_1"
 
@@ -6775,7 +6776,8 @@ def _gwas_fvlmm_scan_stage_ctx(threads: int):
 
     Modes:
     - `full` (legacy opt-in): BLAS=t, Rayon=t
-    - `blas_t_rayon_1` (default): BLAS=t, Rayon=1
+    - `blas_t_rayon_1` (default): BLAS=t, outer Rayon=1, Rust projection=t,
+      association=t
     - `generic`: reuse the generic GWAS scan stage (BLAS=1, Rayon=t)
 
     The Rust projection/association budgets are exported separately through
@@ -6845,7 +6847,7 @@ def _gwas_fvlmm_rust_stage_thread_plan(
 
     if scan_mode == "blas_t_rayon_1":
         proj_threads = t
-        assoc_threads = 1
+        assoc_threads = t
     elif scan_mode == "generic":
         proj_threads = 1
         assoc_threads = t

@@ -1,8 +1,8 @@
 # JanusX
 
-[CLI Guide](./doc/JanusXcli.md) | [Core API Guide](./doc/JanusXcore.md) | [Zea Eureka](https://mp.weixin.qq.com/s/jl3h2DPRC21l8QJ0WxzXDA)
+[CLI Guide](./doc/JanusXcli.md) | [Core API Guide](./doc/JanusXcore.md) | [Zea Eureka](https://mp.weixin.qq.com/s/jl3h2DPRC21l8QJ0WxzXDA) | [v2.0.0 Release Notes](./doc/release/v2.0.0.md)
 
-![Python](https://img.shields.io/badge/Python-3.10+-blue.svg) ![License](https://img.shields.io/badge/License-AGPLv3-blue.svg)
+[![GitHub release](https://img.shields.io/github/v/release/FJingxian/JanusX?label=release)](https://github.com/FJingxian/JanusX/releases/latest) ![Python](https://img.shields.io/badge/Python-3.10+-blue.svg) ![License](https://img.shields.io/badge/License-AGPLv3-blue.svg)
 
 ## Overview
 
@@ -24,11 +24,11 @@ JanusX (Joint Association and Novel Utility for Selection) is a GWAS and genomic
 
 **Main capabilities**:
 
-- Genome-Wide Association Study (GWAS): `lm`, `lmm`, `lmm2`, `fvlmm`, SparseLMM (`splmm` / `splmm-exact`), and `farmcpu`
-- Genomic Selection (GS): `BLUP`, `BayesA/B/C/R`, and ML models (`RF/ET/GBDT/XGB/SVM/ENET`)
-- Streaming genotype IO for VCF/HMP/PLINK
+- Genome-Wide Association Study (GWAS): `lm`, `lmm`, `lmm2`, `fvlmm`, SparseLMM (`splmm` / `splmm-exact`), `farmcpu`, and cis/trans pair scans (`ct`)
+- Genomic Selection (GS): `BLUP`, `BayesA/B/C/R`, PLS/KRR, and ML models (`RF/ET/GBDT/XGB/SVM/ENET`)
+- Streaming genotype IO for VCF/HMP/PLINK BED and PLINK 2 PGEN
 - Post-analysis workflows: `postgwas`, `postgs`
-- Utility workflows: `grm`, `pca`, `gformat`, `gmerge`, `fastpop`
+- Utility workflows: `grm`, `pca`, `gformat`, `gmerge`, `fastpop` (including FST and XP-CLR)
 
 ---
 
@@ -49,7 +49,7 @@ powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/FJi
 ### Option A: Python package install
 
 ```Bash
-pip install janusx
+pip install janusx==2.0.0
 ```
 
 ### Option B: Conda / Bioconda
@@ -81,6 +81,8 @@ jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -splmm-ex
 # FarmCPU.
 jx gwas -vcf example/mouse_hs1940.vcf.gz -p example/mouse_hs1940.pheno -farmcpu -o test/
 ```
+
+For PLINK 2 PGEN input, use `-pfile <prefix>`; `-bfile <prefix>` reads PLINK BED files.
 
 <p align="center">
   <img src="./doc/mouse_hs1940.test0.add.lmm.svg" alt="overview" />
@@ -127,8 +129,8 @@ Train size: 1410, Test size: 530, EffSNPs: 8960
 ...
 ------------------------------------------------------------
 Fold Method     Pearsonr Spearmanr R2     time(s)  Best
-1    BLUP       0.704    0.675     0.493  0.198    
-1    BayesA     0.709    0.680     0.493  3.507    
+1    BLUP       0.704    0.675     0.493  0.198
+1    BayesA     0.709    0.680     0.493  3.507
 ...
 ------------------------------------------------------------
 ```
@@ -155,8 +157,9 @@ jx <module> -h
 - `grm`
 - `pca`
 - `gwas`
+- `ct` (cis/trans pair scans)
 - `postgwas` (Visualization, `manh` `qq` `ldblock`)
-- `fastpop` (population-structure analysis)
+- `fastpop` (population structure, FST, and XP-CLR)
 
 Attribution note:
 

@@ -1,6 +1,6 @@
 # JanusX
 
-[CLI Guide](./doc/JanusXcli.md) | [Core API Guide](./doc/JanusXcore.md) | [Zea Eureka](https://mp.weixin.qq.com/s/jl3h2DPRC21l8QJ0WxzXDA) | [v2.0.0 Release Notes](./doc/release/v2.0.0.md)
+[CLI Guide](./doc/JanusXcli.md) | [Core API Guide](./doc/JanusXcore.md) | [v2.0.0 Release](./doc/release/v2.0.0.md)
 
 [![GitHub release](https://img.shields.io/github/v/release/FJingxian/JanusX?label=release)](https://github.com/FJingxian/JanusX/releases/latest) ![Python](https://img.shields.io/badge/Python-3.10+-blue.svg) ![License](https://img.shields.io/badge/License-AGPLv3-blue.svg)
 

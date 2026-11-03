@@ -4,13 +4,49 @@ Version baseline: `v2.0.0`
 
 This document focuses on Python usage through the `janusx` package. It complements `doc/JanusXcli.md`: the CLI guide explains command-line workflows, while this file explains recommended imports, wrappers, and lower-level kernels.
 
+## Agent quick start
+
+Use this guide when changing or calling the Python API, genotype readers, or
+Rust-backed model kernels. Choose the layer that matches the input:
+
+| Input / goal | Preferred entrypoint |
+| --- | --- |
+| Genotypes already on disk; run a full GWAS | `janusx.assoc.run_gwas_config()` |
+| Genotypes already on disk; run GS | `janusx.gs.run_gs_config()` or `GenomicSelection` |
+| Genotype matrix already in memory; run association | `janusx.assoc.LinearModel` |
+| Read or stream genotype files | `janusx.gfreader` |
+| Direct in-memory statistical kernels | `janusx.pyBLUP` |
+| Backend diagnostics or advanced native calls | `janusx.janusx` (Rust extension; lower-level interface) |
+
+Implementation map for code changes:
+
+- Public wrapper contracts: `python/janusx/assoc/`, `python/janusx/gs/`
+- File readers and format conversion: `python/janusx/gfreader/`
+- GWAS workflow and scan routes: `python/janusx/assoc/workflow.py`, `workflow_model_stream.py`, `workflow_model_packed.py`
+- GS orchestration: `python/janusx/gs/workflow.py`
+- PyO3 registration and exported Rust functions: `src/lib.rs`
+- Native computation: locate the relevant implementation under `src/` before editing; keep Python wrappers thin
+
+Preserve these data contracts:
+
+- Keep sample order explicit and align phenotype, covariates, Q, and GRM to it.
+- File-backed genotype chunks are SNP-major `(variants, samples)`.
+- `LinearModel` matrix mode is sample-major `(samples, variants)`; direct `janusx.pyBLUP` association kernels are generally SNP-major.
+- GWAS currently accepts additive coding (`model="add"`). Trait indices are zero-based among phenotype columns after the sample-ID column.
+- Large file-backed jobs should stay on a reader/workflow route instead of copying the full genotype matrix into Python.
+
+When investigating behavior, first reproduce it through the public wrapper or
+`jx <module> -h`, then trace the delegated workflow/native function. For a
+change, validate the affected route and its input layout; a passing import alone
+does not validate the numerical result.
+
 ## 1. Public package map
 
 Use these modules as the main public surface:
 
 | Package | Use it for | Notes |
 | --- | --- | --- |
-| `janusx.gfreader` | genotype IO, chunk streaming, format conversion, packed BED preparation | best first stop for file-backed data |
+| `janusx.gfreader` | genotype IO, chunk streaming, format conversion, packed BED preparation | BED and PGEN readers are available where supported by the consuming workflow |
 | `janusx.assoc` | GWAS-style wrappers and file-mode orchestration | mirrors `jx gwas` |
 | `janusx.gs` | GS-style wrappers and result objects | mirrors `jx gs` |
 | `janusx.pyBLUP` | direct in-memory association, GRM, BLUP, and ML kernels | lower-level than `assoc` / `gs` |
@@ -21,7 +57,7 @@ Use these modules as the main public surface:
 | `janusx.bioplotkit` | GWAS, PCA, GS, and structure plots | some helpers live in submodules rather than the top-level export list |
 | `janusx.pipeline` | `fastq2vcf` / `fastq2count` compatibility checks | preflight only |
 | `janusx.ui` | parser/server entrypoints for the web UI | integration-oriented |
-| `janusx.janusx` | native Rust extension | useful for backend diagnostics and advanced users |
+| `janusx.janusx` | native Rust extension | backend diagnostics and advanced calls; lower-level than the wrapper API |
 
 Avoid importing `janusx.assoc.workflow` and `janusx.gs.workflow` directly for ordinary use. The wrapper packages above are the safer API layer.
 
@@ -76,6 +112,9 @@ for geno_chunk, sites in load_genotype_chunks(
 ```
 
 `load_genotype_chunks()` is the main Python entry for streaming file-backed genotype data. It returns SNP-major blocks and site metadata together.
+For PLINK inputs, pass the dataset prefix; BED and PGEN prefixes are supported
+by the relevant reader/workflow routes. Check the consuming command or reader
+help when choosing a format-specific option.
 
 ### 3.2 Save or convert streamed data
 

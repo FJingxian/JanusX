@@ -8,6 +8,36 @@ This guide tracks the current command-line surface in this repository. For exact
 jx <module> -h
 ```
 
+## Agent quick start
+
+Use this guide when an issue involves a `jx` command, CLI options, file formats,
+or command-line output. For Python entrypoints and array contracts, see
+[`JanusXcore.md`](JanusXcore.md).
+
+Start with the command path, then follow the implementation:
+
+| Work area | First code to inspect |
+| --- | --- |
+| CLI dispatch and module names | `python/janusx/script/JanusX.py` |
+| GWAS parsing and orchestration | `python/janusx/assoc/workflow.py` |
+| GWAS streaming and packed scans | `python/janusx/assoc/workflow_model_stream.py`, `workflow_model_packed.py` |
+| GS parsing and orchestration | `python/janusx/gs/workflow.py` |
+| Genotype readers and conversion | `python/janusx/gfreader/` and `python/janusx/script/gformat.py` |
+| GRM / PCA command behavior | `python/janusx/script/grm.py`, `pca.py` |
+| Native Rust implementation | `src/lib.rs`, then the relevant `src/` module |
+
+Keep these CLI contracts in view while changing code:
+
+- Sample IDs must be aligned across genotype, phenotype, GRM, Q, and covariates.
+- Genotype matrix files are SNP-major: variants by rows, samples by columns.
+- Trait indices are zero-based after the sample-ID column; names and ranges are also accepted.
+- GWAS uses additive genotype coding. `-lm2` adds selected covariate interactions; it is not a non-additive genotype-coding mode.
+- File-backed scans should use the module's streaming or packed route; avoid materializing a full genotype matrix without a concrete reason.
+
+For a code change, inspect that module's `-h` output and nearby implementation
+before editing. Afterward, run the narrowest relevant build or functional check
+for the changed path; do not infer supported flags from this guide alone.
+
 ## 1. Entrypoints and install modes
 
 JanusX is used in two common ways:
@@ -39,7 +69,11 @@ Most scientific modules accept one of these input families:
 - `-vcf`: `.vcf` or `.vcf.gz`
 - `-hmp`: `.hmp` or `.hmp.gz`
 - `-bfile`: PLINK prefix for `.bed/.bim/.fam`
+- `-pfile`: PLINK 2 prefix for `.pgen/.pvar/.psam`
 - `-file`: numeric genotype matrix `.txt/.tsv/.csv/.npy`, or a shared prefix
+
+Input support varies by command. Check `jx <module> -h` before assuming every
+module accepts every source format.
 
 For large repeated analyses, `-bfile` is usually the best default because packed BED paths can be reused across `grm`, `pca`, `gwas`, `gs`, `fastpop`, `gformat`, and related workflows.
 
@@ -81,7 +115,8 @@ For `gwas`, `gs`, and related modules:
 
 - first column: sample ID
 - remaining columns: traits or covariates
-- `-n/--ncol` is zero-based and excludes the sample ID column
+- `-n` or `--ncol`: select traits by zero-based index (excluding the sample-ID column), name, comma list, or inclusive range
+- the removed long option `--n` is not an alias for `--ncol`
 
 Examples:
 
@@ -133,6 +168,10 @@ Current model flags:
 - `-splmm` for the approximate GRAMMAR-gamma SparseLMM scan
 - `-splmm-exact` for the exact sparse-Cholesky SparseLMM scan
 - `-farmcpu`
+- `-lm2` for LM with selected SNP-by-covariate interactions
+
+`-splmm-approx` is a legacy spelling; use `-splmm` for new commands. GWAS
+genotype coding is additive across these models.
 
 Useful notes:
 
@@ -198,6 +237,9 @@ jx fastpop -vcf example/mouse_hs1940.vcf.gz -k 4 -tag x,1 -o demo -prefix mouse_
 ```
 
 Compatibility note: `jx adamixture` is still accepted as an alias.
+
+The structure/CV workflow is the default. Windowed population scans are
+subcommands: `jx fastpop fst ...` and `jx fastpop xpclr ...`.
 
 Accepted `-k` forms:
 
@@ -310,6 +352,11 @@ Use launcher `jx` when you want the full external workflow to run.
 - `simulation`: extended simulation and benchmarking workflow
 - `gblupbench`: GBLUP benchmark workflow
 - `garfieldbench`: GARFIELD local-interval benchmark workflow
+
+Other current command entrypoints include `ct` (cis/trans pair testing),
+`fvlmm2`, `hybrid`, `tree`, `treeplot`, `refcheck`, `view`, and the `kformat`
+K-mer utility. Their exact availability and arguments are defined by their
+module help.
 
 ## 5. Practical notes
 

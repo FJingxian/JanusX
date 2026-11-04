@@ -114,7 +114,32 @@ pub struct BimChunkReader {
     path: PathBuf,
     reader: BufReader<File>,
     next_row: usize,
-    pvar_columns: Option<Vec<String>>,
+    pvar_columns: Option<PvarColumnIndices>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PvarColumnIndices {
+    chrom: usize,
+    pos: usize,
+    id: usize,
+    ref_allele: usize,
+    alt_allele: usize,
+}
+
+struct BimLineFields<'a> {
+    chrom: &'a str,
+    snp: &'a str,
+    pos: i32,
+    ref_allele: &'a str,
+    alt_allele: &'a str,
+}
+
+struct PvarLineFields<'a> {
+    chrom: &'a str,
+    snp: &'a str,
+    pos: i32,
+    ref_allele: &'a str,
+    alt_allele: &'a str,
 }
 
 impl BimChunkReader {
@@ -149,15 +174,21 @@ impl BimChunkReader {
                             .split_whitespace()
                             .map(|field| field.trim_start_matches('#').to_ascii_uppercase())
                             .collect::<Vec<_>>();
-                        for required in ["CHROM", "POS", "ID", "REF", "ALT"] {
-                            if !columns.iter().any(|field| field == required) {
-                                return Err(format!(
-                                    "{}: PVAR header is missing {required}",
-                                    path.display()
-                                ));
-                            }
-                        }
-                        break columns;
+                        let column_index = |name: &str| {
+                            columns
+                                .iter()
+                                .position(|field| field == name)
+                                .ok_or_else(|| {
+                                    format!("{}: PVAR header is missing {name}", path.display())
+                                })
+                        };
+                        break PvarColumnIndices {
+                            chrom: column_index("CHROM")?,
+                            pos: column_index("POS")?,
+                            id: column_index("ID")?,
+                            ref_allele: column_index("REF")?,
+                            alt_allele: column_index("ALT")?,
+                        };
                     }
                     return Err(format!(
                         "{}: PVAR data appears before #CHROM header",
@@ -240,8 +271,9 @@ impl BimChunkReader {
             ));
         }
 
+        let mut line = String::new();
         while self.next_row < start {
-            self.read_next_line()?.ok_or_else(|| {
+            self.read_next_line_into(&mut line)?.ok_or_else(|| {
                 format!(
                     "BIM ended early: needed row {start} but only saw {} rows from {}",
                     self.next_row,
@@ -253,7 +285,7 @@ impl BimChunkReader {
         let kept_n = keep.iter().filter(|&&selected| selected).count();
         let mut sites = Vec::with_capacity(kept_n);
         for &selected in keep.iter() {
-            let (row_idx, line) = self.read_next_line()?.ok_or_else(|| {
+            let row_idx = self.read_next_line_into(&mut line)?.ok_or_else(|| {
                 format!(
                     "BIM ended early: needed row {end} but only saw {} rows from {}",
                     self.next_row,
@@ -261,13 +293,19 @@ impl BimChunkReader {
                 )
             })?;
             let line = line.trim_end();
-            let site = if let Some(columns) = self.pvar_columns.as_deref() {
-                parse_pvar_line(&self.path, row_idx + 1, line, columns)?
-            } else {
-                parse_bim_line(&self.path, row_idx + 1, line)?
-            };
             if selected {
+                let site = if let Some(columns) = self.pvar_columns {
+                    parse_pvar_line(&self.path, row_idx + 1, line, columns)?
+                } else {
+                    parse_bim_line(&self.path, row_idx + 1, line)?
+                };
                 sites.push(site);
+            } else {
+                if let Some(columns) = self.pvar_columns {
+                    validate_pvar_line(&self.path, row_idx + 1, line, columns)?;
+                } else {
+                    validate_bim_line(&self.path, row_idx + 1, line)?;
+                }
             }
         }
         Ok(sites)
@@ -327,13 +365,13 @@ impl BimChunkReader {
         }
     }
 
-    fn read_next_line(&mut self) -> Result<Option<(usize, String)>, String> {
+    fn read_next_line_into(&mut self, line: &mut String) -> Result<Option<usize>, String> {
         loop {
-            let mut line = String::new();
+            line.clear();
             let line_no = self.next_row + 1;
             let bytes = self
                 .reader
-                .read_line(&mut line)
+                .read_line(line)
                 .map_err(|e| format!("{}:{}: {}", self.path.display(), line_no, e))?;
             if bytes == 0 {
                 return Ok(None);
@@ -345,7 +383,15 @@ impl BimChunkReader {
             }
             let row_idx = self.next_row;
             self.next_row = self.next_row.saturating_add(1);
-            return Ok(Some((row_idx, line)));
+            return Ok(Some(row_idx));
+        }
+    }
+
+    fn read_next_line(&mut self) -> Result<Option<(usize, String)>, String> {
+        let mut line = String::new();
+        match self.read_next_line_into(&mut line)? {
+            Some(row_idx) => Ok(Some((row_idx, line))),
+            None => Ok(None),
         }
     }
 
@@ -353,7 +399,7 @@ impl BimChunkReader {
         let Some((row_idx, line)) = self.read_next_line()? else {
             return Ok(None);
         };
-        if let Some(columns) = self.pvar_columns.as_deref() {
+        if let Some(columns) = self.pvar_columns {
             parse_pvar_line(&self.path, row_idx + 1, line.trim_end(), columns).map(Some)
         } else {
             parse_bim_line(&self.path, row_idx + 1, line.trim_end()).map(Some)
@@ -1638,7 +1684,11 @@ fn read_bim_file(path: &Path) -> Result<Vec<SiteInfo>, String> {
 }
 
 #[inline]
-fn parse_bim_line(path: &Path, line_no: usize, line: &str) -> Result<SiteInfo, String> {
+fn parse_bim_fields<'a>(
+    path: &Path,
+    line_no: usize,
+    line: &'a str,
+) -> Result<BimLineFields<'a>, String> {
     let mut cols = line.split_whitespace();
     let chrom_tok = cols.next().ok_or_else(|| {
         format!(
@@ -1683,37 +1733,82 @@ fn parse_bim_line(path: &Path, line_no: usize, line: &str) -> Result<SiteInfo, S
         )
     })?;
 
-    Ok(SiteInfo {
-        chrom: chrom_tok.to_string(),
+    Ok(BimLineFields {
+        chrom: chrom_tok,
+        snp: snp_tok,
         pos: pos_tok.parse::<i32>().unwrap_or(0),
-        snp: snp_tok.to_string(),
-        ref_allele: a1_tok.to_string(),
-        alt_allele: a2_tok.to_string(),
+        ref_allele: a1_tok,
+        alt_allele: a2_tok,
     })
 }
 
 #[inline]
-fn parse_pvar_line(
+fn validate_bim_line(path: &Path, line_no: usize, line: &str) -> Result<(), String> {
+    parse_bim_fields(path, line_no, line).map(|_| ())
+}
+
+#[inline]
+fn parse_bim_line(path: &Path, line_no: usize, line: &str) -> Result<SiteInfo, String> {
+    let fields = parse_bim_fields(path, line_no, line)?;
+    Ok(SiteInfo {
+        chrom: fields.chrom.to_string(),
+        pos: fields.pos,
+        snp: fields.snp.to_string(),
+        ref_allele: fields.ref_allele.to_string(),
+        alt_allele: fields.alt_allele.to_string(),
+    })
+}
+
+#[inline]
+fn parse_pvar_fields<'a>(
     path: &Path,
     line_no: usize,
-    line: &str,
-    columns: &[String],
-) -> Result<SiteInfo, String> {
-    let fields = line.split_whitespace().collect::<Vec<_>>();
-    let field = |name: &str| -> Result<&str, String> {
-        let idx = columns
-            .iter()
-            .position(|column| column == name)
-            .ok_or_else(|| format!("{}: PVAR header is missing {name}", path.display()))?;
-        fields.get(idx).copied().ok_or_else(|| {
-            format!(
-                "Malformed PVAR line at {}:{}: {line}",
-                path.display(),
-                line_no
-            )
-        })
+    line: &'a str,
+    columns: PvarColumnIndices,
+) -> Result<PvarLineFields<'a>, String> {
+    let mut chrom = None;
+    let mut pos = None;
+    let mut id = None;
+    let mut ref_allele = None;
+    let mut alt_allele = None;
+    let last_column = columns
+        .chrom
+        .max(columns.pos)
+        .max(columns.id)
+        .max(columns.ref_allele)
+        .max(columns.alt_allele);
+    for (index, value) in line.split_whitespace().enumerate() {
+        if index == columns.chrom {
+            chrom = Some(value);
+        }
+        if index == columns.pos {
+            pos = Some(value);
+        }
+        if index == columns.id {
+            id = Some(value);
+        }
+        if index == columns.ref_allele {
+            ref_allele = Some(value);
+        }
+        if index == columns.alt_allele {
+            alt_allele = Some(value);
+        }
+        if index >= last_column {
+            break;
+        }
+    }
+    let malformed = || {
+        format!(
+            "Malformed PVAR line at {}:{}: {line}",
+            path.display(),
+            line_no
+        )
     };
-    let alt = field("ALT")?;
+    let chrom = chrom.ok_or_else(malformed)?;
+    let id = id.ok_or_else(malformed)?;
+    let ref_allele = ref_allele.ok_or_else(malformed)?;
+    let alt = alt_allele.ok_or_else(malformed)?;
+    let pos_token = pos.ok_or_else(malformed)?;
     if alt == "." || alt.contains(',') {
         return Err(format!(
             "{}:{}: only biallelic PGEN variants are supported; ALT={alt}",
@@ -1721,19 +1816,46 @@ fn parse_pvar_line(
             line_no
         ));
     }
-    let pos = field("POS")?.parse::<i32>().map_err(|e| {
+    let pos = pos_token.parse::<i32>().map_err(|e| {
         format!(
             "{}:{}: invalid PVAR POS value: {e}",
             path.display(),
             line_no
         )
     })?;
-    Ok(SiteInfo {
-        chrom: field("CHROM")?.to_string(),
+    Ok(PvarLineFields {
+        chrom,
         pos,
-        snp: field("ID")?.to_string(),
-        ref_allele: field("REF")?.to_string(),
-        alt_allele: alt.to_string(),
+        snp: id,
+        ref_allele,
+        alt_allele: alt,
+    })
+}
+
+#[inline]
+fn validate_pvar_line(
+    path: &Path,
+    line_no: usize,
+    line: &str,
+    columns: PvarColumnIndices,
+) -> Result<(), String> {
+    parse_pvar_fields(path, line_no, line, columns).map(|_| ())
+}
+
+#[inline]
+fn parse_pvar_line(
+    path: &Path,
+    line_no: usize,
+    line: &str,
+    columns: PvarColumnIndices,
+) -> Result<SiteInfo, String> {
+    let fields = parse_pvar_fields(path, line_no, line, columns)?;
+    Ok(SiteInfo {
+        chrom: fields.chrom.to_string(),
+        pos: fields.pos,
+        snp: fields.snp.to_string(),
+        ref_allele: fields.ref_allele.to_string(),
+        alt_allele: fields.alt_allele.to_string(),
     })
 }
 

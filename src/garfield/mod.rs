@@ -18730,6 +18730,57 @@ const MAX6_FUSED_QC_FAIL_NO_HOMOZYGOUS: u8 = 3;
 const MAX6_FUSED_QC_FAIL_MAF: u8 = 4;
 const MAX6_FUSED_QC_FAIL_NON_SIMPLE_SNP: u8 = 5;
 
+#[inline]
+fn scan_max6_identity_row_qc_counts(
+    row: &[u8],
+    n_samples: usize,
+) -> (usize, usize, usize, bool, bool) {
+    const LOW_BITS: u64 = 0x5555_5555_5555_5555;
+
+    let full_word_bytes = (n_samples / 32) * 8;
+    let mut logic_missing = 0usize;
+    let mut hom_alt = 0usize;
+    let mut has_het = false;
+    let mut has_raw_missing = false;
+    for packed_bytes in row[..full_word_bytes].chunks_exact(8) {
+        let packed = u64::from_le_bytes(
+            packed_bytes
+                .try_into()
+                .expect("eight packed genotype bytes form one word"),
+        );
+        let low = packed & LOW_BITS;
+        let high = (packed >> 1) & LOW_BITS;
+        logic_missing += (low ^ high).count_ones() as usize;
+        hom_alt += (low & high).count_ones() as usize;
+        has_het |= high & !low != 0;
+        has_raw_missing |= low & !high != 0;
+    }
+
+    let lut = packed_byte_lut();
+    let active_bytes = n_samples.div_ceil(4);
+    let rem_lanes = n_samples & 3;
+    for byte_idx in full_word_bytes..active_bytes {
+        let active_lanes = if rem_lanes > 0 && byte_idx + 1 == active_bytes {
+            rem_lanes
+        } else {
+            4
+        };
+        let mut byte = row[byte_idx];
+        if active_lanes < 4 {
+            byte &= (1u8 << (active_lanes * 2)) - 1u8;
+        }
+        let idx = byte as usize;
+        logic_missing += lut.logic_missing[idx] as usize;
+        hom_alt += lut.hom_alt[idx] as usize;
+        has_het |= lut.has_het[idx];
+        has_raw_missing |= lut.has_raw_missing[idx];
+    }
+    let hom_ref = n_samples
+        .saturating_sub(logic_missing)
+        .saturating_sub(hom_alt);
+    (logic_missing, hom_alt, hom_ref, has_het, has_raw_missing)
+}
+
 /// Count pure-line QC statistics and build the Max6 BIN row in one traversal
 /// of a mapped BED marker. QC and output use the same selected samples, so
 /// the homozygous counts collected here also determine the existing majority
@@ -18746,45 +18797,13 @@ fn scan_max6_row_qc_and_pack_logic(
     dst_words: &mut [u64],
     missing_words: &mut [u64],
 ) -> Max6FusedRowQc {
-    dst_words.fill(0);
-    missing_words.fill(0);
-    let mut logic_missing = 0usize;
-    let mut hom_alt = 0usize;
-    let mut hom_ref = 0usize;
-    let mut has_het = false;
-    let mut has_raw_missing = false;
-
-    if sample_identity {
-        let lut = packed_byte_lut();
-        let active_bytes = n_samples.div_ceil(4);
-        let rem_lanes = n_samples & 3;
-        for byte_idx in 0..active_bytes {
-            let active_lanes = if rem_lanes > 0 && byte_idx + 1 == active_bytes {
-                rem_lanes
-            } else {
-                4
-            };
-            let mut byte = row[byte_idx];
-            if active_lanes < 4 {
-                byte &= (1u8 << (active_lanes * 2)) - 1u8;
-            }
-            let idx = byte as usize;
-            let word_idx = byte_idx >> 4;
-            let shift = ((byte_idx & 15) * 4) as u32;
-            logic_missing += lut.logic_missing[idx] as usize;
-            hom_alt += lut.hom_alt[idx] as usize;
-            hom_ref += active_lanes
-                .saturating_sub(lut.logic_missing[idx] as usize)
-                .saturating_sub(lut.hom_alt[idx] as usize);
-            has_het |= lut.has_het[idx];
-            has_raw_missing |= lut.has_raw_missing[idx];
-            dst_words[word_idx] |= (lut.logic_alt_bits[idx] as u64) << shift;
-            missing_words[word_idx] |= (lut.logic_missing_bits[idx] as u64) << shift;
-        }
+    let (logic_missing, hom_alt, hom_ref, has_het, has_raw_missing) = if sample_identity {
+        scan_max6_identity_row_qc_counts(row, n_samples)
     } else {
-        (logic_missing, hom_alt, hom_ref, has_het, has_raw_missing) =
-            scan_max6_subset_row_and_pack(row, sample_plan, dst_words, missing_words);
-    }
+        dst_words.fill(0);
+        missing_words.fill(0);
+        scan_max6_subset_row_and_pack(row, sample_plan, dst_words, missing_words)
+    };
 
     let logic_missing = logic_missing.min(n_samples);
     let missing_rate = if n_samples > 0 {
@@ -18814,6 +18833,31 @@ fn scan_max6_row_qc_and_pack_logic(
     let row_flip = alt_freq > 0.5_f32;
     let keep = reason == MAX6_FUSED_QC_KEEP;
     if keep {
+        if sample_identity {
+            // Identity rows arrive in a fresh zeroed batch slice. Delay all
+            // output writes until QC passes so rejected rows stay untouched.
+            dst_words.fill(0);
+            missing_words.fill(0);
+            let lut = packed_byte_lut();
+            let active_bytes = n_samples.div_ceil(4);
+            let rem_lanes = n_samples & 3;
+            for byte_idx in 0..active_bytes {
+                let active_lanes = if rem_lanes > 0 && byte_idx + 1 == active_bytes {
+                    rem_lanes
+                } else {
+                    4
+                };
+                let mut byte = row[byte_idx];
+                if active_lanes < 4 {
+                    byte &= (1u8 << (active_lanes * 2)) - 1u8;
+                }
+                let idx = byte as usize;
+                let word_idx = byte_idx >> 4;
+                let shift = ((byte_idx & 15) * 4) as u32;
+                dst_words[word_idx] |= (lut.logic_alt_bits[idx] as u64) << shift;
+                missing_words[word_idx] |= (lut.logic_missing_bits[idx] as u64) << shift;
+            }
+        }
         let n_words = dst_words.len();
         let tail_bits = n_samples & 63;
         for word_idx in 0..n_words {

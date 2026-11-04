@@ -14596,6 +14596,13 @@ struct Max6SharedCandidatePairPlan {
     unit_pair_indices: Vec<Vec<usize>>,
 }
 
+fn max6_shared_grm_int_diagnostic_recipient(unit_pair_indices: &[Vec<usize>]) -> Option<usize> {
+    unit_pair_indices
+        .iter()
+        .position(|pair_indices| !pair_indices.is_empty())
+        .or_else(|| (!unit_pair_indices.is_empty()).then_some(0))
+}
+
 /// Deduplicate window-local screen candidates by their global marker pair,
 /// keeping an index map that restores each window's original candidate order.
 fn max6_shared_candidate_pair_plan(
@@ -23212,6 +23219,8 @@ fn run_max6_grmmax6_pipeline(
                 }
 
                 let mut scores_by_unit = Vec::with_capacity(pair_plan.unit_pair_indices.len());
+                let diagnostic_recipient =
+                    max6_shared_grm_int_diagnostic_recipient(&pair_plan.unit_pair_indices);
                 for (unit_index, pair_indices) in pair_plan.unit_pair_indices.iter().enumerate() {
                     let mut chisq = Vec::with_capacity(pair_indices.len());
                     let mut invalid = Vec::with_capacity(pair_indices.len());
@@ -23248,7 +23257,7 @@ fn run_max6_grmmax6_pipeline(
                             None => {}
                         }
                     }
-                    if unit_index == 0 {
+                    if diagnostic_recipient == Some(unit_index) {
                         diagnostics.batches = shared_diagnostics.batches;
                         diagnostics.max_workspace_bytes = shared_diagnostics.max_workspace_bytes;
                         diagnostics.elapsed_seconds = shared_diagnostics.elapsed_seconds;

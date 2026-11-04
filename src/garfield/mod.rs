@@ -14587,6 +14587,84 @@ struct Max6DeferredWindowScreen {
 struct Max6PrecomputedScreen {
     screen: logic_residual_screen::ResidualScreenResult,
     kernel_seconds: f64,
+    shared_grm_int: Option<grm_max6::GrmIntScoreBatch>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Max6SharedCandidatePairPlan {
+    global_pairs: Vec<(usize, usize)>,
+    unit_pair_indices: Vec<Vec<usize>>,
+}
+
+/// Deduplicate window-local screen candidates by their global marker pair,
+/// keeping an index map that restores each window's original candidate order.
+fn max6_shared_candidate_pair_plan(
+    selected_global_rows: &[&[usize]],
+    local_pairs_by_unit: &[Vec<(usize, usize)>],
+) -> Result<Max6SharedCandidatePairPlan, String> {
+    if selected_global_rows.len() != local_pairs_by_unit.len() {
+        return Err(format!(
+            "Max6 shared candidate plan has {} row lists for {} unit pair lists",
+            selected_global_rows.len(),
+            local_pairs_by_unit.len()
+        ));
+    }
+
+    let mut pair_keys_by_unit = Vec::with_capacity(local_pairs_by_unit.len());
+    let mut unique_pair_keys = Vec::new();
+    for (unit_index, (rows, local_pairs)) in selected_global_rows
+        .iter()
+        .zip(local_pairs_by_unit)
+        .enumerate()
+    {
+        let mut pair_keys = Vec::with_capacity(local_pairs.len());
+        for &(left, right) in local_pairs {
+            let global_left = *rows.get(left).ok_or_else(|| {
+                format!(
+                    "Max6 shared candidate pair left index {left} is out of range for unit {unit_index}"
+                )
+            })?;
+            let global_right = *rows.get(right).ok_or_else(|| {
+                format!(
+                    "Max6 shared candidate pair right index {right} is out of range for unit {unit_index}"
+                )
+            })?;
+            let key = max6_diagnostic_pair_key(global_left, global_right)?;
+            pair_keys.push(key);
+            unique_pair_keys.push(key);
+        }
+        pair_keys_by_unit.push(pair_keys);
+    }
+
+    unique_pair_keys.sort_unstable();
+    unique_pair_keys.dedup();
+    let global_pairs = unique_pair_keys
+        .iter()
+        .map(|&key| (((key >> 32) as u32) as usize, (key as u32) as usize))
+        .collect::<Vec<_>>();
+    let pair_index_by_key = unique_pair_keys
+        .iter()
+        .enumerate()
+        .map(|(index, &key)| (key, index))
+        .collect::<HashMap<_, _>>();
+    let unit_pair_indices = pair_keys_by_unit
+        .iter()
+        .map(|pair_keys| {
+            pair_keys
+                .iter()
+                .map(|key| {
+                    pair_index_by_key.get(key).copied().ok_or_else(|| {
+                        "Max6 shared candidate pair index map is incomplete".to_string()
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Max6SharedCandidatePairPlan {
+        global_pairs,
+        unit_pair_indices,
+    })
 }
 
 #[inline]
@@ -15938,8 +16016,14 @@ fn scan_max6_grmmax6_unit(
     let selected_margins = one_cell_margin_table.select(selected.as_slice())?;
     let selected_margins_for_profile = screen_profile_pairs.map(|_| selected_margins.clone());
     let screen_input_prepare_seconds = screen_input_prepare_started.elapsed().as_secs_f64();
-    let (screen, screen_kernel_seconds) = if let Some(precomputed) = precomputed_screen {
-        (precomputed.screen, precomputed.kernel_seconds)
+    let (screen, screen_kernel_seconds, precomputed_grm_int) = if let Some(precomputed) =
+        precomputed_screen
+    {
+        (
+            precomputed.screen,
+            precomputed.kernel_seconds,
+            precomputed.shared_grm_int,
+        )
     } else {
         let screen_kernel_started = Instant::now();
         let screen = if let Some(callback) = progress_callback {
@@ -15994,7 +16078,7 @@ fn scan_max6_grmmax6_unit(
             beam_params.allow_parallel,
         )?
         };
-        (screen, screen_kernel_started.elapsed().as_secs_f64())
+        (screen, screen_kernel_started.elapsed().as_secs_f64(), None)
     };
     let screen_profile = if let (Some(profile_pairs), Some(profile_margins)) =
         (screen_profile_pairs, selected_margins_for_profile.as_ref())
@@ -16067,17 +16151,30 @@ fn scan_max6_grmmax6_unit(
             .map(|candidate| (candidate.first, candidate.second))
             .collect::<Vec<_>>();
         let candidate_prepare_seconds = candidate_prepare_started.elapsed().as_secs_f64();
-        let grm_int = grm_max6::grm_int_interaction_scores_packed(
-            packed.as_slice(),
-            logic_bits.row_words,
-            logic_bits.n_samples,
-            selected.len(),
-            candidate_pairs.as_slice(),
-            p_c,
-            no_grm_projector,
-            projected_y,
-            score_scale,
-        )?;
+        let grm_int = if let Some(precomputed) = precomputed_grm_int {
+            if precomputed.chisq.len() != screen_candidate_count
+                || precomputed.invalid.len() != screen_candidate_count
+            {
+                return Err(format!(
+                    "shared GRM-INT scorer returned {} scores / {} statuses for {screen_candidate_count} screen candidates",
+                    precomputed.chisq.len(),
+                    precomputed.invalid.len()
+                ));
+            }
+            precomputed
+        } else {
+            grm_max6::grm_int_interaction_scores_packed(
+                packed.as_slice(),
+                logic_bits.row_words,
+                logic_bits.n_samples,
+                selected.len(),
+                candidate_pairs.as_slice(),
+                p_c,
+                no_grm_projector,
+                projected_y,
+                score_scale,
+            )?
+        };
 
         let mut candidate_pair_keys = Vec::new();
         let mut candidate_score_observations = Vec::new();
@@ -17571,9 +17668,12 @@ fn max6_membership_scan_task_chunks(
         })
         .collect::<Option<Vec<_>>>()?;
 
-    const MAX_BATCH_UNITS: usize = 16;
-    const MAX_BATCH_MEMBERSHIPS: usize = 65_536;
-    const MAX_BATCH_UNIQUE_ROWS: usize = 32_768;
+    // Score reuse happens within a screen batch. Group enough windows to
+    // expose parallel unique-pair jobs while the row and membership budgets
+    // continue to bound memory.
+    const MAX_BATCH_UNITS: usize = 32;
+    const MAX_BATCH_MEMBERSHIPS: usize = 131_072;
+    const MAX_BATCH_UNIQUE_ROWS: usize = 65_536;
     const MAX_HEAP_ENTRIES_PER_WORKER: usize = 32_768;
     let heap_limited_units = (MAX_HEAP_ENTRIES_PER_WORKER / top_k.max(1)).max(1);
     let max_batch_units = MAX_BATCH_UNITS.min(heap_limited_units);
@@ -23025,15 +23125,157 @@ fn run_max6_grmmax6_pipeline(
             }
             let per_unit_kernel_seconds =
                 batch_kernel_seconds / batch_screen.units.len().max(1) as f64;
+            let grm_int_batch_started = Instant::now();
+            let shared_grm_int_by_unit = if grm_int_only && unit_kind_lc == "window" {
+                const SHARED_GRM_INT_SCORE_PAIRS: usize = 64;
+
+                // A GRM-INT score is a property of the global marker pair and
+                // trait, so overlapping windows can reuse its exact value.
+                let selected_rows_by_unit = batch_units
+                    .iter()
+                    .map(|unit| unit.selected_global_rows)
+                    .collect::<Vec<_>>();
+                let local_pairs_by_unit = batch_screen
+                    .units
+                    .iter()
+                    .map(|screen| {
+                        screen
+                            .candidates
+                            .iter()
+                            .map(|candidate| (candidate.first, candidate.second))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+                let pair_plan = max6_shared_candidate_pair_plan(
+                    selected_rows_by_unit.as_slice(),
+                    local_pairs_by_unit.as_slice(),
+                )?;
+                let bits = logic_bits.bits();
+                let marker_count = bits.len() / logic_bits.row_words;
+                let score_pair_chunk = |candidate_pairs: &[(usize, usize)]| {
+                    grm_max6::grm_int_interaction_scores_packed(
+                        bits,
+                        logic_bits.row_words,
+                        logic_bits.n_samples,
+                        marker_count,
+                        candidate_pairs,
+                        p_c,
+                        no_grm_projector,
+                        projected_y.as_slice(),
+                        score_scale,
+                    )
+                };
+                let score_chunks = if let Some(pool) = outer_pool.as_ref() {
+                    pool.install(|| {
+                        pair_plan
+                            .global_pairs
+                            .par_chunks(SHARED_GRM_INT_SCORE_PAIRS)
+                            .map(score_pair_chunk)
+                            .collect::<Result<Vec<_>, String>>()
+                    })?
+                } else {
+                    pair_plan
+                        .global_pairs
+                        .chunks(SHARED_GRM_INT_SCORE_PAIRS)
+                        .map(score_pair_chunk)
+                        .collect::<Result<Vec<_>, String>>()?
+                };
+
+                let mut unique_chisq = Vec::with_capacity(pair_plan.global_pairs.len());
+                let mut unique_invalid = Vec::with_capacity(pair_plan.global_pairs.len());
+                let mut shared_diagnostics = grm_max6::GrmIntScoreDiagnostics::default();
+                for batch in score_chunks {
+                    if batch.chisq.len() != batch.invalid.len() {
+                        return Err(
+                            "shared GRM-INT scores/statuses have different lengths".to_string()
+                        );
+                    }
+                    unique_chisq.extend(batch.chisq);
+                    unique_invalid.extend(batch.invalid);
+                    shared_diagnostics.batches = shared_diagnostics
+                        .batches
+                        .saturating_add(batch.diagnostics.batches);
+                    shared_diagnostics.max_workspace_bytes = shared_diagnostics
+                        .max_workspace_bytes
+                        .max(batch.diagnostics.max_workspace_bytes);
+                    shared_diagnostics.elapsed_seconds += batch.diagnostics.elapsed_seconds;
+                }
+                if unique_chisq.len() != pair_plan.global_pairs.len()
+                    || unique_invalid.len() != pair_plan.global_pairs.len()
+                {
+                    return Err(format!(
+                        "shared GRM-INT scorer returned {} scores / {} statuses for {} unique candidates",
+                        unique_chisq.len(),
+                        unique_invalid.len(),
+                        pair_plan.global_pairs.len()
+                    ));
+                }
+
+                let mut scores_by_unit = Vec::with_capacity(pair_plan.unit_pair_indices.len());
+                for (unit_index, pair_indices) in pair_plan.unit_pair_indices.iter().enumerate() {
+                    let mut chisq = Vec::with_capacity(pair_indices.len());
+                    let mut invalid = Vec::with_capacity(pair_indices.len());
+                    let mut diagnostics = grm_max6::GrmIntScoreDiagnostics::default();
+                    for &pair_index in pair_indices {
+                        let Some(&score) = unique_chisq.get(pair_index) else {
+                            return Err(format!(
+                                "shared GRM-INT pair index {pair_index} is out of range"
+                            ));
+                        };
+                        let Some(&invalid_status) = unique_invalid.get(pair_index) else {
+                            return Err(format!(
+                                "shared GRM-INT invalid-status index {pair_index} is out of range"
+                            ));
+                        };
+                        chisq.push(score);
+                        invalid.push(invalid_status);
+                        match invalid_status {
+                            Some(grm_max6::GrmIntInvalidScore::SingularEndpointDesign) => {
+                                diagnostics.singular_endpoint_design =
+                                    diagnostics.singular_endpoint_design.saturating_add(1);
+                            }
+                            Some(
+                                grm_max6::GrmIntInvalidScore::NegligibleInteractionInformation,
+                            ) => {
+                                diagnostics.negligible_residual_interaction_information =
+                                    diagnostics
+                                        .negligible_residual_interaction_information
+                                        .saturating_add(1);
+                            }
+                            Some(grm_max6::GrmIntInvalidScore::Nonfinite) => {
+                                diagnostics.nonfinite = diagnostics.nonfinite.saturating_add(1);
+                            }
+                            None => {}
+                        }
+                    }
+                    if unit_index == 0 {
+                        diagnostics.batches = shared_diagnostics.batches;
+                        diagnostics.max_workspace_bytes = shared_diagnostics.max_workspace_bytes;
+                        diagnostics.elapsed_seconds = shared_diagnostics.elapsed_seconds;
+                    }
+                    scores_by_unit.push(grm_max6::GrmIntScoreBatch {
+                        chisq,
+                        invalid,
+                        diagnostics,
+                    });
+                }
+                Some(scores_by_unit)
+            } else {
+                None
+            };
+            let shared_grm_int_by_unit = shared_grm_int_by_unit
+                .map(|scores| scores.into_iter().map(Some).collect::<Vec<_>>())
+                .unwrap_or_else(|| vec![None; batch_screen.units.len()]);
             let precomputed_screens = batch_screen
                 .units
                 .into_iter()
-                .map(|screen| Max6PrecomputedScreen {
+                .zip(shared_grm_int_by_unit)
+                .map(|(screen, shared_grm_int)| Max6PrecomputedScreen {
                     screen,
                     kernel_seconds: per_unit_kernel_seconds,
+                    shared_grm_int,
                 })
                 .collect::<Vec<_>>();
-            let grm_int_batch_started = Instant::now();
             let scored = if let Some(pool) = outer_pool.as_ref() {
                 pool.install(|| {
                     unit_chunk

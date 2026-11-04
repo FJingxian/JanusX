@@ -587,11 +587,13 @@ pub(crate) struct GrmIntScoreBatch {
     /// One interaction chi-square(1) score per input pair, in input order.
     /// Singular, uninformative, and non-finite tests are represented by NaN.
     pub(crate) chisq: Vec<f64>,
+    /// The failure class for each candidate, or `None` when the score is finite.
+    pub(crate) invalid: Vec<Option<GrmIntInvalidScore>>,
     pub(crate) diagnostics: GrmIntScoreDiagnostics,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GrmIntInvalidScore {
+pub(crate) enum GrmIntInvalidScore {
     SingularEndpointDesign,
     NegligibleInteractionInformation,
     Nonfinite,
@@ -757,6 +759,7 @@ pub(crate) fn grm_int_interaction_scores_packed(
 
     let mut result = GrmIntScoreBatch {
         chisq: vec![f64::NAN; candidate_pairs.len()],
+        invalid: vec![None; candidate_pairs.len()],
         diagnostics: GrmIntScoreDiagnostics::default(),
     };
     if candidate_pairs.is_empty() {
@@ -925,12 +928,15 @@ pub(crate) fn grm_int_interaction_scores_packed(
             match score {
                 Ok(chisq) => result.chisq[output_index] = chisq,
                 Err(GrmIntInvalidScore::SingularEndpointDesign) => {
+                    result.invalid[output_index] = Some(GrmIntInvalidScore::SingularEndpointDesign);
                     result.diagnostics.singular_endpoint_design = result
                         .diagnostics
                         .singular_endpoint_design
                         .saturating_add(1);
                 }
                 Err(GrmIntInvalidScore::NegligibleInteractionInformation) => {
+                    result.invalid[output_index] =
+                        Some(GrmIntInvalidScore::NegligibleInteractionInformation);
                     result
                         .diagnostics
                         .negligible_residual_interaction_information = result
@@ -939,6 +945,7 @@ pub(crate) fn grm_int_interaction_scores_packed(
                         .saturating_add(1);
                 }
                 Err(GrmIntInvalidScore::Nonfinite) => {
+                    result.invalid[output_index] = Some(GrmIntInvalidScore::Nonfinite);
                     result.diagnostics.nonfinite = result.diagnostics.nonfinite.saturating_add(1);
                 }
             }

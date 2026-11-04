@@ -166,7 +166,8 @@ use residual::{
 };
 use residual::{
     build_exact_projection_from_eigensystem_rust, garfield_residualize_exact_from_grm_rust,
-    garfield_residualize_exact_with_eigenvectors_rust, GarfieldResidualResult,
+    garfield_residualize_exact_with_eigenvectors_rust, garfield_residualize_lm_rust,
+    GarfieldResidualResult,
 };
 pub use residual::{garfield_residualize_bed_py, garfield_residualize_grm_py};
 #[allow(unused_imports)]
@@ -21220,6 +21221,7 @@ fn rule_null_generation_for_output(
     has_screen_calibration: bool,
     has_max6_pair_output: bool,
     exact_lmm: bool,
+    lm: bool,
 ) -> Option<&'static str> {
     if grm_int_only {
         None
@@ -21229,6 +21231,8 @@ fn rule_null_generation_for_output(
         Some("global_pair_score_permutation_fixed_pc")
     } else if exact_lmm {
         Some("lmm_parametric_bootstrap")
+    } else if lm {
+        Some("lm_parametric_bootstrap")
     } else {
         Some("pcg_residual_permutation")
     }
@@ -22774,9 +22778,9 @@ fn run_max6_grmmax6_pipeline(
         vec![scan_unit_indices.to_vec()]
     };
     let scan_progress_detail = if grm_int_only {
-        "Max6 Top-K screen, conditional GRM-INT scoring, and final subset audit"
+        "Max6 Top-K screen, conditional interaction scoring, and final subset audit"
     } else {
-        "screen candidates, exact GRM-Max6 rerank, and final subset audit"
+        "screen candidates, exact Max6 rerank, and final subset audit"
     };
     garfield_stage_progress_notify(
         progress_callback,
@@ -24411,15 +24415,19 @@ fn garfield_logic_search_bed_owned(
     validate_continuous_y(&y)?;
     let using_external_grm = grm.is_some();
     let residual_method_lc = residual_method.trim().to_ascii_lowercase();
+    let use_lm_residualization = residual_method_lc == "lm";
     let use_pcg_residualization = matches!(
         residual_method_lc.as_str(),
         "rrblup_pcg" | "rrblup-pcg" | "pcg"
     );
-    if !use_pcg_residualization && residual_method_lc != "exact" {
+    if !use_lm_residualization && !use_pcg_residualization && residual_method_lc != "exact" {
         return Err(format!(
-            "unsupported residual_method '{}'; expected 'exact' or 'rrblup_pcg'",
+            "unsupported residual_method '{}'; expected 'lm', 'exact', or 'rrblup_pcg'",
             residual_method
         ));
+    }
+    if use_lm_residualization && using_external_grm {
+        return Err("LM residualization cannot be combined with a provided GRM".to_string());
     }
     if max6_grm_backend && use_pcg_residualization {
         return Err(
@@ -24672,7 +24680,7 @@ fn garfield_logic_search_bed_owned(
                 threads_eff,
             )?
         };
-        let logic_row_flip = if using_external_grm {
+        let logic_row_flip = if using_external_grm || use_lm_residualization {
             Some(meta.row_flip)
         } else {
             None
@@ -24762,7 +24770,7 @@ fn garfield_logic_search_bed_owned(
     let mut auto_grm_full: Option<Vec<f64>> = None;
     let mut auto_eff_m_full: Option<usize> = None;
     let mut logic_row_flip_auto: Option<Vec<bool>> = None;
-    if !using_external_grm && !use_pcg_residualization {
+    if !using_external_grm && !use_pcg_residualization && !use_lm_residualization {
         garfield_stage_progress_notify(
             progress_callback.as_ref(),
             "garfield_auto_grm",
@@ -24919,6 +24927,8 @@ fn garfield_logic_search_bed_owned(
                 0,
                 seed,
             )?
+        } else if use_lm_residualization {
+            garfield_residualize_lm_rust(y_train, x_train, q_cov, add_intercept, 0, seed, 0)?
         } else {
             let (grm_train, eff_m_train) = if let Some(full_grm) = grm.as_ref() {
                 (
@@ -24986,6 +24996,16 @@ fn garfield_logic_search_bed_owned(
                 0,
                 seed.wrapping_add(1),
             )?
+        } else if use_lm_residualization {
+            garfield_residualize_lm_rust(
+                y_test,
+                x_test,
+                q_cov,
+                add_intercept,
+                0,
+                seed.wrapping_add(1),
+                0,
+            )?
         } else {
             let (grm_test, eff_m_test) = if let Some(full_grm) = grm.as_ref() {
                 (
@@ -25052,6 +25072,22 @@ fn garfield_logic_search_bed_owned(
             pcg_config(),
             pcg_null_repeats,
             seed,
+        )?;
+        let fit = Arc::new(fit);
+        (fit.clone(), fit)
+    } else if use_lm_residualization {
+        let fit = garfield_residualize_lm_rust(
+            y_train,
+            x_train,
+            q_cov,
+            add_intercept,
+            pcg_null_repeats,
+            seed,
+            if max6_screen_tail_audit {
+                max6_screen_tail_audit_repeats
+            } else {
+                0
+            },
         )?;
         let fit = Arc::new(fit);
         (fit.clone(), fit)
@@ -28128,6 +28164,7 @@ pub fn garfield_logic_search_bed_py<'py>(
         result.max6_screen_threshold_method.is_some(),
         result.max6_pairs_tsv.is_some(),
         residualization_method == "exact_lmm",
+        residualization_method == "lm",
     );
     out.set_item("residualization_method", residualization_method)?;
     out.set_item("lambda_source", result.train_fit.lambda_source.clone())?;
@@ -31319,12 +31356,16 @@ mod tests {
             "screen_maxT"
         );
         assert_eq!(
-            rule_null_generation_for_output(true, false, true, true),
+            rule_null_generation_for_output(true, false, true, true, false),
             None
         );
         assert_eq!(
-            rule_null_generation_for_output(false, false, true, true),
+            rule_null_generation_for_output(false, false, true, true, false),
             Some("global_pair_score_permutation_fixed_pc")
+        );
+        assert_eq!(
+            rule_null_generation_for_output(false, false, false, false, true),
+            Some("lm_parametric_bootstrap")
         );
     }
 

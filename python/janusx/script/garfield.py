@@ -148,6 +148,15 @@ def _resolve_garfield_grm_int_mode(
     return bool(requested), "explicit_enabled" if requested else "explicit_disabled"
 
 
+def _resolve_garfield_residual_method(
+    requested: str | None,
+    grm_path: str | None,
+) -> str:
+    if requested is not None:
+        return str(requested).strip().lower()
+    return "exact" if grm_path and str(grm_path).strip() else "lm"
+
+
 def _resolve_garfield_null_resampling(
     search_backend: object,
     explicit_permutation_spec: object,
@@ -1869,10 +1878,11 @@ def main() -> None:
         "--residual-method",
         dest="residual_method",
         choices=["exact", "rrblup_pcg"],
-        default="exact",
+        default=None,
         help=(
-            "Residualization method: exact GRM-eigh/REML (default) or "
-            "rrBLUP-PCG additive projection."
+            "Residualization method. Default is LM/OLS when -k is omitted, and "
+            "exact GRM-eigh/REML when -k is supplied. Use rrblup_pcg for "
+            "marker-space additive projection."
         ),
     )
     optional_group.add_argument(
@@ -1907,7 +1917,7 @@ def main() -> None:
         default="NONE",
         help=(
             "Legacy ML engine for candidate search. The default max6-grmmax6 backend uses "
-            "LD-tag exhaustive Max6 screening followed by GRM-INT Top-K scoring and does "
+            "LD-tag exhaustive Max6 screening followed by one-df interaction Top-K scoring and does "
             "not call ML/CORR."
         ),
     )
@@ -2127,8 +2137,8 @@ def main() -> None:
         default="max6-grmmax6",
         help=(
             "GARFIELD search backend. `max6-grmmax6` runs deterministic LD-tag "
-            "exhaustive packed Max6 screening followed by one-df GRM-INT Top-K ranking "
-            "by default (`--no-grm-int` selects exact GRM-Max6 reranking); "
+            "exhaustive packed Max6 screening followed by one-df interaction Top-K ranking "
+            "by default (`--no-grm-int` selects exact Max6 reranking); "
             "`max6-grmmax6-legacy` retains the former ML/CORR-prefiltered path; "
             "`pair-triple` remains development-only."
             if show_dev_help
@@ -2167,11 +2177,12 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=None,
         help=(
-            "Use one-df GRM interaction-only FWL scoring for the Max6 Top-K pairs "
-            "(g1×g2 adjusted for g1, g2, covariates, and GRM), write chi-square/pwald, "
+            "Use one-df interaction-only FWL scoring for the Max6 Top-K pairs "
+            "(g1×g2 adjusted for g1, g2, and covariates; also GRM when an LMM is used), "
+            "write chi-square/pwald, "
             "and rank within Top-K by interaction chi-square. Defaults on for "
             "--search-backend max6-grmmax6 and off for other routes; --no-grm-int "
-            "selects exact GRM-Max6 scoring."
+            "selects exact Max6 scoring."
         ),
     )
     optional_group.add_argument(
@@ -2214,7 +2225,8 @@ def main() -> None:
         type=int,
         default=1,
         help=(
-            "Keep up to top-k de-duplicated Max6 pairs per scan unit for GRM-INT scoring "
+            "Keep up to top-k de-duplicated Max6 pairs per scan unit for one-df "
+            "interaction scoring "
             "(default: 1)."
         ),
     )
@@ -2256,9 +2268,19 @@ def main() -> None:
     )
 
     args, extras = parser.parse_known_args()
+    args.residual_method = _resolve_garfield_residual_method(
+        args.residual_method,
+        args.grm,
+    )
     args.grm_int, args.grm_int_mode_source = _resolve_garfield_grm_int_mode(
         args.grm_int,
         args.search_backend,
+    )
+    grm_int_label = "LM-INT" if args.residual_method == "lm" else "GRM-INT"
+    grm_int_test_metadata = (
+        "one_df_FWL_g1xg2_adjusted_for_g1_g2_covariates"
+        if args.residual_method == "lm"
+        else "one_df_FWL_g1xg2_adjusted_for_g1_g2_covariates_GRM"
     )
 
     has_genotype = bool(args.bfile)
@@ -2605,7 +2627,16 @@ def main() -> None:
 
     general_rows = [
         ("Genotype input", gfile),
-        ("Residualization GRM", args.grm if args.grm else "auto from genotype"),
+        (
+            "Residualization GRM",
+            args.grm
+            if args.grm
+            else (
+                "not used (LM/OLS)"
+                if args.residual_method == "lm"
+                else "auto from genotype"
+            ),
+        ),
         ("Covariates", None if not args.cov_inputs else ",".join(str(x) for x in args.cov_inputs)),
         ("Phenotype", args.pheno),
         ("Scan mode", args.scan_mode),
@@ -2636,9 +2667,9 @@ def main() -> None:
         (
             "Post-screen test",
             (
-                f"GRM-INT 1df; Max6 Top-{int(args.top_rules_runtime)} per unit; rank by interaction p"
+                f"{grm_int_label} 1df; Max6 Top-{int(args.top_rules_runtime)} per unit; rank by interaction p"
                 if args.grm_int
-                else "GRM-Max6 exact candidate rerank"
+                else f"{'LM' if args.residual_method == 'lm' else 'GRM'}-Max6 exact candidate rerank"
             ),
         ),
         ("Seed", int(args.seed)),
@@ -3040,7 +3071,7 @@ def main() -> None:
                 )
 
         # Rust handles residualization, genotype-only LD-tag compression,
-        # exhaustive Max6 screening, and the selected GRM-INT or exact
+        # exhaustive Max6 screening, and the selected interaction-only or exact
         # GRM-Max6 scoring route.
         result = _run_scan_with_progress(
             scan_desc,
@@ -3174,7 +3205,7 @@ def main() -> None:
                     _emit_garfield_file_only_line(
                         logger,
                         (
-                            f"Max6 -> GRM-INT: topk={int(args.top_rules_runtime)} per scan unit; "
+                            f"Max6 -> {grm_int_label}: topk={int(args.top_rules_runtime)} per scan unit; "
                             "interaction-only one-df FWL score; output ranked by grm_int_chisq; "
                             "pwald=chi2_1; Bonferroni threshold is a reference only"
                         ),
@@ -3183,7 +3214,7 @@ def main() -> None:
                         _emit_garfield_file_only_line(
                             logger,
                             (
-                                "GRM-INT pwald Bonferroni reference line: "
+                                f"{grm_int_label} pwald Bonferroni reference line: "
                                 f"N_unique={format_max6_count(grm_int_pwald_reference['n_unique_pairs'])}, "
                                 f"alpha={grm_int_pwald_reference['alpha']:.3g}, "
                                 f"p_cut={grm_int_pwald_reference['p_cut']:.6g}, "
@@ -3321,7 +3352,7 @@ def main() -> None:
                 )
                 if args.grm_int:
                     observed_score_summary = (
-                        "GRM-INT_score_task_sum="
+                        f"{grm_int_label}_score_task_sum="
                         f"{float(result.get('timing_max6_observed_grm_int_task_sum_s', 0.0)):.3f}s, "
                         f"batches={int(result.get('max6_observed_grm_int_batches', 0))}, "
                         "invalid_singular="
@@ -3334,7 +3365,7 @@ def main() -> None:
                     scored_candidate_count = int(
                         result.get("max6_observed_grm_int_pair_occurrences", 0)
                     )
-                    scored_candidate_label = "GRM-INT_scored_occurrences"
+                    scored_candidate_label = f"{grm_int_label}_scored_occurrences"
                 else:
                     observed_score_summary = (
                         f"exact_rerank_task_sum={float(result.get('timing_max6_observed_rerank_kernel_task_sum_s', 0.0)):.3f}s "
@@ -3362,7 +3393,7 @@ def main() -> None:
                 _emit_garfield_file_only_line(
                     logger,
                     (
-                        f"Observed Max6 -> {'GRM-INT' if args.grm_int else 'GRM-Max6'} timing (summed window-task elapsed time; "
+                        f"Observed Max6 -> {grm_int_label if args.grm_int else ('LM-Max6' if args.residual_method == 'lm' else 'GRM-Max6')} timing (summed window-task elapsed time; "
                         "parallel stages overlap): "
                         f"scan_wall={float(result.get('timing_scan_wall_s', 0.0)):.3f}s, "
                         f"windows={int(result.get('max6_observed_units_timed', 0))}, "
@@ -3754,7 +3785,14 @@ def main() -> None:
                 if _is_max6_grm_backend(args.search_backend) and args.grm_int
                 else "global_pair_score_permutation_fixed_pc"
                 if _is_max6_grm_backend(args.search_backend)
-                else str(result.get("rule_null_generation", "lmm_parametric_bootstrap"))
+                else str(
+                    result.get(
+                        "rule_null_generation",
+                        "lm_parametric_bootstrap"
+                        if args.residual_method == "lm"
+                        else "lmm_parametric_bootstrap",
+                    )
+                )
             ),
             "operational_fwer_scope": (
                 "weak_global_null_screen_subset"
@@ -3819,7 +3857,7 @@ def main() -> None:
             **(
                 {
                     "grm_int_only": True,
-                    "grm_int_test": "one_df_FWL_g1xg2_adjusted_for_g1_g2_covariates_GRM",
+                    "grm_int_test": grm_int_test_metadata,
                     "grm_int_pvalue_calibration": "nominal_chi2_1_after_Max6_selection_unadjusted",
                     "pwald_bonferroni_reference": grm_int_pwald_reference,
                     "pwald_bonferroni_reference_applied": False,
@@ -3828,7 +3866,7 @@ def main() -> None:
                     ),
                     "grm_int_screen_source": "Max6 proposal score; exact requested Top-K per scan unit",
                     "grm_int_best_channel_source": "winning gate from the Max6 screen",
-                    "grm_int_output_order": "conditional GRM-INT chi-square(1) within selected Top-K",
+                    "grm_int_output_order": f"conditional {grm_int_label} chi-square(1) within selected Top-K",
                     "grm_int_screen_threshold_applied": False,
                 }
                 if args.grm_int
@@ -4271,11 +4309,11 @@ def main() -> None:
                 **(
                     {
                         "grm_int_only": True,
-                        "grm_int_test": "one_df_FWL_g1xg2_adjusted_for_g1_g2_covariates_GRM",
+                        "grm_int_test": grm_int_test_metadata,
                         "grm_int_pvalue_calibration": "nominal_chi2_1_after_Max6_selection_unadjusted",
                         "grm_int_screen_source": "Max6 proposal score; exact requested Top-K per scan unit",
                         "grm_int_best_channel_source": "winning gate from the Max6 screen",
-                        "grm_int_output_order": "conditional GRM-INT chi-square(1) within selected Top-K",
+                        "grm_int_output_order": f"conditional {grm_int_label} chi-square(1) within selected Top-K",
                         "grm_int_screen_threshold_applied": False,
                     }
                     if args.grm_int

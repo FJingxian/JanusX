@@ -848,6 +848,135 @@ fn exact_no_grm_fit_from_rotated(
     })
 }
 
+fn generate_lm_null_residualized(
+    x: &[f64],
+    n: usize,
+    p: usize,
+    repeats: usize,
+    seed: u64,
+) -> Result<Vec<Vec<f64>>, String> {
+    if repeats == 0 {
+        return Ok(Vec::new());
+    }
+    if x.len() != n.saturating_mul(p) || n == 0 || p == 0 {
+        return Err("conditional LM null design shape mismatch".to_string());
+    }
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut out = Vec::with_capacity(repeats);
+    for _ in 0..repeats {
+        let y = (0..n)
+            .map(|_| rng.sample::<f64, _>(StandardNormal))
+            .collect::<Vec<_>>();
+        let fit = exact_no_grm_fit_from_rotated(x, &y, n, p)
+            .ok_or_else(|| "failed to evaluate conditional LM null draw".to_string())?;
+        let mut py = fit.py_rot;
+        standardize_residualized_y(&mut py)?;
+        out.push(py);
+    }
+    Ok(out)
+}
+
+/// Fit an ordinary linear-model null without constructing or loading a GRM.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn garfield_residualize_lm_rust(
+    y_vec: Vec<f64>,
+    x_cov_vec: Option<Vec<f64>>,
+    q_cov: usize,
+    add_intercept: bool,
+    null_repeats: usize,
+    null_seed: u64,
+    tail_audit_repeats: usize,
+) -> Result<GarfieldResidualResult, String> {
+    let n = y_vec.len();
+    if n == 0 || y_vec.iter().any(|value| !value.is_finite()) {
+        return Err("LM residualization requires a non-empty finite response".to_string());
+    }
+    if let Some(cov) = x_cov_vec.as_ref() {
+        if cov.len() != n.saturating_mul(q_cov) {
+            return Err(format!(
+                "x_cov payload length mismatch: got {}, expected {}",
+                cov.len(),
+                n.saturating_mul(q_cov)
+            ));
+        }
+        if cov.iter().any(|value| !value.is_finite()) {
+            return Err("x_cov contains non-finite values".to_string());
+        }
+    }
+    let (original_design, original_p) =
+        build_design_matrix(x_cov_vec.as_deref(), n, q_cov, add_intercept)?;
+    let fixed_design = rank_aware_fixed_design(&original_design, n, original_p)?;
+    let fit = exact_no_grm_fit_from_rotated(
+        fixed_design.x.as_slice(),
+        y_vec.as_slice(),
+        n,
+        fixed_design.rank,
+    )
+    .ok_or_else(|| "GARFIELD LM residual fit failed".to_string())?;
+    let mut residualized_y = fit.py_rot.clone();
+    standardize_residualized_y(&mut residualized_y)?;
+    let null_residualized_y = generate_lm_null_residualized(
+        fixed_design.x.as_slice(),
+        n,
+        fixed_design.rank,
+        null_repeats,
+        null_seed,
+    )?;
+    let null_validation_residualized_y = generate_lm_null_residualized(
+        fixed_design.x.as_slice(),
+        n,
+        fixed_design.rank,
+        null_repeats,
+        null_validation_seed(null_seed),
+    )?;
+    let tail_audit_residualized_y = generate_lm_null_residualized(
+        fixed_design.x.as_slice(),
+        n,
+        fixed_design.rank,
+        tail_audit_repeats,
+        null_tail_audit_seed(null_seed),
+    )?;
+    let fitted_y = y_vec
+        .iter()
+        .zip(fit.resid_rot.iter())
+        .map(|(&y, &resid)| y - resid)
+        .collect::<Vec<_>>();
+
+    Ok(GarfieldResidualResult {
+        beta: fixed_design.expand_beta(&fit.beta),
+        py: fit.py_rot,
+        residualized_y,
+        resid: fit.resid_rot,
+        fitted_y: Some(fitted_y),
+        additive_effect: None,
+        lbd: f64::INFINITY,
+        lambda_marker: f64::NAN,
+        residualization_method: "lm".to_string(),
+        lambda_source: "no_grm_requested".to_string(),
+        no_grm_boundary: true,
+        pcg_converged: true,
+        pcg_iters: 0,
+        pcg_rel_res: 0.0,
+        lambda_converged: true,
+        lambda_iters: 0,
+        lambda_rel_res: 0.0,
+        ml: fit.ml,
+        reml: fit.reml,
+        sigma_g2: 0.0,
+        sigma_e2: fit.sigma_e2,
+        pve: 0.0,
+        n_samples: n,
+        n_fixed_effects: fit.fixed_rank,
+        eigh_backend: "none (LM)".to_string(),
+        eigh_elapsed: 0.0,
+        eigenvalues: Vec::new(),
+        eff_m: None,
+        null_residualized_y,
+        null_validation_residualized_y,
+        tail_audit_residualized_y,
+    })
+}
+
 /// Generate conditional parametric null phenotypes for a fitted LMM.
 ///
 /// The draws are made in the GRM eigenbasis, where the fitted covariance is
@@ -1996,8 +2125,9 @@ pub fn garfield_residualize_bed_py<'py>(
 mod tests {
     use super::{
         build_exact_projection_from_grm_rust, build_no_grm_covariate_projector,
-        build_no_grm_projection, exact_no_grm_fit_from_rotated, generate_lmm_null_residualized,
-        null_tail_audit_seed, null_validation_seed, standardize_residualized_y,
+        build_no_grm_projection, exact_no_grm_fit_from_rotated, garfield_residualize_lm_rust,
+        generate_lmm_null_residualized, null_tail_audit_seed, null_validation_seed,
+        standardize_residualized_y,
     };
 
     fn sample_mean(values: &[f64]) -> f64 {
@@ -2214,6 +2344,42 @@ mod tests {
             .iter()
             .zip(fit.resid_rot.iter())
             .all(|(&py, &resid)| (py - resid / fit.sigma_e2).abs() < 1.0e-12));
+    }
+
+    #[test]
+    fn direct_lm_residualization_uses_ols_and_generates_null_draws_without_grm() {
+        let n = 6usize;
+        let cov = (0..n).map(|value| value as f64).collect::<Vec<_>>();
+        let y = vec![0.1, 1.4, 1.9, 3.2, 3.7, 5.1];
+        let fit =
+            garfield_residualize_lm_rust(y.clone(), Some(cov.clone()), 1, true, 3, 91, 2).unwrap();
+
+        assert_eq!(fit.residualization_method, "lm");
+        assert_eq!(fit.lambda_source, "no_grm_requested");
+        assert!(fit.no_grm_boundary);
+        assert!(fit.lbd.is_infinite() && fit.lbd.is_sign_positive());
+        assert_eq!(fit.sigma_g2, 0.0);
+        assert_eq!(fit.pve, 0.0);
+        assert!(fit.eigenvalues.is_empty());
+        assert_eq!(fit.null_residualized_y.len(), 3);
+        assert_eq!(fit.null_validation_residualized_y.len(), 3);
+        assert_eq!(fit.tail_audit_residualized_y.len(), 2);
+        assert!(fit
+            .null_residualized_y
+            .iter()
+            .all(|draw| sample_mean(draw).abs() < 1.0e-12
+                && (sample_std(draw) - 1.0).abs() < 1.0e-12));
+        assert!(fit.resid.iter().sum::<f64>().abs() < 1.0e-12);
+        assert!(
+            fit.resid
+                .iter()
+                .zip(cov.iter())
+                .map(|(&resid, &x)| resid * x)
+                .sum::<f64>()
+                .abs()
+                < 1.0e-12
+        );
+        assert!(fit.py.iter().all(|value| value.is_finite()));
     }
 
     #[test]

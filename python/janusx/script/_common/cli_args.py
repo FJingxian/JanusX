@@ -369,8 +369,9 @@ def _resolve_grm_file_help(profile: str) -> str:
     table = {
         "required_lmm": "Required GRM file path for LMM (no auto-build).",
         "garfield_residualization": (
-            "Optional precomputed GRM/kernel (.npy or text). If set, GARFIELD residualization "
-            "uses this matrix on the aligned sample set instead of rebuilding GRM from BED."
+            "Optional precomputed GRM/kernel (.npy or text). Supplying it defaults GARFIELD "
+            "to exact LMM residualization; omitting it defaults to LM/OLS. Use "
+            "--residual-method exact without -k to build an additive GRM from BED."
         ),
         "background_kernel": (
             "Optional precomputed GRM/kernel (.npy or text). If set, background breeding values "

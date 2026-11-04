@@ -5032,6 +5032,75 @@ impl CompactMax6SiteMetadataBuilder {
     }
 }
 
+/// Read the raw BIM metadata for an ordered subset of source rows without
+/// opening or decoding genotype data. The Max6 preparation path uses this
+/// after global QC and LD selection have already established that each row is
+/// valid, and only the original BIM identity is still needed.
+pub(crate) fn read_compact_max6_bim_rows(
+    prefix: &str,
+    n_snps_total: usize,
+    row_source_indices: &[usize],
+) -> Result<CompactMax6SiteMetadata, String> {
+    if n_snps_total == 0 {
+        return Err("no SNP sites found in PLINK BIM input".to_string());
+    }
+    if row_source_indices.is_empty() {
+        return Err("preselected source rows must not be empty".to_string());
+    }
+    if row_source_indices.windows(2).any(|rows| rows[0] >= rows[1]) {
+        return Err("preselected source rows must be strictly increasing".to_string());
+    }
+    if let Some(&bad_row) = row_source_indices.iter().find(|&&row| row >= n_snps_total) {
+        return Err(format!(
+            "preselected source row {bad_row} is outside BIM marker range 0..{n_snps_total}"
+        ));
+    }
+
+    let bed_prefix = normalize_plink_prefix_local(prefix);
+    let mut bim = core::BimChunkReader::open(&bed_prefix)?;
+    let chunk_rows = 131_072usize;
+    let mut builder = CompactMax6SiteMetadata::builder(row_source_indices.len());
+    let mut selected_cursor = 0usize;
+    let mut base = 0usize;
+    while base < n_snps_total {
+        let end = (base + chunk_rows).min(n_snps_total);
+        let mut keep = vec![false; end - base];
+        while selected_cursor < row_source_indices.len()
+            && row_source_indices[selected_cursor] < end
+        {
+            let row = row_source_indices[selected_cursor];
+            if row < base {
+                return Err(format!(
+                    "preselected source row {row} was skipped before BIM chunk {base}"
+                ));
+            }
+            keep[row - base] = true;
+            selected_cursor += 1;
+        }
+        for site in bim.read_range_masked(base, end, keep.as_slice())? {
+            builder.push(site)?;
+        }
+        base = end;
+    }
+    bim.ensure_exhausted(n_snps_total)?;
+    if selected_cursor != row_source_indices.len() {
+        return Err(format!(
+            "preselected BIM row collection mismatch: requested={}, consumed={}",
+            row_source_indices.len(),
+            selected_cursor
+        ));
+    }
+    let compact_sites = builder.finish();
+    if compact_sites.len() != row_source_indices.len() {
+        return Err(format!(
+            "preselected BIM compact-row mismatch: requested={}, sites={}",
+            row_source_indices.len(),
+            compact_sites.len()
+        ));
+    }
+    Ok(compact_sites)
+}
+
 /// Build logic metadata from a keep mask that was already computed for the
 /// same BED/sample selection. This avoids rescanning the BED payload merely
 /// to reconstruct source-row indices and retained BIM metadata.
@@ -5692,6 +5761,7 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_cached_compact_source_rows_pure_l
 /// Load genotype-global Max6 tag metadata from selected BIM rows in bounded
 /// chunks, then run the shared pure-line QC against the compact cache. This
 /// avoids ever materializing a full selected-tag `Vec<SiteInfo>`.
+#[cfg(test)]
 pub(crate) fn prepare_bed_logic_meta_owned_and_compact_source_rows_pure_line(
     prefix: &str,
     maf_threshold: f32,
@@ -5745,47 +5815,7 @@ pub(crate) fn prepare_bed_logic_meta_owned_and_compact_source_rows_pure_line(
     }
     drop(bed_iter);
 
-    let mut bim = core::BimChunkReader::open(&bed_prefix)?;
-    let chunk_rows = 131_072usize;
-    let mut builder = CompactMax6SiteMetadata::builder(row_source_indices.len());
-    let mut selected_cursor = 0usize;
-    let mut base = 0usize;
-    while base < n_snps_total {
-        let end = (base + chunk_rows).min(n_snps_total);
-        let mut keep = vec![false; end - base];
-        while selected_cursor < row_source_indices.len()
-            && row_source_indices[selected_cursor] < end
-        {
-            let row = row_source_indices[selected_cursor];
-            if row < base {
-                return Err(format!(
-                    "preselected source row {row} was skipped before BIM chunk {base}"
-                ));
-            }
-            keep[row - base] = true;
-            selected_cursor += 1;
-        }
-        for site in bim.read_range_masked(base, end, keep.as_slice())? {
-            builder.push(site)?;
-        }
-        base = end;
-    }
-    bim.ensure_exhausted(n_snps_total)?;
-    if selected_cursor != row_source_indices.len() {
-        return Err(format!(
-            "preselected BIM row collection mismatch: requested={}, consumed={}",
-            row_source_indices.len(),
-            selected_cursor
-        ));
-    }
-    let compact_sites = builder.finish();
-    if compact_sites.len() != row_source_indices.len() {
-        return Err(format!(
-            "preselected BIM compact-row mismatch: requested={}, sites={}",
-            row_source_indices.len(),
-            compact_sites.len()
-        ));
-    }
+    let compact_sites = read_compact_max6_bim_rows(&bed_prefix, n_snps_total, row_source_indices)?;
     let meta = prepare_bed_logic_meta_owned_for_cached_compact_source_rows_pure_line(
         bed_prefix.as_str(),
         maf_threshold,
@@ -10936,8 +10966,9 @@ mod tests {
         prepare_bed_logic_meta_owned_for_stats_samples_pure_line_intervals,
         prepare_bed_logic_meta_owned_for_stats_samples_pure_line_with_mmap_window,
         prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window,
-        pure_line_filter_status_from_counts, pure_line_filter_status_reason, BedChunkReader,
-        CompactMax6SiteMetadata, PURE_LINE_FILTER_FAIL_MISSING, PURE_LINE_FILTER_KEEP,
+        pure_line_filter_status_from_counts, pure_line_filter_status_reason,
+        read_compact_max6_bim_rows, BedChunkReader, CompactMax6SiteMetadata,
+        PURE_LINE_FILTER_FAIL_MISSING, PURE_LINE_FILTER_KEEP,
     };
 
     #[test]
@@ -11023,6 +11054,51 @@ mod tests {
         assert_eq!(compact.sites[0].ref_id, compact.sites[1].ref_id);
         assert_eq!(compact.sites[0].alt_id, compact.sites[1].alt_id);
         assert!(compact.fields(2).is_none());
+    }
+
+    #[test]
+    fn compact_max6_bim_rows_reads_selected_metadata_without_genotype_files() {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("janusx_compact_bim_rows_{stamp}"));
+        fs::create_dir_all(&dir).expect("create temporary BIM directory");
+        let prefix = dir.join("tiny");
+        fs::write(
+            prefix.with_extension("bim"),
+            "1 rs0 0 10 A G\n1 rs1 0 20 C T\n2 rs2 0 30 G A\n2 rs3 0 40 T C\n",
+        )
+        .expect("write BIM");
+
+        let compact = read_compact_max6_bim_rows(prefix.to_str().unwrap(), 4, &[1, 3])
+            .expect("load only selected raw BIM rows");
+        assert_eq!(compact.len(), 2);
+        assert_eq!(
+            (
+                compact.fields(0).unwrap().chrom,
+                compact.fields(0).unwrap().pos,
+                compact.fields(0).unwrap().snp,
+                compact.fields(0).unwrap().ref_allele,
+                compact.fields(0).unwrap().alt_allele,
+            ),
+            ("1", 20, "rs1", "C", "T")
+        );
+        assert_eq!(
+            (
+                compact.fields(1).unwrap().chrom,
+                compact.fields(1).unwrap().pos,
+                compact.fields(1).unwrap().snp,
+                compact.fields(1).unwrap().ref_allele,
+                compact.fields(1).unwrap().alt_allele,
+            ),
+            ("2", 40, "rs3", "T", "C")
+        );
+        assert!(read_compact_max6_bim_rows(prefix.to_str().unwrap(), 4, &[1, 1]).is_err());
+        fs::remove_dir_all(dir).expect("remove temporary BIM directory");
     }
 
     #[test]

@@ -78,13 +78,12 @@ use crate::gfcore::{
 use crate::gfreader::{
     build_sample_selection, compute_bed_row_meta_owned_for_source_rows,
     format_zero_sites_pure_line_error, is_simple_snp_allele,
-    prepare_bed_logic_meta_owned_and_compact_source_rows_pure_line,
     prepare_bed_logic_meta_owned_for_cached_compact_source_rows_pure_line,
     prepare_bed_logic_meta_owned_for_precomputed_site_keep,
     prepare_bed_logic_meta_owned_for_stats_samples_pure_line_intervals,
     prepare_bed_logic_meta_owned_for_stats_samples_pure_line_with_mmap_window,
-    prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window, sample_indices_are_identity,
-    CompactMax6SiteMetadata,
+    prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window, read_compact_max6_bim_rows,
+    sample_indices_are_identity, CompactMax6SiteMetadata,
 };
 use crate::gload::load_file_owned;
 use crate::ml::common::{
@@ -19461,41 +19460,29 @@ fn prepare_max6_genotype_tags_owned(
             .sum::<usize>()
     );
     prep_profiler.finish_phase(remap_phase, "selected_row_remap", remap_detail.as_str());
-    // Cache raw BIM metadata once with the genotype-global tag selection.
-    // Trait scans can then QC only these BED rows without rereading the full
-    // BIM for every phenotype. Keep original allele/SNP identity rather than
-    // reconstructing it from the MAF-oriented logic-site representation.
+    // All selected rows map back to the global-QC-passing source rows above.
+    // Only their original BIM identity is still needed here; genotype QC was
+    // already done before LD selection and trait-specific QC runs per scan.
     let metadata_phase = prep_profiler.start_phase();
-    let cached_tag_meta_result = prepare_bed_logic_meta_owned_and_compact_source_rows_pure_line(
+    let compact_tag_sites_result = read_compact_max6_bim_rows(
         prefix.as_str(),
-        maf_threshold,
-        max_missing_rate,
-        het_threshold,
-        snps_only,
-        Some(sample_indices.as_slice()),
+        source_marker_count,
         active_source_rows.as_slice(),
     );
-    let metadata_detail = match cached_tag_meta_result.as_ref() {
-        Ok((meta, _)) => format!(
-            "requested_rows={} retained_rows={}",
+    let metadata_detail = match compact_tag_sites_result.as_ref() {
+        Ok(sites) => format!(
+            "requested_rows={} loaded_rows={}",
             active_source_rows.len(),
-            meta.row_source_indices.len()
+            sites.len()
         ),
         Err(_) => "status=error".to_string(),
     };
     prep_profiler.finish_phase(
         metadata_phase,
-        "tag_metadata_recacquire",
+        "tag_metadata_bim_read",
         metadata_detail.as_str(),
     );
-    let (cached_tag_meta, compact_tag_sites) = cached_tag_meta_result?;
-    if cached_tag_meta.row_source_indices != active_source_rows {
-        return Err(format!(
-            "genotype-global Max6 tags changed during metadata caching: selected={}, retained={}",
-            active_source_rows.len(),
-            cached_tag_meta.row_source_indices.len()
-        ));
-    }
+    let compact_tag_sites = compact_tag_sites_result?;
     let active_source_sites = Arc::new(compact_tag_sites);
     let mut units_meta = Vec::with_capacity(screen_units.len());
     for &original_unit_index in local_universe.original_unit_indices.iter() {

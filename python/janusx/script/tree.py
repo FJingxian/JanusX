@@ -50,7 +50,7 @@ from ._common.cli_args import (
 )
 from ._common.genoio import determine_genotype_source_from_args
 from ._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
-from ._common.log import setup_logging
+from ._common.log import local_log_capture, setup_logging
 from ._common.outprefix import apply_output_prefix_compat
 from ._common.pathcheck import (
     ensure_file_exists,
@@ -844,7 +844,7 @@ def _run_ml(args, *, log_tag: str) -> None:
 
     stderr_text = str(proc.stderr or "")
     if stderr_text.strip():
-        with open(stderr_path, "w", encoding="utf-8") as ew:
+        with local_log_capture(stderr_path, mode="w") as ew:
             ew.write(stderr_text)
         logger.info(f"Wrote FastTree stderr log: {format_path_for_display(stderr_path)}")
 

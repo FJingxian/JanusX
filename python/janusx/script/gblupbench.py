@@ -64,6 +64,7 @@ def _bootstrap_repo_python_path() -> None:
 _bootstrap_repo_python_path()
 
 from janusx.script._common.pathcheck import safe_expanduser  # noqa: E402
+from janusx.script._common.log import local_log_capture  # noqa: E402
 from janusx.script._common.threads import (  # noqa: E402
     apply_blas_thread_env,
     detect_effective_threads,
@@ -452,7 +453,7 @@ def _run_timed(
     t0 = time.time()
     rc_final = 1
     runtime_peak_rss_kb = math.nan
-    with log_file.open(("a" if append_log else "w"), encoding="utf-8") as lf:
+    with local_log_capture(log_file, mode=("a" if append_log else "w")) as lf:
         if time_tool:
             full = [*time_tool, "-o", str(time_file.resolve()), *cmd]
         else:
@@ -553,7 +554,7 @@ def _run_timed(
     if use_mem_limit and math.isfinite(rss) and float(rss) > float(limit_kb):
         rc_final = 137
         try:
-            with log_file.open("a", encoding="utf-8") as lf:
+            with local_log_capture(log_file, mode="a") as lf:
                 lf.write(
                     (
                         "\n[gblupbench] memory limit exceeded (post-check): "
@@ -1181,7 +1182,8 @@ def _run_smoke_checks_with_sim(engines: list[str]) -> list[EnvCheck]:
                         "unrelated",
                     ]
                 )
-            sim_gen_log.write_text(sim_out.getvalue() + sim_err.getvalue(), encoding="utf-8")
+            with local_log_capture(sim_gen_log, mode="w") as sim_log:
+                sim_log.write(sim_out.getvalue() + sim_err.getvalue())
         except Exception as e:
             detail = f"sim dataset generation failed: {e}"
             if sim_gen_log.exists():
@@ -2305,14 +2307,9 @@ def _run_tool_with_parfile_fallback(
     total_elapsed = 0.0
     max_rss = math.nan
     last_rc = 1
-    if log_file.exists():
-        try:
-            log_file.unlink()
-        except Exception:
-            pass
     for idx, (cmd, input_text) in enumerate(attempts, start=1):
         if idx > 1:
-            with log_file.open("a", encoding="utf-8") as lf:
+            with local_log_capture(log_file, mode="a") as lf:
                 lf.write(f"\n[retry {idx}] {' '.join(cmd)}\n")
         attempt_time = time_file.parent / f"{time_file.stem}.try{idx}{time_file.suffix}"
         rc, elapsed, rss = _run_timed(
@@ -2681,7 +2678,8 @@ def _run_engine_janusx(
 
     log_file = run_dir / f"{engine}.log"
     time_file = run_dir / f"{engine}.time"
-    log_file.write_text("", encoding="utf-8")
+    with local_log_capture(log_file, mode="w"):
+        pass
 
     meta = json.loads(Path(meta_json).read_text(encoding="utf-8"))
     sample_df = pd.read_csv(str(meta["sample_tsv"]), sep="\t")
@@ -2807,7 +2805,7 @@ def _run_engine_janusx(
                 max_rss = _safe_float(rss_i, math.nan) if not math.isfinite(max_rss) else max(float(max_rss), float(rss_i))
 
             fold_log_text = fold_log.read_text(encoding="utf-8", errors="ignore") if fold_log.exists() else ""
-            with log_file.open("a", encoding="utf-8") as agg:
+            with local_log_capture(log_file, mode="a") as agg:
                 agg.write(f"\n===== {engine} fold={fd} =====\n")
                 agg.write(fold_log_text)
                 if not fold_log_text.endswith("\n"):

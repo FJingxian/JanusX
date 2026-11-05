@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import logging
 import socket
 import threading
 from pathlib import Path
@@ -16,7 +15,7 @@ from ._common.cli_args import (
 )
 from ._common.config_render import emit_cli_configuration
 from ._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
-from ._common.log import setup_logging
+from ._common.log import get_log_spool_path, setup_logging
 from ._common.outprefix import apply_output_prefix_compat
 from ._common.pathcheck import format_kmc_db_pair_for_display, format_path_for_display
 from ._common.progress import ProgressAdapter, log_success
@@ -36,28 +35,6 @@ def _normalize_memory_gb(memory_gb: float | int | None) -> float:
 
 def _memory_gb_to_mb(memory_gb: float | int | None) -> int:
     return max(1, int(round(_normalize_memory_gb(memory_gb) * 1024.0)))
-
-
-def _reopen_file_handlers_append(logger: logging.Logger) -> None:
-    file_specs: list[tuple[str, int, logging.Formatter | None]] = []
-    for handler in list(logger.handlers):
-        if isinstance(handler, logging.FileHandler):
-            try:
-                handler.flush()
-            except Exception:
-                pass
-            file_specs.append((str(handler.baseFilename), int(handler.level), handler.formatter))
-            logger.removeHandler(handler)
-            try:
-                handler.close()
-            except Exception:
-                pass
-    for filename, level, formatter in file_specs:
-        handler = logging.FileHandler(filename, mode="a", encoding="utf-8")
-        handler.setLevel(level)
-        if formatter is not None:
-            handler.setFormatter(formatter)
-        logger.addHandler(handler)
 
 
 class _KstatsCliProgress:
@@ -457,8 +434,6 @@ def main() -> int:
         logger.info("Compare groups:")
         for idx, spec in enumerate(compare_specs, start=1):
             logger.info(f"  [{idx}] {spec}")
-    _reopen_file_handlers_append(logger)
-
     progress_ui = _KstatsCliProgress()
     try:
         summary = jxrs.kstats_run(
@@ -479,7 +454,7 @@ def main() -> int:
             min_count=int(args.min_count),
             keep_tmp=bool(args.keep_tmp),
             force=bool(args.force),
-            log_path=log_path,
+            log_path=get_log_spool_path(logger) or None,
             progress_callback=progress_ui.callback,
         )
     except Exception as exc:

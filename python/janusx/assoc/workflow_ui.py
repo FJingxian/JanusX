@@ -204,13 +204,18 @@ class _GwasProgressLog:
             f" | {self.unit}s={done:,}/{self.total:,}"
             f" | elapsed={format_elapsed(elapsed)} ETA={eta}{rss}"
         )
-        if stdout_is_tty():
-            _log_file_only(self.logger, logging.INFO, line)
-        else:
-            self.logger.info(line)
-        for handler in self.logger.handlers:
-            handler.flush()
+        # Advance the throttle before emitting so a failing handler does not
+        # get retried on every native progress callback.
         self.last_emit = now
+        try:
+            if stdout_is_tty():
+                _log_file_only(self.logger, logging.INFO, line)
+            else:
+                self.logger.info(line)
+        except OSError:
+            # Progress is advisory; a local spool or console write failure
+            # must not abort the GWAS native scan or flood callbacks.
+            pass
         self.finished = complete
 
 

@@ -95,6 +95,12 @@ from janusx.gfreader import (
 from janusx.pyBLUP.QK2 import QK
 from janusx import janusx as jxrs
 from janusx.script._common.log import setup_logging
+from janusx.assoc.runlog import (
+    GwasRunLease,
+    GwasRunLockError,
+    create_local_log_spool,
+    publish_log_spool,
+)
 from janusx.script._common.config_render import emit_cli_configuration
 from janusx.script._common.cli_args import (
     add_common_covariate_file_or_site_arg,
@@ -110,6 +116,7 @@ from janusx.script._common.cli_args import (
     trait_selector_help_text,
 )
 from janusx.script._common.genoio import (
+    determine_genotype_source as _determine_genotype_source_raw,
     determine_genotype_source_force_kind_from_args,
     genotype_load_status_done,
     genotype_load_status_fail,
@@ -8541,6 +8548,150 @@ def _prepare_qtn_packed_preload(
     }
 
 
+def _resolve_gwas_output_for_runlog(args) -> tuple[str, str, str]:
+    """Resolve genotype and output paths before acquiring the run-prefix lock."""
+    legacy_prefix = getattr(args, "prefix", None)
+    gfile, prefix = _determine_genotype_source_raw(
+        vcf=getattr(args, "vcf", None),
+        hmp=getattr(args, "hmp", None),
+        file=getattr(args, "file", None),
+        bfile=getattr(args, "bfile", None),
+        kfile=getattr(args, "kfile", None),
+        prefix=None,
+        snps_only=bool(getattr(args, "snps_only", False)),
+        delimiter=getattr(args, "delimiter", None),
+        apply_cache=False,
+        threads=int(getattr(args, "thread", 0) or 0),
+    )
+    if bool(getattr(args, "kfile", None)):
+        gfile = _resolve_kfile_prefix(args.kfile)
+        prefix = os.path.basename(str(gfile).rstrip("/\\"))
+    out_dir, outprefix = _resolve_gwas_output_prefix(
+        getattr(args, "out", None),
+        legacy_prefix,
+        prefix,
+        out_was_explicit=bool(getattr(args, "_out_was_explicit", False)),
+    )
+    return str(gfile), str(out_dir), str(outprefix)
+
+
+def _write_gwas_stderr(message: str) -> None:
+    try:
+        sys.stderr.write(f"{message}\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _archive_previous_incomplete_gwas_log(
+    outprefix: str,
+    run_id: str,
+) -> str | None:
+    """Preserve a prior fixed-name log unless it has this version's done footer."""
+    log_path = f"{outprefix}.gwas.log"
+    try:
+        fh = open(log_path, "rb")
+    except FileNotFoundError:
+        return None
+    with fh:
+        fh.seek(0, os.SEEK_END)
+        size = fh.tell()
+        fh.seek(max(0, size - (64 * 1024)), os.SEEK_SET)
+        tail = fh.read().decode("utf-8", errors="replace")
+    last_line = tail.rstrip().splitlines()[-1] if tail.rstrip() else ""
+    if re.search(r"GWAS run status:\s*done;\s*run_id:\s*[A-Za-z0-9_.-]+$", last_line):
+        return None
+    archive_path = f"{outprefix}.gwas.previous.{run_id}.log"
+    if os.path.exists(archive_path):
+        raise FileExistsError(f"Previous GWAS log archive already exists: {archive_path}")
+    os.replace(log_path, archive_path)
+    return archive_path
+
+
+def _finish_gwas_runlog(context: dict[str, Any], status: str) -> str:
+    """Close the local log, publish once, and release this run's prefix lease."""
+    if bool(context.get("finalized", False)):
+        return str(context.get("published_log_path", context.get("spool_path", "")))
+
+    handler = context.get("file_handler")
+    handler_failed = bool(
+        getattr(handler, "janusx_io_failed", False)
+        or getattr(handler, "janusx_publish_failed", False)
+    )
+    handler_error_reported = handler_failed
+    if handler is not None:
+        root_logger = logging.getLogger()
+        file_only_logger = logging.getLogger("janusx.gwas.file_only")
+        for owner in (root_logger, file_only_logger):
+            for candidate in list(owner.handlers):
+                if candidate is handler:
+                    owner.removeHandler(candidate)
+        try:
+            handler.flush()
+        except Exception:
+            handler_failed = True
+        try:
+            handler.close()
+        except Exception:
+            handler_failed = True
+    handler_failed = bool(
+        handler_failed
+        or getattr(handler, "janusx_io_failed", False)
+        or getattr(handler, "janusx_publish_failed", False)
+    )
+    handler_error_reported = bool(
+        handler_error_reported
+        or getattr(handler, "janusx_io_failed", False)
+        or getattr(handler, "janusx_publish_failed", False)
+    )
+    if handler_failed and not handler_error_reported:
+        _write_gwas_stderr(
+            "Warning: GWAS log spool could not be flushed; the local log is "
+            f"preserved at {context.get('spool_path', '')}"
+        )
+
+    spool_path = str(context.get("spool_path", ""))
+    run_id = str(context.get("run_id", ""))
+    outprefix = str(context.get("outprefix", ""))
+    stable_log_path = str(context.get("log_path", f"{outprefix}.gwas.log"))
+    if str(status) == "done" and not handler_failed:
+        destination = stable_log_path
+    else:
+        destination = f"{outprefix}.gwas.incomplete.{run_id}.log"
+
+    published_path = spool_path
+    log_published = False
+    if not handler_failed:
+        try:
+            publish_log_spool(spool_path, destination)
+            published_path = destination
+            log_published = True
+            try:
+                os.remove(spool_path)
+            except OSError:
+                pass
+            discard_live = getattr(handler, "discard_live_snapshot", None)
+            if callable(discard_live):
+                discard_live()
+        except Exception as exc:
+            _write_gwas_stderr(
+                "Warning: could not publish the GWAS log to the output directory; "
+                f"the local log is preserved at {spool_path} ({exc})"
+            )
+
+    lease = context.get("lease")
+    if lease is not None:
+        lease.mark_terminal(str(status) if log_published else "failed")
+        if not lease.release():
+            _write_gwas_stderr(
+                "Warning: JanusX could not release the GWAS output lock; "
+                f"the next run may need to recover it: {lease.lock_path}"
+            )
+    context["published_log_path"] = published_path
+    context["finalized"] = True
+    return published_path
+
+
 def _run_gwas_pipeline(
     args=None,
     *,
@@ -8548,9 +8699,97 @@ def _run_gwas_pipeline(
     log: bool = True,
     return_result: bool = False,
 ):
+    """Run GWAS with a per-prefix lease and a local log spool."""
+    if args is None:
+        args = parse_args(argv)
+    run_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    gfile, out_dir, outprefix = _resolve_gwas_output_for_runlog(args)
+    os.makedirs(out_dir, 0o755, exist_ok=True)
+    spool_path = create_local_log_spool(run_id, prefix="janusx-gwas")
+    lease = GwasRunLease(outprefix, run_id)
+    try:
+        lease.acquire(spool_path)
+        previous_log = _archive_previous_incomplete_gwas_log(outprefix, run_id)
+        if previous_log is not None:
+            _write_gwas_stderr(
+                "Note: a previous GWAS log had no completion marker and was "
+                f"preserved at {previous_log}"
+            )
+    except (GwasRunLockError, OSError) as exc:
+        try:
+            os.remove(spool_path)
+        except OSError:
+            pass
+        if lease.acquired:
+            lease.mark_terminal("failed")
+            lease.release()
+        _write_gwas_stderr(f"✘ Error: {exc}")
+        if return_result:
+            return {
+                "status": "failed",
+                "error": str(exc),
+                "genofile": gfile,
+                "outprefix": outprefix,
+                "log_file": "",
+                "summary_rows": [],
+                "result_files": [],
+                "elapsed_sec": 0.0,
+                "traits": [],
+            }
+        raise SystemExit(1) from None
+
+    context: dict[str, Any] = {
+        "run_id": run_id,
+        "outprefix": outprefix,
+        "log_path": f"{outprefix}.gwas.log",
+        "spool_path": os.path.abspath(spool_path),
+        "lease": lease,
+        "file_handler": None,
+        "finalized": False,
+    }
+    try:
+        result = _run_gwas_pipeline_impl(
+            args,
+            argv=argv,
+            log=log,
+            return_result=return_result,
+            _runlog_context=context,
+        )
+    except BaseException:
+        context["status"] = "failed"
+        logger = context.get("logger")
+        if logger is not None:
+            try:
+                logger.exception("GWAS pipeline exited unexpectedly.")
+            except Exception:
+                pass
+        else:
+            try:
+                with open(context["spool_path"], "a", encoding="utf-8") as fh:
+                    fh.write("GWAS pipeline exited unexpectedly. See the console traceback.\n")
+            except OSError:
+                pass
+        _finish_gwas_runlog(context, "failed")
+        raise
+
+    status = str(context.get("status", "failed"))
+    published_log_path = _finish_gwas_runlog(context, status)
+    if isinstance(result, dict):
+        result["log_file"] = published_log_path
+    return result
+
+
+def _run_gwas_pipeline_impl(
+    args=None,
+    *,
+    argv: Optional[list[str]] = None,
+    log: bool = True,
+    return_result: bool = False,
+    _runlog_context: dict[str, Any],
+):
     t_start = time.time()
     use_spinner = bool(stdout_is_tty())
-    run_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    run_id = str(_runlog_context["run_id"])
     run_created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     run_status = "done"
     run_error = ""
@@ -8602,14 +8841,39 @@ def _run_gwas_pipeline(
         prefix,
         out_was_explicit=bool(getattr(args, "_out_was_explicit", False)),
     )
+    if os.path.abspath(str(outprefix)) != os.path.abspath(str(_runlog_context["outprefix"])):
+        raise RuntimeError("GWAS output prefix changed after its run lock was acquired.")
     args.out = str(out_dir)
     args.out_dir = str(out_dir)
     args.outprefix = str(outprefix)
     args.out_stem = os.path.basename(str(outprefix))
     os.makedirs(args.out_dir, 0o755, exist_ok=True)
     configure_genotype_cache_from_out(args.out_dir)
-    log_path = f"{outprefix}.gwas.log"
-    logger = setup_logging(log_path)
+    log_path = str(_runlog_context["log_path"])
+    spool_path = str(_runlog_context["spool_path"])
+    logger = setup_logging(
+        log_path,
+        spool_path=spool_path,
+        manage_lifecycle=False,
+        acquire_lock=False,
+        publish_interval=5.0,
+    )
+    _runlog_context["logger"] = logger
+    _runlog_context["outprefix"] = str(outprefix)
+    for _h in list(logger.handlers):
+        if isinstance(_h, logging.FileHandler):
+            _runlog_context["file_handler"] = _h
+            actual_spool_path = os.path.abspath(str(getattr(_h, "baseFilename", spool_path)))
+            if actual_spool_path != os.path.abspath(spool_path):
+                _runlog_context["spool_path"] = actual_spool_path
+                lease = _runlog_context.get("lease")
+                if lease is not None:
+                    lease.set_spool_path(actual_spool_path)
+                try:
+                    os.remove(spool_path)
+                except OSError:
+                    pass
+            break
     setattr(logger, "_janusx_gwas_verbose", bool(getattr(args, "verbose", False)))
     progress_log_enabled = _gwas_progress_enabled(None)
     setattr(logger, "_janusx_gwas_progress_enabled", progress_log_enabled)
@@ -12023,8 +12287,20 @@ def _run_gwas_pipeline(
             except Exception:
                 pass
             try:
+                _log_file_only(
+                    logger,
+                    logging.INFO,
+                    f"GWAS run status: failed; run_id: {run_id}",
+                )
+                _finish_gwas_runlog(_runlog_context, "failed")
+            except Exception:
+                pass
+            try:
                 logging.shutdown()
             finally:
+                lease = _runlog_context.get("lease")
+                if lease is not None:
+                    lease.mark_terminal("failed")
                 os._exit(130)
     except Exception as e:
         run_status = "failed"
@@ -12049,6 +12325,9 @@ def _run_gwas_pipeline(
     _emit_report_kv(report_logger, "Total Wall Time", f"{max(time.time() - t_start, 0.0):.2f}s")
     _emit_report_kv(report_logger, "Finished At", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     report_logger.info(_REPORT_RULE)
+    _log_file_only(logger, logging.INFO, f"GWAS run status: {run_status}; run_id: {run_id}")
+
+    _runlog_context["status"] = str(run_status)
 
     if bool(return_result):
         return {

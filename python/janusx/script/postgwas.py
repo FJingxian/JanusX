@@ -34,7 +34,12 @@ from ._common.cli_args import (
     add_common_prefix_arg,
     add_common_thread_arg,
 )
-from ._common.log import setup_logging
+from ._common.log import (
+    attach_worker_log_handler,
+    get_log_process_lock_path,
+    get_log_spool_path,
+    setup_logging,
+)
 from ._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
 from ._common.pathcheck import (
     ensure_all_true,
@@ -559,18 +564,6 @@ def _allow_windows_postgwas_process_pool() -> bool:
     return _env_truthy("JANUSX_POSTGWAS_WINDOWS_PROCESS_POOL", False)
 
 
-class _PostgwasFilePrefixFormatter(logging.Formatter):
-    """Prefix warning/error records in worker append-mode log handlers."""
-
-    def format(self, record: logging.LogRecord) -> str:
-        msg = super().format(record)
-        if record.levelno >= logging.ERROR:
-            return msg if msg.startswith("Error: ") else f"Error: {msg}"
-        if record.levelno == logging.WARNING:
-            return msg if msg.startswith("Warning: ") else f"Warning: {msg}"
-        return msg
-
-
 def _select_postgwas_mp_context():
     """
     Choose a multiprocessing start method for postgwas workers.
@@ -658,30 +651,19 @@ def _log_postgwas_broken_pool_hint(
 
 def _ensure_postgwas_worker_file_logging(args, logger: logging.Logger) -> logging.Logger:
     """
-    Spawned workers do not inherit the parent's file handlers. Reattach an
-    append-mode file handler so per-task logs are preserved in the main log.
+    Spawned workers write to the parent's process-safe local spool.
     """
-    log_path = str(getattr(args, "_postgwas_log_path", "")).strip()
-    if log_path == "":
+    spool_path = str(getattr(args, "_postgwas_log_spool_path", "")).strip()
+    process_lock_path = str(
+        getattr(args, "_postgwas_log_process_lock_path", "")
+    ).strip()
+    if spool_path == "" or process_lock_path == "":
         return logger
-    target = os.path.abspath(log_path)
     for handler in list(logger.handlers):
-        if not isinstance(handler, logging.FileHandler):
-            continue
-        try:
-            base = os.path.abspath(str(handler.baseFilename))
-        except Exception:
-            base = ""
-        if base == target:
+        if os.path.abspath(str(getattr(handler, "baseFilename", ""))) == os.path.abspath(spool_path):
             return logger
-    try:
-        file_handler = logging.FileHandler(target, mode="a", encoding="utf-8")
-    except Exception:
-        return logger
-    file_handler.setLevel(logging.INFO)
-    file_handler.setFormatter(_PostgwasFilePrefixFormatter())
+    attach_worker_log_handler(logger, spool_path, process_lock_path)
     logger.setLevel(logging.INFO)
-    logger.addHandler(file_handler)
     logging.captureWarnings(True)
     return logger
 
@@ -15053,7 +15035,8 @@ def main(argv: Optional[list[str]] = None):
     configure_genotype_cache_from_out(out_dir)
     log_path = f"{outprefix_base}.postGWAS.log"
     logger = setup_logging(log_path)
-    args._postgwas_log_path = str(log_path)
+    args._postgwas_log_spool_path = get_log_spool_path(logger)
+    args._postgwas_log_process_lock_path = get_log_process_lock_path(logger)
     try:
         args.anno, args.annobroaden = _resolve_postgwas_anno_cli(getattr(args, "anno", None))
     except ValueError as e:

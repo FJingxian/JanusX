@@ -67,6 +67,12 @@ def force_exit(code: int = 130, msg: Optional[str] = None) -> None:
         _terminate_active_children()
     finally:
         try:
+            from .log import finalize_logging
+
+            finalize_logging(success=False)
+        except Exception:
+            pass
+        try:
             logging.shutdown()
         finally:
             os._exit(int(code))

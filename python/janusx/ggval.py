@@ -17,6 +17,12 @@ import zipfile
 from pathlib import Path
 from typing import Any, Iterable
 
+_PYTHON_ROOT = str(Path(__file__).resolve().parents[1])
+if _PYTHON_ROOT not in sys.path:
+    sys.path.insert(0, _PYTHON_ROOT)
+
+from janusx.script._common.log import local_log_capture  # noqa: E402
+
 TRAIT_NAME = "test"
 SIM_PREFIX_NAME = "ggval_sim"
 SIM_TXT_PREFIX_NAME = "ggval_sim_txt"
@@ -158,17 +164,19 @@ def run(
     cwd_use = Path.cwd() if cwd is None else Path(cwd)
 
     if stdout_path is not None:
-        stdout_path.parent.mkdir(parents=True, exist_ok=True)
-        with stdout_path.open("w", encoding="utf-8") as out:
-            return subprocess.run(
+        with local_log_capture(stdout_path, mode="w") as out:
+            proc = subprocess.run(
                 cmd,
                 cwd=str(cwd_use),
                 text=True,
                 env=proc_env,
                 stdout=out,
                 stderr=subprocess.STDOUT if stderr_to_stdout else None,
-                check=True,
+                check=False,
             )
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, cmd)
+        return proc
 
     return subprocess.run(cmd, cwd=str(cwd_use), text=True, env=proc_env, check=True)
 

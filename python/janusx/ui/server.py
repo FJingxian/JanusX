@@ -44,6 +44,7 @@ from ..script._common.gwas_history import (
     resolve_jx_home,
     upsert_postgwas_run,
 )
+from ..script._common.log import local_log_capture
 from .render import (
     render_single_svg,
     render_merged_manhattan_svg,
@@ -1936,8 +1937,10 @@ class WebUIState:
         rc = -1
         err_msg = ""
         try:
-            with out_path.open("w", encoding="utf-8") as out_f, err_path.open(
-                "w", encoding="utf-8"
+            with local_log_capture(
+                out_path, mode="w", publish_interval=2.0
+            ) as out_f, local_log_capture(
+                err_path, mode="w", publish_interval=2.0
             ) as err_f:
                 proc = subprocess.run(
                     cmd,

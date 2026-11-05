@@ -442,9 +442,10 @@ def main():
                 del sys.argv[1]
                 try:
                     result = _load_script_module(module_name).main()  # Process of target module
-                    if isinstance(result, int):
-                        raise SystemExit(result)
                 except ModuleNotFoundError as exc:
+                    from janusx.script._common.log import finalize_logging
+
+                    finalize_logging(success=False)
                     msg = format_missing_dependency_for_module(
                         exc.name,
                         f"Missing optional dependency required by `jx {module_name}`.",
@@ -455,8 +456,29 @@ def main():
                     _CONSOLE.print(_render_logo())
                     _CONSOLE.print(f"[bold red]Error:[/bold red] {msg}")
                     raise SystemExit(1)
+                except SystemExit as exc:
+                    from janusx.script._common.log import finalize_logging
+
+                    finalize_logging(success=exc.code in (None, 0))
+                    raise
                 except KeyboardInterrupt:
+                    from janusx.script._common.log import finalize_logging
+
+                    finalize_logging(success=False)
                     force_exit(130, "Interrupted by user (Ctrl+C).")
+                except BaseException:
+                    from janusx.script._common.log import finalize_logging
+
+                    finalize_logging(success=False)
+                    raise
+                else:
+                    from janusx.script._common.log import finalize_logging
+
+                    finalize_logging(
+                        success=not (isinstance(result, int) and result != 0)
+                    )
+                    if isinstance(result, int):
+                        raise SystemExit(result)
             elif module_name not in _MODULE_NAMES:
                 _print_unknown_module_error(module_name)
     else:

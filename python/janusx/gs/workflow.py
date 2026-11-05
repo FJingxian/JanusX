@@ -23524,6 +23524,12 @@ def _run_gs_pipeline(
             except Exception:
                 pass
             try:
+                from janusx.script._common.log import finalize_logging
+
+                finalize_logging(success=False)
+            except Exception:
+                pass
+            try:
                 logging.shutdown()
             finally:
                 os._exit(130)

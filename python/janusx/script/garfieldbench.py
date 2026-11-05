@@ -34,7 +34,7 @@ from janusx.script._common.config_render import emit_cli_configuration
 from janusx.script._common.genoio import determine_genotype_source_from_args as determine_genotype_source
 from janusx.script._common.genocache import configure_genotype_cache_from_out
 from janusx.script._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
-from janusx.script._common.log import setup_logging
+from janusx.script._common.log import local_log_capture, setup_logging
 from janusx.script._common.outprefix import apply_output_prefix_compat
 from janusx.script._common.pathcheck import (
     ensure_all_true,
@@ -385,7 +385,7 @@ def _run_garfield_subprocess(
             str(Path(out_dir) / str(out_prefix)),
         ]
     )
-    with open(log_path, "w", encoding="utf-8") as fw:
+    with local_log_capture(log_path, mode="w") as fw:
         rc = subprocess.run(cmd, stdout=fw, stderr=subprocess.STDOUT, check=False).returncode
     if rc != 0:
         raise RuntimeError(f"GARFIELD command failed (exit={rc}). See log: {log_path}")

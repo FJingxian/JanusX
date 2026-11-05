@@ -1475,14 +1475,25 @@ fn push_top_k(
     let item = Reverse(candidate);
     if heap.len() < top_k {
         heap.push(item);
-    } else if heap
-        .peek()
-        .map(|worst| item.0.cmp(&worst.0) == Ordering::Greater)
-        .unwrap_or(true)
-    {
-        let _ = heap.pop();
-        heap.push(item);
+    } else {
+        replace_top_k_worst_if_better(heap, item);
     }
+}
+
+#[inline]
+fn replace_top_k_worst_if_better(
+    heap: &mut BinaryHeap<Reverse<CandidateHeapEntry>>,
+    item: Reverse<CandidateHeapEntry>,
+) -> bool {
+    if !heap
+        .peek()
+        .is_some_and(|worst| item.0.cmp(&worst.0) == Ordering::Greater)
+    {
+        return false;
+    }
+    let mut worst = heap.peek_mut().expect("checked nonempty Top-K heap");
+    *worst = item;
+    true
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2973,11 +2984,12 @@ pub(crate) fn scan_residual_pairs_packed_max6_batch(
     margin_table: &OneCellMarginTable,
     allow_parallel: bool,
 ) -> Result<ResidualScreenBatchResult, String> {
+    let platform_default = max6_fold_min_anchor_len_default();
     let min_anchor_len = std::env::var("JX_GARFIELD_MAX6_FOLD_MIN_ANCHORS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|&value| value > 0)
-        .unwrap_or(1);
+        .unwrap_or(platform_default);
     scan_residual_pairs_packed_max6_batch_with_min_anchor_len(
         bits_flat,
         row_words,
@@ -2991,6 +3003,11 @@ pub(crate) fn scan_residual_pairs_packed_max6_batch(
         allow_parallel,
         min_anchor_len,
     )
+}
+
+#[inline]
+fn max6_fold_min_anchor_len_default() -> usize {
+    16
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4062,6 +4079,61 @@ mod tests {
         derive_standardized_dosage_interaction_score, FourCellGate as ResidualGate,
     };
     use crate::garfield::score::score_cont_centered_gain_from_sum_and_n_hit;
+
+    #[test]
+    fn max6_topk_root_replacement_matches_pop_push_reference() {
+        let entries = [
+            (0.4, 4, 9),
+            (0.9, 1, 8),
+            (0.7, 3, 7),
+            (0.4, 2, 6),
+            (0.9, 0, 5),
+            (0.2, 6, 4),
+            (0.7, 5, 3),
+            (0.6, 7, 2),
+        ]
+        .map(|(proposal_score, first, second)| CandidateHeapEntry {
+            first,
+            second,
+            best_gate: ResidualGateScore {
+                gate: ResidualGate::And00,
+                score: proposal_score,
+                signed_score: -proposal_score,
+                n_hit: first + second,
+            },
+            proposal_score,
+            proposal_source: ResidualProposalSource::Max6,
+        });
+
+        for top_k in [1, 2, 3] {
+            let mut expected = BinaryHeap::new();
+            let mut observed = BinaryHeap::new();
+            for &entry in &entries {
+                let item = Reverse(entry);
+                if expected.len() < top_k {
+                    expected.push(item);
+                } else if expected
+                    .peek()
+                    .is_some_and(|worst| item.0.cmp(&worst.0) == Ordering::Greater)
+                {
+                    let _ = expected.pop();
+                    expected.push(item);
+                }
+
+                if observed.len() < top_k {
+                    observed.push(item);
+                } else {
+                    replace_top_k_worst_if_better(&mut observed, item);
+                }
+            }
+            assert_eq!(observed.into_sorted_vec(), expected.into_sorted_vec());
+        }
+    }
+
+    #[test]
+    fn max6_fold_min_anchor_default_is_sixteen_on_all_platforms() {
+        assert_eq!(max6_fold_min_anchor_len_default(), 16);
+    }
 
     fn pack(values: &[bool]) -> Vec<u64> {
         let mut out = vec![0u64; values.len().div_ceil(64).max(1)];

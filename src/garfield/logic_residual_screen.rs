@@ -3010,6 +3010,19 @@ fn max6_fold_min_anchor_len_default() -> usize {
     16
 }
 
+// Keep several stealable anchor chunks per worker while limiting partial-heap merge fanout.
+const MAX6_ANCHOR_CHUNKS_PER_THREAD: usize = 16;
+
+#[inline]
+fn max6_anchor_chunk_len(n_anchors: usize, n_threads: usize, min_anchor_len: usize) -> usize {
+    let target_chunk_count = n_threads
+        .max(1)
+        .saturating_mul(MAX6_ANCHOR_CHUNKS_PER_THREAD);
+    n_anchors
+        .div_ceil(target_chunk_count)
+        .max(min_anchor_len.max(1))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scan_residual_pairs_packed_max6_batch_with_min_anchor_len(
     bits_flat: &[u64],
@@ -3217,32 +3230,44 @@ fn scan_residual_pairs_packed_max6_batch_with_min_anchor_len(
     let scan_started = Instant::now();
     let worker_state = || ResidualBatchWorkerState::new(units.len(), top_k, needed_words);
     let mut state = if parallel {
-        (0..source_rows.len())
+        let anchors_per_chunk = max6_anchor_chunk_len(
+            source_rows.len(),
+            rayon::current_num_threads(),
+            min_anchor_len,
+        );
+        let anchor_chunk_count = source_rows.len().div_ceil(anchors_per_chunk);
+        (0..anchor_chunk_count)
             .into_par_iter()
-            .with_min_len(min_anchor_len.max(1))
-            .fold(worker_state, |mut state, anchor_index| {
+            .with_max_len(4)
+            .fold(worker_state, |mut state, chunk_index| {
                 if state.fold_started_at.is_none() {
                     state.fold_started_at = Some(Instant::now());
                     state.fold_worker_index = rayon::current_thread_index();
                 }
-                state.fold_anchor_count += 1;
-                residual_batch_scan_anchor(
-                    anchor_index,
-                    bits_flat,
-                    row_words,
-                    units,
-                    margin_slots_by_unit.as_slice(),
-                    source_rows.as_slice(),
-                    memberships.as_slice(),
-                    &margins,
-                    residual,
-                    n_samples,
-                    top_k,
-                    min_cell,
-                    true,
-                    lookup,
-                    &mut state,
-                );
+                let anchor_start = chunk_index * anchors_per_chunk;
+                let anchor_end = anchor_start
+                    .saturating_add(anchors_per_chunk)
+                    .min(source_rows.len());
+                for anchor_index in anchor_start..anchor_end {
+                    state.fold_anchor_count += 1;
+                    residual_batch_scan_anchor(
+                        anchor_index,
+                        bits_flat,
+                        row_words,
+                        units,
+                        margin_slots_by_unit.as_slice(),
+                        source_rows.as_slice(),
+                        memberships.as_slice(),
+                        &margins,
+                        residual,
+                        n_samples,
+                        top_k,
+                        min_cell,
+                        true,
+                        lookup,
+                        &mut state,
+                    );
+                }
                 state
             })
             .map(|mut state| {
@@ -4133,6 +4158,13 @@ mod tests {
     #[test]
     fn max6_fold_min_anchor_default_is_sixteen_on_all_platforms() {
         assert_eq!(max6_fold_min_anchor_len_default(), 16);
+    }
+
+    #[test]
+    fn max6_anchor_chunk_len_caps_tasks_and_honors_minimum() {
+        assert_eq!(max6_anchor_chunk_len(4096, 8, 16), 32);
+        assert_eq!(max6_anchor_chunk_len(8, 8, 16), 16);
+        assert_eq!(max6_anchor_chunk_len(4096, 8, 128), 128);
     }
 
     fn pack(values: &[bool]) -> Vec<u64> {

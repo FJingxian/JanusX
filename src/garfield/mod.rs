@@ -18730,6 +18730,180 @@ const MAX6_FUSED_QC_FAIL_NO_HOMOZYGOUS: u8 = 3;
 const MAX6_FUSED_QC_FAIL_MAF: u8 = 4;
 const MAX6_FUSED_QC_FAIL_NON_SIMPLE_SNP: u8 = 5;
 
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn max6_identity_pack_bmi2_runtime_available() -> bool {
+    static BMI2: OnceLock<bool> = OnceLock::new();
+    *BMI2.get_or_init(|| std::arch::is_x86_feature_detected!("bmi2"))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "bmi2")]
+unsafe fn pack_max6_identity_row_logic_bmi2(
+    row: &[u8],
+    n_samples: usize,
+    dst_words: &mut [u64],
+    missing_words: &mut [u64],
+) {
+    use std::arch::x86_64::_pext_u64;
+
+    const LOW_BITS: u64 = 0x5555_5555_5555_5555;
+    let mut sample = 0usize;
+    while sample + 32 <= n_samples {
+        let byte_start = sample / 4;
+        let packed = u64::from_le_bytes(
+            row[byte_start..byte_start + 8]
+                .try_into()
+                .expect("eight packed genotype bytes form 32 samples"),
+        );
+        let low = packed & LOW_BITS;
+        let high = (packed >> 1) & LOW_BITS;
+        let alt_bits = _pext_u64(low & high, LOW_BITS) as u32;
+        let missing_bits = _pext_u64(low ^ high, LOW_BITS) as u32;
+        let word_idx = sample >> 6;
+        let shift = (sample & 63) as u32;
+        dst_words[word_idx] |= (alt_bits as u64) << shift;
+        missing_words[word_idx] |= (missing_bits as u64) << shift;
+        sample += 32;
+    }
+
+    let tail_samples = n_samples - sample;
+    if tail_samples > 0 {
+        let byte_start = sample / 4;
+        let tail_bytes = tail_samples.div_ceil(4);
+        let mut tail = [0u8; 8];
+        tail[..tail_bytes].copy_from_slice(&row[byte_start..byte_start + tail_bytes]);
+        let active_lanes = tail_samples & 3;
+        if active_lanes > 0 {
+            tail[tail_bytes - 1] &= (1u8 << (active_lanes * 2)) - 1;
+        }
+        let packed = u64::from_le_bytes(tail);
+        let low = packed & LOW_BITS;
+        let high = (packed >> 1) & LOW_BITS;
+        let alt_bits = _pext_u64(low & high, LOW_BITS) as u32;
+        let missing_bits = _pext_u64(low ^ high, LOW_BITS) as u32;
+        let word_idx = sample >> 6;
+        let shift = (sample & 63) as u32;
+        dst_words[word_idx] |= (alt_bits as u64) << shift;
+        missing_words[word_idx] |= (missing_bits as u64) << shift;
+    }
+}
+
+#[inline]
+fn compact_max6_even_bits_swar(bits: u64) -> u32 {
+    let mut packed = bits & 0x5555_5555_5555_5555;
+    packed = (packed | (packed >> 1)) & 0x3333_3333_3333_3333;
+    packed = (packed | (packed >> 2)) & 0x0f0f_0f0f_0f0f_0f0f;
+    packed = (packed | (packed >> 4)) & 0x00ff_00ff_00ff_00ff;
+    packed = (packed | (packed >> 8)) & 0x0000_ffff_0000_ffff;
+    packed = (packed | (packed >> 16)) & 0x0000_0000_ffff_ffff;
+    packed as u32
+}
+
+#[inline]
+fn pack_max6_identity_row_logic_swar(
+    row: &[u8],
+    n_samples: usize,
+    dst_words: &mut [u64],
+    missing_words: &mut [u64],
+) {
+    const LOW_BITS: u64 = 0x5555_5555_5555_5555;
+
+    let mut sample = 0usize;
+    while sample + 32 <= n_samples {
+        let byte_start = sample / 4;
+        let packed = u64::from_le_bytes(
+            row[byte_start..byte_start + 8]
+                .try_into()
+                .expect("eight packed genotype bytes form 32 samples"),
+        );
+        let low = packed & LOW_BITS;
+        let high = (packed >> 1) & LOW_BITS;
+        let alt_bits = compact_max6_even_bits_swar(low & high);
+        let missing_bits = compact_max6_even_bits_swar(low ^ high);
+        let word_idx = sample >> 6;
+        let shift = (sample & 63) as u32;
+        dst_words[word_idx] |= (alt_bits as u64) << shift;
+        missing_words[word_idx] |= (missing_bits as u64) << shift;
+        sample += 32;
+    }
+
+    let tail_samples = n_samples - sample;
+    if tail_samples > 0 {
+        let byte_start = sample / 4;
+        let tail_bytes = tail_samples.div_ceil(4);
+        let mut tail = [0u8; 8];
+        tail[..tail_bytes].copy_from_slice(&row[byte_start..byte_start + tail_bytes]);
+        let active_lanes = tail_samples & 3;
+        if active_lanes > 0 {
+            tail[tail_bytes - 1] &= (1u8 << (active_lanes * 2)) - 1;
+        }
+        let packed = u64::from_le_bytes(tail);
+        let low = packed & LOW_BITS;
+        let high = (packed >> 1) & LOW_BITS;
+        let alt_bits = compact_max6_even_bits_swar(low & high);
+        let missing_bits = compact_max6_even_bits_swar(low ^ high);
+        let word_idx = sample >> 6;
+        let shift = (sample & 63) as u32;
+        dst_words[word_idx] |= (alt_bits as u64) << shift;
+        missing_words[word_idx] |= (missing_bits as u64) << shift;
+    }
+}
+
+#[inline]
+fn pack_max6_identity_row_logic_lut(
+    row: &[u8],
+    n_samples: usize,
+    dst_words: &mut [u64],
+    missing_words: &mut [u64],
+) {
+    let lut = packed_byte_lut();
+    let active_bytes = n_samples.div_ceil(4);
+    let rem_lanes = n_samples & 3;
+    for byte_idx in 0..active_bytes {
+        let active_lanes = if rem_lanes > 0 && byte_idx + 1 == active_bytes {
+            rem_lanes
+        } else {
+            4
+        };
+        let mut byte = row[byte_idx];
+        if active_lanes < 4 {
+            byte &= (1u8 << (active_lanes * 2)) - 1;
+        }
+        let idx = byte as usize;
+        let word_idx = byte_idx >> 4;
+        let shift = ((byte_idx & 15) * 4) as u32;
+        dst_words[word_idx] |= (lut.logic_alt_bits[idx] as u64) << shift;
+        missing_words[word_idx] |= (lut.logic_missing_bits[idx] as u64) << shift;
+    }
+}
+
+#[inline]
+fn pack_max6_identity_row_logic(
+    row: &[u8],
+    n_samples: usize,
+    dst_words: &mut [u64],
+    missing_words: &mut [u64],
+) {
+    dst_words.fill(0);
+    missing_words.fill(0);
+
+    #[cfg(target_arch = "x86_64")]
+    if n_samples >= 32 && max6_identity_pack_bmi2_runtime_available() {
+        // SAFETY: the runtime feature check above guarantees BMI2 support.
+        unsafe {
+            pack_max6_identity_row_logic_bmi2(row, n_samples, dst_words, missing_words);
+        }
+        return;
+    }
+
+    if n_samples >= 32 {
+        pack_max6_identity_row_logic_swar(row, n_samples, dst_words, missing_words);
+    } else {
+        pack_max6_identity_row_logic_lut(row, n_samples, dst_words, missing_words);
+    }
+}
+
 #[inline]
 fn scan_max6_identity_row_qc_counts(
     row: &[u8],
@@ -18836,27 +19010,7 @@ fn scan_max6_row_qc_and_pack_logic(
         if sample_identity {
             // Identity rows arrive in a fresh zeroed batch slice. Delay all
             // output writes until QC passes so rejected rows stay untouched.
-            dst_words.fill(0);
-            missing_words.fill(0);
-            let lut = packed_byte_lut();
-            let active_bytes = n_samples.div_ceil(4);
-            let rem_lanes = n_samples & 3;
-            for byte_idx in 0..active_bytes {
-                let active_lanes = if rem_lanes > 0 && byte_idx + 1 == active_bytes {
-                    rem_lanes
-                } else {
-                    4
-                };
-                let mut byte = row[byte_idx];
-                if active_lanes < 4 {
-                    byte &= (1u8 << (active_lanes * 2)) - 1u8;
-                }
-                let idx = byte as usize;
-                let word_idx = byte_idx >> 4;
-                let shift = ((byte_idx & 15) * 4) as u32;
-                dst_words[word_idx] |= (lut.logic_alt_bits[idx] as u64) << shift;
-                missing_words[word_idx] |= (lut.logic_missing_bits[idx] as u64) << shift;
-            }
+            pack_max6_identity_row_logic(row, n_samples, dst_words, missing_words);
         }
         let n_words = dst_words.len();
         let tail_bits = n_samples & 63;

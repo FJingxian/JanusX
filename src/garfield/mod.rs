@@ -23206,6 +23206,8 @@ fn run_max6_grmmax6_pipeline(
             None,
         )
     };
+    let shared_grm_int_score_pairs = parse_env_usize("JX_GARFIELD_GRM_INT_SCORE_PAIRS")
+        .unwrap_or(if cfg!(windows) { 32 } else { 64 });
     for unit_chunk in scan_unit_chunks.iter() {
         let chunk_results = if cross_window_union_rerank {
             let batches = unit_chunk
@@ -23422,8 +23424,6 @@ fn run_max6_grmmax6_pipeline(
                 batch_kernel_seconds / batch_screen.units.len().max(1) as f64;
             let grm_int_batch_started = Instant::now();
             let shared_grm_int_by_unit = if grm_int_only && unit_kind_lc == "window" {
-                const SHARED_GRM_INT_SCORE_PAIRS: usize = 64;
-
                 // A GRM-INT score is a property of the global marker pair and
                 // trait, so overlapping windows can reuse its exact value.
                 let selected_rows_by_unit = batch_units
@@ -23464,14 +23464,14 @@ fn run_max6_grmmax6_pipeline(
                     pool.install(|| {
                         pair_plan
                             .global_pairs
-                            .par_chunks(SHARED_GRM_INT_SCORE_PAIRS)
+                            .par_chunks(shared_grm_int_score_pairs)
                             .map(score_pair_chunk)
                             .collect::<Result<Vec<_>, String>>()
                     })?
                 } else {
                     pair_plan
                         .global_pairs
-                        .chunks(SHARED_GRM_INT_SCORE_PAIRS)
+                        .chunks(shared_grm_int_score_pairs)
                         .map(score_pair_chunk)
                         .collect::<Result<Vec<_>, String>>()?
                 };

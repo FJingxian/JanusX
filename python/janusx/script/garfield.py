@@ -3511,6 +3511,35 @@ def main() -> None:
                         + f"max_merge_call={topk_merge_wall_max:.6f}s, calls={topk_merge_count}; "
                         + "fold and Top-K task sums overlap wall time",
                     )
+                    fold_worker_values = [int(row[6]) for row in batch_profiles]
+                    fold_task_count_values = [int(row[1]) for row in batch_profiles]
+                    fold_task_wall_sum = sum(float(row[2]) for row in batch_profiles)
+                    pair_scan_wall_sum = sum(float(row[0]) for row in batch_profiles)
+                    full_worker_batches = sum(
+                        workers >= int(args.thread) for workers in fold_worker_values
+                    )
+                    fold_worker_equiv = (
+                        fold_task_wall_sum / pair_scan_wall_sum
+                        if pair_scan_wall_sum > 0.0
+                        else 0.0
+                    )
+                    _emit_garfield_file_only_line(
+                        logger,
+                        "Max6 fold-worker occupancy: "
+                        + f"requested={int(args.thread)}, "
+                        + "active_workers p50/p95/max="
+                        + f"{_batch_quantile(fold_worker_values, .50):.1f}/"
+                        + f"{_batch_quantile(fold_worker_values, .95):.1f}/"
+                        + f"{max(fold_worker_values, default=0)}, "
+                        + f"full_worker_batches={full_worker_batches}/{len(fold_worker_values)}, "
+                        + "fold_tasks p50/p95/max="
+                        + f"{_batch_quantile(fold_task_count_values, .50):.1f}/"
+                        + f"{_batch_quantile(fold_task_count_values, .95):.1f}/"
+                        + f"{max(fold_task_count_values, default=0)}, "
+                        + f"fold_task_sum={fold_task_wall_sum:.3f}s, "
+                        + f"pair_scan_wall={pair_scan_wall_sum:.3f}s, "
+                        + f"fold_worker_equiv={fold_worker_equiv:.2f}",
+                    )
                 pair_scan_profiles = result.get("max6_pair_scan_subphase_profiles") or []
                 if pair_scan_profiles:
                     pair_profile_totals = [

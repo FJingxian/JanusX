@@ -202,6 +202,54 @@ impl NoGrmCovariateProjector {
         Ok(projected)
     }
 
+    /// Project all columns of a row-major matrix without allocating a
+    /// temporary input and output vector for each column.
+    pub(crate) fn project_row_major_columns_into(
+        &self,
+        values: &[f64],
+        n_columns: usize,
+        projected: &mut [f64],
+    ) -> Result<(), String> {
+        let expected = self
+            .n_samples
+            .checked_mul(n_columns)
+            .ok_or_else(|| "no-GRM projector matrix length overflow".to_string())?;
+        if values.len() != expected || projected.len() != expected {
+            return Err(format!(
+                "no-GRM projector matrix length mismatch: input={}, output={}, expected={expected}",
+                values.len(),
+                projected.len()
+            ));
+        }
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err("no-GRM projector matrix input contains a non-finite value".to_string());
+        }
+
+        let mut coordinates = vec![0.0_f64; self.rank];
+        for column in 0..n_columns {
+            coordinates.fill(0.0);
+            for row in 0..self.n_samples {
+                let value = values[row * n_columns + column];
+                for basis_column in 0..self.rank {
+                    coordinates[basis_column] += self.q[row * self.rank + basis_column] * value;
+                }
+            }
+            for row in 0..self.n_samples {
+                let fitted = (0..self.rank)
+                    .map(|basis_column| {
+                        self.q[row * self.rank + basis_column] * coordinates[basis_column]
+                    })
+                    .sum::<f64>();
+                let index = row * n_columns + column;
+                projected[index] = values[index] - fitted;
+            }
+        }
+        if projected.iter().any(|value| !value.is_finite()) {
+            return Err("no-GRM projector produced a non-finite matrix".to_string());
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn projected_dot(&self, left: &[f64], right: &[f64]) -> Result<f64, String> {
         let left_coordinates = self.coordinates(left)?;

@@ -84,6 +84,28 @@ fn emit_verbose_note(msg: impl AsRef<str>) {
     }
 }
 
+fn configure_macos_deployment_target() {
+    println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
+
+    // When building from source on Apple Silicon, cc-rs may derive the C/C++
+    // deployment target from the installed SDK if this variable is unset.
+    // That can produce an SDK-version target (for example 27.2), which is not
+    // a valid minimum target and breaks conda clang's libc++ headers. Keep the
+    // native build aligned with JanusX's macOS arm64 wheel minimum while
+    // preserving any explicit user choice.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos")
+        || env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("aarch64")
+        || env::var_os("MACOSX_DEPLOYMENT_TARGET").is_some()
+    {
+        return;
+    }
+
+    env::set_var("MACOSX_DEPLOYMENT_TARGET", "11.0");
+    println!(
+        "cargo:warning=MACOSX_DEPLOYMENT_TARGET was unset; defaulting to 11.0 for macOS arm64 C/C++ builds."
+    );
+}
+
 fn has_library_with_prefix(lib_dir_s: &str, prefix: &str) -> bool {
     let Ok(entries) = fs::read_dir(lib_dir_s) else {
         return false;
@@ -1581,6 +1603,7 @@ fn configure_openblas_from_dir(lib_dir_s: &str, source_label: &str) -> bool {
 fn main() {
     println!("cargo:rerun-if-env-changed=PYO3_BUILD_EXTENSION_MODULE");
     println!("cargo:rerun-if-env-changed=JANUSX_BUILD_VERBOSE");
+    configure_macos_deployment_target();
     let build_extension_module = env_value("PYO3_BUILD_EXTENSION_MODULE")
         .as_deref()
         .and_then(parse_boolish)

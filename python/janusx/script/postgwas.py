@@ -1733,18 +1733,65 @@ def _postgwas_require_nonempty_source(path: Path, label: str) -> None:
         raise FineMapSkip(f"{label} file could not be inspected: {exc}") from exc
 
 
-def _postgwas_fvlmm_genotype_fam_path(
+def _postgwas_fvlmm_genotype_sample_path(
     record: GwasNullModelSidecarV1,
     genotype_prefix: Optional[str | os.PathLike[str]],
 ) -> Path:
     if genotype_prefix is not None and str(genotype_prefix).strip() != "":
         prefix = _normalize_plink_prefix(genotype_prefix)
-        return Path(f"{prefix}.fam")
+        is_pgen = os.path.isfile(f"{prefix}.pgen") and not os.path.isfile(
+            f"{prefix}.bed"
+        )
+        suffix = ".psam" if is_pgen else ".fam"
+        return Path(f"{prefix}{suffix}")
     for fingerprint in record.genotype_files:
-        if str(getattr(fingerprint, "basename", "")).lower().endswith(".fam"):
+        basename = str(getattr(fingerprint, "basename", "")).lower()
+        if basename.endswith((".fam", ".psam")):
             return Path(str(fingerprint.canonical_path)).expanduser()
     prefix = _normalize_plink_prefix(record.genotype_prefix)
-    return Path(f"{prefix}.fam")
+    is_pgen = os.path.isfile(f"{prefix}.pgen") and not os.path.isfile(
+        f"{prefix}.bed"
+    )
+    suffix = ".psam" if is_pgen else ".fam"
+    return Path(f"{prefix}{suffix}")
+
+
+def _postgwas_read_plink_sample_ids(sample_path: str | os.PathLike[str]) -> list[str]:
+    """Read PLINK IID values in source order from FAM or PSAM metadata."""
+    path = Path(sample_path)
+    is_psam = path.suffix.lower() == ".psam"
+    sample_ids: list[str] = []
+    header: Optional[list[str]] = None
+    try:
+        with path.open("rt", encoding="utf-8", errors="replace") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                stripped = line.strip()
+                if not stripped or stripped.startswith("##"):
+                    continue
+                fields = stripped.split()
+                if is_psam and stripped.startswith("#"):
+                    header = [field.lstrip("#").upper() for field in fields]
+                    if "IID" not in header:
+                        raise ValueError(f"PSAM header has no IID column at line {line_number}")
+                    continue
+                if is_psam:
+                    iid_index = (
+                        header.index("IID")
+                        if header is not None
+                        else (1 if len(fields) >= 6 else 0)
+                    )
+                else:
+                    iid_index = 1
+                if iid_index >= len(fields) or not fields[iid_index].strip():
+                    label = "PSAM" if is_psam else "FAM"
+                    raise ValueError(f"malformed {label} row at line {line_number}")
+                sample_ids.append(fields[iid_index].strip())
+    except OSError as exc:
+        raise ValueError(f"unable to read PLINK sample metadata {path}: {exc}") from exc
+    if not sample_ids:
+        label = "PSAM" if is_psam else "FAM"
+        raise ValueError(f"PLINK {label} sample metadata is empty: {path}")
+    return sample_ids
 
 
 def _postgwas_load_qmatrix_source(
@@ -2052,6 +2099,56 @@ def _postgwas_scan_bim_candidates(
     return candidates, source_index
 
 
+def _postgwas_scan_pvar_candidates(
+    handle: Iterable[str],
+    target_sites: set[tuple[str, int]],
+) -> tuple[
+    dict[
+        tuple[str, int],
+        list[tuple[int, tuple[str, int, str | None, str | None, str | None]]],
+    ],
+    int,
+]:
+    """Scan PVAR once and retain identity metadata only for target coordinates."""
+    candidates = {site: [] for site in target_sites}
+    columns: Optional[dict[str, int]] = None
+    source_index = 0
+    for line_number, line in enumerate(handle, start=1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("##"):
+            continue
+        tokens = stripped.split()
+        if stripped.startswith("#"):
+            columns = {
+                value.lstrip("#").upper(): index
+                for index, value in enumerate(tokens)
+            }
+            required = {"CHROM", "POS", "ID", "REF", "ALT"}
+            missing = required.difference(columns)
+            if missing:
+                raise ValueError(
+                    "PVAR header is missing required columns: "
+                    + ", ".join(sorted(missing))
+                )
+            continue
+        if columns is None:
+            raise ValueError("PVAR header is missing")
+        try:
+            chrom = _normalize_chr(tokens[columns["CHROM"]])
+            pos = int(float(tokens[columns["POS"]]))
+            snp = _postgwas_variant_token(tokens[columns["ID"]])
+            ref = _postgwas_variant_token(tokens[columns["REF"]], allele=True)
+            alt = _postgwas_variant_token(tokens[columns["ALT"]], allele=True)
+        except (IndexError, TypeError, ValueError) as exc:
+            raise ValueError(f"Malformed PVAR row at line {line_number}") from exc
+        metadata = (chrom, pos, snp, ref, alt)
+        site = (chrom, pos)
+        if site in candidates:
+            candidates[site].append((source_index, metadata))
+        source_index += 1
+    return candidates, source_index
+
+
 def _postgwas_index_bim_candidates(
     candidates_by_site: dict[
         tuple[str, int],
@@ -2118,7 +2215,7 @@ def _postgwas_resolve_prepared_bim_rows(
     list[int],
     list[tuple[str, int, str | None, str | None, str | None]],
 ]:
-    """Resolve prepared variants from one BIM scan without materializing BIM."""
+    """Resolve prepared variants from one BIM/PVAR scan without materializing it."""
 
     prepared_identity: list[tuple[str, int, str | None, str | None, str | None]] = []
     target_sites: set[tuple[str, int]] = set()
@@ -2156,16 +2253,25 @@ def _postgwas_resolve_prepared_bim_rows(
         target_sites.add((chrom, pos))
 
     prefix = _normalize_plink_prefix(genotype_prefix)
-    bim_path = Path(f"{prefix}.bim")
+    is_pgen = os.path.isfile(f"{prefix}.pgen") and not os.path.isfile(
+        f"{prefix}.bed"
+    )
+    variant_path = Path(f"{prefix}.pvar" if is_pgen else f"{prefix}.bim")
+    variant_label = "PVAR" if is_pgen else "BIM"
     try:
-        with bim_path.open("rt", encoding="utf-8", errors="replace") as handle:
-            candidates_by_site, source_rows = _postgwas_scan_bim_candidates(
-                handle, target_sites
+        with variant_path.open("rt", encoding="utf-8", errors="replace") as handle:
+            scanner = (
+                _postgwas_scan_pvar_candidates
+                if is_pgen
+                else _postgwas_scan_bim_candidates
             )
+            candidates_by_site, source_rows = scanner(handle, target_sites)
     except (OSError, ValueError) as exc:
-        raise FineMapSkip(f"BIM variant identity could not be read: {exc}") from exc
+        raise FineMapSkip(
+            f"{variant_label} variant identity could not be read: {exc}"
+        ) from exc
     if source_rows == 0:
-        raise FineMapSkip("BIM variant identity is empty")
+        raise FineMapSkip(f"{variant_label} variant identity is empty")
     indexed_candidates_by_site = _postgwas_index_bim_candidates(candidates_by_site)
 
     selected_indices: list[int] = []
@@ -2183,7 +2289,7 @@ def _postgwas_resolve_prepared_bim_rows(
         candidates = all_candidates
         if not candidates:
             raise FineMapSkip(
-                f"no BIM variant matches prepared row {row_number} at {chrom}:{pos}"
+                f"no {variant_label} variant matches prepared row {row_number} at {chrom}:{pos}"
             )
         prepared_pair = _postgwas_variant_allele_pair(prepared_a0, prepared_a1)
         id_matches = candidates_by_id.get(prepared_snp, []) if prepared_snp is not None else []
@@ -2191,9 +2297,9 @@ def _postgwas_resolve_prepared_bim_rows(
             candidates = id_matches
         elif prepared_snp is not None and has_named_id:
             # A named variant that cannot be found by ID is not proven by a
-            # coordinate fallback when BIM contains real IDs.
+            # coordinate fallback when the source metadata contains real IDs.
             raise FineMapSkip(
-                f"prepared SNP ID {prepared_snp!r} is not present in BIM; "
+                f"prepared SNP ID {prepared_snp!r} is not present in {variant_label}; "
                 "variant identity cannot be proven"
             )
         if prepared_pair is not None:
@@ -2211,12 +2317,14 @@ def _postgwas_resolve_prepared_bim_rows(
             )
         if len(candidates) != 1:
             raise FineMapSkip(
-                "variant identity is ambiguous; exact BIM alignment cannot be proven "
+                f"variant identity is ambiguous; exact {variant_label} alignment cannot be proven "
                 f"for prepared row {row_number} at {chrom}:{pos}"
             )
         bim_index, bim_metadata = candidates[0]
         if bim_index in used:
-            raise FineMapSkip("prepared variants resolve to the same BIM row")
+            raise FineMapSkip(
+                f"prepared variants resolve to the same {variant_label} row"
+            )
         used.add(bim_index)
         selected_indices.append(bim_index)
         selected_metadata.append(bim_metadata)
@@ -2250,7 +2358,7 @@ def _postgwas_reconstruct_fvlmm_context(
     """Reconstruct the GWAS FvLMM sample order and fixed-effect design.
 
     The source loaders used here are the same workflow loaders used by GWAS:
-    phenotype parsing/duplicate-ID averaging, covariate parsing, FAM IID
+    phenotype parsing/duplicate-ID averaging, covariate parsing, PLINK IID
     extraction, and GRM ID-based alignment.  The full GRM is intentionally
     loaded only after the final ordered sample hash has been checked.
     """
@@ -2264,7 +2372,6 @@ def _postgwas_reconstruct_fvlmm_context(
         _trait_values_and_mask,
         load_phenotype,
     )
-    from janusx.script._common.genoio import read_id_file as _read_geno_id_file
     from janusx.script._common.grmio import (
         load_and_align_grm,
         read_id_file as _read_grm_id_file,
@@ -2274,26 +2381,19 @@ def _postgwas_reconstruct_fvlmm_context(
     if dependency_roots is not None:
         roots = tuple(Path(root).expanduser().resolve() for root in dependency_roots)
 
-    fam_path = _postgwas_fvlmm_genotype_fam_path(record, genotype_prefix)
-    if not fam_path.is_file():
-        raise FineMapSkip(f"PLINK FAM file not found: {fam_path}")
+    sample_path = _postgwas_fvlmm_genotype_sample_path(record, genotype_prefix)
+    if not sample_path.is_file():
+        raise FineMapSkip(f"PLINK sample metadata file not found: {sample_path}")
     try:
-        fam_ids_raw = _read_geno_id_file(
-            str(fam_path),
-            log,
-            "PLINK FAM",
-            show_status=False,
-        )
+        fam_ids_raw = _postgwas_read_plink_sample_ids(sample_path)
     except (OSError, ValueError) as exc:
-        raise FineMapSkip(f"PLINK FAM IDs could not be read: {exc}") from exc
-    if fam_ids_raw is None:
-        raise FineMapSkip("PLINK FAM IDs are missing")
+        raise FineMapSkip(f"PLINK sample IDs could not be read: {exc}") from exc
     fam_ids = np.asarray(fam_ids_raw, dtype=str).reshape(-1)
     if fam_ids.size == 0:
-        raise FineMapSkip("PLINK FAM IDs are empty")
+        raise FineMapSkip("PLINK sample IDs are empty")
     fam_id_list = [str(value) for value in fam_ids.tolist()]
     if len(set(fam_id_list)) != len(fam_id_list):
-        raise FineMapSkip("PLINK FAM contains duplicate sample IDs")
+        raise FineMapSkip("PLINK sample metadata contains duplicate IDs")
 
     phenotype_path = _postgwas_resolve_fvlmm_dependency(
         record.phenotype_file,
@@ -2420,7 +2520,8 @@ def _postgwas_reconstruct_fvlmm_context(
             f"sidecar shape={record.kinship_shape}, IDs={grm_ids.size}"
         )
 
-    # This mirrors prepare_streaming_context: intersect sources in FAM order,
+    # This mirrors prepare_streaming_context: intersect sources in PLINK sample
+    # order,
     # then apply the exact single-trait ~isnan phenotype mask.
     source_sets = [set(fam_id_list), set(str(value) for value in phenotype.index)]
     source_sets.append(set(grm_id_list))
@@ -2831,9 +2932,11 @@ def _postgwas_build_fvlmm_effective_ld(
     try:
         bfile_samples = _postgwas_count_plink_samples(requested_prefix)
         if int(bfile_samples) <= 0:
-            raise ValueError("PLINK FAM contains no samples")
+            raise ValueError("PLINK sample metadata contains no samples")
     except (OSError, ValueError, OverflowError) as exc:
-        raise FineMapSkip(f"FvLMM memory preflight could not inspect FAM: {exc}") from exc
+        raise FineMapSkip(
+            f"FvLMM memory preflight could not inspect PLINK sample metadata: {exc}"
+        ) from exc
 
     dependency_roots = _dependency_search_roots(
         record.result.canonical_path,
@@ -2864,7 +2967,7 @@ def _postgwas_build_fvlmm_effective_ld(
         )
     if int(record.sample_count) > int(bfile_samples) or int(record.sample_count) > actual_grm_shape[0]:
         raise FineMapSkip(
-            "FvLMM sidecar sample count exceeds verified FAM/GRM dimensions"
+            "FvLMM sidecar sample count exceeds verified PLINK sample/GRM dimensions"
         )
     qmatrix_rows: Optional[int] = None
     if record.qmatrix_file is not None:
@@ -2879,8 +2982,8 @@ def _postgwas_build_fvlmm_effective_ld(
         )
         if qmatrix_rows != int(bfile_samples):
             raise FineMapSkip(
-                "Q/PC storage header row count disagrees with verified FAM IDs: "
-                f"q_rows={qmatrix_rows}, fam_rows={bfile_samples}"
+                "Q/PC storage header row count disagrees with verified PLINK IDs: "
+                f"q_rows={qmatrix_rows}, sample_rows={bfile_samples}"
             )
     existing_bytes = int(
         prepared.memory_usage(deep=True, index=True).sum()
@@ -3394,7 +3497,7 @@ def _postgwas_estimate_finemap_memory_bytes(
     n_samples: int,
     existing_bytes: int = 0,
 ) -> int:
-    """Estimate the dense signed-LD peak before any BED decoding starts."""
+    """Estimate the dense signed-LD peak before any genotype decoding starts."""
     m = max(0, int(n_variants))
     n = max(0, int(n_samples))
     existing = max(0, int(existing_bytes))
@@ -3428,7 +3531,7 @@ def _postgwas_check_finemap_memory(
         estimated_gib = estimated / float(1024**3)
         limit_gib = limit / float(1024**3)
         raise MemoryError(
-            "Fine-mapping dense signed-LD was refused before BED decoding: "
+            "Fine-mapping dense signed-LD was refused before genotype decoding: "
             f"{int(n_variants)} variants x {int(n_samples)} samples would require "
             f"approximately {estimated_gib:.2f} GiB, exceeding the {limit_gib:.2f} "
             "GiB memory limit. Use a smaller -bimrange or split the locus."
@@ -3437,14 +3540,18 @@ def _postgwas_check_finemap_memory(
 
 
 def _postgwas_count_plink_samples(bfile: object) -> int:
-    """Count non-empty FAM rows without materializing genotype data."""
+    """Count PLINK samples from FAM/PSAM metadata without loading genotypes."""
     prefix = _normalize_plink_prefix(bfile)
-    fam_path = f"{prefix}.fam"
+    sample_suffix = (
+        ".psam"
+        if os.path.isfile(f"{prefix}.pgen") and not os.path.isfile(f"{prefix}.bed")
+        else ".fam"
+    )
+    sample_path = Path(f"{prefix}{sample_suffix}")
     try:
-        with open(fam_path, "rt", encoding="utf-8") as handle:
-            return sum(1 for line in handle if line.strip())
-    except OSError as exc:
-        raise ValueError(f"Unable to read PLINK sample file {fam_path}: {exc}") from exc
+        return len(_postgwas_read_plink_sample_ids(sample_path))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"Unable to read PLINK sample file {sample_path}: {exc}") from exc
 
 
 def _postgwas_finemap_result_model(
@@ -3479,25 +3586,22 @@ def _postgwas_select_finemap_ld_route(
 
 
 def _postgwas_read_finemap_fam_sample_ids(bfile: object) -> list[str]:
-    """Read unique PLINK IID values in their exact FAM order."""
+    """Read unique PLINK IID values in their exact FAM/PSAM order."""
     prefix = _normalize_plink_prefix(bfile)
-    fam_path = Path(f"{prefix}.fam")
-    sample_ids: list[str] = []
+    sample_suffix = (
+        ".psam"
+        if os.path.isfile(f"{prefix}.pgen") and not os.path.isfile(f"{prefix}.bed")
+        else ".fam"
+    )
+    sample_path = Path(f"{prefix}{sample_suffix}")
     try:
-        with fam_path.open("rt", encoding="utf-8") as handle:
-            for line_number, line in enumerate(handle, start=1):
-                fields = line.split()
-                if not fields:
-                    continue
-                if len(fields) < 2 or str(fields[1]).strip() == "":
-                    raise ValueError(f"malformed FAM row at {fam_path}:{line_number}")
-                sample_ids.append(str(fields[1]).strip())
+        sample_ids = _postgwas_read_plink_sample_ids(sample_path)
     except (OSError, ValueError) as exc:
-        raise FineMapSkip(f"PLINK FAM sample metadata is unavailable: {exc}") from exc
+        raise FineMapSkip(f"PLINK sample metadata is unavailable: {exc}") from exc
     if not sample_ids:
-        raise FineMapSkip("PLINK FAM sample metadata is empty")
+        raise FineMapSkip("PLINK sample metadata is empty")
     if len(set(sample_ids)) != len(sample_ids):
-        raise FineMapSkip("PLINK FAM sample metadata contains duplicate IIDs")
+        raise FineMapSkip("PLINK sample metadata contains duplicate IIDs")
     return sample_ids
 
 
@@ -3508,9 +3612,9 @@ def _postgwas_resolve_finemap_sample_ids(
     """Resolve and hash-check the exact sample order used by an ordinary GWAS.
 
     Ordinary/legacy LM results do not carry the sidecar's reconstructable
-    phenotype context.  They are therefore safe only when the caller supplies
-    an explicit ordered sample list or indices together with its ordered-ID
-    hash.  In particular, FAM order is never silently treated as GWAS order.
+    phenotype context. They are safe only when the caller supplies an explicit
+    ordered sample list or indices together with its ordered-ID hash. In
+    particular, PLINK input order is never silently treated as GWAS order.
     """
     fam_ids = _postgwas_read_finemap_fam_sample_ids(bfile)
     supplied_ids = getattr(args, "finemap_sample_ids", None)
@@ -3572,7 +3676,8 @@ def _postgwas_resolve_finemap_sample_ids(
         )
     except KeyError as exc:
         raise FineMapSkip(
-            f"LM fine-mapping sample metadata contains IID absent from FAM: {exc.args[0]}"
+            "LM fine-mapping sample metadata contains IID absent from PLINK input: "
+            f"{exc.args[0]}"
         ) from exc
     if supplied_indices is not None and supplied_ids is not None:
         try:
@@ -3615,7 +3720,7 @@ def _validate_postgwas_finemap_args(
             "Fine-mapping requires exactly one GWAS input file from -i/--gwasfile."
         )
     if not getattr(args, "bfile", None):
-        parser.error("Fine-mapping requires -bfile/--bfile.")
+        parser.error("Fine-mapping requires -bfile/--bfile or -pfile/--pfile.")
     if not getattr(args, "bimrange_tuples", None):
         parser.error("Fine-mapping requires at least one -bimrange/--bimrange.")
     if int(args.finemap_l) <= 0:
@@ -3908,7 +4013,7 @@ def _postgwas_align_finemap_locus(
     counters["unresolved_identities"] = int(len(gwas) - len(set(pair_for_bed.values())))
     if snp_conflicts > 0:
         raise FineMapSkip(
-            "GWAS/BIM SNP identity mismatch or missing canonical BIM SNP metadata"
+            "GWAS/PLINK variant identity mismatch or missing canonical PLINK variant metadata"
         )
     if len(records) == 0:
         aligned = gwas.drop(columns=["_chrom_norm", "_pos_num"], errors="ignore").iloc[0:0].copy()
@@ -3924,7 +4029,7 @@ def _postgwas_canonicalize_raw_finemap_rows(
     prepared: pd.DataFrame,
     bfile: object,
 ) -> pd.DataFrame:
-    """Canonicalize every raw-route summary row against its BIM identity.
+    """Canonicalize every raw-route summary row against its PLINK variant identity.
 
     This is deliberately a metadata-only pass.  It runs after the LD route has
     been selected and before raw LD clumping, so folded rows cannot carry
@@ -5385,7 +5490,7 @@ def _postgwas_run_susie_finemap_body(
         effective_source: Optional[pd.DataFrame] = None
         effective_locus_r: Optional[np.ndarray] = None
         if ld_route == "raw":
-            # Establish canonical BIM identity for every regional row before
+            # Establish canonical PLINK variant identity for every regional row before
             # raw clumping can form folded groups.  This metadata-only pass is
             # intentionally after route selection and before any raw LD use.
             prepared_source = _postgwas_canonicalize_raw_finemap_rows(
@@ -6479,13 +6584,13 @@ def _extract_ld_site_set(
 def _normalize_plink_prefix(path_or_prefix: object) -> str:
     s = str(path_or_prefix).strip()
     low = s.lower()
-    for ext in (".bed", ".bim", ".fam"):
+    for ext in (".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"):
         if low.endswith(ext):
             return s[: -len(ext)]
     return s
 
 
-def _is_existing_plink_prefix(path_or_prefix: object) -> bool:
+def _is_existing_bed_prefix(path_or_prefix: object) -> bool:
     prefix = _normalize_plink_prefix(path_or_prefix)
     if prefix == "":
         return False
@@ -6493,6 +6598,23 @@ def _is_existing_plink_prefix(path_or_prefix: object) -> bool:
         os.path.isfile(f"{prefix}.bed")
         and os.path.isfile(f"{prefix}.bim")
         and os.path.isfile(f"{prefix}.fam")
+    )
+
+
+def _is_existing_pgen_prefix(path_or_prefix: object) -> bool:
+    prefix = _normalize_plink_prefix(path_or_prefix)
+    if prefix == "":
+        return False
+    return (
+        os.path.isfile(f"{prefix}.pgen")
+        and os.path.isfile(f"{prefix}.pvar")
+        and os.path.isfile(f"{prefix}.psam")
+    )
+
+
+def _is_existing_plink_prefix(path_or_prefix: object) -> bool:
+    return _is_existing_bed_prefix(path_or_prefix) or _is_existing_pgen_prefix(
+        path_or_prefix
     )
 
 
@@ -6712,7 +6834,9 @@ def _compute_ld_from_bed_rust(
                 )
             plink_prefix = ""
 
-    if plink_prefix != "" and hasattr(jxrs, "bed_ldblock_r2_rust"):
+    if _is_existing_bed_prefix(plink_prefix) and hasattr(
+        jxrs, "bed_ldblock_r2_rust"
+    ):
         chrom_ranges = [str(x[0]) for x in bimrange_tuples]
         start_bp = [int(x[1]) for x in bimrange_tuples]
         end_bp = [int(x[2]) for x in bimrange_tuples]
@@ -6746,7 +6870,11 @@ def _compute_ld_from_bed_rust(
             )
         return ld_mat, ld_keys
 
-    if logger is not None:
+    if logger is not None and _is_existing_pgen_prefix(plink_prefix):
+        logger.info(
+            "LD backend: reading PGEN input through the native genotype reader."
+        )
+    elif logger is not None:
         logger.warning(
             "Warning: Rust LD matrix backend requires PLINK BED/BIM/FAM input; "
             "falling back to generic genotype LD computation."
@@ -14547,6 +14675,7 @@ def main(argv: Optional[list[str]] = None):
             "jx postgwas -i a.tsv b.tsv -manh-merge -qq-merge -marker '1,o,x'",
             "jx postgwas -gwasfile result.lmm.tsv -a 50 -gff genes.gff3",
             "jx postgwas -bfile test/geno -bimrange 1:1-2 -ldblock-all -bed genes.bed",
+            "jx postgwas -i result.fvlmm.tsv -pfile test/pgen -bimrange 1:10-12 -ldblock-all",
             "jx postgwas -i result.lmm.tsv -bfile test/geno -bimrange 1:10-12 -finemap susie -o result -prefix locus",
         ]),
     )
@@ -14766,7 +14895,12 @@ def main(argv: Optional[list[str]] = None):
     geno_group = ldblock_group.add_mutually_exclusive_group(required=False)
     geno_group.add_argument(
         "-bfile", "--bfile", type=str, default=None,
-        help="Genotype PLINK prefix (for fine-mapping, LD block, or LD clump).",
+        help="Genotype PLINK 1 BED/BIM/FAM prefix (for fine-mapping, LD block, or LD clump).",
+    )
+    geno_group.add_argument(
+        "-pfile", "--pfile", dest="bfile", type=str, default=None,
+        metavar="PFILE",
+        help="Genotype PLINK 2 PGEN/PVAR/PSAM prefix (for fine-mapping, LD block, or LD clump).",
     )
     geno_group.add_argument(
         "-vcf", "--vcf", type=str, default=None,
@@ -14841,7 +14975,7 @@ def main(argv: Optional[list[str]] = None):
             "Enable LD clumping for annotation output using threshold-passing SNPs only. "
             "Format: --LDclump <window> <r2>, e.g. --LDclump 500kb 0.8. "
             "Window supports kb/mb/bp (no unit defaults to kb). "
-            "Requires genotype input via --bfile/--vcf/--hmp/--file."
+            "Requires genotype input via --bfile/--pfile/--vcf/--hmp/--file."
         ),
     )
 

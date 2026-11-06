@@ -14476,6 +14476,7 @@ struct Max6GrmMax6PairOutput {
     candidate_rank: usize,
     first_global_row: usize,
     second_global_row: usize,
+    four_cell_counts: Option<[usize; 4]>,
     dosage: f64,
     max6: f64,
     best_channel: &'static str,
@@ -15873,6 +15874,7 @@ fn max6_screen_gate_output_id(gate: logic_residual_screen::FourCellGate) -> &'st
 fn max6_grm_int_outputs_from_screen(
     unit_index: usize,
     selected_global_rows: &[usize],
+    sites: &[GarfieldLogicSite],
     candidates: &[logic_residual_screen::ResidualScreenCandidate],
     chisq: &[f64],
 ) -> Result<Vec<Max6GrmMax6PairOutput>, String> {
@@ -15899,13 +15901,26 @@ fn max6_grm_int_outputs_from_screen(
             ));
         }
         let screen_rank = candidate_index + 1;
+        let first_global_row = selected_global_rows[candidate.first];
+        let second_global_row = selected_global_rows[candidate.second];
+        let first_site = sites
+            .get(first_global_row)
+            .ok_or_else(|| format!("GRM-INT first site index out of range: {first_global_row}"))?;
+        let second_site = sites.get(second_global_row).ok_or_else(|| {
+            format!("GRM-INT second site index out of range: {second_global_row}")
+        })?;
         outputs.push(Max6GrmMax6PairOutput {
             unit_index,
             // The output's max6_rank column keeps the original Max6 screen
             // rank. Rows themselves are ordered by conditional GRM-INT chi-square.
             candidate_rank: screen_rank,
-            first_global_row: selected_global_rows[candidate.first],
-            second_global_row: selected_global_rows[candidate.second],
+            first_global_row,
+            second_global_row,
+            four_cell_counts: Some(max6_four_cell_counts_in_physical_order(
+                candidate.stats.counts,
+                first_site,
+                second_site,
+            )),
             dosage: chisq[candidate_index],
             max6: candidate.proposal_score,
             best_channel: max6_screen_gate_output_id(candidate.best_gate.gate),
@@ -16271,6 +16286,7 @@ fn scan_max6_grmmax6_unit(
         let outputs = max6_grm_int_outputs_from_screen(
             unit_index,
             selected.as_slice(),
+            logic_bits.sites.as_slice(),
             screen.candidates.as_slice(),
             grm_int.chisq.as_slice(),
         )?;
@@ -16503,6 +16519,7 @@ fn scan_max6_grmmax6_unit(
             candidate_rank: exact.candidate_rank[candidate_index],
             first_global_row: selected[local_first],
             second_global_row: selected[local_second],
+            four_cell_counts: None,
             dosage: exact.dosage[candidate_index],
             max6: exact.max6[candidate_index],
             best_channel: exact.best_max6_channel[candidate_index],
@@ -17320,6 +17337,7 @@ fn rerank_max6_grmmax6_screen_batch_with_audit(
                 candidate_rank: rank + 1,
                 first_global_row: global_first,
                 second_global_row: global_second,
+                four_cell_counts: None,
                 dosage: score.dosage,
                 max6: score.max6,
                 best_channel,
@@ -21666,6 +21684,29 @@ fn max6_output_channel_label(
     }
 }
 
+#[inline]
+fn max6_four_cell_counts_in_physical_order(
+    counts: [usize; 4],
+    first_site: &GarfieldLogicSite,
+    second_site: &GarfieldLogicSite,
+) -> [usize; 4] {
+    let first_key = (
+        chrom_sort_key(first_site.chrom()),
+        first_site.pos,
+        first_site.snp(),
+    );
+    let second_key = (
+        chrom_sort_key(second_site.chrom()),
+        second_site.pos,
+        second_site.snp(),
+    );
+    if first_key <= second_key {
+        counts
+    } else {
+        [counts[0], counts[2], counts[1], counts[3]]
+    }
+}
+
 /// Count the four genotype cells in physical SNP order, using the same
 /// allele-oriented and imputed binary rows used by the Max6 search.
 /// Cell order is [00, 01, 10, 11], where 0/1 are the rows' displayed
@@ -23752,12 +23793,15 @@ fn run_max6_grmmax6_pipeline(
                     .saturating_add(unit_result.final_screen_subset_audit_pairs_checked);
             if let Some(writer) = pair_spool.as_mut() {
                 for record in unit_result.outputs.iter() {
-                    let four_cell_counts = max6_pair_four_cell_counts(
-                        logic_bits,
-                        record.first_global_row,
-                        record.second_global_row,
-                        train_idx_local,
-                    )?;
+                    let four_cell_counts = match record.four_cell_counts {
+                        Some(counts) => counts,
+                        None => max6_pair_four_cell_counts(
+                            logic_bits,
+                            record.first_global_row,
+                            record.second_global_row,
+                            train_idx_local,
+                        )?,
+                    };
                     write_max6_grmmax6_pair_spool_record(
                         writer,
                         record,

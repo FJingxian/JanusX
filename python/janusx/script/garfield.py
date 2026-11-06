@@ -542,6 +542,18 @@ def _ensure_followup_grm(
     )
 
 
+def _max6_prepared_qc_mask_reusable(
+    prepared_sample_ids: Optional[list[str]],
+    trait_sample_ids: list[str],
+    has_aligned_grm: bool,
+) -> bool:
+    return (
+        not has_aligned_grm
+        and prepared_sample_ids is not None
+        and prepared_sample_ids == trait_sample_ids
+    )
+
+
 def _prepare_site_keep(
     *,
     genofile: str,
@@ -2816,6 +2828,7 @@ def main() -> None:
     elif args.scan_mode == "wholegenome":
         scan_unit_total = 1
     global_site_keep: Optional[np.ndarray] = None
+    prepared_max6_qc_mask: Optional[np.ndarray] = None
     use_prepared_max6 = bool(
         _is_ld_tag_max6_backend(args.search_backend) and not max6_audit_requested
     )
@@ -2933,10 +2946,11 @@ def main() -> None:
                 f"(N_unique={format_max6_count(prepared_max6_universe.unique_pair_count)})...Finished"
             )
         if bool(args.global_stats) and aligned_grm is None:
-            global_site_keep = np.asarray(
+            prepared_max6_qc_mask = np.asarray(
                 prepared_max6_universe.global_site_keep,
                 dtype=np.bool_,
             )
+            global_site_keep = prepared_max6_qc_mask
         prepared_max6_tags = None
 
     _emit_plain_info_line(
@@ -2998,6 +3012,21 @@ def main() -> None:
             # External-GRM Max6 only needs trait-sample QC for the frozen tag
             # rows; the native consumer performs that bounded source-row QC.
             site_keep_trait = None
+        elif (
+            site_keep_trait is None
+            and prepared_max6_universe is not None
+            and _max6_prepared_qc_mask_reusable(
+                prepared_sample_ids,
+                list(common_ids),
+                aligned_grm is not None,
+            )
+        ):
+            if prepared_max6_qc_mask is None:
+                prepared_max6_qc_mask = np.asarray(
+                    prepared_max6_universe.global_site_keep,
+                    dtype=np.bool_,
+                )
+            site_keep_trait = prepared_max6_qc_mask
         elif site_keep_trait is None:
             site_keep_trait = _prepare_site_keep(
                 genofile=gfile,

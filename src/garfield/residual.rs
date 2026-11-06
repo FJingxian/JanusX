@@ -202,6 +202,79 @@ impl NoGrmCovariateProjector {
         Ok(projected)
     }
 
+    /// Project a strided vector into a strided output column without making
+    /// per-column input, coordinate, and result allocations.
+    pub(crate) fn project_strided_into(
+        &self,
+        values: &[f64],
+        value_stride: usize,
+        output: &mut [f64],
+        output_stride: usize,
+        coordinates: &mut [f64],
+    ) -> Result<(), String> {
+        if self.n_samples > 1 && (value_stride == 0 || output_stride == 0) {
+            return Err("no-GRM projector strides must be nonzero".to_string());
+        }
+        let required_len = |stride: usize| {
+            if self.n_samples == 0 {
+                Some(0)
+            } else {
+                self.n_samples
+                    .saturating_sub(1)
+                    .checked_mul(stride)
+                    .and_then(|last| last.checked_add(1))
+            }
+        };
+        let Some(value_len) = required_len(value_stride) else {
+            return Err("no-GRM projector strided input offset overflow".to_string());
+        };
+        let Some(output_len) = required_len(output_stride) else {
+            return Err("no-GRM projector strided output offset overflow".to_string());
+        };
+        if values.len() < value_len {
+            return Err(format!(
+                "no-GRM projector strided input length mismatch: need {value_len} values, got {}",
+                values.len()
+            ));
+        }
+        if output.len() < output_len {
+            return Err(format!(
+                "no-GRM projector strided output length mismatch: need {output_len} values, got {}",
+                output.len()
+            ));
+        }
+        if coordinates.len() != self.rank {
+            return Err(format!(
+                "no-GRM projector coordinate length mismatch: got {}, expected {}",
+                coordinates.len(),
+                self.rank
+            ));
+        }
+
+        coordinates.fill(0.0);
+        for row in 0..self.n_samples {
+            let value = values[row * value_stride];
+            if !value.is_finite() {
+                return Err("no-GRM projector input contains a non-finite value".to_string());
+            }
+            for column in 0..self.rank {
+                coordinates[column] += self.q[row * self.rank + column] * value;
+            }
+        }
+        for row in 0..self.n_samples {
+            let mut fitted = 0.0;
+            for column in 0..self.rank {
+                fitted += self.q[row * self.rank + column] * coordinates[column];
+            }
+            let value = values[row * value_stride] - fitted;
+            if !value.is_finite() {
+                return Err("no-GRM projector produced a non-finite value".to_string());
+            }
+            output[row * output_stride] = value;
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn projected_dot(&self, left: &[f64], right: &[f64]) -> Result<f64, String> {
         let left_coordinates = self.coordinates(left)?;

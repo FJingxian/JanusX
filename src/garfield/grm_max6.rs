@@ -844,23 +844,24 @@ pub(crate) fn grm_int_interaction_scores_packed(
             )?;
         } else {
             let projector = no_grm_projector.expect("validated no-GRM projector");
+            let mut projection_coordinates = vec![0.0; projector.rank()];
             for column in 0..n_endpoints {
-                let values = (0..n_samples)
-                    .map(|sample| x_endpoints[sample * n_endpoints + column])
-                    .collect::<Vec<_>>();
-                let projected = projector.project(&values)?;
-                for (sample, value) in projected.into_iter().enumerate() {
-                    z_endpoints[sample * n_endpoints + column] = value;
-                }
+                projector.project_strided_into(
+                    &x_endpoints[column..],
+                    n_endpoints,
+                    &mut z_endpoints[column..],
+                    n_endpoints,
+                    &mut projection_coordinates,
+                )?;
             }
             for column in 0..n_pairs {
-                let values = (0..n_samples)
-                    .map(|sample| h[sample * n_pairs + column])
-                    .collect::<Vec<_>>();
-                let projected = projector.project(&values)?;
-                for (sample, value) in projected.into_iter().enumerate() {
-                    z_h[sample * n_pairs + column] = value;
-                }
+                projector.project_strided_into(
+                    &h[column..],
+                    n_pairs,
+                    &mut z_h[column..],
+                    n_pairs,
+                    &mut projection_coordinates,
+                )?;
             }
         }
         let workspace_bytes = endpoint_len

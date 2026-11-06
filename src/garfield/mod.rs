@@ -17657,6 +17657,18 @@ impl Max6ScreenPairOwnership {
 /// Build output-ordered, memory-bounded Max6 screen batches from the actual
 /// prepared tag membership. The batch scorer itself decides whether any
 /// pair is eligible for sharing; rows are never inferred from coordinates.
+const MAX6_MEMBERSHIP_BATCH_MAX_UNITS: usize = 32;
+const MAX6_MEMBERSHIP_BATCH_MAX_MEMBERSHIPS: usize = 131_072;
+const MAX6_MEMBERSHIP_BATCH_MAX_UNIQUE_ROWS: usize = 65_536;
+const MAX6_MEMBERSHIP_BATCH_HEAP_ENTRIES_PER_WORKER: usize = 32_768;
+
+#[inline]
+fn max6_membership_scan_batch_unit_cap(top_k: usize) -> usize {
+    (MAX6_MEMBERSHIP_BATCH_HEAP_ENTRIES_PER_WORKER / top_k.max(1))
+        .max(1)
+        .min(MAX6_MEMBERSHIP_BATCH_MAX_UNITS)
+}
+
 fn max6_membership_scan_task_chunks(
     scan_unit_indices: &[usize],
     units: &[GarfieldLogicUnit],
@@ -17692,12 +17704,7 @@ fn max6_membership_scan_task_chunks(
     // Score reuse happens within a screen batch. Group enough windows to
     // expose parallel unique-pair jobs while the row and membership budgets
     // continue to bound memory.
-    const MAX_BATCH_UNITS: usize = 32;
-    const MAX_BATCH_MEMBERSHIPS: usize = 131_072;
-    const MAX_BATCH_UNIQUE_ROWS: usize = 65_536;
-    const MAX_HEAP_ENTRIES_PER_WORKER: usize = 32_768;
-    let heap_limited_units = (MAX_HEAP_ENTRIES_PER_WORKER / top_k.max(1)).max(1);
-    let max_batch_units = MAX_BATCH_UNITS.min(heap_limited_units);
+    let max_batch_units = max6_membership_scan_batch_unit_cap(top_k);
     let target_tasks = threads
         .max(1)
         .saturating_mul(2)
@@ -17708,7 +17715,9 @@ fn max6_membership_scan_task_chunks(
     let target_work = total_work.div_ceil(target_tasks.max(1)).max(1);
 
     let union_rows = |left: &[usize], right: &[usize]| -> Option<Vec<usize>> {
-        let mut merged = Vec::with_capacity((left.len() + right.len()).min(MAX_BATCH_UNIQUE_ROWS));
+        let mut merged = Vec::with_capacity(
+            (left.len() + right.len()).min(MAX6_MEMBERSHIP_BATCH_MAX_UNIQUE_ROWS),
+        );
         let (mut i, mut j) = (0usize, 0usize);
         while i < left.len() || j < right.len() {
             let value = if j == right.len() || (i < left.len() && left[i] < right[j]) {
@@ -17726,7 +17735,7 @@ fn max6_membership_scan_task_chunks(
                 value
             };
             if merged.last().copied() != Some(value) {
-                if merged.len() == MAX_BATCH_UNIQUE_ROWS {
+                if merged.len() == MAX6_MEMBERSHIP_BATCH_MAX_UNIQUE_ROWS {
                     return None;
                 }
                 merged.push(value);
@@ -17741,8 +17750,8 @@ fn max6_membership_scan_task_chunks(
     let mut current_memberships = 0usize;
     let mut current_work = 0usize;
     for &(unit_index, selected_rows) in &prepared_units {
-        let too_large_alone = selected_rows.len() > MAX_BATCH_MEMBERSHIPS
-            || selected_rows.len() > MAX_BATCH_UNIQUE_ROWS;
+        let too_large_alone = selected_rows.len() > MAX6_MEMBERSHIP_BATCH_MAX_MEMBERSHIPS
+            || selected_rows.len() > MAX6_MEMBERSHIP_BATCH_MAX_UNIQUE_ROWS;
         let work_target_reached = current_units.len() >= 2
             && current_work >= target_work
             && chunks.len() + 1 < target_tasks;
@@ -17755,7 +17764,7 @@ fn max6_membership_scan_task_chunks(
         };
         let proposed_memberships = current_memberships.saturating_add(selected_rows.len());
         let over_budget = proposed_union.is_none()
-            || proposed_memberships > MAX_BATCH_MEMBERSHIPS
+            || proposed_memberships > MAX6_MEMBERSHIP_BATCH_MAX_MEMBERSHIPS
             || current_units.len() >= max_batch_units
             || work_target_reached;
         if !current_units.is_empty() && over_budget {
@@ -18430,6 +18439,11 @@ fn summarize_max6_screen_validation(
     })
 }
 
+#[inline]
+fn max6_ld_support_cache_required(ld_tag_r2: f64, full_identity_samples: bool) -> bool {
+    full_identity_samples && ld_tag_r2 < 1.0
+}
+
 fn prepare_max6_screen_selection(
     logic_bits: &GarfieldLogicBits,
     units: &[GarfieldLogicUnit],
@@ -18452,14 +18466,17 @@ fn prepare_max6_screen_selection(
         .map_or(1, rayon::ThreadPool::current_num_threads)
         .max(1);
     let task_batch_size = worker_count.saturating_mul(2).max(1);
-    let support_cache_rows = collect_scan_ld_cache_rows(
-        units,
-        scan_unit_indices,
-        logic_bits.sites.len(),
-        unit_kind_lc,
-    );
+    let full_identity_samples =
+        sample_indices_are_full_identity(train_idx_local, logic_bits.n_samples);
+    let support_cache_required = max6_ld_support_cache_required(ld_tag_r2, full_identity_samples);
     let support_cache_build_started = Instant::now();
-    let support_cache = if sample_indices_are_full_identity(train_idx_local, logic_bits.n_samples) {
+    let support_cache = if support_cache_required {
+        let support_cache_rows = collect_scan_ld_cache_rows(
+            units,
+            scan_unit_indices,
+            logic_bits.sites.len(),
+            unit_kind_lc,
+        );
         let build_cache =
             || build_garfield_ld_support_cache(logic_bits, &support_cache_rows, train_idx_local);
         Some(if let Some(pool) = pool {

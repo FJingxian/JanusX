@@ -725,6 +725,50 @@ fn one_cell_sufficient_stats_packed_no_valid(
         s11 += lookup.sum_word_adaptive(y, word_idx, intersection);
     }
 
+    one_cell_sufficient_stats_from_n11_s11(margins, first_marker, second_marker, n11, s11)
+}
+
+#[inline]
+fn one_cell_sufficient_stats_packed_no_valid_with_n11(
+    first: &[u64],
+    second: &[u64],
+    needed_words: usize,
+    tail: Option<u64>,
+    y: &[f64],
+    first_marker: usize,
+    second_marker: usize,
+    margins: &OneCellMargins,
+    lookup: &PackedYSumLookup,
+    n11: usize,
+    skip_zero: bool,
+) -> FourCellSufficientStats {
+    debug_assert!(first_marker < margins.counts.len());
+    debug_assert!(second_marker < margins.counts.len());
+    debug_assert!(first.len() >= needed_words);
+    debug_assert!(second.len() >= needed_words);
+    let mut s11 = 0.0f64;
+    for word_idx in 0..needed_words {
+        let mut intersection = first[word_idx] & second[word_idx];
+        if word_idx + 1 == needed_words {
+            if let Some(mask) = tail {
+                intersection &= mask;
+            }
+        }
+        if !skip_zero || intersection != 0 {
+            s11 += lookup.sum_word_adaptive(y, word_idx, intersection);
+        }
+    }
+    one_cell_sufficient_stats_from_n11_s11(margins, first_marker, second_marker, n11, s11)
+}
+
+#[inline]
+fn one_cell_sufficient_stats_from_n11_s11(
+    margins: &OneCellMargins,
+    first_marker: usize,
+    second_marker: usize,
+    n11: usize,
+    s11: f64,
+) -> FourCellSufficientStats {
     let n_first = margins.counts[first_marker];
     let n_second = margins.counts[second_marker];
     debug_assert!(n11 <= n_first);
@@ -741,13 +785,14 @@ fn one_cell_sufficient_stats_packed_no_valid(
         .expect("one-cell residual screen cell-count underflow");
     let s_first = margins.sums[first_marker];
     let s_second = margins.sums[second_marker];
-    let s10 = s_first - s11;
-    let s01 = s_second - s11;
-    let s00 = margins.total_y - s_first - s_second + s11;
-
     FourCellSufficientStats {
         counts: [n00, n01, n10, n11],
-        sums: [s00, s01, s10, s11],
+        sums: [
+            margins.total_y - s_first - s_second + s11,
+            s_second - s11,
+            s_first - s11,
+            s11,
+        ],
         n_valid: margins.n_samples,
     }
 }
@@ -844,21 +889,19 @@ fn one_cell_min_cell_n11_bounds(
     Some((usize::try_from(lower).ok()?, usize::try_from(upper).ok()?))
 }
 
-/// Count only the 11 intersection and retain each word's popcount for the
-/// accepted pair's weighted-sum pass. The scratch belongs to one scan worker.
+/// Count the 11 intersection for the MinCell gate and return its exact count
+/// so accepted pairs can reuse it without per-word scratch storage.
 #[inline]
-fn packed_n11_min_cell_passes(
+fn packed_n11_min_cell_pass_count_no_scratch(
     first: &[u64],
     second: &[u64],
     n_samples: usize,
     lower: usize,
     upper: usize,
-    popcounts: &mut [u8],
-) -> bool {
+) -> Option<usize> {
     let needed_words = words_for_samples(n_samples);
     debug_assert!(first.len() >= needed_words);
     debug_assert!(second.len() >= needed_words);
-    debug_assert!(popcounts.len() >= needed_words);
     let tail = tail_mask(n_samples);
     let mut n11 = 0usize;
     let mut processed = 0usize;
@@ -874,36 +917,32 @@ fn packed_n11_min_cell_passes(
         } else {
             64
         };
-        let popcount = intersection.count_ones();
-        popcounts[word_idx] = popcount as u8;
-        n11 = n11.saturating_add(popcount as usize);
+        n11 = n11.saturating_add(intersection.count_ones() as usize);
         processed = processed.saturating_add(valid_bits);
         if n11 > upper || n11.saturating_add(n_samples.saturating_sub(processed)) < lower {
-            return false;
+            return None;
         }
     }
-    (lower..=upper).contains(&n11)
+    (lower..=upper).contains(&n11).then_some(n11)
 }
 
 /// Four-word-unrolled MinCell gate. Threshold checks happen once per four
 /// complete words; an optional partial tail is masked and checked afterward.
-/// For short vectors, keep the scalar early-exit path.
+/// Returns the accepted n11 count so the caller need not write per-word scratch.
 #[inline]
-fn packed_n11_min_cell_passes_unrolled4(
+fn packed_n11_min_cell_pass_count_unrolled4_no_scratch(
     first: &[u64],
     second: &[u64],
     n_samples: usize,
     lower: usize,
     upper: usize,
-    popcounts: &mut [u8],
-) -> bool {
+) -> Option<usize> {
     let needed_words = words_for_samples(n_samples);
     debug_assert!(first.len() >= needed_words);
     debug_assert!(second.len() >= needed_words);
-    debug_assert!(popcounts.len() >= needed_words);
     let full_words = n_samples / 64;
     if full_words < 4 {
-        return packed_n11_min_cell_passes(first, second, n_samples, lower, upper, popcounts);
+        return packed_n11_min_cell_pass_count_no_scratch(first, second, n_samples, lower, upper);
     }
 
     let mut n11 = 0usize;
@@ -913,93 +952,26 @@ fn packed_n11_min_cell_passes_unrolled4(
         let count1 = (first[word_idx + 1] & second[word_idx + 1]).count_ones() as u8;
         let count2 = (first[word_idx + 2] & second[word_idx + 2]).count_ones() as u8;
         let count3 = (first[word_idx + 3] & second[word_idx + 3]).count_ones() as u8;
-        popcounts[word_idx] = count0;
-        popcounts[word_idx + 1] = count1;
-        popcounts[word_idx + 2] = count2;
-        popcounts[word_idx + 3] = count3;
         n11 = n11
             .saturating_add(count0 as usize + count1 as usize + count2 as usize + count3 as usize);
         word_idx += 4;
         let processed = word_idx * 64;
         if n11 > upper || n11.saturating_add(n_samples.saturating_sub(processed)) < lower {
-            return false;
+            return None;
         }
     }
 
     while word_idx < full_words {
         let count = (first[word_idx] & second[word_idx]).count_ones();
-        popcounts[word_idx] = count as u8;
         n11 = n11.saturating_add(count as usize);
         word_idx += 1;
     }
     if let Some(mask) = tail_mask(n_samples) {
         let last_word = full_words;
         let count = (first[last_word] & second[last_word] & mask).count_ones();
-        popcounts[last_word] = count as u8;
         n11 = n11.saturating_add(count as usize);
     }
-    (lower..=upper).contains(&n11)
-}
-
-#[inline]
-fn one_cell_sufficient_stats_packed_no_valid_from_popcounts(
-    first: &[u64],
-    second: &[u64],
-    needed_words: usize,
-    tail: Option<u64>,
-    y: &[f64],
-    first_marker: usize,
-    second_marker: usize,
-    margins: &OneCellMargins,
-    lookup: &PackedYSumLookup,
-    popcounts: &[u8],
-    skip_zero: bool,
-) -> FourCellSufficientStats {
-    debug_assert!(first_marker < margins.counts.len());
-    debug_assert!(second_marker < margins.counts.len());
-    debug_assert!(popcounts.len() >= needed_words);
-    let mut n11 = 0usize;
-    let mut s11 = 0.0f64;
-    for word_idx in 0..needed_words {
-        let mut intersection = first[word_idx] & second[word_idx];
-        if word_idx + 1 == needed_words {
-            if let Some(mask) = tail {
-                intersection &= mask;
-            }
-        }
-        let popcount = u32::from(popcounts[word_idx]);
-        n11 = n11.saturating_add(popcount as usize);
-        if !skip_zero || popcount != 0 {
-            s11 += lookup.sum_word_adaptive_with_popcount(y, word_idx, intersection, popcount);
-        }
-    }
-
-    let n_first = margins.counts[first_marker];
-    let n_second = margins.counts[second_marker];
-    debug_assert!(n11 <= n_first);
-    debug_assert!(n11 <= n_second);
-    let n10 = n_first - n11;
-    let n01 = n_second - n11;
-    let union = n_first
-        .checked_add(n_second)
-        .and_then(|value| value.checked_sub(n11))
-        .expect("one-cell residual screen cell-count overflow");
-    let n00 = margins
-        .n_samples
-        .checked_sub(union)
-        .expect("one-cell residual screen cell-count underflow");
-    let s_first = margins.sums[first_marker];
-    let s_second = margins.sums[second_marker];
-    FourCellSufficientStats {
-        counts: [n00, n01, n10, n11],
-        sums: [
-            margins.total_y - s_first - s_second + s11,
-            s_second - s11,
-            s_first - s11,
-            s11,
-        ],
-        n_valid: margins.n_samples,
-    }
+    (lower..=upper).contains(&n11).then_some(n11)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1038,6 +1010,35 @@ pub(crate) struct ResidualScreenBatchResult {
 /// Wall spans are disjoint. Heap reduction task time overlaps the scan span
 /// and must not be subtracted from it or added to the wall-time total.
 #[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ResidualScreenPairScanProfile {
+    pub(crate) sampled_anchors: usize,
+    pub(crate) sampled_pairs: usize,
+    pub(crate) sampled_scored_pairs: usize,
+    pub(crate) sampled_score_offers: usize,
+    pub(crate) cursor_merge_seconds: f64,
+    pub(crate) min_cell_gate_seconds: f64,
+    pub(crate) sufficient_stats_seconds: f64,
+    pub(crate) topk_offer_seconds: f64,
+}
+
+impl ResidualScreenPairScanProfile {
+    fn merge(&mut self, other: Self) {
+        self.sampled_anchors = self.sampled_anchors.saturating_add(other.sampled_anchors);
+        self.sampled_pairs = self.sampled_pairs.saturating_add(other.sampled_pairs);
+        self.sampled_scored_pairs = self
+            .sampled_scored_pairs
+            .saturating_add(other.sampled_scored_pairs);
+        self.sampled_score_offers = self
+            .sampled_score_offers
+            .saturating_add(other.sampled_score_offers);
+        self.cursor_merge_seconds += other.cursor_merge_seconds;
+        self.min_cell_gate_seconds += other.min_cell_gate_seconds;
+        self.sufficient_stats_seconds += other.sufficient_stats_seconds;
+        self.topk_offer_seconds += other.topk_offer_seconds;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ResidualScreenBatchTiming {
     pub(crate) prepare_wall_seconds: f64,
     pub(crate) scan_merge_wall_seconds: f64,
@@ -1061,6 +1062,7 @@ pub(crate) struct ResidualScreenBatchTiming {
     pub(crate) finalize_wall_seconds: f64,
     pub(crate) source_rows: usize,
     pub(crate) memberships: usize,
+    pub(crate) pair_scan_profile: ResidualScreenPairScanProfile,
     pub(crate) parallel: bool,
 }
 
@@ -2257,8 +2259,7 @@ fn scan_residual_pairs_packed_with_mode_options(
     let score_pair = |first: usize,
                       first_row: &[u64],
                       first_valid: Option<&[u64]>,
-                      second: usize,
-                      popcount_scratch: &mut [u8]|
+                      second: usize|
      -> Option<CandidateHeapEntry> {
         let second_start = second * row_words;
         let second_row = &bits_flat[second_start..second_start + needed_words];
@@ -2274,17 +2275,10 @@ fn scan_residual_pairs_packed_with_mode_options(
                 margins.counts[second],
                 min_cell,
             )?;
-            if !packed_n11_min_cell_passes_unrolled4(
-                first_row,
-                second_row,
-                n_samples,
-                lower,
-                upper,
-                popcount_scratch,
-            ) {
-                return None;
-            }
-            Some(one_cell_sufficient_stats_packed_no_valid_from_popcounts(
+            let n11 = packed_n11_min_cell_pass_count_unrolled4_no_scratch(
+                first_row, second_row, n_samples, lower, upper,
+            )?;
+            Some(one_cell_sufficient_stats_packed_no_valid_with_n11(
                 first_row,
                 second_row,
                 needed_words,
@@ -2294,7 +2288,7 @@ fn scan_residual_pairs_packed_with_mode_options(
                 second,
                 margins,
                 lookup,
-                popcount_scratch,
+                n11,
                 one_cell_skip_zero,
             ))
         } else {
@@ -2380,15 +2374,13 @@ fn scan_residual_pairs_packed_with_mode_options(
     };
     let scan_first = |first: usize,
                       mut heap: BinaryHeap<Reverse<CandidateHeapEntry>>,
-                      mut pairs_scored: usize,
-                      popcount_scratch: &mut [u8]|
+                      mut pairs_scored: usize|
      -> (BinaryHeap<Reverse<CandidateHeapEntry>>, usize) {
         let first_start = first * row_words;
         let first_row = &bits_flat[first_start..first_start + needed_words];
         let first_valid = valid_flat.map(|valid| &valid[first_start..first_start + needed_words]);
         let mut score_second = |second| {
-            if let Some(entry) = score_pair(first, first_row, first_valid, second, popcount_scratch)
-            {
+            if let Some(entry) = score_pair(first, first_row, first_valid, second) {
                 pairs_scored = pairs_scored.saturating_add(1);
                 push_top_k(&mut heap, entry, top_k);
             }
@@ -2448,7 +2440,6 @@ fn scan_residual_pairs_packed_with_mode_options(
             let progress_chunk = (pairs_evaluated / 200).max(1);
             let mut next_progress = progress_chunk;
             let mut progress_pairs = 0usize;
-            let mut popcount_scratch = vec![0u8; needed_words];
             if let Some(callback) = progress.as_deref_mut() {
                 callback(0, progress_total)?;
             }
@@ -2461,13 +2452,7 @@ fn scan_residual_pairs_packed_with_mode_options(
                     let mut row_pairs = 0usize;
                     let mut score_second = |second| {
                         row_pairs = row_pairs.saturating_add(1);
-                        if let Some(entry) = score_pair(
-                            first,
-                            first_row,
-                            first_valid,
-                            second,
-                            popcount_scratch.as_mut_slice(),
-                        ) {
+                        if let Some(entry) = score_pair(first, first_row, first_valid, second) {
                             pairs_scored = pairs_scored.saturating_add(1);
                             if score_threshold
                                 .map(|threshold| entry.proposal_score > threshold)
@@ -2519,37 +2504,27 @@ fn scan_residual_pairs_packed_with_mode_options(
             let first_rows = 0..first_rows_end;
             let (heap, pairs_scored) =
                 if allow_parallel && rayon::current_num_threads() > 1 && n_rows >= 32 {
-                    let (heap, pairs_scored, _) = first_rows
+                    let (heap, pairs_scored) = first_rows
                         .into_par_iter()
                         .fold(
-                            || (empty_heap(), 0usize, vec![0u8; needed_words]),
-                            |(heap, pairs_scored, mut scratch), first| {
-                                let (heap, pairs_scored) =
-                                    scan_first(first, heap, pairs_scored, scratch.as_mut_slice());
-                                (heap, pairs_scored, scratch)
-                            },
+                            || (empty_heap(), 0usize),
+                            |(heap, pairs_scored), first| scan_first(first, heap, pairs_scored),
                         )
                         .reduce(
-                            || (empty_heap(), 0usize, Vec::new()),
-                            |(mut left_heap, left_scored, _), (right_heap, right_scored, _)| {
+                            || (empty_heap(), 0usize),
+                            |(mut left_heap, left_scored), (right_heap, right_scored)| {
                                 for Reverse(entry) in right_heap {
                                     push_top_k(&mut left_heap, entry, top_k);
                                 }
-                                (
-                                    left_heap,
-                                    left_scored.saturating_add(right_scored),
-                                    Vec::new(),
-                                )
+                                (left_heap, left_scored.saturating_add(right_scored))
                             },
                         );
                     (heap, pairs_scored)
                 } else {
                     let mut serial_heap = empty_heap();
                     let mut serial_scored = 0usize;
-                    let mut scratch = vec![0u8; needed_words];
                     for first in first_rows {
-                        let (row_heap, row_scored) =
-                            scan_first(first, empty_heap(), 0, scratch.as_mut_slice());
+                        let (row_heap, row_scored) = scan_first(first, empty_heap(), 0);
                         for Reverse(entry) in row_heap {
                             push_top_k(&mut serial_heap, entry, top_k);
                         }
@@ -2666,12 +2641,6 @@ struct ResidualBatchPartnerCursor {
     current_local_index: usize,
 }
 
-#[derive(Clone, Copy)]
-struct ResidualBatchRecipient {
-    unit_index: usize,
-    second_local_index: usize,
-}
-
 #[derive(Clone, Copy, Debug)]
 struct ResidualBatchFoldTiming {
     worker_index: usize,
@@ -2696,14 +2665,14 @@ struct ResidualBatchWorkerState {
     pairs_scored: Vec<usize>,
     pairs_scored_unique: usize,
     score_offers: usize,
-    popcounts: Vec<u8>,
+    pair_scan_profile: ResidualScreenPairScanProfile,
     cursors: Vec<ResidualBatchPartnerCursor>,
     cursor_heap: BinaryHeap<Reverse<(usize, usize)>>,
-    recipients: Vec<ResidualBatchRecipient>,
+    recipients: Vec<usize>,
 }
 
 impl ResidualBatchWorkerState {
-    fn new(n_units: usize, top_k: usize, needed_words: usize) -> Self {
+    fn new(n_units: usize, top_k: usize) -> Self {
         let heap_capacity = top_k.min(1024);
         Self {
             merge_task_seconds: 0.0,
@@ -2723,12 +2692,30 @@ impl ResidualBatchWorkerState {
             pairs_scored: vec![0; n_units],
             pairs_scored_unique: 0,
             score_offers: 0,
-            popcounts: vec![0; needed_words],
+            pair_scan_profile: ResidualScreenPairScanProfile::default(),
             cursors: Vec::with_capacity(n_units),
             cursor_heap: BinaryHeap::with_capacity(n_units),
             recipients: Vec::with_capacity(n_units),
         }
     }
+}
+
+#[inline]
+fn residual_batch_unit_pairs_evaluated(unit: &ResidualScreenBatchUnit<'_>) -> usize {
+    let n_rows = unit.selected_global_rows.len();
+    let total_pairs = n_rows.saturating_mul(n_rows.saturating_sub(1)) / 2;
+    let Some(groups) = unit.pair_groups else {
+        return total_pairs;
+    };
+
+    let mut group_counts = HashMap::<usize, usize>::new();
+    for &group in groups {
+        *group_counts.entry(group).or_default() += 1;
+    }
+    let same_group_pairs = group_counts.values().fold(0usize, |sum, &count| {
+        sum.saturating_add(count.saturating_mul(count.saturating_sub(1)) / 2)
+    });
+    total_pairs.saturating_sub(same_group_pairs)
 }
 
 fn residual_batch_advance_partner(
@@ -2825,6 +2812,7 @@ fn residual_batch_units_share_eligible_pair(
 #[allow(clippy::too_many_arguments)]
 fn residual_batch_scan_anchor(
     anchor_index: usize,
+    profile_anchor: bool,
     bits_flat: &[u64],
     row_words: usize,
     units: &[ResidualScreenBatchUnit<'_>],
@@ -2841,8 +2829,15 @@ fn residual_batch_scan_anchor(
     state: &mut ResidualBatchWorkerState,
 ) {
     let anchor = &source_rows[anchor_index];
+    if profile_anchor {
+        state.pair_scan_profile.sampled_anchors =
+            state.pair_scan_profile.sampled_anchors.saturating_add(1);
+    }
+    let first_margin_slot = anchor.margin_slot;
+    let first_count = margins.counts[first_margin_slot];
     let anchor_row_start = anchor.global_row * row_words;
     let anchor_row = &bits_flat[anchor_row_start..anchor_row_start + words_for_samples(n_samples)];
+    let cursor_init_started = profile_anchor.then(Instant::now);
     state.cursors.clear();
     state.cursor_heap.clear();
     state.recipients.clear();
@@ -2864,9 +2859,86 @@ fn residual_batch_scan_anchor(
                 .push(Reverse((partner_global_row, cursor_index)));
         }
     }
+    if let Some(started) = cursor_init_started {
+        state.pair_scan_profile.cursor_merge_seconds += started.elapsed().as_secs_f64();
+    }
 
-    while let Some(Reverse((partner_global_row, _))) = state.cursor_heap.peek().copied() {
+    while let Some(Reverse((partner_global_row, first_cursor_index))) =
+        state.cursor_heap.peek().copied()
+    {
+        let first_cursor = &state.cursors[first_cursor_index];
+        let second_margin_slot =
+            margin_slots_by_unit[first_cursor.unit_index][first_cursor.current_local_index];
+        let second_count = margins.counts[second_margin_slot];
+        let partner_row_start = partner_global_row * row_words;
+        let partner_row =
+            &bits_flat[partner_row_start..partner_row_start + words_for_samples(n_samples)];
+        if profile_anchor {
+            state.pair_scan_profile.sampled_pairs =
+                state.pair_scan_profile.sampled_pairs.saturating_add(1);
+        }
+
+        let min_cell_n11 = if min_cell > 0 {
+            let min_cell_started = profile_anchor.then(Instant::now);
+            let n11 = one_cell_min_cell_n11_bounds(n_samples, first_count, second_count, min_cell)
+                .and_then(|(lower, upper)| {
+                    packed_n11_min_cell_pass_count_unrolled4_no_scratch(
+                        anchor_row,
+                        partner_row,
+                        n_samples,
+                        lower,
+                        upper,
+                    )
+                });
+            if let Some(started) = min_cell_started {
+                state.pair_scan_profile.min_cell_gate_seconds += started.elapsed().as_secs_f64();
+            }
+            n11
+        } else {
+            None
+        };
+        let min_cell_passes = min_cell == 0 || min_cell_n11.is_some();
+        let best_gate = if min_cell_passes {
+            let sufficient_stats_started = profile_anchor.then(Instant::now);
+            let stats = if let Some(n11) = min_cell_n11 {
+                one_cell_sufficient_stats_packed_no_valid_with_n11(
+                    anchor_row,
+                    partner_row,
+                    words_for_samples(n_samples),
+                    tail_mask(n_samples),
+                    residual,
+                    first_margin_slot,
+                    second_margin_slot,
+                    margins,
+                    lookup,
+                    n11,
+                    false,
+                )
+            } else {
+                one_cell_sufficient_stats_packed_no_valid(
+                    anchor_row,
+                    partner_row,
+                    words_for_samples(n_samples),
+                    tail_mask(n_samples),
+                    residual,
+                    first_margin_slot,
+                    second_margin_slot,
+                    margins,
+                    lookup,
+                )
+            };
+            let best_gate =
+                best_proposal_gate_fused(stats, ResidualProposalMode::Max6, include_xor);
+            if let Some(started) = sufficient_stats_started {
+                state.pair_scan_profile.sufficient_stats_seconds += started.elapsed().as_secs_f64();
+            }
+            best_gate
+        } else {
+            None
+        };
+
         state.recipients.clear();
+        let cursor_merge_started = profile_anchor.then(Instant::now);
         while let Some(Reverse((current_partner, cursor_index))) = state.cursor_heap.peek().copied()
         {
             if current_partner != partner_global_row {
@@ -2874,10 +2946,9 @@ fn residual_batch_scan_anchor(
             }
             state.cursor_heap.pop();
             let cursor = &mut state.cursors[cursor_index];
-            state.recipients.push(ResidualBatchRecipient {
-                unit_index: cursor.unit_index,
-                second_local_index: cursor.current_local_index,
-            });
+            if best_gate.is_some() {
+                state.recipients.push(cursor.unit_index);
+            }
             if let Some(next_global_row) =
                 residual_batch_advance_partner(units, anchor.global_row, cursor)
             {
@@ -2886,70 +2957,23 @@ fn residual_batch_scan_anchor(
                     .push(Reverse((next_global_row, cursor_index)));
             }
         }
-
-        for recipient in state.recipients.iter().copied() {
-            state.pairs_evaluated[recipient.unit_index] =
-                state.pairs_evaluated[recipient.unit_index].saturating_add(1);
+        if let Some(started) = cursor_merge_started {
+            state.pair_scan_profile.cursor_merge_seconds += started.elapsed().as_secs_f64();
         }
-        let first_margin_slot = anchor.margin_slot;
-        let first_count = margins.counts[first_margin_slot];
-        let first_local = state.recipients[0].second_local_index;
-        let first_unit = state.recipients[0].unit_index;
-        let second_margin_slot = margin_slots_by_unit[first_unit][first_local];
-        let second_count = margins.counts[second_margin_slot];
-        let partner_row_start = partner_global_row * row_words;
-        let partner_row =
-            &bits_flat[partner_row_start..partner_row_start + words_for_samples(n_samples)];
 
-        if min_cell > 0 {
-            let min_cell_passes =
-                one_cell_min_cell_n11_bounds(n_samples, first_count, second_count, min_cell)
-                    .is_some_and(|(lower, upper)| {
-                        packed_n11_min_cell_passes_unrolled4(
-                            anchor_row,
-                            partner_row,
-                            n_samples,
-                            lower,
-                            upper,
-                            state.popcounts.as_mut_slice(),
-                        )
-                    });
-            if !min_cell_passes {
-                continue;
-            }
-        }
-        let stats = if min_cell > 0 {
-            one_cell_sufficient_stats_packed_no_valid_from_popcounts(
-                anchor_row,
-                partner_row,
-                words_for_samples(n_samples),
-                tail_mask(n_samples),
-                residual,
-                first_margin_slot,
-                second_margin_slot,
-                margins,
-                lookup,
-                state.popcounts.as_slice(),
-                false,
-            )
-        } else {
-            one_cell_sufficient_stats_packed_no_valid(
-                anchor_row,
-                partner_row,
-                words_for_samples(n_samples),
-                tail_mask(n_samples),
-                residual,
-                first_margin_slot,
-                second_margin_slot,
-                margins,
-                lookup,
-            )
-        };
-        let Some(best_gate) =
-            best_proposal_gate_fused(stats, ResidualProposalMode::Max6, include_xor)
-        else {
+        let Some(best_gate) = best_gate else {
             continue;
         };
+        if profile_anchor {
+            state.pair_scan_profile.sampled_scored_pairs = state
+                .pair_scan_profile
+                .sampled_scored_pairs
+                .saturating_add(1);
+            state.pair_scan_profile.sampled_score_offers = state
+                .pair_scan_profile
+                .sampled_score_offers
+                .saturating_add(state.recipients.len());
+        }
         let entry = CandidateHeapEntry {
             first: anchor.global_row,
             second: partner_global_row,
@@ -2959,10 +2983,13 @@ fn residual_batch_scan_anchor(
         };
         state.pairs_scored_unique = state.pairs_scored_unique.saturating_add(1);
         state.score_offers = state.score_offers.saturating_add(state.recipients.len());
-        for recipient in state.recipients.iter().copied() {
-            state.pairs_scored[recipient.unit_index] =
-                state.pairs_scored[recipient.unit_index].saturating_add(1);
-            push_top_k(&mut state.heaps[recipient.unit_index], entry, top_k);
+        let topk_offer_started = profile_anchor.then(Instant::now);
+        for unit_index in state.recipients.iter().copied() {
+            state.pairs_scored[unit_index] = state.pairs_scored[unit_index].saturating_add(1);
+            push_top_k(&mut state.heaps[unit_index], entry, top_k);
+        }
+        if let Some(started) = topk_offer_started {
+            state.pair_scan_profile.topk_offer_seconds += started.elapsed().as_secs_f64();
         }
     }
 }
@@ -2990,7 +3017,7 @@ pub(crate) fn scan_residual_pairs_packed_max6_batch(
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|&value| value > 0)
         .unwrap_or(platform_default);
-    scan_residual_pairs_packed_max6_batch_with_min_anchor_len(
+    scan_residual_pairs_packed_max6_batch_with_min_anchor_len_and_profile(
         bits_flat,
         row_words,
         units,
@@ -3002,6 +3029,7 @@ pub(crate) fn scan_residual_pairs_packed_max6_batch(
         margin_table,
         allow_parallel,
         min_anchor_len,
+        super::garfield_pair_scan_profile_enabled(),
     )
 }
 
@@ -3012,6 +3040,17 @@ fn max6_fold_min_anchor_len_default() -> usize {
 
 // Keep several stealable anchor chunks per worker while limiting partial-heap merge fanout.
 const MAX6_ANCHOR_CHUNKS_PER_THREAD: usize = 16;
+const MAX6_PROFILED_ANCHORS_PER_BATCH: usize = 2;
+
+#[inline]
+fn max6_pair_scan_profile_anchor_stride(n_anchors: usize) -> usize {
+    n_anchors.div_ceil(MAX6_PROFILED_ANCHORS_PER_BATCH).max(1)
+}
+
+#[inline]
+fn max6_pair_scan_profile_anchor_selected(anchor_index: usize, stride: usize) -> bool {
+    anchor_index % stride.max(1) == 0
+}
 
 #[inline]
 fn max6_anchor_chunk_len(n_anchors: usize, n_threads: usize, min_anchor_len: usize) -> usize {
@@ -3024,7 +3063,7 @@ fn max6_anchor_chunk_len(n_anchors: usize, n_threads: usize, min_anchor_len: usi
 }
 
 #[allow(clippy::too_many_arguments)]
-fn scan_residual_pairs_packed_max6_batch_with_min_anchor_len(
+fn scan_residual_pairs_packed_max6_batch_with_min_anchor_len_and_profile(
     bits_flat: &[u64],
     row_words: usize,
     units: &[ResidualScreenBatchUnit<'_>],
@@ -3036,6 +3075,7 @@ fn scan_residual_pairs_packed_max6_batch_with_min_anchor_len(
     margin_table: &OneCellMarginTable,
     allow_parallel: bool,
     min_anchor_len: usize,
+    profile_pair_scan: bool,
 ) -> Result<ResidualScreenBatchResult, String> {
     let prepare_started = Instant::now();
     if row_words == 0 {
@@ -3225,10 +3265,16 @@ fn scan_residual_pairs_packed_max6_batch_with_min_anchor_len(
         record_start = record_end;
     }
 
+    let pairs_evaluated_by_unit = units
+        .iter()
+        .map(residual_batch_unit_pairs_evaluated)
+        .collect::<Vec<_>>();
+
     let prepare_wall_seconds = prepare_started.elapsed().as_secs_f64();
     let parallel = allow_parallel && rayon::current_num_threads() > 1 && source_rows.len() >= 32;
     let scan_started = Instant::now();
-    let worker_state = || ResidualBatchWorkerState::new(units.len(), top_k, needed_words);
+    let profile_anchor_stride = max6_pair_scan_profile_anchor_stride(source_rows.len());
+    let worker_state = || ResidualBatchWorkerState::new(units.len(), top_k);
     let mut state = if parallel {
         let anchors_per_chunk = max6_anchor_chunk_len(
             source_rows.len(),
@@ -3252,6 +3298,11 @@ fn scan_residual_pairs_packed_max6_batch_with_min_anchor_len(
                     state.fold_anchor_count += 1;
                     residual_batch_scan_anchor(
                         anchor_index,
+                        profile_pair_scan
+                            && max6_pair_scan_profile_anchor_selected(
+                                anchor_index,
+                                profile_anchor_stride,
+                            ),
                         bits_flat,
                         row_words,
                         units,
@@ -3318,8 +3369,6 @@ fn scan_residual_pairs_packed_max6_batch_with_min_anchor_len(
                     .saturating_add(1);
                 left.fold_timings.append(&mut right.fold_timings);
                 for unit_index in 0..units.len() {
-                    left.pairs_evaluated[unit_index] = left.pairs_evaluated[unit_index]
-                        .saturating_add(right.pairs_evaluated[unit_index]);
                     left.pairs_scored[unit_index] = left.pairs_scored[unit_index]
                         .saturating_add(right.pairs_scored[unit_index]);
                 }
@@ -3327,6 +3376,7 @@ fn scan_residual_pairs_packed_max6_batch_with_min_anchor_len(
                     .pairs_scored_unique
                     .saturating_add(right.pairs_scored_unique);
                 left.score_offers = left.score_offers.saturating_add(right.score_offers);
+                left.pair_scan_profile.merge(right.pair_scan_profile);
                 left.merge_task_seconds +=
                     right.merge_task_seconds + merge_started.elapsed().as_secs_f64();
                 left
@@ -3336,6 +3386,8 @@ fn scan_residual_pairs_packed_max6_batch_with_min_anchor_len(
         for anchor_index in 0..source_rows.len() {
             residual_batch_scan_anchor(
                 anchor_index,
+                profile_pair_scan
+                    && max6_pair_scan_profile_anchor_selected(anchor_index, profile_anchor_stride),
                 bits_flat,
                 row_words,
                 units,
@@ -3355,6 +3407,7 @@ fn scan_residual_pairs_packed_max6_batch_with_min_anchor_len(
         state
     };
 
+    state.pairs_evaluated = pairs_evaluated_by_unit;
     let scan_merge_wall_seconds = scan_started.elapsed().as_secs_f64();
     let fold_task_count = state.fold_timings.len();
     let fold_task_wall_sum_seconds = state
@@ -3514,6 +3567,7 @@ fn scan_residual_pairs_packed_max6_batch_with_min_anchor_len(
             finalize_wall_seconds: finalize_started.elapsed().as_secs_f64(),
             source_rows: source_rows.len(),
             memberships: membership_count,
+            pair_scan_profile: state.pair_scan_profile,
             parallel,
         },
     })
@@ -4388,7 +4442,7 @@ mod tests {
     }
 
     #[test]
-    fn min_cell_popcount_scratch_preserves_one_cell_stats_bitwise() {
+    fn min_cell_gate_count_reuse_preserves_one_cell_stats_bitwise() {
         let n_samples = 130usize;
         let row_words = words_for_samples(n_samples);
         let first_values = (0..n_samples)

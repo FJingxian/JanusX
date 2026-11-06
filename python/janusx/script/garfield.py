@@ -3482,6 +3482,28 @@ def main() -> None:
                         + f"max_merge_call={topk_merge_wall_max:.6f}s, calls={topk_merge_count}; "
                         + "fold and Top-K task sums overlap wall time",
                     )
+                pair_scan_profiles = result.get("max6_pair_scan_subphase_profiles") or []
+                if pair_scan_profiles:
+                    pair_profile_totals = [
+                        sum(float(row[index]) for row in pair_scan_profiles)
+                        for index in range(8)
+                    ]
+                    sampled_anchors = int(pair_profile_totals[0])
+                    if sampled_anchors:
+                        sampled_phase_seconds = pair_profile_totals[4:8]
+                        sampled_phase_total = sum(sampled_phase_seconds)
+                        _emit_garfield_file_only_line(
+                            logger,
+                            "Max6 pair-scan sampled subphases (sampled worker-time sums, not wall time): "
+                            + f"anchors={sampled_anchors}, pairs={int(pair_profile_totals[1])}, "
+                            + f"scored_pairs={int(pair_profile_totals[2])}, "
+                            + f"offers={int(pair_profile_totals[3])}; "
+                            + f"cursor_merge={sampled_phase_seconds[0]:.3f}s, "
+                            + f"min_cell_gate={sampled_phase_seconds[1]:.3f}s, "
+                            + f"sufficient_stats_and_proposal={sampled_phase_seconds[2]:.3f}s, "
+                            + f"topk_offers={sampled_phase_seconds[3]:.3f}s, "
+                            + f"sampled_total={sampled_phase_total:.3f}s",
+                        )
                 reuse_diagnostic = result.get("max6_candidate_reuse_diagnostic")
                 if isinstance(reuse_diagnostic, dict) and reuse_diagnostic.get("enabled"):
                     screen_profile = reuse_diagnostic.get("screen_microprofile") or {}

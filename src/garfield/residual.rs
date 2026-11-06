@@ -221,31 +221,92 @@ impl NoGrmCovariateProjector {
                 projected.len()
             ));
         }
-        if values.iter().any(|value| !value.is_finite()) {
-            return Err("no-GRM projector matrix input contains a non-finite value".to_string());
+        if self.n_samples == 0 || n_columns == 0 {
+            return Ok(());
         }
 
-        let mut coordinates = vec![0.0_f64; self.rank];
+        let mut coordinates = vec![0.0; self.rank];
         for column in 0..n_columns {
-            coordinates.fill(0.0);
-            for row in 0..self.n_samples {
-                let value = values[row * n_columns + column];
-                for basis_column in 0..self.rank {
-                    coordinates[basis_column] += self.q[row * self.rank + basis_column] * value;
-                }
+            self.project_strided_into(
+                &values[column..],
+                n_columns,
+                &mut projected[column..],
+                n_columns,
+                &mut coordinates,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Project a strided vector into a strided output column without making
+    /// per-column input, coordinate, and result allocations.
+    pub(crate) fn project_strided_into(
+        &self,
+        values: &[f64],
+        value_stride: usize,
+        output: &mut [f64],
+        output_stride: usize,
+        coordinates: &mut [f64],
+    ) -> Result<(), String> {
+        if self.n_samples > 1 && (value_stride == 0 || output_stride == 0) {
+            return Err("no-GRM projector strides must be nonzero".to_string());
+        }
+        let required_len = |stride: usize| {
+            if self.n_samples == 0 {
+                Some(0)
+            } else {
+                self.n_samples
+                    .saturating_sub(1)
+                    .checked_mul(stride)
+                    .and_then(|last| last.checked_add(1))
             }
-            for row in 0..self.n_samples {
-                let fitted = (0..self.rank)
-                    .map(|basis_column| {
-                        self.q[row * self.rank + basis_column] * coordinates[basis_column]
-                    })
-                    .sum::<f64>();
-                let index = row * n_columns + column;
-                projected[index] = values[index] - fitted;
+        };
+        let Some(value_len) = required_len(value_stride) else {
+            return Err("no-GRM projector strided input offset overflow".to_string());
+        };
+        let Some(output_len) = required_len(output_stride) else {
+            return Err("no-GRM projector strided output offset overflow".to_string());
+        };
+        if values.len() < value_len {
+            return Err(format!(
+                "no-GRM projector strided input length mismatch: need {value_len} values, got {}",
+                values.len()
+            ));
+        }
+        if output.len() < output_len {
+            return Err(format!(
+                "no-GRM projector strided output length mismatch: need {output_len} values, got {}",
+                output.len()
+            ));
+        }
+        if coordinates.len() != self.rank {
+            return Err(format!(
+                "no-GRM projector coordinate length mismatch: got {}, expected {}",
+                coordinates.len(),
+                self.rank
+            ));
+        }
+
+        coordinates.fill(0.0);
+        for row in 0..self.n_samples {
+            let value = values[row * value_stride];
+            if !value.is_finite() {
+                return Err("no-GRM projector input contains a non-finite value".to_string());
+            }
+            for column in 0..self.rank {
+                coordinates[column] += self.q[row * self.rank + column] * value;
             }
         }
-        if projected.iter().any(|value| !value.is_finite()) {
-            return Err("no-GRM projector produced a non-finite matrix".to_string());
+        for row in 0..self.n_samples {
+            let mut fitted = 0.0;
+            for column in 0..self.rank {
+                fitted += self.q[row * self.rank + column] * coordinates[column];
+            }
+            let value = values[row * value_stride] - fitted;
+            if !value.is_finite() {
+                return Err("no-GRM projector produced a non-finite value".to_string());
+            }
+            output[row * output_stride] = value;
         }
         Ok(())
     }

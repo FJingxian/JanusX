@@ -297,6 +297,12 @@ fn garfield_stage_profile_enabled() -> bool {
 }
 
 #[inline]
+fn garfield_pair_scan_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| env_truthy("JX_GARFIELD_PAIR_SCAN_PROFILE"))
+}
+
+#[inline]
 fn garfield_stage_profile_start() -> Option<Instant> {
     garfield_stage_profile_enabled().then(Instant::now)
 }
@@ -14780,6 +14786,14 @@ struct Max6BatchScanProfile {
     topk_merge_task_count: usize,
     topk_merge_critical_path_seconds: f64,
     scan_reduce_critical_path_seconds: f64,
+    pair_profile_sampled_anchors: usize,
+    pair_profile_sampled_pairs: usize,
+    pair_profile_sampled_scored_pairs: usize,
+    pair_profile_sampled_score_offers: usize,
+    pair_profile_cursor_merge_seconds: f64,
+    pair_profile_min_cell_gate_seconds: f64,
+    pair_profile_sufficient_stats_seconds: f64,
+    pair_profile_topk_offer_seconds: f64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -23304,6 +23318,24 @@ fn run_max6_grmmax6_pipeline(
                     topk_merge_task_count: timing.topk_merge_task_count,
                     topk_merge_critical_path_seconds: timing.topk_merge_critical_path_seconds,
                     scan_reduce_critical_path_seconds: timing.scan_reduce_critical_path_seconds,
+                    pair_profile_sampled_anchors: timing.pair_scan_profile.sampled_anchors,
+                    pair_profile_sampled_pairs: timing.pair_scan_profile.sampled_pairs,
+                    pair_profile_sampled_scored_pairs: timing
+                        .pair_scan_profile
+                        .sampled_scored_pairs,
+                    pair_profile_sampled_score_offers: timing
+                        .pair_scan_profile
+                        .sampled_score_offers,
+                    pair_profile_cursor_merge_seconds: timing
+                        .pair_scan_profile
+                        .cursor_merge_seconds,
+                    pair_profile_min_cell_gate_seconds: timing
+                        .pair_scan_profile
+                        .min_cell_gate_seconds,
+                    pair_profile_sufficient_stats_seconds: timing
+                        .pair_scan_profile
+                        .sufficient_stats_seconds,
+                    pair_profile_topk_offer_seconds: timing.pair_scan_profile.topk_offer_seconds,
                 });
             max6_observed_scan_timing.screen_batch_count = max6_observed_scan_timing
                 .screen_batch_count
@@ -28727,6 +28759,28 @@ pub fn garfield_logic_search_bed_py<'py>(
         })
         .collect::<Vec<_>>();
     out.set_item("max6_batch_scan_profiles", batch_scan_profiles)?;
+    if garfield_pair_scan_profile_enabled() {
+        let pair_scan_subphase_profiles = batch_timing
+            .screen_batch_profiles
+            .iter()
+            .map(|profile| {
+                vec![
+                    profile.pair_profile_sampled_anchors as f64,
+                    profile.pair_profile_sampled_pairs as f64,
+                    profile.pair_profile_sampled_scored_pairs as f64,
+                    profile.pair_profile_sampled_score_offers as f64,
+                    profile.pair_profile_cursor_merge_seconds,
+                    profile.pair_profile_min_cell_gate_seconds,
+                    profile.pair_profile_sufficient_stats_seconds,
+                    profile.pair_profile_topk_offer_seconds,
+                ]
+            })
+            .collect::<Vec<_>>();
+        out.set_item(
+            "max6_pair_scan_subphase_profiles",
+            pair_scan_subphase_profiles,
+        )?;
+    }
     out.set_item(
         "max6_observed_units_timed",
         result.max6_observed_scan_timing.units_timed,

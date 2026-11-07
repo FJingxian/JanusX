@@ -2187,6 +2187,62 @@ pub(crate) fn count_pvar_variants(path_or_prefix: &str) -> Result<usize, String>
     Ok(count)
 }
 
+/// Read the variant count from the PGEN container without scanning the
+/// companion PVAR text file.
+pub(crate) fn count_pgen_variants(path_or_prefix: &str, n_samples: usize) -> Result<usize, String> {
+    if n_samples == 0 {
+        return Err("PGEN sample count must be greater than zero".to_string());
+    }
+    let prefix = normalize_pgen_prefix(path_or_prefix);
+    let path = PathBuf::from(format!("{prefix}.pgen"));
+    let file = std::fs::File::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let file_size = file
+        .metadata()
+        .map_err(|e| format!("stat {}: {e}", path.display()))?
+        .len();
+    let mut reader = BufReader::new(file);
+    let mut magic = [0u8; 3];
+    reader
+        .read_exact(&mut magic)
+        .map_err(|e| format!("read {} header: {e}", path.display()))?;
+    if magic[0..2] != [0x6c, 0x1b] {
+        return Err(format!("{}: invalid PGEN magic bytes", path.display()));
+    }
+    let n_variants = match magic[2] {
+        0x01 => {
+            let bytes_per_variant = n_samples.div_ceil(4);
+            let payload_bytes = file_size.saturating_sub(3);
+            if bytes_per_variant == 0 || payload_bytes % bytes_per_variant as u64 != 0 {
+                return Err(format!(
+                    "{}: BED-compatible PGEN size is not divisible by {bytes_per_variant} bytes per variant",
+                    path.display()
+                ));
+            }
+            (payload_bytes / bytes_per_variant as u64) as usize
+        }
+        0x02 | 0x10 => {
+            let (n_variants, header_samples, _) = read_standard_dimensions(&mut reader, &path)?;
+            if header_samples != n_samples {
+                return Err(format!(
+                    "{}: PGEN/PSAM sample count mismatch (pgen={header_samples}, psam={n_samples})",
+                    path.display()
+                ));
+            }
+            n_variants
+        }
+        other => {
+            return Err(format!(
+                "{}: unsupported PGEN storage mode 0x{other:02x}",
+                path.display()
+            ));
+        }
+    };
+    if n_variants == 0 {
+        return Err(format!("{} contains zero variants", path.display()));
+    }
+    Ok(n_variants)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2423,6 +2479,20 @@ mod tests {
         decode_record(5, &[], 4, &mut current, &mut base).unwrap();
         assert_eq!(current, [0x00]);
         assert_eq!(base, [0x00]);
+    }
+
+    #[test]
+    fn pgen_variant_count_comes_from_header_without_reading_pvar() {
+        let mut pgen = vec![0x6c, 0x1b, 0x02];
+        pgen.extend_from_slice(&2u32.to_le_bytes());
+        pgen.extend_from_slice(&5u32.to_le_bytes());
+        pgen.push(0); // fixed hard-call storage flags
+        pgen.extend_from_slice(&[0xc4, 0x01, 0xaa, 0x02]);
+        let file = TempPgen::new(&pgen);
+        assert_eq!(
+            super::count_pgen_variants(file.0.to_str().unwrap(), 5).unwrap(),
+            2
+        );
     }
 
     #[test]

@@ -2362,6 +2362,7 @@ impl AsRef<[u8]> for PackedRowBytes<'_> {
 fn open_pgen_iter_source(
     path_or_prefix: &str,
     n_samples: usize,
+    count_pvar_rows: bool,
 ) -> Result<Option<(Arc<Mutex<PgenIterSource>>, usize, usize)>, String> {
     if !genotype_prefix_uses_pgen(path_or_prefix) {
         return Ok(None);
@@ -2373,7 +2374,11 @@ fn open_pgen_iter_source(
             "PGEN/PSAM sample count mismatch: expected {n_samples}, found {psam_samples}"
         ));
     }
-    let n_variants = crate::pgen::count_pvar_variants(&prefix)?;
+    let n_variants = if count_pvar_rows {
+        crate::pgen::count_pvar_variants(&prefix)?
+    } else {
+        crate::pgen::count_pgen_variants(&prefix, n_samples)?
+    };
     let path = PathBuf::from(format!("{prefix}.pgen"));
     let reader = crate::pgen::PgenReader::open(&path, n_samples, n_variants)?;
     let bytes_per_variant = n_samples.div_ceil(4);
@@ -2407,12 +2412,37 @@ impl BedSnpIter {
         apply_het_filter: bool,
         het_threshold: f32,
     ) -> Result<Option<Self>, String> {
+        Self::try_new_pgen_with_count_mode(
+            prefix,
+            samples,
+            sites,
+            maf,
+            miss,
+            fill_missing,
+            apply_het_filter,
+            het_threshold,
+            true,
+        )
+    }
+
+    fn try_new_pgen_with_count_mode(
+        prefix: &str,
+        samples: &[String],
+        sites: &[SiteInfo],
+        maf: f32,
+        miss: f32,
+        fill_missing: bool,
+        apply_het_filter: bool,
+        het_threshold: f32,
+        count_pvar_rows: bool,
+    ) -> Result<Option<Self>, String> {
         let n_samples = if samples.is_empty() {
             count_fam_samples(prefix)?
         } else {
             samples.len()
         };
-        let Some((pgen_source, n_snps, bytes_per_snp)) = open_pgen_iter_source(prefix, n_samples)?
+        let Some((pgen_source, n_snps, bytes_per_snp)) =
+            open_pgen_iter_source(prefix, n_samples, count_pvar_rows)?
         else {
             return Ok(None);
         };
@@ -2730,11 +2760,39 @@ impl BedSnpIter {
     /// Lightweight constructor with mmap windowing for GRM streaming path:
     /// parses FAM count and BED shape, skips full BIM metadata parse.
     pub fn new_for_grm_window(prefix: &str, mmap_window_mb: usize) -> Result<Self, String> {
+        Self::new_for_grm_window_count_mode(prefix, mmap_window_mb, true)
+    }
+
+    /// GARFIELD's range-bounded preparation reads BIM/PVAR rows alongside the
+    /// selected chromosome scan. It can therefore use the PGEN header count
+    /// and avoid a full PVAR count pass before the bounded metadata read.
+    pub(crate) fn new_for_grm_window_header_count(
+        prefix: &str,
+        mmap_window_mb: usize,
+    ) -> Result<Self, String> {
+        Self::new_for_grm_window_count_mode(prefix, mmap_window_mb, false)
+    }
+
+    fn new_for_grm_window_count_mode(
+        prefix: &str,
+        mmap_window_mb: usize,
+        count_pvar_rows: bool,
+    ) -> Result<Self, String> {
         if mmap_window_mb == 0 {
             return Err("mmap_window_mb must be > 0".into());
         }
         let n_samples = count_fam_samples(prefix)?;
-        if let Some(iter) = Self::try_new_pgen(prefix, &[], &[], 0.0, 1.0, false, false, 0.02)? {
+        if let Some(iter) = Self::try_new_pgen_with_count_mode(
+            prefix,
+            &[],
+            &[],
+            0.0,
+            1.0,
+            false,
+            false,
+            0.02,
+            count_pvar_rows,
+        )? {
             return Ok(iter);
         }
         let (file, bed_len, bytes_per_snp, n_snps) =

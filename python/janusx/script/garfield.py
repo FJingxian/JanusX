@@ -2818,8 +2818,11 @@ def main() -> None:
     group_labels: list[str] = []
     group_intervals: list[list[tuple[str, int, int]]] = []
     null_group_intervals: Optional[list[list[tuple[str, int, int]]]] = None
+    use_prepared_max6 = bool(
+        _is_ld_tag_max6_backend(args.search_backend) and not max6_audit_requested
+    )
     scan_unit_total: Optional[int] = None
-    if args.scan_mode == "window":
+    if args.scan_mode == "window" and not args.bimrange and not use_prepared_max6:
         scan_unit_total = _count_window_scan_units_from_bim(
             str(gfile),
             extension=int(args.extension),
@@ -2829,9 +2832,6 @@ def main() -> None:
         scan_unit_total = 1
     global_site_keep: Optional[np.ndarray] = None
     prepared_max6_qc_mask: Optional[np.ndarray] = None
-    use_prepared_max6 = bool(
-        _is_ld_tag_max6_backend(args.search_backend) and not max6_audit_requested
-    )
     if bool(args.global_stats) and not use_prepared_max6:
         global_site_keep = _prepare_site_keep(
             genofile=gfile,

@@ -5822,6 +5822,7 @@ mod tests {
             bits_flat,
             bits_mmap: None,
             bits_mmap_words: 0,
+            bits_mmap_owner: None,
             bits_hi_flat: None,
             row_words,
             sample_ids: (0..n_samples)

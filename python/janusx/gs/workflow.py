@@ -4797,16 +4797,46 @@ def _apply_optional_pca(
 ) -> tuple[np.ndarray, np.ndarray]:
     if not enabled:
         return Xtrain, Xtest
-    Xtt = np.concatenate([Xtrain, Xtest], axis=1)
-    Xtt = (Xtt - np.mean(Xtt, axis=1, keepdims=True)) / (
-        np.std(Xtt, axis=1, keepdims=True) + 1e-8
-    )
-    val, vec = np.linalg.eigh(Xtt.T @ Xtt / Xtt.shape[0])
+    train = np.asarray(Xtrain)
+    test = np.asarray(Xtest)
+    if train.ndim != 2 or test.ndim != 2:
+        raise ValueError("PCA expects marker-by-sample 2D genotype matrices.")
+    if int(train.shape[0]) != int(test.shape[0]):
+        raise ValueError(
+            f"PCA marker dimension mismatch: train={train.shape[0]}, test={test.shape[0]}."
+        )
+    n_markers, n_train = map(int, train.shape)
+    if n_markers <= 0 or n_train <= 0:
+        raise ValueError("PCA requires at least one marker and one training sample.")
+
+    # Fit all PCA preprocessing on training samples only.  The held-out/test
+    # samples are projected into this fixed basis so they cannot influence the
+    # components or the 90% variance cutoff.
+    mean = np.mean(train, axis=1, keepdims=True)
+    scale = np.std(train, axis=1, keepdims=True) + 1e-8
+    train_scaled = (train - mean) / scale
+    test_scaled = (test - mean) / scale
+    train_kernel = train_scaled.T @ train_scaled / float(n_markers)
+    val, vec = np.linalg.eigh(train_kernel)
     idx = np.argsort(val)[::-1]
     val, vec = val[idx], vec[:, idx]
-    dim = np.sum(np.cumsum(val) / np.sum(val) <= 0.9)
-    vec = val[:dim] * vec[:, :dim]
-    return vec[: Xtrain.shape[1], :].T, vec[Xtrain.shape[1] :, :].T
+    val = np.maximum(val, 0.0)
+    total_variance = float(np.sum(val, dtype=np.float64))
+    if not np.isfinite(total_variance) or total_variance <= 0.0:
+        raise ValueError("PCA cannot retain components because training variance is zero.")
+
+    cumulative_variance = np.cumsum(val, dtype=np.float64) / total_variance
+    # Keep the smallest number of PCs whose cumulative variance reaches 90%.
+    dim = int(np.searchsorted(cumulative_variance, 0.9, side="left") + 1)
+    dim = min(max(dim, 1), int(val.shape[0]))
+    basis = vec[:, :dim]
+    train_scores = (train_kernel @ basis).T
+    if int(test.shape[1]) == 0:
+        test_scores = np.zeros((dim, 0), dtype=train_scores.dtype)
+    else:
+        test_kernel = test_scaled.T @ train_scaled / float(n_markers)
+        test_scores = (test_kernel @ basis).T
+    return train_scores, test_scores
 
 
 def _looks_like_packed_payload(obj: typing.Any) -> bool:
@@ -8231,7 +8261,8 @@ def GSapi(
         Prediction model.
     PCAdec : bool, optional
         If True, perform PCA-based dimensionality reduction before modeling.
-        PCA is computed on the concatenated matrix [Xtrain, Xtest].
+        PCA is fit on Xtrain; Xtest is projected using the training-derived
+        centering, scaling, and principal-component basis.
     n_jobs : int, optional
         Thread count for ML models. Non-ML models currently ignore this setting.
     seed : int, optional
@@ -18470,7 +18501,9 @@ def parse_args(argv: typing.Optional[list[str]] = None):
     optional_group.add_argument(
         "-strict-cv", "--strict-cv",
         action="store_true",
-        default=False,
+        # Keep nested, training-fold-only hyperparameter selection as the
+        # default so outer validation samples never select model parameters.
+        default=True,
         help=argparse.SUPPRESS,
     )
     optional_group.add_argument(

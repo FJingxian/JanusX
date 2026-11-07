@@ -33,7 +33,7 @@ use crate::blas::{
     cblas_sgemm_dispatch, rust_sgemm_backend_tag, BlasThreadGuard, CblasInt, CBLAS_NO_TRANS,
     CBLAS_ROW_MAJOR, CBLAS_TRANS,
 };
-use crate::brent::{brent_minimize, brent_minimize_with_init};
+use crate::brent::brent_minimize_with_init;
 use crate::decode::{
     decode_centered_block_packed_model_f32, AdditiveDecodePlan, PackedGeneticModel,
 };
@@ -48,8 +48,8 @@ use memmap2::Mmap;
 use std::fs::File;
 
 use crate::reml::{
-    final_beta_se, ml_loglike, reml_loglike, reml_loglike_with_workspace,
-    run_rotated_assoc_block_f32, RemlWorkspace,
+    final_beta_se, final_beta_se_with_workspace, ml_loglike, reml_brent_minimize_with_workspace,
+    reml_loglike, run_rotated_assoc_block_f32, RemlWorkspace,
 };
 
 struct RotatedRemlAssocState {
@@ -154,51 +154,35 @@ fn process_rotated_reml_assoc_row(
     } else {
         None
     };
-    let (best_log10_lbd, _best_cost) = if let Some(guess) = init_guess {
-        brent_minimize_with_init(
-            |x| {
-                -reml_loglike_with_workspace(
-                    x,
-                    s,
-                    xcov_flat,
-                    y,
-                    &state.snp_vec[..],
-                    n,
-                    p_cov,
-                    &mut state.reml_workspace,
-                )
-            },
-            low,
-            high,
-            tol,
-            max_iter,
-            Some(guess),
-        )
-    } else {
-        brent_minimize(
-            |x| {
-                -reml_loglike_with_workspace(
-                    x,
-                    s,
-                    xcov_flat,
-                    y,
-                    &state.snp_vec[..],
-                    n,
-                    p_cov,
-                    &mut state.reml_workspace,
-                )
-            },
-            low,
-            high,
-            tol,
-            max_iter,
-        )
-    };
+    let (best_log10_lbd, _best_cost, last_eval_log10_lbd) = reml_brent_minimize_with_workspace(
+        low,
+        high,
+        tol,
+        max_iter,
+        init_guess,
+        s,
+        xcov_flat,
+        y,
+        &state.snp_vec,
+        n,
+        p_cov,
+        &mut state.reml_workspace,
+    );
     if carry_warm_start {
         state.last_log10_lbd = Some(best_log10_lbd);
     }
 
-    let (beta, se, _lbd) = final_beta_se(best_log10_lbd, s, xcov_flat, y, &state.snp_vec, n, p_cov);
+    let (beta, se, _lbd, _reused_fit) = final_beta_se_with_workspace(
+        best_log10_lbd,
+        s,
+        xcov_flat,
+        y,
+        &state.snp_vec,
+        n,
+        p_cov,
+        last_eval_log10_lbd,
+        &mut state.reml_workspace,
+    );
     let pwald = if beta.is_finite() && se.is_finite() && se > 0.0 {
         let z = beta / se;
         (2.0 * normal_sf(z.abs())).clamp(f64::MIN_POSITIVE, 1.0)
@@ -687,27 +671,33 @@ pub fn lmm_reml_chunk_f32<'py>(
                                 snp_vec[i] = row[i] as f64;
                             }
 
-                            let (best_log10_lbd, _best_cost) = brent_minimize(
-                                |x| {
-                                    -reml_loglike_with_workspace(
-                                        x,
-                                        s,
-                                        &xcov_flat,
-                                        y,
-                                        snp_vec,
-                                        n,
-                                        p_cov,
-                                        reml_workspace,
-                                    )
-                                },
-                                low,
-                                high,
-                                tol,
-                                max_iter,
-                            );
+                            let (best_log10_lbd, _best_cost, last_eval_log10_lbd) =
+                                reml_brent_minimize_with_workspace(
+                                    low,
+                                    high,
+                                    tol,
+                                    max_iter,
+                                    None,
+                                    s,
+                                    &xcov_flat,
+                                    y,
+                                    snp_vec,
+                                    n,
+                                    p_cov,
+                                    reml_workspace,
+                                );
 
-                            let (beta, se, _lbd) =
-                                final_beta_se(best_log10_lbd, s, &xcov_flat, y, &snp_vec, n, p_cov);
+                            let (beta, se, _lbd, _reused_fit) = final_beta_se_with_workspace(
+                                best_log10_lbd,
+                                s,
+                                &xcov_flat,
+                                y,
+                                snp_vec,
+                                n,
+                                p_cov,
+                                last_eval_log10_lbd,
+                                reml_workspace,
+                            );
 
                             let p = if beta.is_finite() && se.is_finite() && se > 0.0 {
                                 let z = beta / se;

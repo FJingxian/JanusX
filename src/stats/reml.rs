@@ -23,11 +23,15 @@ use std::f64::consts::PI;
 use std::sync::Arc;
 
 use crate::aireml::ai_reml_null_from_spectral;
-use crate::brent::brent_minimize;
+use crate::brent::{brent_minimize, brent_minimize_with_init};
 use crate::linalg::{
     cholesky_gram_inplace, cholesky_logdet, cholesky_solve_into, validate_fixed_effect_design,
 };
 use crate::stats_common::get_cached_pool;
+
+const REML_FINAL_BEST_CACHE_MAX_DIM: usize = 64;
+const REML_PROJECTION_MAX_ABS_CORRELATION: f64 = 0.9;
+const REML_PROJECTION_MIN_RESIDUAL_FRACTION: f64 = 1e-4;
 
 #[inline]
 pub(crate) fn gwas_max_output_rows_env() -> Option<usize> {
@@ -370,6 +374,13 @@ pub(crate) struct RemlWorkspace {
     gram: Vec<f64>,
     rhs: Vec<f64>,
     beta: Vec<f64>,
+    weighted_y_ss: f64,
+    last_log10_lbd: Option<f64>,
+    residual_ss: f64,
+    best_gram: Vec<f64>,
+    best_log10_lbd: Option<f64>,
+    best_residual_ss: f64,
+    best_beta: f64,
 }
 
 impl RemlWorkspace {
@@ -378,6 +389,17 @@ impl RemlWorkspace {
             gram: vec![0.0; dim.saturating_mul(dim)],
             rhs: vec![0.0; dim],
             beta: vec![0.0; dim],
+            weighted_y_ss: 0.0,
+            last_log10_lbd: None,
+            residual_ss: f64::NAN,
+            best_gram: if dim <= REML_FINAL_BEST_CACHE_MAX_DIM {
+                vec![0.0; dim.saturating_mul(dim)]
+            } else {
+                Vec::new()
+            },
+            best_log10_lbd: None,
+            best_residual_ss: f64::NAN,
+            best_beta: f64::NAN,
         }
     }
 
@@ -392,6 +414,20 @@ impl RemlWorkspace {
         if self.beta.len() != dim {
             self.beta.resize(dim, 0.0);
         }
+        if dim <= REML_FINAL_BEST_CACHE_MAX_DIM {
+            if self.best_gram.len() != gram_len {
+                self.best_gram.resize(gram_len, 0.0);
+            }
+        } else {
+            self.best_gram.clear();
+            self.clear_best_fit();
+        }
+    }
+
+    fn clear_best_fit(&mut self) {
+        self.best_log10_lbd = None;
+        self.best_residual_ss = f64::NAN;
+        self.best_beta = f64::NAN;
     }
 }
 
@@ -406,6 +442,9 @@ pub(crate) fn reml_loglike_with_workspace(
     p_cov: usize,
     workspace: &mut RemlWorkspace,
 ) -> f64 {
+    workspace.last_log10_lbd = None;
+    workspace.residual_ss = f64::NAN;
+
     let lambda = 10.0_f64.powf(log10_lbd);
     let Some(dim) = p_cov.checked_add(1) else {
         return -1e8;
@@ -431,6 +470,8 @@ pub(crate) fn reml_loglike_with_workspace(
     workspace.gram.fill(0.0);
     workspace.rhs.fill(0.0);
     workspace.beta.fill(0.0);
+    workspace.weighted_y_ss = 0.0;
+    let mut projection_well_conditioned = p_cov == 0;
 
     match p_cov {
         0 => {
@@ -445,6 +486,7 @@ pub(crate) fn reml_loglike_with_workspace(
                 let genotype = snp[i];
                 rhs0 += weight * genotype * y[i];
                 gram00 += weight * genotype * genotype;
+                workspace.weighted_y_ss += weight * y[i] * y[i];
             }
             workspace.gram[0] = gram00;
             workspace.rhs[0] = rhs0;
@@ -469,7 +511,16 @@ pub(crate) fn reml_loglike_with_workspace(
                 rhs1 += weight * genotype * yi;
                 gram10 += weight * genotype * covariate;
                 gram11 += weight * genotype * genotype;
+                workspace.weighted_y_ss += weight * yi * yi;
             }
+            let diagonal_scale = gram00.sqrt() * gram11.sqrt();
+            let weighted_correlation = if diagonal_scale.is_finite() && diagonal_scale > 0.0 {
+                (gram10 / diagonal_scale).abs()
+            } else {
+                f64::INFINITY
+            };
+            projection_well_conditioned =
+                weighted_correlation < REML_PROJECTION_MAX_ABS_CORRELATION;
             workspace.gram[0] = gram00;
             workspace.gram[2] = gram10;
             workspace.gram[3] = gram11;
@@ -569,21 +620,43 @@ pub(crate) fn reml_loglike_with_workspace(
     }
     cholesky_solve_into(&workspace.gram, dim, &workspace.rhs, &mut workspace.beta);
 
-    // Direct residual accumulation avoids cancellation when the fitted SNP is
-    // nearly deterministic, matching the reference objective's stable path.
-    let mut residual_ss = 0.0;
-    for i in 0..n {
-        let mut fitted = 0.0;
-        for r in 0..dim {
-            let xr = if r < p_cov {
-                xcov[i * p_cov + r]
-            } else {
-                snp[i]
-            };
-            fitted += xr * workspace.beta[r];
+    // The normal-equation identity avoids another sample pass for zero- or
+    // one-column fixed-effect designs. Fall back to direct residuals near
+    // cancellation or when the two-column design is strongly collinear.
+    let mut residual_ss = if projection_well_conditioned {
+        let explained_ss = workspace
+            .beta
+            .iter()
+            .zip(&workspace.rhs)
+            .map(|(beta, rhs)| beta * rhs)
+            .sum::<f64>();
+        let projected_residual_ss = workspace.weighted_y_ss - explained_ss;
+        if projected_residual_ss.is_finite()
+            && projected_residual_ss
+                > workspace.weighted_y_ss.abs() * REML_PROJECTION_MIN_RESIDUAL_FRACTION
+        {
+            projected_residual_ss
+        } else {
+            f64::NAN
         }
-        let residual = y[i] - fitted;
-        residual_ss += residual * residual / (s[i] + lambda);
+    } else {
+        f64::NAN
+    };
+    if !residual_ss.is_finite() {
+        residual_ss = 0.0;
+        for i in 0..n {
+            let mut fitted = 0.0;
+            for r in 0..dim {
+                let xr = if r < p_cov {
+                    xcov[i * p_cov + r]
+                } else {
+                    snp[i]
+                };
+                fitted += xr * workspace.beta[r];
+            }
+            let residual = y[i] - fitted;
+            residual_ss += residual * residual / (s[i] + lambda);
+        }
     }
     if !residual_ss.is_finite() || residual_ss <= 0.0 || !log_det_v.is_finite() {
         return -1e8;
@@ -594,10 +667,62 @@ pub(crate) fn reml_loglike_with_workspace(
     let constant = dof * (dof.ln() - 1.0 - (2.0 * PI).ln()) / 2.0;
     let reml = constant - 0.5 * total_log;
     if reml.is_finite() {
+        workspace.last_log10_lbd = Some(log10_lbd);
+        workspace.residual_ss = residual_ss;
         reml
     } else {
         -1e8
     }
+}
+
+/// Run Brent with one reusable scorer workspace and retain its best Cholesky
+/// state when the workspace dimension is small enough for the bounded cache.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reml_brent_minimize_with_workspace(
+    low: f64,
+    high: f64,
+    tol: f64,
+    max_iter: usize,
+    init_log10_lbd: Option<f64>,
+    s: &[f64],
+    xcov: &[f64],
+    y: &[f64],
+    snp: &[f64],
+    n: usize,
+    p_cov: usize,
+    workspace: &mut RemlWorkspace,
+) -> (f64, f64, Option<f64>) {
+    let mut last_log10_lbd = None;
+    let mut best_observed_cost = f64::INFINITY;
+    workspace.clear_best_fit();
+    let (best_log10_lbd, optimizer_cost) = brent_minimize_with_init(
+        |log10_lbd| {
+            last_log10_lbd = Some(log10_lbd);
+            let cost =
+                -reml_loglike_with_workspace(log10_lbd, s, xcov, y, snp, n, p_cov, workspace);
+            if cost <= best_observed_cost {
+                best_observed_cost = cost;
+                workspace.clear_best_fit();
+                if workspace.best_gram.len() == workspace.gram.len()
+                    && workspace.last_log10_lbd == Some(log10_lbd)
+                    && workspace.residual_ss.is_finite()
+                    && workspace.residual_ss > 0.0
+                {
+                    workspace.best_gram.copy_from_slice(&workspace.gram);
+                    workspace.best_log10_lbd = Some(log10_lbd);
+                    workspace.best_residual_ss = workspace.residual_ss;
+                    workspace.best_beta = workspace.beta[p_cov];
+                }
+            }
+            cost
+        },
+        low,
+        high,
+        tol,
+        max_iter,
+        init_log10_lbd,
+    );
+    (best_log10_lbd, optimizer_cost, last_log10_lbd)
 }
 
 /// Accumulate the lower triangle of the weighted fixed-effect/SNP Gram matrix
@@ -1001,6 +1126,98 @@ pub(crate) fn final_beta_se(
     }
 
     (beta[k], var_beta_k.sqrt(), lbd)
+}
+
+/// Final beta/SE calculation using the scorer's reusable Cholesky workspace.
+///
+/// If `last_evaluated_log10_lbd` and the workspace both identify the returned
+/// Brent optimum, the weighted Gram matrix, beta, and residual sum of squares
+/// are already available. Otherwise the optimum is evaluated once into the
+/// same workspace before computing SE. The returned bool reports cache reuse.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn final_beta_se_with_workspace(
+    log10_lbd: f64,
+    s: &[f64],
+    xcov: &[f64],
+    y: &[f64],
+    snp: &[f64],
+    n: usize,
+    p_cov: usize,
+    last_evaluated_log10_lbd: Option<f64>,
+    workspace: &mut RemlWorkspace,
+) -> (f64, f64, f64, bool) {
+    let lambda = 10.0_f64.powf(log10_lbd);
+    let Some(dim) = p_cov.checked_add(1) else {
+        return (f64::NAN, f64::NAN, f64::NAN, false);
+    };
+    if !lambda.is_finite()
+        || lambda <= 0.0
+        || s.len() != n
+        || y.len() != n
+        || xcov.len() != n.saturating_mul(p_cov)
+        || snp.len() != n
+        || n <= dim
+    {
+        return (f64::NAN, f64::NAN, lambda, false);
+    }
+
+    let best_snapshot_matches = workspace.best_log10_lbd == Some(log10_lbd)
+        && workspace.best_gram.len() == dim.saturating_mul(dim)
+        && workspace.best_residual_ss.is_finite()
+        && workspace.best_residual_ss > 0.0
+        && workspace.best_beta.is_finite();
+    let reused_last_eval = last_evaluated_log10_lbd == Some(log10_lbd)
+        && workspace.last_log10_lbd == Some(log10_lbd)
+        && workspace.residual_ss.is_finite()
+        && workspace.residual_ss > 0.0
+        && workspace.gram.len() == dim.saturating_mul(dim)
+        && workspace.rhs.len() == dim
+        && workspace.beta.len() == dim;
+
+    let reused_fit = best_snapshot_matches || reused_last_eval;
+    if !reused_fit {
+        let _ = reml_loglike_with_workspace(log10_lbd, s, xcov, y, snp, n, p_cov, workspace);
+        if workspace.last_log10_lbd != Some(log10_lbd)
+            || !workspace.residual_ss.is_finite()
+            || workspace.residual_ss <= 0.0
+        {
+            return (f64::NAN, f64::NAN, lambda, false);
+        }
+    }
+
+    let snp_col = dim - 1;
+    let (beta, residual_ss) = if best_snapshot_matches {
+        (workspace.best_beta, workspace.best_residual_ss)
+    } else {
+        (workspace.beta[snp_col], workspace.residual_ss)
+    };
+    let sigma2 = residual_ss / (n - dim) as f64;
+
+    // The fitted beta is no longer needed. Reuse both the RHS and beta buffers
+    // to solve the unit-vector system that gives the SNP diagonal of (X'WX)^-1.
+    workspace.rhs.fill(0.0);
+    workspace.rhs[snp_col] = 1.0;
+    if best_snapshot_matches {
+        cholesky_solve_into(
+            &workspace.best_gram,
+            dim,
+            &workspace.rhs,
+            &mut workspace.beta,
+        );
+    } else {
+        cholesky_solve_into(&workspace.gram, dim, &workspace.rhs, &mut workspace.beta);
+    }
+    let var_beta = sigma2 * workspace.beta[snp_col];
+
+    workspace.last_log10_lbd = None;
+    workspace.residual_ss = f64::NAN;
+    workspace.clear_best_fit();
+
+    if beta.is_finite() && var_beta.is_finite() && var_beta > 0.0 {
+        (beta, var_beta.sqrt(), lambda, reused_fit)
+    } else {
+        (f64::NAN, f64::NAN, lambda, reused_fit)
+    }
 }
 
 #[pyfunction]

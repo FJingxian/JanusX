@@ -23000,6 +23000,7 @@ fn run_max6_grmmax6_pipeline(
     progress_callback: Option<&Py<PyAny>>,
     progress_every: usize,
     ld_tag_r2: f64,
+    write_provenance: bool,
 ) -> Result<GarfieldLogicPipelineResult, String> {
     let min_cell = min_cell::resolve_min_cell(min_cell, min_cell_fraction, logic_bits.n_samples)?;
     let final_top_k = final_top_k.max(1);
@@ -23759,7 +23760,7 @@ fn run_max6_grmmax6_pipeline(
     } else {
         None
     };
-    let pair_provenance_spool_path = if grm_int_only {
+    let pair_provenance_spool_path = if grm_int_only && write_provenance {
         out_prefix.map(|prefix| {
             format!(
                 "{prefix}.max6_grmmax6.provenance.tsv.tmp.{}",
@@ -25087,7 +25088,7 @@ fn run_max6_grmmax6_pipeline(
         fs::remove_file(spool_path).map_err(|error| {
             format!("failed to remove Max6 pair spool '{}': {error}", spool_path)
         })?;
-        if grm_int_only {
+        if grm_int_only && write_provenance {
             let provenance_spool_path = pair_provenance_spool_path.as_ref().ok_or_else(|| {
                 "internal error: Max6 GRM-INT provenance spool path is missing".to_string()
             })?;
@@ -25104,7 +25105,7 @@ fn run_max6_grmmax6_pipeline(
             })?;
             max6_pairs_provenance_tsv = Some(provenance_path);
         } else {
-            remove_stale_max6_grm_int_provenance(prefix, grm_int_only)?;
+            remove_stale_max6_grm_int_provenance(prefix, false)?;
         }
         let threshold_path = format!("{prefix}.max6_grmmax6.threshold.tsv");
         if Path::new(threshold_path.as_str()).exists() {
@@ -25727,6 +25728,7 @@ fn garfield_logic_search_bed_owned(
     min_cell_fraction: f64,
     ld_tag_r2: f64,
     summary_callback: Option<Py<PyAny>>,
+    write_provenance: bool,
 ) -> Result<GarfieldLogicPipelineResult, String> {
     let total_wall_t0 = Instant::now();
     let search_backend = GarfieldSearchBackend::parse(search_backend.as_str())?;
@@ -27028,6 +27030,7 @@ fn garfield_logic_search_bed_owned(
             progress_callback.as_ref(),
             progress_every,
             ld_tag_r2,
+            write_provenance,
         );
     }
     let ld_support_cache_t0 = Instant::now();
@@ -28901,6 +28904,7 @@ pub fn garfield_debug_probe_single_group_from_files(
         0.0,
         GARFIELD_MAX6_LD_TAG_R2_DEFAULT,
         None,
+        false,
     )?;
     Ok(out_tsv)
 }
@@ -28995,7 +28999,8 @@ pub fn garfield_debug_probe_single_group_from_files(
     min_cell=10,
     min_cell_fraction=0.0,
     ld_tag_r2=1.0,
-    summary_callback=None
+    summary_callback=None,
+    write_provenance=false
 ))]
 pub fn garfield_logic_search_bed_py<'py>(
     py: Python<'py>,
@@ -29088,6 +29093,7 @@ pub fn garfield_logic_search_bed_py<'py>(
     min_cell_fraction: f64,
     ld_tag_r2: f64,
     summary_callback: Option<Py<PyAny>>,
+    write_provenance: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
     arm_interrupt_trap();
     let grm_int_only =
@@ -29232,6 +29238,7 @@ pub fn garfield_logic_search_bed_py<'py>(
                 min_cell_fraction,
                 ld_tag_r2,
                 summary_callback,
+                write_provenance,
             )
         })
         .map_err(map_err_string_to_py)?;

@@ -1827,6 +1827,16 @@ def main() -> None:
     )
 
     optional_group = parser.add_argument_group("Optional Arguments")
+    optional_group.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        default=False,
+        help=(
+            "Write the GARFIELD summary JSON and Max6 GRM-INT provenance TSV. "
+            "By default only the result TSV and log are written."
+        ),
+    )
     optional_group.add_argument("-gff", "--gff3", type=str, default=None, help="GFF3 annotation.")
     optional_group.add_argument(
         "--scan-mode",
@@ -3199,6 +3209,7 @@ def main() -> None:
                 min_cell_fraction=float(args.min_cell_frac),
                 ld_tag_r2=float(args.ld_tag_r2),
                 summary_callback=_on_scan_stage,
+                write_provenance=bool(args.verbose),
             ),
         )
         rust_memory_debug = result.get("memory_debug")
@@ -4364,97 +4375,113 @@ def main() -> None:
     if saved == 0:
         raise ValueError("No GARFIELD outputs were generated for the selected phenotype columns.")
 
-    aggregate_json_path = f"{outprefix}.garfield.json"
-    with open(aggregate_json_path, "w", encoding="utf-8") as fw:
-        json.dump(
-            {
-                "format": "janusx.garfield.summary.v1",
-                "log_file": log_path,
-                "output_prefix": outprefix,
-                "genotype_input": gfile,
-                "input_kind": _infer_plink_input_kind(gfile),
-                "execution_route": "direct Rust packed PLINK pipeline",
-                "encoding": "bin",
-                "phenotype_file": args.pheno,
-                "gene_files": list(args.genefiles),
-                "gff3": gff3_effective,
-                "grm_path": args.grm,
-                "grm_id_path": resolved_grm_id,
-                "scan_mode": args.scan_mode,
-                "rank_score_runtime": rank_score_runtime,
-                "rank_schedule_runtime": rank_schedule_runtime,
-                "rank_schedule_source": rank_schedule_source,
-                "search_backend": str(args.search_backend),
-                "grm_int_mode_source": str(args.grm_int_mode_source),
-                **(
-                    {
-                        "grm_int_only": True,
-                        "grm_int_test": grm_int_test_metadata,
-                        "grm_int_pvalue_calibration": "nominal_chi2_1_after_Max6_selection_unadjusted",
-                        "grm_int_screen_source": "Max6 proposal score; exact requested Top-K per scan unit",
-                        "grm_int_best_channel_source": "winning gate from the Max6 screen",
-                        "grm_int_output_order": f"conditional {grm_int_label} chi-square(1) within selected Top-K",
-                        "grm_int_screen_threshold_applied": False,
-                    }
-                    if args.grm_int
-                    else {}
-                ),
-                "max6_pairs_tsv": [
-                    item.get("max6_pairs_tsv")
-                    for item in garfield_manifest_traits
-                    if isinstance(item, dict) and item.get("max6_pairs_tsv")
-                ],
-                "max6_pairs_provenance_tsv": [
-                    item.get("max6_pairs_provenance_tsv")
-                    for item in garfield_manifest_traits
-                    if isinstance(item, dict) and item.get("max6_pairs_provenance_tsv")
-                ],
-                "max6_ld_tags_tsv": [
-                    item.get("max6_ld_tags_tsv")
-                    for item in garfield_manifest_traits
-                    if isinstance(item, dict) and item.get("max6_ld_tags_tsv")
-                ],
-                "max6_threshold_tsv": [
-                    item.get("max6_threshold_tsv")
-                    for item in garfield_manifest_traits
-                    if isinstance(item, dict) and item.get("max6_threshold_tsv")
-                ],
-                "max6_screen_maxima_tsv": [
-                    item.get("max6_screen_maxima_tsv")
-                    for item in garfield_manifest_traits
-                    if isinstance(item, dict) and item.get("max6_screen_maxima_tsv")
-                ],
-                "max6_screen_validation_maxima_tsv": [
-                    item.get("max6_screen_validation_maxima_tsv")
-                    for item in garfield_manifest_traits
-                    if isinstance(item, dict) and item.get("max6_screen_validation_maxima_tsv")
-                ],
-                "max6_screen_validation_fwer": [
-                    item.get("max6_screen_validation_fwer")
-                    for item in garfield_manifest_traits
-                    if isinstance(item, dict)
-                    and item.get("max6_screen_validation_fwer") is not None
-                ],
-                "max6_screen_validation": [
-                    {
-                        "trait": item.get("trait"),
-                        "scope": item.get("operational_fwer_scope"),
-                        "method": item.get("max6_screen_validation_method"),
-                        "threshold": item.get("max6_screen_threshold"),
-                        "threshold_method": item.get("max6_screen_threshold_method"),
-                        "pair_universe_size": item.get("max6_screen_pair_universe_size"),
-                        "window_pair_occurrences": item.get(
-                            "max6_screen_window_pair_occurrences"
-                        ),
-                        "calibration_repeats": item.get("max6_screen_null_repeats"),
-                        "validation_repeats": item.get("max6_screen_validation_repeats"),
-                        "validation_rejections": item.get("max6_screen_validation_rejections"),
-                        "validation_fwer": item.get("max6_screen_validation_fwer"),
-                        "validation_ci95": [
-                            item.get("max6_screen_validation_ci_lower"),
-                            item.get("max6_screen_validation_ci_upper"),
-                        ],
-                        "final_subset_audit": {
+    if args.verbose:
+        aggregate_json_path = f"{outprefix}.garfield.json"
+        with open(aggregate_json_path, "w", encoding="utf-8") as fw:
+            json.dump(
+                {
+                    "format": "janusx.garfield.summary.v1",
+                    "log_file": log_path,
+                    "output_prefix": outprefix,
+                    "genotype_input": gfile,
+                    "input_kind": _infer_plink_input_kind(gfile),
+                    "execution_route": "direct Rust packed PLINK pipeline",
+                    "encoding": "bin",
+                    "phenotype_file": args.pheno,
+                    "gene_files": list(args.genefiles),
+                    "gff3": gff3_effective,
+                    "grm_path": args.grm,
+                    "grm_id_path": resolved_grm_id,
+                    "scan_mode": args.scan_mode,
+                    "rank_score_runtime": rank_score_runtime,
+                    "rank_schedule_runtime": rank_schedule_runtime,
+                    "rank_schedule_source": rank_schedule_source,
+                    "search_backend": str(args.search_backend),
+                    "grm_int_mode_source": str(args.grm_int_mode_source),
+                    **(
+                        {
+                            "grm_int_only": True,
+                            "grm_int_test": grm_int_test_metadata,
+                            "grm_int_pvalue_calibration": "nominal_chi2_1_after_Max6_selection_unadjusted",
+                            "grm_int_screen_source": "Max6 proposal score; exact requested Top-K per scan unit",
+                            "grm_int_best_channel_source": "winning gate from the Max6 screen",
+                            "grm_int_output_order": f"conditional {grm_int_label} chi-square(1) within selected Top-K",
+                            "grm_int_screen_threshold_applied": False,
+                        }
+                        if args.grm_int
+                        else {}
+                    ),
+                    "max6_pairs_tsv": [
+                        item.get("max6_pairs_tsv")
+                        for item in garfield_manifest_traits
+                        if isinstance(item, dict) and item.get("max6_pairs_tsv")
+                    ],
+                    "max6_pairs_provenance_tsv": [
+                        item.get("max6_pairs_provenance_tsv")
+                        for item in garfield_manifest_traits
+                        if isinstance(item, dict) and item.get("max6_pairs_provenance_tsv")
+                    ],
+                    "max6_ld_tags_tsv": [
+                        item.get("max6_ld_tags_tsv")
+                        for item in garfield_manifest_traits
+                        if isinstance(item, dict) and item.get("max6_ld_tags_tsv")
+                    ],
+                    "max6_threshold_tsv": [
+                        item.get("max6_threshold_tsv")
+                        for item in garfield_manifest_traits
+                        if isinstance(item, dict) and item.get("max6_threshold_tsv")
+                    ],
+                    "max6_screen_maxima_tsv": [
+                        item.get("max6_screen_maxima_tsv")
+                        for item in garfield_manifest_traits
+                        if isinstance(item, dict) and item.get("max6_screen_maxima_tsv")
+                    ],
+                    "max6_screen_validation_maxima_tsv": [
+                        item.get("max6_screen_validation_maxima_tsv")
+                        for item in garfield_manifest_traits
+                        if isinstance(item, dict) and item.get("max6_screen_validation_maxima_tsv")
+                    ],
+                    "max6_screen_validation_fwer": [
+                        item.get("max6_screen_validation_fwer")
+                        for item in garfield_manifest_traits
+                        if isinstance(item, dict)
+                        and item.get("max6_screen_validation_fwer") is not None
+                    ],
+                    "max6_screen_validation": [
+                        {
+                            "trait": item.get("trait"),
+                            "scope": item.get("operational_fwer_scope"),
+                            "method": item.get("max6_screen_validation_method"),
+                            "threshold": item.get("max6_screen_threshold"),
+                            "threshold_method": item.get("max6_screen_threshold_method"),
+                            "pair_universe_size": item.get("max6_screen_pair_universe_size"),
+                            "window_pair_occurrences": item.get(
+                                "max6_screen_window_pair_occurrences"
+                            ),
+                            "calibration_repeats": item.get("max6_screen_null_repeats"),
+                            "validation_repeats": item.get("max6_screen_validation_repeats"),
+                            "validation_rejections": item.get("max6_screen_validation_rejections"),
+                            "validation_fwer": item.get("max6_screen_validation_fwer"),
+                            "validation_ci95": [
+                                item.get("max6_screen_validation_ci_lower"),
+                                item.get("max6_screen_validation_ci_upper"),
+                            ],
+                            "final_subset_audit": {
+                                "passed": item.get("max6_final_screen_subset_audit_passed"),
+                                "pairs_checked": item.get(
+                                    "max6_final_screen_subset_audit_pairs_checked", 0
+                                ),
+                                "violations": item.get(
+                                    "max6_final_screen_subset_audit_violations", 0
+                                ),
+                            },
+                        }
+                        for item in garfield_manifest_traits
+                        if isinstance(item, dict)
+                        and item.get("max6_screen_validation_repeats", 0) > 0
+                    ],
+                    "max6_final_screen_subset_audit": [
+                        {
                             "passed": item.get("max6_final_screen_subset_audit_passed"),
                             "pairs_checked": item.get(
                                 "max6_final_screen_subset_audit_pairs_checked", 0
@@ -4462,148 +4489,140 @@ def main() -> None:
                             "violations": item.get(
                                 "max6_final_screen_subset_audit_violations", 0
                             ),
-                        },
-                    }
-                    for item in garfield_manifest_traits
-                    if isinstance(item, dict)
-                    and item.get("max6_screen_validation_repeats", 0) > 0
-                ],
-                "max6_final_screen_subset_audit": [
-                    {
-                        "passed": item.get("max6_final_screen_subset_audit_passed"),
-                        "pairs_checked": item.get(
-                            "max6_final_screen_subset_audit_pairs_checked", 0
-                        ),
-                        "violations": item.get(
-                            "max6_final_screen_subset_audit_violations", 0
-                        ),
-                    }
-                    for item in garfield_manifest_traits
-                    if isinstance(item, dict)
-                    and item.get("max6_final_screen_subset_audit_passed") is not None
-                ],
-                "max6_pair_pve_definition": (
-                    "scaled_winner_score / scaled_y_quadratic; GRM-metric partial-R2"
-                    if any(
-                        isinstance(item, dict) and item.get("max6_pair_pve_total_quadratic") is not None
-                        for item in garfield_manifest_traits
-                    )
-                    else None
-                ),
-                "max6_pair_pve_total_quadratic": [
-                    item.get("max6_pair_pve_total_quadratic")
-                    for item in garfield_manifest_traits
-                    if isinstance(item, dict) and item.get("max6_pair_pve_total_quadratic") is not None
-                ],
-                "max6_bonferroni_thresholds": (
-                    []
-                    if args.grm_int
-                    else [
-                        {
-                            "trait": item.get("trait"),
-                            "N_unique": item.get("max6_pair_universe_size"),
-                            "alpha": item.get("max6_bonferroni_alpha"),
-                            "m": item.get("max6_bonferroni_channel_count"),
-                            "p_cut": item.get("max6_bonferroni_p_cut"),
                         }
                         for item in garfield_manifest_traits
                         if isinstance(item, dict)
-                        and item.get("max6_bonferroni_p_cut") is not None
-                    ]
-                ),
-                "pwald_bonferroni_thresholds": [
-                    {
-                        "trait": item.get("trait"),
-                        "N_unique_pairs": item["pwald_bonferroni_reference"][
-                            "n_unique_pairs"
-                        ],
-                        "alpha": item["pwald_bonferroni_reference"]["alpha"],
-                        "p_cut": item["pwald_bonferroni_reference"]["p_cut"],
-                        "minus_log10_p_cut": item["pwald_bonferroni_reference"][
-                            "minus_log10_p_cut"
-                        ],
-                        "method": item.get("pwald_bonferroni_reference_method"),
-                        "applied": item.get("pwald_bonferroni_reference_applied"),
-                    }
-                    for item in garfield_manifest_traits
-                    if isinstance(item, dict)
-                    and isinstance(item.get("pwald_bonferroni_reference"), dict)
-                ],
-                "xor_search_requested": bool(args.xor_search_requested),
-                "xor_search_enabled": bool(args.xor_search),
-                "evaluation_mode": "full_exploratory",
-                "permutation": (
-                    not _is_ld_tag_max6_backend(args.search_backend) and not args.grm_int
-                ),
-                "permutation_scope": (
-                    None
-                    if _is_ld_tag_max6_backend(args.search_backend) or args.grm_int
-                    else "global_pair_score_threshold"
-                    if _is_max6_grm_backend(args.search_backend)
-                    else "rule_null_penalty"
-                ),
-                "null_calibration_scope": (
-                    "screen_maxT_weak_global_null"
-                    if _is_ld_tag_max6_backend(args.search_backend)
-                    and args.rule_permutation_runtime
-                    else None
-                ),
-                "null_generation": (
-                    (
-                        "lmm_parametric_bootstrap_max6_screen"
-                        if args.rule_permutation_runtime
+                        and item.get("max6_final_screen_subset_audit_passed") is not None
+                    ],
+                    "max6_pair_pve_definition": (
+                        "scaled_winner_score / scaled_y_quadratic; GRM-metric partial-R2"
+                        if any(
+                            isinstance(item, dict) and item.get("max6_pair_pve_total_quadratic") is not None
+                            for item in garfield_manifest_traits
+                        )
                         else None
-                )
-                if _is_ld_tag_max6_backend(args.search_backend)
-                else None
-                if _is_max6_grm_backend(args.search_backend) and args.grm_int
-                else "global_pair_score_permutation_fixed_pc"
-                if _is_max6_grm_backend(args.search_backend)
-                    else "lmm_parametric_bootstrap"
-                ),
-                "operational_fwer_scope": (
-                    "weak_global_null_screen_subset"
+                    ),
+                    "max6_pair_pve_total_quadratic": [
+                        item.get("max6_pair_pve_total_quadratic")
+                        for item in garfield_manifest_traits
+                        if isinstance(item, dict) and item.get("max6_pair_pve_total_quadratic") is not None
+                    ],
+                    "max6_bonferroni_thresholds": (
+                        []
+                        if args.grm_int
+                        else [
+                            {
+                                "trait": item.get("trait"),
+                                "N_unique": item.get("max6_pair_universe_size"),
+                                "alpha": item.get("max6_bonferroni_alpha"),
+                                "m": item.get("max6_bonferroni_channel_count"),
+                                "p_cut": item.get("max6_bonferroni_p_cut"),
+                            }
+                            for item in garfield_manifest_traits
+                            if isinstance(item, dict)
+                            and item.get("max6_bonferroni_p_cut") is not None
+                        ]
+                    ),
+                    "pwald_bonferroni_thresholds": [
+                        {
+                            "trait": item.get("trait"),
+                            "N_unique_pairs": item["pwald_bonferroni_reference"][
+                                "n_unique_pairs"
+                            ],
+                            "alpha": item["pwald_bonferroni_reference"]["alpha"],
+                            "p_cut": item["pwald_bonferroni_reference"]["p_cut"],
+                            "minus_log10_p_cut": item["pwald_bonferroni_reference"][
+                                "minus_log10_p_cut"
+                            ],
+                            "method": item.get("pwald_bonferroni_reference_method"),
+                            "applied": item.get("pwald_bonferroni_reference_applied"),
+                        }
+                        for item in garfield_manifest_traits
+                        if isinstance(item, dict)
+                        and isinstance(item.get("pwald_bonferroni_reference"), dict)
+                    ],
+                    "xor_search_requested": bool(args.xor_search_requested),
+                    "xor_search_enabled": bool(args.xor_search),
+                    "evaluation_mode": "full_exploratory",
+                    "permutation": (
+                        not _is_ld_tag_max6_backend(args.search_backend) and not args.grm_int
+                    ),
+                    "permutation_scope": (
+                        None
+                        if _is_ld_tag_max6_backend(args.search_backend) or args.grm_int
+                        else "global_pair_score_threshold"
+                        if _is_max6_grm_backend(args.search_backend)
+                        else "rule_null_penalty"
+                    ),
+                    "null_calibration_scope": (
+                        "screen_maxT_weak_global_null"
+                        if _is_ld_tag_max6_backend(args.search_backend)
+                        and args.rule_permutation_runtime
+                        else None
+                    ),
+                    "null_generation": (
+                        (
+                            "lmm_parametric_bootstrap_max6_screen"
+                            if args.rule_permutation_runtime
+                            else None
+                    )
                     if _is_ld_tag_max6_backend(args.search_backend)
-                    and args.rule_permutation_runtime
                     else None
-                ),
-                "rule_null_penalty_method": (
-                    None if _is_ld_tag_max6_backend(args.search_backend)
-                    and not args.rule_permutation_runtime
-                    else str(args.rule_null_penalty_method_runtime)
-                ),
-                "rule_null_quantile": (
-                    None if _is_ld_tag_max6_backend(args.search_backend)
-                    and not args.rule_permutation_runtime
-                    else float(args.rule_null_quantile_runtime)
-                ),
-                "rule_null_report_pvalue": bool(args.rule_null_report_pvalue_runtime),
-                "rule_null_quantile_spec": args.rule_null_quantile_spec_runtime,
-                "null_chunk_bp": int(args.extension) * 2,
-                "null_chunk_target": 150,
-                "null_chunk_min_snps": 50,
-                "bimrange": (list(args.bimrange) if args.bimrange else None),
-                "top_rules_per_unit": int(args.top_rules_runtime),
-                "pair_seed_depth": int(args.exhaustive_depth_runtime),
-                "not_control": (
-                    "score_threshold_only"
+                    if _is_max6_grm_backend(args.search_backend) and args.grm_int
+                    else "global_pair_score_permutation_fixed_pc"
                     if _is_max6_grm_backend(args.search_backend)
-                    else "null_penalty_only"
-                ),
-                "thread": int(args.thread),
-                "seed": int(args.seed),
-                "summary_rows": summary_rows,
-                "traits": garfield_manifest_traits,
-            },
-            fw,
-            indent=2,
-            ensure_ascii=False,
+                        else "lmm_parametric_bootstrap"
+                    ),
+                    "operational_fwer_scope": (
+                        "weak_global_null_screen_subset"
+                        if _is_ld_tag_max6_backend(args.search_backend)
+                        and args.rule_permutation_runtime
+                        else None
+                    ),
+                    "rule_null_penalty_method": (
+                        None if _is_ld_tag_max6_backend(args.search_backend)
+                        and not args.rule_permutation_runtime
+                        else str(args.rule_null_penalty_method_runtime)
+                    ),
+                    "rule_null_quantile": (
+                        None if _is_ld_tag_max6_backend(args.search_backend)
+                        and not args.rule_permutation_runtime
+                        else float(args.rule_null_quantile_runtime)
+                    ),
+                    "rule_null_report_pvalue": bool(args.rule_null_report_pvalue_runtime),
+                    "rule_null_quantile_spec": args.rule_null_quantile_spec_runtime,
+                    "null_chunk_bp": int(args.extension) * 2,
+                    "null_chunk_target": 150,
+                    "null_chunk_min_snps": 50,
+                    "bimrange": (list(args.bimrange) if args.bimrange else None),
+                    "top_rules_per_unit": int(args.top_rules_runtime),
+                    "pair_seed_depth": int(args.exhaustive_depth_runtime),
+                    "not_control": (
+                        "score_threshold_only"
+                        if _is_max6_grm_backend(args.search_backend)
+                        else "null_penalty_only"
+                    ),
+                    "thread": int(args.thread),
+                    "seed": int(args.seed),
+                    "summary_rows": summary_rows,
+                    "traits": garfield_manifest_traits,
+                },
+                fw,
+                indent=2,
+                ensure_ascii=False,
+            )
+        _emit_garfield_saved_paths(
+            logger,
+            [aggregate_json_path],
+            use_spinner=use_spinner,
         )
-    _emit_garfield_saved_paths(
-        logger,
-        [aggregate_json_path],
-        use_spinner=use_spinner,
-    )
+    else:
+        aggregate_json_path = f"{outprefix}.garfield.json"
+        try:
+            os.remove(aggregate_json_path)
+        except FileNotFoundError:
+            pass
+
     _rich_success(
         logger,
         f"\nFinished. Total wall time: {round(time.time() - t_start, 2)} seconds\n"

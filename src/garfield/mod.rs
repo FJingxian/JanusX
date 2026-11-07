@@ -32582,6 +32582,7 @@ mod tests {
             candidate_rank: 1,
             first_global_row: 0,
             second_global_row: 1,
+            four_cell_counts: None,
             dosage: f64::NAN,
             max6: 3.841458820694124,
             best_channel: "AND11",
@@ -32704,6 +32705,7 @@ mod tests {
             candidate_rank: 6,
             first_global_row: 0,
             second_global_row: 1,
+            four_cell_counts: None,
             dosage: 3.841458820694124,
             max6: 101.0,
             best_channel: "AND01",
@@ -32922,7 +32924,41 @@ mod tests {
 
     #[test]
     fn grm_int_outputs_sort_only_selected_pairs_and_keep_screen_metadata() {
-        let selected_global_rows = [100, 200, 300, 400];
+        let selected_global_rows = [0, 1, 2, 3];
+        let sites = vec![
+            GarfieldLogicSite::owned(
+                "Chr01",
+                100,
+                "Chr01:100",
+                "A",
+                "G",
+                GarfieldLogicSiteMode::Bin,
+            ),
+            GarfieldLogicSite::owned(
+                "Chr01",
+                200,
+                "Chr01:200",
+                "C",
+                "T",
+                GarfieldLogicSiteMode::Bin,
+            ),
+            GarfieldLogicSite::owned(
+                "Chr01",
+                300,
+                "Chr01:300",
+                "A",
+                "C",
+                GarfieldLogicSiteMode::Bin,
+            ),
+            GarfieldLogicSite::owned(
+                "Chr01",
+                400,
+                "Chr01:400",
+                "G",
+                "T",
+                GarfieldLogicSiteMode::Bin,
+            ),
+        ];
         let candidates = [
             grm_int_test_screen_candidate(0, 1, logic_residual_screen::FourCellGate::And10, 9.0),
             grm_int_test_screen_candidate(1, 2, logic_residual_screen::FourCellGate::Xor, 8.0),
@@ -32935,7 +32971,7 @@ mod tests {
         ];
         let chisq = [2.0, 11.0, 50.0];
         let outputs =
-            max6_grm_int_outputs_from_screen(4, &selected_global_rows, &candidates, &chisq)
+            max6_grm_int_outputs_from_screen(4, &selected_global_rows, &sites, &candidates, &chisq)
                 .unwrap();
 
         assert_eq!(outputs.len(), 3);
@@ -32944,7 +32980,7 @@ mod tests {
                 .iter()
                 .map(|output| (output.first_global_row, output.second_global_row))
                 .collect::<Vec<_>>(),
-            vec![(300, 400), (200, 300), (100, 200)]
+            vec![(2, 3), (1, 2), (0, 1)]
         );
         assert_eq!(outputs[0].unit_index, 4);
         assert_eq!(outputs[0].candidate_rank, 3);
@@ -32952,6 +32988,7 @@ mod tests {
         assert_eq!(outputs[0].best_channel, "DOSAGE_PRODUCT");
         assert_eq!(outputs[0].dosage, 50.0);
         assert!(outputs[0].pair_pve.is_nan());
+        assert!(outputs[0].four_cell_counts.is_some());
         assert_eq!(outputs[1].best_channel, "XOR");
         assert_eq!(outputs[1].max6, 8.0);
         assert_eq!(outputs[1].dosage, 11.0);
@@ -32962,7 +32999,25 @@ mod tests {
 
     #[test]
     fn grm_int_keeps_same_pair_occurrence_for_each_overlapping_unit() {
-        let selected_global_rows = [100, 200];
+        let selected_global_rows = [0, 1];
+        let sites = vec![
+            GarfieldLogicSite::owned(
+                "Chr01",
+                100,
+                "Chr01:100",
+                "A",
+                "G",
+                GarfieldLogicSiteMode::Bin,
+            ),
+            GarfieldLogicSite::owned(
+                "Chr01",
+                200,
+                "Chr01:200",
+                "C",
+                "T",
+                GarfieldLogicSiteMode::Bin,
+            ),
+        ];
         let candidates = [grm_int_test_screen_candidate(
             0,
             1,
@@ -32970,10 +33025,10 @@ mod tests {
             12.0,
         )];
         let first_unit =
-            max6_grm_int_outputs_from_screen(2, &selected_global_rows, &candidates, &[4.0])
+            max6_grm_int_outputs_from_screen(2, &selected_global_rows, &sites, &candidates, &[4.0])
                 .unwrap();
         let second_unit =
-            max6_grm_int_outputs_from_screen(9, &selected_global_rows, &candidates, &[4.0])
+            max6_grm_int_outputs_from_screen(9, &selected_global_rows, &sites, &candidates, &[4.0])
                 .unwrap();
 
         assert_eq!(first_unit.len(), 1);

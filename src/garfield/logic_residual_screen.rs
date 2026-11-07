@@ -4462,15 +4462,14 @@ mod tests {
         let bounds =
             one_cell_min_cell_n11_bounds(n_samples, margins.counts[0], margins.counts[1], 2)
                 .unwrap();
-        let mut popcounts = vec![0u8; row_words];
-        assert!(packed_n11_min_cell_passes(
+        let n11 = packed_n11_min_cell_pass_count_unrolled4_no_scratch(
             first.as_slice(),
             second.as_slice(),
             n_samples,
             bounds.0,
             bounds.1,
-            popcounts.as_mut_slice(),
-        ));
+        )
+        .expect("the test pair should pass the four-cell MinCell gate");
         let expected = one_cell_sufficient_stats_packed_no_valid(
             first.as_slice(),
             second.as_slice(),
@@ -4482,7 +4481,7 @@ mod tests {
             &margins,
             &lookup,
         );
-        let observed = one_cell_sufficient_stats_packed_no_valid_from_popcounts(
+        let observed = one_cell_sufficient_stats_packed_no_valid_with_n11(
             first.as_slice(),
             second.as_slice(),
             row_words,
@@ -4492,7 +4491,7 @@ mod tests {
             1,
             &margins,
             &lookup,
-            popcounts.as_slice(),
+            n11,
             false,
         );
         assert_eq!(observed.counts, expected.counts);

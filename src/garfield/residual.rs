@@ -2528,6 +2528,36 @@ mod tests {
     }
 
     #[test]
+    fn no_grm_row_major_batch_projection_matches_dense_projection() {
+        let n = 7usize;
+        let p = 3usize;
+        let n_columns = 4usize;
+        let design = (0..n)
+            .flat_map(|row| [1.0, row as f64, (row as f64).powi(2)])
+            .collect::<Vec<_>>();
+        let projector = build_no_grm_covariate_projector(&design, n, p).unwrap();
+        let dense = build_no_grm_projection(&design, n, p).unwrap();
+        let values = (0..n * n_columns)
+            .map(|index| ((index * 7 % 13) as f64 - 4.0) / 3.0)
+            .collect::<Vec<_>>();
+        let mut projected = vec![f64::NAN; values.len()];
+
+        projector
+            .project_row_major_columns_into(&values, n_columns, &mut projected)
+            .unwrap();
+
+        for row in 0..n {
+            for column in 0..n_columns {
+                let expected = (0..n)
+                    .map(|sample| dense[row * n + sample] * values[sample * n_columns + column])
+                    .sum::<f64>();
+                let actual = projected[row * n_columns + column];
+                assert!((actual - expected).abs() < 1.0e-10);
+            }
+        }
+    }
+
+    #[test]
     fn no_grm_qr_projector_handles_redundant_covariate() {
         let n = 6usize;
         let p = 3usize;

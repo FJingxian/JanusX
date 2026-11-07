@@ -1883,3 +1883,151 @@ mod pve_se_tests {
         assert!(profile_reml_pve_se(-5.0 + 0.01, &s, &xcov, &y, 4, 1, 1.25, -5.0, 5.0,).is_none());
     }
 }
+
+#[cfg(test)]
+mod projected_rss_tests {
+    use super::{
+        checked_projected_residual_ss, normalized_cholesky_is_well_conditioned,
+        reml_loglike_with_workspace_mode, RemlWorkspace,
+    };
+
+    #[test]
+    fn projected_rss_uses_all_fixed_effect_coefficients() {
+        let beta = [2.0_f64, -1.0, 0.5];
+        let rhs = [3.0_f64, 4.0, 8.0];
+        assert_eq!(
+            checked_projected_residual_ss(100.0, &beta, &rhs),
+            Some(94.0)
+        );
+    }
+
+    #[test]
+    fn projected_rss_rejects_cancellation_prone_residuals() {
+        let beta = [1.0_f64];
+        let rhs = [99.99999_f64];
+        assert_eq!(checked_projected_residual_ss(100.0, &beta, &rhs), None);
+    }
+
+    #[test]
+    fn projected_rss_rejects_unstable_normalized_cholesky_pivots() {
+        let factor = [1.0_f64, 0.0, 0.0, 0.019];
+        let diagonal_scale = [1.0_f64, 1.0];
+        assert!(!normalized_cholesky_is_well_conditioned(
+            &factor,
+            &diagonal_scale,
+            2,
+        ));
+    }
+
+    #[test]
+    fn multicov_projected_reml_matches_direct_residual_path() {
+        let n = 1_024usize;
+        let s: Vec<f64> = (0..n).map(|i| 0.1 + (i % 71) as f64 / 35.0).collect();
+        let snp: Vec<f64> = (0..n)
+            .map(|i| (std::f64::consts::TAU * 8.73 * i as f64 / n as f64).cos())
+            .collect();
+
+        for p_cov in [2usize, 4, 8, 17, 32] {
+            let mut xcov = vec![0.0_f64; n * p_cov];
+            let mut y = vec![0.0_f64; n];
+            for i in 0..n {
+                xcov[i * p_cov] = 1.0;
+                for c in 1..p_cov {
+                    let phase =
+                        std::f64::consts::TAU * (0.73 + c as f64 * 0.37) * i as f64 / n as f64;
+                    xcov[i * p_cov + c] = phase.sin() + 0.2 * (phase * 0.43).cos();
+                }
+                let fixed_effect = (0..p_cov)
+                    .map(|c| xcov[i * p_cov + c] * (c as f64 + 1.0) / p_cov as f64)
+                    .sum::<f64>();
+                let noise = (std::f64::consts::TAU * 19.27 * i as f64 / n as f64).sin();
+                y[i] = fixed_effect + 0.3 * snp[i] + 0.2 * noise;
+            }
+
+            let mut direct_workspace = RemlWorkspace::new(p_cov + 1);
+            let mut projected_workspace = RemlWorkspace::new(p_cov + 1);
+            for log10_lambda in [-1.0_f64, 0.0, 1.0] {
+                let direct = reml_loglike_with_workspace_mode::<false>(
+                    log10_lambda,
+                    &s,
+                    &xcov,
+                    &y,
+                    &snp,
+                    n,
+                    p_cov,
+                    &mut direct_workspace,
+                );
+                let projected = reml_loglike_with_workspace_mode::<true>(
+                    log10_lambda,
+                    &s,
+                    &xcov,
+                    &y,
+                    &snp,
+                    n,
+                    p_cov,
+                    &mut projected_workspace,
+                );
+                assert!(direct.is_finite() && direct > -1e8);
+                assert!(projected.is_finite() && projected > -1e8);
+                assert!(
+                    (direct - projected).abs() <= 1e-10 * direct.abs().max(1.0),
+                    "p_cov={p_cov}, log10_lambda={log10_lambda}, direct={direct}, projected={projected}"
+                );
+                assert!(
+                    (direct_workspace.residual_ss - projected_workspace.residual_ss).abs()
+                        <= 1e-10 * direct_workspace.residual_ss.abs().max(1.0),
+                    "p_cov={p_cov}, log10_lambda={log10_lambda}, direct RSS={}, projected RSS={}",
+                    direct_workspace.residual_ss,
+                    projected_workspace.residual_ss
+                );
+            }
+
+            let mut direct_workspace = RemlWorkspace::new(p_cov + 1);
+            let (direct_theta, direct_cost) = super::brent_minimize(
+                |theta| {
+                    -reml_loglike_with_workspace_mode::<false>(
+                        theta,
+                        &s,
+                        &xcov,
+                        &y,
+                        &snp,
+                        n,
+                        p_cov,
+                        &mut direct_workspace,
+                    )
+                },
+                -4.0,
+                4.0,
+                1e-5,
+                100,
+            );
+            let mut projected_workspace = RemlWorkspace::new(p_cov + 1);
+            let (projected_theta, projected_cost) = super::brent_minimize(
+                |theta| {
+                    -reml_loglike_with_workspace_mode::<true>(
+                        theta,
+                        &s,
+                        &xcov,
+                        &y,
+                        &snp,
+                        n,
+                        p_cov,
+                        &mut projected_workspace,
+                    )
+                },
+                -4.0,
+                4.0,
+                1e-5,
+                100,
+            );
+            assert!(
+                (direct_theta - projected_theta).abs() <= 1e-3,
+                "p_cov={p_cov}, direct lambda={direct_theta}, projected lambda={projected_theta}"
+            );
+            assert!(
+                (direct_cost - projected_cost).abs() <= 1e-7 * direct_cost.abs().max(1.0),
+                "p_cov={p_cov}, direct cost={direct_cost}, projected cost={projected_cost}"
+            );
+        }
+    }
+}

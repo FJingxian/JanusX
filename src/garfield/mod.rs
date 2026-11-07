@@ -20074,12 +20074,823 @@ fn prepare_max6_global_qc_and_logic_bits(
     Ok((site_keep, row_source_indices, logic_bits))
 }
 
+const MAX6_WINDOW_STREAM_UNSUPPORTED_ORDER: &str = "__MAX6_WINDOW_STREAM_UNSUPPORTED_ORDER__";
+
 struct Max6WindowStreamPrep {
     global_site_keep: Vec<bool>,
     packed_source_rows: Vec<usize>,
     logic_bits: GarfieldLogicBits,
     units: Vec<GarfieldLogicUnit>,
     source_unit_indices: Vec<usize>,
+}
+
+struct Max6StreamWindowRow {
+    qc_index: usize,
+    source_row: usize,
+    pos: i32,
+    logic_words: Option<Vec<u64>>,
+    support: Option<u32>,
+    block_support: Option<Vec<u16>>,
+}
+
+struct Max6StreamWindowState {
+    chrom: String,
+    min_bp: i32,
+    last_bp: i32,
+    next_center: i64,
+    rows: VecDeque<Max6StreamWindowRow>,
+    previous_signature: Option<(usize, usize, usize)>,
+    done: bool,
+}
+
+struct Max6StreamWindowTask {
+    original_unit_index: usize,
+    unit: GarfieldLogicUnit,
+    source_rows: Vec<usize>,
+    logic_words: Vec<u64>,
+    support: Vec<u32>,
+    block_support: Vec<u16>,
+}
+
+struct Max6WindowStreamLdPrep {
+    global_site_keep: Vec<bool>,
+    units: Vec<Max6PreparedUnitMetadata>,
+    screen_units: Vec<Max6GrmMax6LdPreparedUnit>,
+    original_unit_indices: Vec<usize>,
+    active_source_rows: Vec<usize>,
+    source_marker_count: usize,
+    window_pair_count: usize,
+    qc_row_count: usize,
+    distinct_window_count: usize,
+    selected_window_count: usize,
+    max_active_rows: usize,
+    max_task_batch_bytes: usize,
+}
+
+fn select_max6_stream_window_task(
+    task: Max6StreamWindowTask,
+    sample_indices: &[usize],
+    row_words: usize,
+    n_samples: usize,
+    ld_tag_r2: f64,
+) -> Result<(Max6PreparedUnitMetadata, Max6GrmMax6LdPreparedUnit), String> {
+    let Max6StreamWindowTask {
+        original_unit_index,
+        unit,
+        source_rows,
+        mut logic_words,
+        mut support,
+        mut block_support,
+    } = task;
+    let n_rows = source_rows.len();
+    if logic_words.len() != n_rows.saturating_mul(row_words) {
+        return Err(format!(
+            "streamed Max6 window '{}' has {} logic words for {} rows x {} words",
+            unit.label,
+            logic_words.len(),
+            n_rows,
+            row_words
+        ));
+    }
+    let empty_text: Arc<str> = Arc::from("");
+    let logic_bits = GarfieldLogicBits {
+        bits_flat: std::mem::take(&mut logic_words),
+        bits_mmap: None,
+        bits_mmap_words: 0,
+        bits_mmap_owner: None,
+        bits_hi_flat: None,
+        row_words,
+        sample_ids: Vec::new(),
+        sites: (0..n_rows)
+            .map(|_| {
+                GarfieldLogicSite::owned(
+                    empty_text.clone(),
+                    0,
+                    empty_text.clone(),
+                    empty_text.clone(),
+                    empty_text.clone(),
+                    GarfieldLogicSiteMode::Bin,
+                )
+            })
+            .collect(),
+        group_ids: build_logic_mode_group_ids(n_rows, GarfieldBinMode::Bin),
+        n_samples,
+    };
+    let support_cache = if ld_tag_r2 < 1.0 {
+        let block_words = garfield_ld_block_words();
+        let block_count = row_words.div_ceil(block_words);
+        if support.len() != n_rows || block_support.len() != n_rows.saturating_mul(block_count) {
+            return Err(format!(
+                "streamed Max6 window '{}' has an incomplete LD support cache",
+                unit.label
+            ));
+        }
+        Some(GarfieldLdSupportCache {
+            n_rows,
+            row_words,
+            block_words,
+            block_count,
+            support: std::mem::take(&mut support),
+            block_support: std::mem::take(&mut block_support),
+            sparse_global_to_local: None,
+        })
+    } else {
+        None
+    };
+    let candidates = (0..n_rows).collect::<Vec<_>>();
+    let unit = GarfieldLogicUnit {
+        label: unit.label.clone(),
+        indices: candidates,
+        spans: unit.spans.clone(),
+    };
+    let selected = prepare_max6_grmmax6_ld_unit_with_support_cache(
+        &unit,
+        "window",
+        &logic_bits,
+        sample_indices,
+        support_cache.as_ref(),
+        ld_tag_r2,
+    )?;
+    let map_row = |row: usize| {
+        source_rows
+            .get(row)
+            .copied()
+            .ok_or_else(|| format!("streamed Max6 LD row {row} is outside its window"))
+    };
+    let prepared = Max6GrmMax6LdPreparedUnit {
+        selected_global_rows: selected
+            .selected_global_rows
+            .iter()
+            .map(|&row| map_row(row))
+            .collect::<Result<Vec<_>, _>>()?,
+        pair_groups: None,
+        ld_compression: selected
+            .ld_compression
+            .iter()
+            .map(|record| {
+                Ok(GarfieldLdCompressionRecord {
+                    kept_global_row: map_row(record.kept_global_row)?,
+                    dropped_global_row: map_row(record.dropped_global_row)?,
+                    r2: record.r2,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+    };
+    Ok((
+        Max6PreparedUnitMetadata {
+            original_unit_index,
+            label: unit.label,
+            spans: unit.spans,
+        },
+        prepared,
+    ))
+}
+
+fn process_max6_stream_window_batch(
+    tasks: &mut Vec<Max6StreamWindowTask>,
+    sample_indices: &[usize],
+    row_words: usize,
+    n_samples: usize,
+    ld_tag_r2: f64,
+    pool: Option<&rayon::ThreadPool>,
+    units: &mut Vec<Max6PreparedUnitMetadata>,
+    screen_units: &mut Vec<Max6GrmMax6LdPreparedUnit>,
+    original_unit_indices: &mut Vec<usize>,
+    active_source_rows: &mut Vec<usize>,
+    window_pair_count: &mut usize,
+    any_eligible_unit: &mut bool,
+) -> Result<(), String> {
+    if tasks.is_empty() {
+        return Ok(());
+    }
+    let batch = std::mem::take(tasks);
+    let results = if let Some(pool) = pool {
+        pool.install(|| {
+            batch
+                .into_par_iter()
+                .map(|task| {
+                    select_max6_stream_window_task(
+                        task,
+                        sample_indices,
+                        row_words,
+                        n_samples,
+                        ld_tag_r2,
+                    )
+                })
+                .collect::<Result<Vec<_>, String>>()
+        })?
+    } else {
+        batch
+            .into_iter()
+            .map(|task| {
+                select_max6_stream_window_task(
+                    task,
+                    sample_indices,
+                    row_words,
+                    n_samples,
+                    ld_tag_r2,
+                )
+            })
+            .collect::<Result<Vec<_>, String>>()?
+    };
+    for (metadata, prepared) in results {
+        *any_eligible_unit |= prepared.selected_global_rows.len() >= 2;
+        *window_pair_count = window_pair_count.saturating_add(
+            prepared
+                .selected_global_rows
+                .len()
+                .saturating_mul(prepared.selected_global_rows.len().saturating_sub(1))
+                / 2,
+        );
+        active_source_rows.extend(prepared.selected_global_rows.iter().copied());
+        original_unit_indices.push(metadata.original_unit_index);
+        units.push(metadata);
+        screen_units.push(prepared);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_max6_stream_windows(
+    state: &mut Max6StreamWindowState,
+    max_bp: i32,
+    at_chromosome_end: bool,
+    extension: usize,
+    step: usize,
+    scan_bimranges: &[GarfieldScanBimRange],
+    next_original_unit_index: &mut usize,
+    distinct_window_count: &mut usize,
+    selected_window_count: &mut usize,
+    tasks: &mut Vec<Max6StreamWindowTask>,
+    task_batch_bytes: &mut usize,
+    max_task_batch_bytes: &mut usize,
+) -> Result<(), String> {
+    if state.done {
+        return Ok(());
+    }
+    let extension_i64 = extension.max(1) as i64;
+    let step_i64 = step.max(1) as i64;
+    loop {
+        let right_unclipped = state.next_center.saturating_add(extension_i64);
+        if !at_chromosome_end && i64::from(max_bp) <= right_unclipped {
+            break;
+        }
+        let left = state
+            .next_center
+            .saturating_sub(extension_i64)
+            .max(i64::from(state.min_bp));
+        let right = if at_chromosome_end {
+            right_unclipped.min(i64::from(max_bp))
+        } else {
+            right_unclipped
+        };
+        let rows = state
+            .rows
+            .iter()
+            .filter(|row| i64::from(row.pos) >= left && i64::from(row.pos) <= right)
+            .collect::<Vec<_>>();
+        if let (Some(first), Some(last)) = (rows.first(), rows.last()) {
+            let signature = (first.qc_index, last.qc_index, rows.len());
+            if state.previous_signature != Some(signature) {
+                let bp_start = clamp_i64_to_i32(left);
+                let bp_end = clamp_i64_to_i32(right);
+                let unit = GarfieldLogicUnit {
+                    label: format!("{}:{}-{}", state.chrom, bp_start, bp_end),
+                    indices: Vec::new(),
+                    spans: vec![GarfieldUnitSpan {
+                        chrom: state.chrom.clone(),
+                        bp_start,
+                        bp_end,
+                    }],
+                };
+                *distinct_window_count = distinct_window_count.saturating_add(1);
+                if scan_bimranges.is_empty() || unit_overlaps_scan_bimranges(&unit, scan_bimranges)
+                {
+                    let row_words = rows
+                        .first()
+                        .and_then(|row| row.logic_words.as_ref())
+                        .map_or(0, Vec::len);
+                    if row_words == 0 {
+                        return Err(format!(
+                            "selected streamed window '{}' has no packed genotype rows",
+                            unit.label
+                        ));
+                    }
+                    let mut source_rows = Vec::with_capacity(rows.len());
+                    let mut logic_words = Vec::with_capacity(rows.len().saturating_mul(row_words));
+                    let mut support = Vec::with_capacity(rows.len());
+                    let block_count = row_words.div_ceil(garfield_ld_block_words());
+                    let mut block_support =
+                        Vec::with_capacity(rows.len().saturating_mul(block_count));
+                    for row in rows.iter() {
+                        let words = row.logic_words.as_ref().ok_or_else(|| {
+                            format!(
+                                "selected streamed window '{}' includes unpacked source row {}",
+                                unit.label, row.source_row
+                            )
+                        })?;
+                        if words.len() != row_words {
+                            return Err(format!(
+                                "streamed Max6 window '{}' contains inconsistent row widths",
+                                unit.label
+                            ));
+                        }
+                        source_rows.push(row.source_row);
+                        logic_words.extend_from_slice(words);
+                        if let Some(row_support) = row.support {
+                            support.push(row_support);
+                        }
+                        if let Some(row_blocks) = row.block_support.as_ref() {
+                            block_support.extend_from_slice(row_blocks);
+                        }
+                    }
+                    let task_bytes = logic_words
+                        .len()
+                        .saturating_mul(std::mem::size_of::<u64>())
+                        .saturating_add(
+                            block_support
+                                .len()
+                                .saturating_mul(std::mem::size_of::<u16>()),
+                        )
+                        .saturating_add(support.len().saturating_mul(std::mem::size_of::<u32>()));
+                    *task_batch_bytes = task_batch_bytes.saturating_add(task_bytes);
+                    *max_task_batch_bytes = (*max_task_batch_bytes).max(*task_batch_bytes);
+                    tasks.push(Max6StreamWindowTask {
+                        original_unit_index: *next_original_unit_index,
+                        unit,
+                        source_rows,
+                        logic_words,
+                        support,
+                        block_support,
+                    });
+                    *selected_window_count = selected_window_count.saturating_add(1);
+                }
+                *next_original_unit_index = next_original_unit_index.saturating_add(1);
+                state.previous_signature = Some(signature);
+            }
+        }
+
+        if at_chromosome_end && i64::from(max_bp) <= state.next_center {
+            state.done = true;
+            break;
+        }
+        let next_center = state.next_center.saturating_add(step_i64);
+        if next_center > i64::from(i32::MAX) {
+            state.done = true;
+            break;
+        }
+        state.next_center = next_center;
+        let keep_from = state
+            .next_center
+            .saturating_sub(extension_i64)
+            .max(i64::from(state.min_bp));
+        while state
+            .rows
+            .front()
+            .is_some_and(|row| i64::from(row.pos) < keep_from)
+        {
+            state.rows.pop_front();
+        }
+    }
+    if at_chromosome_end {
+        state.rows.clear();
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_max6_window_streamed_ld(
+    prefix: &str,
+    sample_ids: &[String],
+    sample_indices: &[usize],
+    extension: usize,
+    step: Option<usize>,
+    scan_bimranges: &[GarfieldScanBimRange],
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
+    threads: usize,
+    ld_tag_r2: f64,
+    mem_tracker: Option<&GarfieldStageMemoryTracker>,
+) -> Result<Max6WindowStreamLdPrep, String> {
+    if !(0.0..=0.5).contains(&maf_threshold) {
+        return Err("maf_threshold must be within [0, 0.5]".to_string());
+    }
+    if !(0.0..=1.0).contains(&max_missing_rate) {
+        return Err("max_missing_rate must be within [0, 1.0]".to_string());
+    }
+    if !(0.0..=1.0).contains(&het_threshold) {
+        return Err("het_threshold must be within [0, 1.0]".to_string());
+    }
+    if sample_ids.is_empty() || sample_ids.len() != sample_indices.len() {
+        return Err(format!(
+            "Max6 window stream requires matching nonempty sample IDs/indices; got {}/{}",
+            sample_ids.len(),
+            sample_indices.len()
+        ));
+    }
+    validate_max6_ld_tag_r2(ld_tag_r2)?;
+
+    let mut source = Max6WindowRangeSource::new(prefix, scan_bimranges)?;
+    let source_marker_count = source.n_source_rows;
+    let n_samples_total = source.bed.n_samples();
+    if sample_indices.iter().any(|&index| index >= n_samples_total) {
+        return Err("selected sample index out of range for Max6 window stream".to_string());
+    }
+    let n_samples = sample_indices.len();
+    let row_words = words_for_samples(n_samples);
+    let bytes_per_variant = source.bed.bytes_per_snp();
+    let sample_identity =
+        n_samples == n_samples_total && sample_indices_are_identity(sample_indices);
+    let sample_plan = build_logic_sample_plan(sample_indices);
+    let prep_threads = effective_threads_local(threads).max(1);
+    let pool = if prep_threads > 1 {
+        crate::stats_common::get_cached_pool(prep_threads).map_err(|error| error.to_string())?
+    } else {
+        None
+    };
+
+    let mut global_site_keep = vec![false; source_marker_count];
+    let mut fail_missing = 0usize;
+    let mut fail_het = 0usize;
+    let mut fail_no_non_missing = 0usize;
+    let mut fail_maf = 0usize;
+    let mut fail_non_simple_snp = 0usize;
+    let mut het_sites = 0usize;
+    let mut raw_missing_sites = 0usize;
+    let mut qc_row_count = 0usize;
+    let mut distinct_window_count = 0usize;
+    let mut selected_window_count = 0usize;
+    let mut max_active_rows = 0usize;
+    let mut max_task_batch_bytes = 0usize;
+    let extension_bp = (extension.max(1) as i64).saturating_mul(2);
+    let in_pack_scope = |site: &SiteInfo| {
+        scan_bimranges.is_empty()
+            || scan_bimranges.iter().any(|range| {
+                if !same_normalized_chrom(site.chrom.as_str(), range.chrom.as_str()) {
+                    return false;
+                }
+                let start = i64::from(range.bp_start)
+                    .saturating_sub(extension_bp)
+                    .max(0);
+                let end = i64::from(range.bp_end)
+                    .saturating_add(extension_bp)
+                    .min(i64::from(i32::MAX));
+                (i64::from(site.pos) >= start) && (i64::from(site.pos) <= end)
+            })
+    };
+    let extension_eff = extension.max(1);
+    let step_eff = step.unwrap_or((extension_eff / 2).max(1)).max(1);
+    let worker_count = pool
+        .as_ref()
+        .map_or(1, |pool| pool.current_num_threads())
+        .max(1);
+    let task_batch_limit = worker_count.saturating_mul(2).max(1);
+    let task_batch_byte_limit = 64usize * 1024 * 1024;
+    let support_cache_required = ld_tag_r2 < 1.0;
+    let support_block_words = garfield_ld_block_words();
+    let support_block_count = row_words.div_ceil(support_block_words);
+    let mut tasks = Vec::<Max6StreamWindowTask>::new();
+    let mut task_batch_bytes = 0usize;
+    let train_indices = (0..n_samples).collect::<Vec<_>>();
+    let mut units = Vec::<Max6PreparedUnitMetadata>::new();
+    let mut screen_units = Vec::<Max6GrmMax6LdPreparedUnit>::new();
+    let mut original_unit_indices = Vec::<usize>::new();
+    let mut active_source_rows = Vec::<usize>::new();
+    let mut window_pair_count = 0usize;
+    let mut any_eligible_unit = false;
+    let mut next_original_unit_index = 0usize;
+    let mut next_qc_index = 0usize;
+    let mut window_state: Option<Max6StreamWindowState> = None;
+    let mut seen_qc_chromosomes = HashSet::<String>::new();
+    let mut chrom_pool = HashMap::<String, Arc<str>>::new();
+    let mut unsupported_order = false;
+
+    crate::pipeline::run_double_buffer(
+        2,
+        || Max6WindowStreamChunk::new(MAX6_WINDOW_STREAM_CHUNK_ROWS, bytes_per_variant, row_words),
+        |chunk| match source.fill_chunk(chunk) {
+            Ok(more) => more,
+            Err(error) => {
+                chunk.clear();
+                chunk.error = Some(error);
+                false
+            }
+        },
+        |chunk| {
+            if let Some(error) = chunk.error.take() {
+                return Err(error);
+            }
+            let rows = chunk.sites.len();
+            if rows == 0 {
+                return Ok(());
+            }
+            let required_words = rows
+                .checked_mul(row_words)
+                .ok_or_else(|| "Max6 window logic chunk size overflow".to_string())?;
+            chunk.logic_bits.resize(required_words, 0);
+            chunk.logic_bits.fill(0);
+            chunk.qc.resize(rows, Max6FusedRowQc::default());
+            let qc_batch = &mut chunk.qc;
+            let row_bits = &mut chunk.logic_bits;
+            let sites = &chunk.sites;
+            let packed_genotypes = &chunk.packed_genotypes;
+            let mut process_rows = || {
+                row_bits
+                    .par_chunks_mut(row_words)
+                    .zip(qc_batch.par_iter_mut())
+                    .enumerate()
+                    .for_each_init(
+                        || vec![0u64; row_words],
+                        |missing_words, (offset, (dst_words, qc_dst))| {
+                            let site = &sites[offset];
+                            let row_start = offset * bytes_per_variant;
+                            let row = &packed_genotypes[row_start..row_start + bytes_per_variant];
+                            let simple_snp_alleles = !snps_only
+                                || (is_simple_snp_allele(&site.ref_allele)
+                                    && is_simple_snp_allele(&site.alt_allele));
+                            *qc_dst = scan_max6_row_qc_and_pack_logic(
+                                row,
+                                n_samples,
+                                sample_identity,
+                                sample_plan.as_slice(),
+                                maf_threshold,
+                                max_missing_rate,
+                                simple_snp_alleles,
+                                dst_words,
+                                missing_words.as_mut_slice(),
+                            );
+                        },
+                    );
+            };
+            if let Some(pool) = pool.as_ref() {
+                pool.install(process_rows);
+            } else {
+                process_rows();
+            }
+            check_ctrlc()?;
+
+            for offset in 0..rows {
+                let qc = chunk.qc[offset];
+                let source_row = chunk.source_rows[offset];
+                if qc.keep {
+                    global_site_keep[source_row] = true;
+                    let site = &chunk.sites[offset];
+                    let chrom_key = normalize_chrom(site.chrom.as_str());
+                    let chrom = chrom_pool
+                        .entry(chrom_key.clone())
+                        .or_insert_with(|| Arc::<str>::from(chrom_key.as_str()))
+                        .clone();
+                    let is_in_scope = in_pack_scope(site);
+                    let source_words =
+                        &chunk.logic_bits[offset * row_words..(offset + 1) * row_words];
+                    let (logic_words, support, block_support) = if is_in_scope {
+                        let words = source_words.to_vec();
+                        if support_cache_required {
+                            let mut blocks = vec![0u16; support_block_count];
+                            let support = fill_ld_block_supports(
+                                words.as_slice(),
+                                support_block_words,
+                                blocks.as_mut_slice(),
+                            );
+                            (
+                                Some(words),
+                                Some(u32::try_from(support).unwrap_or(u32::MAX)),
+                                Some(blocks),
+                            )
+                        } else {
+                            (Some(words), None, None)
+                        }
+                    } else {
+                        (None, None, None)
+                    };
+                    let row = Max6StreamWindowRow {
+                        qc_index: next_qc_index,
+                        source_row,
+                        pos: site.pos,
+                        logic_words,
+                        support,
+                        block_support,
+                    };
+                    next_qc_index = next_qc_index.saturating_add(1);
+                    qc_row_count = qc_row_count.saturating_add(1);
+                    match window_state.as_mut() {
+                        Some(state) if state.chrom == chrom.as_ref() => {
+                            if site.pos < state.last_bp {
+                                unsupported_order = true;
+                                return Err(MAX6_WINDOW_STREAM_UNSUPPORTED_ORDER.to_string());
+                            }
+                            state.last_bp = site.pos;
+                            state.rows.push_back(row);
+                        }
+                        Some(state) => {
+                            if seen_qc_chromosomes.contains(chrom.as_ref()) {
+                                unsupported_order = true;
+                                return Err(MAX6_WINDOW_STREAM_UNSUPPORTED_ORDER.to_string());
+                            }
+                            emit_max6_stream_windows(
+                                state,
+                                state.last_bp,
+                                true,
+                                extension_eff,
+                                step_eff,
+                                scan_bimranges,
+                                &mut next_original_unit_index,
+                                &mut distinct_window_count,
+                                &mut selected_window_count,
+                                &mut tasks,
+                                &mut task_batch_bytes,
+                                &mut max_task_batch_bytes,
+                            )?;
+                            seen_qc_chromosomes.insert(state.chrom.clone());
+                            window_state = Some(Max6StreamWindowState {
+                                chrom: chrom.to_string(),
+                                min_bp: site.pos,
+                                last_bp: site.pos,
+                                next_center: i64::from(site.pos),
+                                rows: VecDeque::new(),
+                                previous_signature: None,
+                                done: false,
+                            });
+                            window_state
+                                .as_mut()
+                                .expect("new Max6 window state was inserted")
+                                .rows
+                                .push_back(row);
+                        }
+                        None => {
+                            if seen_qc_chromosomes.contains(chrom.as_ref()) {
+                                unsupported_order = true;
+                                return Err(MAX6_WINDOW_STREAM_UNSUPPORTED_ORDER.to_string());
+                            }
+                            window_state = Some(Max6StreamWindowState {
+                                chrom: chrom.to_string(),
+                                min_bp: site.pos,
+                                last_bp: site.pos,
+                                next_center: i64::from(site.pos),
+                                rows: VecDeque::new(),
+                                previous_signature: None,
+                                done: false,
+                            });
+                            window_state
+                                .as_mut()
+                                .expect("new Max6 window state was inserted")
+                                .rows
+                                .push_back(row);
+                        }
+                    }
+                    if let Some(state) = window_state.as_mut() {
+                        max_active_rows = max_active_rows.max(state.rows.len());
+                        emit_max6_stream_windows(
+                            state,
+                            site.pos,
+                            false,
+                            extension_eff,
+                            step_eff,
+                            scan_bimranges,
+                            &mut next_original_unit_index,
+                            &mut distinct_window_count,
+                            &mut selected_window_count,
+                            &mut tasks,
+                            &mut task_batch_bytes,
+                            &mut max_task_batch_bytes,
+                        )?;
+                    }
+                    let should_flush = tasks.len() >= task_batch_limit
+                        || task_batch_bytes >= task_batch_byte_limit;
+                    if should_flush {
+                        process_max6_stream_window_batch(
+                            &mut tasks,
+                            train_indices.as_slice(),
+                            row_words,
+                            n_samples,
+                            ld_tag_r2,
+                            pool.as_deref(),
+                            &mut units,
+                            &mut screen_units,
+                            &mut original_unit_indices,
+                            &mut active_source_rows,
+                            &mut window_pair_count,
+                            &mut any_eligible_unit,
+                        )?;
+                        task_batch_bytes = 0;
+                    }
+                } else {
+                    match qc.reason {
+                        MAX6_FUSED_QC_FAIL_MISSING => fail_missing += 1,
+                        MAX6_FUSED_QC_FAIL_HET => fail_het += 1,
+                        MAX6_FUSED_QC_FAIL_NO_HOMOZYGOUS => fail_no_non_missing += 1,
+                        MAX6_FUSED_QC_FAIL_MAF => fail_maf += 1,
+                        MAX6_FUSED_QC_FAIL_NON_SIMPLE_SNP => fail_non_simple_snp += 1,
+                        _ => {}
+                    }
+                }
+                if qc.has_het {
+                    het_sites += 1;
+                }
+                if qc.has_raw_missing {
+                    raw_missing_sites += 1;
+                }
+            }
+            if let Some(tracker) = mem_tracker {
+                tracker.sample_now();
+            }
+            Ok(())
+        },
+    )
+    .map_err(|error| {
+        if unsupported_order {
+            MAX6_WINDOW_STREAM_UNSUPPORTED_ORDER.to_string()
+        } else {
+            error
+        }
+    })?;
+
+    if let Some(state) = window_state.as_mut() {
+        emit_max6_stream_windows(
+            state,
+            state.last_bp,
+            true,
+            extension_eff,
+            step_eff,
+            scan_bimranges,
+            &mut next_original_unit_index,
+            &mut distinct_window_count,
+            &mut selected_window_count,
+            &mut tasks,
+            &mut task_batch_bytes,
+            &mut max_task_batch_bytes,
+        )?;
+    }
+    process_max6_stream_window_batch(
+        &mut tasks,
+        train_indices.as_slice(),
+        row_words,
+        n_samples,
+        ld_tag_r2,
+        pool.as_deref(),
+        &mut units,
+        &mut screen_units,
+        &mut original_unit_indices,
+        &mut active_source_rows,
+        &mut window_pair_count,
+        &mut any_eligible_unit,
+    )?;
+
+    if qc_row_count == 0 {
+        if !scan_bimranges.is_empty() && source.seen_selected_chroms.is_empty() {
+            return Err("--bimrange matched no BIM/PVAR chromosomes".to_string());
+        }
+        return Err(format_zero_sites_pure_line_error(
+            n_samples,
+            n_samples_total,
+            source_marker_count,
+            maf_threshold,
+            max_missing_rate,
+            het_threshold,
+            snps_only,
+            fail_missing,
+            fail_het,
+            fail_no_non_missing,
+            fail_maf,
+            fail_non_simple_snp,
+            het_sites,
+            raw_missing_sites,
+        ));
+    }
+    if selected_window_count == 0 {
+        return Err(if scan_bimranges.is_empty() {
+            "no scan units were built from the globally QC-passing markers".to_string()
+        } else {
+            "--bimrange matched no Max6 scan units".to_string()
+        });
+    }
+    if !any_eligible_unit {
+        return Err("Max6 scan found no eligible LD-tag unit with at least two markers".into());
+    }
+    active_source_rows.sort_unstable();
+    active_source_rows.dedup();
+    if active_source_rows.len() < 2 {
+        return Err("Max6 streamed LD selection produced fewer than two active markers".into());
+    }
+    if units.len() != screen_units.len() || units.len() != original_unit_indices.len() {
+        return Err("streamed Max6 window unit metadata lengths disagree".to_string());
+    }
+    Ok(Max6WindowStreamLdPrep {
+        global_site_keep,
+        units,
+        screen_units,
+        original_unit_indices,
+        active_source_rows,
+        source_marker_count,
+        window_pair_count,
+        qc_row_count,
+        distinct_window_count,
+        selected_window_count,
+        max_active_rows,
+        max_task_batch_bytes,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -20486,6 +21297,85 @@ fn prepare_max6_genotype_tags_owned(
         build_max6_prepared_input_fingerprint(prefix.as_str(), sample_ids.clone(), &config)?;
 
     let stream_window = matches!(unit_kind_lc.as_str(), "" | "window");
+    if stream_window {
+        let fused_phase = prep_profiler.start_phase();
+        let stream_result = prepare_max6_window_streamed_ld(
+            prefix.as_str(),
+            sample_ids.as_slice(),
+            sample_indices.as_slice(),
+            extension,
+            step,
+            parsed_scan_bimranges.as_slice(),
+            maf_threshold,
+            max_missing_rate,
+            het_threshold,
+            snps_only,
+            effective_threads_local(threads),
+            ld_tag_r2,
+            if prep_profiler.enabled() {
+                Some(fused_phase.tracker())
+            } else {
+                None
+            },
+        );
+        let detail = match stream_result.as_ref() {
+            Ok(prepared) => format!(
+                "source_markers={} qc_rows={} windows={} selected_windows={} active_tags={} pair_occurrences={} max_active_rows={} max_batch_bytes={} threads={} storage=bounded_window",
+                prepared.source_marker_count,
+                prepared.qc_row_count,
+                prepared.distinct_window_count,
+                prepared.selected_window_count,
+                prepared.active_source_rows.len(),
+                prepared.window_pair_count,
+                prepared.max_active_rows,
+                prepared.max_task_batch_bytes,
+                effective_threads_local(threads)
+            ),
+            Err(error) if error == MAX6_WINDOW_STREAM_UNSUPPORTED_ORDER => {
+                "input_order=unsupported; retrying compatibility stream".to_string()
+            }
+            Err(_) => "status=error".to_string(),
+        };
+        prep_profiler.finish_phase(fused_phase, "streamed_window_qc_ld", detail.as_str());
+        match stream_result {
+            Ok(prepared) => {
+                let metadata_phase = prep_profiler.start_phase();
+                let compact_tag_sites_result = read_compact_max6_bim_rows(
+                    prefix.as_str(),
+                    prepared.source_marker_count,
+                    prepared.active_source_rows.as_slice(),
+                );
+                let metadata_detail = match compact_tag_sites_result.as_ref() {
+                    Ok(sites) => format!(
+                        "requested_rows={} loaded_rows={}",
+                        prepared.active_source_rows.len(),
+                        sites.len()
+                    ),
+                    Err(_) => "status=error".to_string(),
+                };
+                prep_profiler.finish_phase(
+                    metadata_phase,
+                    "tag_metadata_bim_read",
+                    metadata_detail.as_str(),
+                );
+                let active_source_sites = Arc::new(compact_tag_sites_result?);
+                return Ok(Max6PreparedGenotypeTags {
+                    input_fingerprint,
+                    unit_kind: unit_kind_lc,
+                    units: prepared.units,
+                    screen_units: prepared.screen_units,
+                    original_unit_indices: prepared.original_unit_indices,
+                    active_source_rows: prepared.active_source_rows,
+                    active_source_sites,
+                    source_marker_count: prepared.source_marker_count,
+                    window_pair_count: prepared.window_pair_count,
+                    global_site_keep: prepared.global_site_keep,
+                });
+            }
+            Err(error) if error == MAX6_WINDOW_STREAM_UNSUPPORTED_ORDER => {}
+            Err(error) => return Err(error),
+        }
+    }
     let fused_phase = prep_profiler.start_phase();
     let (global_site_keep, global_qc_source_rows, logic_bits, window_layout) = if stream_window {
         let stream_result = prepare_max6_window_stream(
@@ -26809,12 +27699,17 @@ fn garfield_logic_search_bed_owned(
     } else {
         None
     };
+    let logic_bits_progress_detail = if prepared_max6_universe.is_some() {
+        "packing LD-selected tag genotypes for screen/rerank"
+    } else {
+        "packing QC genotypes for screen/rerank"
+    };
     garfield_stage_progress_notify(
         progress_callback.as_ref(),
         "garfield_logic_bits",
         0,
         1,
-        Some("packing QC genotypes for screen/rerank"),
+        Some(logic_bits_progress_detail),
     )
     .map_err(|error| error.to_string())?;
     let global_bits_mem_tracker = GarfieldStageMemoryTracker::new(rss_debug_enabled);
@@ -36710,6 +37605,228 @@ mod tests {
             None,
         )
         .unwrap();
+
+        let train_indices = (0..sample_ids.len()).collect::<Vec<_>>();
+        let remap_units = |units: &[Max6GrmMax6LdPreparedUnit], source_rows: &[usize]| {
+            units
+                .iter()
+                .map(|unit| Max6GrmMax6LdPreparedUnit {
+                    selected_global_rows: unit
+                        .selected_global_rows
+                        .iter()
+                        .map(|&row| source_rows[row])
+                        .collect(),
+                    pair_groups: unit.pair_groups.clone(),
+                    ld_compression: unit
+                        .ld_compression
+                        .iter()
+                        .map(|record| GarfieldLdCompressionRecord {
+                            kept_global_row: source_rows[record.kept_global_row],
+                            dropped_global_row: source_rows[record.dropped_global_row],
+                            r2: record.r2,
+                        })
+                        .collect(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let remap_active_rows = |rows: &[usize], source_rows: &[usize]| {
+            let mut mapped = rows.iter().map(|&row| source_rows[row]).collect::<Vec<_>>();
+            mapped.sort_unstable();
+            mapped.dedup();
+            mapped
+        };
+        for ld_tag_r2 in [1.0, 0.80] {
+            let streamed_full = prepare_max6_window_streamed_ld(
+                prefix.to_str().unwrap(),
+                sample_ids.as_slice(),
+                sample_indices.as_slice(),
+                500,
+                Some(250),
+                &[],
+                0.01,
+                0.0,
+                1.0,
+                false,
+                2,
+                ld_tag_r2,
+                None,
+            )
+            .unwrap();
+            let full_reference = prepare_max6_screen_selection(
+                &full_stream.logic_bits,
+                full_stream.units.as_slice(),
+                &(0..full_stream.units.len()).collect::<Vec<_>>(),
+                "window",
+                train_indices.as_slice(),
+                None,
+                None,
+                ld_tag_r2,
+            )
+            .unwrap();
+            assert_eq!(
+                streamed_full
+                    .units
+                    .iter()
+                    .map(|unit| unit.original_unit_index)
+                    .collect::<Vec<_>>(),
+                full_reference.original_unit_indices
+            );
+            assert_eq!(
+                streamed_full.screen_units,
+                remap_units(
+                    &full_reference.units,
+                    full_stream.packed_source_rows.as_slice()
+                )
+            );
+            assert_eq!(
+                streamed_full.active_source_rows,
+                remap_active_rows(
+                    full_reference.active_rows.as_slice(),
+                    full_stream.packed_source_rows.as_slice()
+                )
+            );
+            assert_eq!(
+                streamed_full.window_pair_count,
+                full_reference.window_pair_count
+            );
+            assert_eq!(streamed_full.global_site_keep, full_stream.global_site_keep);
+            assert_eq!(
+                streamed_full
+                    .units
+                    .iter()
+                    .map(|unit| unit.label.as_str())
+                    .collect::<Vec<_>>(),
+                full_stream
+                    .units
+                    .iter()
+                    .map(|unit| unit.label.as_str())
+                    .collect::<Vec<_>>()
+            );
+
+            let streamed_range = prepare_max6_window_streamed_ld(
+                prefix.to_str().unwrap(),
+                sample_ids.as_slice(),
+                sample_indices.as_slice(),
+                500,
+                Some(250),
+                scan_ranges.as_slice(),
+                0.01,
+                0.0,
+                1.0,
+                false,
+                2,
+                ld_tag_r2,
+                None,
+            )
+            .unwrap();
+            let range_reference = prepare_max6_screen_selection(
+                &range_stream.logic_bits,
+                range_stream.units.as_slice(),
+                &(0..range_stream.units.len()).collect::<Vec<_>>(),
+                "window",
+                train_indices.as_slice(),
+                None,
+                None,
+                ld_tag_r2,
+            )
+            .unwrap();
+            let expected_range_indices = range_reference
+                .original_unit_indices
+                .iter()
+                .map(|&index| range_stream.source_unit_indices[index])
+                .collect::<Vec<_>>();
+            assert_eq!(
+                streamed_range
+                    .units
+                    .iter()
+                    .map(|unit| unit.original_unit_index)
+                    .collect::<Vec<_>>(),
+                expected_range_indices
+            );
+            assert_eq!(
+                streamed_range.screen_units,
+                remap_units(
+                    &range_reference.units,
+                    range_stream.packed_source_rows.as_slice()
+                )
+            );
+            assert_eq!(
+                streamed_range.active_source_rows,
+                remap_active_rows(
+                    range_reference.active_rows.as_slice(),
+                    range_stream.packed_source_rows.as_slice()
+                )
+            );
+            assert_eq!(
+                streamed_range.window_pair_count,
+                range_reference.window_pair_count
+            );
+            assert!(streamed_range
+                .global_site_keep
+                .iter()
+                .enumerate()
+                .all(|(row, &keep)| keep == (row < 80 && full_keep[row])));
+            assert_eq!(streamed_range.selected_window_count, selected_full.len());
+        }
+
+        let streamed_default = prepare_max6_window_streamed_ld(
+            prefix.to_str().unwrap(),
+            sample_ids.as_slice(),
+            sample_indices.as_slice(),
+            500,
+            Some(250),
+            &[],
+            0.01,
+            0.0,
+            1.0,
+            false,
+            2,
+            GARFIELD_MAX6_LD_TAG_R2_DEFAULT,
+            None,
+        )
+        .unwrap();
+        let production_tags = prepare_max6_genotype_tags_owned(
+            prefix.to_string_lossy().into_owned(),
+            sample_ids.clone(),
+            sample_indices.clone(),
+            String::new(),
+            None,
+            None,
+            500,
+            Some(250),
+            None,
+            0.01,
+            0.0,
+            1.0,
+            false,
+            2,
+            0,
+            GARFIELD_MAX6_LD_TAG_R2_DEFAULT,
+        )
+        .unwrap();
+        assert_eq!(production_tags.global_site_keep, full_keep);
+        assert_eq!(
+            production_tags
+                .units
+                .iter()
+                .map(|unit| unit.original_unit_index)
+                .collect::<Vec<_>>(),
+            streamed_default
+                .units
+                .iter()
+                .map(|unit| unit.original_unit_index)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(production_tags.screen_units, streamed_default.screen_units);
+        assert_eq!(
+            production_tags.active_source_rows,
+            streamed_default.active_source_rows
+        );
+        assert_eq!(
+            production_tags.window_pair_count,
+            streamed_default.window_pair_count
+        );
+
         assert_eq!(range_stream.source_unit_indices, selected_full);
         assert_eq!(range_stream.units.len(), selected_full.len());
         assert!(range_stream

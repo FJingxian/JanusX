@@ -1621,7 +1621,7 @@ class _GarfieldStageProgress:
         if stage == "garfield_projection":
             return "Building exact GRM projection"
         if stage == "garfield_logic_bits":
-            return "Packing genotype bitsets"
+            return "Preparing scan genotype bitsets"
         if stage == "max6_setup_margins":
             return "Preparing Max6 marker margins"
         if stage == "max6_setup_ld_tags":

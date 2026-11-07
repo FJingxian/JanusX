@@ -48,8 +48,8 @@ use memmap2::Mmap;
 use std::fs::File;
 
 use crate::reml::{
-    final_beta_se_with_workspace, ml_loglike, reml_brent_minimize_with_workspace,
-    run_rotated_assoc_block_f32, RemlWorkspace,
+    final_beta_se_with_workspace, ml_loglike, ml_loglike_with_workspace,
+    reml_brent_minimize_with_workspace, run_rotated_assoc_block_f32, MlWorkspace, RemlWorkspace,
 };
 
 struct RotatedRemlAssocState {
@@ -81,6 +81,7 @@ impl RotatedRemlWarmStartState {
 struct RotatedLmm2AssocState {
     snp_vec: Vec<f64>,
     reml_workspace: RemlWorkspace,
+    ml_workspace: MlWorkspace,
 }
 
 #[inline]
@@ -469,6 +470,7 @@ fn run_rotated_lmm2_assoc_block_f32(
         || RotatedLmm2AssocState {
             snp_vec: vec![0.0_f64; n],
             reml_workspace: RemlWorkspace::new(p_cov + 1),
+            ml_workspace: MlWorkspace::new(p_cov + 1),
         },
         |_, row, state, out_row| {
             let snp_ssq = copy_rotated_snp_row_to_f64(row, &mut state.snp_vec);
@@ -517,7 +519,18 @@ fn run_rotated_lmm2_assoc_block_f32(
             // the per-marker result.
             let ml_init_guess = Some(best_log10_lbd_reml);
             let (best_log10_lbd_ml, best_ml_cost) = brent_minimize_with_init(
-                |x| -ml_loglike(x, s, xcov_flat, y, Some(&state.snp_vec[..]), n, p_cov),
+                |x| {
+                    -ml_loglike_with_workspace(
+                        x,
+                        s,
+                        xcov_flat,
+                        y,
+                        Some(&state.snp_vec[..]),
+                        n,
+                        p_cov,
+                        &mut state.ml_workspace,
+                    )
+                },
                 low,
                 high,
                 tol,

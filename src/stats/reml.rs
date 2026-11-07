@@ -893,6 +893,45 @@ fn checked_projected_residual_ss(weighted_y_ss: f64, beta: &[f64], rhs: &[f64]) 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn ml_weighted_residual_ss(
+    weighted_y_ss: f64,
+    beta: &[f64],
+    rhs: &[f64],
+    projection_well_conditioned: bool,
+    s: &[f64],
+    lambda: f64,
+    xcov: &[f64],
+    y: &[f64],
+    snp: Option<&[f64]>,
+    n: usize,
+    p_cov: usize,
+) -> f64 {
+    let dim = p_cov + usize::from(snp.is_some());
+    if projection_well_conditioned && beta.len() == dim && rhs.len() == dim {
+        if let Some(residual_ss) = checked_projected_residual_ss(weighted_y_ss, beta, rhs) {
+            return residual_ss;
+        }
+    }
+
+    let snp = snp.unwrap_or(&[]);
+    let mut residual_ss = 0.0;
+    for i in 0..n {
+        let mut fitted = 0.0;
+        for r in 0..dim {
+            let xr = if r < p_cov {
+                xcov[i * p_cov + r]
+            } else {
+                snp[i]
+            };
+            fitted += xr * beta[r];
+        }
+        let residual = y[i] - fitted;
+        residual_ss += residual * residual / (s[i] + lambda);
+    }
+    residual_ss
+}
+
 #[inline]
 fn normalized_cholesky_is_well_conditioned(
     factor: &[f64],
@@ -1130,6 +1169,287 @@ pub(crate) fn ml_loglike(
         -1e8
     } else {
         ml
+    }
+}
+
+/// Scratch storage for repeatedly evaluating a per-marker ML objective.
+///
+/// LMM2 invokes the ML objective many times per SNP during Brent refinement.
+/// Keeping these vectors with the Rayon worker avoids allocating them for
+/// every objective evaluation; the scorer also guards its projected residual
+/// calculation and falls back to direct residual accumulation when needed.
+pub(crate) struct MlWorkspace {
+    xtv_inv_x: Vec<f64>,
+    xtv_inv_y: Vec<f64>,
+    beta: Vec<f64>,
+}
+
+impl MlWorkspace {
+    pub(crate) fn new(dim: usize) -> Self {
+        Self {
+            xtv_inv_x: vec![0.0; dim.saturating_mul(dim)],
+            xtv_inv_y: vec![0.0; dim],
+            beta: vec![0.0; dim],
+        }
+    }
+
+    fn ensure_dim(&mut self, dim: usize) {
+        let gram_len = dim.saturating_mul(dim);
+        if self.xtv_inv_x.len() != gram_len {
+            self.xtv_inv_x.resize(gram_len, 0.0);
+        }
+        if self.xtv_inv_y.len() != dim {
+            self.xtv_inv_y.resize(dim, 0.0);
+        }
+        if self.beta.len() != dim {
+            self.beta.resize(dim, 0.0);
+        }
+    }
+}
+
+/// Accumulate the weighted ML sufficient statistics for a compile-time fixed
+/// number of covariates and one marker column.
+#[inline]
+fn accumulate_ml_weighted_stats_fixed<const P_COV: usize>(
+    s: &[f64],
+    xcov: &[f64],
+    y: &[f64],
+    snp: &[f64],
+    n: usize,
+    lambda: f64,
+    gram: &mut [f64],
+    rhs: &mut [f64],
+    weighted_y_ss: &mut f64,
+) -> bool {
+    let dim = P_COV + 1;
+    debug_assert_eq!(xcov.len(), n.saturating_mul(P_COV));
+    debug_assert_eq!(snp.len(), n);
+    debug_assert!(gram.len() >= dim * dim);
+    debug_assert!(rhs.len() >= dim);
+
+    for i in 0..n {
+        let variance = s[i] + lambda;
+        if !variance.is_finite() || variance <= 0.0 {
+            return false;
+        }
+        let weight = 1.0 / variance;
+        let yi = y[i];
+        *weighted_y_ss += weight * yi * yi;
+        let row = i * P_COV;
+        for r in 0..P_COV {
+            let xr = xcov[row + r];
+            rhs[r] += weight * xr * yi;
+            for c in 0..=r {
+                gram[r * dim + c] += weight * xr * xcov[row + c];
+            }
+        }
+
+        let genotype = snp[i];
+        rhs[P_COV] += weight * genotype * yi;
+        for c in 0..P_COV {
+            gram[P_COV * dim + c] += weight * genotype * xcov[row + c];
+        }
+        gram[P_COV * dim + P_COV] += weight * genotype * genotype;
+    }
+    true
+}
+
+/// Dynamic-dimension fallback for larger fixed-effect designs.
+fn accumulate_ml_weighted_stats_general(
+    s: &[f64],
+    xcov: &[f64],
+    y: &[f64],
+    snp: Option<&[f64]>,
+    n: usize,
+    p_cov: usize,
+    lambda: f64,
+    gram: &mut [f64],
+    rhs: &mut [f64],
+    weighted_y_ss: &mut f64,
+) -> bool {
+    let dim = p_cov + usize::from(snp.is_some());
+    let snp = snp.unwrap_or(&[]);
+    for i in 0..n {
+        let variance = s[i] + lambda;
+        if !variance.is_finite() || variance <= 0.0 {
+            return false;
+        }
+        let weight = 1.0 / variance;
+        let yi = y[i];
+        *weighted_y_ss += weight * yi * yi;
+        for r in 0..dim {
+            let xr = if r < p_cov {
+                xcov[i * p_cov + r]
+            } else {
+                snp[i]
+            };
+            rhs[r] += weight * xr * yi;
+            for c in 0..=r {
+                let xc = if c < p_cov {
+                    xcov[i * p_cov + c]
+                } else {
+                    snp[i]
+                };
+                gram[r * dim + c] += weight * xr * xc;
+            }
+        }
+    }
+    true
+}
+
+/// Workspace-reusing counterpart to [`ml_loglike`] for repeated ML scoring.
+pub(crate) fn ml_loglike_with_workspace(
+    log10_lbd: f64,
+    s: &[f64],
+    xcov: &[f64],
+    y: &[f64],
+    snp: Option<&[f64]>,
+    n: usize,
+    p_cov: usize,
+    workspace: &mut MlWorkspace,
+) -> f64 {
+    let use_snp = snp.is_some();
+    let snp = snp.unwrap_or(&[]);
+    let lbd = 10.0_f64.powf(log10_lbd);
+    if !lbd.is_finite() || lbd <= 0.0 {
+        return -1e8;
+    }
+    if s.len() != n
+        || y.len() != n
+        || xcov.len() != n.saturating_mul(p_cov)
+        || (use_snp && snp.len() != n)
+    {
+        return -1e8;
+    }
+    let dim = p_cov + usize::from(use_snp);
+    if n <= dim {
+        return -1e8;
+    }
+
+    let Some(log_det_v) = fast_logdet_variance(s, lbd).or_else(|| scalar_logdet_variance(s, lbd))
+    else {
+        return -1e8;
+    };
+
+    workspace.ensure_dim(dim);
+    let MlWorkspace {
+        xtv_inv_x,
+        xtv_inv_y,
+        beta,
+    } = workspace;
+    let gram = &mut xtv_inv_x[..dim * dim];
+    gram.fill(0.0);
+    let rhs = &mut xtv_inv_y[..dim];
+    rhs.fill(0.0);
+    let mut weighted_y_ss = 0.0;
+    let accumulated = if use_snp && p_cov <= 16 {
+        macro_rules! fixed_covariate_count {
+            ($p:literal) => {
+                accumulate_ml_weighted_stats_fixed::<$p>(
+                    s,
+                    xcov,
+                    y,
+                    snp,
+                    n,
+                    lbd,
+                    gram,
+                    rhs,
+                    &mut weighted_y_ss,
+                )
+            };
+        }
+        match p_cov {
+            0 => fixed_covariate_count!(0),
+            1 => fixed_covariate_count!(1),
+            2 => fixed_covariate_count!(2),
+            3 => fixed_covariate_count!(3),
+            4 => fixed_covariate_count!(4),
+            5 => fixed_covariate_count!(5),
+            6 => fixed_covariate_count!(6),
+            7 => fixed_covariate_count!(7),
+            8 => fixed_covariate_count!(8),
+            9 => fixed_covariate_count!(9),
+            10 => fixed_covariate_count!(10),
+            11 => fixed_covariate_count!(11),
+            12 => fixed_covariate_count!(12),
+            13 => fixed_covariate_count!(13),
+            14 => fixed_covariate_count!(14),
+            15 => fixed_covariate_count!(15),
+            16 => fixed_covariate_count!(16),
+            _ => unreachable!(),
+        }
+    } else {
+        accumulate_ml_weighted_stats_general(
+            s,
+            xcov,
+            y,
+            use_snp.then_some(snp),
+            n,
+            p_cov,
+            lbd,
+            gram,
+            rhs,
+            &mut weighted_y_ss,
+        )
+    };
+    if !accumulated {
+        return -1e8;
+    }
+
+    for r in 0..dim {
+        for c in 0..r {
+            let value = gram[r * dim + c];
+            gram[c * dim + r] = value;
+        }
+    }
+    // The projected RSS subtraction is fast for one-dimensional designs. For
+    // a covariate plus SNP, use it only when their weighted correlation is
+    // moderate. For larger designs, diagonal-pivot heuristics do not bound
+    // the full Gram condition number, so always accumulate residuals directly.
+    let mut projection_well_conditioned = dim <= 1;
+    if use_snp && p_cov == 1 {
+        let diagonal_scale = gram[0].sqrt() * gram[dim * dim - 1].sqrt();
+        let weighted_correlation = if diagonal_scale.is_finite() && diagonal_scale > 0.0 {
+            (gram[dim] / diagonal_scale).abs()
+        } else {
+            f64::INFINITY
+        };
+        projection_well_conditioned = weighted_correlation < REML_PROJECTION_MAX_ABS_CORRELATION;
+    }
+
+    if dim > 0 && cholesky_gram_inplace(gram, dim).is_none() {
+        return -1e8;
+    }
+
+    let beta = &mut beta[..dim];
+    if dim > 0 {
+        cholesky_solve_into(gram, dim, rhs, beta);
+    }
+    let rtv_invr = ml_weighted_residual_ss(
+        weighted_y_ss,
+        beta,
+        rhs,
+        projection_well_conditioned,
+        s,
+        lbd,
+        xcov,
+        y,
+        use_snp.then_some(snp),
+        n,
+        p_cov,
+    );
+    if !rtv_invr.is_finite() || rtv_invr <= 0.0 || !log_det_v.is_finite() {
+        return -1e8;
+    }
+
+    let n_f = n as f64;
+    let total_log = n_f * rtv_invr.ln() + log_det_v;
+    let constant = n_f * (n_f.ln() - 1.0 - (2.0 * PI).ln()) / 2.0;
+    let ml = constant - 0.5 * total_log;
+    if ml.is_finite() {
+        ml
+    } else {
+        -1e8
     }
 }
 
@@ -2029,5 +2349,178 @@ mod projected_rss_tests {
                 "p_cov={p_cov}, direct cost={direct_cost}, projected cost={projected_cost}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod ml_workspace_tests {
+    use super::{ml_loglike, ml_loglike_with_workspace, MlWorkspace};
+
+    #[test]
+    fn workspace_ml_likelihood_matches_allocation_owning_reference() {
+        let n = 257usize;
+        let s: Vec<f64> = (0..n).map(|i| 0.15 + (i % 83) as f64 / 37.0).collect();
+        let snp: Vec<f64> = (0..n)
+            .map(|i| (std::f64::consts::TAU * 7.31 * i as f64 / n as f64).cos())
+            .collect();
+        let y: Vec<f64> = (0..n)
+            .map(|i| {
+                let phase = std::f64::consts::TAU * i as f64 / n as f64;
+                0.4 * phase.sin() + 0.25 * (phase * 3.7).cos()
+            })
+            .collect();
+
+        for p_cov in [0usize, 1, 3, 17] {
+            let mut xcov = vec![0.0_f64; n * p_cov];
+            for i in 0..n {
+                for c in 0..p_cov {
+                    xcov[i * p_cov + c] = if c == 0 {
+                        1.0
+                    } else {
+                        let phase = std::f64::consts::TAU * (c as f64 + 0.7) * i as f64 / n as f64;
+                        phase.sin() + 0.3 * (phase * 0.41).cos()
+                    };
+                }
+            }
+
+            for snp_arg in [None, Some(snp.as_slice())] {
+                let dim = p_cov + usize::from(snp_arg.is_some());
+                let mut workspace = MlWorkspace::new(dim);
+                for log10_lambda in [-2.0_f64, -0.5, 0.0, 1.25, 3.0] {
+                    let reference = ml_loglike(log10_lambda, &s, &xcov, &y, snp_arg, n, p_cov);
+                    let observed = ml_loglike_with_workspace(
+                        log10_lambda,
+                        &s,
+                        &xcov,
+                        &y,
+                        snp_arg,
+                        n,
+                        p_cov,
+                        &mut workspace,
+                    );
+                    assert!(reference.is_finite() && observed.is_finite());
+                    assert!(
+                        (reference - observed).abs() <= 1e-12 * reference.abs().max(1.0),
+                        "p_cov={p_cov}, has_snp={}, log10_lambda={log10_lambda}, reference={reference}, observed={observed}",
+                        snp_arg.is_some()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_ml_matches_reference_for_nearly_collinear_multicovariate_design() {
+        let n = 9usize;
+        let p_cov = 6usize;
+        let mut xcov = vec![0.0_f64; n * p_cov];
+        let mut snp = vec![0.0_f64; n];
+        let near_one = (1.0_f64 - 0.06_f64.powi(2)).sqrt();
+        xcov[0] = 1.0;
+        for col in 1..=6 {
+            if col < p_cov {
+                xcov[(col - 1) * p_cov + col] = near_one;
+                xcov[col * p_cov + col] = 0.06;
+            } else {
+                snp[col - 1] = near_one;
+                snp[col] = 0.06;
+            }
+        }
+        let mut y = vec![0.0_f64; n];
+        y[6] = 1.0;
+        y[7] = 1.0;
+        let s = vec![0.0_f64; n];
+        let mut workspace = MlWorkspace::new(p_cov + 1);
+
+        let reference = ml_loglike(0.0, &s, &xcov, &y, Some(&snp), n, p_cov);
+        let observed =
+            ml_loglike_with_workspace(0.0, &s, &xcov, &y, Some(&snp), n, p_cov, &mut workspace);
+
+        assert!(reference.is_finite() && observed.is_finite());
+        assert!(
+            (reference - observed).abs() <= 1e-12,
+            "reference={reference}, observed={observed}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ml_projected_residual_tests {
+    use super::ml_weighted_residual_ss;
+
+    fn scalar_projection_inputs(x: &[f64], y: &[f64], s: &[f64], lambda: f64) -> (f64, f64, f64) {
+        let mut weighted_y_ss = 0.0;
+        let mut gram = 0.0;
+        let mut rhs = 0.0;
+        for i in 0..y.len() {
+            let weight = 1.0 / (s[i] + lambda);
+            weighted_y_ss += weight * y[i] * y[i];
+            gram += weight * x[i] * x[i];
+            rhs += weight * x[i] * y[i];
+        }
+        (weighted_y_ss, rhs / gram, rhs)
+    }
+
+    #[test]
+    fn projected_ml_residual_uses_sufficient_statistics_when_safe() {
+        let x = [-1.0, 0.0, 1.0, 2.0];
+        let y = [-0.8, 0.3, 1.4, 1.7];
+        let s = [0.3, 0.6, 0.9, 1.2];
+        let lambda = 0.7;
+        let (weighted_y_ss, beta, rhs) = scalar_projection_inputs(&x, &y, &s, lambda);
+        let projected = weighted_y_ss - beta * rhs;
+        let mut direct = 0.0;
+        for i in 0..y.len() {
+            let residual = y[i] - x[i] * beta;
+            direct += residual * residual / (s[i] + lambda);
+        }
+
+        let observed = ml_weighted_residual_ss(
+            weighted_y_ss,
+            &[beta],
+            &[rhs],
+            true,
+            &s,
+            lambda,
+            &[],
+            &y,
+            Some(&x),
+            y.len(),
+            0,
+        );
+
+        assert!((observed - projected).abs() <= 1e-14);
+        assert!((observed - direct).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn projected_ml_residual_recomputes_when_subtraction_cancels() {
+        let x = [1.0, 1.0];
+        let y = [1.0, 1.0 + 1e-8];
+        let s = [0.0, 0.0];
+        let lambda = 1.0;
+        let (weighted_y_ss, beta, rhs) = scalar_projection_inputs(&x, &y, &s, lambda);
+        let mut direct = 0.0;
+        for i in 0..y.len() {
+            let residual = y[i] - x[i] * beta;
+            direct += residual * residual / (s[i] + lambda);
+        }
+
+        let observed = ml_weighted_residual_ss(
+            weighted_y_ss,
+            &[beta],
+            &[rhs],
+            true,
+            &s,
+            lambda,
+            &[],
+            &y,
+            Some(&x),
+            y.len(),
+            0,
+        );
+
+        assert!(observed > 0.0);
+        assert!((observed - direct).abs() <= 1e-30);
     }
 }

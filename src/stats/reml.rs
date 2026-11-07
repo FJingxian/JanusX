@@ -24,7 +24,9 @@ use std::sync::Arc;
 
 use crate::aireml::ai_reml_null_from_spectral;
 use crate::brent::brent_minimize;
-use crate::linalg::{cholesky_gram_inplace, cholesky_logdet, validate_fixed_effect_design};
+use crate::linalg::{
+    cholesky_gram_inplace, cholesky_logdet, cholesky_solve_into, validate_fixed_effect_design,
+};
 use crate::stats_common::get_cached_pool;
 
 #[inline]
@@ -357,6 +359,387 @@ pub(crate) fn reml_loglike(
     } else {
         reml
     }
+}
+
+/// Per-thread scratch space for per-SNP REML objective evaluations.
+///
+/// `reml_loglike` remains the allocation-owning reference path. Streaming LMM
+/// scans keep one workspace per Rayon worker and reuse it for every lambda
+/// evaluation of each SNP.
+pub(crate) struct RemlWorkspace {
+    gram: Vec<f64>,
+    rhs: Vec<f64>,
+    beta: Vec<f64>,
+}
+
+impl RemlWorkspace {
+    pub(crate) fn new(dim: usize) -> Self {
+        Self {
+            gram: vec![0.0; dim.saturating_mul(dim)],
+            rhs: vec![0.0; dim],
+            beta: vec![0.0; dim],
+        }
+    }
+
+    fn ensure_dim(&mut self, dim: usize) {
+        let gram_len = dim.saturating_mul(dim);
+        if self.gram.len() != gram_len {
+            self.gram.resize(gram_len, 0.0);
+        }
+        if self.rhs.len() != dim {
+            self.rhs.resize(dim, 0.0);
+        }
+        if self.beta.len() != dim {
+            self.beta.resize(dim, 0.0);
+        }
+    }
+}
+
+/// Allocation-free REML objective for a single rotated SNP vector.
+pub(crate) fn reml_loglike_with_workspace(
+    log10_lbd: f64,
+    s: &[f64],
+    xcov: &[f64],
+    y: &[f64],
+    snp: &[f64],
+    n: usize,
+    p_cov: usize,
+    workspace: &mut RemlWorkspace,
+) -> f64 {
+    let lambda = 10.0_f64.powf(log10_lbd);
+    let Some(dim) = p_cov.checked_add(1) else {
+        return -1e8;
+    };
+    if !lambda.is_finite()
+        || lambda <= 0.0
+        || s.len() != n
+        || y.len() != n
+        || xcov.len() != n.saturating_mul(p_cov)
+        || snp.len() != n
+        || n <= dim
+    {
+        return -1e8;
+    }
+
+    let Some(log_det_v) =
+        fast_logdet_variance(s, lambda).or_else(|| scalar_logdet_variance(s, lambda))
+    else {
+        return -1e8;
+    };
+
+    workspace.ensure_dim(dim);
+    workspace.gram.fill(0.0);
+    workspace.rhs.fill(0.0);
+    workspace.beta.fill(0.0);
+
+    match p_cov {
+        0 => {
+            let mut gram00 = 0.0;
+            let mut rhs0 = 0.0;
+            for i in 0..n {
+                let variance = s[i] + lambda;
+                if !variance.is_finite() || variance <= 0.0 {
+                    return -1e8;
+                }
+                let weight = 1.0 / variance;
+                let genotype = snp[i];
+                rhs0 += weight * genotype * y[i];
+                gram00 += weight * genotype * genotype;
+            }
+            workspace.gram[0] = gram00;
+            workspace.rhs[0] = rhs0;
+        }
+        1 => {
+            let mut gram00 = 0.0;
+            let mut gram10 = 0.0;
+            let mut gram11 = 0.0;
+            let mut rhs0 = 0.0;
+            let mut rhs1 = 0.0;
+            for i in 0..n {
+                let variance = s[i] + lambda;
+                if !variance.is_finite() || variance <= 0.0 {
+                    return -1e8;
+                }
+                let weight = 1.0 / variance;
+                let covariate = xcov[i];
+                let genotype = snp[i];
+                let yi = y[i];
+                rhs0 += weight * covariate * yi;
+                gram00 += weight * covariate * covariate;
+                rhs1 += weight * genotype * yi;
+                gram10 += weight * genotype * covariate;
+                gram11 += weight * genotype * genotype;
+            }
+            workspace.gram[0] = gram00;
+            workspace.gram[2] = gram10;
+            workspace.gram[3] = gram11;
+            workspace.rhs[0] = rhs0;
+            workspace.rhs[1] = rhs1;
+        }
+        2 => {
+            if !accumulate_reml_weighted_stats_fixed::<2>(s, xcov, y, snp, n, lambda, workspace) {
+                return -1e8;
+            }
+        }
+        3 => {
+            if !accumulate_reml_weighted_stats_fixed::<3>(s, xcov, y, snp, n, lambda, workspace) {
+                return -1e8;
+            }
+        }
+        4 => {
+            if !accumulate_reml_weighted_stats_fixed::<4>(s, xcov, y, snp, n, lambda, workspace) {
+                return -1e8;
+            }
+        }
+        5 => {
+            if !accumulate_reml_weighted_stats_fixed::<5>(s, xcov, y, snp, n, lambda, workspace) {
+                return -1e8;
+            }
+        }
+        6 => {
+            if !accumulate_reml_weighted_stats_fixed::<6>(s, xcov, y, snp, n, lambda, workspace) {
+                return -1e8;
+            }
+        }
+        7 => {
+            if !accumulate_reml_weighted_stats_fixed::<7>(s, xcov, y, snp, n, lambda, workspace) {
+                return -1e8;
+            }
+        }
+        8 => {
+            if !accumulate_reml_weighted_stats_fixed::<8>(s, xcov, y, snp, n, lambda, workspace) {
+                return -1e8;
+            }
+        }
+        9 => {
+            if !accumulate_reml_weighted_stats_fixed::<9>(s, xcov, y, snp, n, lambda, workspace) {
+                return -1e8;
+            }
+        }
+        10 => {
+            if !accumulate_reml_weighted_stats_fixed::<10>(s, xcov, y, snp, n, lambda, workspace) {
+                return -1e8;
+            }
+        }
+        11 => {
+            if !accumulate_reml_weighted_stats_fixed::<11>(s, xcov, y, snp, n, lambda, workspace) {
+                return -1e8;
+            }
+        }
+        12 => {
+            if !accumulate_reml_weighted_stats_fixed::<12>(s, xcov, y, snp, n, lambda, workspace) {
+                return -1e8;
+            }
+        }
+        13 => {
+            if !accumulate_reml_weighted_stats_fixed::<13>(s, xcov, y, snp, n, lambda, workspace) {
+                return -1e8;
+            }
+        }
+        14 => {
+            if !accumulate_reml_weighted_stats_fixed::<14>(s, xcov, y, snp, n, lambda, workspace) {
+                return -1e8;
+            }
+        }
+        15 => {
+            if !accumulate_reml_weighted_stats_fixed::<15>(s, xcov, y, snp, n, lambda, workspace) {
+                return -1e8;
+            }
+        }
+        16 => {
+            if !accumulate_reml_weighted_stats_fixed::<16>(s, xcov, y, snp, n, lambda, workspace) {
+                return -1e8;
+            }
+        }
+        _ => {
+            if !accumulate_reml_weighted_stats_general(s, xcov, y, snp, n, p_cov, lambda, workspace)
+            {
+                return -1e8;
+            }
+        }
+    }
+
+    for r in 0..dim {
+        for c in 0..r {
+            workspace.gram[c * dim + r] = workspace.gram[r * dim + c];
+        }
+    }
+    if cholesky_gram_inplace(&mut workspace.gram, dim).is_none() {
+        return -1e8;
+    }
+    cholesky_solve_into(&workspace.gram, dim, &workspace.rhs, &mut workspace.beta);
+
+    // Direct residual accumulation avoids cancellation when the fitted SNP is
+    // nearly deterministic, matching the reference objective's stable path.
+    let mut residual_ss = 0.0;
+    for i in 0..n {
+        let mut fitted = 0.0;
+        for r in 0..dim {
+            let xr = if r < p_cov {
+                xcov[i * p_cov + r]
+            } else {
+                snp[i]
+            };
+            fitted += xr * workspace.beta[r];
+        }
+        let residual = y[i] - fitted;
+        residual_ss += residual * residual / (s[i] + lambda);
+    }
+    if !residual_ss.is_finite() || residual_ss <= 0.0 || !log_det_v.is_finite() {
+        return -1e8;
+    }
+
+    let dof = n as f64 - dim as f64;
+    let total_log = dof * residual_ss.ln() + log_det_v + cholesky_logdet(&workspace.gram, dim);
+    let constant = dof * (dof.ln() - 1.0 - (2.0 * PI).ln()) / 2.0;
+    let reml = constant - 0.5 * total_log;
+    if reml.is_finite() {
+        reml
+    } else {
+        -1e8
+    }
+}
+
+/// Accumulate the lower triangle of the weighted fixed-effect/SNP Gram matrix
+/// with a compile-time covariate count. The SNP terms are handled after the
+/// covariate block, removing the dynamic `r < p_cov` branch from the hot loop.
+#[inline]
+fn accumulate_reml_weighted_stats_fixed<const P_COV: usize>(
+    s: &[f64],
+    xcov: &[f64],
+    y: &[f64],
+    snp: &[f64],
+    n: usize,
+    lambda: f64,
+    workspace: &mut RemlWorkspace,
+) -> bool {
+    let dim = P_COV + 1;
+    debug_assert_eq!(xcov.len(), n.saturating_mul(P_COV));
+    debug_assert!(workspace.gram.len() >= dim * dim);
+    debug_assert!(workspace.rhs.len() >= dim);
+
+    for i in 0..n {
+        let variance = s[i] + lambda;
+        if !variance.is_finite() || variance <= 0.0 {
+            return false;
+        }
+        let weight = 1.0 / variance;
+        let yi = y[i];
+        let row = i * P_COV;
+        for r in 0..P_COV {
+            let xr = xcov[row + r];
+            workspace.rhs[r] += weight * xr * yi;
+            for c in 0..=r {
+                workspace.gram[r * dim + c] += weight * xr * xcov[row + c];
+            }
+        }
+
+        let genotype = snp[i];
+        workspace.rhs[P_COV] += weight * genotype * yi;
+        for c in 0..P_COV {
+            workspace.gram[P_COV * dim + c] += weight * genotype * xcov[row + c];
+        }
+        workspace.gram[P_COV * dim + P_COV] += weight * genotype * genotype;
+    }
+    true
+}
+
+/// Dynamic-dimension counterpart for unusually large covariate sets. It uses
+/// the same covariate block/SNP split as the fixed-dimension kernels while
+/// avoiding code-size growth from specializing every possible dimension.
+fn accumulate_reml_weighted_stats_general(
+    s: &[f64],
+    xcov: &[f64],
+    y: &[f64],
+    snp: &[f64],
+    n: usize,
+    p_cov: usize,
+    lambda: f64,
+    workspace: &mut RemlWorkspace,
+) -> bool {
+    let dim = p_cov + 1;
+    debug_assert_eq!(xcov.len(), n.saturating_mul(p_cov));
+    debug_assert!(workspace.gram.len() >= dim * dim);
+    debug_assert!(workspace.rhs.len() >= dim);
+
+    for i in 0..n {
+        let variance = s[i] + lambda;
+        if !variance.is_finite() || variance <= 0.0 {
+            return false;
+        }
+        let weight = 1.0 / variance;
+        let yi = y[i];
+        let row = i * p_cov;
+        for r in 0..p_cov {
+            let xr = xcov[row + r];
+            workspace.rhs[r] += weight * xr * yi;
+            for c in 0..=r {
+                workspace.gram[r * dim + c] += weight * xr * xcov[row + c];
+            }
+        }
+
+        let genotype = snp[i];
+        workspace.rhs[p_cov] += weight * genotype * yi;
+        for c in 0..p_cov {
+            workspace.gram[p_cov * dim + c] += weight * genotype * xcov[row + c];
+        }
+        workspace.gram[p_cov * dim + p_cov] += weight * genotype * genotype;
+    }
+    true
+}
+
+/// Sum log(s[i] + lambda) by accumulating bounded mantissas and binary
+/// exponents. Fall back for subnormal, non-positive or non-finite terms.
+fn fast_logdet_variance(s: &[f64], lambda: f64) -> Option<f64> {
+    const EXPONENT_MASK: u64 = 0x7ff;
+    const FRACTION_MASK: u64 = (1_u64 << 52) - 1;
+    const MANTISSA_EXPONENT: u64 = 1022;
+
+    if !lambda.is_finite() {
+        return None;
+    }
+    let mut products = [1.0_f64; 4];
+    let mut exponents = [0_i64; 4];
+    let mut sum = 0.0;
+    for (i, &eigenvalue) in s.iter().enumerate() {
+        let value = eigenvalue + lambda;
+        if !value.is_finite() || value < f64::MIN_POSITIVE {
+            return None;
+        }
+        let bits = value.to_bits();
+        let exponent = ((bits >> 52) & EXPONENT_MASK) as i64;
+        if exponent == 0 || exponent == EXPONENT_MASK as i64 {
+            return None;
+        }
+        let mantissa_bits = (bits & FRACTION_MASK) | (MANTISSA_EXPONENT << 52);
+        let lane = i & 3;
+        products[lane] *= f64::from_bits(mantissa_bits);
+        exponents[lane] += exponent - MANTISSA_EXPONENT as i64;
+        if i & 63 == 63 {
+            sum += products.iter().map(|value| value.ln()).sum::<f64>();
+            sum += exponents.iter().sum::<i64>() as f64 * std::f64::consts::LN_2;
+            products = [1.0; 4];
+            exponents = [0; 4];
+        }
+    }
+    sum += products.iter().map(|value| value.ln()).sum::<f64>();
+    sum += exponents.iter().sum::<i64>() as f64 * std::f64::consts::LN_2;
+    Some(sum)
+}
+
+fn scalar_logdet_variance(s: &[f64], lambda: f64) -> Option<f64> {
+    if !lambda.is_finite() || lambda <= 0.0 {
+        return None;
+    }
+    let mut sum = 0.0;
+    for &eigenvalue in s {
+        let variance = eigenvalue + lambda;
+        if !variance.is_finite() || variance <= 0.0 {
+            return None;
+        }
+        sum += variance.ln();
+    }
+    Some(sum)
 }
 
 /// Estimate the standard error of phenotype-scale PVE from the observed
@@ -1239,6 +1622,58 @@ mod pve_se_tests {
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use rand_distr::StandardNormal;
+
+    #[test]
+    fn reusable_workspace_reml_matches_scalar_reference_across_covariate_counts() {
+        let n = 96usize;
+        let s: Vec<f64> = (0..n)
+            .map(|i| 0.1 + 1.9 * (i as f64 / (n - 1) as f64))
+            .collect();
+        let y: Vec<f64> = (0..n)
+            .map(|i| (i as f64 * 0.31).sin() + 0.35 * (i as f64 * 0.071).cos())
+            .collect();
+        let snp: Vec<f64> = (0..n)
+            .map(|i| (((i * 17 + i / 3) % 3) as f64) - 1.0)
+            .collect();
+
+        for p_cov in [0usize, 1, 2, 3, 4, 8, 16, 17, 32] {
+            let mut xcov = Vec::with_capacity(n * p_cov);
+            for i in 0..n {
+                let x = i as f64 / n as f64;
+                for col in 0..p_cov {
+                    let value = match col {
+                        0 => 1.0,
+                        1 => x - 0.5,
+                        _ => {
+                            let frequency = (col - 1) as f64;
+                            (i as f64 * frequency * std::f64::consts::TAU / n as f64).sin()
+                        }
+                    };
+                    xcov.push(value);
+                }
+            }
+
+            let mut workspace = RemlWorkspace::new(p_cov + 1);
+            for theta in [-3.0, -0.5, 2.0] {
+                let expected = reml_loglike(theta, &s, &xcov, &y, Some(&snp), n, p_cov);
+                let observed = reml_loglike_with_workspace(
+                    theta,
+                    &s,
+                    &xcov,
+                    &y,
+                    &snp,
+                    n,
+                    p_cov,
+                    &mut workspace,
+                );
+                let tolerance = 2e-10 * expected.abs().max(1.0);
+                assert!(
+                    (expected - observed).abs() <= tolerance,
+                    "p_cov={p_cov}, theta={theta}, expected={expected:.16e}, observed={observed:.16e}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn profile_reml_curvature_produces_interior_pve_se() {

@@ -47,10 +47,14 @@ use crate::stats_common::{env_truthy, get_cached_pool, parse_index_vec_i64, Asyn
 use memmap2::Mmap;
 use std::fs::File;
 
-use crate::reml::{final_beta_se, ml_loglike, reml_loglike, run_rotated_assoc_block_f32};
+use crate::reml::{
+    final_beta_se, ml_loglike, reml_loglike, reml_loglike_with_workspace,
+    run_rotated_assoc_block_f32, RemlWorkspace,
+};
 
 struct RotatedRemlAssocState {
     snp_vec: Vec<f64>,
+    reml_workspace: RemlWorkspace,
     last_log10_lbd: Option<f64>,
 }
 
@@ -62,10 +66,11 @@ struct RotatedRemlWarmStartState {
 }
 
 impl RotatedRemlWarmStartState {
-    fn new(n: usize) -> Self {
+    fn new(n: usize, p_cov: usize) -> Self {
         Self {
             assoc: RotatedRemlAssocState {
                 snp_vec: vec![0.0_f64; n],
+                reml_workspace: RemlWorkspace::new(p_cov + 1),
                 last_log10_lbd: None,
             },
             rows_in_group: 0,
@@ -151,7 +156,18 @@ fn process_rotated_reml_assoc_row(
     };
     let (best_log10_lbd, _best_cost) = if let Some(guess) = init_guess {
         brent_minimize_with_init(
-            |x| -reml_loglike(x, s, xcov_flat, y, Some(&state.snp_vec[..]), n, p_cov),
+            |x| {
+                -reml_loglike_with_workspace(
+                    x,
+                    s,
+                    xcov_flat,
+                    y,
+                    &state.snp_vec[..],
+                    n,
+                    p_cov,
+                    &mut state.reml_workspace,
+                )
+            },
             low,
             high,
             tol,
@@ -160,7 +176,18 @@ fn process_rotated_reml_assoc_row(
         )
     } else {
         brent_minimize(
-            |x| -reml_loglike(x, s, xcov_flat, y, Some(&state.snp_vec[..]), n, p_cov),
+            |x| {
+                -reml_loglike_with_workspace(
+                    x,
+                    s,
+                    xcov_flat,
+                    y,
+                    &state.snp_vec[..],
+                    n,
+                    p_cov,
+                    &mut state.reml_workspace,
+                )
+            },
             low,
             high,
             tol,
@@ -236,6 +263,7 @@ fn run_rotated_reml_assoc_block_f32(
     let nullml_val = nullml.unwrap_or(0.0);
     let init_state = || RotatedRemlAssocState {
         snp_vec: vec![0.0_f64; n],
+        reml_workspace: RemlWorkspace::new(p_cov + 1),
         last_log10_lbd: None,
     };
     let process_row = |row: &[f32], state: &mut RotatedRemlAssocState, out_row: &mut [f64]| {
@@ -652,8 +680,8 @@ pub fn lmm_reml_chunk_f32<'py>(
                     .par_chunks_mut(out_cols)
                     .enumerate()
                     .for_each_init(
-                        || vec![0.0_f64; n],
-                        |snp_vec, (idx, out_row)| {
+                        || (vec![0.0_f64; n], RemlWorkspace::new(p_cov + 1)),
+                        |(snp_vec, reml_workspace), (idx, out_row)| {
                             let row = g_arr.row(idx);
                             for i in 0..n {
                                 snp_vec[i] = row[i] as f64;
@@ -661,7 +689,16 @@ pub fn lmm_reml_chunk_f32<'py>(
 
                             let (best_log10_lbd, _best_cost) = brent_minimize(
                                 |x| {
-                                    -reml_loglike(x, s, &xcov_flat, y, Some(&snp_vec[..]), n, p_cov)
+                                    -reml_loglike_with_workspace(
+                                        x,
+                                        s,
+                                        &xcov_flat,
+                                        y,
+                                        snp_vec,
+                                        n,
+                                        p_cov,
+                                        reml_workspace,
+                                    )
                                 },
                                 low,
                                 high,
@@ -2828,7 +2865,7 @@ pub fn lmm_reml_assoc_bed_to_tsv_f32<'py>(
             b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n"
         };
 
-        let mut warm_state = RotatedRemlWarmStartState::new(n);
+        let mut warm_state = RotatedRemlWarmStartState::new(n, p);
         let run_rows = |g_block: &[f32], rows: usize, out_block: &mut [f64]| {
             if carry_snp_lambda {
                 run_rotated_reml_assoc_block_f32_with_warm_state(
@@ -3088,7 +3125,7 @@ pub fn lmm_reml_assoc_kfile_to_tsv_f32<'py>(
         .map_err(PyRuntimeError::new_err)?;
         let mut rot_block = vec![0.0_f32; block_rows.saturating_mul(n)];
         let mut out_block = vec![0.0_f64; block_rows.saturating_mul(3)];
-        let mut warm_state = RotatedRemlWarmStartState::new(n);
+        let mut warm_state = RotatedRemlWarmStartState::new(n, p);
         let mut text = String::with_capacity(block_rows.saturating_mul(96));
         let mut done = 0usize;
         let mut next_progress = progress_block.min(total_rows).max(1);
@@ -3658,7 +3695,7 @@ pub fn lmm_reml_assoc_packed_f32<'py>(
 
         let mut snp_buf = vec![0.0_f32; block_rows * n];
         let mut rot_buf = vec![0.0_f32; block_rows * n];
-        let mut warm_state = RotatedRemlWarmStartState::new(n);
+        let mut warm_state = RotatedRemlWarmStartState::new(n, p_cov);
 
         let mut run_rows = |g_block: &[f32], out_block: &mut [f64]| {
             run_rotated_reml_assoc_block_f32_with_warm_state(
@@ -4021,7 +4058,7 @@ pub fn lmm_reml_assoc_packed_f32_to_tsv<'py>(
 
         let mut snp_buf = vec![0.0_f32; block_rows * n];
         let mut rot_buf = vec![0.0_f32; block_rows * n];
-        let mut warm_state = RotatedRemlWarmStartState::new(n);
+        let mut warm_state = RotatedRemlWarmStartState::new(n, p_cov);
         let mut out_block = vec![0.0_f64; block_rows * out_cols];
         let mut miss_block = vec![0usize; block_rows];
         let mut text_buf = String::with_capacity(block_rows * 128);
@@ -4270,7 +4307,7 @@ mod tests {
 
         let run_chunks = |chunk_rows: &[usize], pool: &Arc<rayon::ThreadPool>| {
             let mut output = vec![0.0_f64; rows * 3];
-            let mut warm_state = RotatedRemlWarmStartState::new(n);
+            let mut warm_state = RotatedRemlWarmStartState::new(n, 1);
             let mut row_start = 0usize;
             for &chunk_len in chunk_rows {
                 let row_end = row_start + chunk_len;

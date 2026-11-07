@@ -63,6 +63,9 @@ mod ld;
 mod lm_trait;
 #[path = "stats/lmm.rs"]
 mod lmm;
+#[cfg(feature = "lmm-reml-regression")]
+#[path = "stats/lmm_reml_test_support.rs"]
+pub mod lmm_reml_test_support;
 #[path = "stats/logreg.rs"]
 mod logreg;
 #[path = "stats/mixed_ld.rs"]

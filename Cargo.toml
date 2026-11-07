@@ -14,6 +14,11 @@ repository = "https://github.com/FJingxian/JanusX"
 name = "janusx"
 crate-type = ["cdylib", "rlib"]
 
+[[test]]
+name = "lmm_reml_regression"
+path = "tests/lmm_reml_regression.rs"
+required-features = ["lmm-reml-regression"]
+
 [features]
 default = ["blas-openblas"]
 # Compile-time BLAS selection:
@@ -27,6 +32,8 @@ python-extension = []
 # Optional AVX-512 bitwise kernels (nightly-only intrinsics on many stable toolchains).
 # Keep off by default so release wheels build on stable Rust.
 simd-avx512 = []
+# LMM REML regression harness; off in production builds.
+lmm-reml-regression = []
 
 [dependencies]
 pyo3 = { version = "0.27.2", features = ["abi3-py310", "generate-import-lib"] }

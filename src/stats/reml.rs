@@ -32,6 +32,7 @@ use crate::stats_common::get_cached_pool;
 const REML_FINAL_BEST_CACHE_MAX_DIM: usize = 64;
 const REML_PROJECTION_MAX_ABS_CORRELATION: f64 = 0.9;
 const REML_PROJECTION_MIN_RESIDUAL_FRACTION: f64 = 1e-4;
+const REML_PROJECTION_MIN_NORMALIZED_CHOLESKY_DIAGONAL: f64 = 5e-2;
 
 #[inline]
 pub(crate) fn gwas_max_output_rows_env() -> Option<usize> {
@@ -372,6 +373,7 @@ pub(crate) fn reml_loglike(
 /// evaluation of each SNP.
 pub(crate) struct RemlWorkspace {
     gram: Vec<f64>,
+    gram_diagonal_scale: Vec<f64>,
     rhs: Vec<f64>,
     beta: Vec<f64>,
     weighted_y_ss: f64,
@@ -387,6 +389,7 @@ impl RemlWorkspace {
     pub(crate) fn new(dim: usize) -> Self {
         Self {
             gram: vec![0.0; dim.saturating_mul(dim)],
+            gram_diagonal_scale: vec![0.0; dim],
             rhs: vec![0.0; dim],
             beta: vec![0.0; dim],
             weighted_y_ss: 0.0,
@@ -407,6 +410,9 @@ impl RemlWorkspace {
         let gram_len = dim.saturating_mul(dim);
         if self.gram.len() != gram_len {
             self.gram.resize(gram_len, 0.0);
+        }
+        if self.gram_diagonal_scale.len() != dim {
+            self.gram_diagonal_scale.resize(dim, 0.0);
         }
         if self.rhs.len() != dim {
             self.rhs.resize(dim, 0.0);
@@ -433,6 +439,20 @@ impl RemlWorkspace {
 
 /// Allocation-free REML objective for a single rotated SNP vector.
 pub(crate) fn reml_loglike_with_workspace(
+    log10_lbd: f64,
+    s: &[f64],
+    xcov: &[f64],
+    y: &[f64],
+    snp: &[f64],
+    n: usize,
+    p_cov: usize,
+    workspace: &mut RemlWorkspace,
+) -> f64 {
+    reml_loglike_with_workspace_mode::<true>(log10_lbd, s, xcov, y, snp, n, p_cov, workspace)
+}
+
+#[inline]
+fn reml_loglike_with_workspace_mode<const USE_PROJECTED_RSS: bool>(
     log10_lbd: f64,
     s: &[f64],
     xcov: &[f64],
@@ -528,83 +548,114 @@ pub(crate) fn reml_loglike_with_workspace(
             workspace.rhs[1] = rhs1;
         }
         2 => {
-            if !accumulate_reml_weighted_stats_fixed::<2>(s, xcov, y, snp, n, lambda, workspace) {
+            if !accumulate_reml_weighted_stats_fixed::<2, USE_PROJECTED_RSS>(
+                s, xcov, y, snp, n, lambda, workspace,
+            ) {
                 return -1e8;
             }
         }
         3 => {
-            if !accumulate_reml_weighted_stats_fixed::<3>(s, xcov, y, snp, n, lambda, workspace) {
+            if !accumulate_reml_weighted_stats_fixed::<3, USE_PROJECTED_RSS>(
+                s, xcov, y, snp, n, lambda, workspace,
+            ) {
                 return -1e8;
             }
         }
         4 => {
-            if !accumulate_reml_weighted_stats_fixed::<4>(s, xcov, y, snp, n, lambda, workspace) {
+            if !accumulate_reml_weighted_stats_fixed::<4, USE_PROJECTED_RSS>(
+                s, xcov, y, snp, n, lambda, workspace,
+            ) {
                 return -1e8;
             }
         }
         5 => {
-            if !accumulate_reml_weighted_stats_fixed::<5>(s, xcov, y, snp, n, lambda, workspace) {
+            if !accumulate_reml_weighted_stats_fixed::<5, USE_PROJECTED_RSS>(
+                s, xcov, y, snp, n, lambda, workspace,
+            ) {
                 return -1e8;
             }
         }
         6 => {
-            if !accumulate_reml_weighted_stats_fixed::<6>(s, xcov, y, snp, n, lambda, workspace) {
+            if !accumulate_reml_weighted_stats_fixed::<6, USE_PROJECTED_RSS>(
+                s, xcov, y, snp, n, lambda, workspace,
+            ) {
                 return -1e8;
             }
         }
         7 => {
-            if !accumulate_reml_weighted_stats_fixed::<7>(s, xcov, y, snp, n, lambda, workspace) {
+            if !accumulate_reml_weighted_stats_fixed::<7, USE_PROJECTED_RSS>(
+                s, xcov, y, snp, n, lambda, workspace,
+            ) {
                 return -1e8;
             }
         }
         8 => {
-            if !accumulate_reml_weighted_stats_fixed::<8>(s, xcov, y, snp, n, lambda, workspace) {
+            if !accumulate_reml_weighted_stats_fixed::<8, USE_PROJECTED_RSS>(
+                s, xcov, y, snp, n, lambda, workspace,
+            ) {
                 return -1e8;
             }
         }
         9 => {
-            if !accumulate_reml_weighted_stats_fixed::<9>(s, xcov, y, snp, n, lambda, workspace) {
+            if !accumulate_reml_weighted_stats_fixed::<9, USE_PROJECTED_RSS>(
+                s, xcov, y, snp, n, lambda, workspace,
+            ) {
                 return -1e8;
             }
         }
         10 => {
-            if !accumulate_reml_weighted_stats_fixed::<10>(s, xcov, y, snp, n, lambda, workspace) {
+            if !accumulate_reml_weighted_stats_fixed::<10, USE_PROJECTED_RSS>(
+                s, xcov, y, snp, n, lambda, workspace,
+            ) {
                 return -1e8;
             }
         }
         11 => {
-            if !accumulate_reml_weighted_stats_fixed::<11>(s, xcov, y, snp, n, lambda, workspace) {
+            if !accumulate_reml_weighted_stats_fixed::<11, USE_PROJECTED_RSS>(
+                s, xcov, y, snp, n, lambda, workspace,
+            ) {
                 return -1e8;
             }
         }
         12 => {
-            if !accumulate_reml_weighted_stats_fixed::<12>(s, xcov, y, snp, n, lambda, workspace) {
+            if !accumulate_reml_weighted_stats_fixed::<12, USE_PROJECTED_RSS>(
+                s, xcov, y, snp, n, lambda, workspace,
+            ) {
                 return -1e8;
             }
         }
         13 => {
-            if !accumulate_reml_weighted_stats_fixed::<13>(s, xcov, y, snp, n, lambda, workspace) {
+            if !accumulate_reml_weighted_stats_fixed::<13, USE_PROJECTED_RSS>(
+                s, xcov, y, snp, n, lambda, workspace,
+            ) {
                 return -1e8;
             }
         }
         14 => {
-            if !accumulate_reml_weighted_stats_fixed::<14>(s, xcov, y, snp, n, lambda, workspace) {
+            if !accumulate_reml_weighted_stats_fixed::<14, USE_PROJECTED_RSS>(
+                s, xcov, y, snp, n, lambda, workspace,
+            ) {
                 return -1e8;
             }
         }
         15 => {
-            if !accumulate_reml_weighted_stats_fixed::<15>(s, xcov, y, snp, n, lambda, workspace) {
+            if !accumulate_reml_weighted_stats_fixed::<15, USE_PROJECTED_RSS>(
+                s, xcov, y, snp, n, lambda, workspace,
+            ) {
                 return -1e8;
             }
         }
         16 => {
-            if !accumulate_reml_weighted_stats_fixed::<16>(s, xcov, y, snp, n, lambda, workspace) {
+            if !accumulate_reml_weighted_stats_fixed::<16, USE_PROJECTED_RSS>(
+                s, xcov, y, snp, n, lambda, workspace,
+            ) {
                 return -1e8;
             }
         }
         _ => {
-            if !accumulate_reml_weighted_stats_general(s, xcov, y, snp, n, p_cov, lambda, workspace)
-            {
+            if !accumulate_reml_weighted_stats_general::<USE_PROJECTED_RSS>(
+                s, xcov, y, snp, n, p_cov, lambda, workspace,
+            ) {
                 return -1e8;
             }
         }
@@ -615,30 +666,33 @@ pub(crate) fn reml_loglike_with_workspace(
             workspace.gram[c * dim + r] = workspace.gram[r * dim + c];
         }
     }
+    if USE_PROJECTED_RSS && p_cov >= 2 {
+        for i in 0..dim {
+            let diagonal = workspace.gram[i * dim + i];
+            if !diagonal.is_finite() || diagonal <= 0.0 {
+                return -1e8;
+            }
+            workspace.gram_diagonal_scale[i] = diagonal.sqrt();
+        }
+    }
     if cholesky_gram_inplace(&mut workspace.gram, dim).is_none() {
         return -1e8;
     }
+    if USE_PROJECTED_RSS && p_cov >= 2 {
+        projection_well_conditioned = normalized_cholesky_is_well_conditioned(
+            &workspace.gram,
+            &workspace.gram_diagonal_scale,
+            dim,
+        );
+    }
     cholesky_solve_into(&workspace.gram, dim, &workspace.rhs, &mut workspace.beta);
 
-    // The normal-equation identity avoids another sample pass for zero- or
-    // one-column fixed-effect designs. Fall back to direct residuals near
-    // cancellation or when the two-column design is strongly collinear.
-    let mut residual_ss = if projection_well_conditioned {
-        let explained_ss = workspace
-            .beta
-            .iter()
-            .zip(&workspace.rhs)
-            .map(|(beta, rhs)| beta * rhs)
-            .sum::<f64>();
-        let projected_residual_ss = workspace.weighted_y_ss - explained_ss;
-        if projected_residual_ss.is_finite()
-            && projected_residual_ss
-                > workspace.weighted_y_ss.abs() * REML_PROJECTION_MIN_RESIDUAL_FRACTION
-        {
-            projected_residual_ss
-        } else {
-            f64::NAN
-        }
+    // The normal-equation identity avoids another sample pass when the
+    // weighted design is well-conditioned. Fall back near cancellation or
+    // when its normalized Cholesky pivots indicate an unstable projection.
+    let mut residual_ss = if USE_PROJECTED_RSS && projection_well_conditioned {
+        checked_projected_residual_ss(workspace.weighted_y_ss, &workspace.beta, &workspace.rhs)
+            .unwrap_or(f64::NAN)
     } else {
         f64::NAN
     };
@@ -729,7 +783,7 @@ pub(crate) fn reml_brent_minimize_with_workspace(
 /// with a compile-time covariate count. The SNP terms are handled after the
 /// covariate block, removing the dynamic `r < p_cov` branch from the hot loop.
 #[inline]
-fn accumulate_reml_weighted_stats_fixed<const P_COV: usize>(
+fn accumulate_reml_weighted_stats_fixed<const P_COV: usize, const CAPTURE_WEIGHTED_Y_SS: bool>(
     s: &[f64],
     xcov: &[f64],
     y: &[f64],
@@ -750,6 +804,9 @@ fn accumulate_reml_weighted_stats_fixed<const P_COV: usize>(
         }
         let weight = 1.0 / variance;
         let yi = y[i];
+        if CAPTURE_WEIGHTED_Y_SS {
+            workspace.weighted_y_ss += weight * yi * yi;
+        }
         let row = i * P_COV;
         for r in 0..P_COV {
             let xr = xcov[row + r];
@@ -772,7 +829,7 @@ fn accumulate_reml_weighted_stats_fixed<const P_COV: usize>(
 /// Dynamic-dimension counterpart for unusually large covariate sets. It uses
 /// the same covariate block/SNP split as the fixed-dimension kernels while
 /// avoiding code-size growth from specializing every possible dimension.
-fn accumulate_reml_weighted_stats_general(
+fn accumulate_reml_weighted_stats_general<const CAPTURE_WEIGHTED_Y_SS: bool>(
     s: &[f64],
     xcov: &[f64],
     y: &[f64],
@@ -794,6 +851,9 @@ fn accumulate_reml_weighted_stats_general(
         }
         let weight = 1.0 / variance;
         let yi = y[i];
+        if CAPTURE_WEIGHTED_Y_SS {
+            workspace.weighted_y_ss += weight * yi * yi;
+        }
         let row = i * p_cov;
         for r in 0..p_cov {
             let xr = xcov[row + r];
@@ -811,6 +871,47 @@ fn accumulate_reml_weighted_stats_general(
         workspace.gram[p_cov * dim + p_cov] += weight * genotype * genotype;
     }
     true
+}
+
+#[inline]
+fn checked_projected_residual_ss(weighted_y_ss: f64, beta: &[f64], rhs: &[f64]) -> Option<f64> {
+    if !weighted_y_ss.is_finite() || weighted_y_ss <= 0.0 || beta.len() != rhs.len() {
+        return None;
+    }
+    let explained_ss = beta
+        .iter()
+        .zip(rhs)
+        .map(|(beta, rhs)| beta * rhs)
+        .sum::<f64>();
+    let residual_ss = weighted_y_ss - explained_ss;
+    if residual_ss.is_finite()
+        && residual_ss > weighted_y_ss.abs() * REML_PROJECTION_MIN_RESIDUAL_FRACTION
+    {
+        Some(residual_ss)
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn normalized_cholesky_is_well_conditioned(
+    factor: &[f64],
+    diagonal_scale: &[f64],
+    dim: usize,
+) -> bool {
+    if factor.len() != dim.saturating_mul(dim) || diagonal_scale.len() != dim {
+        return false;
+    }
+    let mut min_normalized_diagonal = f64::INFINITY;
+    for i in 0..dim {
+        let scale = diagonal_scale[i];
+        let diagonal = factor[i * dim + i];
+        if !scale.is_finite() || scale <= 0.0 || !diagonal.is_finite() || diagonal <= 0.0 {
+            return false;
+        }
+        min_normalized_diagonal = min_normalized_diagonal.min(diagonal / scale);
+    }
+    min_normalized_diagonal >= REML_PROJECTION_MIN_NORMALIZED_CHOLESKY_DIAGONAL
 }
 
 /// Sum log(s[i] + lambda) by accumulating bounded mantissas and binary

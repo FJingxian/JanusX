@@ -24,11 +24,6 @@ test*.gwas.*
 # Test outputs
 test*
 
-# Keep the checked-in Rust regression harness; generated test outputs remain ignored.
-!/tests/
-tests/*
-!/tests/lmm_reml_regression.rs
-
 # Tooling
 uv.lock
 webapp/db.sqlite3

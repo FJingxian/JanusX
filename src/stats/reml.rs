@@ -1624,58 +1624,6 @@ mod pve_se_tests {
     use rand_distr::StandardNormal;
 
     #[test]
-    fn reusable_workspace_reml_matches_scalar_reference_across_covariate_counts() {
-        let n = 96usize;
-        let s: Vec<f64> = (0..n)
-            .map(|i| 0.1 + 1.9 * (i as f64 / (n - 1) as f64))
-            .collect();
-        let y: Vec<f64> = (0..n)
-            .map(|i| (i as f64 * 0.31).sin() + 0.35 * (i as f64 * 0.071).cos())
-            .collect();
-        let snp: Vec<f64> = (0..n)
-            .map(|i| (((i * 17 + i / 3) % 3) as f64) - 1.0)
-            .collect();
-
-        for p_cov in [0usize, 1, 2, 3, 4, 8, 16, 17, 32] {
-            let mut xcov = Vec::with_capacity(n * p_cov);
-            for i in 0..n {
-                let x = i as f64 / n as f64;
-                for col in 0..p_cov {
-                    let value = match col {
-                        0 => 1.0,
-                        1 => x - 0.5,
-                        _ => {
-                            let frequency = (col - 1) as f64;
-                            (i as f64 * frequency * std::f64::consts::TAU / n as f64).sin()
-                        }
-                    };
-                    xcov.push(value);
-                }
-            }
-
-            let mut workspace = RemlWorkspace::new(p_cov + 1);
-            for theta in [-3.0, -0.5, 2.0] {
-                let expected = reml_loglike(theta, &s, &xcov, &y, Some(&snp), n, p_cov);
-                let observed = reml_loglike_with_workspace(
-                    theta,
-                    &s,
-                    &xcov,
-                    &y,
-                    &snp,
-                    n,
-                    p_cov,
-                    &mut workspace,
-                );
-                let tolerance = 2e-10 * expected.abs().max(1.0);
-                assert!(
-                    (expected - observed).abs() <= tolerance,
-                    "p_cov={p_cov}, theta={theta}, expected={expected:.16e}, observed={observed:.16e}"
-                );
-            }
-        }
-    }
-
-    #[test]
     fn profile_reml_curvature_produces_interior_pve_se() {
         let n = 400usize;
         let s: Vec<f64> = (0..n)

@@ -1,7 +1,7 @@
 // Shared REML / ML helpers for spectral LMM-family code:
 // reml_loglike(log10_lambda) evaluates the null or per-SNP REML objective on the rotated scale.
 // ml_loglike(log10_lambda) evaluates the matching ML objective.
-// final_beta_se(log10_lambda) returns the Wald beta / se pair for a single SNP.
+// final_beta_se_with_workspace(log10_lambda) returns the Wald beta / se pair for a single SNP.
 //
 // This module owns null-fit utilities and common likelihood code used by exact LMM/LMM2
 // and fixed-lambda FvLMM/FaST-LMM routes.
@@ -1030,102 +1030,6 @@ pub(crate) fn ml_loglike(
     } else {
         ml
     }
-}
-
-pub(crate) fn final_beta_se(
-    log10_lbd: f64,
-    s: &[f64],
-    xcov: &[f64],
-    y: &[f64],
-    snp: &[f64],
-    n: usize,
-    p_cov: usize,
-) -> (f64, f64, f64) {
-    let lbd = 10.0_f64.powf(log10_lbd);
-    if !lbd.is_finite() || lbd <= 0.0 {
-        return (f64::NAN, f64::NAN, f64::NAN);
-    }
-    let p = p_cov + 1;
-    if n <= p {
-        return (f64::NAN, f64::NAN, lbd);
-    }
-
-    let mut vinv = vec![0.0_f64; n];
-    for i in 0..n {
-        let vv = s[i] + lbd;
-        if vv <= 0.0 {
-            return (f64::NAN, f64::NAN, lbd);
-        }
-        vinv[i] = 1.0 / vv;
-    }
-
-    let dim = p;
-    let mut xtv_inv_x = vec![0.0_f64; dim * dim];
-    let mut xtv_inv_y = vec![0.0_f64; dim];
-
-    for i in 0..n {
-        let vi = vinv[i];
-        let yi = y[i];
-        for r in 0..dim {
-            let xir = if r < p_cov {
-                xcov[i * p_cov + r]
-            } else {
-                snp[i]
-            };
-            xtv_inv_y[r] += vi * xir * yi;
-
-            for c in 0..=r {
-                let xic = if c < p_cov {
-                    xcov[i * p_cov + c]
-                } else {
-                    snp[i]
-                };
-                xtv_inv_x[r * dim + c] += vi * xir * xic;
-            }
-        }
-    }
-
-    for r in 0..dim {
-        for c in 0..r {
-            let vrc = xtv_inv_x[r * dim + c];
-            xtv_inv_x[c * dim + r] = vrc;
-        }
-    }
-
-    if cholesky_gram_inplace(&mut xtv_inv_x, dim).is_none() {
-        return (f64::NAN, f64::NAN, lbd);
-    }
-    let beta = cholesky_solve(&xtv_inv_x, dim, &xtv_inv_y);
-
-    let mut rtv_invr = 0.0_f64;
-    for i in 0..n {
-        let mut xb = 0.0;
-        for r in 0..dim {
-            let xir = if r < p_cov {
-                xcov[i * p_cov + r]
-            } else {
-                snp[i]
-            };
-            xb += xir * beta[r];
-        }
-        let ri = y[i] - xb;
-        rtv_invr += vinv[i] * ri * ri;
-    }
-
-    let n_f = n as f64;
-    let p_f = p as f64;
-    let sigma2 = rtv_invr / (n_f - p_f);
-
-    let k = dim - 1;
-    let mut e = vec![0.0_f64; dim];
-    e[k] = 1.0;
-    let x = cholesky_solve(&xtv_inv_x, dim, &e);
-    let var_beta_k = sigma2 * x[k];
-    if var_beta_k <= 0.0 || !var_beta_k.is_finite() {
-        return (f64::NAN, f64::NAN, lbd);
-    }
-
-    (beta[k], var_beta_k.sqrt(), lbd)
 }
 
 /// Final beta/SE calculation using the scorer's reusable Cholesky workspace.

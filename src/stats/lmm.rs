@@ -48,8 +48,8 @@ use memmap2::Mmap;
 use std::fs::File;
 
 use crate::reml::{
-    final_beta_se, final_beta_se_with_workspace, ml_loglike, reml_brent_minimize_with_workspace,
-    reml_loglike, run_rotated_assoc_block_f32, RemlWorkspace,
+    final_beta_se_with_workspace, ml_loglike, reml_brent_minimize_with_workspace,
+    run_rotated_assoc_block_f32, RemlWorkspace,
 };
 
 struct RotatedRemlAssocState {
@@ -80,6 +80,7 @@ impl RotatedRemlWarmStartState {
 
 struct RotatedLmm2AssocState {
     snp_vec: Vec<f64>,
+    reml_workspace: RemlWorkspace,
 }
 
 #[inline]
@@ -467,6 +468,7 @@ fn run_rotated_lmm2_assoc_block_f32(
         pool,
         || RotatedLmm2AssocState {
             snp_vec: vec![0.0_f64; n],
+            reml_workspace: RemlWorkspace::new(p_cov + 1),
         },
         |_, row, state, out_row| {
             let snp_ssq = copy_rotated_snp_row_to_f64(row, &mut state.snp_vec);
@@ -476,15 +478,22 @@ fn run_rotated_lmm2_assoc_block_f32(
             }
 
             let reml_init_guess = init_log10_lbd_reml.or(init_log10_lbd_ml);
-            let (best_log10_lbd_reml, _best_reml_cost) = brent_minimize_with_init(
-                |x| -reml_loglike(x, s, xcov_flat, y, Some(&state.snp_vec[..]), n, p_cov),
-                low,
-                high,
-                tol,
-                max_iter,
-                reml_init_guess,
-            );
-            let (beta, se, lambda_reml) = final_beta_se(
+            let (best_log10_lbd_reml, _best_reml_cost, last_eval_log10_lbd) =
+                reml_brent_minimize_with_workspace(
+                    low,
+                    high,
+                    tol,
+                    max_iter,
+                    reml_init_guess,
+                    s,
+                    xcov_flat,
+                    y,
+                    &state.snp_vec,
+                    n,
+                    p_cov,
+                    &mut state.reml_workspace,
+                );
+            let (beta, se, lambda_reml, _reused_fit) = final_beta_se_with_workspace(
                 best_log10_lbd_reml,
                 s,
                 xcov_flat,
@@ -492,6 +501,8 @@ fn run_rotated_lmm2_assoc_block_f32(
                 &state.snp_vec,
                 n,
                 p_cov,
+                last_eval_log10_lbd,
+                &mut state.reml_workspace,
             );
             let pwald = if beta.is_finite() && se.is_finite() && se > 0.0 {
                 let z = beta / se;

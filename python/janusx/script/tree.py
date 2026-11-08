@@ -97,6 +97,9 @@ def _default_prefix_from_genofile(path: str) -> str:
         ".bed",
         ".bim",
         ".fam",
+        ".pgen",
+        ".pvar",
+        ".psam",
         ".txt",
         ".tsv",
         ".csv",
@@ -367,10 +370,11 @@ def _validate_inputs(args, logger) -> None:
         ok = ensure_file_input_exists(logger, args.file, "FILE genotype input")
         if not ok:
             raise FileNotFoundError(args.file)
-    elif args.bfile:
-        ok = ensure_plink_prefix_exists(logger, args.bfile, "PLINK prefix")
+    elif args.bfile or args.pfile:
+        plink_input, _ = determine_genotype_source_from_args(args)
+        ok = ensure_plink_prefix_exists(logger, plink_input, "PLINK prefix")
         if not ok:
-            raise FileNotFoundError(args.bfile)
+            raise FileNotFoundError(plink_input)
 
 
 def _genotype_to_alignment(
@@ -885,8 +889,8 @@ def main(argv: list[str] | None = None) -> None:
     parser = build_tree_parser()
     args = parser.parse_args(argv_list)
 
-    if not any((args.vcf, args.hmp, args.file, args.bfile, args.fasta)):
-        parser.error("`jx tree` requires one input: -vcf/-hmp/-file/-bfile/-fa.")
+    if not any((args.vcf, args.hmp, args.file, args.bfile, args.pfile, args.fasta)):
+        parser.error("`jx tree` requires one input: -vcf/-hmp/-file/-bfile/-pfile/-fa.")
 
     try:
         if bool(getattr(args, "ml", False)):

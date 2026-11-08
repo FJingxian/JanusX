@@ -30,6 +30,7 @@ from .workflow import (
     _GWAS_PROGRESS_BAR_WIDTH,
     _ProgressAdapter,
     _align_pheno_to_sample_order,
+    _as_plink_input_path,
     _as_plink_prefix,
     _display_path,
     _emit_trait_header,
@@ -457,6 +458,7 @@ def _new_bed_chunk_reader_for_stream(
     het_threshold: float,
     mmap_window_mb: Union[int, None],
     bimranges: Optional[list[tuple[str, int, int]]],
+    snp_indices: Optional[np.ndarray] = None,
     logger: logging.Logger,
 ) -> object:
     """
@@ -491,6 +493,11 @@ def _new_bed_chunk_reader_for_stream(
         base_kwargs["ranges"] = [
             (str(chrom), int(start), int(end))
             for chrom, start, end in bimranges
+        ]
+    if snp_indices is not None:
+        base_kwargs["snp_indices"] = [
+            int(index)
+            for index in np.asarray(snp_indices, dtype=np.int64).reshape(-1).tolist()
         ]
 
     try:
@@ -1286,7 +1293,7 @@ def run_chunked_gwas_lmm_lm(
     trait_iter = _resolve_trait_iter(pheno_aligned, trait_names)
     multi_trait_mode = len(trait_iter) > 1
 
-    bed_prefix = _as_plink_prefix(genofile)
+    bed_prefix = _as_plink_input_path(genofile)
     has_prepared_bed_bus = (
         bed_prefix is not None
         and hasattr(jxrs, "BedChunkReader")
@@ -1909,7 +1916,7 @@ def run_chunked_gwas_lmm_lm(
                 # Unified FvLMM path: single Rust call replaces entire chunk loop.
                 # The Rust function mmaps BED, filters SNPs, and runs the full
                 # triple-buffer pipeline (decode -> rotate -> assoc -> TSV write).
-                bed_prefix = _as_plink_prefix(genofile)
+                bed_prefix = _as_plink_input_path(genofile)
                 if bed_prefix is None:
                     raise RuntimeError(
                         "Rust-only GWAS scan requires PLINK BED input/prefix."
@@ -1983,7 +1990,7 @@ def run_chunked_gwas_lmm_lm(
                     pbar.close(show_done=False)
                     pbar = None
             elif _use_lmm_unified:
-                bed_prefix = _as_plink_prefix(genofile)
+                bed_prefix = _as_plink_input_path(genofile)
                 if bed_prefix is None:
                     raise RuntimeError(
                         "Rust-only GWAS scan requires PLINK BED input/prefix."
@@ -2085,7 +2092,7 @@ def run_chunked_gwas_lmm_lm(
                     pbar.close(show_done=False)
                     pbar = None
             elif _use_lmm2_unified:
-                bed_prefix = _as_plink_prefix(genofile)
+                bed_prefix = _as_plink_input_path(genofile)
                 if bed_prefix is None:
                     raise RuntimeError(
                         "Rust-only GWAS scan requires PLINK BED input/prefix."
@@ -2195,7 +2202,7 @@ def run_chunked_gwas_lmm_lm(
             else:
                 ex = cf.ThreadPoolExecutor(max_workers=workers)
                 try:
-                    bed_prefix = _as_plink_prefix(genofile)
+                    bed_prefix = _as_plink_input_path(genofile)
                     if bed_prefix is None:
                         raise RuntimeError(
                             "Rust-only GWAS scan requires PLINK BED input/prefix."
@@ -3129,7 +3136,7 @@ def run_chunked_gwas_streaming_shared(
         ),
     ):
         try:
-            bed_prefix = _as_plink_prefix(genofile)
+            bed_prefix = _as_plink_input_path(genofile)
             if bed_prefix is None:
                 raise RuntimeError(
                     "Rust-only GWAS scan requires PLINK BED input/prefix."
@@ -3139,7 +3146,8 @@ def run_chunked_gwas_streaming_shared(
                     "Rust-only GWAS scan requires rust symbol BedChunkReader."
                 )
             try:
-                if trait_prepared_meta is not None:
+                source_is_pgen = str(bed_prefix).lower().endswith(".pgen")
+                if trait_prepared_meta is not None and not source_is_pgen:
                     bed_reader = _new_bed_chunk_reader_from_meta_for_stream(
                         bed_prefix=str(bed_prefix),
                         row_indices=np.asarray(trait_prepared_meta["row_indices"], dtype=np.int64),
@@ -3151,6 +3159,24 @@ def run_chunked_gwas_streaming_shared(
                         row_maf=np.asarray(trait_prepared_meta["maf"], dtype=np.float32),
                         sample_ids=sample_sub.tolist(),
                         mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
+                    )
+                elif trait_prepared_meta is not None:
+                    # BedChunkReaderFromMeta uses the BED-only windowed matrix.
+                    # Keep PGEN selection explicit and feed its prefiltered row
+                    # indices through the native PGEN chunk reader instead.
+                    bed_reader = _new_bed_chunk_reader_for_stream(
+                        bed_prefix=str(bed_prefix),
+                        maf_threshold=0.0,
+                        max_missing_rate=1.0,
+                        sample_ids=sample_sub.tolist(),
+                        model=str(genetic_model),
+                        het_threshold=1.0,
+                        mmap_window_mb=None,
+                        bimranges=None,
+                        snp_indices=np.asarray(
+                            trait_prepared_meta["row_indices"], dtype=np.int64
+                        ),
+                        logger=logger,
                     )
                 else:
                     bed_reader = _new_bed_chunk_reader_for_stream(

@@ -2516,6 +2516,8 @@ fn spgrm_decode_stream_batch_buffer(
     row_inv_sd: &[f32],
     bed_window: Option<&mut WindowedBedMatrix>,
     full_mmap: Option<&Mmap>,
+    source_reader: Option<&mut crate::gload::PackedBedSourceReader>,
+    source_scratch: &mut Vec<u8>,
     rel_row_indices: &mut Vec<usize>,
     code4_lut: &[[u8; 4]; 256],
     pool: Option<&std::sync::Arc<rayon::ThreadPool>>,
@@ -2534,7 +2536,36 @@ fn spgrm_decode_stream_batch_buffer(
     let row_mean_use: &[f32];
     let row_inv_sd_use: &[f32];
 
-    if let Some(window) = bed_window {
+    if let Some(reader) = source_reader {
+        let selected_source_rows = &meta.row_source_indices[row_start..row_start + cur_rows];
+        if selected_source_rows
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        {
+            return Err("PGEN sparse-GRM source rows must be strictly increasing".to_string());
+        }
+        let packed_len = cur_rows
+            .checked_mul(meta.bytes_per_snp)
+            .ok_or_else(|| "PGEN sparse-GRM packed block size overflow".to_string())?;
+        source_scratch.resize(packed_len, 0u8);
+        for (local_row, &source_row) in selected_source_rows.iter().enumerate() {
+            let start = local_row * meta.bytes_per_snp;
+            let end = start + meta.bytes_per_snp;
+            if reader.read_source_block(source_row, 1, &mut source_scratch[start..end])? != 1 {
+                return Err(format!(
+                    "PGEN ended while reading sparse-GRM source row {source_row}"
+                ));
+            }
+        }
+        rel_row_indices.clear();
+        rel_row_indices.extend(0..cur_rows);
+        packed_block = source_scratch.as_slice();
+        packed_row_indices = Some(rel_row_indices.as_slice());
+        decode_row_start = 0usize;
+        row_flip_use = &meta.row_flip[row_start..row_start + cur_rows];
+        row_mean_use = &row_mean[row_start..row_start + cur_rows];
+        row_inv_sd_use = &row_inv_sd[row_start..row_start + cur_rows];
+    } else if let Some(window) = bed_window {
         let row_end = row_start + cur_rows;
         packed_block = window.prepare_source_rows(
             &meta.row_source_indices[row_start..row_end],
@@ -4197,7 +4228,19 @@ fn spgrm_stream_bed_to_jxgrm_core(
         return Err("Sparse GRM output prefix must not be empty".to_string());
     }
     let (row_mean, row_inv_sd) = spgrm_row_mean_and_inv_sd(meta.maf.as_slice(), method);
-    let mut bed_window = if let Some(window_mb) = mmap_window_mb {
+    let pgen_source = crate::pgen::path_uses_pgen(bed_prefix);
+    let mut pgen_reader = if pgen_source {
+        Some(crate::gload::PackedBedSourceReader::open(
+            bed_prefix,
+            n_samples_full,
+        )?)
+    } else {
+        None
+    };
+    let mut pgen_scratch = Vec::<u8>::new();
+    let mut bed_window = if pgen_source {
+        None
+    } else if let Some(window_mb) = mmap_window_mb {
         if window_mb == 0 {
             return Err("Sparse GRM mmap_window_mb must be > 0".to_string());
         }
@@ -4205,7 +4248,7 @@ fn spgrm_stream_bed_to_jxgrm_core(
     } else {
         None
     };
-    let full_mmap = if bed_window.is_none() {
+    let full_mmap = if bed_window.is_none() && !pgen_source {
         Some(spgrm_open_bed_payload_mmap(
             bed_prefix,
             meta.n_samples,
@@ -4277,6 +4320,8 @@ fn spgrm_stream_bed_to_jxgrm_core(
                         row_inv_sd.as_slice(),
                         bed_window.as_mut(),
                         full_mmap.as_ref(),
+                        pgen_reader.as_mut(),
+                        &mut pgen_scratch,
                         &mut rel_row_indices,
                         code4_lut,
                         pool.as_ref(),
@@ -4345,6 +4390,8 @@ fn spgrm_stream_bed_to_jxgrm_core(
                         row_inv_sd.as_slice(),
                         bed_window.as_mut(),
                         full_mmap.as_ref(),
+                        pgen_reader.as_mut(),
+                        &mut pgen_scratch,
                         &mut rel_row_indices,
                         code4_lut,
                         pool.as_ref(),
@@ -4873,6 +4920,8 @@ fn grm_stream_bed_row_band_f32_fill_core(
                     row_inv_sd.as_slice(),
                     bed_window.as_mut(),
                     full_mmap.as_ref(),
+                    None,
+                    &mut Vec::new(),
                     &mut rel_row_indices,
                     code4_lut,
                     pool.as_ref(),
@@ -4941,6 +4990,8 @@ fn grm_stream_bed_row_band_f32_fill_core(
                     row_inv_sd.as_slice(),
                     bed_window.as_mut(),
                     full_mmap.as_ref(),
+                    None,
+                    &mut Vec::new(),
                     &mut rel_row_indices,
                     code4_lut,
                     pool.as_ref(),
@@ -5247,6 +5298,8 @@ fn grm_stream_bed_full_f32_to_npy_core(
                         row_inv_sd.as_slice(),
                         bed_window.as_mut(),
                         full_mmap.as_ref(),
+                        None,
+                        &mut Vec::new(),
                         &mut rel_row_indices,
                         code4_lut,
                         pool.as_ref(),
@@ -5313,6 +5366,8 @@ fn grm_stream_bed_full_f32_to_npy_core(
                         row_inv_sd.as_slice(),
                         bed_window.as_mut(),
                         full_mmap.as_ref(),
+                        None,
+                        &mut Vec::new(),
                         &mut rel_row_indices,
                         code4_lut,
                         pool.as_ref(),
@@ -7303,6 +7358,47 @@ mod tests {
         std::fs::write(format!("{prefix}.bim"), bim).unwrap();
     }
 
+    fn write_toy_pgen(prefix: &str, sample_major: &[Vec<Option<u8>>]) {
+        let bed_rows = pack_site_major_dosages(sample_major);
+        let n_samples = sample_major.len();
+        let n_sites = sample_major.first().map(|v| v.len()).unwrap_or(0);
+        let bytes_per_site = n_samples.div_ceil(4);
+        let mut pgen = vec![0x6c, 0x1b, 0x02];
+        pgen.extend_from_slice(&(n_sites as u32).to_le_bytes());
+        pgen.extend_from_slice(&(n_samples as u32).to_le_bytes());
+        pgen.push(0); // fixed hard-call storage
+        for bed_row in bed_rows.chunks_exact(bytes_per_site) {
+            let mut category_row = vec![0u8; bytes_per_site];
+            for sample_idx in 0..n_samples {
+                let bed_code = (bed_row[sample_idx >> 2] >> ((sample_idx & 3) * 2)) & 3;
+                let category = match bed_code {
+                    0b00 => 0b00,
+                    0b10 => 0b01,
+                    0b11 => 0b10,
+                    0b01 => 0b11,
+                    _ => unreachable!(),
+                };
+                category_row[sample_idx >> 2] |= category << ((sample_idx & 3) * 2);
+            }
+            pgen.extend_from_slice(&category_row);
+        }
+        std::fs::write(format!("{prefix}.pgen"), pgen).unwrap();
+        let psam = format!(
+            "#FID IID\n{}",
+            (0..n_samples)
+                .map(|i| format!("F{i} I{i}\n"))
+                .collect::<String>()
+        );
+        std::fs::write(format!("{prefix}.psam"), psam).unwrap();
+        let pvar = format!(
+            "#CHROM POS ID REF ALT\n{}",
+            (0..n_sites)
+                .map(|i| format!("1 {} snp{} A C\n", i + 1, i + 1))
+                .collect::<String>()
+        );
+        std::fs::write(format!("{prefix}.pvar"), pvar).unwrap();
+    }
+
     fn dense_from_csc_lower(csc: &SparseGrmCsc) -> Vec<f64> {
         let n = csc.n_samples;
         let mut out = vec![0.0_f64; n * n];
@@ -7639,6 +7735,84 @@ mod tests {
         let _ = std::fs::remove_file(format!("{prefix_str}.fam"));
         let _ = std::fs::remove_file(path_full);
         let _ = std::fs::remove_file(path_window);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn spgrm_explicit_pgen_matches_bed_when_both_families_exist() {
+        let geno = vec![
+            vec![Some(0), Some(0), Some(1), Some(2)],
+            vec![Some(0), Some(1), Some(1), Some(2)],
+            vec![Some(2), Some(1), Some(2), Some(1)],
+            vec![Some(2), Some(2), Some(2), Some(0)],
+        ];
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "janusx_spgrm_explicit_pgen_{}_{}",
+            std::process::id(),
+            stamp
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prefix = dir.join("toy");
+        let prefix_str = prefix.to_string_lossy().to_string();
+        write_toy_plink(&prefix_str, &geno);
+        write_toy_pgen(&prefix_str, &geno);
+
+        let out_bed = dir.join("bed").to_string_lossy().to_string();
+        let out_pgen = dir.join("pgen").to_string_lossy().to_string();
+        let (bed_path, bed_n, bed_nnz) = spgrm_bed_to_jxgrm_core(
+            &prefix_str,
+            None,
+            &out_bed,
+            1,
+            0.0,
+            true,
+            0.0,
+            1.0,
+            0.0,
+            false,
+            0,
+            0,
+            1,
+            Some(1),
+            None,
+            0,
+        )
+        .unwrap();
+        let (pgen_path, pgen_n, pgen_nnz) = spgrm_bed_to_jxgrm_core(
+            &format!("{prefix_str}.pgen"),
+            None,
+            &out_pgen,
+            1,
+            0.0,
+            true,
+            0.0,
+            1.0,
+            0.0,
+            false,
+            0,
+            0,
+            1,
+            Some(1),
+            None,
+            0,
+        )
+        .unwrap();
+
+        let bed = crate::cholesky::read_sparse_grm_csc(&bed_path).unwrap();
+        let pgen = crate::cholesky::read_sparse_grm_csc(&pgen_path).unwrap();
+        assert_eq!((bed_n, bed_nnz), (pgen_n, pgen_nnz));
+        assert_eq!(bed.n_samples, pgen.n_samples);
+        assert_eq!(bed.nnz, pgen.nnz);
+        assert_eq!(bed.col_ptr, pgen.col_ptr);
+        assert_eq!(bed.row_indices, pgen.row_indices);
+        for (lhs, rhs) in bed.values.iter().zip(pgen.values.iter()) {
+            assert!((lhs - rhs).abs() <= 1e-12, "BED={lhs}, PGEN={rhs}");
+        }
+
         let _ = std::fs::remove_dir_all(dir);
     }
 

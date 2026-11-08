@@ -22,6 +22,7 @@ import numpy as np
 
 from janusx.assoc.workflow import load_or_build_grm_with_cache
 from janusx.assoc.workflow_cache import _gwas_cache_prefix_with_params
+from janusx._plink import detect_existing_plink_kind
 from janusx.gfreader import (
     inspect_genotype_file,
     prepare_bed_logic_keep_mask_pure_line,
@@ -234,6 +235,45 @@ def _normalize_bim_chrom(chrom: object) -> str:
     return text.upper()
 
 
+def _plink_variant_metadata_path(path_or_prefix: str) -> str:
+    resolved = detect_existing_plink_kind(str(path_or_prefix))
+    if resolved is None:
+        raise FileNotFoundError(f"Cannot resolve PLINK variant metadata for {path_or_prefix}")
+    kind, prefix = resolved
+    return f"{prefix}.pvar" if kind == "pfile" else f"{prefix}.bim"
+
+
+def _iter_plink_variant_chrom_pos(path_or_prefix: str):
+    variant_path = _plink_variant_metadata_path(path_or_prefix)
+    is_pvar = variant_path.lower().endswith(".pvar")
+    columns: list[str] | None = None
+    with open(variant_path, "r", encoding="utf-8", errors="replace") as handle:
+        for line_no, line in enumerate(handle, start=1):
+            text = line.strip()
+            if not text or text.startswith("##"):
+                continue
+            fields = text.split()
+            if is_pvar and text.startswith("#"):
+                columns = [field.lstrip("#").upper() for field in fields]
+                continue
+            if text.startswith("#"):
+                continue
+            try:
+                if is_pvar:
+                    if columns is None:
+                        raise ValueError("missing PVAR header")
+                    chrom_i, pos_i = columns.index("CHROM"), columns.index("POS")
+                    chrom, pos = fields[chrom_i], int(fields[pos_i])
+                else:
+                    chrom, pos = fields[0], int(fields[3])
+            except (ValueError, IndexError) as exc:
+                label = "PVAR" if is_pvar else "BIM"
+                raise ValueError(
+                    f"Malformed {label} row at {variant_path}:{line_no}"
+                ) from exc
+            yield str(chrom).strip(), int(pos)
+
+
 def _prepare_simulation_site_keep(
     *,
     bed_prefix: str,
@@ -273,24 +313,27 @@ def _build_active_bim_position_index(
     bed_prefix: str,
     site_keep: np.ndarray,
 ) -> dict[str, list[int]]:
-    bim_path = f"{bed_prefix}.bim"
-    if not os.path.exists(bim_path):
-        raise ValueError(f"GFF-constrained simulation requires BIM metadata: {bim_path}")
+    variant_path = _plink_variant_metadata_path(bed_prefix)
+    if not os.path.exists(variant_path):
+        raise ValueError(f"GFF-constrained simulation requires variant metadata: {variant_path}")
     keep_mask = np.asarray(site_keep, dtype=np.bool_).reshape(-1)
     out: dict[str, list[int]] = {}
-    with open(bim_path, "r", encoding="utf-8") as fh:
-        for row_idx, line in enumerate(fh):
-            if row_idx >= int(keep_mask.shape[0]) or not bool(keep_mask[row_idx]):
-                continue
-            toks = line.rstrip("\n").split()
-            if len(toks) < 4:
-                continue
-            chrom = _normalize_bim_chrom(toks[0])
-            try:
-                pos = int(toks[3])
-            except Exception:
-                continue
+    n_rows = 0
+    for row_idx, (chrom_raw, pos) in enumerate(_iter_plink_variant_chrom_pos(bed_prefix)):
+        n_rows = row_idx + 1
+        if row_idx >= int(keep_mask.shape[0]):
+            raise ValueError(
+                "PLINK variant metadata has more rows than the QC mask: "
+                f"metadata={n_rows}, mask={int(keep_mask.shape[0])}."
+            )
+        if bool(keep_mask[row_idx]):
+            chrom = _normalize_bim_chrom(chrom_raw)
             out.setdefault(chrom, []).append(int(pos))
+    if n_rows != int(keep_mask.shape[0]):
+        raise ValueError(
+            "PLINK variant metadata row count does not match the QC mask: "
+            f"metadata={n_rows}, mask={int(keep_mask.shape[0])}."
+        )
     for chrom in list(out.keys()):
         out[chrom].sort()
     return out
@@ -399,9 +442,9 @@ def _build_ldms_gene_catalog(
         raise ValueError("LDMS causal spacing must be >= 0 bp.")
 
     keep_mask = np.asarray(site_keep, dtype=np.bool_).reshape(-1)
-    bim_path = f"{bed_prefix}.bim"
-    if not os.path.exists(bim_path):
-        raise ValueError(f"LDMS causal sampling requires BIM metadata: {bim_path}")
+    variant_path = _plink_variant_metadata_path(bed_prefix)
+    if not os.path.exists(variant_path):
+        raise ValueError(f"LDMS causal sampling requires variant metadata: {variant_path}")
     if not os.path.exists(ldsc_path):
         raise ValueError(f"LDMS score table does not exist: {ldsc_path}")
     if not os.path.exists(freq_path):
@@ -411,10 +454,10 @@ def _build_ldms_gene_catalog(
     active_ldsc: list[float] = []
     active_maf: list[float] = []
     with (
-        open(bim_path, "r", encoding="utf-8", buffering=8 * 1024 * 1024) as bim_fh,
         open(ldsc_path, "r", encoding="utf-8", buffering=8 * 1024 * 1024) as ldsc_fh,
         open(freq_path, "r", encoding="utf-8", buffering=8 * 1024 * 1024) as freq_fh,
     ):
+        variant_rows = iter(_iter_plink_variant_chrom_pos(bed_prefix))
         ldsc_chrom_idx, ldsc_pos_idx, ldsc_value_idx = _read_metric_header(
             ldsc_fh,
             path=str(ldsc_path),
@@ -426,15 +469,12 @@ def _build_ldms_gene_catalog(
             value_columns=("maf", "freq", "af", "allele_frequency"),
         )
         for row_idx in range(int(keep_mask.shape[0])):
-            bim_line = _next_nonempty_data_line(bim_fh, path=str(bim_path))
-            bim_fields = bim_line.strip().split()
-            if len(bim_fields) < 4:
-                raise ValueError(f"{bim_path}: malformed BIM row {int(row_idx) + 1}.")
-            bim_chrom = str(bim_fields[0]).strip()
             try:
-                bim_pos = int(float(bim_fields[3]))
-            except ValueError as exc:
-                raise ValueError(f"{bim_path}: invalid position at row {int(row_idx) + 1}.") from exc
+                bim_chrom, bim_pos = next(variant_rows)
+            except StopIteration as exc:
+                raise ValueError(
+                    f"{variant_path}: variant metadata ended before row {int(row_idx) + 1}."
+                ) from exc
 
             ldsc_chrom, ldsc_pos, ldsc_value = _parse_metric_row(
                 _next_nonempty_data_line(ldsc_fh, path=str(ldsc_path)),
@@ -455,14 +495,14 @@ def _build_ldms_gene_catalog(
             bim_key = (_normalize_bim_chrom(bim_chrom), int(bim_pos))
             if (_normalize_bim_chrom(ldsc_chrom), int(ldsc_pos)) != bim_key:
                 raise ValueError(
-                    "LD-score/BIM coordinate mismatch at row "
-                    f"{int(row_idx) + 1}: BIM={bim_chrom}:{bim_pos}, "
+                    "LD-score/PLINK variant coordinate mismatch at row "
+                    f"{int(row_idx) + 1}: PLINK={bim_chrom}:{bim_pos}, "
                     f"LDSC={ldsc_chrom}:{ldsc_pos}."
                 )
             if (_normalize_bim_chrom(freq_chrom), int(freq_pos)) != bim_key:
                 raise ValueError(
-                    "MAF/BIM coordinate mismatch at row "
-                    f"{int(row_idx) + 1}: BIM={bim_chrom}:{bim_pos}, "
+                    "MAF/PLINK variant coordinate mismatch at row "
+                    f"{int(row_idx) + 1}: PLINK={bim_chrom}:{bim_pos}, "
                     f"MAF={freq_chrom}:{freq_pos}."
                 )
             if not bool(keep_mask[row_idx]):
@@ -479,9 +519,11 @@ def _build_ldms_gene_catalog(
             active_ldsc.append(float(ldsc_value))
             active_maf.append(float(maf_value))
 
-        for handle, label in ((bim_fh, bim_path), (ldsc_fh, ldsc_path), (freq_fh, freq_path)):
+        if next(variant_rows, None) is not None:
+            raise ValueError(f"{variant_path} has more data rows than the QC mask.")
+        for handle, label in ((ldsc_fh, ldsc_path), (freq_fh, freq_path)):
             if any(str(line).strip() for line in handle):
-                raise ValueError(f"{label} has more data rows than the BIM/site_keep mask.")
+                raise ValueError(f"{label} has more data rows than the PLINK/site_keep mask.")
 
     if not active_rows:
         raise ValueError("LDMS causal sampling found no finite metrics on QC-passing sites.")
@@ -500,15 +542,15 @@ def _build_ldms_gene_catalog(
     candidate_mask = np.zeros(keep_mask.shape[0], dtype=np.bool_)
     candidate_mask[candidate_rows] = True
     candidate_coords: dict[int, tuple[str, int]] = {}
-    with open(bim_path, "r", encoding="utf-8", buffering=8 * 1024 * 1024) as bim_fh:
-        for row_idx in range(int(keep_mask.shape[0])):
-            line = _next_nonempty_data_line(bim_fh, path=str(bim_path))
-            if not bool(candidate_mask[row_idx]):
-                continue
-            fields = line.strip().split()
-            if len(fields) < 4:
-                raise ValueError(f"{bim_path}: malformed candidate row {int(row_idx) + 1}.")
-            candidate_coords[int(row_idx)] = (str(fields[0]).strip(), int(float(fields[3])))
+    resolved_variant_rows = 0
+    for row_idx, (chrom, pos) in enumerate(_iter_plink_variant_chrom_pos(bed_prefix)):
+        if row_idx >= int(keep_mask.shape[0]):
+            raise ValueError(f"{variant_path} has more data rows than the QC mask.")
+        resolved_variant_rows = row_idx + 1
+        if bool(candidate_mask[row_idx]):
+            candidate_coords[int(row_idx)] = (str(chrom).strip(), int(pos))
+    if resolved_variant_rows != int(keep_mask.shape[0]):
+        raise ValueError(f"{variant_path} row count does not match the QC mask.")
 
     interval_index: dict[str, list[tuple[int, int, str, str]]] = {}
     for gene, (chrom, start, end) in gene_catalog:
@@ -2053,7 +2095,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
 
     checks: list[bool] = []
-    if args.bfile:
+    if args.bfile or args.pfile:
         checks.append(ensure_plink_prefix_exists(logger, gfile, "Genotype PLINK prefix"))
     elif args.file:
         checks.append(ensure_file_input_exists(logger, gfile, "Genotype FILE input"))
@@ -2179,7 +2221,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             het=1.0 if args.het is None else float(args.het),
             out_dir=str(cache_dir or args.out),
             logger=logger,
-            prefer_plink_source=bool(args.bfile),
+            prefer_plink_source=bool(args.bfile or args.pfile),
             threads=int(detected_threads),
         )
         logger.info(
@@ -2191,10 +2233,11 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if gff3_path is not None:
         _simulation_section(logger, "Causal Units")
-        if not os.path.exists(f"{gfile}.bim"):
+        variant_path = _plink_variant_metadata_path(str(gfile))
+        if not os.path.exists(variant_path):
             logger.error(
-                "GFF-constrained simulation currently requires PLINK BIM metadata; expected %s.bim.",
-                gfile,
+                "GFF-constrained simulation requires PLINK variant metadata; expected %s.",
+                variant_path,
             )
             raise SystemExit(1)
         try:

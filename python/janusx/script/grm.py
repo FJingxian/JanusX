@@ -34,6 +34,7 @@ from contextlib import contextmanager
 from typing import Union
 
 import numpy as np
+from janusx._plink import canonical_plink_input_path, detect_existing_plink_kind
 from janusx.gfreader import (
     inspect_genotype_file,
     prepare_cli_input_cache,
@@ -159,13 +160,7 @@ def _normalize_plink_prefix_path(path_or_prefix: str) -> str:
 
 
 def _is_plink_prefix_path(path_or_prefix: str) -> bool:
-    p = _normalize_plink_prefix_path(path_or_prefix)
-    if p == "":
-        return False
-    return any(
-        all(os.path.isfile(f"{p}.{ext}") for ext in extensions)
-        for extensions in (("bed", "bim", "fam"), ("pgen", "pvar", "psam"))
-    )
+    return detect_existing_plink_kind(str(path_or_prefix)) is not None
 
 
 def _log_file_only(
@@ -442,8 +437,9 @@ def _resolve_rust_grm_input(
     snps_only: bool,
     threads: int = 0,
 ) -> str:
-    if _is_plink_prefix_path(str(genofile)):
-        return _normalize_plink_prefix_path(str(genofile))
+    resolved_plink = detect_existing_plink_kind(str(genofile))
+    if resolved_plink is not None:
+        return canonical_plink_input_path(str(genofile), resolved_plink[0])
 
     if not bool(from_vcf or from_hmp or from_file):
         raise RuntimeError(
@@ -2385,6 +2381,7 @@ def main(log: bool = True):
             hmp=getattr(args, "hmp", None),
             file=getattr(args, "file", None),
             bfile=getattr(args, "bfile", None),
+            pfile=getattr(args, "pfile", None),
             kfile=getattr(args, "kfile", None),
             prefix=None,
         )
@@ -2472,7 +2469,7 @@ def main(log: bool = True):
     checks: list[bool] = []
     if getattr(args, "dense_grm", None):
         checks.append(ensure_file_exists(logger, gfile, "Dense GRM file"))
-    elif args.bfile:
+    elif args.bfile or args.pfile:
         checks.append(ensure_plink_prefix_exists(logger, gfile, "Genotype PLINK prefix"))
     elif args.file:
         checks.append(ensure_file_input_exists(logger, gfile, "Genotype FILE input"))

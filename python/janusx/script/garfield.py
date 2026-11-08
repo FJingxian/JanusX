@@ -15,6 +15,11 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 import psutil
+from janusx._plink import (
+    canonical_plink_input_path,
+    detect_existing_plink_kind,
+    normalize_plink_prefix,
+)
 
 from janusx.assoc.workflow import (
     _format_cli_finished_timestamp,
@@ -1213,15 +1218,18 @@ def _normalize_scan_chrom(chrom: object) -> str:
 
 def _infer_plink_input_kind(genotype_input: str) -> str:
     """Report whether a packed PLINK prefix resolves to PGEN or BED files."""
-    prefix = str(genotype_input)
-    lowered = prefix.lower()
-    for suffix in (".pgen", ".pvar", ".psam", ".bed", ".bim", ".fam"):
-        if lowered.endswith(suffix):
-            prefix = prefix[: -len(suffix)]
-            break
-    if os.path.isfile(f"{prefix}.pgen") and not os.path.isfile(f"{prefix}.bed"):
-        return "pfile"
-    return "bfile"
+    resolved = detect_existing_plink_kind(str(genotype_input))
+    if resolved is None:
+        raise ValueError(f"PLINK input is incomplete or not found: {genotype_input}")
+    return resolved[0]
+
+
+def _strip_plink_input_suffix(genotype_input: str) -> str:
+    return normalize_plink_prefix(str(genotype_input))
+
+
+def _select_plink_input_kind(genotype_input: str, kind: str) -> str:
+    return canonical_plink_input_path(str(genotype_input), str(kind))
 
 
 def _count_window_scan_units_from_bim(
@@ -1232,15 +1240,11 @@ def _count_window_scan_units_from_bim(
     site_keep: Optional[np.ndarray] = None,
 ) -> int:
     raw_prefix = str(prefix).strip()
-    low = raw_prefix.lower()
-    for suffix in (".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"):
-        if low.endswith(suffix):
-            raw_prefix = raw_prefix[: -len(suffix)]
-            break
-    is_pgen = (
-        not os.path.isfile(f"{raw_prefix}.bed")
-        and all(os.path.isfile(f"{raw_prefix}.{ext}") for ext in ("pgen", "pvar", "psam"))
-    )
+    resolved = detect_existing_plink_kind(raw_prefix)
+    if resolved is None:
+        return 0
+    kind, raw_prefix = resolved
+    is_pgen = kind == "pfile"
     variant_path = f"{raw_prefix}.pvar" if is_pgen else f"{raw_prefix}.bim"
     if not os.path.exists(variant_path):
         return 0
@@ -1792,6 +1796,7 @@ def main() -> None:
         include_hmp=False,
         include_file=False,
         include_bfile=True,
+        pfile_dest="pfile",
         help_profile="plink_prefix_short",
     )
     add_common_pheno_arg(required_group, required=False, help_text="Phenotype file for the scan.")
@@ -2292,6 +2297,20 @@ def main() -> None:
     )
 
     args, extras = parser.parse_known_args()
+    if args.pfile and args.bfile:
+        parser.error("-bfile and -pfile are mutually exclusive")
+    selected_plink_kind = "pfile" if args.pfile else "bfile"
+    selected_plink_input = args.pfile if args.pfile else args.bfile
+    if selected_plink_input:
+        # Keep the requested file family explicit after Rust helpers normalize
+        # `.pgen`/`.bed` suffixes away. This matters when both PLINK formats
+        # exist under one prefix.
+        try:
+            selected_plink_input = _select_plink_input_kind(
+                str(selected_plink_input), selected_plink_kind
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
     args.residual_method = _resolve_garfield_residual_method(
         args.residual_method,
         args.grm,
@@ -2307,7 +2326,7 @@ def main() -> None:
         else "one_df_FWL_g1xg2_adjusted_for_g1_g2_covariates_GRM"
     )
 
-    has_genotype = bool(args.bfile)
+    has_genotype = bool(selected_plink_input)
     has_pheno = bool(args.pheno)
     if bool(args.grm_int) and str(args.search_backend).strip().lower() != "max6-grmmax6":
         parser.error("--grm-int requires --search-backend max6-grmmax6")
@@ -2604,6 +2623,8 @@ def main() -> None:
         args.thread = int(detected_threads)
 
     gfile, prefix = determine_genotype_source(args)
+    if selected_plink_input:
+        gfile = _select_plink_input_kind(gfile, selected_plink_kind)
     out_dir, outprefix, out_stem = apply_output_prefix_compat(args, prefix)
     if bool(args.max6_screen_exceedance_audit) or bool(args.max6_screen_pot_audit):
         project_root = Path(__file__).resolve().parents[3]

@@ -57,6 +57,7 @@ import numpy as np
 import pandas as pd
 import psutil
 import janusx as jx_pkg
+from janusx._plink import canonical_plink_input_path, detect_existing_plink_kind
 from janusx import janusx as jxrs
 from janusx.gfreader import (
     inspect_genotype_file,
@@ -358,8 +359,7 @@ def resolve_group_levels(data: pd.DataFrame, group_col: Union[str, None], group_
 
 
 def _is_plink_prefix_path(path_or_prefix: str) -> bool:
-    p = str(path_or_prefix)
-    return all(os.path.isfile(f"{p}.{ext}") for ext in ("bed", "bim", "fam"))
+    return detect_existing_plink_kind(str(path_or_prefix)) is not None
 
 
 def _is_txt_like_input_path(path_or_prefix: str) -> bool:
@@ -389,8 +389,9 @@ def _resolve_rust_grm_input_for_pca(
     threads: int = 0,
 ) -> str:
     p = str(genofile).strip()
-    if _is_plink_prefix_path(p):
-        return p
+    resolved_plink = detect_existing_plink_kind(p)
+    if resolved_plink is not None:
+        return canonical_plink_input_path(p, resolved_plink[0])
     delim = "," if p.lower().endswith(".csv") else None
     cached = prepare_cli_input_cache(
         p,
@@ -1259,8 +1260,8 @@ def main(log: bool = True):
         parser.error("RSVD power must be >= 0.")
     if not (float(args.rsvd_tol) > 0):
         parser.error("RSVD tol must be > 0.")
-    if bool(args.rsvd) and not bool(args.vcf or args.hmp or args.file or args.bfile):
-        parser.error("--rsvd is only supported for genotype inputs (-vcf/-hmp/-file/-bfile).")
+    if bool(args.rsvd) and not bool(args.vcf or args.hmp or args.file or args.bfile or args.pfile):
+        parser.error("--rsvd is only supported for genotype inputs (-vcf/-hmp/-file/-bfile/-pfile).")
     # Keep RSVD preprocessing aligned with load_genotype_chunks defaults:
     # only VCF path applies SNP-only allele filter in current pipeline.
     rsvd_snps_only = bool(args.vcf)
@@ -1272,6 +1273,7 @@ def main(log: bool = True):
             hmp=None,
             file=None,
             bfile=None,
+            pfile=None,
             prefix=None,
         )
     elif args.hmp:
@@ -1280,6 +1282,7 @@ def main(log: bool = True):
             hmp=args.hmp,
             file=None,
             bfile=None,
+            pfile=None,
             prefix=None,
         )
     elif args.file:
@@ -1288,14 +1291,16 @@ def main(log: bool = True):
             hmp=None,
             file=args.file,
             bfile=None,
+            pfile=None,
             prefix=None,
         )
-    elif args.bfile:
+    elif args.bfile or args.pfile:
         gfile, auto_prefix = _determine_genotype_source(
             vcf=None,
             hmp=None,
             file=None,
             bfile=args.bfile,
+            pfile=args.pfile,
             prefix=None,
         )
     elif args.grm:
@@ -1308,7 +1313,7 @@ def main(log: bool = True):
         raise ValueError("No valid input found; one of --vcf/--hmp/--bfile/--grm/--cov must be provided.")
 
     out_dir, outprefix, out_stem = apply_output_prefix_compat(args, auto_prefix)
-    genotype_input_mode = bool(args.vcf or args.hmp or args.file or args.bfile)
+    genotype_input_mode = bool(args.vcf or args.hmp or args.file or args.bfile or args.pfile)
     args.memory = _normalize_memory_gb(args.memory)
     memory_mb = _memory_gb_to_mb(args.memory)
 
@@ -1354,7 +1359,7 @@ def main(log: bool = True):
                 or bool(args.file and _is_txt_like_input_path(gfile))
             )
         )
-        if args.vcf or args.hmp or args.file or args.bfile:
+        if args.vcf or args.hmp or args.file or args.bfile or args.pfile:
             cfg_rows.extend(
                 [
                     ("Genotype file", gfile),
@@ -1430,7 +1435,7 @@ def main(log: bool = True):
         checks.append(ensure_file_exists(logger, gfile, "Genotype file"))
     elif args.file:
         checks.append(ensure_file_input_exists(logger, gfile, "Genotype FILE input"))
-    elif args.bfile:
+    elif args.bfile or args.pfile:
         checks.append(ensure_plink_prefix_exists(logger, gfile, "Genotype PLINK prefix"))
     elif args.grm:
         if os.path.isfile(gfile):
@@ -1475,7 +1480,7 @@ def main(log: bool = True):
     samples = None
 
     # --- Case 1: VCF / BFILE -> memmap GRM -> PCA (aligned with GWAS) ---
-    if args.vcf or args.hmp or args.file or args.bfile:
+    if args.vcf or args.hmp or args.file or args.bfile or args.pfile:
         rsvd_total_variance = None
         load_src_disp = os.path.basename(str(gfile).rstrip("/\\")) or format_path_for_display(str(gfile))
         if bool(args.rsvd):

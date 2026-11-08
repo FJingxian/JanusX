@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Sequence
 
 import numpy as np
+from janusx._plink import detect_existing_plink_kind, explicit_plink_kind
 
 from .pathcheck import safe_expanduser, safe_resolve
 
@@ -180,6 +181,17 @@ def genotype_cache_prefix(
     """
     del snps_only  # kept for signature compatibility with existing callers
     base = _normalize_genotype_cache_stem(genofile)
+    # PLINK 1 and PLINK 2 inputs can share a prefix while containing different
+    # variant and sample tables. Keep their derived GRM/PCA caches separate.
+    plink_kind = explicit_plink_kind(genofile)
+    if plink_kind is None:
+        resolved_plink = detect_existing_plink_kind(genofile)
+        if resolved_plink is not None:
+            plink_kind = resolved_plink[0]
+    if plink_kind == "bfile":
+        base = f"{base}.bed"
+    elif plink_kind == "pfile":
+        base = f"{base}.pgen"
     cache_root = resolve_genotype_cache_dir(
         genofile,
         cache_dir=cache_dir,
@@ -362,15 +374,15 @@ def latest_genotype_mtime(genofile: str) -> float | None:
     - File input  : mtime of the file path itself
     """
     raw = str(genofile).strip()
-    low = raw.lower()
-    for suffix in (".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"):
-        if low.endswith(suffix):
-            raw = raw[: -len(suffix)]
-            break
-    for extensions in (("bed", "bim", "fam"), ("pgen", "pvar", "psam")):
-        paths = [f"{raw}.{ext}" for ext in extensions]
+    resolved = detect_existing_plink_kind(raw)
+    if resolved is not None:
+        kind, prefix = resolved
+        extensions = ("bed", "bim", "fam") if kind == "bfile" else ("pgen", "pvar", "psam")
+        paths = [f"{prefix}.{ext}" for ext in extensions]
         if all(os.path.isfile(path) for path in paths):
             return max(os.path.getmtime(path) for path in paths)
+        if explicit_plink_kind(raw) is not None:
+            return None
 
     file_prefix, matrix_path = _resolve_file_input_matrix(genofile)
     if file_prefix and matrix_path:

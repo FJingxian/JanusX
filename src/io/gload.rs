@@ -335,6 +335,18 @@ pub trait GenotypeMatrix: Send + Sync {
     /// This is the primitive accessor for mmap matrices.
     fn source_row_bytes(&self, source_idx: usize) -> &[u8];
 
+    /// Ensure the packed source rows for a kept-marker block are available to
+    /// `source_row_bytes`. Resident backends need no preparation; streaming
+    /// sources may fill a bounded block cache here.
+    fn prepare_source_rows(
+        &mut self,
+        _stats: &GlobalStats,
+        _row_start: usize,
+        _rows_here: usize,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     /// MAF values produced by a streaming decoder for the most recent block.
     /// Resident BED backends return `None` because their metadata is already
     /// available in `GlobalStats`; k-file adapters use this bounded slice for

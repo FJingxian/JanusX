@@ -11,6 +11,7 @@ from typing import Union
 import numpy as np
 import pandas as pd
 import psutil
+from janusx._plink import canonical_plink_input_path
 from janusx.script._common.genoio import (
     determine_genotype_source_force_kind_from_args,
     inspect_genotype_file,
@@ -27,6 +28,7 @@ from .workflow import (
     CliStatus,
     _ProgressAdapter,
     _align_pheno_to_sample_order,
+    _as_plink_input_path,
     _as_plink_prefix,
     _basename_only,
     _cache_lock,
@@ -858,9 +860,9 @@ def run_farmcpu_fullmem(
         preloaded_packed_ready = (
             preloaded_packed if packed_preload_is_ready(preloaded_packed) else None
         )
-        packed_prefix = _as_plink_prefix(gfile)
+        packed_prefix = _as_plink_input_path(gfile)
         if packed_prefix is None and isinstance(preloaded_packed_ready, dict):
-            packed_prefix = _as_plink_prefix(
+            packed_prefix = _as_plink_input_path(
                 str(preloaded_packed_ready.get("prefix", ""))
             )
         if packed_prefix is None:
@@ -871,14 +873,32 @@ def run_farmcpu_fullmem(
                 snps_only=bool(snps_only),
                 logger=logger,
             )
-            packed_prefix = _as_plink_prefix(cache_guess)
+            cache_bed_path = (
+                canonical_plink_input_path(cache_guess, "bfile")
+                if cache_guess
+                else None
+            )
+            packed_prefix = (
+                cache_bed_path
+                if cache_bed_path and os.path.isfile(cache_bed_path)
+                else None
+            )
         if packed_prefix is None:
             cache_guess_plain = genotype_cache_prefix(
                 gfile,
                 snps_only=bool(snps_only),
                 logger=logger,
             )
-            packed_prefix = _as_plink_prefix(cache_guess_plain)
+            cache_plain_bed_path = (
+                canonical_plink_input_path(cache_guess_plain, "bfile")
+                if cache_guess_plain
+                else None
+            )
+            packed_prefix = (
+                cache_plain_bed_path
+                if cache_plain_bed_path and os.path.isfile(cache_plain_bed_path)
+                else None
+            )
 
         geno = None
         packed_ctx: Union[dict[str, object], None] = None
@@ -1166,7 +1186,7 @@ def run_farmcpu_fullmem(
         if packed_ctx is None and bool(defer_packed_trait_load):
             packed_prefix_cached = str(farmcpu_cache.get("packed_prefix", "")).strip()
             if packed_prefix_cached == "":
-                packed_prefix_cached = str(_as_plink_prefix(gfile) or "")
+                packed_prefix_cached = str(_as_plink_input_path(gfile) or "")
             if packed_prefix_cached == "":
                 raise ValueError("FarmCPU deferred packed load requires a PLINK BED prefix.")
             full_ids_cached = np.asarray(
@@ -1414,7 +1434,7 @@ def run_farmcpu_fullmem(
                     if bed_prefix_raw != "":
                         bed_prefix_meta = bed_prefix_raw
                 if not bed_prefix_meta:
-                    bed_prefix_detected = _as_plink_prefix(gfile)
+                    bed_prefix_detected = _as_plink_input_path(gfile)
                     if bed_prefix_detected is not None:
                         bed_prefix_meta = str(bed_prefix_detected)
                 if not bed_prefix_meta:
@@ -1658,7 +1678,7 @@ def run_farmcpu_fullmem(
             if bool(farmcpu_cache.get("_qtn_stage_mode", False)) and int(n_pseudo_qtn) > 0:
                 if not isinstance(effective_qtn_preloaded_packed, dict):
                     raise ValueError("FarmCPU QTN stage2 payload is missing.")
-                main_prefix = _as_plink_prefix(gfile)
+                main_prefix = _as_plink_input_path(gfile)
                 if main_prefix is None:
                     raise ValueError("FarmCPU QTN stage2 requires main genotype PLINK BED prefix.")
                 from janusx.assoc.workflow_model_packed import run_qtn_segmented_lm_stage2

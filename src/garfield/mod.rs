@@ -27721,8 +27721,11 @@ pub fn prepare_max6_genotype_tags_py(
     ld_tag_r2: f64,
 ) -> PyResult<PyMax6PreparedGenotypeTags> {
     arm_interrupt_trap();
+    let input_kind_override_prefix = prefix.clone();
     let tags = py
         .detach(move || {
+            let _input_kind_override =
+                crate::pgen::scoped_input_kind_override(&input_kind_override_prefix)?;
             prepare_max6_genotype_tags_owned(
                 prefix,
                 sample_ids,
@@ -31330,6 +31333,7 @@ pub fn garfield_logic_search_bed_py<'py>(
     write_provenance: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
     arm_interrupt_trap();
+    let input_kind_override_prefix = prefix.clone();
     let grm_int_only =
         grm_int_only.unwrap_or_else(|| search_backend.trim().eq_ignore_ascii_case("max6-grmmax6"));
     let y_vec = read_y_f64(&y);
@@ -31385,6 +31389,8 @@ pub fn garfield_logic_search_bed_py<'py>(
     };
     let result = py
         .detach(move || {
+            let _input_kind_override =
+                crate::pgen::scoped_input_kind_override(&input_kind_override_prefix)?;
             garfield_logic_search_bed_owned(
                 prefix,
                 y_vec,

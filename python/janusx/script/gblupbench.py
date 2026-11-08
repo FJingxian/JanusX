@@ -84,6 +84,7 @@ from janusx.script._common.cli_args import (  # noqa: E402
     resolve_trait_selectors,
 )  # noqa: E402
 from janusx.script._common.outprefix import apply_output_prefix_compat  # noqa: E402
+from janusx.script._common.genoio import determine_genotype_source_from_args  # noqa: E402
 from janusx.script._common.progress import CliStatus, stdout_is_tty  # noqa: E402
 from janusx.script import sim as sim_mod  # noqa: E402
 from janusx.gfreader import convert_genotypes, inspect_genotype_file, load_genotype_chunks, save_genotype_streaming  # noqa: E402
@@ -216,25 +217,7 @@ def _strip_default_prefix_suffix(path: str) -> str:
 
 
 def _determine_genotype_source_from_args(args: argparse.Namespace) -> tuple[str, str]:
-    vcf = getattr(args, "vcf", None)
-    hmp = getattr(args, "hmp", None)
-    file = getattr(args, "file", None)
-    bfile = getattr(args, "bfile", None)
-    if vcf:
-        gfile = str(vcf)
-        auto_prefix = _strip_default_prefix_suffix(gfile)
-    elif hmp:
-        gfile = str(hmp)
-        auto_prefix = _strip_default_prefix_suffix(gfile)
-    elif file:
-        gfile = str(file)
-        auto_prefix = _strip_default_prefix_suffix(gfile)
-    elif bfile:
-        gfile = str(bfile)
-        auto_prefix = os.path.basename(gfile.rstrip("/\\"))
-    else:
-        raise ValueError("No genotype input specified. Use -vcf, -hmp, -file, -bfile or -pfile.")
-    return gfile, auto_prefix
+    return determine_genotype_source_from_args(args)
 
 
 def _safe_float(v: Any, default: float = math.nan) -> float:
@@ -788,7 +771,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         p.error("unrecognized arguments: " + " ".join(extras))
     args._engines_explicit = _option_seen(tokens, {"--engines"})
 
-    has_genotype = bool(args.bfile or args.vcf or args.hmp or args.file)
+    has_genotype = bool(args.bfile or args.pfile or args.vcf or args.hmp or args.file)
     has_pheno = bool(args.pheno)
     if not bool(args.check):
         if (not has_pheno) and (not has_genotype):

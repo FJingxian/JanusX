@@ -734,8 +734,9 @@ def main() -> None:
         try:
             if args.vcf:
                 source = _build_vcf_source(args.vcf)
-            elif args.bfile:
-                source = _build_bfile_source(args.bfile)
+            elif args.bfile or args.pfile:
+                plink_input, _ = determine_genotype_source(args)
+                source = _build_bfile_source(plink_input)
             else:
                 source = _build_file_source(args.file)
         except Exception:

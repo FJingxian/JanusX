@@ -5,9 +5,11 @@
 //! auxiliary tracks are intentionally ignored to match BED hard-call semantics.
 
 use rayon::prelude::*;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 const PGEN_BLOCK_VARIANTS: usize = 1 << 16;
 const PGEN_PARALLEL_WORK_THRESHOLD: usize = 1 << 20;
@@ -1994,13 +1996,104 @@ pub(crate) fn normalize_pgen_prefix(path_or_prefix: &str) -> String {
     path.to_string()
 }
 
-pub(crate) fn path_uses_pgen(path_or_prefix: &str) -> bool {
+type InputKindOverrides = HashMap<String, (bool, usize)>;
+
+static INPUT_KIND_OVERRIDES: OnceLock<Mutex<InputKindOverrides>> = OnceLock::new();
+
+fn input_kind_override_key(path_or_prefix: &str) -> String {
+    let prefix = normalize_pgen_prefix(path_or_prefix);
+    if cfg!(windows) {
+        prefix.replace('/', "\\").to_ascii_lowercase()
+    } else {
+        prefix
+    }
+}
+
+fn explicit_input_kind(path_or_prefix: &str) -> Option<bool> {
     let lower = path_or_prefix.trim().to_ascii_lowercase();
     if [".pgen", ".pvar", ".psam"]
         .iter()
         .any(|suffix| lower.ends_with(suffix))
     {
-        return true;
+        Some(true)
+    } else if [".bed", ".bim", ".fam"]
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+    {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Keep an explicitly selected PLINK file kind visible after callers
+/// normalize `.pgen`/`.bed` suffixes away. The override is scoped to one
+/// native GARFIELD call and keyed by the normalized genotype prefix so helper
+/// readers and worker threads use the same input family.
+pub(crate) struct InputKindOverrideGuard {
+    key: String,
+    pgen: bool,
+}
+
+impl Drop for InputKindOverrideGuard {
+    fn drop(&mut self) {
+        let Some(overrides) = INPUT_KIND_OVERRIDES.get() else {
+            return;
+        };
+        if let Ok(mut overrides) = overrides.lock() {
+            if let Some((kind, count)) = overrides.get_mut(&self.key) {
+                if *kind == self.pgen {
+                    if *count > 1 {
+                        *count -= 1;
+                    } else {
+                        overrides.remove(&self.key);
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn scoped_input_kind_override(
+    path_or_prefix: &str,
+) -> Result<Option<InputKindOverrideGuard>, String> {
+    let Some(pgen) = explicit_input_kind(path_or_prefix) else {
+        return Ok(None);
+    };
+    let key = input_kind_override_key(path_or_prefix);
+    let overrides = INPUT_KIND_OVERRIDES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut overrides = overrides
+        .lock()
+        .map_err(|_| "PLINK input-kind override lock is poisoned".to_string())?;
+    match overrides.get_mut(&key) {
+        Some((kind, count)) if *kind == pgen => *count = count.saturating_add(1),
+        Some((kind, _)) => {
+            return Err(format!(
+                "conflicting PLINK input kinds were selected concurrently for '{}': existing={}, requested={}",
+                key,
+                if *kind { "pfile" } else { "bfile" },
+                if pgen { "pfile" } else { "bfile" },
+            ));
+        }
+        None => {
+            overrides.insert(key.clone(), (pgen, 1));
+        }
+    }
+    Ok(Some(InputKindOverrideGuard { key, pgen }))
+}
+
+pub(crate) fn path_uses_pgen(path_or_prefix: &str) -> bool {
+    let lower = path_or_prefix.trim().to_ascii_lowercase();
+    if let Some(pgen) = explicit_input_kind(lower.as_str()) {
+        return pgen;
+    }
+    let key = input_kind_override_key(path_or_prefix);
+    if let Some(overrides) = INPUT_KIND_OVERRIDES.get() {
+        if let Ok(overrides) = overrides.lock() {
+            if let Some((pgen, _)) = overrides.get(key.as_str()) {
+                return *pgen;
+            }
+        }
     }
     let prefix = normalize_pgen_prefix(path_or_prefix);
     Path::new(&format!("{prefix}.pgen")).is_file() && !Path::new(&format!("{prefix}.bed")).is_file()
@@ -2246,9 +2339,9 @@ pub(crate) fn count_pgen_variants(path_or_prefix: &str, n_samples: usize) -> Res
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_packed_record, invert_packed_categories, one_bit_nibble_to_packed,
-        pgen_category_byte_to_row_byte, set_packed_category, GenotypeRowStats,
-        GenotypeSampleSelection, PgenReader, PGEN_BLOCK_VARIANTS,
+        decode_packed_record, invert_packed_categories, one_bit_nibble_to_packed, path_uses_pgen,
+        pgen_category_byte_to_row_byte, scoped_input_kind_override, set_packed_category,
+        GenotypeRowStats, GenotypeSampleSelection, PgenReader, PGEN_BLOCK_VARIANTS,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -2520,6 +2613,27 @@ mod tests {
         assert_eq!(stats[0].heterozygote_count, 1);
         assert_eq!(stats[0].homozygous_alt_count, 1);
         assert_eq!(keep, [true]);
+    }
+
+    #[test]
+    fn scoped_input_kind_override_preserves_explicit_pgen_with_same_prefix_bed() {
+        let file = TempPgen::new(&[0x6c, 0x1b, 0x01, 0x78]);
+        let prefix = file.0.with_extension("");
+        let bed_path = prefix.with_extension("bed");
+        fs::write(&bed_path, [0x6c, 0x1b, 0x01, 0x78]).unwrap();
+        let prefix_text = prefix.to_string_lossy().to_string();
+        let pgen_path = file.0.to_string_lossy().to_string();
+
+        assert!(!path_uses_pgen(&prefix_text));
+        assert!(!path_uses_pgen(&bed_path.to_string_lossy()));
+        {
+            let _guard = scoped_input_kind_override(&pgen_path).unwrap().unwrap();
+            assert!(path_uses_pgen(&prefix_text));
+            assert!(path_uses_pgen(&pgen_path));
+        }
+        assert!(!path_uses_pgen(&prefix_text));
+
+        let _ = fs::remove_file(bed_path);
     }
 
     #[test]

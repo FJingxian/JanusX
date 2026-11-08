@@ -731,10 +731,11 @@ def _resolve_prune_mask_mmap_window_mb() -> int | None:
 
 def _inspect_plink_prefix_light(prefix: str) -> tuple[list[str], int]:
     p = str(prefix)
+    is_pgen = _is_pgen_prefix(p)
     if p.lower().endswith((".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam")):
         p = str(Path(p).with_suffix(""))
-    if _is_pgen_prefix(p):
-        sample_ids, n_sites = inspect_genotype_file(p)
+    if is_pgen:
+        sample_ids, n_sites = inspect_genotype_file(f"{p}.pgen")
         return [str(sid) for sid in sample_ids], int(n_sites)
 
     fam_path = f"{p}.fam"
@@ -2541,10 +2542,6 @@ def main() -> None:
     if extras:
         parser.error("unrecognized arguments: " + " ".join(extras))
     pgen_input = bool(getattr(args, "pfile", None))
-    if pgen_input:
-        # The shared genotype-source helper uses `bfile` for downstream
-        # compatibility; preserve PGEN's explicit identity separately above.
-        args.bfile = str(args.pfile)
     if not (0.0 <= float(args.maf) <= 0.5):
         parser.error("-maf must be within [0, 0.5].")
     if not (0.0 <= float(args.geno) <= 1.0):
@@ -2654,7 +2651,7 @@ def main() -> None:
     )
 
     checks: list[bool] = []
-    if args.bfile:
+    if args.bfile or args.pfile:
         checks.append(ensure_plink_prefix_exists(logger, gfile, "Genotype PLINK prefix"))
     elif args.file:
         checks.append(ensure_file_input_exists(logger, gfile, "Genotype FILE input"))

@@ -181,6 +181,7 @@ from janusx.gs.progress import (
     trace_preparation,
 )
 from janusx.script._common.genocache import configure_genotype_cache_from_out
+from janusx._plink import detect_existing_plink_kind
 from janusx.script._common.threads import (
     detect_thread_budget_info,
     detect_rust_blas_backend,
@@ -205,6 +206,7 @@ from janusx.script._common.grmio import (
     load_or_materialize_square_grm_cache,
 )
 from janusx.script._common.genoio import (
+    determine_genotype_source_from_args,
     genotype_load_status_done,
     genotype_load_status_fail,
     genotype_load_status_open,
@@ -1906,15 +1908,6 @@ def _load_legacy_text_effect_jxmodel(path: str) -> dict[str, typing.Any]:
     }
 
 
-def _strip_plink_suffix(path_or_prefix: str) -> str:
-    p = str(path_or_prefix).strip()
-    low = p.lower()
-    for suffix in (".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"):
-        if low.endswith(suffix):
-            return p[: -len(suffix)]
-    return p
-
-
 def _read_plink_bim_effect_meta(
     prefix_or_bim: str,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -1925,11 +1918,11 @@ def _read_plink_bim_effect_meta(
 def _read_plink_bim_marker_meta(
     prefix_or_bim: str,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    prefix = _strip_plink_suffix(str(prefix_or_bim))
-    is_pgen = (
-        not os.path.isfile(f"{prefix}.bed")
-        and all(os.path.isfile(f"{prefix}.{ext}") for ext in ("pgen", "pvar", "psam"))
-    )
+    resolved = detect_existing_plink_kind(str(prefix_or_bim))
+    if resolved is None:
+        raise FileNotFoundError(f"Cannot resolve PLINK variant metadata for {prefix_or_bim}")
+    kind, prefix = resolved
+    is_pgen = kind == "pfile"
     if is_pgen:
         variant_path = f"{prefix}.pvar"
         columns: list[str] | None = None
@@ -2771,16 +2764,16 @@ def _build_method_effect_table(
     prefix_candidates: list[str] = []
     state_prefix_hint = str(model_state.get("genotype_prefix_hint", "") or "").strip()
     if state_prefix_hint != "":
-        prefix_candidates.append(_strip_plink_suffix(state_prefix_hint))
+        prefix_candidates.append(state_prefix_hint)
     source_prefix_hint = str(model_state.get("source_prefix", "") or "").strip()
     if source_prefix_hint != "":
-        prefix_candidates.append(_strip_plink_suffix(source_prefix_hint))
+        prefix_candidates.append(source_prefix_hint)
     if packed_local is not None:
         src_prefix = str(packed_local.get("source_prefix", "") or "").strip()
         if src_prefix != "":
-            prefix_candidates.append(_strip_plink_suffix(src_prefix))
+            prefix_candidates.append(src_prefix)
     if genotype_prefix_hint is not None and str(genotype_prefix_hint).strip() != "":
-        prefix_candidates.append(_strip_plink_suffix(str(genotype_prefix_hint)))
+        prefix_candidates.append(str(genotype_prefix_hint).strip())
 
     prefix_candidates = list(dict.fromkeys(prefix_candidates))
     active_row_idx = np.zeros((0,), dtype=np.int64)
@@ -3006,7 +2999,7 @@ def _build_jxmodel_marker_table(
     ref = np.full((n_rows,), "", dtype=object)
     alt = np.full((n_rows,), "", dtype=object)
     metadata_source = str(meta.get("metadata_source", "")).strip()
-    if metadata_source and _is_plink_prefix(_strip_plink_suffix(metadata_source)):
+    if metadata_source and _is_plink_prefix(metadata_source):
         try:
             _chrom_full, _pos_full, _snp_full, ref_full, alt_full = _read_plink_bim_marker_meta(
                 metadata_source
@@ -3321,12 +3314,7 @@ def _parse_ld_prune_args(values: list[str] | None) -> _GsLdPruneSpec | None:
 
 
 def _is_plink_prefix(path_or_prefix: str) -> bool:
-    p = _strip_plink_suffix(str(path_or_prefix))
-    if p == "":
-        return False
-    if os.path.isfile(f"{p}.bed"):
-        return all(os.path.isfile(f"{p}.{ext}") for ext in ("bed", "bim", "fam"))
-    return all(os.path.isfile(f"{p}.{ext}") for ext in ("pgen", "pvar", "psam"))
+    return detect_existing_plink_kind(str(path_or_prefix)) is not None
 
 
 def _is_txt_like_input(path_or_prefix: str) -> bool:
@@ -13363,7 +13351,6 @@ def _model_only_training_alignment(
             )
             or ""
         ).strip()
-        source_prefix = _strip_plink_suffix(source_prefix)
         if source_prefix == "" or not _is_plink_prefix(source_prefix):
             raise ValueError(
                 f"Model {model_path} lacks frozen training orientation/statistics and its "
@@ -13661,7 +13648,7 @@ def _load_model_only_raw_genotype(
     genotype_path: str,
 ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, dict[str, np.ndarray]]:
     """Load all source markers without prediction-side QC or allele flipping."""
-    norm_prefix = _strip_plink_suffix(str(genotype_path))
+    norm_prefix = str(genotype_path)
     if _is_plink_prefix(norm_prefix):
         sample_ids_raw, n_source = inspect_genotype_file(norm_prefix, snps_only=False)
         packed_raw, _miss, _maf, _std, n_samples = load_bed_2bit_packed(norm_prefix)
@@ -18801,7 +18788,7 @@ def parse_args(argv: typing.Optional[list[str]] = None):
     )
 
     args, extras = parser.parse_known_args(argv)
-    has_genotype = bool(args.vcf or args.hmp or args.bfile or args.file)
+    has_genotype = bool(args.vcf or args.hmp or args.bfile or args.pfile or args.file)
     has_pheno = bool(args.pheno)
     model_paths = [
         os.path.expanduser(str(path).strip())
@@ -19001,9 +18988,8 @@ def _resolve_gs_pipeline_paths(
                 base = base[: -len(ext)]
                 break
         auto_prefix = base
-    elif args.bfile:
-        gfile = str(args.bfile)
-        auto_prefix = os.path.basename(gfile)
+    elif args.bfile or args.pfile:
+        gfile, auto_prefix = determine_genotype_source_from_args(args)
     else:
         raise ValueError("No genotype input detected. Use -vcf, -hmp, -file, -bfile or -pfile.")
 
@@ -19189,7 +19175,7 @@ def _run_gs_pipeline_impl(
     gfile_is_plink = _is_plink_prefix(str(gfile))
     gfile_lower = str(gfile).strip().lower()
     bfile_non_plink_path = bool(
-        args.bfile
+        (args.bfile or args.pfile)
         and (not gfile_is_plink)
         and os.path.isfile(str(gfile))
     )
@@ -22353,7 +22339,7 @@ def _run_gs_pipeline_impl(
                     )
                     genotype_prefix_hint = (
                         str(gfile)
-                        if _is_plink_prefix(_strip_plink_suffix(str(gfile)))
+                        if _is_plink_prefix(str(gfile))
                         else None
                     )
                     _attach_effect_export_hints_to_model_state(

@@ -23,7 +23,7 @@ use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::assoc2tsv::{
@@ -2414,9 +2414,17 @@ fn prepare_prefix_input_from_external_meta<'py>(
             "splmm_assoc_pcg_bed: mmap metadata path requires `row_indices` argument.",
         )
     })?;
-    let (bytes_per_snp, n_snps_bed) = inspect_plink_bed_shape_local(&bed_prefix, n_samples_full)
-        .map_err(PyRuntimeError::new_err)?;
-    let payload = if retain_payload {
+    let pgen_source = crate::pgen::path_uses_pgen(&bed_prefix);
+    let (bytes_per_snp, n_snps_bed) = if pgen_source {
+        (
+            n_samples_full.div_ceil(4),
+            crate::pgen::count_pvar_variants(&bed_prefix).map_err(PyRuntimeError::new_err)?,
+        )
+    } else {
+        inspect_plink_bed_shape_local(&bed_prefix, n_samples_full)
+            .map_err(PyRuntimeError::new_err)?
+    };
+    let payload = if retain_payload && !pgen_source {
         let mmap = if let Some(mmap) = payload_mmap {
             mmap
         } else {
@@ -2481,16 +2489,21 @@ fn prepare_prefix_input(
     retain_payload: bool,
 ) -> Result<SplmmPreparedInput, String> {
     let bed_prefix = normalize_plink_prefix_local(prefix);
+    let pgen_source = crate::pgen::path_uses_pgen(&bed_prefix);
     if bed_prefix.is_empty() {
         return Err("BED-prefix mode requires a non-empty prefix".to_string());
     }
     if n_samples_full == 0 {
         return Err("No samples found in BED input.".to_string());
     }
+    let retain_payload = retain_payload && !pgen_source;
     let meta = if !retain_payload {
-        let window_mb = mmap_window_mb.filter(|&v| v > 0).ok_or_else(|| {
-            "SparseLMM non-resident BED preparation requires mmap_window_mb > 0.".to_string()
-        })?;
+        let window_mb = mmap_window_mb
+            .filter(|&v| v > 0)
+            .or_else(|| pgen_source.then_some(64))
+            .ok_or_else(|| {
+                "SparseLMM non-resident BED preparation requires mmap_window_mb > 0.".to_string()
+            })?;
         prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window(
             &bed_prefix,
             0.0_f32,
@@ -2638,7 +2651,8 @@ fn prepare_splmm_assoc_inputs<'py>(
     // provide precomputed row metadata.  Retaining the resident mmap in that
     // case defeats the memory bound and also makes the r-hat path decode from
     // the full BED payload.
-    let skip_resident_bed_payload = !use_external_packed && windowed_requested;
+    let pgen_source = crate::pgen::path_uses_pgen(&bed_prefix);
+    let skip_resident_bed_payload = !use_external_packed && (windowed_requested || pgen_source);
     let shared_bed_mmap = if use_external_packed {
         None
     } else if skip_resident_bed_payload {
@@ -2769,37 +2783,84 @@ pub(crate) fn decode_rhat_markers_col_major(
     let n_rhat = rhat_rows.len();
     let decode_plan =
         AdditiveDecodePlan::from_sample_indices(scan_prepared.n_samples_full, scan_sample_idx);
+    let pgen_source = scan_prepared.payload.is_none()
+        && scan_prepared
+            .bed_prefix
+            .as_deref()
+            .is_some_and(crate::pgen::path_uses_pgen);
+    let mut pgen_reader = if pgen_source {
+        let prefix = scan_prepared
+            .bed_prefix
+            .as_deref()
+            .ok_or_else(|| "SparseLMM PGEN row decode is missing its source path".to_string())?;
+        Some(PackedBedSourceReader::open(
+            prefix,
+            scan_prepared.n_samples_full,
+        )?)
+    } else {
+        None
+    };
+    let mut pgen_row = vec![0u8; scan_prepared.bytes_per_snp];
     let mut row_source = if let Some(payload) = scan_prepared.payload.as_ref() {
-        PackedRowDecodeSource::Resident {
+        Some(PackedRowDecodeSource::Resident {
             packed_flat: payload.as_bytes(),
             bytes_per_snp: scan_prepared.bytes_per_snp,
-        }
+        })
+    } else if pgen_source {
+        None
     } else {
         let prefix = scan_prepared.bed_prefix.as_deref().ok_or_else(|| {
-            "SparseLMM requires a PLINK BED prefix for windowed row decode.".to_string()
+            "SparseLMM requires a PLINK input path for windowed row decode.".to_string()
         })?;
         let window_mb = mmap_window_mb.filter(|&v| v > 0).ok_or_else(|| {
             "SparseLMM windowed row decode requires mmap_window_mb when no resident BED payload is retained."
                 .to_string()
         })?;
-        PackedRowDecodeSource::Windowed(WindowedBedMatrix::open(prefix, window_mb)?)
+        Some(PackedRowDecodeSource::Windowed(WindowedBedMatrix::open(
+            prefix, window_mb,
+        )?))
     };
     let mut sampled_markers = vec![0.0_f64; n * n_rhat];
     let mut tmp_snp = vec![0.0_f64; n];
     for (col, &row_idx) in rhat_rows.iter().enumerate() {
-        decode_indexed_row_model_into_f64(
-            &mut row_source,
-            scan_prepared.row_flip.as_ref(),
-            scan_prepared.row_maf.as_ref(),
-            scan_prepared.row_source_indices.as_deref(),
-            row_idx,
-            n,
-            gm,
-            decode_plan.sample_identity(),
-            decode_plan.sample_byte_idx(),
-            decode_plan.sample_bit_shift(),
-            &mut tmp_snp,
-        )?;
+        if let Some(reader) = pgen_reader.as_mut() {
+            let source_row = scan_prepared
+                .row_source_indices
+                .as_ref()
+                .map_or(row_idx, |indices| indices[row_idx]);
+            if reader.read_source_block(source_row, 1, &mut pgen_row)? != 1 {
+                return Err(format!(
+                    "PGEN ended while reading SparseLMM gamma row {source_row}"
+                ));
+            }
+            decode_packed_row_model_enum_into_f64(
+                &pgen_row,
+                scan_prepared.row_flip[row_idx],
+                scan_prepared.row_maf[row_idx],
+                n,
+                gm,
+                decode_plan.sample_identity(),
+                decode_plan.sample_byte_idx(),
+                decode_plan.sample_bit_shift(),
+                &mut tmp_snp,
+            );
+        } else {
+            decode_indexed_row_model_into_f64(
+                row_source.as_mut().ok_or_else(|| {
+                    "SparseLMM row decoder is missing its PLINK source".to_string()
+                })?,
+                scan_prepared.row_flip.as_ref(),
+                scan_prepared.row_maf.as_ref(),
+                scan_prepared.row_source_indices.as_deref(),
+                row_idx,
+                n,
+                gm,
+                decode_plan.sample_identity(),
+                decode_plan.sample_byte_idx(),
+                decode_plan.sample_bit_shift(),
+                &mut tmp_snp,
+            )?;
+        }
         for i in 0..n {
             sampled_markers[col * n + i] = tmp_snp[i];
         }
@@ -4754,6 +4815,9 @@ fn grammar_scan_blocks_core<G: GenotypeMatrix>(
             let row_end = (row_start + scan_block_rows).min(m);
             let rows_here = row_end - row_start;
             let out_slice = &mut out_block[..rows_here * 3];
+            input
+                .matrix
+                .prepare_source_rows(&input.stats, row_start, rows_here)?;
             let mut run_block = || {
                 out_slice
                     .par_chunks_mut(row_tile * 3)
@@ -8336,7 +8400,28 @@ fn unified_input_from_splmm_prepared(
     prepared: &SplmmPreparedInput,
     mmap_window_mb: Option<usize>,
 ) -> Result<UnifiedInput<SplmmPreparedMatrixAdapter<'_>>, String> {
-    let matrix = if let Some(window_mb) = mmap_window_mb.filter(|&v| v > 0) {
+    let pgen_source = prepared.payload.is_none()
+        && prepared
+            .bed_prefix
+            .as_deref()
+            .is_some_and(crate::pgen::path_uses_pgen);
+    let matrix = if pgen_source {
+        let prefix = prepared
+            .bed_prefix
+            .as_deref()
+            .ok_or_else(|| "SparseLMM PGEN stream is missing its source path".to_string())?;
+        SplmmPreparedMatrixAdapter::PgenStream {
+            reader: Mutex::new(PackedBedSourceReader::open(
+                prefix,
+                prepared.n_samples_full,
+            )?),
+            source_rows: Vec::new(),
+            packed_rows: Vec::new(),
+            local_rows: Vec::new(),
+            n_samples_full: prepared.n_samples_full,
+            bytes_per_snp: prepared.bytes_per_snp,
+        }
+    } else if let Some(window_mb) = mmap_window_mb.filter(|&v| v > 0) {
         if let Some(prefix) = prepared.bed_prefix.as_deref() {
             SplmmPreparedMatrixAdapter::Windowed {
                 matrix: WindowedBedMatrix::open(prefix, window_mb)?,
@@ -8361,8 +8446,20 @@ fn unified_input_from_splmm_prepared(
 
 /// Wraps a SparseLMM prepared input as a [`GenotypeMatrix`].
 enum SplmmPreparedMatrixAdapter<'a> {
-    Direct { inner: &'a SplmmPreparedInput },
-    Windowed { matrix: WindowedBedMatrix },
+    Direct {
+        inner: &'a SplmmPreparedInput,
+    },
+    Windowed {
+        matrix: WindowedBedMatrix,
+    },
+    PgenStream {
+        reader: Mutex<PackedBedSourceReader>,
+        source_rows: Vec<usize>,
+        packed_rows: Vec<u8>,
+        local_rows: Vec<usize>,
+        n_samples_full: usize,
+        bytes_per_snp: usize,
+    },
 }
 
 impl GenotypeMatrix for SplmmPreparedMatrixAdapter<'_> {
@@ -8370,12 +8467,14 @@ impl GenotypeMatrix for SplmmPreparedMatrixAdapter<'_> {
         match self {
             Self::Direct { inner } => inner.n_samples_full,
             Self::Windowed { matrix } => matrix.n_samples_full(),
+            Self::PgenStream { n_samples_full, .. } => *n_samples_full,
         }
     }
     fn bytes_per_snp(&self) -> usize {
         match self {
             Self::Direct { inner } => inner.bytes_per_snp,
             Self::Windowed { matrix } => matrix.bytes_per_snp(),
+            Self::PgenStream { bytes_per_snp, .. } => *bytes_per_snp,
         }
     }
     fn packed_flat(&self) -> &[u8] {
@@ -8384,6 +8483,7 @@ impl GenotypeMatrix for SplmmPreparedMatrixAdapter<'_> {
                 .payload_bytes()
                 .expect("direct SparseLMM matrix adapter requires resident BED payload"),
             Self::Windowed { matrix } => matrix.packed_flat(),
+            Self::PgenStream { packed_rows, .. } => packed_rows.as_slice(),
         }
     }
     fn source_row_bytes(&self, source_idx: usize) -> &[u8] {
@@ -8396,7 +8496,77 @@ impl GenotypeMatrix for SplmmPreparedMatrixAdapter<'_> {
                     [offset..][..inner.bytes_per_snp]
             }
             Self::Windowed { matrix } => matrix.source_row_bytes(source_idx),
+            Self::PgenStream {
+                source_rows,
+                packed_rows,
+                bytes_per_snp,
+                ..
+            } => source_rows
+                .binary_search(&source_idx)
+                .ok()
+                .map_or(&[], |local_idx| {
+                    let offset = local_idx * bytes_per_snp;
+                    &packed_rows[offset..offset + bytes_per_snp]
+                }),
         }
+    }
+
+    fn prepare_source_rows(
+        &mut self,
+        stats: &crate::gload::GlobalStats,
+        row_start: usize,
+        rows_here: usize,
+    ) -> Result<(), String> {
+        let Self::PgenStream {
+            reader,
+            source_rows,
+            packed_rows,
+            local_rows,
+            bytes_per_snp,
+            ..
+        } = self
+        else {
+            return Ok(());
+        };
+        if rows_here == 0 {
+            source_rows.clear();
+            packed_rows.clear();
+            local_rows.clear();
+            return Ok(());
+        }
+        if row_start.checked_add(rows_here).is_none() || row_start + rows_here > stats.n_markers() {
+            return Err("SparseLMM PGEN block is outside the prepared marker range".to_string());
+        }
+        let selected_source_rows = stats.row_source_slice(row_start, rows_here);
+        if selected_source_rows
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(
+                "SparseLMM PGEN prepared source rows must be strictly increasing".to_string(),
+            );
+        }
+        let packed_len = rows_here
+            .checked_mul(*bytes_per_snp)
+            .ok_or_else(|| "SparseLMM PGEN packed block size overflow".to_string())?;
+        packed_rows.resize(packed_len, 0);
+        source_rows.clear();
+        source_rows.extend_from_slice(selected_source_rows);
+        local_rows.clear();
+        local_rows.extend(0..rows_here);
+        let mut source = reader
+            .lock()
+            .map_err(|_| "SparseLMM PGEN reader lock is poisoned".to_string())?;
+        for (local_idx, &source_idx) in selected_source_rows.iter().enumerate() {
+            let start = local_idx * *bytes_per_snp;
+            let end = start + *bytes_per_snp;
+            if source.read_source_block(source_idx, 1, &mut packed_rows[start..end])? != 1 {
+                return Err(format!(
+                    "PGEN ended while reading SparseLMM scan row {source_idx}"
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn decode_additive_block(
@@ -8408,6 +8578,15 @@ impl GenotypeMatrix for SplmmPreparedMatrixAdapter<'_> {
         sample_identity: bool,
         pool: Option<&Arc<rayon::ThreadPool>>,
     ) -> Result<(), String> {
+        if let Self::PgenStream { .. } = self {
+            let cols = if sample_identity {
+                stats.n_samples_full
+            } else {
+                sample_idx.len()
+            };
+            let rows_here = out.len().saturating_div(cols.max(1));
+            self.prepare_source_rows(stats, row_start, rows_here)?;
+        }
         match self {
             Self::Direct { inner } => {
                 let payload = inner
@@ -8446,6 +8625,43 @@ impl GenotypeMatrix for SplmmPreparedMatrixAdapter<'_> {
                 sample_identity,
                 pool,
             ),
+            Self::PgenStream {
+                packed_rows,
+                local_rows,
+                bytes_per_snp,
+                ..
+            } => {
+                let cols = if sample_identity {
+                    stats.n_samples_full
+                } else {
+                    sample_idx.len()
+                };
+                let rows_here = out.len().saturating_div(cols.max(1));
+                if rows_here == 0 {
+                    return Ok(());
+                }
+                if row_start.checked_add(rows_here).is_none()
+                    || row_start + rows_here > stats.n_markers()
+                {
+                    return Err(
+                        "SparseLMM PGEN block is outside the prepared marker range".to_string()
+                    );
+                }
+                decode_mean_imputed_additive_packed_block_rows_f32(
+                    packed_rows,
+                    *bytes_per_snp,
+                    stats.n_samples_full,
+                    stats.row_flip_slice(row_start, rows_here),
+                    stats.row_maf_slice(row_start, rows_here),
+                    sample_idx,
+                    sample_identity,
+                    Some(local_rows.as_slice()),
+                    0,
+                    out,
+                    &packed_byte_lut().code4,
+                    pool,
+                )
+            }
         }
     }
 }
@@ -8821,6 +9037,51 @@ mod tests {
             row[sample_idx >> 2] |= (code & 0b11) << ((sample_idx & 3) * 2);
         }
         row
+    }
+
+    fn write_fixed_pgen(prefix: &std::path::Path, bed_rows: &[Vec<u8>], n_samples: usize) {
+        let bytes_per_variant = n_samples.div_ceil(4);
+        let mut pgen = vec![0x6c, 0x1b, 0x02];
+        pgen.extend_from_slice(&(bed_rows.len() as u32).to_le_bytes());
+        pgen.extend_from_slice(&(n_samples as u32).to_le_bytes());
+        pgen.push(0); // fixed hard-call storage
+        for bed_row in bed_rows {
+            assert_eq!(bed_row.len(), bytes_per_variant);
+            let mut category_row = vec![0u8; bytes_per_variant];
+            for sample_idx in 0..n_samples {
+                let bed_code = (bed_row[sample_idx >> 2] >> ((sample_idx & 3) * 2)) & 3;
+                let category = match bed_code {
+                    0b00 => 0b00,
+                    0b10 => 0b01,
+                    0b11 => 0b10,
+                    0b01 => 0b11,
+                    _ => unreachable!(),
+                };
+                category_row[sample_idx >> 2] |= category << ((sample_idx & 3) * 2);
+            }
+            pgen.extend_from_slice(&category_row);
+        }
+        std::fs::write(prefix.with_extension("pgen"), pgen).unwrap();
+        std::fs::write(
+            prefix.with_extension("psam"),
+            format!(
+                "#FID IID\n{}",
+                (0..n_samples)
+                    .map(|i| format!("F{i} I{i}\n"))
+                    .collect::<String>()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            prefix.with_extension("pvar"),
+            format!(
+                "#CHROM POS ID REF ALT\n{}",
+                (0..bed_rows.len())
+                    .map(|i| format!("1 {} v{} A C\n", i + 1, i + 1))
+                    .collect::<String>()
+            ),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -9948,6 +10209,226 @@ mod tests {
         assert!(prepared.payload.is_none());
         assert_eq!(prepared.n_rows(), 1);
         assert_eq!(prepared.row_source_indices.as_deref(), Some(&[0usize][..]));
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pgen_prefix_preparation_and_rhat_decode_match_bed_rows() {
+        pyo3::Python::initialize();
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "janusx_splmm_pgen_decode_{}_{}",
+            std::process::id(),
+            stamp
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let prefix = dir.join("case");
+        let bed_rows = vec![
+            pack_plink_codes(&[0b00, 0b10, 0b11, 0b01]),
+            pack_plink_codes(&[0b10, 0b10, 0b00, 0b11]),
+            pack_plink_codes(&[0b11, 0b00, 0b10, 0b00]),
+        ];
+        write_fixed_pgen(&prefix, &bed_rows, 4);
+        let mut bed = vec![0x6c, 0x1b, 0x01];
+        bed.extend(bed_rows.iter().flatten().copied());
+        std::fs::write(prefix.with_extension("bed"), bed).unwrap();
+        std::fs::write(
+            prefix.with_extension("fam"),
+            "F0 I0 0 0 1 1\nF1 I1 0 0 1 1\nF2 I2 0 0 1 1\nF3 I3 0 0 1 1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            prefix.with_extension("bim"),
+            (0..bed_rows.len())
+                .map(|idx| format!("1 rs{idx} 0 {} A G\n", idx + 1))
+                .collect::<String>(),
+        )
+        .unwrap();
+
+        let pgen_path = format!("{}.pgen", prefix.to_string_lossy());
+        let prepared = prepare_prefix_input(&pgen_path, 4, None, None, None, None, false).unwrap();
+        assert_eq!(
+            crate::gfcore::read_fam(&pgen_path).unwrap(),
+            vec!["I0", "I1", "I2", "I3"]
+        );
+        let mut pvar_reader = BimChunkReader::open(&pgen_path).unwrap();
+        let pvar_sites = pvar_reader.read_range(0, bed_rows.len()).unwrap();
+        assert_eq!(
+            pvar_sites
+                .iter()
+                .map(|site| site.snp.as_str())
+                .collect::<Vec<_>>(),
+            vec!["v1", "v2", "v3"]
+        );
+        assert!(prepared.payload.is_none());
+        assert_eq!(prepared.n_rows(), 3);
+        assert_eq!(
+            prepared.row_source_indices.as_deref(),
+            Some(&[0usize, 1, 2][..])
+        );
+        let prepared_bed = prepare_prefix_input(
+            &format!("{}.bed", prefix.to_string_lossy()),
+            4,
+            None,
+            None,
+            None,
+            Some(1),
+            false,
+        )
+        .unwrap();
+
+        let sample_idx = [3usize, 1, 0];
+        let rhat_rows = [2usize, 0]; // exercise out-of-order PGEN source access
+        let actual = decode_rhat_markers_col_major(
+            &prepared,
+            &sample_idx,
+            PackedGeneticModel::Add,
+            &rhat_rows,
+            None,
+            0,
+            rhat_rows.len(),
+            None,
+        )
+        .unwrap();
+
+        let decode_plan = AdditiveDecodePlan::from_sample_indices(4, &sample_idx);
+        let mut expected = vec![0.0_f64; sample_idx.len() * rhat_rows.len()];
+        let mut row = vec![0.0_f64; sample_idx.len()];
+        for (col, &row_idx) in rhat_rows.iter().enumerate() {
+            decode_packed_row_model_enum_into_f64(
+                &bed_rows[row_idx],
+                prepared.row_flip[row_idx],
+                prepared.row_maf[row_idx],
+                sample_idx.len(),
+                PackedGeneticModel::Add,
+                decode_plan.sample_identity(),
+                decode_plan.sample_byte_idx(),
+                decode_plan.sample_bit_shift(),
+                &mut row,
+            );
+            expected[col * sample_idx.len()..(col + 1) * sample_idx.len()].copy_from_slice(&row);
+        }
+        assert_close(&actual, &expected, 1e-12);
+
+        // The association scan uses the GenotypeMatrix adapter, which must
+        // also stream an explicit PGEN source when the caller requests a
+        // bounded/windowed input. Compare that block decode to the same BED
+        // rows used above, including the selected-sample order.
+        let mut scan_input = unified_input_from_splmm_prepared(&prepared, Some(1)).unwrap();
+        assert!(matches!(
+            &scan_input.matrix,
+            SplmmPreparedMatrixAdapter::PgenStream { .. }
+        ));
+        let mut scan_actual = vec![0.0_f32; bed_rows.len() * sample_idx.len()];
+        scan_input
+            .matrix
+            .decode_additive_block(
+                &scan_input.stats,
+                0,
+                &mut scan_actual,
+                &sample_idx,
+                false,
+                None,
+            )
+            .unwrap();
+        let mut scan_expected = vec![0.0_f64; scan_actual.len()];
+        for row_idx in 0..bed_rows.len() {
+            let mut decoded_row = vec![0.0_f64; sample_idx.len()];
+            decode_packed_row_model_enum_into_f64(
+                &bed_rows[row_idx],
+                prepared.row_flip[row_idx],
+                prepared.row_maf[row_idx],
+                sample_idx.len(),
+                PackedGeneticModel::Add,
+                decode_plan.sample_identity(),
+                decode_plan.sample_byte_idx(),
+                decode_plan.sample_bit_shift(),
+                &mut decoded_row,
+            );
+            let start = row_idx * sample_idx.len();
+            scan_expected[start..start + sample_idx.len()].copy_from_slice(&decoded_row);
+        }
+        assert_close(
+            &scan_actual
+                .iter()
+                .map(|&value| value as f64)
+                .collect::<Vec<_>>(),
+            &scan_expected,
+            1e-6,
+        );
+        for (row_idx, &source_idx) in scan_input.stats.row_source_indices.iter().enumerate() {
+            assert_eq!(
+                scan_input.matrix.source_row_bytes(source_idx).len(),
+                prepared.bytes_per_snp,
+                "PGEN association scan cache missing source row {row_idx}"
+            );
+        }
+
+        let mut pgen_nonadd_input = unified_input_from_splmm_prepared(&prepared, Some(1)).unwrap();
+        let mut bed_nonadd_input =
+            unified_input_from_splmm_prepared(&prepared_bed, Some(1)).unwrap();
+        let x_design = vec![1.0_f64; 4];
+        let score_vec = [0.25_f64, -0.5, 1.0, 0.75];
+        let mut pgen_nonadd_out = vec![0.0_f64; bed_rows.len() * 3];
+        let mut bed_nonadd_out = vec![0.0_f64; bed_rows.len() * 3];
+        let mut pgen_sink =
+            |row_start: usize, rows_here: usize, block: &[f64], _block_maf: Option<&[f32]>| {
+                pgen_nonadd_out[row_start * 3..][..rows_here * 3].copy_from_slice(block);
+                Ok(())
+            };
+        grammar_scan_blocks_core(
+            &mut pgen_nonadd_input,
+            &x_design,
+            &score_vec,
+            1.0,
+            &[2.0],
+            &[0, 1, 2, 3],
+            PackedGeneticModel::Add,
+            1.0,
+            1.0,
+            1,
+            1,
+            None,
+            0,
+            0,
+            0,
+            0,
+            &mut pgen_sink,
+        )
+        .unwrap();
+        drop(pgen_sink);
+        let mut bed_sink =
+            |row_start: usize, rows_here: usize, block: &[f64], _block_maf: Option<&[f32]>| {
+                bed_nonadd_out[row_start * 3..][..rows_here * 3].copy_from_slice(block);
+                Ok(())
+            };
+        grammar_scan_blocks_core(
+            &mut bed_nonadd_input,
+            &x_design,
+            &score_vec,
+            1.0,
+            &[2.0],
+            &[0, 1, 2, 3],
+            PackedGeneticModel::Add,
+            1.0,
+            1.0,
+            1,
+            1,
+            None,
+            0,
+            0,
+            0,
+            0,
+            &mut bed_sink,
+        )
+        .unwrap();
+        assert_close(&pgen_nonadd_out, &bed_nonadd_out, 1e-12);
 
         std::fs::remove_dir_all(dir).unwrap();
     }

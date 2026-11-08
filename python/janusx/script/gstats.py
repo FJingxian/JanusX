@@ -14,6 +14,12 @@ import numpy as np
 import pandas as pd
 
 from janusx.gfreader import prepare_cli_input_cache
+from janusx._plink import (
+    canonical_plink_input_path,
+    detect_existing_plink_kind,
+    explicit_plink_kind,
+    normalize_plink_prefix,
+)
 from ._common.cli_args import (
     add_common_genotype_source_args,
     add_common_out_arg,
@@ -91,11 +97,17 @@ def _require_rust_backend() -> None:
 
 
 def _normalize_plink_prefix(path_or_prefix: str) -> str:
-    p = str(path_or_prefix).strip()
-    low = p.lower()
-    if low.endswith(".bed") or low.endswith(".bim") or low.endswith(".fam"):
-        return p[:-4]
-    return p
+    return normalize_plink_prefix(path_or_prefix)
+
+
+def _gstats_plink_kind(path_or_prefix: str) -> str:
+    explicit_kind = explicit_plink_kind(path_or_prefix)
+    if explicit_kind is not None:
+        return explicit_kind
+    resolved = detect_existing_plink_kind(path_or_prefix)
+    if resolved is None:
+        raise FileNotFoundError(f"Cannot resolve PLINK input family for {path_or_prefix}")
+    return resolved[0]
 
 
 def _histogram_edges(values: np.ndarray) -> np.ndarray:
@@ -159,7 +171,13 @@ def _parse_ldsc_window(text: str | None) -> LdscWindowSpec:
 
 
 def _read_fam_table(prefix: str) -> pd.DataFrame:
-    fam_path = f"{prefix}.fam"
+    if _gstats_plink_kind(prefix) == "pfile":
+        rows = list(_iter_psam_rows(prefix))
+        out = pd.DataFrame(rows, columns=["fid", "iid"])
+        out["fid"] = out["fid"].astype(str).str.strip()
+        out["iid"] = out["iid"].astype(str).str.strip()
+        return out
+    fam_path = f"{normalize_plink_prefix(prefix)}.fam"
     fam = pd.read_csv(
         fam_path,
         sep=r"\s+",
@@ -178,7 +196,13 @@ def _read_fam_table(prefix: str) -> pd.DataFrame:
 
 
 def _read_bim_table(prefix: str) -> pd.DataFrame:
-    bim_path = f"{prefix}.bim"
+    if _gstats_plink_kind(prefix) == "pfile":
+        rows = list(_iter_pvar_rows(prefix))
+        out = pd.DataFrame(rows, columns=["chr", "pos"])
+        out["chr"] = out["chr"].astype(str).str.strip()
+        out["pos"] = pd.to_numeric(out["pos"], errors="raise").astype(np.int64)
+        return out
+    bim_path = f"{normalize_plink_prefix(prefix)}.bim"
     bim = pd.read_csv(
         bim_path,
         sep=r"\s+",
@@ -448,12 +472,74 @@ def _open_text_writer(path: str):
     return open(path, "w", encoding="utf-8", buffering=8 * 1024 * 1024)
 
 
+def _iter_pvar_rows(prefix: str):
+    pvar_path = f"{normalize_plink_prefix(prefix)}.pvar"
+    columns: list[str] | None = None
+    try:
+        with open(pvar_path, "r", encoding="utf-8", buffering=8 * 1024 * 1024) as handle:
+            for line_no, line in enumerate(handle, start=1):
+                content = line.strip()
+                if not content or content.startswith("##"):
+                    continue
+                if content.startswith("#"):
+                    columns = [token.lstrip("#").upper() for token in content.split()]
+                    for required in ("CHROM", "POS"):
+                        if required not in columns:
+                            raise ValueError(f"PVAR header is missing {required}: {pvar_path}:{line_no}")
+                    continue
+                if columns is None:
+                    raise ValueError(f"PVAR header is missing: {pvar_path}:{line_no}")
+                fields = content.split()
+                try:
+                    chrom = fields[columns.index("CHROM")]
+                    pos = int(fields[columns.index("POS")])
+                except (IndexError, ValueError) as exc:
+                    raise ValueError(f"Malformed PVAR row: {pvar_path}:{line_no}") from exc
+                yield str(chrom).strip(), pos
+    except OSError as exc:
+        raise OSError(f"Cannot read PVAR file {pvar_path}: {exc}") from exc
+
+
+def _iter_psam_rows(prefix: str):
+    psam_path = f"{normalize_plink_prefix(prefix)}.psam"
+    columns: list[str] | None = None
+    try:
+        with open(psam_path, "r", encoding="utf-8", buffering=8 * 1024 * 1024) as handle:
+            for line_no, line in enumerate(handle, start=1):
+                content = line.strip()
+                if not content or content.startswith("##"):
+                    continue
+                if content.startswith("#"):
+                    columns = [token.lstrip("#").upper() for token in content.split()]
+                    if "IID" not in columns and "ID" not in columns:
+                        raise ValueError(f"PSAM header is missing IID: {psam_path}:{line_no}")
+                    continue
+                fields = content.split()
+                if columns is None:
+                    fid_index, iid_index = (0, 1) if len(fields) >= 6 else (None, 0)
+                else:
+                    iid_name = "IID" if "IID" in columns else "ID"
+                    fid_index = columns.index("FID") if "FID" in columns else None
+                    iid_index = columns.index(iid_name)
+                try:
+                    iid = fields[iid_index]
+                    fid = fields[fid_index] if fid_index is not None else "0"
+                except IndexError as exc:
+                    raise ValueError(f"Malformed PSAM row: {psam_path}:{line_no}") from exc
+                yield str(fid).strip(), str(iid).strip()
+    except OSError as exc:
+        raise OSError(f"Cannot read PSAM file {psam_path}: {exc}") from exc
+
+
 def _iter_bim_output_rows(source: str | pd.DataFrame):
     if isinstance(source, pd.DataFrame):
         for row in source.itertuples(index=False):
             yield str(row.chr).strip(), int(row.pos)
         return
-    path = f"{source}.bim"
+    if _gstats_plink_kind(str(source)) == "pfile":
+        yield from _iter_pvar_rows(str(source))
+        return
+    path = f"{normalize_plink_prefix(str(source))}.bim"
     with open(path, "r", encoding="utf-8", buffering=8 * 1024 * 1024) as handle:
         for line_no, line in enumerate(handle, start=1):
             if not line.strip():
@@ -469,7 +555,10 @@ def _iter_fam_output_rows(source: str | pd.DataFrame):
         for row in source.itertuples(index=False):
             yield str(row.fid).strip(), str(row.iid).strip()
         return
-    path = f"{source}.fam"
+    if _gstats_plink_kind(str(source)) == "pfile":
+        yield from _iter_psam_rows(str(source))
+        return
+    path = f"{normalize_plink_prefix(str(source))}.fam"
     with open(path, "r", encoding="utf-8", buffering=8 * 1024 * 1024) as handle:
         for line_no, line in enumerate(handle, start=1):
             if not line.strip():
@@ -775,7 +864,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     geno = parser.add_argument_group("Genotype input")
-    add_common_genotype_source_args(geno, include_file=True, help_profile="gstats")
+    add_common_genotype_source_args(
+        geno,
+        include_file=True,
+        include_pfile=True,
+        help_profile="gstats",
+    )
 
     stats = parser.add_argument_group("Statistics")
     stats.add_argument("-freq", action="store_true", help="Write site MAF table: <prefix>.freq and a PDF histogram.")
@@ -862,9 +956,9 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    if not any((args.bfile, args.vcf, args.hmp, args.file)):
-        parser.error("one genotype input is required: -bfile / -pfile / -vcf / -hmp / -file")
-    if sum(bool(x) for x in (args.bfile, args.vcf, args.hmp, args.file)) != 1:
+    if not any((args.bfile, args.pfile, args.vcf, args.hmp, args.file)):
+        parser.error("one genotype input is required: -bfile / -vcf / -hmp / -file")
+    if sum(bool(x) for x in (args.bfile, args.pfile, args.vcf, args.hmp, args.file)) != 1:
         parser.error("provide exactly one genotype input among -bfile / -pfile / -vcf / -hmp / -file")
     if not any((bool(args.freq), bool(args.miss), bool(args.het), args.ldsc is not None)):
         parser.error("select at least one statistic: -freq / -miss / -het / -ldsc")
@@ -878,6 +972,7 @@ def main() -> None:
         hmp=getattr(args, "hmp", None),
         file=getattr(args, "file", None),
         bfile=getattr(args, "bfile", None),
+        pfile=getattr(args, "pfile", None),
         prefix=None,
         apply_cache=False,
     )
@@ -887,7 +982,7 @@ def main() -> None:
     logger = setup_logging(log_path)
 
     checks: list[bool] = []
-    if args.bfile:
+    if args.bfile or args.pfile:
         checks.append(ensure_plink_prefix_exists(logger, gfile, "Genotype PLINK prefix"))
     elif args.vcf:
         checks.append(ensure_file_exists(logger, gfile, "Genotype VCF input"))
@@ -912,6 +1007,7 @@ def main() -> None:
                 [
                     ("Source", gfile),
                     ("BFILE", bool(args.bfile)),
+                    ("PFILE", bool(args.pfile)),
                     ("VCF", bool(args.vcf)),
                     ("HMP", bool(args.hmp)),
                     ("FILE", bool(args.file)),
@@ -956,12 +1052,12 @@ def main() -> None:
     )
 
     t0 = time.monotonic()
-    bed_prefix = str(gfile)
-    if not args.bfile:
+    plink_input_path = str(gfile)
+    if not (args.bfile or args.pfile):
         cache_msg = "Caching genotype as PLINK BED..."
         delim = "," if (args.file and str(gfile).lower().endswith(".csv")) else None
         with CliStatus(cache_msg, enabled=True) as task:
-            bed_prefix = prepare_cli_input_cache(
+            cache_path = prepare_cli_input_cache(
                 str(gfile),
                 snps_only=False,
                 delimiter=delim,
@@ -969,19 +1065,17 @@ def main() -> None:
                 threads=int(args.threads),
             )
             task.complete("Caching genotype as PLINK BED ...Finished")
-        bed_prefix = _normalize_plink_prefix(str(bed_prefix))
+        plink_input_path = canonical_plink_input_path(str(cache_path), "bfile")
         log_success(
             logger,
-            f"Statistics backend input switched to BED cache: {format_path_for_display(bed_prefix)}",
+            f"Statistics backend input switched to BED cache: {format_path_for_display(plink_input_path)}",
         )
-    else:
-        bed_prefix = _normalize_plink_prefix(str(bed_prefix))
 
-    if not ensure_plink_prefix_exists(logger, bed_prefix, "Statistics BED prefix"):
-        raise FileNotFoundError(bed_prefix)
+    if not ensure_plink_prefix_exists(logger, plink_input_path, "Statistics PLINK input"):
+        raise FileNotFoundError(plink_input_path)
 
     selection = _resolve_gstats_selection(
-        str(bed_prefix),
+        plink_input_path,
         keep_path=args.keep,
         extract_tokens=args.extract,
         chr_values=args.chr_filter,
@@ -1013,7 +1107,7 @@ def main() -> None:
         with CliStatus("Computing genotype statistics...", enabled=True) as task:
             if args.freq and not args.miss and not args.het:
                 maf_raw, lmiss_raw, lhet_raw, n_samples = jxrs.gstats_bed_site_stats(
-                    str(bed_prefix),
+                    plink_input_path,
                     threads=int(args.threads),
                     **selection_kwargs,
                 )
@@ -1022,7 +1116,7 @@ def main() -> None:
                 n_sites = int(np.asarray(maf_raw).size)
             else:
                 maf_raw, lmiss_raw, lhet_raw, imiss_raw, ihet_raw, n_samples, n_sites = jxrs.gstats_bed_joint_stats(
-                    str(bed_prefix),
+                    plink_input_path,
                     site_maf=bool(args.freq),
                     site_miss=bool(args.miss),
                     site_het=bool(args.het),
@@ -1047,7 +1141,9 @@ def main() -> None:
     if args.freq or args.miss or args.het:
         assert site_stats is not None
         site_outputs = _write_site_tables_from_bim(
-            selection.selected_bim if selection.selected_bim is not None else str(bed_prefix),
+            selection.selected_bim
+            if selection.selected_bim is not None
+            else plink_input_path,
             outprefix=outprefix,
             freq=site_stats["maf"] if args.freq else None,
             miss=site_stats["miss"] if args.miss else None,
@@ -1058,7 +1154,9 @@ def main() -> None:
     if args.miss or args.het:
         assert site_stats is not None and individual_stats is not None
         sample_outputs = _write_individual_tables_from_fam(
-            selection.selected_fam if selection.selected_fam is not None else str(bed_prefix),
+            selection.selected_fam
+            if selection.selected_fam is not None
+            else plink_input_path,
             outprefix=outprefix,
             miss=individual_stats["miss"] if args.miss else None,
             het=individual_stats["het"] if args.het else None,
@@ -1114,11 +1212,11 @@ def main() -> None:
         bim_df = (
             selection.selected_bim
             if selection.selected_bim is not None
-            else _read_bim_table(str(bed_prefix))
+            else _read_bim_table(plink_input_path)
         )
         with CliStatus("Computing LD scores...", enabled=True) as task:
             m_raw, ld_raw, ld_n_samples = jxrs.gstats_bed_ldscore(
-                str(bed_prefix),
+                plink_input_path,
                 str(ldsc_spec.kind),
                 float(ldsc_spec.value),
                 threads=int(args.threads),

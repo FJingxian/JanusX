@@ -9,6 +9,11 @@ import time
 import tempfile
 import numpy as np
 from tqdm import tqdm
+from janusx._plink import (
+    detect_existing_plink_kind,
+    explicit_plink_kind,
+    normalize_plink_prefix,
+)
 from janusx.janusx import (
     BedChunkReader,
     HmpChunkReader,
@@ -491,25 +496,28 @@ def _cache_lock(lock_key: str, timeout_s: float = 7200.0, poll_s: float = 0.2):
 
 
 def _is_bed_prefix(path_or_prefix: str) -> bool:
-    return all(
-        os.path.isfile(f"{path_or_prefix}.{ext}") for ext in ("bed", "bim", "fam")
-    )
+    resolved = detect_existing_plink_kind(str(path_or_prefix))
+    if resolved is None or resolved[0] != "bfile":
+        return False
+    prefix = resolved[1]
+    return all(os.path.isfile(f"{prefix}.{ext}") for ext in ("bed", "bim", "fam"))
 
 
 def _is_pgen_prefix(path_or_prefix: str) -> bool:
-    raw = str(path_or_prefix)
-    lower = raw.lower()
-    explicit_pgen_path = lower.endswith((".pgen", ".pvar", ".psam"))
-    prefix = _strip_known_suffix(raw) if explicit_pgen_path else raw
-    return (
-        os.path.isfile(f"{prefix}.pgen")
-        and (explicit_pgen_path or not os.path.isfile(f"{prefix}.bed"))
-        and all(os.path.isfile(f"{prefix}.{ext}") for ext in ("pvar", "psam"))
-    )
+    resolved = detect_existing_plink_kind(str(path_or_prefix))
+    if resolved is None or resolved[0] != "pfile":
+        return False
+    prefix = resolved[1]
+    return all(os.path.isfile(f"{prefix}.{ext}") for ext in ("pgen", "pvar", "psam"))
 
 
 def _is_plink_prefix(path_or_prefix: str) -> bool:
-    return _is_bed_prefix(path_or_prefix) or _is_pgen_prefix(path_or_prefix)
+    resolved = detect_existing_plink_kind(str(path_or_prefix))
+    if resolved is None:
+        return False
+    kind, prefix = resolved
+    extensions = ("pgen", "pvar", "psam") if kind == "pfile" else ("bed", "bim", "fam")
+    return all(os.path.isfile(f"{prefix}.{ext}") for ext in extensions)
 
 
 def _strip_known_suffix(path_or_prefix: str) -> str:
@@ -727,6 +735,9 @@ def _resolve_input(path_or_prefix: str, force_kind: Union[str, None] = None):
     """
     p = str(path_or_prefix)
     fk = str(force_kind or "").strip().lower()
+    if fk == "plink":
+        resolved = detect_existing_plink_kind(p)
+        fk = "pfile" if resolved is not None and resolved[0] == "pfile" else "bfile"
     if fk in {
         "vcf",
         "hmp",
@@ -750,12 +761,18 @@ def _resolve_input(path_or_prefix: str, force_kind: Union[str, None] = None):
             # it to distinguish an explicit PGEN input when a same-prefix BED
             # output also exists.
             return "plink", f"{prefix}.pgen", None
-        if fk in {"plink", "bfile"}:
+        if fk == "bfile":
             prefix = _strip_known_suffix(p)
-            missing = _plink_missing_files(prefix)
+            missing = [
+                f"{prefix}.{ext}"
+                for ext in ("bed", "bim", "fam")
+                if not os.path.isfile(f"{prefix}.{ext}")
+            ]
             if missing:
-                _raise_plink_prefix_error(prefix)
-            return "plink", prefix, None
+                lines = [f"PLINK BED prefix is incomplete or not found: {prefix}"]
+                lines.extend(f"Missing file: {path}" for path in missing)
+                raise ValueError("\n".join(lines))
+            return "plink", f"{prefix}.bed", None
         if fk == "vcf":
             prefix, src_path = _resolve_existing_text_source(
                 p,
@@ -803,9 +820,21 @@ def _resolve_input(path_or_prefix: str, force_kind: Union[str, None] = None):
         return matrix_kind, _normalize_matrix_prefix(prefix, matrix_kind), matrix_path
     low = p.lower()
 
-    if low.endswith((".pgen", ".pvar", ".psam")) and _is_pgen_prefix(p):
-        prefix = _strip_known_suffix(p)
-        return "plink", f"{prefix}.pgen", None
+    explicit_plink = explicit_plink_kind(p)
+    if explicit_plink is not None:
+        prefix = normalize_plink_prefix(p)
+        family = ("pgen", "pvar", "psam") if explicit_plink == "pfile" else ("bed", "bim", "fam")
+        missing = [f"{prefix}.{ext}" for ext in family if not os.path.isfile(f"{prefix}.{ext}")]
+        if missing:
+            label = "PLINK 2 PGEN" if explicit_plink == "pfile" else "PLINK BED"
+            lines = [f"{label} prefix is incomplete or not found: {prefix}"]
+            lines.extend(f"Missing file: {path}" for path in missing)
+            raise ValueError("\n".join(lines))
+        if explicit_plink == "pfile":
+            return "plink", f"{prefix}.pgen", None
+        # Keep the selected family explicit for downstream readers. The bare
+        # prefix is ambiguous when a converted BED cache shares this prefix.
+        return "plink", f"{prefix}.bed", None
 
     if _is_plink_prefix(p):
         return "plink", p, None
@@ -1453,9 +1482,12 @@ def _prepare_txtlike_input_for_cache(kind: str, prefix: str, src_path: Union[str
 
 
 def _read_plink_fam_sample_ids(prefix: str) -> list[str]:
-    if _is_pgen_prefix(prefix):
-        pgen_prefix = _strip_known_suffix(str(prefix))
-        psam_path = f"{pgen_prefix}.psam"
+    resolved = detect_existing_plink_kind(str(prefix))
+    if resolved is None:
+        raise FileNotFoundError(f"Cannot resolve PLINK sample metadata for {prefix}")
+    kind, plink_prefix = resolved
+    if kind == "pfile":
+        psam_path = f"{plink_prefix}.psam"
         sample_ids: list[str] = []
         header: list[str] | None = None
         with open(psam_path, "r", encoding="utf-8", errors="replace") as handle:
@@ -1481,7 +1513,7 @@ def _read_plink_fam_sample_ids(prefix: str) -> list[str]:
             raise ValueError(f"PSAM contains zero samples: {psam_path}")
         return sample_ids
 
-    fam_path = f"{prefix}.fam"
+    fam_path = f"{plink_prefix}.fam"
     sample_ids: list[str] = []
     with open(fam_path, "r", encoding="utf-8", errors="replace") as handle:
         for line_no, line in enumerate(handle, start=1):
@@ -1498,11 +1530,12 @@ def _read_plink_fam_sample_ids(prefix: str) -> list[str]:
 
 
 def _count_plink_bim_rows(prefix: str) -> int:
-    if _is_pgen_prefix(prefix):
-        pgen_prefix = _strip_known_suffix(str(prefix))
-        variant_path = f"{pgen_prefix}.pvar"
-    else:
-        variant_path = f"{prefix}.bim"
+    resolved = detect_existing_plink_kind(str(prefix))
+    if resolved is None:
+        raise FileNotFoundError(f"Cannot resolve PLINK variant metadata for {prefix}")
+    kind, plink_prefix = resolved
+    variant_suffix = "pvar" if kind == "pfile" else "bim"
+    variant_path = f"{plink_prefix}.{variant_suffix}"
     n_snps = 0
     with open(variant_path, "r", encoding="utf-8", errors="replace") as handle:
         for line in handle:

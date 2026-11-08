@@ -4,6 +4,12 @@ import os
 from pathlib import Path
 from typing import Iterable
 
+from janusx._plink import (
+    detect_existing_plink_kind,
+    explicit_plink_kind,
+    normalize_plink_prefix,
+)
+
 
 def format_path_for_display(path: str | Path) -> str:
     s = str(path)
@@ -105,10 +111,16 @@ _safe_expanduser = safe_expanduser
 
 def ensure_file_exists(logger, path: str, label: str) -> bool:
     p = safe_expanduser(path)
+    if explicit_plink_kind(str(p)) is not None:
+        return ensure_plink_prefix_exists(logger, str(p), label)
     if p.is_file():
         return True
-    if _plink_prefix_paths(p) is not None:
-        return True
+    try:
+        if _plink_prefix_paths(p) is not None:
+            return True
+    except ValueError as exc:
+        logger.error(str(exc))
+        return False
     logger.error(f"{label} not found: {_norm(str(p))}")
     return False
 
@@ -203,30 +215,43 @@ def ensure_file_input_site_metadata_exists(
 
 def ensure_plink_prefix_exists(logger, prefix: str, label: str = "PLINK prefix") -> bool:
     pfx = safe_expanduser(prefix)
-    paths = _plink_prefix_paths(pfx)
+    try:
+        paths = _plink_prefix_paths(pfx)
+    except ValueError as exc:
+        logger.error(str(exc))
+        return False
     if paths is not None:
         return True
     raw = str(pfx)
     lower = raw.lower()
+    explicit_kind = explicit_plink_kind(raw)
     selected = None
-    for suffix, family in (
-        (".bed", (".bed", ".bim", ".fam")),
-        (".bim", (".bed", ".bim", ".fam")),
-        (".fam", (".bed", ".bim", ".fam")),
-        (".pgen", (".pgen", ".pvar", ".psam")),
-        (".pvar", (".pgen", ".pvar", ".psam")),
-        (".psam", (".pgen", ".pvar", ".psam")),
-    ):
-        if lower.endswith(suffix):
-            raw = raw[: -len(suffix)]
-            selected = family
-            break
+    if explicit_kind == "pfile":
+        raw = normalize_plink_prefix(raw)
+        selected = (".pgen", ".pvar", ".psam")
+    elif explicit_kind == "bfile":
+        raw = normalize_plink_prefix(raw)
+        selected = (".bed", ".bim", ".fam")
     if selected is None:
-        selected = (
-            (".pgen", ".pvar", ".psam")
-            if any(Path(f"{raw}{ext}").exists() for ext in (".pgen", ".pvar", ".psam"))
-            else (".bed", ".bim", ".fam")
-        )
+        resolved = detect_existing_plink_kind(raw)
+        if resolved is not None:
+            kind, raw = resolved
+            selected = (".pgen", ".pvar", ".psam") if kind == "pfile" else (".bed", ".bim", ".fam")
+        else:
+            has_pfile_parts = any(Path(f"{raw}{ext}").exists() for ext in (".pgen", ".pvar", ".psam"))
+            has_bfile_parts = any(Path(f"{raw}{ext}").exists() for ext in (".bed", ".bim", ".fam"))
+            if has_pfile_parts and has_bfile_parts:
+                logger.error(
+                    "Ambiguous incomplete PLINK prefix has both BED and PGEN files: %s; "
+                    "pass a `.bed` or `.pgen` path to select the input family.",
+                    _norm(raw),
+                )
+                return False
+            selected = (
+                (".pgen", ".pvar", ".psam")
+                if has_pfile_parts and not has_bfile_parts
+                else (".bed", ".bim", ".fam")
+            )
     missing = [Path(f"{raw}{ext}") for ext in selected if not Path(f"{raw}{ext}").is_file()]
     logger.error(f"{label} is incomplete: {_norm(str(pfx))}")
     for p in missing:
@@ -236,22 +261,35 @@ def ensure_plink_prefix_exists(logger, prefix: str, label: str = "PLINK prefix")
 
 def _plink_prefix_paths(path: Path) -> list[Path] | None:
     raw = str(path)
-    lower = raw.lower()
-    prefix = raw
-    for suffix in (".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"):
-        if lower.endswith(suffix):
-            prefix = raw[: -len(suffix)]
-            break
-    if Path(f"{prefix}.bed").exists():
-        families = ((".bed", ".bim", ".fam"),)
-    elif any(Path(f"{prefix}{ext}").exists() for ext in (".pgen", ".pvar", ".psam")):
-        families = ((".pgen", ".pvar", ".psam"),)
-    else:
-        families = ((".bed", ".bim", ".fam"),)
-    for family in families:
+    resolved = detect_existing_plink_kind(raw)
+    if resolved is not None:
+        kind, prefix = resolved
+        family = (".pgen", ".pvar", ".psam") if kind == "pfile" else (".bed", ".bim", ".fam")
         required = [Path(f"{prefix}{ext}") for ext in family]
-        if all(item.is_file() for item in required):
-            return required
+        return required if all(item.is_file() for item in required) else None
+
+    explicit_kind = explicit_plink_kind(raw)
+    if explicit_kind is not None:
+        prefix = normalize_plink_prefix(raw)
+        family = (".pgen", ".pvar", ".psam") if explicit_kind == "pfile" else (".bed", ".bim", ".fam")
+    else:
+        prefix = raw
+        has_pfile_parts = any(Path(f"{prefix}{ext}").exists() for ext in (".pgen", ".pvar", ".psam"))
+        has_bfile_parts = any(Path(f"{prefix}{ext}").exists() for ext in (".bed", ".bim", ".fam"))
+        if has_pfile_parts and has_bfile_parts:
+            raise ValueError(
+                f"Ambiguous incomplete PLINK prefix has both BED and PGEN files: {prefix}; "
+                "pass a `.bed` or `.pgen` path to select the input family."
+            )
+        if has_pfile_parts and not has_bfile_parts:
+            family = (".pgen", ".pvar", ".psam")
+        elif has_bfile_parts and not has_pfile_parts:
+            family = (".bed", ".bim", ".fam")
+        else:
+            return None
+    required = [Path(f"{prefix}{ext}") for ext in family]
+    if all(item.is_file() for item in required):
+        return required
     return None
 
 

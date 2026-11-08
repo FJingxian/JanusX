@@ -19,6 +19,8 @@ import struct
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 
+from janusx._plink import detect_existing_plink_kind
+
 
 SIDECAR_SCHEMA_V1 = "janusx.gwas-null-model/v1"
 SIDECAR_BEGIN_V1 = "[JANUSX_GWAS_NULL_MODEL_V1_BEGIN]"
@@ -202,9 +204,8 @@ def build_fvlmm_sidecar(
     if len(ordered_sample_ids) == 0:
         raise ValueError("FvLMM sidecar sample IDs must not be empty")
 
-    genotype_prefix = Path(context.genotype_prefix).expanduser()
-    genotype_prefix = _normalize_genotype_prefix(genotype_prefix)
-    genotype_suffixes = _plink_source_suffixes(genotype_prefix)
+    genotype_suffixes = _plink_source_suffixes(context.genotype_prefix)
+    genotype_prefix = _normalize_genotype_prefix(context.genotype_prefix)
     genotype_paths = tuple(Path(f"{genotype_prefix}{suffix}") for suffix in genotype_suffixes)
 
     kinship_id_path = Path(context.kinship_id_file).expanduser()
@@ -523,6 +524,7 @@ def validate_sidecar_dependencies(
         allow_moved=True,
     )
 
+    current_suffixes = _plink_source_suffixes(bfile)
     requested_prefix = _normalize_genotype_prefix(bfile)
 
     if len(record.genotype_files) != 3:
@@ -539,7 +541,6 @@ def validate_sidecar_dependencies(
         raise FineMapSkip(
             "sidecar genotype fingerprint set must contain a BED/BIM/FAM or PGEN/PVAR/PSAM triplet"
         )
-    current_suffixes = _plink_source_suffixes(requested_prefix)
     if genotype_suffixes != current_suffixes:
         raise FineMapSkip("sidecar PLINK source format differs from the current genotype input")
     for suffix, expected in zip(genotype_suffixes, record.genotype_files):
@@ -622,12 +623,15 @@ def _normalize_genotype_prefix(path: str | Path) -> Path:
 
 
 def _plink_source_suffixes(genotype_prefix: str | Path) -> tuple[str, str, str]:
-    prefix = str(genotype_prefix)
-    if Path(f"{prefix}.bed").is_file():
+    resolved = detect_existing_plink_kind(str(genotype_prefix))
+    if resolved is None:
+        raise FileNotFoundError(f"No PLINK BED or PGEN source found at prefix: {genotype_prefix}")
+    kind, prefix = resolved
+    if kind == "bfile" and Path(f"{prefix}.bed").is_file():
         return (".bed", ".bim", ".fam")
-    if Path(f"{prefix}.pgen").is_file():
+    if kind == "pfile" and Path(f"{prefix}.pgen").is_file():
         return (".pgen", ".pvar", ".psam")
-    raise FileNotFoundError(f"No PLINK BED or PGEN source found at prefix: {prefix}")
+    raise FileNotFoundError(f"No PLINK {kind} source found at prefix: {prefix}")
 
 
 def _dependency_search_roots(

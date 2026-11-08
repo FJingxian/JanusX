@@ -11,7 +11,9 @@ use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Instant;
 
 use crate::bedmath::{packed_byte_lut, packed_pair_lut};
@@ -21,6 +23,7 @@ use crate::gfreader::{
     count_packed_row_counts_selected_with_excluded, evaluate_packed_row_keep_and_flip,
     packed_row_stats_from_counts, SampleSubsetPlan,
 };
+use crate::gload::PackedBedSourceReader;
 use crate::math_ld::{
     build_bitplanes_u64, compute_packed_row_stats, dot_nomiss_pair_bitplanes,
     dot_nomiss_pair_from_packed, r2_pairwise_complete_bitplanes, r2_pairwise_complete_from_packed,
@@ -29,6 +32,7 @@ use crate::math_ld::{
 use crate::stats_common::{get_cached_pool, map_err_string_to_py};
 
 const LDSC_BITPLANE_MAX_MB_DEFAULT: u64 = 1024;
+static PGEN_LDSC_TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug)]
 enum LdscWindow {
@@ -558,10 +562,39 @@ fn compute_individual_stats_core(
     bytes_per_snp: usize,
     threads: usize,
 ) -> Result<(Vec<f32>, Vec<f32>), String> {
+    let (miss_ct, nonmiss_ct, het_ct) = compute_individual_counts_core(
+        packed_src,
+        n_samples,
+        n_snps,
+        bytes_per_snp,
+        None,
+        threads,
+    )?;
+    let request = GstatsRequest {
+        individual_miss: true,
+        individual_het: true,
+        ..GstatsRequest::default()
+    };
+    let (miss_rate, het_rate) =
+        finalize_individual_rates(miss_ct, nonmiss_ct, het_ct, n_snps, request);
+    let miss_rate = miss_rate.unwrap_or_else(|| vec![0.0_f32; n_samples]);
+    let het_rate = het_rate.unwrap_or_else(|| vec![0.0_f32; n_samples]);
+    Ok((miss_rate, het_rate))
+}
+
+fn compute_individual_counts_core(
+    packed_src: &[u8],
+    n_samples_full: usize,
+    n_snps: usize,
+    bytes_per_snp: usize,
+    sample_indices: Option<&[usize]>,
+    threads: usize,
+) -> Result<(Vec<u64>, Vec<u64>, Vec<u64>), String> {
     let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
     let code4_lut = &packed_byte_lut().code4;
-    let full_bytes = n_samples / 4;
-    let rem = n_samples % 4;
+    let full_bytes = n_samples_full / 4;
+    let rem = n_samples_full % 4;
+    let n_output_samples = sample_indices.map_or(n_samples_full, <[usize]>::len);
     let block_rows = 2048usize;
     let n_blocks = n_snps.div_ceil(block_rows);
 
@@ -571,9 +604,9 @@ fn compute_individual_stats_core(
             .fold(
                 || {
                     (
-                        vec![0u64; n_samples],
-                        vec![0u64; n_samples],
-                        vec![0u64; n_samples],
+                        vec![0u64; n_output_samples],
+                        vec![0u64; n_output_samples],
+                        vec![0u64; n_output_samples],
                     )
                 },
                 |mut acc, block_idx| {
@@ -583,9 +616,15 @@ fn compute_individual_stats_core(
                     for row_idx in row_start..row_end {
                         let row =
                             &packed_src[row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
-                        accumulate_individual_row_counts(
-                            row, code4_lut, full_bytes, rem, miss_ct, nonmiss_ct, het_ct,
-                        );
+                        if let Some(indices) = sample_indices {
+                            accumulate_individual_row_counts_selected(
+                                row, indices, miss_ct, nonmiss_ct, het_ct,
+                            );
+                        } else {
+                            accumulate_individual_row_counts(
+                                row, code4_lut, full_bytes, rem, miss_ct, nonmiss_ct, het_ct,
+                            );
+                        }
                     }
                     acc
                 },
@@ -593,15 +632,15 @@ fn compute_individual_stats_core(
             .reduce(
                 || {
                     (
-                        vec![0u64; n_samples],
-                        vec![0u64; n_samples],
-                        vec![0u64; n_samples],
+                        vec![0u64; n_output_samples],
+                        vec![0u64; n_output_samples],
+                        vec![0u64; n_output_samples],
                     )
                 },
                 |mut left, right| {
                     let (ref mut miss_l, ref mut nonmiss_l, ref mut het_l) = left;
                     let (miss_r, nonmiss_r, het_r) = right;
-                    for i in 0..n_samples {
+                    for i in 0..n_output_samples {
                         miss_l[i] += miss_r[i];
                         nonmiss_l[i] += nonmiss_r[i];
                         het_l[i] += het_r[i];
@@ -617,16 +656,7 @@ fn compute_individual_stats_core(
         run()
     };
 
-    let request = GstatsRequest {
-        individual_miss: true,
-        individual_het: true,
-        ..GstatsRequest::default()
-    };
-    let (miss_rate, het_rate) =
-        finalize_individual_rates(miss_ct, nonmiss_ct, het_ct, n_snps, request);
-    let miss_rate = miss_rate.unwrap_or_else(|| vec![0.0_f32; n_samples]);
-    let het_rate = het_rate.unwrap_or_else(|| vec![0.0_f32; n_samples]);
-    Ok((miss_rate, het_rate))
+    Ok((miss_ct, nonmiss_ct, het_ct))
 }
 
 fn compute_joint_stats_core(
@@ -998,6 +1028,150 @@ fn compute_joint_stats_selected_core(
     })
 }
 
+fn compute_pgen_stats_core(
+    prefix: &str,
+    request: GstatsRequest,
+    sample_indices: Option<&[usize]>,
+    site_indices: Option<&[usize]>,
+    threads: usize,
+) -> Result<(GstatsCombinedOutput, usize, usize), String> {
+    let sample_count = gfcore::read_fam(prefix)?.len();
+    if sample_count == 0 {
+        return Err("no samples found in PGEN input".to_string());
+    }
+    let mut reader = PackedBedSourceReader::open(prefix, sample_count)?;
+    let n_snps_full = reader.n_snps();
+    let sample_indices = validate_selection_indices(sample_indices, sample_count, "sample")?;
+    let site_indices = validate_selection_indices(site_indices, n_snps_full, "site")?;
+    let n_samples = sample_indices.as_ref().map_or(sample_count, Vec::len);
+    let n_snps = site_indices.as_ref().map_or(n_snps_full, Vec::len);
+    let bytes_per_snp = reader.bytes_per_snp();
+    let block_rows = ((16usize * 1024 * 1024) / bytes_per_snp.max(1))
+        .clamp(1, 65_536)
+        .min(n_snps_full.max(1));
+    let mut packed_block = vec![0u8; block_rows.saturating_mul(bytes_per_snp)];
+    let mut site_maf = request.site_maf.then(|| Vec::with_capacity(n_snps));
+    let mut site_miss = request.site_miss.then(|| Vec::with_capacity(n_snps));
+    let mut site_het = request.site_het.then(|| Vec::with_capacity(n_snps));
+    let mut total_miss = request.needs_individual().then(|| vec![0u64; n_samples]);
+    let mut total_nonmiss = request.needs_individual().then(|| vec![0u64; n_samples]);
+    let mut total_het = request.needs_individual().then(|| vec![0u64; n_samples]);
+    let mut site_cursor = 0usize;
+
+    for source_start in (0..n_snps_full).step_by(block_rows) {
+        let rows_here = block_rows.min(n_snps_full - source_start);
+        let byte_len = rows_here.saturating_mul(bytes_per_snp);
+        let got =
+            reader.read_source_block(source_start, rows_here, &mut packed_block[..byte_len])?;
+        if got != rows_here {
+            return Err(format!(
+                "PGEN source block length mismatch at row {source_start}: got {got}, expected {rows_here}"
+            ));
+        }
+        let source_end = source_start + rows_here;
+        let selected_begin = site_cursor;
+        if let Some(indices) = site_indices.as_ref() {
+            while site_cursor < indices.len() && indices[site_cursor] < source_end {
+                site_cursor += 1;
+            }
+        } else {
+            site_cursor = source_end;
+        }
+        let selected_here = site_cursor - selected_begin;
+        let local_site_indices = site_indices.as_ref().map(|indices| {
+            indices[selected_begin..site_cursor]
+                .iter()
+                .map(|&index| index - source_start)
+                .collect::<Vec<_>>()
+        });
+
+        if request.needs_site() && (site_indices.is_none() || selected_here > 0) {
+            let local_request = GstatsRequest {
+                individual_miss: false,
+                individual_het: false,
+                ..request
+            };
+            let out = compute_joint_stats_selected_core(
+                &packed_block[..byte_len],
+                sample_count,
+                rows_here,
+                bytes_per_snp,
+                local_request,
+                sample_indices.as_deref(),
+                local_site_indices.as_deref(),
+                threads,
+            )?;
+            if let (Some(dst), Some(src)) = (site_maf.as_mut(), out.site_maf) {
+                dst.extend(src);
+            }
+            if let (Some(dst), Some(src)) = (site_miss.as_mut(), out.site_miss) {
+                dst.extend(src);
+            }
+            if let (Some(dst), Some(src)) = (site_het.as_mut(), out.site_het) {
+                dst.extend(src);
+            }
+        }
+
+        if request.needs_individual() && (site_indices.is_none() || selected_here > 0) {
+            let individual_rows = if let Some(local_indices) = local_site_indices.as_deref() {
+                let mut selected_packed = Vec::with_capacity(selected_here * bytes_per_snp);
+                for &local_idx in local_indices {
+                    let start = local_idx * bytes_per_snp;
+                    selected_packed.extend_from_slice(&packed_block[start..start + bytes_per_snp]);
+                }
+                selected_packed
+            } else {
+                packed_block[..byte_len].to_vec()
+            };
+            let selected_rows = if site_indices.is_some() {
+                selected_here
+            } else {
+                rows_here
+            };
+            let (miss, nonmiss, het) = compute_individual_counts_core(
+                &individual_rows,
+                sample_count,
+                selected_rows,
+                bytes_per_snp,
+                sample_indices.as_deref(),
+                threads,
+            )?;
+            for (dst, src) in total_miss.as_mut().unwrap().iter_mut().zip(miss) {
+                *dst += src;
+            }
+            for (dst, src) in total_nonmiss.as_mut().unwrap().iter_mut().zip(nonmiss) {
+                *dst += src;
+            }
+            for (dst, src) in total_het.as_mut().unwrap().iter_mut().zip(het) {
+                *dst += src;
+            }
+        }
+    }
+
+    if site_cursor != n_snps {
+        return Err(format!(
+            "PGEN selected site count mismatch: processed {site_cursor}, expected {n_snps}"
+        ));
+    }
+    let (individual_miss, individual_het) = match (total_miss, total_nonmiss, total_het) {
+        (Some(miss), Some(nonmiss), Some(het)) => {
+            finalize_individual_rates(miss, nonmiss, het, n_snps, request)
+        }
+        _ => (None, None),
+    };
+    Ok((
+        GstatsCombinedOutput {
+            site_maf,
+            site_miss,
+            site_het,
+            individual_miss,
+            individual_het,
+        },
+        n_samples,
+        n_snps,
+    ))
+}
+
 fn contiguous_site_range(indices: &[usize]) -> Option<(usize, usize)> {
     let (&start, rest) = indices.split_first()?;
     if rest
@@ -1119,6 +1293,246 @@ fn parse_bim_ldsc_meta(prefix: &str) -> Result<(Vec<i32>, Vec<i64>, Vec<f64>), S
         return Err(format!("{bim_path}: no variant rows found"));
     }
     Ok((chrom_codes, positions, cm_positions))
+}
+
+fn parse_pvar_ldsc_meta(
+    prefix: &str,
+    require_cm: bool,
+) -> Result<(Vec<i32>, Vec<i64>, Vec<f64>), String> {
+    let pvar_path = format!("{}.pvar", crate::pgen::normalize_pgen_prefix(prefix));
+    let file = File::open(&pvar_path).map_err(|e| format!("{pvar_path}: {e}"))?;
+    let reader = BufReader::new(file);
+    let mut header: Option<Vec<String>> = None;
+    let mut chrom_codes = Vec::<i32>::new();
+    let mut positions = Vec::<i64>::new();
+    let mut cm_positions = Vec::<f64>::new();
+    let mut chrom_dict = HashMap::<String, i32>::new();
+
+    for (line_idx, line) in reader.lines().enumerate() {
+        let line_no = line_idx + 1;
+        let line = line.map_err(|e| format!("{pvar_path}:{line_no}: {e}"))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("##") {
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            let columns = trimmed
+                .split_whitespace()
+                .map(|field| field.trim_start_matches('#').to_ascii_uppercase())
+                .collect::<Vec<_>>();
+            for name in ["CHROM", "POS"] {
+                if !columns.iter().any(|column| column == name) {
+                    return Err(format!(
+                        "{pvar_path}:{line_no}: PVAR header is missing {name}"
+                    ));
+                }
+            }
+            header = Some(columns);
+            continue;
+        }
+        let columns = header.as_ref().ok_or_else(|| {
+            format!("{pvar_path}:{line_no}: PVAR data appears before #CHROM header")
+        })?;
+        let fields = trimmed.split_whitespace().collect::<Vec<_>>();
+        let column = |name: &str| -> Result<&str, String> {
+            let idx = columns
+                .iter()
+                .position(|field| field == name)
+                .ok_or_else(|| format!("{pvar_path}: PVAR header is missing {name}"))?;
+            fields
+                .get(idx)
+                .copied()
+                .ok_or_else(|| format!("{pvar_path}:{line_no}: PVAR row is missing {name}"))
+        };
+        let chrom = normalize_chr_token(column("CHROM")?);
+        let pos = column("POS")?
+            .parse::<i64>()
+            .map_err(|e| format!("{pvar_path}:{line_no}: invalid POS value: {e}"))?;
+        let cm = if columns.iter().any(|field| field == "CM") {
+            let raw = column("CM")?;
+            if raw == "." {
+                if require_cm {
+                    return Err(format!(
+                        "{pvar_path}:{line_no}: genetic-distance LD score requires numeric CM values"
+                    ));
+                }
+                0.0
+            } else {
+                raw.parse::<f64>()
+                    .map_err(|e| format!("{pvar_path}:{line_no}: invalid CM value '{raw}': {e}"))?
+            }
+        } else if require_cm {
+            return Err(format!(
+                "{pvar_path}: genetic-distance LD score requires a CM column in the PVAR header"
+            ));
+        } else {
+            0.0
+        };
+        let next_code = chrom_dict.len() as i32;
+        let chrom_code = *chrom_dict.entry(chrom).or_insert(next_code);
+        chrom_codes.push(chrom_code);
+        positions.push(pos);
+        cm_positions.push(cm);
+    }
+    if chrom_codes.is_empty() {
+        return Err(format!("{pvar_path}: no variant rows found"));
+    }
+    Ok((chrom_codes, positions, cm_positions))
+}
+
+struct TemporaryPackedBed(PathBuf);
+
+impl Drop for TemporaryPackedBed {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn compute_pgen_ldscore(
+    prefix: &str,
+    window: LdscWindow,
+    sample_indices: Option<&[usize]>,
+    site_indices: Option<&[usize]>,
+    threads: usize,
+) -> Result<(Vec<i64>, Vec<f64>, usize), String> {
+    let n_samples_full = gfcore::read_fam(prefix)?.len();
+    if n_samples_full == 0 {
+        return Err("no samples found in PGEN input".to_string());
+    }
+    let mut source = PackedBedSourceReader::open(prefix, n_samples_full)?;
+    let n_snps_full = source.n_snps();
+    let bytes_per_snp_full = source.bytes_per_snp();
+    let sample_indices = validate_selection_indices(sample_indices, n_samples_full, "sample")?;
+    let site_indices = validate_selection_indices(site_indices, n_snps_full, "site")?;
+    let (chrom_codes_full, positions_full, cm_positions_full) =
+        parse_pvar_ldsc_meta(prefix, matches!(window, LdscWindow::Cm(_)))?;
+    if chrom_codes_full.len() != n_snps_full {
+        return Err(format!(
+            "PGEN/PVAR row mismatch: pgen={n_snps_full}, pvar={}",
+            chrom_codes_full.len()
+        ));
+    }
+
+    let unique = PGEN_LDSC_TEMP_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+    let temp_path = std::env::temp_dir().join(format!(
+        "janusx-gstats-ldsc-{}-{unique}.bed",
+        std::process::id()
+    ));
+    let temp_guard = TemporaryPackedBed(temp_path.clone());
+    let file = File::create(&temp_path).map_err(|e| {
+        format!(
+            "create temporary PGEN LD-score payload {}: {e}",
+            temp_path.display()
+        )
+    })?;
+    let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, file);
+    writer
+        .write_all(&[0x6c, 0x1b, 0x01])
+        .map_err(|e| format!("write temporary PGEN LD-score header: {e}"))?;
+    let block_rows = ((16usize * 1024 * 1024) / bytes_per_snp_full.max(1))
+        .clamp(1, 65_536)
+        .min(n_snps_full.max(1));
+    let mut packed = vec![0u8; block_rows.saturating_mul(bytes_per_snp_full)];
+    for row_start in (0..n_snps_full).step_by(block_rows) {
+        let rows = block_rows.min(n_snps_full - row_start);
+        let byte_len = rows.saturating_mul(bytes_per_snp_full);
+        let got = source.read_source_block(row_start, rows, &mut packed[..byte_len])?;
+        if got != rows {
+            return Err(format!(
+                "PGEN source block length mismatch at row {row_start}: got {got}, expected {rows}"
+            ));
+        }
+        writer
+            .write_all(&packed[..byte_len])
+            .map_err(|e| format!("write temporary PGEN LD-score payload: {e}"))?;
+    }
+    writer
+        .flush()
+        .map_err(|e| format!("flush temporary PGEN LD-score payload: {e}"))?;
+    drop(writer);
+
+    let payload_file = File::open(&temp_path).map_err(|e| {
+        format!(
+            "open temporary PGEN LD-score payload {}: {e}",
+            temp_path.display()
+        )
+    })?;
+    let mmap = unsafe { Mmap::map(&payload_file) }
+        .map_err(|e| format!("mmap temporary PGEN LD-score payload: {e}"))?;
+    let packed_src = &mmap[3..];
+    let n_samples = sample_indices.as_ref().map_or(n_samples_full, Vec::len);
+    let n_snps = site_indices.as_ref().map_or(n_snps_full, Vec::len);
+    let select_i64 = |values: &[i64]| -> Vec<i64> {
+        site_indices.as_ref().map_or_else(
+            || values.to_vec(),
+            |indices| indices.iter().map(|&index| values[index]).collect(),
+        )
+    };
+    let chrom_i64 = chrom_codes_full
+        .iter()
+        .map(|&value| i64::from(value))
+        .collect::<Vec<_>>();
+    let chrom_codes = select_i64(&chrom_i64)
+        .into_iter()
+        .map(|value| value as i32)
+        .collect::<Vec<_>>();
+    let positions = select_i64(&positions_full);
+    let cm_positions = site_indices.as_ref().map_or_else(
+        || cm_positions_full.clone(),
+        |indices| {
+            indices
+                .iter()
+                .map(|&index| cm_positions_full[index])
+                .collect()
+        },
+    );
+    let run_core = |data: &[u8], row_bytes: usize| {
+        compute_ldscore_core(
+            data,
+            n_samples,
+            n_snps,
+            row_bytes,
+            &chrom_codes,
+            &positions,
+            &cm_positions,
+            window,
+            threads,
+        )
+    };
+    let (m_counts, ld_scores) = if sample_indices.is_none() {
+        if let Some(indices) = site_indices.as_ref() {
+            if let Some((start, end)) = contiguous_site_range(indices) {
+                run_core(
+                    &packed_src[start * bytes_per_snp_full..end * bytes_per_snp_full],
+                    bytes_per_snp_full,
+                )?
+            } else {
+                let compact = compact_bed_selection(
+                    packed_src,
+                    bytes_per_snp_full,
+                    n_snps_full,
+                    Some(indices),
+                    None,
+                );
+                run_core(&compact, bytes_per_snp_full)?
+            }
+        } else {
+            run_core(packed_src, bytes_per_snp_full)?
+        }
+    } else {
+        let compact = compact_bed_selection(
+            packed_src,
+            bytes_per_snp_full,
+            n_snps_full,
+            site_indices.as_deref(),
+            sample_indices.as_deref(),
+        );
+        run_core(&compact, n_samples.div_ceil(4))?
+    };
+    drop(mmap);
+    drop(payload_file);
+    drop(temp_guard);
+    Ok((m_counts, ld_scores, n_samples))
 }
 
 fn parse_ldsc_window(kind: &str, value: f64) -> Result<LdscWindow, String> {
@@ -1489,6 +1903,27 @@ pub fn gstats_bed_site_stats<'py>(
     let (maf, miss, het, n_samples) = py
         .detach(
             move || -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, usize), String> {
+                if crate::pgen::path_uses_pgen(&prefix) {
+                    let request = GstatsRequest {
+                        site_maf: true,
+                        site_miss: true,
+                        site_het: true,
+                        ..GstatsRequest::default()
+                    };
+                    let (out, n_samples, _n_snps) = compute_pgen_stats_core(
+                        &prefix,
+                        request,
+                        sample_indices.as_deref(),
+                        site_indices.as_deref(),
+                        threads,
+                    )?;
+                    return Ok((
+                        out.site_maf.unwrap(),
+                        out.site_miss.unwrap(),
+                        out.site_het.unwrap(),
+                        n_samples,
+                    ));
+                }
                 if sample_indices.is_none() && site_indices.is_none() {
                     let (maf, miss, het, n_samples, _n_snps) =
                         compute_site_stats_unified_from_prefix(&prefix, threads)?;
@@ -1575,6 +2010,15 @@ pub fn gstats_bed_joint_stats<'py>(
     let out = py
         .detach(
             move || -> Result<(GstatsCombinedOutput, usize, usize), String> {
+                if crate::pgen::path_uses_pgen(&prefix) {
+                    return compute_pgen_stats_core(
+                        &prefix,
+                        request,
+                        sample_indices.as_deref(),
+                        site_indices.as_deref(),
+                        threads,
+                    );
+                }
                 if sample_indices.is_none() && site_indices.is_none() && !request.needs_individual()
                 {
                     compute_joint_site_only_via_meta(&bed_prefix, request, threads)
@@ -1686,6 +2130,25 @@ pub fn gstats_bed_individual_stats<'py>(
     let bed_prefix = normalize_plink_prefix(&prefix);
     let (miss_rate, het_rate, n_snps) = py
         .detach(move || -> Result<(Vec<f32>, Vec<f32>, usize), String> {
+            if crate::pgen::path_uses_pgen(&prefix) {
+                let request = GstatsRequest {
+                    individual_miss: true,
+                    individual_het: true,
+                    ..GstatsRequest::default()
+                };
+                let (out, _n_samples, n_snps) = compute_pgen_stats_core(
+                    &prefix,
+                    request,
+                    sample_indices.as_deref(),
+                    site_indices.as_deref(),
+                    threads,
+                )?;
+                return Ok((
+                    out.individual_miss.unwrap(),
+                    out.individual_het.unwrap(),
+                    n_snps,
+                ));
+            }
             let (mmap, n_samples, n_snps, bytes_per_snp) = open_bed_mmap(&bed_prefix)?;
             let packed_src = &mmap[3..];
             if sample_indices.is_none() && site_indices.is_none() {
@@ -1747,10 +2210,19 @@ pub fn gstats_bed_ldscore<'py>(
 ) -> PyResult<(Bound<'py, PyArray1<i64>>, Bound<'py, PyArray1<f64>>, usize)> {
     let sample_indices = readonly_indices_to_usize(sample_indices, "sample")?;
     let site_indices = readonly_indices_to_usize(site_indices, "site")?;
-    let bed_prefix = normalize_plink_prefix(&prefix);
     let window = parse_ldsc_window(&window_kind, window_value).map_err(map_err_string_to_py)?;
     let (m_counts, ld_scores, n_samples) = py
         .detach(move || -> Result<(Vec<i64>, Vec<f64>, usize), String> {
+            if crate::pgen::path_uses_pgen(&prefix) {
+                return compute_pgen_ldscore(
+                    &prefix,
+                    window,
+                    sample_indices.as_deref(),
+                    site_indices.as_deref(),
+                    threads,
+                );
+            }
+            let bed_prefix = normalize_plink_prefix(&prefix);
             let (mmap, n_samples_full, n_snps_full, bytes_per_snp_full) =
                 open_bed_mmap(&bed_prefix)?;
             let (chrom_codes_full, positions_full, cm_positions_full) =
@@ -1862,6 +2334,95 @@ pub fn gstats_bed_ldscore<'py>(
 mod selection_tests {
     use super::*;
 
+    struct TempPgenDataset {
+        dir: PathBuf,
+        prefix: PathBuf,
+        n_samples: usize,
+        n_variants: usize,
+    }
+
+    impl TempPgenDataset {
+        fn new(bed_rows: Vec<u8>, n_samples: usize, n_variants: usize) -> Self {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "janusx_gstats_pgen_{}_{}",
+                std::process::id(),
+                stamp
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let prefix = dir.join("toy");
+            let bytes_per_variant = n_samples.div_ceil(4);
+            assert_eq!(bed_rows.len(), n_variants * bytes_per_variant);
+
+            let mut pgen = vec![0x6c, 0x1b, 0x02];
+            pgen.extend_from_slice(&(n_variants as u32).to_le_bytes());
+            pgen.extend_from_slice(&(n_samples as u32).to_le_bytes());
+            pgen.push(0); // fixed hard-call storage
+            for row in bed_rows.chunks_exact(bytes_per_variant) {
+                let mut category_row = vec![0u8; bytes_per_variant];
+                for sample_idx in 0..n_samples {
+                    let bed_code = (row[sample_idx >> 2] >> ((sample_idx & 3) * 2)) & 3;
+                    let category = match bed_code {
+                        0b00 => 0b00,
+                        0b10 => 0b01,
+                        0b11 => 0b10,
+                        0b01 => 0b11,
+                        _ => unreachable!(),
+                    };
+                    category_row[sample_idx >> 2] |= category << ((sample_idx & 3) * 2);
+                }
+                pgen.extend_from_slice(&category_row);
+            }
+            std::fs::write(prefix.with_extension("pgen"), pgen).unwrap();
+            std::fs::write(
+                prefix.with_extension("psam"),
+                format!(
+                    "#FID IID\n{}",
+                    (0..n_samples)
+                        .map(|i| format!("F{i} I{i}\n"))
+                        .collect::<String>()
+                ),
+            )
+            .unwrap();
+            std::fs::write(
+                prefix.with_extension("pvar"),
+                format!(
+                    "#CHROM POS ID REF ALT CM\n{}",
+                    (0..n_variants)
+                        .map(|i| format!(
+                            "{} {} v{} A C {}\n",
+                            if i == 2 { 2 } else { 1 },
+                            (i + 1) * 100,
+                            i + 1,
+                            (i + 1) as f64 / 10.0
+                        ))
+                        .collect::<String>()
+                ),
+            )
+            .unwrap();
+
+            Self {
+                dir,
+                prefix,
+                n_samples,
+                n_variants,
+            }
+        }
+
+        fn pgen_path(&self) -> String {
+            format!("{}.pgen", self.prefix.to_string_lossy())
+        }
+    }
+
+    impl Drop for TempPgenDataset {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
     #[test]
     fn selected_joint_stats_use_selected_samples_and_sites() {
         // Four samples per row, PLINK codes packed low-to-high in one byte.
@@ -1911,5 +2472,98 @@ mod selection_tests {
         assert_eq!(compact, vec![6_u8, 14_u8]);
         assert_eq!(contiguous_site_range(&[1, 2]), Some((1, 3)));
         assert_eq!(contiguous_site_range(&[0, 2]), None);
+    }
+
+    #[test]
+    fn pgen_joint_stats_match_bed_for_selected_samples_and_sites() {
+        let bed_rows = vec![0x78, 0x02, 0xe4, 0x01, 0x1b, 0x02, 0x2c, 0x00];
+        let dataset = TempPgenDataset::new(bed_rows.clone(), 5, 4);
+        let request = GstatsRequest {
+            site_maf: true,
+            site_miss: true,
+            site_het: true,
+            individual_miss: true,
+            individual_het: true,
+        };
+        let sample_indices = [0usize, 2, 4];
+        let site_indices = [0usize, 2, 3];
+        let (pgen, n_samples, n_sites) = compute_pgen_stats_core(
+            &dataset.pgen_path(),
+            request,
+            Some(&sample_indices),
+            Some(&site_indices),
+            2,
+        )
+        .unwrap();
+        let bed = compute_joint_stats_selected_core(
+            &bed_rows,
+            dataset.n_samples,
+            dataset.n_variants,
+            dataset.n_samples.div_ceil(4),
+            request,
+            Some(&sample_indices),
+            Some(&site_indices),
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(
+            (n_samples, n_sites),
+            (sample_indices.len(), site_indices.len())
+        );
+        for (pgen, bed) in [
+            (pgen.site_maf.unwrap(), bed.site_maf.unwrap()),
+            (pgen.site_miss.unwrap(), bed.site_miss.unwrap()),
+            (pgen.site_het.unwrap(), bed.site_het.unwrap()),
+            (pgen.individual_miss.unwrap(), bed.individual_miss.unwrap()),
+            (pgen.individual_het.unwrap(), bed.individual_het.unwrap()),
+        ] {
+            assert_eq!(pgen.len(), bed.len());
+            for (lhs, rhs) in pgen.iter().zip(bed.iter()) {
+                assert!((lhs - rhs).abs() <= 1e-7, "PGEN={lhs}, BED={rhs}");
+            }
+        }
+    }
+
+    #[test]
+    fn pgen_ldscore_matches_bed_for_selected_samples_and_sites() {
+        let bed_rows = vec![0x78, 0x02, 0xe4, 0x01, 0x1b, 0x02, 0x2c, 0x00];
+        let dataset = TempPgenDataset::new(bed_rows.clone(), 5, 4);
+        let sample_indices = [0usize, 2, 4];
+        let site_indices = [0usize, 2, 3];
+        let (pgen_m, pgen_ld, n_samples) = compute_pgen_ldscore(
+            &dataset.pgen_path(),
+            LdscWindow::Bp(250),
+            Some(&sample_indices),
+            Some(&site_indices),
+            2,
+        )
+        .unwrap();
+        let compact = compact_bed_selection(
+            &bed_rows,
+            dataset.n_samples.div_ceil(4),
+            dataset.n_variants,
+            Some(&site_indices),
+            Some(&sample_indices),
+        );
+        let (expected_m, expected_ld) = compute_ldscore_core(
+            &compact,
+            sample_indices.len(),
+            site_indices.len(),
+            sample_indices.len().div_ceil(4),
+            &[0, 1, 0],
+            &[100, 300, 400],
+            &[0.1, 0.3, 0.4],
+            LdscWindow::Bp(250),
+            2,
+        )
+        .unwrap();
+
+        assert_eq!(n_samples, sample_indices.len());
+        assert_eq!(pgen_m, expected_m);
+        assert_eq!(pgen_ld.len(), expected_ld.len());
+        for (lhs, rhs) in pgen_ld.iter().zip(expected_ld.iter()) {
+            assert!((lhs - rhs).abs() <= 1e-10, "PGEN={lhs}, BED={rhs}");
+        }
     }
 }

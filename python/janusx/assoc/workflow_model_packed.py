@@ -55,6 +55,8 @@ from .workflow import (
     _start_indeterminate_progress_bar,
     _stop_indeterminate_progress_bar,
     _align_pheno_to_sample_order,
+    _as_bfile_prefix,
+    _as_plink_input_path,
     _as_plink_prefix,
     _cleanup_gwas_result_tmp,
     _display_path,
@@ -882,11 +884,12 @@ def _ensure_splmm_sparse_grm(
     )
     spec["sample_hash"] = _splmm_sparse_sample_hash(sample_idx_arg)
     spec["sample_n"] = int(sample_idx_arg.shape[0]) if sample_idx_arg is not None else None
+    pgen_source = _is_pgen_prefix(str(prefix))
     if dense_grm_path_use is not None and dense_grm_path_use.lower().endswith(".npy"):
         spec["source"] = "dense_grm_npy"
         spec["dense_grm_path"] = os.path.normpath(dense_grm_path_use)
     else:
-        spec["source"] = "bed"
+        spec["source"] = "pgen" if pgen_source else "bed"
     if os.path.exists(sparse_path):
         existing_spec = None
         if os.path.exists(meta_path):
@@ -968,6 +971,7 @@ def _ensure_splmm_sparse_grm(
             sparse_mmap_window_mb = None
     use_fused_stream = bool(
         not use_dense_extract
+        and not pgen_source
         and n_samples_full is not None
         and n_snps_total is not None
         and _splmm_sparse_fused_stream_eligible(
@@ -1342,8 +1346,9 @@ def _build_gwas_global_logic_meta(
     het_threshold: float,
     snps_only: bool,
 ) -> dict[str, object]:
-    plink_prefix = normalize_plink_prefix(str(prefix))
-    full_ids = _read_bed_fam_iids(str(plink_prefix))
+    source_path = str(prefix)
+    plink_prefix = normalize_plink_prefix(source_path)
+    full_ids = _read_bed_fam_iids(source_path)
     n_expected = int(full_ids.shape[0])
     if n_expected <= 0:
         raise ValueError("GWAS global scan metadata requires non-empty PLINK samples.")
@@ -1351,11 +1356,11 @@ def _build_gwas_global_logic_meta(
     # This specialized metadata routine directly opens BED/BIM/FAM files.
     # PGEN uses the streaming packed-stats reader below, which dispatches to
     # the native PGEN decoder and then applies the same QC thresholds here.
-    if hasattr(jxrs, "prepare_bed_logic_meta_selected") and not _is_pgen_prefix(str(plink_prefix)):
+    if hasattr(jxrs, "prepare_bed_logic_meta_selected") and not _is_pgen_prefix(source_path):
         threads_use = int(max(1, detect_effective_threads()))
         mmap_window_mb = int(max(1, _current_bed_memory_mb()))
         row_idx, miss, af, row_flip, _site_keep, n_samples_full, n_snps_total = jxrs.prepare_bed_logic_meta_selected(
-            str(plink_prefix),
+            source_path,
             sample_indices=None,
             maf_threshold=float(maf_threshold),
             max_missing_rate=float(max_missing_rate),
@@ -1385,11 +1390,11 @@ def _build_gwas_global_logic_meta(
 
     if scan_bed_2bit_packed_stats is not None:
         miss_raw, maf_raw, _std_raw, row_flip_raw, het_raw, packed_n = scan_bed_2bit_packed_stats(
-            str(plink_prefix)
+            source_path
         )
     else:
         miss_raw, maf_raw, _std_raw, row_flip_raw, het_raw, packed_n = _scan_bed_2bit_packed_stats_fallback(
-            str(plink_prefix),
+            source_path,
             n_expected_samples=int(n_expected),
         )
     if int(packed_n) != int(n_expected):
@@ -1915,7 +1920,7 @@ def _prepare_packed_bed_once_for_gwas(
     -------
     prefix, full_ids, packed_ctx, site_meta_or_none
     """
-    prefix = _as_plink_prefix(genofile)
+    prefix = _as_plink_input_path(genofile)
     if prefix is None:
         raise ValueError(
             "Full-rust packed path requires PLINK BED input "
@@ -1986,7 +1991,7 @@ def _prepare_packed_bed_once_for_gwas(
                     raise
                 task.complete(f"{status_label} (fused QC) ...Finished")
         packed_raw, row_idx_raw, miss_raw, maf_raw, row_flip_raw, n_samples_raw, n_snps_raw = fused_result
-        full_ids = _read_bed_fam_iids(str(normalize_plink_prefix(prefix)))
+        full_ids = _read_bed_fam_iids(str(prefix))
         packed_payload = np.asarray(packed_raw, dtype=np.uint8)
         source_row_idx = np.ascontiguousarray(
             np.asarray(row_idx_raw, dtype=np.int64).reshape(-1), dtype=np.int64
@@ -2052,7 +2057,7 @@ def _prepare_packed_bed_once_for_gwas(
     prepared_scan_meta = _coerce_trait_prepared_scan_meta(trait_prepared_meta)
     if prepared_scan_meta is not None:
         row_idx, miss_rate, maf, row_flip = prepared_scan_meta
-        full_ids, n_snps = inspect_genotype_file(str(normalize_plink_prefix(prefix)))
+        full_ids, n_snps = inspect_genotype_file(str(prefix))
         full_ids = np.asarray(full_ids, dtype=str)
         if int(row_idx.min()) < 0 or int(row_idx.max()) >= int(n_snps):
             raise ValueError(
@@ -2293,22 +2298,41 @@ def _iter_bim_active_rows(prefix: str, active_row_idx: np.ndarray):
         return
     ptr = 0
     target = int(row_idx[ptr])
-    with open(f"{prefix}.bim", "r", encoding="utf-8", errors="replace") as fh:
-        for source_idx, line in enumerate(fh):
+    is_pgen = _is_pgen_prefix(str(prefix))
+    plink_prefix = normalize_plink_prefix(str(prefix))
+    variant_path = f"{plink_prefix}.pvar" if is_pgen else f"{plink_prefix}.bim"
+    source_idx = 0
+    with open(variant_path, "r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if not line.strip() or (is_pgen and line.lstrip().startswith("#")):
+                continue
+            parts = line.rstrip("\n").split()
+            if is_pgen:
+                if len(parts) < 5:
+                    raise ValueError(f"{variant_path} variant row {source_idx + 1} is malformed.")
+                row = (
+                    str(parts[0]), int(float(parts[1])), str(parts[2]),
+                    str(parts[3]), str(parts[4]),
+                )
+            else:
+                if len(parts) < 6:
+                    raise ValueError(f"{variant_path} line {source_idx + 1} is malformed.")
+                row = (
+                    str(parts[0]), int(float(parts[3])), str(parts[1]),
+                    str(parts[4]), str(parts[5]),
+                )
             if source_idx < target:
+                source_idx += 1
                 continue
             while source_idx == target:
-                parts = line.rstrip("\n").split()
-                if len(parts) < 6:
-                    raise ValueError(f"{prefix}.bim line {source_idx + 1} is malformed.")
                 yield (
                     ptr,
                     source_idx,
-                    str(parts[0]),
-                    int(float(parts[3])),
-                    str(parts[1]),
-                    str(parts[4]),
-                    str(parts[5]),
+                    row[0],
+                    row[1],
+                    row[2],
+                    row[3],
+                    row[4],
                 )
                 ptr += 1
                 if ptr >= int(row_idx.shape[0]):
@@ -2316,6 +2340,7 @@ def _iter_bim_active_rows(prefix: str, active_row_idx: np.ndarray):
                 target = int(row_idx[ptr])
                 if source_idx != target:
                     break
+            source_idx += 1
 
 
 def _read_qtn_rows(qtn_tsv: str) -> pd.DataFrame:
@@ -2584,6 +2609,10 @@ def _active_segments_for_windows(
 
 
 def _plink_bed_n_snps_from_prefix(prefix: str, n_samples: int) -> int:
+    if _is_pgen_prefix(str(prefix)):
+        _sample_ids, n_snps = inspect_genotype_file(str(prefix))
+        return int(n_snps)
+    prefix = normalize_plink_prefix(str(prefix))
     bytes_per_snp = (int(n_samples) + 3) // 4
     if bytes_per_snp <= 0:
         raise ValueError("Invalid PLINK sample count while estimating BED SNP count.")
@@ -3918,9 +3947,13 @@ def prepare_memmap_filtered_bed_for_gwas(
     This performs one Rust-side BED mmap pass with QC filtering, then emits a
     temporary BED/BIM/FAM prefix for downstream GWAS routes.
     """
-    prefix = _as_plink_prefix(genofile)
+    prefix = _as_plink_input_path(genofile)
     if prefix is None:
         raise ValueError("memmap BED route requires PLINK BED input/prefix.")
+    if _is_pgen_prefix(str(prefix)):
+        raise ValueError(
+            "Memmap BED filtering requires BED input; this route cannot reinterpret an explicit PGEN source."
+        )
     if not hasattr(jxrs, "bed_mmap_filter_to_plink_rust"):
         raise RuntimeError(
             "Rust extension missing bed_mmap_filter_to_plink_rust. "
@@ -4804,7 +4837,7 @@ def run_lm_stream_bed_single_entry(
         raise RuntimeError(
             f"Rust extension missing {rust_symbol}. Rebuild/install JanusX extension first."
         )
-    prefix = _as_plink_prefix(genofile)
+    prefix = _as_plink_input_path(genofile)
     if prefix is None:
         raise ValueError(f"{str(model_key_norm).upper()} rust streaming single-entry route requires PLINK BED input.")
 
@@ -5258,7 +5291,7 @@ def run_lm_trait_bed_multi_entry(
             "Rust extension missing lm_trait_assoc_bed_to_tsv. "
             "Rebuild/install JanusX extension first."
         )
-    prefix = _as_plink_prefix(genofile)
+    prefix = _as_plink_input_path(genofile)
     if prefix is None:
         raise ValueError("LM trait-level route requires PLINK BED input.")
     if str(genetic_model).lower() != "add":
@@ -7442,7 +7475,7 @@ def run_algwas_packed_fullrank(
         )
 
     qtn_stage_mode = isinstance(qtn_preloaded_packed, dict)
-    main_prefix = _as_plink_prefix(genofile)
+    main_prefix = _as_plink_input_path(genofile)
     if main_prefix is None:
         raise ValueError("ALGWAS route requires PLINK BED input or BED cache prefix.")
     if qtn_stage_mode:
@@ -7975,9 +8008,9 @@ def run_splmm_windowed_fullrank(
         )
 
     pheno_aligned, ids = _align_pheno_to_sample_order(pheno, ids)
-    prefix = _as_plink_prefix(genofile)
+    prefix = _as_plink_input_path(genofile)
     if prefix is None:
-        raise ValueError("SparseLMM requires PLINK BED input/prefix after genotype streaming context preparation.")
+        raise ValueError("SparseLMM requires PLINK BED or PGEN input after genotype streaming context preparation.")
     aligned_ids = np.asarray(ids, dtype=str)
     full_geno_ids = _plink_fam_sample_ids(str(prefix))
     id_to_full_idx = {sid: i for i, sid in enumerate(full_geno_ids)}
@@ -8212,12 +8245,16 @@ def run_splmm_windowed_fullrank(
             if scan_mode_norm == "exact"
             else hasattr(jxrs, "splmm_assoc_pcg_bed_to_tsv_fused_approx")
         )
+        selected_bfile_prefix = _as_bfile_prefix(str(prefix))
         fused_qc_raw_requested = _splmm_fused_qc_eligible(
             route_name="splmm",
             genetic_model=genetic_model,
             scan_mode=scan_mode_norm,
             row_stat_mode=row_stat_mode,
-            bed_exists=os.path.exists(f"{str(prefix)}.bed"),
+            bed_exists=bool(
+                selected_bfile_prefix is not None
+                and os.path.isfile(f"{selected_bfile_prefix}.bed")
+            ),
             sparse_grm_available=bool(
                 trait_sparse_kinship_path
                 and os.path.exists(str(trait_sparse_kinship_path))

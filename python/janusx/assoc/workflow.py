@@ -80,6 +80,12 @@ mpl.rcParams['svg.fonttype'] = 'none'
 mpl.rcParams['svg.hashsalt'] = 'hello'
 
 import numpy as np
+from janusx._plink import (
+    canonical_plink_input_path,
+    detect_existing_plink_kind,
+    explicit_plink_kind,
+    normalize_plink_prefix,
+)
 import pandas as pd
 try:
     from scipy.special import erfc as _sp_erfc
@@ -416,22 +422,28 @@ def _packed_model_fused_qc_eligible(
     ):
         return False
 
+    resolved_source = detect_existing_plink_kind(str(bed_prefix))
+    if resolved_source is None:
+        return False
+    source_kind, source_prefix = resolved_source
+
     try:
         budget_mb = float(memory_budget_mb)
         if not np.isfinite(budget_mb) or budget_mb <= 0.0:
             return False
-        bed_path = f"{str(bed_prefix)}.bed"
-        pgen_path = f"{str(bed_prefix)}.pgen"
-        if os.path.isfile(bed_path):
+        bed_path = f"{source_prefix}.bed"
+        pgen_path = f"{source_prefix}.pgen"
+        if source_kind == "bfile" and os.path.isfile(bed_path):
             packed_bytes = max(0, int(os.path.getsize(bed_path)) - 3)
             required_bytes = int(np.ceil(float(packed_bytes) * 1.06))
             if bool(snps_only):
-                bim_bytes = int(os.path.getsize(f"{str(bed_prefix)}.bim"))
+                bim_bytes = int(os.path.getsize(f"{source_prefix}.bim"))
                 required_bytes += int(np.ceil(float(bim_bytes) * 1.5))
         elif (
-            os.path.isfile(pgen_path)
-            and os.path.isfile(f"{str(bed_prefix)}.pvar")
-            and os.path.isfile(f"{str(bed_prefix)}.psam")
+            source_kind == "pfile"
+            and os.path.isfile(pgen_path)
+            and os.path.isfile(f"{source_prefix}.pvar")
+            and os.path.isfile(f"{source_prefix}.psam")
             and n_snps is not None
             and int(n_snps) > 0
         ):
@@ -441,7 +453,8 @@ def _packed_model_fused_qc_eligible(
                 # phenotype/GRM intersection, which can understate the packed
                 # matrix size FarmCPU will retain.
                 try:
-                    n_samples = len(_plink_fam_sample_ids(str(bed_prefix)))
+                    pgen_input = canonical_plink_input_path(source_prefix, "pfile")
+                    n_samples = len(_plink_fam_sample_ids(pgen_input))
                 except (OSError, TypeError, ValueError, OverflowError):
                     return False
             if int(n_samples) <= 0:
@@ -676,7 +689,7 @@ def _build_gwas_sidecar_context(
     snps_only: bool,
     genetic_model: str,
 ) -> GwasSidecarRunContext | None:
-    prefix = _as_plink_prefix(str(genotype_prefix))
+    prefix = _as_plink_input_path(str(genotype_prefix))
     kinship_text = str(kinship_file or "").strip()
     if prefix is None or kinship_text == "":
         return None
@@ -988,8 +1001,8 @@ def _format_gwas_packed_route_status(
         )
     )
     if trait_level_packed_candidate:
-        source_is_bed = bool(_as_plink_prefix(str(gfile)) is not None)
-        if source_is_bed:
+        source_is_plink = bool(_as_plink_prefix(str(gfile)) is not None)
+        if source_is_plink:
             return "Candidate (trait-level shared packed scan)"
         if bool(len(requested_stream_models) > 0 or qtn_input_requested):
             return "Deferred (trait-level shared packed scan; PLINK cache on demand)"
@@ -1012,7 +1025,7 @@ def _format_gwas_packed_route_resolution(
             original_prefix is not None
             and os.path.abspath(str(original_prefix)) == os.path.abspath(str(stream_prefix))
         )
-        tags.append("BED input ready" if same_prefix else "PLINK cache ready")
+        tags.append("PLINK input ready" if same_prefix else "PLINK cache ready")
     if packed_preload_is_ready(preloaded_packed):
         tags.append("packed preload ready")
     trait_level_packed_candidate = bool(
@@ -2188,15 +2201,15 @@ def latest_genotype_mtime(genofile: str) -> Union[float, None]:
     - File input  : mtime of the file path itself
     """
     raw = str(genofile).strip()
-    low = raw.lower()
-    for suffix in (".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"):
-        if low.endswith(suffix):
-            raw = raw[: -len(suffix)]
-            break
-    for extensions in (("bed", "bim", "fam"), ("pgen", "pvar", "psam")):
-        paths = [f"{raw}.{ext}" for ext in extensions]
+    resolved = detect_existing_plink_kind(raw)
+    if resolved is not None:
+        kind, prefix = resolved
+        extensions = ("bed", "bim", "fam") if kind == "bfile" else ("pgen", "pvar", "psam")
+        paths = [f"{prefix}.{ext}" for ext in extensions]
         if all(os.path.isfile(path) for path in paths):
             return max(os.path.getmtime(path) for path in paths)
+        if explicit_plink_kind(raw) is not None:
+            return None
 
     file_prefix, matrix_path = _resolve_file_input_matrix(genofile)
     if file_prefix and matrix_path:
@@ -2492,28 +2505,21 @@ def _kfile_site_row_indices(
     prefix: str,
     site_specs: list[tuple[str, int]],
 ) -> list[int]:
-    """Map requested ``chrom:pos`` tokens to source-row indices in a BIM."""
-    bim_path = _resolve_gwas_snp_bim_path(prefix)
-    if bim_path is None:
+    """Map requested ``chrom:pos`` tokens to source-row indices in PLINK metadata."""
+    variant_path = _resolve_gwas_snp_bim_path(prefix)
+    if variant_path is None:
         raise ValueError(
-            "k-file site covariates require a sibling .bim site header: "
-            f"{_display_path(_resolve_kfile_prefix(prefix))}.bim"
+            "k-file site covariates require a sibling .bim or .pvar site header: "
+            f"{_display_path(_resolve_kfile_prefix(prefix))}"
         )
     requested = {_canon_site_key(chrom, pos) for chrom, pos in site_specs}
     found: dict[tuple[str, int], int] = {}
-    with open(bim_path, "r", encoding="utf-8", errors="replace") as handle:
-        row_index = 0
-        for line_no, raw in enumerate(handle, start=1):
-            line = raw.strip()
-            if line == "" or line.startswith("#"):
-                continue
-            fields = line.split()
-            if len(fields) < 4:
-                raise ValueError(f"Malformed BIM line at {bim_path}:{line_no}")
-            key = _canon_site_key(fields[0], int(float(fields[3])))
-            if key in requested and key not in found:
-                found[key] = int(row_index)
-            row_index += 1
+    for row_index, (chrom, pos, _snp, _allele0, _allele1) in enumerate(
+        _iter_plink_variant_sites(variant_path)
+    ):
+        key = _canon_site_key(chrom, pos)
+        if key in requested and key not in found:
+            found[key] = int(row_index)
     missing = [
         f"{chrom}:{int(pos)}"
         for chrom, pos in site_specs
@@ -3541,7 +3547,7 @@ def _resolve_rust_grm_backend_plan(
     preloaded_packed: Union[dict[str, object], None],
     cache_write_path: Union[str, None],
 ) -> tuple[str, str, bool]:
-    packed_prefix = _as_plink_prefix(genofile)
+    packed_prefix = _as_plink_input_path(genofile)
     if packed_prefix is None:
         raise RuntimeError(
             "Rust-only GWAS GRM build requires PLINK BED input/prefix."
@@ -3613,7 +3619,7 @@ def build_grm_streaming(
     - when a compatible packed preload already exists, reuse it
     - if memmap is unavailable, fallback to packed BED full-load
     """
-    packed_prefix = _as_plink_prefix(genofile)
+    packed_prefix = _as_plink_input_path(genofile)
     backend_kind, backend_reason, stream_direct_cache = _resolve_rust_grm_backend_plan(
         genofile,
         allow_packed_full_load=bool(allow_packed_full_load),
@@ -4729,7 +4735,7 @@ def prepare_streaming_context(
 
     prewarm_scanmeta_secs = 0.0
     if bool(prewarm_global_scanmeta):
-        bed_prefix_global = _as_plink_prefix(stream_genofile)
+        bed_prefix_global = _as_plink_input_path(stream_genofile)
         if bed_prefix_global is not None:
             scanmeta_t0 = time.monotonic()
             _ = _gwas_logic_meta_global_cached(
@@ -5027,16 +5033,30 @@ def _as_plink_prefix(path_or_prefix: str) -> Union[str, None]:
     p = str(path_or_prefix).strip()
     if p == "":
         return None
-    low = p.lower()
-    for suffix in (".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"):
-        if low.endswith(suffix):
-            p = p[: -len(suffix)]
-            break
-    if os.path.isfile(f"{p}.bed"):
-        complete = all(os.path.isfile(f"{p}.{ext}") for ext in ("bed", "bim", "fam"))
-    else:
-        complete = all(os.path.isfile(f"{p}.{ext}") for ext in ("pgen", "pvar", "psam"))
-    return p if complete else None
+    resolved = detect_existing_plink_kind(p)
+    return resolved[1] if resolved is not None else None
+
+
+def _as_bfile_prefix(path_or_prefix: str) -> Union[str, None]:
+    """Resolve a BED source only when BED is the selected PLINK family."""
+    p = str(path_or_prefix).strip()
+    if p == "":
+        return None
+    resolved = detect_existing_plink_kind(p)
+    if resolved is None or resolved[0] != "bfile":
+        return None
+    return resolved[1]
+
+
+def _as_plink_input_path(path_or_prefix: str) -> Union[str, None]:
+    """Resolve a PLINK source while retaining its BED/PGEN family explicitly."""
+    p = str(path_or_prefix).strip()
+    if p == "":
+        return None
+    resolved = detect_existing_plink_kind(p)
+    if resolved is None:
+        return None
+    return canonical_plink_input_path(p, resolved[0])
 
 
 def _is_kfile_prefix(path_or_prefix: object) -> bool:
@@ -5700,16 +5720,11 @@ def _split_gwas_sites(
 
 def _read_bim_sites(prefix: str) -> list[tuple[str, int, str, str, str]]:
     out: list[tuple[str, int, str, str, str]] = []
-    raw_prefix = str(prefix).strip()
-    low = raw_prefix.lower()
-    for suffix in (".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"):
-        if low.endswith(suffix):
-            raw_prefix = raw_prefix[: -len(suffix)]
-            break
-    is_pgen = (
-        not os.path.isfile(f"{raw_prefix}.bed")
-        and all(os.path.isfile(f"{raw_prefix}.{ext}") for ext in ("pgen", "pvar", "psam"))
-    )
+    resolved = detect_existing_plink_kind(str(prefix).strip())
+    if resolved is None:
+        raise FileNotFoundError(f"Cannot resolve PLINK variant metadata for {prefix}")
+    kind, raw_prefix = resolved
+    is_pgen = kind == "pfile"
     variant_path = f"{raw_prefix}.pvar" if is_pgen else f"{raw_prefix}.bim"
     columns: list[str] | None = None
     with open(variant_path, "r", encoding="utf-8", errors="ignore") as fh:
@@ -6173,26 +6188,44 @@ def _filter_trait_prepared_meta_by_bimranges(
 
 
 def _resolve_gwas_snp_bim_path(genofile: str) -> Union[str, None]:
+    """Resolve the selected PLINK family's variant table (BIM or PVAR)."""
     path = str(safe_expanduser(str(genofile))).strip()
     if path == "":
         return None
-    if path.lower().endswith(".bim") and os.path.isfile(path):
+    low_path = path.lower()
+    if low_path.endswith((".bim", ".pvar")) and os.path.isfile(path):
         return path
 
     # Marker-oriented kfiles produced by ``gformat -fmt kfile`` intentionally
     # have no ``.bkmer`` payload.  Their sibling BIM is the site header, so
     # check the logical prefix before falling back to PLINK/FILE resolution.
-    if path.lower().endswith(".meta.json"):
+    is_kfile_meta = low_path.endswith(".meta.json")
+    is_kfile_source = is_kfile_meta or _is_kfile_prefix(path)
+    if is_kfile_meta:
         path = path[: -len(".meta.json")]
+
+    selected_kind = explicit_plink_kind(path)
+    if selected_kind is not None:
+        plink_prefix = normalize_plink_prefix(path)
+        variant_path = f"{plink_prefix}.pvar" if selected_kind == "pfile" else f"{plink_prefix}.bim"
+        return variant_path if os.path.isfile(variant_path) else None
+
+    if is_kfile_source:
+        bim_from_prefix = f"{path}.bim"
+        if os.path.isfile(bim_from_prefix):
+            return bim_from_prefix
+
+    resolved = detect_existing_plink_kind(path)
+    if resolved is not None:
+        kind, plink_prefix = resolved
+        variant_path = f"{plink_prefix}.pvar" if kind == "pfile" else f"{plink_prefix}.bim"
+        if os.path.isfile(variant_path):
+            return variant_path
+
+    # Retain the legacy sibling-BIM lookup for kfiles passed as a bare prefix.
     bim_from_prefix = f"{path}.bim"
     if os.path.isfile(bim_from_prefix):
         return bim_from_prefix
-
-    plink_prefix = _as_plink_prefix(path)
-    if plink_prefix is not None:
-        bim_path = f"{plink_prefix}.bim"
-        if os.path.isfile(bim_path):
-            return bim_path
 
     file_prefix, _matrix_path = _resolve_file_input_matrix(path)
     if file_prefix:
@@ -6203,43 +6236,55 @@ def _resolve_gwas_snp_bim_path(genofile: str) -> Union[str, None]:
     return None
 
 
-def _iter_bim_named_sites(bim_path: str) -> Iterator[tuple[str, int, str]]:
-    with open(bim_path, "r", encoding="utf-8", errors="replace") as fh:
+def _iter_plink_variant_sites(
+    variant_path: str,
+) -> Iterator[tuple[str, int, str, str, str]]:
+    """Stream normalized marker records from a PLINK BIM or PVAR file."""
+    is_pvar = str(variant_path).lower().endswith(".pvar")
+    with open(variant_path, "r", encoding="utf-8", errors="replace") as fh:
         for line_no, raw in enumerate(fh, start=1):
             line = raw.strip()
-            if line == "":
+            if line == "" or line.startswith("#"):
                 continue
             toks = line.split()
-            if len(toks) < 4:
-                raise ValueError(f"Malformed BIM line at {bim_path}:{line_no}")
+            min_fields = 5 if is_pvar else 6
+            if len(toks) < min_fields:
+                label = "PVAR" if is_pvar else "BIM"
+                raise ValueError(f"Malformed {label} line at {variant_path}:{line_no}")
             chrom = str(toks[0]).strip()
-            pos = _coerce_site_pos(toks[3])
-            raw_name = toks[1] if len(toks) > 1 else "."
-            yield chrom, pos, _normalize_snp_name(raw_name, chrom, pos)
+            if is_pvar:
+                pos = _coerce_site_pos(toks[1])
+                raw_name = toks[2]
+                allele0, allele1 = str(toks[3]), str(toks[4])
+            else:
+                pos = _coerce_site_pos(toks[3])
+                raw_name = toks[1]
+                allele0, allele1 = str(toks[4]), str(toks[5])
+            yield (
+                chrom,
+                pos,
+                _normalize_snp_name(raw_name, chrom, pos),
+                allele0,
+                allele1,
+            )
+
+
+def _iter_bim_named_sites(bim_path: str) -> Iterator[tuple[str, int, str]]:
+    for chrom, pos, snp, _allele0, _allele1 in _iter_plink_variant_sites(bim_path):
+        yield chrom, pos, snp
 
 
 def _iter_bim_assoc_sites(
     bim_path: str,
 ) -> Iterator[tuple[str, int, str, str, str]]:
-    """Stream PLINK BIM rows for compact k-file GWAS publication.
+    """Stream PLINK BIM/PVAR rows for compact k-file GWAS publication.
 
     The native k-file scanners intentionally write only ``maf/beta/se/pwald``
     to keep the scan writer small.  A sibling BIM is the authoritative marker
     header for kfiles produced by ``gformat -fmt kfile``; stream it one row at
     a time so expanding the result never materializes millions of sites.
     """
-    with open(bim_path, "r", encoding="utf-8", errors="replace") as fh:
-        for line_no, raw in enumerate(fh, start=1):
-            line = raw.strip()
-            if line == "":
-                continue
-            toks = line.split()
-            if len(toks) < 6:
-                raise ValueError(f"Malformed BIM line at {bim_path}:{line_no}")
-            chrom = str(toks[0]).strip()
-            pos = _coerce_site_pos(toks[3])
-            snp = _normalize_snp_name(toks[1], chrom, pos)
-            yield chrom, pos, snp, str(toks[4]), str(toks[5])
+    yield from _iter_plink_variant_sites(bim_path)
 
 
 def _expand_compact_kfile_gwas_tsv(
@@ -8336,7 +8381,7 @@ def parse_args(argv: Optional[list[str]] = None):
     args, extras = parser.parse_known_args(argv)
     args._out_was_explicit = bool(_option_present(raw_argv, "-o", "--out"))
     args._prefix_was_explicit = bool(_option_present(raw_argv, "-prefix", "--prefix"))
-    has_genotype = bool(args.vcf or args.hmp or args.file or args.bfile or args.kfile)
+    has_genotype = bool(args.vcf or args.hmp or args.file or args.bfile or args.pfile or args.kfile)
     has_pheno = bool(args.pheno)
     if (not has_pheno) and (not has_genotype):
         parser.error(
@@ -8468,7 +8513,14 @@ def _prepare_qtn_packed_preload(
         return None
     kind, path, force_kind = src
     if kind == "bfile":
-        prefix = _as_plink_prefix(path)
+        # -qbfile selects the BED family even when a same-prefix PGEN source
+        # also exists. Keep that choice explicit until prefix normalization.
+        try:
+            prefix = canonical_plink_input_path(path, "bfile")
+            if _as_plink_prefix(prefix) is None:
+                prefix = None
+        except ValueError as ex:
+            _abort_cli_input_error(logger, ex)
         if prefix is None:
             _abort_cli_input_error(
                 logger,
@@ -8476,16 +8528,17 @@ def _prepare_qtn_packed_preload(
             )
     else:
         try:
-            prefix = _as_plink_prefix(
-                prepare_cli_input_cache(
-                    path,
-                    snps_only=bool(getattr(args, "snps_only", False)),
-                    delimiter=("," if str(path).lower().endswith(".csv") else None),
-                    prefer_plink_for_txt=True,
-                    force_kind=force_kind,
-                    threads=int(args.thread),
-                )
+            cache_path = prepare_cli_input_cache(
+                path,
+                snps_only=bool(getattr(args, "snps_only", False)),
+                delimiter=("," if str(path).lower().endswith(".csv") else None),
+                prefer_plink_for_txt=True,
+                force_kind=force_kind,
+                threads=int(args.thread),
             )
+            prefix = canonical_plink_input_path(cache_path, "bfile")
+            if _as_plink_prefix(prefix) is None:
+                prefix = None
         except ValueError as ex:
             _abort_cli_input_error(logger, ex)
         if prefix is None:
@@ -9388,7 +9441,7 @@ def _run_gwas_pipeline_impl(
                 "Genotype k-file metadata",
             )
         )
-    elif args.bfile:
+    elif args.bfile or args.pfile:
         checks.append(ensure_plink_prefix_exists(logger, gfile, "Genotype PLINK prefix"))
     elif args.file:
         checks.append(ensure_file_input_exists(logger, gfile, "Genotype FILE input"))
@@ -9413,7 +9466,7 @@ def _run_gwas_pipeline_impl(
     max_missing_rate_scan = float(args.geno)
     het_threshold_scan = float(args.het)
 
-    input_is_bed = _as_plink_prefix(gfile) is not None
+    input_is_plink = _as_plink_prefix(gfile) is not None
     memmap_mode = bool(standard_stream_models_requested or (not bool(fast_mode)))
     mmap_limit_effective = bool(memmap_mode)
     lm_lmm_pread_requested = bool(
@@ -9443,10 +9496,10 @@ def _run_gwas_pipeline_impl(
                 "Default memmap route enabled: stream-aligned windowed mmap will be used on BED/cache input "
                 "(no temporary mmapbed.* PLINK cache will be created)."
             )
-    if (not input_is_bed) and memmap_mode:
+    if (not input_is_plink) and memmap_mode:
         _append_advanced_note(
             (
-                "Input is not direct PLINK BED; the sequential LM/LMM positioned-read route will apply after source conversion/cache to BED."
+                "Input is not direct PLINK; the sequential LM/LMM positioned-read route will apply after source conversion/cache."
                 if lm_lmm_pread_requested
                 else "Input is not direct PLINK BED; memmap route will apply after source conversion/cache to BED."
             )
@@ -9633,7 +9686,7 @@ def _run_gwas_pipeline_impl(
                         stream_genofile_ready: str,
                         loaded_dense_grm_path: Optional[str],
                     ) -> None:
-                        splmm_sparse_prefix = _as_plink_prefix(stream_genofile_ready)
+                        splmm_sparse_prefix = _as_plink_input_path(stream_genofile_ready)
                         if splmm_sparse_prefix is None:
                             return
                         dense_grm_path = None
@@ -10736,7 +10789,7 @@ def _run_gwas_pipeline_impl(
                         has_farmcpu=bool(has_farmcpu),
                     )
                     prefix_meta = (
-                        _as_plink_prefix(genofile_stream)
+                        _as_plink_input_path(genofile_stream)
                         if (
                             genofile_stream is not None
                             and pheno is not None
@@ -10883,14 +10936,19 @@ def _run_gwas_pipeline_impl(
                             if cfg is not None
                             else None
                         )
+                        selected_bfile_prefix = (
+                            _as_bfile_prefix(str(prefix_meta))
+                            if prefix_meta is not None
+                            else None
+                        )
                         return _splmm_fused_qc_eligible(
                             route_name=route_key,
                             genetic_model=str(args.model),
                             scan_mode=scan_mode,
                             row_stat_mode=gwas_row_stat_mode,
                             bed_exists=bool(
-                                prefix_meta is not None
-                                and os.path.exists(f"{str(prefix_meta)}.bed")
+                                selected_bfile_prefix is not None
+                                and os.path.isfile(f"{selected_bfile_prefix}.bed")
                             ),
                             sparse_grm_available=bool(
                                 sparse_path is not None
@@ -10933,16 +10991,23 @@ def _run_gwas_pipeline_impl(
                             )
                         else:
                             binding_available = False
+                        resolved_source = (
+                            detect_existing_plink_kind(str(prefix_meta))
+                            if prefix_meta is not None
+                            else None
+                        )
                         packed_source_available = bool(
-                            prefix_meta is not None
-                            and os.path.isfile(f"{str(prefix_meta)}.bed")
+                            resolved_source is not None
+                            and resolved_source[0] == "bfile"
+                            and os.path.isfile(f"{resolved_source[1]}.bed")
                         )
                         if (
                             not packed_source_available
                             and model_key == "fvlmm"
-                            and prefix_meta is not None
+                            and resolved_source is not None
+                            and resolved_source[0] == "pfile"
                             and all(
-                                os.path.isfile(f"{str(prefix_meta)}.{suffix}")
+                                os.path.isfile(f"{resolved_source[1]}.{suffix}")
                                 for suffix in ("pgen", "pvar", "psam")
                             )
                         ):
@@ -11988,7 +12053,7 @@ def _run_gwas_pipeline_impl(
                 and pheno is not None
                 and ids is not None
             ):
-                strict_prefix_meta = _as_plink_prefix(genofile_stream)
+                strict_prefix_meta = _as_plink_input_path(genofile_stream)
                 if strict_prefix_meta is not None:
                     try:
                         strict_ids_arr_meta = np.asarray(ids, dtype=str).reshape(-1)
@@ -12011,7 +12076,7 @@ def _run_gwas_pipeline_impl(
                     or len(scan_bimranges) > 0
                 )
             ):
-                global_prefix_meta = _as_plink_prefix(genofile_stream)
+                global_prefix_meta = _as_plink_input_path(genofile_stream)
                 global_fused_qc_load = bool(
                     global_prefix_meta is not None
                     and _packed_model_fused_qc_eligible(

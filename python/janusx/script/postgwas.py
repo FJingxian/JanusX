@@ -117,6 +117,12 @@ from functools import lru_cache
 from typing import Any, Iterable, Optional, Sequence, Tuple
 from urllib.parse import unquote
 from janusx import janusx as jxrs
+from janusx._plink import (
+    canonical_plink_input_path,
+    detect_existing_plink_kind,
+    explicit_plink_kind,
+    normalize_plink_prefix as _shared_normalize_plink_prefix,
+)
 from janusx.assoc.null_model_sidecar import (
     FineMapSkip,
     GwasNullModelSidecarV1,
@@ -1738,21 +1744,17 @@ def _postgwas_fvlmm_genotype_sample_path(
     genotype_prefix: Optional[str | os.PathLike[str]],
 ) -> Path:
     if genotype_prefix is not None and str(genotype_prefix).strip() != "":
+        kind = _postgwas_plink_kind(genotype_prefix)
         prefix = _normalize_plink_prefix(genotype_prefix)
-        is_pgen = os.path.isfile(f"{prefix}.pgen") and not os.path.isfile(
-            f"{prefix}.bed"
-        )
-        suffix = ".psam" if is_pgen else ".fam"
+        suffix = ".psam" if kind == "pfile" else ".fam"
         return Path(f"{prefix}{suffix}")
     for fingerprint in record.genotype_files:
         basename = str(getattr(fingerprint, "basename", "")).lower()
         if basename.endswith((".fam", ".psam")):
             return Path(str(fingerprint.canonical_path)).expanduser()
+    kind = _postgwas_plink_kind(record.genotype_prefix)
     prefix = _normalize_plink_prefix(record.genotype_prefix)
-    is_pgen = os.path.isfile(f"{prefix}.pgen") and not os.path.isfile(
-        f"{prefix}.bed"
-    )
-    suffix = ".psam" if is_pgen else ".fam"
+    suffix = ".psam" if kind == "pfile" else ".fam"
     return Path(f"{prefix}{suffix}")
 
 
@@ -2252,10 +2254,9 @@ def _postgwas_resolve_prepared_bim_rows(
         )
         target_sites.add((chrom, pos))
 
+    kind = _postgwas_plink_kind(genotype_prefix)
     prefix = _normalize_plink_prefix(genotype_prefix)
-    is_pgen = os.path.isfile(f"{prefix}.pgen") and not os.path.isfile(
-        f"{prefix}.bed"
-    )
+    is_pgen = kind == "pfile"
     variant_path = Path(f"{prefix}.pvar" if is_pgen else f"{prefix}.bim")
     variant_label = "PVAR" if is_pgen else "BIM"
     try:
@@ -2926,7 +2927,7 @@ def _postgwas_build_fvlmm_effective_ld(
             + ", ".join(missing_columns)
         )
 
-    requested_prefix = getattr(args, "bfile", None)
+    requested_prefix = getattr(args, "plink_input", None)
     if requested_prefix is None or str(requested_prefix).strip() == "":
         requested_prefix = record.genotype_prefix
     try:
@@ -3541,12 +3542,9 @@ def _postgwas_check_finemap_memory(
 
 def _postgwas_count_plink_samples(bfile: object) -> int:
     """Count PLINK samples from FAM/PSAM metadata without loading genotypes."""
+    kind = _postgwas_plink_kind(bfile)
     prefix = _normalize_plink_prefix(bfile)
-    sample_suffix = (
-        ".psam"
-        if os.path.isfile(f"{prefix}.pgen") and not os.path.isfile(f"{prefix}.bed")
-        else ".fam"
-    )
+    sample_suffix = ".psam" if kind == "pfile" else ".fam"
     sample_path = Path(f"{prefix}{sample_suffix}")
     try:
         return len(_postgwas_read_plink_sample_ids(sample_path))
@@ -3587,12 +3585,9 @@ def _postgwas_select_finemap_ld_route(
 
 def _postgwas_read_finemap_fam_sample_ids(bfile: object) -> list[str]:
     """Read unique PLINK IID values in their exact FAM/PSAM order."""
+    kind = _postgwas_plink_kind(bfile)
     prefix = _normalize_plink_prefix(bfile)
-    sample_suffix = (
-        ".psam"
-        if os.path.isfile(f"{prefix}.pgen") and not os.path.isfile(f"{prefix}.bed")
-        else ".fam"
-    )
+    sample_suffix = ".psam" if kind == "pfile" else ".fam"
     sample_path = Path(f"{prefix}{sample_suffix}")
     try:
         sample_ids = _postgwas_read_plink_sample_ids(sample_path)
@@ -3719,7 +3714,7 @@ def _validate_postgwas_finemap_args(
         parser.error(
             "Fine-mapping requires exactly one GWAS input file from -i/--gwasfile."
         )
-    if not getattr(args, "bfile", None):
+    if not getattr(args, "plink_input", None):
         parser.error("Fine-mapping requires -bfile/--bfile or -pfile/--pfile.")
     if not getattr(args, "bimrange_tuples", None):
         parser.error("Fine-mapping requires at least one -bimrange/--bimrange.")
@@ -5152,7 +5147,7 @@ def _postgwas_build_sample_matched_raw_ld(
         )
     try:
         genotype_iter = load_genotype_chunks(
-            str(args.bfile),
+            str(args.plink_input),
             chunk_size=max(1, min(20_000, len(selected_bim_indices))),
             maf=0.0,
             missing_rate=1.0,
@@ -5375,7 +5370,7 @@ def _postgwas_run_susie_finemap_body(
         validate_sidecar_dependencies(
             sidecar,
             gwas_files[0],
-            args.bfile,
+            args.plink_input,
             expected_model=result_model,
         )
         if result_model != "fvlmm":
@@ -5416,7 +5411,7 @@ def _postgwas_run_susie_finemap_body(
     if ld_route == "raw":
         raw_sample_ids, raw_sample_indices = _postgwas_resolve_finemap_sample_ids(
             args,
-            args.bfile,
+            args.plink_input,
         )
         if raw_sample_indices.shape != (len(raw_sample_ids),):
             raise FineMapSkip(
@@ -5429,7 +5424,7 @@ def _postgwas_run_susie_finemap_body(
             hash_ordered_sample_ids(raw_sample_ids),
         )
     gwas_memory_bytes = int(gwas.memory_usage(deep=True, index=True).sum())
-    plink_sample_count = _postgwas_count_plink_samples(args.bfile)
+    plink_sample_count = _postgwas_count_plink_samples(args.plink_input)
     clump_sample_count = (
         len(raw_sample_ids) if raw_sample_ids is not None else plink_sample_count
     )
@@ -5495,7 +5490,7 @@ def _postgwas_run_susie_finemap_body(
             # intentionally after route selection and before any raw LD use.
             prepared_source = _postgwas_canonicalize_raw_finemap_rows(
                 prepared_source,
-                args.bfile,
+                args.plink_input,
             )
         else:
             if sidecar is None:
@@ -5515,7 +5510,7 @@ def _postgwas_run_susie_finemap_body(
         effective_clump_started = time.perf_counter()
         prepared, clump_counts, fold_groups = _postgwas_finemap_ldclump(
             prepared_source,
-            genofile=str(args.bfile),
+            genofile=str(args.plink_input),
             locus=locus_tuple,
             logger=logger,
             preload_max_rows=clump_preload_max_rows,
@@ -6582,15 +6577,36 @@ def _extract_ld_site_set(
 
 
 def _normalize_plink_prefix(path_or_prefix: object) -> str:
-    s = str(path_or_prefix).strip()
-    low = s.lower()
-    for ext in (".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"):
-        if low.endswith(ext):
-            return s[: -len(ext)]
-    return s
+    return _shared_normalize_plink_prefix(str(path_or_prefix))
+
+
+def _postgwas_plink_kind(path_or_prefix: object) -> Optional[str]:
+    """Resolve the selected PLINK family without guessing on mixed prefixes."""
+    raw = str(path_or_prefix).strip()
+    if raw == "":
+        return None
+    explicit = explicit_plink_kind(raw)
+    if explicit is not None:
+        return explicit
+    resolved = detect_existing_plink_kind(raw)
+    return resolved[0] if resolved is not None else None
+
+
+def _postgwas_selected_plink_input(args: argparse.Namespace) -> Optional[str]:
+    bfile = getattr(args, "bfile", None)
+    pfile = getattr(args, "pfile", None)
+    if bfile and pfile:
+        raise ValueError("Specify only one PLINK input: -bfile or -pfile.")
+    if pfile:
+        return canonical_plink_input_path(str(pfile), "pfile")
+    if bfile:
+        return canonical_plink_input_path(str(bfile), "bfile")
+    return None
 
 
 def _is_existing_bed_prefix(path_or_prefix: object) -> bool:
+    if _postgwas_plink_kind(path_or_prefix) != "bfile":
+        return False
     prefix = _normalize_plink_prefix(path_or_prefix)
     if prefix == "":
         return False
@@ -6602,6 +6618,8 @@ def _is_existing_bed_prefix(path_or_prefix: object) -> bool:
 
 
 def _is_existing_pgen_prefix(path_or_prefix: object) -> bool:
+    if _postgwas_plink_kind(path_or_prefix) != "pfile":
+        return False
     prefix = _normalize_plink_prefix(path_or_prefix)
     if prefix == "":
         return False
@@ -6803,9 +6821,8 @@ def _compute_ld_from_bed_rust(
         return np.zeros((0, 0), dtype=np.float32), []
 
     source = str(genofile).strip()
-    plink_prefix = _normalize_plink_prefix(source)
-    if not _is_existing_plink_prefix(plink_prefix):
-        plink_prefix = ""
+    plink_source = source if _is_existing_plink_prefix(source) else ""
+    if not plink_source:
         source_low = source.lower()
         delim = None
         if source_low.endswith(".csv") or os.path.isfile(f"{source}.csv"):
@@ -6818,13 +6835,13 @@ def _compute_ld_from_bed_rust(
                 prefer_plink_for_txt=True,
                 threads=int(threads),
             )
-            cached_prefix = _normalize_plink_prefix(cached)
-            if _is_existing_plink_prefix(cached_prefix):
-                plink_prefix = cached_prefix
-                if logger is not None and cached_prefix != source:
+            cached_source = str(cached)
+            if _is_existing_plink_prefix(cached_source):
+                plink_source = cached_source
+                if logger is not None and cached_source != source:
                     logger.info(
                         "LD backend: using cached PLINK prefix for Rust path: "
-                        f"{format_path_for_display(cached_prefix)}"
+                        f"{format_path_for_display(cached_source)}"
                     )
         except Exception as ex:
             if logger is not None:
@@ -6832,9 +6849,9 @@ def _compute_ld_from_bed_rust(
                     "Warning: failed to materialize PLINK cache for LD backend; "
                     f"falling back to generic path. Reason: {ex}"
                 )
-            plink_prefix = ""
+            plink_source = ""
 
-    if _is_existing_bed_prefix(plink_prefix) and hasattr(
+    if plink_source and _is_existing_bed_prefix(plink_source) and hasattr(
         jxrs, "bed_ldblock_r2_rust"
     ):
         chrom_ranges = [str(x[0]) for x in bimrange_tuples]
@@ -6851,7 +6868,7 @@ def _compute_ld_from_bed_rust(
             kwargs["selected_pos"] = [int(x[1]) for x in sel]
 
         ld_raw, chr_raw, pos_raw = jxrs.bed_ldblock_r2_rust(
-            str(plink_prefix),
+            str(plink_source),
             chrom_ranges,
             start_bp,
             end_bp,
@@ -6870,7 +6887,7 @@ def _compute_ld_from_bed_rust(
             )
         return ld_mat, ld_keys
 
-    if logger is not None and _is_existing_pgen_prefix(plink_prefix):
+    if logger is not None and plink_source and _is_existing_pgen_prefix(plink_source):
         logger.info(
             "LD backend: reading PGEN input through the native genotype reader."
         )
@@ -14898,7 +14915,7 @@ def main(argv: Optional[list[str]] = None):
         help="Genotype PLINK 1 BED/BIM/FAM prefix (for fine-mapping, LD block, or LD clump).",
     )
     geno_group.add_argument(
-        "-pfile", "--pfile", dest="bfile", type=str, default=None,
+        "-pfile", "--pfile", type=str, default=None,
         metavar="PFILE",
         help="Genotype PLINK 2 PGEN/PVAR/PSAM prefix (for fine-mapping, LD block, or LD clump).",
     )
@@ -15134,6 +15151,10 @@ def main(argv: Optional[list[str]] = None):
     )
 
     args = parser.parse_args(argv)
+    try:
+        args.plink_input = _postgwas_selected_plink_input(args)
+    except ValueError as exc:
+        parser.error(str(exc))
     detected_threads = detect_effective_threads()
     requested_threads = int(args.thread)
     thread_capped = False
@@ -15520,7 +15541,7 @@ def main(argv: Optional[list[str]] = None):
         args.ldblock_xspan = None
         args.ldblock_mode = None
 
-    args.genofile = args.bfile or args.vcf or args.hmp or args.geno
+    args.genofile = args.plink_input or args.vcf or args.hmp or args.geno
     _validate_postgwas_finemap_args(args, parser)
     if args.ldblock_ratio is not None and args.genofile is None:
         logger.warning(
@@ -15969,8 +15990,8 @@ def main(argv: Optional[list[str]] = None):
         and len(check_gwas_files) == 1
         and _postgwas_finemap_result_model(check_gwas_files[0]) is not None
     )
-    if args.bfile and not mixed_model_finemap:
-        checks.append(ensure_plink_prefix_exists(logger, args.bfile, "Genotype PLINK prefix"))
+    if args.plink_input and not mixed_model_finemap:
+        checks.append(ensure_plink_prefix_exists(logger, args.plink_input, "Genotype PLINK prefix"))
     if not ensure_all_true(checks):
         raise SystemExit(1)
 

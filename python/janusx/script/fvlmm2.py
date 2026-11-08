@@ -907,6 +907,7 @@ def main(argv: list[str] | None = None) -> int:
         hmp=getattr(args, "hmp", None),
         file=getattr(args, "file", None),
         bfile=getattr(args, "bfile", None),
+        pfile=getattr(args, "pfile", None),
         prefix=None,
         apply_cache=False,
     )
@@ -929,7 +930,7 @@ def main(argv: list[str] | None = None) -> int:
         checks.append(
             ensure_file_input_site_metadata_exists(logger, raw_gfile, "Genotype FILE site metadata")
         )
-    elif args.bfile:
+    elif args.bfile or args.pfile:
         checks.append(ensure_plink_prefix_exists(logger, raw_gfile, "Genotype PLINK prefix"))
     if args.grm:
         checks.append(ensure_file_exists(logger, str(args.grm), "GRM"))
@@ -941,6 +942,7 @@ def main(argv: list[str] | None = None) -> int:
         hmp=getattr(args, "hmp", None),
         file=getattr(args, "file", None),
         bfile=getattr(args, "bfile", None),
+        pfile=getattr(args, "pfile", None),
         prefix=prefix,
         snps_only=bool(args.snps_only),
         threads=int(args.thread),

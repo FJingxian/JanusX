@@ -733,14 +733,13 @@ def _resolve_input(args, logger) -> tuple[str, str, str]:
     elif args.file:
         checks.append(ensure_file_input_exists(logger, gfile, label="FILE genotype input"))
         source_label = "FILE"
-    elif args.bfile:
-        bprefix = gfile
-        if str(gfile).lower().endswith(".bed"):
-            bprefix = str(Path(gfile).with_suffix(""))
-        checks.append(ensure_plink_prefix_exists(logger, bprefix, label="PLINK prefix"))
-        gfile = bprefix
+    elif args.bfile or args.pfile:
+        source_path = gfile
+        bprefix = str(Path(gfile).with_suffix("")) if str(gfile).lower().endswith((".bed", ".pgen")) else gfile
+        checks.append(ensure_plink_prefix_exists(logger, source_path, label="PLINK prefix"))
+        gfile = source_path
         auto_prefix = os.path.basename(bprefix.rstrip("/\\"))
-        source_label = "BFILE"
+        source_label = "PFILE" if args.pfile else "BFILE"
     else:
         raise ValueError("One genotype input is required: -vcf / -hmp / -file / -bfile.")
 

@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional, Sequence
 import os
 import numpy as np
+from janusx._plink import detect_existing_plink_kind
 
 
 def _normalize_path_text(path: str) -> str:
@@ -12,19 +13,8 @@ def _normalize_path_text(path: str) -> str:
 
 
 def _as_plink_prefix(path_or_prefix: str) -> Optional[str]:
-    p = _normalize_path_text(path_or_prefix)
-    if p == "":
-        return None
-    low = p.lower()
-    for suffix in (".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"):
-        if low.endswith(suffix):
-            p = p[: -len(suffix)]
-            break
-    if os.path.isfile(f"{p}.bed"):
-        complete = all(os.path.isfile(f"{p}.{ext}") for ext in ("bed", "bim", "fam"))
-    else:
-        complete = all(os.path.isfile(f"{p}.{ext}") for ext in ("pgen", "pvar", "psam"))
-    return p if complete else None
+    resolved = detect_existing_plink_kind(_normalize_path_text(path_or_prefix))
+    return resolved[1] if resolved is not None else None
 
 
 def _detect_genotype_cli_flag(path_or_prefix: str) -> tuple[str, str]:
@@ -34,11 +24,10 @@ def _detect_genotype_cli_flag(path_or_prefix: str) -> tuple[str, str]:
         return "-vcf", src
     if low.endswith(".hmp") or low.endswith(".hmp.gz"):
         return "-hmp", src
-    prefix = _as_plink_prefix(src)
-    if prefix is not None:
-        if os.path.isfile(f"{prefix}.pgen") and not os.path.isfile(f"{prefix}.bed"):
-            return "-pfile", prefix
-        return "-bfile", prefix
+    resolved = detect_existing_plink_kind(src)
+    if resolved is not None:
+        kind, prefix = resolved
+        return ("-pfile" if kind == "pfile" else "-bfile"), prefix
     return "-file", src
 
 

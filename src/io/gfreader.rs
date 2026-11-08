@@ -4717,6 +4717,8 @@ pub fn load_bed_2bit_packed<'py>(
     Bound<'py, PyArray1<f32>>,
     usize,
 )> {
+    let _input_kind_override =
+        crate::pgen::scoped_input_kind_override(&prefix).map_err(PyRuntimeError::new_err)?;
     let mut bed_prefix = prefix;
     let lower = bed_prefix.to_ascii_lowercase();
     if lower.ends_with(".bed") || lower.ends_with(".bim") || lower.ends_with(".fam") {
@@ -9072,6 +9074,8 @@ pub fn prepare_bed_2bit_packed<'py>(
     usize,
     usize,
 )> {
+    let _input_kind_override =
+        crate::pgen::scoped_input_kind_override(&prefix).map_err(PyRuntimeError::new_err)?;
     if !(0.0..=0.5).contains(&maf_threshold) {
         return Err(PyValueError::new_err(
             "maf_threshold must be within [0, 0.5]",
@@ -9164,6 +9168,8 @@ pub fn prepare_bed_logic_meta_selected<'py>(
     usize,
     usize,
 )> {
+    let _input_kind_override =
+        crate::pgen::scoped_input_kind_override(&prefix).map_err(PyRuntimeError::new_err)?;
     if !(0.0..=0.5).contains(&maf_threshold) {
         return Err(PyValueError::new_err(
             "maf_threshold must be within [0, 0.5]",
@@ -9292,6 +9298,8 @@ pub fn prepare_bed_fused_qc_packed<'py>(
     usize,
     usize,
 )> {
+    let _input_kind_override =
+        crate::pgen::scoped_input_kind_override(&prefix).map_err(PyRuntimeError::new_err)?;
     if !(0.0..=0.5).contains(&maf_threshold) {
         return Err(PyValueError::new_err(
             "maf_threshold must be within [0, 0.5]",
@@ -9414,6 +9422,8 @@ pub fn prepare_bed_logic_keep_mask<'py>(
     threads: usize,
 ) -> PyResult<(Bound<'py, PyArray1<bool>>, usize, usize)> {
     arm_interrupt_trap();
+    let _input_kind_override =
+        crate::pgen::scoped_input_kind_override(&prefix).map_err(PyRuntimeError::new_err)?;
     if !(0.0..=0.5).contains(&maf_threshold) {
         return Err(PyValueError::new_err(
             "maf_threshold must be within [0, 0.5]",
@@ -9514,6 +9524,8 @@ pub fn prepare_bed_logic_keep_mask_pure_line<'py>(
     mmap_window_mb: Option<usize>,
     threads: usize,
 ) -> PyResult<(Bound<'py, PyArray1<bool>>, usize, usize)> {
+    let _input_kind_override =
+        crate::pgen::scoped_input_kind_override(&prefix).map_err(PyRuntimeError::new_err)?;
     if !(0.0..=0.5).contains(&maf_threshold) {
         return Err(PyValueError::new_err(
             "maf_threshold must be within [0, 0.5]",
@@ -9635,6 +9647,8 @@ impl BedChunkReaderFromMeta {
         sample_indices: Option<Vec<usize>>,
         mmap_window_mb: Option<usize>,
     ) -> PyResult<Self> {
+        let _input_kind_override = crate::pgen::scoped_input_kind_override(&prefix)
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
         let norm_prefix = normalize_plink_prefix_local(&prefix);
         let samples = core::read_fam(&norm_prefix)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
@@ -10826,6 +10840,8 @@ pub fn load_site_info(
     path_or_prefix: String,
     delimiter: Option<String>,
 ) -> PyResult<Vec<SiteInfo>> {
+    let _input_kind_override = crate::pgen::scoped_input_kind_override(&path_or_prefix)
+        .map_err(PyRuntimeError::new_err)?;
     let p = path_or_prefix.trim().to_string();
     if p.is_empty() {
         return Err(PyValueError::new_err("path_or_prefix must not be empty"));
@@ -10847,6 +10863,8 @@ pub fn load_bim_columns<'py>(
     path_or_prefix: String,
     row_indices: Option<PyReadonlyArray1<'py, i64>>,
 ) -> PyResult<(Vec<String>, Vec<i64>, Vec<String>, Vec<String>, Vec<String>)> {
+    let _input_kind_override = crate::pgen::scoped_input_kind_override(&path_or_prefix)
+        .map_err(PyRuntimeError::new_err)?;
     let p = path_or_prefix.trim().to_string();
     if p.is_empty() {
         return Err(PyValueError::new_err("path_or_prefix must not be empty"));

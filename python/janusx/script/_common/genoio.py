@@ -11,6 +11,12 @@ from typing import Any, Callable, Iterable, Iterator, Sequence
 
 import numpy as np
 import pandas as pd
+from janusx._plink import (
+    canonical_plink_input_path,
+    detect_existing_plink_kind,
+    explicit_plink_kind,
+    normalize_plink_prefix as _normalize_plink_prefix,
+)
 
 from janusx.gfreader import (
     SiteInfo,
@@ -113,7 +119,10 @@ def strip_default_prefix_suffix(name: str) -> str:
     elif low.endswith(".hmp.gz"):
         base = base[: -len(".hmp.gz")]
     else:
-        for ext in (".vcf", ".hmp", ".txt", ".tsv", ".csv", ".npy", ".bin"):
+        for ext in (
+            ".vcf", ".hmp", ".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam",
+            ".txt", ".tsv", ".csv", ".npy", ".bin",
+        ):
             if low.endswith(ext):
                 base = base[: -len(ext)]
                 break
@@ -128,6 +137,7 @@ def determine_genotype_source(
     hmp: str | None,
     file: str | None,
     bfile: str | None,
+    pfile: str | None = None,
     kfile: str | None = None,
     prefix: str | None = None,
     snps_only: bool = False,
@@ -135,6 +145,8 @@ def determine_genotype_source(
     apply_cache: bool = False,
     threads: int = 0,
 ) -> tuple[str, str]:
+    if bfile and pfile:
+        raise ValueError("Specify only one PLINK source: bfile or pfile.")
     if kfile:
         gfile = str(kfile)
         low_kfile = gfile.lower()
@@ -151,12 +163,15 @@ def determine_genotype_source(
     elif file:
         gfile = str(file)
         auto_prefix = strip_default_prefix_suffix(gfile)
+    elif pfile:
+        gfile = canonical_plink_input_path(str(pfile), "pfile")
+        auto_prefix = os.path.basename(_normalize_plink_prefix(gfile).rstrip("/\\"))
     elif bfile:
-        gfile = str(bfile)
-        auto_prefix = os.path.basename(gfile.rstrip("/\\"))
+        gfile = canonical_plink_input_path(str(bfile), "bfile")
+        auto_prefix = os.path.basename(_normalize_plink_prefix(gfile).rstrip("/\\"))
     else:
         raise ValueError(
-            "No genotype input specified. Use -vcf, -hmp, -file, -bfile or -kfile."
+            "No genotype input specified. Use -vcf, -hmp, -file, -bfile, -pfile or -kfile."
         )
 
     gfile_norm = gfile.replace("\\", "/")
@@ -169,6 +184,7 @@ def determine_genotype_source(
             hmp=hmp,
             file=file,
             bfile=bfile,
+            pfile=pfile,
             kfile=kfile,
         )
         gfile_norm = prepare_cli_input_cache(
@@ -190,6 +206,7 @@ def determine_genotype_source_force_kind(
     hmp: str | None,
     file: str | None,
     bfile: str | None,
+    pfile: str | None = None,
     kfile: str | None = None,
 ) -> str | None:
     if kfile:
@@ -200,8 +217,10 @@ def determine_genotype_source_force_kind(
         return "hmp"
     if file:
         return "file"
+    if pfile:
+        return "pfile"
     if bfile:
-        return "plink"
+        return "bfile"
     return None
 
 
@@ -211,6 +230,7 @@ def determine_genotype_source_force_kind_from_args(args: Any) -> str | None:
         hmp=getattr(args, "hmp", None),
         file=getattr(args, "file", None),
         bfile=getattr(args, "bfile", None),
+        pfile=getattr(args, "pfile", None),
         kfile=getattr(args, "kfile", None),
     )
 
@@ -221,6 +241,7 @@ def determine_genotype_source_from_args(args: Any) -> tuple[str, str]:
         hmp=getattr(args, "hmp", None),
         file=getattr(args, "file", None),
         bfile=getattr(args, "bfile", None),
+        pfile=getattr(args, "pfile", None),
         kfile=getattr(args, "kfile", None),
         prefix=getattr(args, "prefix", None),
         snps_only=bool(getattr(args, "snps_only", False)),
@@ -376,16 +397,15 @@ def packed_no_snps_after_filter_message() -> str:
 
 
 def normalize_plink_prefix(path_or_prefix: str) -> str:
-    p = str(path_or_prefix).strip()
-    low = p.lower()
-    for suffix in (".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"):
-        if low.endswith(suffix):
-            return p[: -len(suffix)]
-    return p
+    return _normalize_plink_prefix(path_or_prefix)
 
 
 def _is_pgen_prefix(prefix: str) -> bool:
-    return os.path.isfile(f"{prefix}.pgen") and not os.path.isfile(f"{prefix}.bed")
+    explicit_kind = explicit_plink_kind(prefix)
+    if explicit_kind is not None:
+        return explicit_kind == "pfile"
+    resolved = detect_existing_plink_kind(prefix)
+    return resolved is not None and resolved[0] == "pfile"
 
 
 def _is_simple_snp_allele(allele: str) -> bool:
@@ -395,8 +415,8 @@ def _is_simple_snp_allele(allele: str) -> bool:
 
 def plink_snp_mask(prefix: str) -> np.ndarray:
     mask: list[bool] = []
+    is_pgen = _is_pgen_prefix(prefix)
     plink_prefix = normalize_plink_prefix(prefix)
-    is_pgen = _is_pgen_prefix(plink_prefix)
     variant_path = f"{plink_prefix}.pvar" if is_pgen else f"{plink_prefix}.bim"
     columns: list[str] | None = None
     with open(variant_path, "r", encoding="utf-8", errors="ignore") as fh:
@@ -432,9 +452,12 @@ def open_plink_bed_payload_memmap(
     n_samples: int,
     n_snps: int,
 ) -> np.ndarray:
+    is_pgen = _is_pgen_prefix(prefix)
     plink_prefix = normalize_plink_prefix(prefix)
-    if _is_pgen_prefix(plink_prefix):
-        packed, _missing, _maf, _std, packed_n = load_bed_2bit_packed(plink_prefix)
+    if is_pgen:
+        packed, _missing, _maf, _std, packed_n = load_bed_2bit_packed(
+            canonical_plink_input_path(plink_prefix, "pfile")
+        )
         payload = np.ascontiguousarray(np.asarray(packed, dtype=np.uint8))
         expected_shape = (int(n_snps), (int(n_samples) + 3) // 4)
         if int(packed_n) != int(n_samples) or payload.shape != expected_shape:
@@ -487,9 +510,12 @@ def load_plink_bed_payload_owned(
     n_samples: int,
     n_snps: int,
 ) -> np.ndarray:
+    is_pgen = _is_pgen_prefix(prefix)
     plink_prefix = normalize_plink_prefix(prefix)
-    if _is_pgen_prefix(plink_prefix):
-        packed, _missing, _maf, _std, packed_n = load_bed_2bit_packed(plink_prefix)
+    if is_pgen:
+        packed, _missing, _maf, _std, packed_n = load_bed_2bit_packed(
+            canonical_plink_input_path(plink_prefix, "pfile")
+        )
         payload = np.ascontiguousarray(np.asarray(packed, dtype=np.uint8))
         expected_shape = (int(n_snps), (int(n_samples) + 3) // 4)
         if int(packed_n) != int(n_samples) or payload.shape != expected_shape:
@@ -544,13 +570,17 @@ def _scan_bed_2bit_packed_stats_fallback(
     Stream packed BED row statistics from a memmap when the Rust-side scan
     helper is unavailable in the installed extension.
     """
+    is_pgen = _is_pgen_prefix(prefix)
     plink_prefix = normalize_plink_prefix(prefix)
-    _sample_ids_check, n_snps = inspect_genotype_file(str(plink_prefix))
+    source_path = canonical_plink_input_path(
+        plink_prefix, "pfile" if is_pgen else "bfile"
+    )
+    _sample_ids_check, n_snps = inspect_genotype_file(source_path)
     n_samples = int(n_expected_samples)
     if n_samples <= 0:
         raise ValueError("Packed BED stats fallback requires n_samples > 0.")
     packed_memmap = open_plink_bed_payload_memmap(
-        str(plink_prefix),
+        source_path,
         n_samples=n_samples,
         n_snps=int(n_snps),
     )
@@ -734,9 +764,13 @@ def packed_meta_cache_prefix(
     logger: Any = None,
     warning_collector: list[str] | None = None,
 ) -> str:
+    is_pgen = _is_pgen_prefix(prefix)
     plink_prefix = normalize_plink_prefix(prefix)
+    source_path = canonical_plink_input_path(
+        plink_prefix, "pfile" if is_pgen else "bfile"
+    )
     base = _shared_genotype_cache_prefix(
-        plink_prefix,
+        source_path,
         snps_only=bool(snps_only),
         cache_dir=cache_dir,
         logger=logger,
@@ -933,17 +967,21 @@ def _build_packed_meta_layer(
     snps_only: bool,
     layer: str,
 ) -> dict[str, Any]:
+    is_pgen = _is_pgen_prefix(prefix)
     plink_prefix = normalize_plink_prefix(prefix)
+    source_path = canonical_plink_input_path(
+        plink_prefix, "pfile" if is_pgen else "bfile"
+    )
     n_expected = int(sample_ids_arr.shape[0])
     want_std = str(layer).strip().lower() == "std"
 
     if scan_bed_2bit_packed_stats is not None:
         miss_raw, maf_raw, std_raw, row_flip_raw, het_raw, packed_n = scan_bed_2bit_packed_stats(
-            str(plink_prefix)
+            source_path
         )
     else:
         miss_raw, maf_raw, std_raw, row_flip_raw, het_raw, packed_n = _scan_bed_2bit_packed_stats_fallback(
-            str(plink_prefix),
+            source_path,
             n_expected_samples=int(n_expected),
         )
     if int(packed_n) != n_expected:
@@ -981,7 +1019,7 @@ def _build_packed_meta_layer(
     if het_thr > 0.0:
         keep &= het_arr <= het_thr
     if bool(snps_only):
-        snp_mask = plink_snp_mask(str(plink_prefix))
+        snp_mask = plink_snp_mask(source_path)
         if snp_mask.shape[0] != keep.shape[0]:
             raise ValueError(
                 f"BIM SNP mask length mismatch: got {snp_mask.shape[0]}, expected {keep.shape[0]}"
@@ -990,7 +1028,7 @@ def _build_packed_meta_layer(
     if not np.any(keep):
         raise ValueError(packed_no_snps_after_filter_message())
     return _build_packed_meta_context(
-        source_prefix=str(plink_prefix),
+        source_prefix=source_path,
         n_samples=int(packed_n),
         row_missing=miss_arr,
         row_maf=row_maf,
@@ -1013,19 +1051,23 @@ def _load_or_build_packed_meta_layer(
     logger: Any = None,
     warning_collector: list[str] | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
+    is_pgen = _is_pgen_prefix(prefix)
     plink_prefix = normalize_plink_prefix(prefix)
-    sample_ids, _ = inspect_genotype_file(str(plink_prefix))
+    source_path = canonical_plink_input_path(
+        plink_prefix, "pfile" if is_pgen else "bfile"
+    )
+    sample_ids, _ = inspect_genotype_file(source_path)
     sample_ids_arr = np.asarray(sample_ids, dtype=str)
     if expected_n_samples is not None and int(expected_n_samples) != int(sample_ids_arr.shape[0]):
         raise ValueError(
             packed_expected_sample_size_mismatch_message(
                 expected_n=int(expected_n_samples),
                 got_n=int(sample_ids_arr.shape[0]),
-                source_prefix=str(plink_prefix),
+                source_prefix=source_path,
             )
         )
     cache_prefix = packed_meta_cache_prefix(
-        str(plink_prefix),
+        source_path,
         maf=float(maf),
         missing_rate=float(missing_rate),
         het_threshold=float(het_threshold),
@@ -1037,7 +1079,7 @@ def _load_or_build_packed_meta_layer(
     cached = _load_cached_packed_meta(
         cache_prefix=str(cache_prefix),
         layer=str(layer),
-        source_prefix=str(plink_prefix),
+        source_prefix=source_path,
         expected_n_samples=int(sample_ids_arr.shape[0]),
     )
     if cached is not None:
@@ -1046,13 +1088,13 @@ def _load_or_build_packed_meta_layer(
         cached = _load_cached_packed_meta(
             cache_prefix=str(cache_prefix),
             layer=str(layer),
-            source_prefix=str(plink_prefix),
+            source_prefix=source_path,
             expected_n_samples=int(sample_ids_arr.shape[0]),
         )
         if cached is not None:
             return sample_ids_arr, cached
         built = _build_packed_meta_layer(
-            str(plink_prefix),
+            source_path,
             sample_ids_arr=sample_ids_arr,
             maf=float(maf),
             missing_rate=float(missing_rate),
@@ -1063,7 +1105,7 @@ def _load_or_build_packed_meta_layer(
         _save_packed_meta_cache(
             cache_prefix=str(cache_prefix),
             layer=str(layer),
-            source_prefix=str(plink_prefix),
+            source_prefix=source_path,
             ctx=built,
         )
         return sample_ids_arr, built
@@ -1112,21 +1154,25 @@ def build_packed_meta_basic_uncached(
     This avoids the `.pmeta.*` cache files and is intended for workflows that
     prefer a fresh precompute per run.
     """
+    is_pgen = _is_pgen_prefix(prefix)
     plink_prefix = normalize_plink_prefix(prefix)
-    sample_ids, _ = inspect_genotype_file(str(plink_prefix))
+    source_path = canonical_plink_input_path(
+        plink_prefix, "pfile" if is_pgen else "bfile"
+    )
+    sample_ids, _ = inspect_genotype_file(source_path)
     sample_ids_arr = np.asarray(sample_ids, dtype=str)
     if expected_n_samples is not None and int(expected_n_samples) != int(sample_ids_arr.shape[0]):
         raise ValueError(
             packed_expected_sample_size_mismatch_message(
                 expected_n=int(expected_n_samples),
                 got_n=int(sample_ids_arr.shape[0]),
-                source_prefix=str(plink_prefix),
+                source_prefix=source_path,
             )
         )
 
     try:
         row_idx, miss, maf_arr, row_flip, site_keep, packed_n, n_total_sites = prepare_bed_logic_meta_selected(
-            str(plink_prefix),
+            source_path,
             sample_indices=None,
             maf_threshold=float(maf),
             max_missing_rate=float(missing_rate),
@@ -1205,11 +1251,11 @@ def build_packed_meta_basic_uncached(
             "n_active_sites": n_active,
             "packed_filter_mode": "stats_only",
             "packed_storage": "metadata",
-            "source_prefix": str(plink_prefix),
+            "source_prefix": source_path,
         }
     except Exception:
         built = _build_packed_meta_layer(
-            str(plink_prefix),
+            source_path,
             sample_ids_arr=sample_ids_arr,
             maf=float(maf),
             missing_rate=float(missing_rate),
@@ -1267,8 +1313,12 @@ def prepare_packed_ctx_from_plink(
     entirely in memory and avoid writing `.pmeta.*` sidecar files.
     """
     filter_mode_key = normalize_packed_filter_mode(filter_mode)
+    is_pgen = _is_pgen_prefix(prefix)
     plink_prefix = normalize_plink_prefix(prefix)
-    sample_ids, _ = inspect_genotype_file(str(plink_prefix))
+    source_path = canonical_plink_input_path(
+        plink_prefix, "pfile" if is_pgen else "bfile"
+    )
+    sample_ids, _ = inspect_genotype_file(source_path)
     sample_ids_arr = np.asarray(sample_ids, dtype=str)
     attempt_errors: list[tuple[str, Exception]] = []
 
@@ -1277,7 +1327,7 @@ def prepare_packed_ctx_from_plink(
             packed_expected_sample_size_mismatch_message(
                 expected_n=int(expected_n_samples),
                 got_n=int(sample_ids_arr.shape[0]),
-                source_prefix=str(plink_prefix),
+                source_prefix=source_path,
             )
         )
 
@@ -1293,7 +1343,7 @@ def prepare_packed_ctx_from_plink(
                 packed_n,
                 total_sites,
             ) = prepare_bed_2bit_packed(
-                str(plink_prefix),
+                source_path,
                 maf_threshold=float(maf),
                 max_missing_rate=float(missing_rate),
                 het_threshold=float(het_threshold),
@@ -1343,7 +1393,7 @@ def prepare_packed_ctx_from_plink(
                 ),
                 "packed_filter_mode": "compact",
                 "packed_storage": "owned",
-                "source_prefix": str(plink_prefix),
+                "source_prefix": source_path,
             }
             return sample_ids_arr, packed_ctx
         except Exception as ex:
@@ -1352,7 +1402,7 @@ def prepare_packed_ctx_from_plink(
     try:
         if bool(use_cache):
             _sample_ids_meta, meta_ctx = load_or_build_packed_meta_std(
-                str(plink_prefix),
+                source_path,
                 maf=float(maf),
                 missing_rate=float(missing_rate),
                 het_threshold=float(het_threshold),
@@ -1361,7 +1411,7 @@ def prepare_packed_ctx_from_plink(
             )
         else:
             meta_ctx = _build_packed_meta_layer(
-                str(plink_prefix),
+                source_path,
                 sample_ids_arr=sample_ids_arr,
                 maf=float(maf),
                 missing_rate=float(missing_rate),
@@ -1394,14 +1444,14 @@ def prepare_packed_ctx_from_plink(
         packed_memmap: np.ndarray | None = None
         if filter_mode_key != "lazy_owned":
             packed_memmap = open_plink_bed_payload_memmap(
-                str(plink_prefix),
+                source_path,
                 n_samples=int(meta_ctx["n_samples"]),
                 n_snps=int(meta_ctx["n_total_sites"]),
             )
         if use_lazy:
             if filter_mode_key == "lazy_owned":
                 packed_payload = load_plink_bed_payload_owned(
-                    str(plink_prefix),
+                    source_path,
                     n_samples=int(meta_ctx["n_samples"]),
                     n_snps=int(meta_ctx["n_total_sites"]),
                 )
@@ -1420,14 +1470,14 @@ def prepare_packed_ctx_from_plink(
 
         if packed_memmap is None:
             packed_memmap = open_plink_bed_payload_memmap(
-                str(plink_prefix),
+                source_path,
                 n_samples=int(meta_ctx["n_samples"]),
                 n_snps=int(meta_ctx["n_total_sites"]),
             )
         if bool(np.all(site_keep)):
             if isinstance(packed_memmap, np.memmap):
                 packed = load_plink_bed_payload_owned(
-                    str(plink_prefix),
+                    source_path,
                     n_samples=int(meta_ctx["n_samples"]),
                     n_snps=int(meta_ctx["n_total_sites"]),
                 )
@@ -1489,7 +1539,7 @@ def prepare_packed_stats_ctx_from_plink(
     """
     if bool(use_cache):
         return load_or_build_packed_meta_basic(
-            str(normalize_plink_prefix(prefix)),
+            str(prefix),
             maf=float(maf),
             missing_rate=float(missing_rate),
             het_threshold=float(het_threshold),
@@ -1497,7 +1547,7 @@ def prepare_packed_stats_ctx_from_plink(
             expected_n_samples=expected_n_samples,
         )
     return build_packed_meta_basic_uncached(
-        str(normalize_plink_prefix(prefix)),
+        str(prefix),
         maf=float(maf),
         missing_rate=float(missing_rate),
         het_threshold=float(het_threshold),

@@ -4492,7 +4492,7 @@ struct GarfieldBeamDebugProbe {
     out_tsv: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct GarfieldLogicPipelineResult {
     pseudo_prefix: Option<String>,
     rules_tsv: Option<String>,
@@ -19305,8 +19305,42 @@ impl Max6WindowStreamChunk {
     }
 }
 
+#[inline]
+fn max6_window_site_in_pack_scope(
+    site: &SiteInfo,
+    scan_bimranges: &[GarfieldScanBimRange],
+    padding_bp: i64,
+) -> bool {
+    scan_bimranges.is_empty()
+        || scan_bimranges.iter().any(|range| {
+            if !same_normalized_chrom(site.chrom.as_str(), range.chrom.as_str()) {
+                return false;
+            }
+            let start = i64::from(range.bp_start).saturating_sub(padding_bp).max(0);
+            let end = i64::from(range.bp_end)
+                .saturating_add(padding_bp)
+                .min(i64::from(i32::MAX));
+            (i64::from(site.pos) >= start) && (i64::from(site.pos) <= end)
+        })
+}
+
+fn max6_window_stream_scope_finish_bp(
+    chrom: &str,
+    scan_bimranges: &[GarfieldScanBimRange],
+    padding_bp: i64,
+) -> Option<i32> {
+    let max_end = scan_bimranges
+        .iter()
+        .filter(|range| same_normalized_chrom(chrom, range.chrom.as_str()))
+        .map(|range| i64::from(range.bp_end).saturating_add(padding_bp))
+        .max()?;
+    Some(clamp_i64_to_i32(max_end.saturating_add(1)))
+}
+
 /// Sequential BIM/PVAR metadata reader that decodes genotypes only for the
-/// chromosomes selected by `--bimrange`. An empty range list means all rows.
+/// chromosomes selected by `--bimrange`. The fused window path can also seek
+/// over selected chromosomes and decode only rows inside window scope plus the
+/// first QC-passing row needed to anchor the chromosome's window grid.
 struct Max6WindowRangeSource {
     bed: BedSnpIter,
     bim: BimChunkReader,
@@ -19317,12 +19351,25 @@ struct Max6WindowRangeSource {
     last_chrom: Option<String>,
     pending: VecDeque<(usize, SiteInfo)>,
     scan_all: bool,
+    scan_bimranges: Vec<GarfieldScanBimRange>,
+    pack_scope_padding_bp: i64,
+    restrict_genotypes_to_scope: bool,
+    anchor_ready_chroms: Arc<Mutex<HashSet<String>>>,
+    tail_scope_complete_chroms: Arc<Mutex<HashSet<String>>>,
+    last_chrom_max_pos: Option<i32>,
     done: bool,
     validated_full_metadata: bool,
 }
 
 impl Max6WindowRangeSource {
-    fn new(prefix: &str, ranges: &[GarfieldScanBimRange]) -> Result<Self, String> {
+    fn new(
+        prefix: &str,
+        ranges: &[GarfieldScanBimRange],
+        extension: usize,
+        restrict_genotypes_to_scope: bool,
+        anchor_ready_chroms: Arc<Mutex<HashSet<String>>>,
+        tail_scope_complete_chroms: Arc<Mutex<HashSet<String>>>,
+    ) -> Result<Self, String> {
         let bed =
             BedSnpIter::new_for_grm_window_header_count(prefix, garfield_logic_mmap_window_mb())?;
         let n_source_rows = bed.n_snps();
@@ -19344,14 +19391,47 @@ impl Max6WindowRangeSource {
             last_chrom: None,
             pending: VecDeque::new(),
             scan_all,
+            scan_bimranges: ranges.to_vec(),
+            pack_scope_padding_bp: (extension.max(1) as i64).saturating_mul(2),
+            restrict_genotypes_to_scope: restrict_genotypes_to_scope && !ranges.is_empty(),
+            anchor_ready_chroms,
+            tail_scope_complete_chroms,
+            last_chrom_max_pos: None,
             done: false,
             validated_full_metadata: false,
         })
     }
 
+    fn mark_chromosome_tail_scope_complete(
+        &mut self,
+        chrom: &str,
+        max_pos: i32,
+    ) -> Result<(), String> {
+        if !self.restrict_genotypes_to_scope
+            || max6_window_stream_scope_finish_bp(
+                chrom,
+                self.scan_bimranges.as_slice(),
+                self.pack_scope_padding_bp,
+            )
+            .is_none_or(|scope_end| scope_end <= max_pos)
+        {
+            return Ok(());
+        }
+        self.tail_scope_complete_chroms
+            .lock()
+            .map_err(|_| "Max6 window range tail state was poisoned".to_string())?
+            .insert(normalize_chrom(chrom));
+        Ok(())
+    }
+
     fn read_metadata_chunk(&mut self) -> Result<(), String> {
         if self.next_metadata_row >= self.n_source_rows {
             if !self.validated_full_metadata {
+                if let (Some(chrom), Some(max_pos)) =
+                    (self.last_chrom.clone(), self.last_chrom_max_pos)
+                {
+                    self.mark_chromosome_tail_scope_complete(chrom.as_str(), max_pos)?;
+                }
                 self.bim.ensure_exhausted(self.n_source_rows)?;
                 self.validated_full_metadata = true;
             }
@@ -19371,14 +19451,30 @@ impl Max6WindowRangeSource {
             ));
         }
         self.next_metadata_row = end;
+        let anchor_ready_snapshot = if self.restrict_genotypes_to_scope {
+            self.anchor_ready_chroms
+                .lock()
+                .map_err(|_| "Max6 window range anchor state was poisoned".to_string())?
+                .clone()
+        } else {
+            HashSet::new()
+        };
         for (offset, site) in sites.into_iter().enumerate() {
             let source_row = start + offset;
             let chrom = chrom_base_view(site.chrom.as_str()).to_ascii_lowercase();
+            let changed = self
+                .last_chrom
+                .as_ref()
+                .is_some_and(|previous| previous != &chrom);
+            if changed {
+                if let (Some(previous), Some(max_pos)) =
+                    (self.last_chrom.clone(), self.last_chrom_max_pos)
+                {
+                    self.mark_chromosome_tail_scope_complete(previous.as_str(), max_pos)?;
+                }
+                self.last_chrom_max_pos = None;
+            }
             if !self.scan_all {
-                let changed = self
-                    .last_chrom
-                    .as_ref()
-                    .is_some_and(|previous| previous != &chrom);
                 if changed
                     && self.seen_selected_chroms.len() == self.selected_chroms.len()
                     && self
@@ -19394,13 +19490,31 @@ impl Max6WindowRangeSource {
             self.last_chrom = Some(chrom.clone());
             let selected = self.scan_all || self.selected_chroms.contains(&chrom);
             if selected {
+                self.last_chrom_max_pos = Some(
+                    self.last_chrom_max_pos
+                        .map_or(site.pos, |previous| previous.max(site.pos)),
+                );
                 if !self.scan_all {
-                    self.seen_selected_chroms.insert(chrom);
+                    self.seen_selected_chroms.insert(chrom.clone());
                 }
-                self.pending.push_back((source_row, site));
+                let in_scope = !self.restrict_genotypes_to_scope
+                    || max6_window_site_in_pack_scope(
+                        &site,
+                        self.scan_bimranges.as_slice(),
+                        self.pack_scope_padding_bp,
+                    );
+                let anchor_not_ready =
+                    self.restrict_genotypes_to_scope && !anchor_ready_snapshot.contains(&chrom);
+                if in_scope || anchor_not_ready {
+                    self.pending.push_back((source_row, site));
+                }
             }
         }
         if self.next_metadata_row >= self.n_source_rows && !self.done {
+            if let (Some(chrom), Some(max_pos)) = (self.last_chrom.clone(), self.last_chrom_max_pos)
+            {
+                self.mark_chromosome_tail_scope_complete(chrom.as_str(), max_pos)?;
+            }
             self.bim.ensure_exhausted(self.n_source_rows)?;
             self.validated_full_metadata = true;
             self.done = true;
@@ -20087,6 +20201,8 @@ struct Max6WindowStreamPrep {
 struct Max6StreamWindowRow {
     qc_index: usize,
     source_row: usize,
+    site: SiteInfo,
+    row_flip: bool,
     pos: i32,
     logic_words: Option<Vec<u64>>,
     support: Option<u32>,
@@ -20107,6 +20223,8 @@ struct Max6StreamWindowTask {
     original_unit_index: usize,
     unit: GarfieldLogicUnit,
     source_rows: Vec<usize>,
+    sites: Vec<SiteInfo>,
+    row_flip: Vec<bool>,
     logic_words: Vec<u64>,
     support: Vec<u32>,
     block_support: Vec<u16>,
@@ -20127,32 +20245,55 @@ struct Max6WindowStreamLdPrep {
     max_task_batch_bytes: usize,
 }
 
+struct Max6StreamWindowSelection {
+    metadata: Max6PreparedUnitMetadata,
+    unit: GarfieldLogicUnit,
+    candidate_source_rows: Vec<usize>,
+    candidate_sites: Vec<SiteInfo>,
+    selected_source_rows: Vec<usize>,
+    bits: GarfieldLogicBits,
+    prepared_local: Max6GrmMax6LdPreparedUnit,
+    prepared_source: Max6GrmMax6LdPreparedUnit,
+}
+
 fn select_max6_stream_window_task(
     task: Max6StreamWindowTask,
     sample_indices: &[usize],
     row_words: usize,
     n_samples: usize,
     ld_tag_r2: f64,
-) -> Result<(Max6PreparedUnitMetadata, Max6GrmMax6LdPreparedUnit), String> {
+) -> Result<Max6StreamWindowSelection, String> {
     let Max6StreamWindowTask {
         original_unit_index,
         unit,
         source_rows,
+        sites,
+        row_flip,
         mut logic_words,
         mut support,
         mut block_support,
     } = task;
     let n_rows = source_rows.len();
-    if logic_words.len() != n_rows.saturating_mul(row_words) {
+    if logic_words.len() != n_rows.saturating_mul(row_words)
+        || sites.len() != n_rows
+        || row_flip.len() != n_rows
+    {
         return Err(format!(
-            "streamed Max6 window '{}' has {} logic words for {} rows x {} words",
+            "streamed Max6 window '{}' has inconsistent genotype or metadata rows ({} words, {} source rows, {} sites, {} flips, {} words per row)",
             unit.label,
             logic_words.len(),
             n_rows,
-            row_words
+            sites.len(),
+            row_flip.len(),
+            row_words,
         ));
     }
-    let empty_text: Arc<str> = Arc::from("");
+    let candidate_sites = sites.clone();
+    let logic_sites = build_logic_sites_from_metadata_owned_direct(
+        sites,
+        row_flip.as_slice(),
+        GarfieldBinMode::Bin,
+    );
     let logic_bits = GarfieldLogicBits {
         bits_flat: std::mem::take(&mut logic_words),
         bits_mmap: None,
@@ -20161,18 +20302,7 @@ fn select_max6_stream_window_task(
         bits_hi_flat: None,
         row_words,
         sample_ids: Vec::new(),
-        sites: (0..n_rows)
-            .map(|_| {
-                GarfieldLogicSite::owned(
-                    empty_text.clone(),
-                    0,
-                    empty_text.clone(),
-                    empty_text.clone(),
-                    empty_text.clone(),
-                    GarfieldLogicSiteMode::Bin,
-                )
-            })
-            .collect(),
+        sites: logic_sites,
         group_ids: build_logic_mode_group_ids(n_rows, GarfieldBinMode::Bin),
         n_samples,
     };
@@ -20217,12 +20347,13 @@ fn select_max6_stream_window_task(
             .copied()
             .ok_or_else(|| format!("streamed Max6 LD row {row} is outside its window"))
     };
-    let prepared = Max6GrmMax6LdPreparedUnit {
-        selected_global_rows: selected
-            .selected_global_rows
-            .iter()
-            .map(|&row| map_row(row))
-            .collect::<Result<Vec<_>, _>>()?,
+    let selected_local_rows = selected.selected_global_rows;
+    let selected_source_rows = selected_local_rows
+        .iter()
+        .map(|&row| map_row(row))
+        .collect::<Result<Vec<_>, _>>()?;
+    let prepared_source = Max6GrmMax6LdPreparedUnit {
+        selected_global_rows: selected_source_rows.clone(),
         pair_groups: None,
         ld_compression: selected
             .ld_compression
@@ -20236,14 +20367,31 @@ fn select_max6_stream_window_task(
             })
             .collect::<Result<Vec<_>, String>>()?,
     };
-    Ok((
-        Max6PreparedUnitMetadata {
-            original_unit_index,
-            label: unit.label,
-            spans: unit.spans,
-        },
-        prepared,
-    ))
+    let prepared_local = Max6GrmMax6LdPreparedUnit {
+        selected_global_rows: selected_local_rows,
+        pair_groups: None,
+        ld_compression: Vec::new(),
+    };
+    let metadata = Max6PreparedUnitMetadata {
+        original_unit_index,
+        label: unit.label.clone(),
+        spans: unit.spans.clone(),
+    };
+    let local_unit = GarfieldLogicUnit {
+        label: unit.label,
+        indices: (0..n_rows).collect(),
+        spans: unit.spans,
+    };
+    Ok(Max6StreamWindowSelection {
+        metadata,
+        unit: local_unit,
+        candidate_source_rows: source_rows,
+        candidate_sites,
+        selected_source_rows,
+        bits: logic_bits,
+        prepared_local,
+        prepared_source,
+    })
 }
 
 fn process_max6_stream_window_batch(
@@ -20259,9 +20407,9 @@ fn process_max6_stream_window_batch(
     active_source_rows: &mut Vec<usize>,
     window_pair_count: &mut usize,
     any_eligible_unit: &mut bool,
-) -> Result<(), String> {
+) -> Result<Vec<Max6StreamWindowSelection>, String> {
     if tasks.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let batch = std::mem::take(tasks);
     let results = if let Some(pool) = pool {
@@ -20293,21 +20441,21 @@ fn process_max6_stream_window_batch(
             })
             .collect::<Result<Vec<_>, String>>()?
     };
-    for (metadata, prepared) in results {
-        *any_eligible_unit |= prepared.selected_global_rows.len() >= 2;
+    for selection in results.iter() {
+        *any_eligible_unit |= selection.selected_source_rows.len() >= 2;
         *window_pair_count = window_pair_count.saturating_add(
-            prepared
-                .selected_global_rows
+            selection
+                .selected_source_rows
                 .len()
-                .saturating_mul(prepared.selected_global_rows.len().saturating_sub(1))
+                .saturating_mul(selection.selected_source_rows.len().saturating_sub(1))
                 / 2,
         );
-        active_source_rows.extend(prepared.selected_global_rows.iter().copied());
-        original_unit_indices.push(metadata.original_unit_index);
-        units.push(metadata);
-        screen_units.push(prepared);
+        active_source_rows.extend(selection.selected_source_rows.iter().copied());
+        original_unit_indices.push(selection.metadata.original_unit_index);
+        units.push(selection.metadata.clone());
+        screen_units.push(selection.prepared_source.clone());
     }
-    Ok(())
+    Ok(results)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -20377,6 +20525,8 @@ fn emit_max6_stream_windows(
                         ));
                     }
                     let mut source_rows = Vec::with_capacity(rows.len());
+                    let mut sites = Vec::with_capacity(rows.len());
+                    let mut row_flip = Vec::with_capacity(rows.len());
                     let mut logic_words = Vec::with_capacity(rows.len().saturating_mul(row_words));
                     let mut support = Vec::with_capacity(rows.len());
                     let block_count = row_words.div_ceil(garfield_ld_block_words());
@@ -20396,6 +20546,8 @@ fn emit_max6_stream_windows(
                             ));
                         }
                         source_rows.push(row.source_row);
+                        sites.push(row.site.clone());
+                        row_flip.push(row.row_flip);
                         logic_words.extend_from_slice(words);
                         if let Some(row_support) = row.support {
                             support.push(row_support);
@@ -20419,6 +20571,8 @@ fn emit_max6_stream_windows(
                         original_unit_index: *next_original_unit_index,
                         unit,
                         source_rows,
+                        sites,
+                        row_flip,
                         logic_words,
                         support,
                         block_support,
@@ -20459,6 +20613,53 @@ fn emit_max6_stream_windows(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn finish_max6_stream_chromosome(
+    state: &mut Max6StreamWindowState,
+    restrict_genotypes_to_scope: bool,
+    tail_scope_complete: bool,
+    scan_bimranges: &[GarfieldScanBimRange],
+    extension: usize,
+    step: usize,
+    next_original_unit_index: &mut usize,
+    distinct_window_count: &mut usize,
+    selected_window_count: &mut usize,
+    tasks: &mut Vec<Max6StreamWindowTask>,
+    task_batch_bytes: &mut usize,
+    max_task_batch_bytes: &mut usize,
+) -> Result<(), String> {
+    let (max_bp, at_chromosome_end) = if !restrict_genotypes_to_scope || tail_scope_complete {
+        (state.last_bp, true)
+    } else if let Some(scope_end) = max6_window_stream_scope_finish_bp(
+        state.chrom.as_str(),
+        scan_bimranges,
+        (extension.max(1) as i64).saturating_mul(2),
+    ) {
+        (scope_end, false)
+    } else {
+        (state.last_bp, true)
+    };
+    emit_max6_stream_windows(
+        state,
+        max_bp,
+        at_chromosome_end,
+        extension,
+        step,
+        scan_bimranges,
+        next_original_unit_index,
+        distinct_window_count,
+        selected_window_count,
+        tasks,
+        task_batch_bytes,
+        max_task_batch_bytes,
+    )?;
+    if !at_chromosome_end {
+        state.done = true;
+        state.rows.clear();
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn prepare_max6_window_streamed_ld(
     prefix: &str,
     sample_ids: &[String],
@@ -20473,6 +20674,46 @@ fn prepare_max6_window_streamed_ld(
     threads: usize,
     ld_tag_r2: f64,
     mem_tracker: Option<&GarfieldStageMemoryTracker>,
+) -> Result<Max6WindowStreamLdPrep, String> {
+    prepare_max6_window_streamed_ld_with_callback(
+        prefix,
+        sample_ids,
+        sample_indices,
+        extension,
+        step,
+        scan_bimranges,
+        maf_threshold,
+        max_missing_rate,
+        het_threshold,
+        snps_only,
+        threads,
+        ld_tag_r2,
+        mem_tracker,
+        false,
+        None,
+    )
+}
+
+type Max6WindowFusedBatchCallback<'a> =
+    dyn FnMut(&[Max6StreamWindowSelection], Option<&rayon::ThreadPool>) -> Result<(), String> + 'a;
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_max6_window_streamed_ld_with_callback(
+    prefix: &str,
+    sample_ids: &[String],
+    sample_indices: &[usize],
+    extension: usize,
+    step: Option<usize>,
+    scan_bimranges: &[GarfieldScanBimRange],
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
+    threads: usize,
+    ld_tag_r2: f64,
+    mem_tracker: Option<&GarfieldStageMemoryTracker>,
+    restrict_to_bimrange_scope: bool,
+    mut on_batch: Option<&mut Max6WindowFusedBatchCallback<'_>>,
 ) -> Result<Max6WindowStreamLdPrep, String> {
     if !(0.0..=0.5).contains(&maf_threshold) {
         return Err("maf_threshold must be within [0, 0.5]".to_string());
@@ -20492,7 +20733,20 @@ fn prepare_max6_window_streamed_ld(
     }
     validate_max6_ld_tag_r2(ld_tag_r2)?;
 
-    let mut source = Max6WindowRangeSource::new(prefix, scan_bimranges)?;
+    let restrict_genotypes_to_scope =
+        restrict_to_bimrange_scope && on_batch.is_some() && !scan_bimranges.is_empty();
+    let anchor_ready_chroms = Arc::new(Mutex::new(HashSet::<String>::new()));
+    let tail_scope_complete_chroms = Arc::new(Mutex::new(HashSet::<String>::new()));
+    let anchor_ready_for_consumer = Arc::clone(&anchor_ready_chroms);
+    let tail_scope_complete_for_consumer = Arc::clone(&tail_scope_complete_chroms);
+    let mut source = Max6WindowRangeSource::new(
+        prefix,
+        scan_bimranges,
+        extension,
+        restrict_genotypes_to_scope,
+        anchor_ready_chroms,
+        tail_scope_complete_chroms,
+    )?;
     let source_marker_count = source.n_source_rows;
     let n_samples_total = source.bed.n_samples();
     if sample_indices.iter().any(|&index| index >= n_samples_total) {
@@ -20511,7 +20765,11 @@ fn prepare_max6_window_streamed_ld(
         None
     };
 
-    let mut global_site_keep = vec![false; source_marker_count];
+    let mut global_site_keep = if on_batch.is_some() {
+        Vec::new()
+    } else {
+        vec![false; source_marker_count]
+    };
     let mut fail_missing = 0usize;
     let mut fail_het = 0usize;
     let mut fail_no_non_missing = 0usize;
@@ -20525,28 +20783,18 @@ fn prepare_max6_window_streamed_ld(
     let mut max_active_rows = 0usize;
     let mut max_task_batch_bytes = 0usize;
     let extension_bp = (extension.max(1) as i64).saturating_mul(2);
-    let in_pack_scope = |site: &SiteInfo| {
-        scan_bimranges.is_empty()
-            || scan_bimranges.iter().any(|range| {
-                if !same_normalized_chrom(site.chrom.as_str(), range.chrom.as_str()) {
-                    return false;
-                }
-                let start = i64::from(range.bp_start)
-                    .saturating_sub(extension_bp)
-                    .max(0);
-                let end = i64::from(range.bp_end)
-                    .saturating_add(extension_bp)
-                    .min(i64::from(i32::MAX));
-                (i64::from(site.pos) >= start) && (i64::from(site.pos) <= end)
-            })
-    };
+    let in_pack_scope =
+        |site: &SiteInfo| max6_window_site_in_pack_scope(site, scan_bimranges, extension_bp);
     let extension_eff = extension.max(1);
     let step_eff = step.unwrap_or((extension_eff / 2).max(1)).max(1);
     let worker_count = pool
         .as_ref()
         .map_or(1, |pool| pool.current_num_threads())
         .max(1);
-    let task_batch_limit = worker_count.saturating_mul(2).max(1);
+    // Keep enough adjacent windows together for the Max6 batch scanner to
+    // merge overlapping pair work. The independent byte cap below remains the
+    // memory bound when dense windows exceed this count-based target.
+    let task_batch_limit = worker_count.saturating_mul(8).max(1);
     let task_batch_byte_limit = 64usize * 1024 * 1024;
     let support_cache_required = ld_tag_r2 < 1.0;
     let support_block_words = garfield_ld_block_words();
@@ -20564,6 +20812,7 @@ fn prepare_max6_window_streamed_ld(
     let mut next_qc_index = 0usize;
     let mut window_state: Option<Max6StreamWindowState> = None;
     let mut seen_qc_chromosomes = HashSet::<String>::new();
+    let mut anchor_ready_marked = HashSet::<String>::new();
     let mut chrom_pool = HashMap::<String, Arc<str>>::new();
     let mut unsupported_order = false;
 
@@ -20635,8 +20884,22 @@ fn prepare_max6_window_streamed_ld(
                 let qc = chunk.qc[offset];
                 let source_row = chunk.source_rows[offset];
                 if qc.keep {
-                    global_site_keep[source_row] = true;
+                    if !global_site_keep.is_empty() {
+                        global_site_keep[source_row] = true;
+                    }
                     let site = &chunk.sites[offset];
+                    if restrict_genotypes_to_scope {
+                        let anchor_chrom =
+                            chrom_base_view(site.chrom.as_str()).to_ascii_lowercase();
+                        if anchor_ready_marked.insert(anchor_chrom.clone()) {
+                            anchor_ready_for_consumer
+                                .lock()
+                                .map_err(|_| {
+                                    "Max6 window range anchor state was poisoned".to_string()
+                                })?
+                                .insert(anchor_chrom);
+                        }
+                    }
                     let chrom_key = normalize_chrom(site.chrom.as_str());
                     let chrom = chrom_pool
                         .entry(chrom_key.clone())
@@ -20668,6 +20931,8 @@ fn prepare_max6_window_streamed_ld(
                     let row = Max6StreamWindowRow {
                         qc_index: next_qc_index,
                         source_row,
+                        site: site.clone(),
+                        row_flip: qc.row_flip,
                         pos: site.pos,
                         logic_words,
                         support,
@@ -20689,13 +20954,19 @@ fn prepare_max6_window_streamed_ld(
                                 unsupported_order = true;
                                 return Err(MAX6_WINDOW_STREAM_UNSUPPORTED_ORDER.to_string());
                             }
-                            emit_max6_stream_windows(
+                            let tail_scope_complete = tail_scope_complete_for_consumer
+                                .lock()
+                                .map_err(|_| {
+                                    "Max6 window range tail state was poisoned".to_string()
+                                })?
+                                .contains(state.chrom.as_str());
+                            finish_max6_stream_chromosome(
                                 state,
-                                state.last_bp,
-                                true,
+                                restrict_genotypes_to_scope,
+                                tail_scope_complete,
+                                scan_bimranges,
                                 extension_eff,
                                 step_eff,
-                                scan_bimranges,
                                 &mut next_original_unit_index,
                                 &mut distinct_window_count,
                                 &mut selected_window_count,
@@ -20760,7 +21031,7 @@ fn prepare_max6_window_streamed_ld(
                     let should_flush = tasks.len() >= task_batch_limit
                         || task_batch_bytes >= task_batch_byte_limit;
                     if should_flush {
-                        process_max6_stream_window_batch(
+                        let selections = process_max6_stream_window_batch(
                             &mut tasks,
                             train_indices.as_slice(),
                             row_words,
@@ -20774,6 +21045,9 @@ fn prepare_max6_window_streamed_ld(
                             &mut window_pair_count,
                             &mut any_eligible_unit,
                         )?;
+                        if let Some(callback) = on_batch.as_deref_mut() {
+                            callback(&selections, pool.as_deref())?;
+                        }
                         task_batch_bytes = 0;
                     }
                 } else {
@@ -20808,13 +21082,17 @@ fn prepare_max6_window_streamed_ld(
     })?;
 
     if let Some(state) = window_state.as_mut() {
-        emit_max6_stream_windows(
+        let tail_scope_complete = tail_scope_complete_for_consumer
+            .lock()
+            .map_err(|_| "Max6 window range tail state was poisoned".to_string())?
+            .contains(state.chrom.as_str());
+        finish_max6_stream_chromosome(
             state,
-            state.last_bp,
-            true,
+            restrict_genotypes_to_scope,
+            tail_scope_complete,
+            scan_bimranges,
             extension_eff,
             step_eff,
-            scan_bimranges,
             &mut next_original_unit_index,
             &mut distinct_window_count,
             &mut selected_window_count,
@@ -20823,7 +21101,7 @@ fn prepare_max6_window_streamed_ld(
             &mut max_task_batch_bytes,
         )?;
     }
-    process_max6_stream_window_batch(
+    let selections = process_max6_stream_window_batch(
         &mut tasks,
         train_indices.as_slice(),
         row_words,
@@ -20837,6 +21115,9 @@ fn prepare_max6_window_streamed_ld(
         &mut window_pair_count,
         &mut any_eligible_unit,
     )?;
+    if let Some(callback) = on_batch.as_deref_mut() {
+        callback(&selections, pool.as_deref())?;
+    }
 
     if qc_row_count == 0 {
         if !scan_bimranges.is_empty() && source.seen_selected_chroms.is_empty() {
@@ -20894,6 +21175,834 @@ fn prepare_max6_window_streamed_ld(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn run_max6_window_fused_grm_int_scan(
+    prefix: &str,
+    sample_ids: &[String],
+    sample_indices: &[usize],
+    extension: usize,
+    step: Option<usize>,
+    scan_bimranges: &[GarfieldScanBimRange],
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
+    threads: usize,
+    ld_tag_r2: f64,
+    y: &[f64],
+    train_fit: Arc<GarfieldResidualResult>,
+    p_c: Option<&[f64]>,
+    no_grm_projector: Option<&NoGrmCovariateProjector>,
+    train_idx_local: &[usize],
+    test_idx_local: &[usize],
+    response: ResponseKind,
+    engine: Option<MlEngine>,
+    importance: ImportanceKind,
+    perm_cfg: PermutationConfig,
+    ml_top_k: usize,
+    ml_top_frac: f64,
+    tree_cfg: ExtraTreesConfig,
+    beam_params: &BeamSearchParams,
+    final_top_k: usize,
+    min_cell: usize,
+    min_cell_fraction: f64,
+    seed: u64,
+    out_prefix: Option<&str>,
+    progress_callback: Option<&Py<PyAny>>,
+    write_provenance: bool,
+) -> Result<GarfieldLogicPipelineResult, String> {
+    let total_wall_t0 = Instant::now();
+    let n_samples = sample_ids.len();
+    if n_samples == 0 || n_samples != sample_indices.len() || y.len() != n_samples {
+        return Err(format!(
+            "fused Max6 window scan sample lengths disagree: ids={}, indices={}, y={}",
+            n_samples,
+            sample_indices.len(),
+            y.len()
+        ));
+    }
+    let min_cell = min_cell::resolve_min_cell(min_cell, min_cell_fraction, n_samples)?;
+    let score_scale = if train_fit.no_grm_boundary {
+        if !(train_fit.sigma_e2.is_finite() && train_fit.sigma_e2 > 0.0) {
+            return Err(format!(
+                "Max6 -> GRM-INT no-GRM boundary requires positive finite sigma_e2, got {}",
+                train_fit.sigma_e2
+            ));
+        }
+        1.0 / train_fit.sigma_e2
+    } else {
+        if !(train_fit.sigma_g2.is_finite() && train_fit.sigma_g2 > 0.0) {
+            return Err(format!(
+                "Max6 -> GRM-INT requires positive finite sigma_g2, got {}",
+                train_fit.sigma_g2
+            ));
+        }
+        1.0 / train_fit.sigma_g2
+    };
+    let projected_y = if let Some(p_c) = p_c {
+        validate_grm_int_dense_projection(n_samples, p_c)?;
+        project_phenotype_for_candidate_rerank(p_c, n_samples, y)
+    } else if let Some(projector) = no_grm_projector {
+        if projector.n_samples() != n_samples {
+            return Err(format!(
+                "fused Max6 no-GRM projector sample count {} != {n_samples}",
+                projector.n_samples()
+            ));
+        }
+        projector.project(y)?
+    } else {
+        return Err("fused Max6 scan requires P_C or a no-GRM projector".to_string());
+    };
+    let scaled_total_quadratic = score_scale
+        * y.iter()
+            .zip(projected_y.iter())
+            .map(|(&value, &projected)| value * projected)
+            .sum::<f64>();
+    if !score_scale.is_finite()
+        || score_scale <= 0.0
+        || !scaled_total_quadratic.is_finite()
+        || scaled_total_quadratic <= 0.0
+    {
+        return Err(format!(
+            "fused Max6 score scale/quadratic is invalid: scale={score_scale}, quadratic={scaled_total_quadratic}"
+        ));
+    }
+    let shared_y_lookup = PackedYSumLookup::build(train_fit.residualized_y.as_slice(), n_samples)?;
+    let scan_started = Instant::now();
+
+    let internal_spool_path = out_prefix.map(|_| {
+        std::env::temp_dir().join(format!(
+            "janusx_garfield_fused_pairs_{}_{}.tsv",
+            std::process::id(),
+            GARFIELD_BITS_MMAP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ))
+    });
+    let _spool_owner = internal_spool_path
+        .as_ref()
+        .map(|path| Max6BitsTempFileOwner { path: path.clone() });
+    let internal_spool_writer = if let Some(path) = internal_spool_path.as_ref() {
+        Some(crate::stats_common::AsyncTsvWriter::with_config(
+            path.to_string_lossy().as_ref(),
+            b"source_row1\tsource_row2\tchrom1\tpos1\tchrom2\tpos2\tmax6_rank\tmax6_score\tbest_channel\t4cell\tmincell\tgrm_int_chisq\tpwald\n",
+            8 * 1024 * 1024,
+            2,
+        )?)
+    } else {
+        None
+    };
+    let pair_path = out_prefix.map(max6_grmmax6_pairs_output_path);
+    let provenance_path = if let Some(prefix) = out_prefix {
+        if write_provenance {
+            Some(max6_grm_int_provenance_output_path(prefix))
+        } else {
+            remove_stale_max6_grm_int_provenance(prefix, false)?;
+            None
+        }
+    } else {
+        None
+    };
+    let provenance_writer = if let Some(path) = provenance_path.as_ref() {
+        Some(crate::stats_common::AsyncTsvWriter::with_config(
+            path,
+            b"output_row_index\tunit_index_zero_based\tunit_label\n",
+            8 * 1024 * 1024,
+            2,
+        )?)
+    } else {
+        None
+    };
+
+    let mut output_count = 0usize;
+    let mut output_row_index = 0usize;
+    let mut screen_candidate_count = 0usize;
+    let mut final_screen_subset_audit_pairs_checked = 0usize;
+    let mut observed_scan_timing = Max6ObservedScanTiming::default();
+    let mut active_site_metadata = HashMap::<usize, SiteInfo>::new();
+    let mut skipped_messages = Vec::<String>::new();
+    let shared_grm_int_score_pairs = parse_env_usize("JX_GARFIELD_GRM_INT_SCORE_PAIRS")
+        .unwrap_or(if cfg!(windows) { 32 } else { 64 });
+    let mut on_batch = |selections: &[Max6StreamWindowSelection],
+                        pool: Option<&rayon::ThreadPool>|
+     -> Result<(), String> {
+        if selections.is_empty() {
+            return Ok(());
+        }
+        let _blas_guard = (selections.len() > 1).then(|| BlasThreadGuard::enter(1));
+        let batch_scan_started = Instant::now();
+        let row_words = selections[0].bits.row_words;
+        if selections
+            .iter()
+            .any(|selection| selection.bits.row_words != row_words)
+        {
+            return Err("fused Max6 window batch has inconsistent row widths".to_string());
+        }
+
+        // Keep only LD-selected rows for the current bounded window batch.
+        // Sorting by source row gives every unit a sorted compact membership
+        // list, while repeated markers across overlapping windows share one
+        // packed row and one GRM-INT score.
+        let mut source_row_origin = HashMap::<usize, (usize, usize)>::new();
+        let mut unit_source_rows = Vec::<Vec<usize>>::with_capacity(selections.len());
+        for (selection_index, selection) in selections.iter().enumerate() {
+            let mut rows = Vec::with_capacity(selection.prepared_local.selected_global_rows.len());
+            for &local_row in selection.prepared_local.selected_global_rows.iter() {
+                let source_row = *selection.candidate_source_rows.get(local_row).ok_or_else(|| {
+                    format!(
+                        "fused Max6 selected row {local_row} is outside candidate metadata for '{}'",
+                        selection.unit.label
+                    )
+                })?;
+                source_row_origin
+                    .entry(source_row)
+                    .or_insert((selection_index, local_row));
+                rows.push(source_row);
+            }
+            unit_source_rows.push(rows);
+        }
+        let mut batch_source_rows = source_row_origin.keys().copied().collect::<Vec<_>>();
+        batch_source_rows.sort_unstable();
+        let source_to_batch = batch_source_rows
+            .iter()
+            .enumerate()
+            .map(|(index, &source_row)| (source_row, index))
+            .collect::<HashMap<_, _>>();
+        let mut batch_bits =
+            Vec::<u64>::with_capacity(batch_source_rows.len().saturating_mul(row_words));
+        for &source_row in batch_source_rows.iter() {
+            let (selection_index, local_row) = *source_row_origin
+                .get(&source_row)
+                .ok_or_else(|| format!("fused Max6 source row {source_row} lost its packed row"))?;
+            let selection = &selections[selection_index];
+            let start = local_row.saturating_mul(row_words);
+            let end = start.saturating_add(row_words);
+            let row = selection.bits.bits().get(start..end).ok_or_else(|| {
+                format!(
+                    "fused Max6 packed row {local_row} is outside window '{}'",
+                    selection.unit.label
+                )
+            })?;
+            batch_bits.extend_from_slice(row);
+        }
+        let unit_selected_rows = unit_source_rows
+            .iter()
+            .map(|source_rows| {
+                source_rows
+                    .iter()
+                    .map(|source_row| {
+                        source_to_batch.get(source_row).copied().ok_or_else(|| {
+                            format!("fused Max6 source row {source_row} has no batch index")
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let scan_unit_indices = unit_selected_rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, rows)| (rows.len() >= 2).then_some(index))
+            .collect::<Vec<_>>();
+        let mut scans = (0..selections.len())
+            .map(|index| {
+                if unit_selected_rows[index].len() >= 2 {
+                    None
+                } else {
+                    Some(Max6GrmMax6UnitScan {
+                        outputs: Vec::new(),
+                        permutation_pool: None,
+                        deferred_screen: None,
+                        screen_pairs_passed: 0,
+                        final_screen_subset_audit_pairs_checked: 0,
+                        candidate_pair_keys: Vec::new(),
+                        candidate_score_observations: Vec::new(),
+                        window_unique_candidate_endpoints: 0,
+                        timing: Max6ObservedUnitTiming::default(),
+                        skipped_message: Some(format!(
+                            "unit '{}' has fewer than two SNPs after Max6 marker selection",
+                            selections[index].unit.label
+                        )),
+                    })
+                }
+            })
+            .collect::<Vec<_>>();
+
+        if !scan_unit_indices.is_empty() {
+            let batch_units = scan_unit_indices
+                .iter()
+                .map(|&index| logic_residual_screen::ResidualScreenBatchUnit {
+                    selected_global_rows: unit_selected_rows[index].as_slice(),
+                    pair_groups: None,
+                })
+                .collect::<Vec<_>>();
+            let all_batch_rows = (0..batch_source_rows.len()).collect::<Vec<_>>();
+            let batch_margins = OneCellMarginTable::build_for_rows(
+                batch_bits.as_slice(),
+                row_words,
+                all_batch_rows.as_slice(),
+                train_fit.residualized_y.as_slice(),
+                n_samples,
+                &shared_y_lookup,
+            )?;
+            let screen_started = Instant::now();
+            let batch_screen = logic_residual_screen::scan_residual_pairs_packed_max6_batch(
+                batch_bits.as_slice(),
+                row_words,
+                batch_units.as_slice(),
+                train_fit.residualized_y.as_slice(),
+                n_samples,
+                max6_grmmax6_screen_top_k(true, final_top_k),
+                min_cell,
+                &shared_y_lookup,
+                &batch_margins,
+                true,
+            )?;
+            let screen_kernel_seconds = screen_started.elapsed().as_secs_f64();
+            let batch_timing = batch_screen.timing;
+            observed_scan_timing.screen_batch_count =
+                observed_scan_timing.screen_batch_count.saturating_add(1);
+            observed_scan_timing.screen_batch_prepare_wall_seconds += screen_started
+                .duration_since(batch_scan_started)
+                .as_secs_f64();
+            observed_scan_timing.screen_membership_prepare_wall_seconds +=
+                batch_timing.prepare_wall_seconds;
+            observed_scan_timing.screen_pair_scan_merge_wall_seconds +=
+                batch_timing.scan_merge_wall_seconds;
+            observed_scan_timing.screen_heap_merge_task_seconds += batch_timing.merge_task_seconds;
+            observed_scan_timing.screen_finalist_wall_seconds += batch_timing.finalize_wall_seconds;
+            observed_scan_timing.screen_parallel_batches = observed_scan_timing
+                .screen_parallel_batches
+                .saturating_add(usize::from(batch_timing.parallel));
+            observed_scan_timing.screen_serial_batches = observed_scan_timing
+                .screen_serial_batches
+                .saturating_add(usize::from(!batch_timing.parallel));
+            observed_scan_timing.screen_source_rows_sum = observed_scan_timing
+                .screen_source_rows_sum
+                .saturating_add(batch_timing.source_rows);
+            observed_scan_timing.screen_source_rows_max = observed_scan_timing
+                .screen_source_rows_max
+                .max(batch_timing.source_rows);
+            observed_scan_timing.screen_memberships_sum = observed_scan_timing
+                .screen_memberships_sum
+                .saturating_add(batch_timing.memberships);
+            if batch_screen.used_direct_fallback {
+                observed_scan_timing.screen_batch_direct_fallbacks = observed_scan_timing
+                    .screen_batch_direct_fallbacks
+                    .saturating_add(1);
+            } else {
+                observed_scan_timing.screen_batch_pairs_scored_unique = observed_scan_timing
+                    .screen_batch_pairs_scored_unique
+                    .saturating_add(batch_screen.pairs_scored_unique);
+                observed_scan_timing.screen_batch_score_offers = observed_scan_timing
+                    .screen_batch_score_offers
+                    .saturating_add(batch_screen.score_offers);
+            }
+            if batch_screen.units.len() != scan_unit_indices.len() {
+                return Err(format!(
+                    "fused Max6 batch scanner returned {} unit screens for {} requested units",
+                    batch_screen.units.len(),
+                    scan_unit_indices.len()
+                ));
+            }
+
+            let selected_rows_by_unit = scan_unit_indices
+                .iter()
+                .map(|&index| unit_selected_rows[index].as_slice())
+                .collect::<Vec<_>>();
+            let local_pairs_by_unit = batch_screen
+                .units
+                .iter()
+                .map(|screen| {
+                    screen
+                        .candidates
+                        .iter()
+                        .map(|candidate| (candidate.first, candidate.second))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let pair_plan = max6_shared_candidate_pair_plan(
+                selected_rows_by_unit.as_slice(),
+                local_pairs_by_unit.as_slice(),
+            )?;
+            let grm_int_started = Instant::now();
+            let shared_grm_int_by_unit = if pair_plan.global_pairs.is_empty() {
+                vec![None; scan_unit_indices.len()]
+            } else {
+                let score_chunk = |candidate_pairs: &[(usize, usize)]| {
+                    grm_max6::grm_int_interaction_scores_packed(
+                        batch_bits.as_slice(),
+                        row_words,
+                        n_samples,
+                        batch_source_rows.len(),
+                        candidate_pairs,
+                        p_c,
+                        no_grm_projector,
+                        projected_y.as_slice(),
+                        score_scale,
+                    )
+                };
+                let scored_chunks = if let Some(pool) = pool {
+                    pool.install(|| {
+                        pair_plan
+                            .global_pairs
+                            .par_chunks(shared_grm_int_score_pairs.max(1))
+                            .map(score_chunk)
+                            .collect::<Result<Vec<_>, String>>()
+                    })?
+                } else {
+                    pair_plan
+                        .global_pairs
+                        .chunks(shared_grm_int_score_pairs.max(1))
+                        .map(score_chunk)
+                        .collect::<Result<Vec<_>, String>>()?
+                };
+                let mut unique_chisq = Vec::with_capacity(pair_plan.global_pairs.len());
+                let mut unique_invalid = Vec::with_capacity(pair_plan.global_pairs.len());
+                let mut shared_diagnostics = grm_max6::GrmIntScoreDiagnostics::default();
+                for batch in scored_chunks {
+                    if batch.chisq.len() != batch.invalid.len() {
+                        return Err(
+                            "fused Max6 shared scores/statuses have different lengths".to_string()
+                        );
+                    }
+                    unique_chisq.extend(batch.chisq);
+                    unique_invalid.extend(batch.invalid);
+                    shared_diagnostics.batches = shared_diagnostics
+                        .batches
+                        .saturating_add(batch.diagnostics.batches);
+                    shared_diagnostics.max_workspace_bytes = shared_diagnostics
+                        .max_workspace_bytes
+                        .max(batch.diagnostics.max_workspace_bytes);
+                    shared_diagnostics.elapsed_seconds += batch.diagnostics.elapsed_seconds;
+                }
+                if unique_chisq.len() != pair_plan.global_pairs.len()
+                    || unique_invalid.len() != pair_plan.global_pairs.len()
+                {
+                    return Err(format!(
+                        "fused Max6 scorer returned {} scores / {} statuses for {} unique pairs",
+                        unique_chisq.len(),
+                        unique_invalid.len(),
+                        pair_plan.global_pairs.len()
+                    ));
+                }
+                let diagnostic_recipient =
+                    max6_shared_grm_int_diagnostic_recipient(&pair_plan.unit_pair_indices);
+                pair_plan
+                    .unit_pair_indices
+                    .iter()
+                    .enumerate()
+                    .map(|(unit_index, pair_indices)| {
+                        let mut chisq = Vec::with_capacity(pair_indices.len());
+                        let mut invalid = Vec::with_capacity(pair_indices.len());
+                        let mut diagnostics = grm_max6::GrmIntScoreDiagnostics::default();
+                        for &pair_index in pair_indices {
+                            chisq.push(*unique_chisq.get(pair_index).ok_or_else(|| {
+                                format!("fused Max6 pair score index {pair_index} is out of range")
+                            })?);
+                            let status = *unique_invalid.get(pair_index).ok_or_else(|| {
+                                format!("fused Max6 pair status index {pair_index} is out of range")
+                            })?;
+                            invalid.push(status);
+                            match status {
+                                Some(grm_max6::GrmIntInvalidScore::SingularEndpointDesign) => {
+                                    diagnostics.singular_endpoint_design =
+                                        diagnostics.singular_endpoint_design.saturating_add(1);
+                                }
+                                Some(
+                                    grm_max6::GrmIntInvalidScore::NegligibleInteractionInformation,
+                                ) => {
+                                    diagnostics.negligible_residual_interaction_information =
+                                        diagnostics
+                                            .negligible_residual_interaction_information
+                                            .saturating_add(1);
+                                }
+                                Some(grm_max6::GrmIntInvalidScore::Nonfinite) => {
+                                    diagnostics.nonfinite = diagnostics.nonfinite.saturating_add(1);
+                                }
+                                None => {}
+                            }
+                        }
+                        if diagnostic_recipient == Some(unit_index) {
+                            diagnostics.batches = shared_diagnostics.batches;
+                            diagnostics.max_workspace_bytes =
+                                shared_diagnostics.max_workspace_bytes;
+                            diagnostics.elapsed_seconds = shared_diagnostics.elapsed_seconds;
+                        }
+                        Ok(Some(grm_max6::GrmIntScoreBatch {
+                            chisq,
+                            invalid,
+                            diagnostics,
+                        }))
+                    })
+                    .collect::<Result<Vec<_>, String>>()?
+            };
+            observed_scan_timing.grm_int_batch_wall_seconds +=
+                grm_int_started.elapsed().as_secs_f64();
+
+            for (batch_index, &selection_index) in scan_unit_indices.iter().enumerate() {
+                let selection = &selections[selection_index];
+                let selected = selection.prepared_local.selected_global_rows.as_slice();
+                let margins = OneCellMarginTable::build_for_rows(
+                    selection.bits.bits(),
+                    selection.bits.row_words,
+                    selected,
+                    train_fit.residualized_y.as_slice(),
+                    n_samples,
+                    &shared_y_lookup,
+                )?;
+                let precomputed = Max6PrecomputedScreen {
+                    screen: batch_screen.units[batch_index].clone(),
+                    kernel_seconds: screen_kernel_seconds / scan_unit_indices.len().max(1) as f64,
+                    shared_grm_int: shared_grm_int_by_unit[batch_index].clone(),
+                };
+                let mut unit_beam_params = beam_params.clone();
+                unit_beam_params.allow_parallel &= pool.is_none();
+                let unit_result = scan_max6_grmmax6_unit(
+                    &selection.unit,
+                    selection.metadata.original_unit_index,
+                    "window",
+                    response,
+                    engine,
+                    importance,
+                    perm_cfg,
+                    ml_top_k,
+                    ml_top_frac,
+                    tree_cfg,
+                    &selection.bits,
+                    train_idx_local,
+                    test_idx_local,
+                    train_fit.residualized_y.as_slice(),
+                    &shared_y_lookup,
+                    &margins,
+                    p_c,
+                    no_grm_projector,
+                    projected_y.as_slice(),
+                    y,
+                    score_scale,
+                    scaled_total_quadratic,
+                    &unit_beam_params,
+                    final_top_k,
+                    min_cell,
+                    true,
+                    false,
+                    true,
+                    Some(&selection.prepared_local),
+                    None,
+                    false,
+                    false,
+                    None,
+                    false,
+                    Some(precomputed),
+                    None,
+                )?;
+                scans[selection_index] = Some(unit_result);
+            }
+        }
+        let scans = scans
+            .into_iter()
+            .map(|scan| scan.ok_or_else(|| "fused Max6 batch lost a scan result".to_string()))
+            .collect::<Result<Vec<_>, String>>()?;
+        if scans.len() != selections.len() {
+            return Err("fused Max6 window batch result count mismatch".to_string());
+        }
+        let _batch_elapsed = batch_scan_started.elapsed().as_secs_f64();
+        let mut pair_text = String::with_capacity(1024 * 1024);
+        let mut provenance_text = String::with_capacity(256 * 1024);
+        for (selection, unit_result) in selections.iter().zip(scans.into_iter()) {
+            observed_scan_timing.accumulate_unit(unit_result.timing);
+            screen_candidate_count =
+                screen_candidate_count.saturating_add(unit_result.screen_pairs_passed);
+            final_screen_subset_audit_pairs_checked = final_screen_subset_audit_pairs_checked
+                .saturating_add(unit_result.final_screen_subset_audit_pairs_checked);
+            if let Some(message) = unit_result.skipped_message {
+                skipped_messages.push(message);
+            }
+            for &local_row in selection.prepared_local.selected_global_rows.iter() {
+                let source_row = *selection.candidate_source_rows.get(local_row).ok_or_else(|| {
+                    format!(
+                        "fused Max6 selected row {local_row} is outside candidate metadata for '{}'",
+                        selection.unit.label
+                    )
+                })?;
+                let site = selection.candidate_sites.get(local_row).ok_or_else(|| {
+                    format!(
+                        "fused Max6 selected row {local_row} is outside candidate sites for '{}'",
+                        selection.unit.label
+                    )
+                })?;
+                active_site_metadata
+                    .entry(source_row)
+                    .or_insert_with(|| site.clone());
+            }
+            for record in unit_result.outputs.iter() {
+                output_count = output_count.saturating_add(1);
+                let first_source_row = *selection
+                    .candidate_source_rows
+                    .get(record.first_global_row)
+                    .ok_or_else(|| {
+                        format!(
+                            "fused Max6 first result row {} is outside window '{}'",
+                            record.first_global_row, selection.unit.label
+                        )
+                    })?;
+                let second_source_row = *selection
+                    .candidate_source_rows
+                    .get(record.second_global_row)
+                    .ok_or_else(|| {
+                        format!(
+                            "fused Max6 second result row {} is outside window '{}'",
+                            record.second_global_row, selection.unit.label
+                        )
+                    })?;
+                if internal_spool_writer.is_some() {
+                    let first_site = selection
+                        .bits
+                        .sites
+                        .get(record.first_global_row)
+                        .ok_or_else(|| {
+                            format!(
+                                "fused Max6 first site index out of range: {}",
+                                record.first_global_row
+                            )
+                        })?;
+                    let second_site = selection
+                        .bits
+                        .sites
+                        .get(record.second_global_row)
+                        .ok_or_else(|| {
+                            format!(
+                                "fused Max6 second site index out of range: {}",
+                                record.second_global_row
+                            )
+                        })?;
+                    let four_cell_counts = match record.four_cell_counts {
+                        Some(counts) => counts,
+                        None => max6_pair_four_cell_counts(
+                            &selection.bits,
+                            record.first_global_row,
+                            record.second_global_row,
+                            train_idx_local,
+                        )?,
+                    };
+                    let best_channel =
+                        max6_output_channel_label(record.best_channel, first_site, second_site);
+                    let four_cell =
+                        format_max6_four_cell_counts(four_cell_counts, first_site, second_site);
+                    let min_count = four_cell_counts.iter().min().copied().unwrap_or(0);
+                    use std::fmt::Write as _;
+                    writeln!(
+                        &mut pair_text,
+                        "{first_source_row}\t{second_source_row}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        first_site.chrom(),
+                        first_site.pos,
+                        second_site.chrom(),
+                        second_site.pos,
+                        record.candidate_rank,
+                        format_max6_score_value(record.max6),
+                        best_channel,
+                        four_cell,
+                        min_count,
+                        format_max6_score_value(record.dosage),
+                        format_max6_pvalue(max6_chi2_reference_pvalue(record.dosage)),
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+                if provenance_writer.is_some() {
+                    output_row_index = output_row_index.saturating_add(1);
+                    use std::fmt::Write as _;
+                    writeln!(
+                        &mut provenance_text,
+                        "{}\t{}\t{}",
+                        output_row_index, record.unit_index, selection.unit.label
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+            }
+        }
+        if let Some(writer) = internal_spool_writer.as_ref() {
+            writer.send_text(&mut pair_text)?;
+        }
+        if let Some(writer) = provenance_writer.as_ref() {
+            writer.send_text(&mut provenance_text)?;
+        }
+        Ok(())
+    };
+
+    garfield_stage_progress_notify(
+        progress_callback,
+        "garfield_window_fused_scan",
+        0,
+        1,
+        Some("streaming window QC, LD selection, pair scan, and output"),
+    )
+    .map_err(|error| error.to_string())?;
+    let stream = prepare_max6_window_streamed_ld_with_callback(
+        prefix,
+        sample_ids,
+        sample_indices,
+        extension,
+        step,
+        scan_bimranges,
+        maf_threshold,
+        max_missing_rate,
+        het_threshold,
+        snps_only,
+        threads,
+        ld_tag_r2,
+        None,
+        !write_provenance,
+        Some(&mut on_batch),
+    )?;
+    if let Some(writer) = internal_spool_writer {
+        writer.finish()?;
+    }
+    if let Some(writer) = provenance_writer {
+        writer.finish()?;
+    }
+
+    if let (Some(spool_path), Some(pair_path)) = (internal_spool_path.as_ref(), pair_path.as_ref())
+    {
+        let mut active_sites = Vec::with_capacity(stream.active_source_rows.len());
+        for &source_row in stream.active_source_rows.iter() {
+            active_sites.push(
+                active_site_metadata
+                    .get(&source_row)
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!(
+                            "fused Max6 stream lost site metadata for active source row {source_row}"
+                        )
+                    })?,
+            );
+        }
+        let inherited_names = garfield_sites_have_distinct_snp_names(active_sites.as_slice());
+        let site_names = stream
+            .active_source_rows
+            .iter()
+            .zip(active_sites.iter())
+            .map(|(&source_row, site)| {
+                let name = if inherited_names {
+                    site.snp.trim().to_string()
+                } else {
+                    format!("{}_{}", site.chrom, site.pos)
+                };
+                (source_row, name)
+            })
+            .collect::<HashMap<_, _>>();
+        let mut reader = BufReader::with_capacity(
+            4 * 1024 * 1024,
+            File::open(spool_path).map_err(|error| {
+                format!(
+                    "open fused Max6 pair spool '{}': {error}",
+                    spool_path.display()
+                )
+            })?,
+        );
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .map_err(|error| format!("read fused Max6 pair spool header: {error}"))?;
+        let mut header = MAX6_GRM_INT_PAIRS_HEADER.as_bytes().to_vec();
+        header.push(b'\n');
+        let final_writer = crate::stats_common::AsyncTsvWriter::with_config(
+            pair_path,
+            header.as_slice(),
+            8 * 1024 * 1024,
+            2,
+        )?;
+        let mut final_text = String::with_capacity(4 * 1024 * 1024);
+        line.clear();
+        loop {
+            let bytes = reader
+                .read_line(&mut line)
+                .map_err(|error| format!("read fused Max6 pair spool: {error}"))?;
+            if bytes == 0 {
+                break;
+            }
+            let row = line.trim_end_matches(['\r', '\n']);
+            let mut columns = row.splitn(3, '\t');
+            let first_source_row = columns
+                .next()
+                .ok_or_else(|| "fused Max6 pair spool lacks first source row".to_string())?
+                .parse::<usize>()
+                .map_err(|error| format!("invalid fused Max6 source row: {error}"))?;
+            let second_source_row = columns
+                .next()
+                .ok_or_else(|| "fused Max6 pair spool lacks second source row".to_string())?
+                .parse::<usize>()
+                .map_err(|error| format!("invalid fused Max6 source row: {error}"))?;
+            let rest = columns
+                .next()
+                .ok_or_else(|| "fused Max6 pair spool lacks output fields".to_string())?;
+            let first_name = site_names.get(&first_source_row).ok_or_else(|| {
+                format!("fused Max6 output references unknown source row {first_source_row}")
+            })?;
+            let second_name = site_names.get(&second_source_row).ok_or_else(|| {
+                format!("fused Max6 output references unknown source row {second_source_row}")
+            })?;
+            use std::fmt::Write as _;
+            writeln!(&mut final_text, "{first_name}\t{second_name}\t{rest}")
+                .map_err(|error| error.to_string())?;
+            line.clear();
+            if final_text.len() >= 1024 * 1024 {
+                final_writer.send_text(&mut final_text)?;
+            }
+        }
+        final_writer.send_text(&mut final_text)?;
+        final_writer.finish()?;
+    }
+
+    let pair_universe = Max6ScreenPairOwnership::build(
+        stream.screen_units.as_slice(),
+        stream.active_source_rows.as_slice(),
+        stream.source_marker_count,
+    )?;
+    let pair_universe_size = count_max6_pairs_by_membership(
+        stream.active_source_rows.as_slice(),
+        stream.window_pair_count,
+        &pair_universe,
+    )?;
+    let (bonferroni_q_cut, bonferroni_p_cut) = max6_bonferroni_cutoff(pair_universe_size)?;
+    let scan_wall_seconds = scan_started.elapsed().as_secs_f64();
+    let total_wall_seconds = total_wall_t0.elapsed().as_secs_f64();
+    let mut result = GarfieldLogicPipelineResult::default();
+    result.n_samples = n_samples;
+    result.logic_bits_backend = "streamed".to_string();
+    result.logic_bits_bytes = stream.max_task_batch_bytes;
+    result.units_total = stream.distinct_window_count;
+    result.units_scanned = stream.selected_window_count;
+    result.timing_total_wall_s = total_wall_seconds;
+    result.timing_scan_wall_s = scan_wall_seconds;
+    result.max6_observed_scan_timing = observed_scan_timing;
+    result.skipped_messages = skipped_messages;
+    result.train_fit = train_fit;
+    result.max6_pairs_tsv = pair_path;
+    result.max6_pairs_provenance_tsv = provenance_path;
+    result.max6_pair_universe_size = pair_universe_size;
+    result.max6_bonferroni_q_cut = Some(bonferroni_q_cut);
+    result.max6_bonferroni_p_cut = Some(bonferroni_p_cut);
+    result.max6_screen_pair_universe_size = pair_universe_size;
+    result.max6_screen_window_pair_occurrences = stream.window_pair_count;
+    result.max6_screen_candidate_count = screen_candidate_count;
+    result.max6_final_screen_subset_audit_passed = Some(true);
+    result.max6_final_screen_subset_audit_pairs_checked = final_screen_subset_audit_pairs_checked;
+    result.max6_score_scale = Some(score_scale);
+    result.max6_pair_count = output_count;
+    garfield_stage_progress_notify(
+        progress_callback,
+        "garfield_window_fused_scan",
+        1,
+        1,
+        Some(&format!(
+            "{} windows; {} LD tags; {} pair results",
+            stream.selected_window_count,
+            stream.active_source_rows.len(),
+            output_count
+        )),
+    )
+    .map_err(|error| error.to_string())?;
+    let _ = seed;
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn prepare_max6_window_stream(
     prefix: &str,
     sample_ids: &[String],
@@ -20925,7 +22034,14 @@ fn prepare_max6_window_stream(
         ));
     }
 
-    let mut source = Max6WindowRangeSource::new(prefix, scan_bimranges)?;
+    let mut source = Max6WindowRangeSource::new(
+        prefix,
+        scan_bimranges,
+        extension,
+        false,
+        Arc::new(Mutex::new(HashSet::new())),
+        Arc::new(Mutex::new(HashSet::new())),
+    )?;
     let source_marker_count = source.n_source_rows;
     let n_samples_total = source.bed.n_samples();
     if sample_indices.iter().any(|&index| index >= n_samples_total) {
@@ -26827,14 +27943,6 @@ fn garfield_logic_search_bed_owned(
             return Err("pcg_small_n_max must be > 0 for rrblup_pcg residualization".to_string());
         }
     }
-    garfield_stage_progress_notify(
-        progress_callback.as_ref(),
-        "garfield_marker_qc",
-        0,
-        1,
-        Some("reading PLINK metadata and applying marker QC"),
-    )
-    .map_err(|error| error.to_string())?;
     let fam_sample_ids = read_fam(normalize_plink_prefix(&prefix).as_str())?;
     let (selected_sample_indices, selected_sample_ids) =
         build_sample_selection(fam_sample_ids.as_slice(), sample_ids, sample_indices)?;
@@ -26910,6 +28018,26 @@ fn garfield_logic_search_bed_owned(
     let scheduler_scan_tasks = new_garfield_scheduler_task_collector();
     let scheduler_permutation_tasks = new_garfield_scheduler_task_collector();
     let unit_kind_lc = unit_kind.trim().to_ascii_lowercase();
+    let fused_window_grm_int_scan = max6_ld_tag_backend
+        && grm_int_only
+        && unit_kind_lc == "window"
+        && !max6_explicit_audit
+        && prepared_max6_universe.is_none()
+        && site_keep_precomputed.is_none();
+    garfield_stage_progress_notify(
+        progress_callback.as_ref(),
+        "garfield_marker_qc",
+        0,
+        1,
+        Some(
+            if fused_window_grm_int_scan && (using_external_grm || use_lm_residualization) {
+                "deferring marker QC to the fused window scan"
+            } else {
+                "reading PLINK metadata and applying marker QC"
+            },
+        ),
+    )
+    .map_err(|error| error.to_string())?;
     let grouped_active_mode = matches!(unit_kind_lc.as_str(), "gene" | "geneset" | "group");
     let grouped_null_mode = matches!(unit_kind_lc.as_str(), "gene" | "geneset");
     let scan_bimranges = scan_bimranges
@@ -26971,7 +28099,19 @@ fn garfield_logic_search_bed_owned(
         filtered_sites,
         n_samples_total,
         bytes_per_snp,
-    ) = if let Some(prepared) = prepared_max6_universe
+    ) = if fused_window_grm_int_scan && (using_external_grm || use_lm_residualization) {
+        let header = BedSnpIter::new_for_grm_window_header_count(
+            normalize_plink_prefix(&prefix).as_str(),
+            garfield_logic_mmap_window_mb(),
+        )?;
+        (
+            Vec::new(),
+            Some(Vec::new()),
+            Vec::new(),
+            header.n_samples(),
+            header.bytes_per_snp(),
+        )
+    } else if let Some(prepared) = prepared_max6_universe
         .as_ref()
         .filter(|_| using_external_grm)
     {
@@ -27074,15 +28214,18 @@ fn garfield_logic_search_bed_owned(
         "logic_meta_ready",
         Some(&format!("rows={}", grm_row_source_indices.len())),
     )?;
+    let marker_qc_detail =
+        if fused_window_grm_int_scan && (using_external_grm || use_lm_residualization) {
+            "marker QC will run in the fused window scan".to_string()
+        } else {
+            format!("{} retained marker rows", grm_row_source_indices.len())
+        };
     garfield_stage_progress_notify(
         progress_callback.as_ref(),
         "garfield_marker_qc",
         1,
         1,
-        Some(&format!(
-            "{} retained marker rows",
-            grm_row_source_indices.len()
-        )),
+        Some(marker_qc_detail.as_str()),
     )
     .map_err(|error| error.to_string())?;
     let n_selected = selected_sample_indices.len();
@@ -27600,6 +28743,86 @@ fn garfield_logic_search_bed_owned(
         Some("projection ready"),
     )
     .map_err(|error| error.to_string())?;
+
+    if fused_window_grm_int_scan {
+        let response = ResponseKind::Continuous;
+        let engine = parse_optional_ml_engine(&ml_method)?;
+        let importance = parse_importance(&ml_importance)?;
+        let rank_mode = parse_beam_rank_mode(&rank_score)?;
+        let perm_cfg = PermutationConfig {
+            n_repeats: permutation_repeats
+                .max(DEFAULT_RULE_NULL_ADAPTIVE_MIN_REPEATS)
+                .min(DEFAULT_RULE_NULL_MAX_REPEATS),
+            scoring: parse_permutation_scoring(&permutation_scoring)?,
+            seed,
+        };
+        let beam_params = apply_proposal_search_config(
+            BeamSearchParams {
+                search_backend,
+                max_pick: max_pick.max(1),
+                beam_width: beam_width.max(1),
+                min_gain: 0.0,
+                min_parent_abs_gain: 0.0,
+                surrogate_test_gain_max: 0.0,
+                surrogate_hamming_frac_max: 0.0,
+                maf_threshold: logic_maf_threshold.clamp(0.0, 0.5) as f64,
+                lambda_len: 0.0,
+                lambda_not: 0.0,
+                exhaustive_depth: if whole_genome_dev_mode {
+                    1
+                } else {
+                    exhaustive_depth.max(1)
+                },
+                rank_mode,
+                null_penalties: None,
+                structure_prior: None,
+                y_sum_lookup: None,
+                disable_parent_delta: false,
+                null_complexity_bin: 0,
+                group_constraint: BeamGroupConstraintMode::AlwaysExclude,
+                allow_parallel: true,
+                whole_genome_dev_mode,
+                filter_xor_substates,
+                xor_search_enabled,
+            },
+            proposal_config,
+        );
+        return run_max6_window_fused_grm_int_scan(
+            prefix.as_str(),
+            selected_sample_ids.as_slice(),
+            selected_sample_indices.as_slice(),
+            extension,
+            step,
+            scan_bimranges.as_slice(),
+            maf_threshold,
+            max_missing_rate,
+            het_threshold,
+            snps_only,
+            threads_eff,
+            ld_tag_r2,
+            y.as_slice(),
+            train_fit,
+            max6_projection.as_deref(),
+            no_grm_projector.as_ref(),
+            train_idx_local.as_slice(),
+            test_idx_local.as_slice(),
+            response,
+            engine,
+            importance,
+            perm_cfg,
+            ml_top_k,
+            ml_top_frac,
+            tree_cfg,
+            &beam_params,
+            top_rules_per_unit,
+            min_cell,
+            min_cell_fraction,
+            seed,
+            out_prefix.as_deref(),
+            progress_callback.as_ref(),
+            write_provenance,
+        );
+    }
 
     let mode = parse_bin_mode(&bin_mode)?;
     let logic_row_mul = 1usize;

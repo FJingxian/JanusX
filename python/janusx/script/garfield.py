@@ -1622,6 +1622,8 @@ class _GarfieldStageProgress:
             return "Building exact GRM projection"
         if stage == "garfield_logic_bits":
             return "Preparing scan genotype bitsets"
+        if stage == "garfield_window_fused_scan":
+            return "Streaming window QC, LD, scan, and output"
         if stage == "max6_setup_margins":
             return "Preparing Max6 marker margins"
         if stage == "max6_setup_ld_tags":
@@ -2828,11 +2830,25 @@ def main() -> None:
     group_labels: list[str] = []
     group_intervals: list[list[tuple[str, int, int]]] = []
     null_group_intervals: Optional[list[list[tuple[str, int, int]]]] = None
+    fused_max6_window = bool(
+        str(args.scan_mode).lower() == "window"
+        and _is_ld_tag_max6_backend(args.search_backend)
+        and bool(args.grm_int)
+        and not max6_audit_requested
+        and not bool(args.global_stats)
+    )
     use_prepared_max6 = bool(
-        _is_ld_tag_max6_backend(args.search_backend) and not max6_audit_requested
+        _is_ld_tag_max6_backend(args.search_backend)
+        and not max6_audit_requested
+        and not fused_max6_window
     )
     scan_unit_total: Optional[int] = None
-    if args.scan_mode == "window" and not args.bimrange and not use_prepared_max6:
+    if (
+        args.scan_mode == "window"
+        and not args.bimrange
+        and not use_prepared_max6
+        and not fused_max6_window
+    ):
         scan_unit_total = _count_window_scan_units_from_bim(
             str(gfile),
             extension=int(args.extension),
@@ -3022,6 +3038,10 @@ def main() -> None:
             # External-GRM Max6 only needs trait-sample QC for the frozen tag
             # rows; the native consumer performs that bounded source-row QC.
             site_keep_trait = None
+        elif fused_max6_window:
+            # The fused native window reader applies trait-sample QC while it
+            # packs the current bounded window batch for LD and pair scanning.
+            site_keep_trait = None
         elif (
             site_keep_trait is None
             and prepared_max6_universe is not None
@@ -3037,7 +3057,7 @@ def main() -> None:
                     dtype=np.bool_,
                 )
             site_keep_trait = prepared_max6_qc_mask
-        elif site_keep_trait is None:
+        elif site_keep_trait is None and not fused_max6_window:
             site_keep_trait = _prepare_site_keep(
                 genofile=gfile,
                 sample_ids=list(common_ids),

@@ -34,7 +34,7 @@ struct GarfieldResidualFit {
     fixed_rank: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct GarfieldResidualResult {
     pub beta: Vec<f64>,
     pub py: Vec<f64>,

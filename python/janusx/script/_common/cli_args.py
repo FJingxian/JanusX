@@ -143,6 +143,7 @@ def add_common_genotype_source_args(
     include_hmp: bool = True,
     include_file: bool = True,
     include_bfile: bool = True,
+    pfile_dest: str | None = None,
     help_profile: str = "default",
 ) -> None:
     if bool(include_vcf):
@@ -176,7 +177,7 @@ def add_common_genotype_source_args(
         group.add_argument(
             "-pfile",
             "--pfile",
-            dest="bfile",
+            dest=(str(pfile_dest) if pfile_dest else "bfile"),
             type=str,
             metavar="PFILE",
             help=_resolve_genotype_source_help(kind="pfile", profile=help_profile),

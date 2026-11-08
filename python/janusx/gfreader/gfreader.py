@@ -497,10 +497,14 @@ def _is_bed_prefix(path_or_prefix: str) -> bool:
 
 
 def _is_pgen_prefix(path_or_prefix: str) -> bool:
-    return os.path.isfile(f"{path_or_prefix}.pgen") and not os.path.isfile(
-        f"{path_or_prefix}.bed"
-    ) and all(
-        os.path.isfile(f"{path_or_prefix}.{ext}") for ext in ("pvar", "psam")
+    raw = str(path_or_prefix)
+    lower = raw.lower()
+    explicit_pgen_path = lower.endswith((".pgen", ".pvar", ".psam"))
+    prefix = _strip_known_suffix(raw) if explicit_pgen_path else raw
+    return (
+        os.path.isfile(f"{prefix}.pgen")
+        and (explicit_pgen_path or not os.path.isfile(f"{prefix}.bed"))
+        and all(os.path.isfile(f"{prefix}.{ext}") for ext in ("pvar", "psam"))
     )
 
 
@@ -564,6 +568,14 @@ def _plink_missing_files(prefix: str) -> list[str]:
     return [
         f"{prefix}.{ext}"
         for ext in extensions
+        if not os.path.isfile(f"{prefix}.{ext}")
+    ]
+
+
+def _pgen_missing_files(prefix: str) -> list[str]:
+    return [
+        f"{prefix}.{ext}"
+        for ext in ("pgen", "pvar", "psam")
         if not os.path.isfile(f"{prefix}.{ext}")
     ]
 
@@ -715,7 +727,29 @@ def _resolve_input(path_or_prefix: str, force_kind: Union[str, None] = None):
     """
     p = str(path_or_prefix)
     fk = str(force_kind or "").strip().lower()
-    if fk in {"vcf", "hmp", "txt", "file", "npy", "bin", "plink", "bfile"}:
+    if fk in {
+        "vcf",
+        "hmp",
+        "txt",
+        "file",
+        "npy",
+        "bin",
+        "plink",
+        "bfile",
+        "pgen",
+        "pfile",
+    }:
+        if fk in {"pgen", "pfile"}:
+            prefix = _strip_known_suffix(p)
+            missing = _pgen_missing_files(prefix)
+            if missing:
+                lines = [f"PLINK 2 PGEN prefix is incomplete or not found: {prefix}"]
+                lines.extend(f"Missing file: {path}" for path in missing)
+                raise ValueError("\n".join(lines))
+            # Carry the extension through the Python/Rust boundary. Rust uses
+            # it to distinguish an explicit PGEN input when a same-prefix BED
+            # output also exists.
+            return "plink", f"{prefix}.pgen", None
         if fk in {"plink", "bfile"}:
             prefix = _strip_known_suffix(p)
             missing = _plink_missing_files(prefix)
@@ -768,6 +802,10 @@ def _resolve_input(path_or_prefix: str, force_kind: Union[str, None] = None):
             )
         return matrix_kind, _normalize_matrix_prefix(prefix, matrix_kind), matrix_path
     low = p.lower()
+
+    if low.endswith((".pgen", ".pvar", ".psam")) and _is_pgen_prefix(p):
+        prefix = _strip_known_suffix(p)
+        return "plink", f"{prefix}.pgen", None
 
     if _is_plink_prefix(p):
         return "plink", p, None
@@ -1416,7 +1454,8 @@ def _prepare_txtlike_input_for_cache(kind: str, prefix: str, src_path: Union[str
 
 def _read_plink_fam_sample_ids(prefix: str) -> list[str]:
     if _is_pgen_prefix(prefix):
-        psam_path = f"{prefix}.psam"
+        pgen_prefix = _strip_known_suffix(str(prefix))
+        psam_path = f"{pgen_prefix}.psam"
         sample_ids: list[str] = []
         header: list[str] | None = None
         with open(psam_path, "r", encoding="utf-8", errors="replace") as handle:
@@ -1460,7 +1499,8 @@ def _read_plink_fam_sample_ids(prefix: str) -> list[str]:
 
 def _count_plink_bim_rows(prefix: str) -> int:
     if _is_pgen_prefix(prefix):
-        variant_path = f"{prefix}.pvar"
+        pgen_prefix = _strip_known_suffix(str(prefix))
+        variant_path = f"{pgen_prefix}.pvar"
     else:
         variant_path = f"{prefix}.bim"
     n_snps = 0

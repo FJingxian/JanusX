@@ -2394,7 +2394,14 @@ def build_parser() -> CliArgumentParser:
 
     req = parser.add_argument_group("Input Arguments")
     src = req.add_mutually_exclusive_group(required=True)
-    add_common_genotype_source_args(src, help_profile="gformat")
+    # Keep PGEN as a distinct parser destination. gformat can write a BED set
+    # beside the input prefix, so the source format must not be rediscovered
+    # after the writer has created the output .bed file.
+    add_common_genotype_source_args(
+        src,
+        pfile_dest="pfile",
+        help_profile="gformat",
+    )
 
     opt = parser.add_argument_group("Optional Arguments")
     add_common_thread_arg(
@@ -2533,6 +2540,11 @@ def main() -> None:
     args, extras = parser.parse_known_args()
     if extras:
         parser.error("unrecognized arguments: " + " ".join(extras))
+    pgen_input = bool(getattr(args, "pfile", None))
+    if pgen_input:
+        # The shared genotype-source helper uses `bfile` for downstream
+        # compatibility; preserve PGEN's explicit identity separately above.
+        args.bfile = str(args.pfile)
     if not (0.0 <= float(args.maf) <= 0.5):
         parser.error("-maf must be within [0, 0.5].")
     if not (0.0 <= float(args.geno) <= 1.0):
@@ -2667,9 +2679,19 @@ def main() -> None:
             out_fmt.upper(),
         )
 
-    source_kind, _source_prefix, source_path = _resolve_input(gfile)
+    source_force_kind = "pgen" if pgen_input else None
+    source_kind, _source_prefix, source_path = _resolve_input(
+        gfile,
+        force_kind=source_force_kind,
+    )
     source_is_pgen = bool(
-        source_kind == "plink" and _is_pgen_prefix(str(_source_prefix))
+        source_kind == "plink"
+        and (pgen_input or _is_pgen_prefix(str(_source_prefix)))
+    )
+    source_reader_input = (
+        f"{_source_prefix}.pgen"
+        if source_is_pgen and not str(_source_prefix).lower().endswith(".pgen")
+        else str(_source_prefix)
     )
     use_direct_no_cache = bool(source_kind in {"vcf", "hmp", "txt"})
     txt_matrix_path: str | None = None
@@ -2904,7 +2926,13 @@ def main() -> None:
                 _ = (txt_matrix_path, txt_id_path, txt_site_path)
                 sample_ids, n_sites = inspect_genotype_file(gfile)
             elif source_kind == "plink":
-                sample_ids, n_sites = _inspect_plink_prefix_light(str(_source_prefix))
+                if source_is_pgen:
+                    sample_ids, n_sites = inspect_genotype_file(
+                        source_reader_input,
+                        force_kind="pgen",
+                    )
+                else:
+                    sample_ids, n_sites = _inspect_plink_prefix_light(str(_source_prefix))
             else:
                 sample_ids, n_sites = inspect_genotype_file(gfile)
         except Exception:
@@ -3100,7 +3128,7 @@ def main() -> None:
             )
         else:
             c = load_genotype_chunks(
-                gfile,
+                source_reader_input if source_is_pgen else gfile,
                 chunk_size=decode_chunk_size,
                 maf=reader_maf,
                 missing_rate=reader_missing,
@@ -3123,6 +3151,7 @@ def main() -> None:
                     if post_filter.ranges
                     else None
                 ),
+                force_kind=("pgen" if source_is_pgen else None),
             )
         for geno, sites in c:
             filtered_geno, filtered_sites = _apply_site_type_filters(

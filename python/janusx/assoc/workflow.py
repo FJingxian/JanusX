@@ -94,7 +94,11 @@ from janusx.gfreader import (
 )
 from janusx.pyBLUP.QK2 import QK
 from janusx import janusx as jxrs
-from janusx.script._common.log import setup_logging
+from janusx.script._common.log import (
+    _append_log_footer,
+    _log_run_footer_status,
+    setup_logging,
+)
 from janusx.assoc.runlog import (
     GwasRunLease,
     GwasRunLockError,
@@ -8583,31 +8587,6 @@ def _write_gwas_stderr(message: str) -> None:
         pass
 
 
-def _archive_previous_incomplete_gwas_log(
-    outprefix: str,
-    run_id: str,
-) -> str | None:
-    """Preserve a prior fixed-name log unless it has this version's done footer."""
-    log_path = f"{outprefix}.gwas.log"
-    try:
-        fh = open(log_path, "rb")
-    except FileNotFoundError:
-        return None
-    with fh:
-        fh.seek(0, os.SEEK_END)
-        size = fh.tell()
-        fh.seek(max(0, size - (64 * 1024)), os.SEEK_SET)
-        tail = fh.read().decode("utf-8", errors="replace")
-    last_line = tail.rstrip().splitlines()[-1] if tail.rstrip() else ""
-    if re.search(r"GWAS run status:\s*done;\s*run_id:\s*[A-Za-z0-9_.-]+$", last_line):
-        return None
-    archive_path = f"{outprefix}.gwas.previous.{run_id}.log"
-    if os.path.exists(archive_path):
-        raise FileExistsError(f"Previous GWAS log archive already exists: {archive_path}")
-    os.replace(log_path, archive_path)
-    return archive_path
-
-
 def _finish_gwas_runlog(context: dict[str, Any], status: str) -> str:
     """Close the local log, publish once, and release this run's prefix lease."""
     if bool(context.get("finalized", False)):
@@ -8654,17 +8633,29 @@ def _finish_gwas_runlog(context: dict[str, Any], status: str) -> str:
     run_id = str(context.get("run_id", ""))
     outprefix = str(context.get("outprefix", ""))
     stable_log_path = str(context.get("log_path", f"{outprefix}.gwas.log"))
-    if str(status) == "done" and not handler_failed:
-        destination = stable_log_path
-    else:
-        destination = f"{outprefix}.gwas.incomplete.{run_id}.log"
+    terminal_status = "done" if str(status) == "done" else "failed"
+    if not bool(getattr(handler, "janusx_io_failed", False)) and os.path.isfile(
+        spool_path
+    ):
+        try:
+            if _log_run_footer_status(spool_path, run_id) is None:
+                _append_log_footer(
+                    spool_path,
+                    f"GWAS run status: {terminal_status}; run_id: {run_id}",
+                )
+        except OSError as exc:
+            handler_failed = True
+            _write_gwas_stderr(
+                "Warning: could not finalize the local GWAS log spool; "
+                f"preserve {spool_path} ({exc})"
+            )
 
     published_path = spool_path
     log_published = False
     if not handler_failed:
         try:
-            publish_log_spool(spool_path, destination)
-            published_path = destination
+            publish_log_spool(spool_path, stable_log_path)
+            published_path = stable_log_path
             log_published = True
             try:
                 os.remove(spool_path)
@@ -8709,12 +8700,6 @@ def _run_gwas_pipeline(
     lease = GwasRunLease(outprefix, run_id)
     try:
         lease.acquire(spool_path)
-        previous_log = _archive_previous_incomplete_gwas_log(outprefix, run_id)
-        if previous_log is not None:
-            _write_gwas_stderr(
-                "Note: a previous GWAS log had no completion marker and was "
-                f"preserved at {previous_log}"
-            )
     except (GwasRunLockError, OSError) as exc:
         try:
             os.remove(spool_path)

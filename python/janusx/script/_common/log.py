@@ -329,7 +329,8 @@ def _files_equal(path_a: str, path_b: str) -> bool:
         return False
 
 
-def _has_completed_log_footer(path: str) -> bool:
+def _log_run_footer_status(path: str, run_id: str) -> str | None:
+    safe_run_id = _safe_component(run_id)
     try:
         with open(path, "rb") as fh:
             fh.seek(0, os.SEEK_END)
@@ -337,26 +338,30 @@ def _has_completed_log_footer(path: str) -> bool:
             fh.seek(max(0, size - 4096), os.SEEK_SET)
             tail = fh.read().decode("utf-8", errors="replace")
     except OSError:
-        return False
+        return None
     last_line = tail.rstrip().splitlines()[-1] if tail.rstrip() else ""
-    return (
-        last_line.startswith("JanusX log status: complete; run_id: ")
-        or last_line.startswith("GWAS run status: done; run_id: ")
-    )
+    for prefix, statuses in (
+        ("JanusX log status", ("complete", "incomplete")),
+        ("GWAS run status", ("done", "failed")),
+    ):
+        for status in statuses:
+            if last_line == f"{prefix}: {status}; run_id: {safe_run_id}":
+                return status
+    return None
 
 
-def _log_has_run_footer(path: str, run_id: str, status: str) -> bool:
-    try:
-        with open(path, "rb") as fh:
-            fh.seek(0, os.SEEK_END)
-            size = fh.tell()
-            fh.seek(max(0, size - 4096), os.SEEK_SET)
-            tail = fh.read().decode("utf-8", errors="replace")
-    except OSError:
-        return False
-    last_line = tail.rstrip().splitlines()[-1] if tail.rstrip() else ""
-    expected = f"GWAS run status: {status}; run_id: {_safe_component(run_id)}"
-    return last_line.endswith(expected)
+def _append_log_footer(path: str, line: str) -> None:
+    """Append and sync one terminal status line to a local log spool."""
+    with open(path, "ab") as fh:
+        size = os.fstat(fh.fileno()).st_size
+        if size:
+            with open(path, "rb") as reader:
+                reader.seek(-1, os.SEEK_END)
+                if reader.read(1) != b"\n":
+                    fh.write(b"\n")
+        fh.write((str(line).rstrip("\r\n") + "\n").encode("utf-8"))
+        fh.flush()
+        os.fsync(fh.fileno())
 
 
 class LogFileBusy(RuntimeError):
@@ -448,7 +453,7 @@ class LogFileLease:
             state, detail = _classify_owner(current)
             if state != "stale":
                 raise LogFileBusy(f"Log lock is no longer stale: {detail}")
-            self._archive_stale_run(current)
+            self._recover_stale_run(current)
             latest = self._read_lock()
             if latest.get("run_id") != current.get("run_id"):
                 raise LogFileBusy(f"Log lock changed during recovery: {self.lock_path}")
@@ -463,47 +468,118 @@ class LogFileLease:
             except FileNotFoundError:
                 pass
 
-    def _archive_stale_run(self, record: dict[str, Any]) -> None:
+    def _recover_stale_run(self, record: dict[str, Any]) -> None:
         old_run_id = _safe_component(str(record.get("run_id", "")))
         if not old_run_id:
             raise LogFileBusy(f"Invalid run ID in log lock: {self.lock_path}")
         spool = str(record.get("spool_path", "")).strip()
         running_path = f"{self.log_path}.running.{old_run_id}.log"
         incomplete_path = f"{self.log_path}.incomplete.{old_run_id}.log"
-        if str(record.get("status", "running")) == "done":
-            for candidate in (spool, running_path):
+        status = str(record.get("status", "running"))
+        spool_path = ""
+        if spool:
+            spool_path = os.path.abspath(os.path.expanduser(spool))
+            expected = f"janusx-log-{old_run_id}-"
+            if not os.path.basename(spool_path).startswith(expected):
+                raise LogFileBusy(
+                    f"Unexpected local spool path in {self.lock_path}: {spool_path}"
+                )
+
+        def remove_stale_artifacts(*, remove_incomplete: bool = False) -> None:
+            for candidate in (spool_path, running_path):
                 if candidate:
                     try:
                         os.remove(candidate)
                     except OSError:
                         pass
-            return
-        recovered_spool = False
-        if spool:
-            src = os.path.abspath(os.path.expanduser(spool))
-            expected = f"janusx-log-{old_run_id}-"
-            if not os.path.basename(src).startswith(expected):
-                raise LogFileBusy(f"Unexpected local spool path in {self.lock_path}: {src}")
-            if os.path.isfile(src):
-                recovered_spool = True
-                if os.path.isfile(incomplete_path):
-                    if not _files_equal(src, incomplete_path):
-                        raise LogFileBusy(f"Incomplete log archive already exists: {incomplete_path}")
-                    os.remove(src)
-                else:
-                    publish_log_spool(src, incomplete_path)
-                    os.remove(src)
-        if not recovered_spool and os.path.isfile(running_path):
             if os.path.isfile(incomplete_path):
-                if not _files_equal(running_path, incomplete_path):
-                    raise LogFileBusy(f"Incomplete log archive already exists: {incomplete_path}")
-                os.remove(running_path)
-            else:
-                os.replace(running_path, incomplete_path)
+                same_as_canonical = False
+                try:
+                    same_as_canonical = _files_equal(incomplete_path, self.log_path)
+                except OSError:
+                    pass
+                if remove_incomplete or same_as_canonical:
+                    try:
+                        os.remove(incomplete_path)
+                    except OSError:
+                        pass
+
+        # A prior version may have published the final log before it crashed
+        # while updating or removing its lock. The canonical file is already
+        # authoritative in that case; remove only artifacts for this run.
+        if _log_run_footer_status(self.log_path, old_run_id) is not None:
+            if spool_path and os.path.isfile(spool_path) and not _files_equal(
+                spool_path, self.log_path
+            ):
+                raise LogFileBusy(
+                    f"Completed log differs from its local spool; preserve both "
+                    f"and inspect {self.lock_path}."
+                )
+            remove_stale_artifacts()
+            return
+
+        source = ""
+        if spool_path:
+            if os.path.isfile(spool_path):
+                source = spool_path
+                if os.path.isfile(incomplete_path) and not _files_equal(
+                    spool_path, incomplete_path
+                ):
+                    raise LogFileBusy(
+                        f"Incomplete log archive differs from its local spool: "
+                        f"{incomplete_path}"
+                    )
+        if not source:
+            # Read artifacts left by older versions as well as the current
+            # canonical snapshot. The suffix is removed after safe recovery.
+            for candidate in (incomplete_path, running_path):
+                if os.path.isfile(candidate):
+                    source = candidate
+                    break
+        if not source and os.path.isfile(self.log_path):
+            # The local temp directory may have been cleaned after a hard
+            # process kill. The atomically published canonical snapshot is
+            # still useful for recovering the last visible part of the run.
+            source = self.log_path
+        if not source:
+            # A normal finalizer may already have removed the spool and the
+            # live snapshot. There is nothing left to recover.
+            return
+
+        recovery_spool = source
+        copied_spool = False
+        if source != spool_path:
+            recovery_spool = create_local_log_spool(
+                old_run_id,
+                prefix="janusx-log-recovery",
+            )
+            try:
+                shutil.copyfile(source, recovery_spool)
+                copied_spool = True
+            except BaseException:
+                try:
+                    os.remove(recovery_spool)
+                except OSError:
+                    pass
+                raise
+
         try:
-            os.remove(running_path)
-        except OSError:
-            pass
+            footer_status = _log_run_footer_status(recovery_spool, old_run_id)
+            if footer_status is None:
+                recovered_status = "complete" if status == "done" else "incomplete"
+                _append_log_footer(
+                    recovery_spool,
+                    f"JanusX log status: {recovered_status}; run_id: {old_run_id}",
+                )
+            publish_log_spool(recovery_spool, self.log_path)
+        finally:
+            if copied_spool:
+                try:
+                    os.remove(recovery_spool)
+                except OSError:
+                    pass
+
+        remove_stale_artifacts(remove_incomplete=True)
 
     def mark_terminal(self, status: str) -> bool:
         try:
@@ -617,7 +693,9 @@ class NfsSafeFileHandler(logging.FileHandler):
         self.publish_interval = (
             None if publish_interval is None else max(0.0, float(publish_interval))
         )
-        self.live_path = f"{self.log_path}.running.{self.run_id}.log"
+        # Publish snapshots to the stable path too. Atomic replacement keeps
+        # readers safe and avoids leaving a per-run .running file after SIGKILL.
+        self.live_path = self.log_path
         self.janusx_io_failed = False
         self.janusx_io_error = ""
         self.janusx_publish_failed = False
@@ -743,11 +821,7 @@ class NfsSafeFileHandler(logging.FileHandler):
             and not self.janusx_io_failed
             and not self.janusx_publish_failed
         ):
-            destination = (
-                self.log_path
-                if success
-                else f"{self.log_path}.incomplete.{self.run_id}.log"
-            )
+            destination = self.log_path
             try:
                 publish_log_spool(self.spool_path, destination)
                 published_path = destination
@@ -756,10 +830,11 @@ class NfsSafeFileHandler(logging.FileHandler):
                     os.remove(self.spool_path)
                 except OSError:
                     pass
-                try:
-                    os.remove(self.live_path)
-                except OSError:
-                    pass
+                if self.live_path != self.log_path:
+                    try:
+                        os.remove(self.live_path)
+                    except OSError:
+                        pass
             except Exception as exc:
                 self.janusx_publish_failed = True
                 self._warn_once(
@@ -794,6 +869,8 @@ class NfsSafeFileHandler(logging.FileHandler):
         super().close()
 
     def discard_live_snapshot(self) -> None:
+        if self.live_path == self.log_path:
+            return
         try:
             os.remove(self.live_path)
         except OSError:
@@ -927,10 +1004,9 @@ def local_log_capture(
             yield fh
     except BaseException:
         snapshots_stopped = stop_live_snapshots()
-        incomplete = f"{target}.incomplete.{_safe_component(run_id)}.log"
         try:
             if snapshots_stopped and os.path.isfile(spool):
-                publish_log_spool(spool, incomplete)
+                publish_log_spool(spool, target)
                 os.remove(spool)
             elif not snapshots_stopped:
                 raise OSError("live log snapshot is still blocked on the destination")
@@ -972,16 +1048,6 @@ def local_log_capture(
             os.remove(spool)
         except OSError:
             pass
-
-
-def _archive_previous_incomplete_log(log_path: str, run_id: str) -> str | None:
-    if not os.path.isfile(log_path) or _has_completed_log_footer(log_path):
-        return None
-    archive_path = f"{log_path}.previous.{_safe_component(run_id)}.log"
-    if os.path.exists(archive_path):
-        raise FileExistsError(f"Previous incomplete log archive already exists: {archive_path}")
-    os.replace(log_path, archive_path)
-    return archive_path
 
 
 def _make_log_handler(
@@ -1082,33 +1148,6 @@ def setup_logging(
                     f"Could not access the log destination; the local spool will be "
                     f"kept at {local_spool} ({exc})."
                 )
-
-            if lease is not None:
-                try:
-                    previous = _archive_previous_incomplete_log(chosen_log_path, run_id)
-                    if previous is not None:
-                        fallback_note = (
-                            f"A prior log without a completion marker was preserved at {previous}."
-                        )
-                except OSError as exc:
-                    lease.release()
-                    lease = None
-                    alt = _fallback_log_path(requested_path)
-                    chosen_log_path = alt
-                    try:
-                        lease = LogFileLease(chosen_log_path, run_id)
-                        lease.acquire(local_spool)
-                        fallback_note = (
-                            f"Could not archive the previous log; preserving it and writing "
-                            f"this run to {chosen_log_path} ({exc})."
-                        )
-                    except (OSError, LogFileBusy) as lock_exc:
-                        lease = None
-                        publish_enabled = False
-                        fallback_note = (
-                            f"Could not safely publish the log; the local spool is at "
-                            f"{local_spool} ({lock_exc})."
-                        )
 
         try:
             handler = _make_log_handler(

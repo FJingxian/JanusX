@@ -5,14 +5,16 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import socket
 import uuid
 from typing import Any
 
 from janusx.script._common.log import (
     _classify_owner,
+    _append_log_footer,
     _files_equal,
-    _log_has_run_footer,
+    _log_run_footer_status,
     _process_start_time,
     _safe_component,
     _utc_now,
@@ -57,32 +59,81 @@ class GwasRunLease:
         self._recover_stale_and_acquire(existing)
 
     def archive_stale_run(self, record: dict[str, Any]) -> None:
-        """Preserve a stale run's spool and unfinished result files."""
+        """Recover a stale run's log and unfinished result files."""
         old_run_id = _safe_component(str(record.get("run_id", "")))
         if not old_run_id:
             raise GwasRunLockError(f"Invalid run ID in lock file: {self.lock_path}")
         archive_log = f"{self.outprefix}.gwas.incomplete.{old_run_id}.log"
+        running_log = f"{self.outprefix}.gwas.log.running.{old_run_id}.log"
         old_spool = str(record.get("spool_path", "")).strip()
         completed_log = f"{self.outprefix}.gwas.log"
-        if _log_has_run_footer(completed_log, old_run_id, "done"):
+        canonical_status = _log_run_footer_status(completed_log, old_run_id)
+        if canonical_status is not None:
             if old_spool:
-                src = os.path.abspath(os.path.expanduser(old_spool))
-                if not os.path.basename(src).startswith(f"janusx-gwas-{old_run_id}-"):
+                src = self._validate_spool_path(old_spool, old_run_id)
+                if os.path.isfile(src) and not _files_equal(src, completed_log):
                     raise GwasRunLockError(
-                        "The completed run lock points to an unexpected local log path; "
-                        f"inspect {self.lock_path}: {src}"
+                        "The canonical GWAS log differs from its terminal local spool; "
+                        f"preserve both and inspect {self.lock_path}: {src}"
                     )
                 try:
                     os.remove(src)
-                except FileNotFoundError:
+                except OSError:
                     pass
-        elif old_spool:
-            self._archive_spool(old_spool, archive_log)
-        elif not os.path.isfile(archive_log):
-            raise GwasRunLockError(
-                "The interrupted GWAS run has no recoverable log spool. "
-                f"Inspect its lock and output files before removing {self.lock_path}."
-            )
+            if os.path.isfile(archive_log) and _files_equal(archive_log, completed_log):
+                try:
+                    os.remove(archive_log)
+                except OSError:
+                    pass
+            if os.path.isfile(running_log):
+                try:
+                    os.remove(running_log)
+                except OSError:
+                    pass
+        else:
+            source = ""
+            if old_spool:
+                src = self._validate_spool_path(old_spool, old_run_id)
+                if os.path.isfile(src):
+                    source = src
+            if not source and os.path.isfile(archive_log):
+                source = archive_log
+            if not source and os.path.isfile(running_log):
+                source = running_log
+            if not source and os.path.isfile(completed_log):
+                source = completed_log
+            if source:
+                if (
+                    old_spool
+                    and source == self._validate_spool_path(old_spool, old_run_id)
+                    and os.path.isfile(archive_log)
+                    and not _files_equal(source, archive_log)
+                ):
+                    raise GwasRunLockError(
+                        "The stale GWAS log archive differs from its local spool; "
+                        f"preserve both and inspect {self.lock_path}."
+                    )
+                terminal_status = (
+                    "done" if str(record.get("status", "")) == "done" else "failed"
+                )
+                self._recover_log(source, completed_log, old_run_id, terminal_status)
+                if old_spool:
+                    try:
+                        os.remove(self._validate_spool_path(old_spool, old_run_id))
+                    except OSError:
+                        pass
+                if os.path.isfile(archive_log) and (
+                    source == archive_log or _files_equal(archive_log, completed_log)
+                ):
+                    try:
+                        os.remove(archive_log)
+                    except OSError:
+                        pass
+                if os.path.isfile(running_log):
+                    try:
+                        os.remove(running_log)
+                    except OSError:
+                        pass
 
         output_dir = os.path.dirname(self.outprefix) or os.curdir
         output_stem = os.path.basename(self.outprefix)
@@ -267,30 +318,53 @@ class GwasRunLease:
                     f"inspect {self.recovery_path} before retrying."
                 )
 
-    def _archive_spool(self, source_path: str, archive_path: str) -> None:
+    def _validate_spool_path(self, source_path: str, run_id: str) -> str:
         src = os.path.abspath(os.path.expanduser(source_path))
-        safe_id = _safe_component(os.path.basename(archive_path).split(".incomplete.")[-1].removesuffix(".log"))
-        if not os.path.basename(src).startswith(f"janusx-gwas-{safe_id}-"):
+        if not os.path.basename(src).startswith(f"janusx-gwas-{run_id}-"):
             raise GwasRunLockError(
                 "The interrupted run lock points to an unexpected local log path; "
                 f"inspect {self.lock_path} before continuing: {src}"
             )
-        if os.path.isfile(archive_path):
-            if os.path.isfile(src):
-                if _files_equal(src, archive_path):
-                    os.remove(src)
-                else:
-                    raise GwasRunLockError(
-                        f"Interrupted log archive already exists and differs: {archive_path}"
-                    )
-            return
-        if not os.path.isfile(src):
-            raise GwasRunLockError(
-                "The previous GWAS log spool is missing and no archived copy exists: "
-                f"{src}. Inspect {self.lock_path} before continuing."
+        return src
+
+    def _recover_log(
+        self,
+        source_path: str,
+        destination: str,
+        run_id: str,
+        status: str,
+    ) -> None:
+        source = os.path.abspath(os.path.expanduser(source_path))
+        is_local_spool = os.path.basename(source).startswith(f"janusx-gwas-{run_id}-")
+        recovery_spool = source
+        copied_spool = False
+        if not is_local_spool:
+            recovery_spool = create_local_log_spool(
+                run_id,
+                prefix="janusx-gwas-recovery",
             )
-        publish_log_spool(src, archive_path)
-        os.remove(src)
+            try:
+                shutil.copyfile(source, recovery_spool)
+                copied_spool = True
+            except BaseException:
+                try:
+                    os.remove(recovery_spool)
+                except OSError:
+                    pass
+                raise
+        try:
+            if _log_run_footer_status(recovery_spool, run_id) is None:
+                _append_log_footer(
+                    recovery_spool,
+                    f"GWAS run status: {status}; run_id: {run_id}",
+                )
+            publish_log_spool(recovery_spool, destination)
+        finally:
+            if copied_spool:
+                try:
+                    os.remove(recovery_spool)
+                except OSError:
+                    pass
 
     def _read_lock(self, path: str) -> dict[str, Any]:
         try:

@@ -8613,6 +8613,7 @@ def _resolve_gwas_output_for_runlog(args) -> tuple[str, str, str]:
         hmp=getattr(args, "hmp", None),
         file=getattr(args, "file", None),
         bfile=getattr(args, "bfile", None),
+        pfile=getattr(args, "pfile", None),
         kfile=getattr(args, "kfile", None),
         prefix=None,
         snps_only=bool(getattr(args, "snps_only", False)),

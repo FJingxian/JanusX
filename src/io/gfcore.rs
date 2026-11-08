@@ -3508,6 +3508,71 @@ impl BedSnpIter {
         self.snp_bytes(snp_idx)
     }
 
+    pub(crate) fn has_pgen_source(&self) -> bool {
+        self.pgen_source.is_some()
+    }
+
+    /// Read a contiguous packed source-row range into caller-owned storage.
+    /// PGEN rows are decoded directly into `out`; BED rows are copied from the
+    /// caller-prepared mmap window.
+    pub(crate) fn read_packed_source_rows(
+        &mut self,
+        source_start: usize,
+        rows: usize,
+        out: &mut [u8],
+    ) -> Result<(), String> {
+        let end = source_start
+            .checked_add(rows)
+            .ok_or_else(|| "packed genotype source range overflow".to_string())?;
+        if end > self.n_snps {
+            return Err(format!(
+                "packed genotype source range {source_start}..{end} exceeds {} rows",
+                self.n_snps
+            ));
+        }
+        let byte_len = rows
+            .checked_mul(self.bytes_per_snp)
+            .ok_or_else(|| "packed genotype source byte length overflow".to_string())?;
+        if out.len() < byte_len {
+            return Err(format!(
+                "packed genotype destination is too small: got {}, need {byte_len}",
+                out.len()
+            ));
+        }
+        if rows == 0 {
+            return Ok(());
+        }
+
+        if let Some(pgen_source) = self.pgen_source.as_ref().map(Arc::clone) {
+            let mut source = pgen_source
+                .lock()
+                .map_err(|_| "PGEN iterator reader lock was poisoned".to_string())?;
+            let PgenIterSource {
+                reader,
+                cached_source_row,
+                ..
+            } = &mut *source;
+            let rows_read = reader.read_source_block(source_start, rows, &mut out[..byte_len])?;
+            if rows_read != rows {
+                return Err(format!(
+                    "PGEN packed reader returned {rows_read} rows; requested {rows} starting at {source_start}"
+                ));
+            }
+            *cached_source_row = None;
+        } else {
+            for row_offset in 0..rows {
+                let source_row = source_start + row_offset;
+                let packed_row = self
+                    .packed_snp_bytes_at(source_row)
+                    .ok_or_else(|| format!("missing packed genotype row {source_row}"))?;
+                let row_start = row_offset * self.bytes_per_snp;
+                out[row_start..row_start + self.bytes_per_snp].copy_from_slice(packed_row.as_ref());
+            }
+        }
+        self.cur = end;
+        Ok(())
+    }
+
     /// Decode next SNP row into caller-provided buffer (len >= n_samples)
     /// and return the source SNP index.
     #[allow(dead_code)]

@@ -19273,6 +19273,8 @@ impl Drop for Max6BitsTempFileOwner {
 
 const MAX6_WINDOW_STREAM_CHUNK_ROWS: usize = 4096;
 const MAX6_WINDOW_STREAM_METADATA_ROWS: usize = 4096;
+const MAX6_WINDOW_STREAM_PGEN_CHUNK_ROWS: usize = 16_384;
+const MAX6_WINDOW_STREAM_PGEN_METADATA_ROWS: usize = 16_384;
 
 struct Max6WindowStreamChunk {
     sites: Vec<SiteInfo>,
@@ -19344,6 +19346,8 @@ fn max6_window_stream_scope_finish_bp(
 struct Max6WindowRangeSource {
     bed: BedSnpIter,
     bim: BimChunkReader,
+    max_chunk_rows: usize,
+    metadata_chunk_rows: usize,
     n_source_rows: usize,
     next_metadata_row: usize,
     selected_chroms: HashSet<String>,
@@ -19380,10 +19384,23 @@ impl Max6WindowRangeSource {
             .iter()
             .map(|range| chrom_base_view(range.chrom.as_str()).to_ascii_lowercase())
             .collect::<HashSet<_>>();
+        let (max_chunk_rows, metadata_chunk_rows) = if bed.has_pgen_source() {
+            (
+                MAX6_WINDOW_STREAM_PGEN_CHUNK_ROWS,
+                MAX6_WINDOW_STREAM_PGEN_METADATA_ROWS,
+            )
+        } else {
+            (
+                MAX6_WINDOW_STREAM_CHUNK_ROWS,
+                MAX6_WINDOW_STREAM_METADATA_ROWS,
+            )
+        };
         let scan_all = selected_chroms.is_empty();
         Ok(Self {
             bed,
             bim: BimChunkReader::open(prefix)?,
+            max_chunk_rows,
+            metadata_chunk_rows,
             n_source_rows,
             next_metadata_row: 0,
             selected_chroms,
@@ -19440,7 +19457,7 @@ impl Max6WindowRangeSource {
         }
         let start = self.next_metadata_row;
         let end = start
-            .saturating_add(MAX6_WINDOW_STREAM_METADATA_ROWS)
+            .saturating_add(self.metadata_chunk_rows)
             .min(self.n_source_rows);
         let sites = self.bim.read_range(start, end)?;
         if sites.len() != end.saturating_sub(start) {
@@ -19531,9 +19548,13 @@ impl Max6WindowRangeSource {
             return Ok(false);
         };
         self.bed.set_cursor(first_source_row);
-        self.bed.ensure_window_for_snp(first_source_row)?;
-        let max_rows = MAX6_WINDOW_STREAM_CHUNK_ROWS
-            .min(self.bed.mapped_contiguous_snps_from(first_source_row));
+        let max_rows = if self.bed.has_pgen_source() {
+            self.max_chunk_rows
+        } else {
+            self.bed.ensure_window_for_snp(first_source_row)?;
+            self.max_chunk_rows
+                .min(self.bed.mapped_contiguous_snps_from(first_source_row))
+        };
         if max_rows == 0 {
             return Err(format!(
                 "empty mapped genotype block at source row {first_source_row}"
@@ -19560,15 +19581,11 @@ impl Max6WindowRangeSource {
         chunk
             .packed_genotypes
             .resize(chunk.sites.len().saturating_mul(bytes_per_variant), 0);
-        for (offset, &source_row) in chunk.source_rows.iter().enumerate() {
-            let row = self
-                .bed
-                .packed_snp_bytes_at(source_row)
-                .ok_or_else(|| format!("missing packed genotype row {source_row}"))?;
-            let start = offset.saturating_mul(bytes_per_variant);
-            chunk.packed_genotypes[start..start + bytes_per_variant].copy_from_slice(row.as_ref());
-        }
-        self.bed.set_cursor(next_source_row);
+        self.bed.read_packed_source_rows(
+            first_source_row,
+            chunk.sites.len(),
+            chunk.packed_genotypes.as_mut_slice(),
+        )?;
         Ok(true)
     }
 }

@@ -1623,7 +1623,7 @@ class _GarfieldStageProgress:
         if stage == "garfield_logic_bits":
             return "Preparing scan genotype bitsets"
         if stage == "garfield_window_fused_scan":
-            return "Streaming window QC, LD, scan, and output"
+            return "Wscan"
         if stage == "max6_setup_margins":
             return "Preparing Max6 marker margins"
         if stage == "max6_setup_ld_tags":

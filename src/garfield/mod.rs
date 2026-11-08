@@ -20708,11 +20708,13 @@ fn prepare_max6_window_streamed_ld(
         mem_tracker,
         false,
         None,
+        None,
     )
 }
 
 type Max6WindowFusedBatchCallback<'a> =
     dyn FnMut(&[Max6StreamWindowSelection], Option<&rayon::ThreadPool>) -> Result<(), String> + 'a;
+type Max6WindowStreamProgressCallback<'a> = dyn FnMut(usize, usize) -> Result<(), String> + 'a;
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_max6_window_streamed_ld_with_callback(
@@ -20731,6 +20733,7 @@ fn prepare_max6_window_streamed_ld_with_callback(
     mem_tracker: Option<&GarfieldStageMemoryTracker>,
     restrict_to_bimrange_scope: bool,
     mut on_batch: Option<&mut Max6WindowFusedBatchCallback<'_>>,
+    mut on_progress: Option<&mut Max6WindowStreamProgressCallback<'_>>,
 ) -> Result<Max6WindowStreamLdPrep, String> {
     if !(0.0..=0.5).contains(&maf_threshold) {
         return Err("maf_threshold must be within [0, 0.5]".to_string());
@@ -20765,6 +20768,9 @@ fn prepare_max6_window_streamed_ld_with_callback(
         tail_scope_complete_chroms,
     )?;
     let source_marker_count = source.n_source_rows;
+    if let Some(callback) = on_progress.as_deref_mut() {
+        callback(0, source_marker_count)?;
+    }
     let n_samples_total = source.bed.n_samples();
     if sample_indices.iter().any(|&index| index >= n_samples_total) {
         return Err("selected sample index out of range for Max6 window stream".to_string());
@@ -21086,6 +21092,19 @@ fn prepare_max6_window_streamed_ld_with_callback(
             }
             if let Some(tracker) = mem_tracker {
                 tracker.sample_now();
+            }
+            if let Some(callback) = on_progress.as_deref_mut() {
+                let done = chunk
+                    .source_rows
+                    .last()
+                    .map_or(0, |source_row| source_row.saturating_add(1));
+                let progress_total = source_marker_count.max(1);
+                let progress_done = if progress_total > 1 {
+                    done.min(progress_total - 1)
+                } else {
+                    0
+                };
+                callback(progress_done, progress_total)?;
             }
             Ok(())
         },
@@ -21847,9 +21866,24 @@ fn run_max6_window_fused_grm_int_scan(
         "garfield_window_fused_scan",
         0,
         1,
-        Some("streaming window QC, LD selection, pair scan, and output"),
+        Some("starting Wscan"),
     )
     .map_err(|error| error.to_string())?;
+    let mut notify_stream_progress = |done: usize, total: usize| {
+        garfield_stage_progress_notify(
+            progress_callback,
+            "garfield_window_fused_scan",
+            done,
+            total,
+            None,
+        )
+        .map_err(|error| error.to_string())
+    };
+    let on_stream_progress = if progress_callback.is_some() {
+        Some(&mut notify_stream_progress as &mut Max6WindowStreamProgressCallback<'_>)
+    } else {
+        None
+    };
     let stream = prepare_max6_window_streamed_ld_with_callback(
         prefix,
         sample_ids,
@@ -21866,6 +21900,7 @@ fn run_max6_window_fused_grm_int_scan(
         None,
         !write_provenance,
         Some(&mut on_batch),
+        on_stream_progress,
     )?;
     if let Some(writer) = internal_spool_writer {
         writer.finish()?;
@@ -22005,8 +22040,8 @@ fn run_max6_window_fused_grm_int_scan(
     garfield_stage_progress_notify(
         progress_callback,
         "garfield_window_fused_scan",
-        1,
-        1,
+        stream.source_marker_count,
+        stream.source_marker_count.max(1),
         Some(&format!(
             "{} windows; {} LD tags; {} pair results",
             stream.selected_window_count,

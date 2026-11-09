@@ -433,7 +433,23 @@ def _resolve_launcher_executable() -> str:
     return ""
 
 
+def _configure_stdio_utf8() -> None:
+    """Avoid UnicodeEncodeError on legacy Windows console code pages."""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None:
+            continue
+        encoding = str(getattr(stream, "encoding", "") or "").lower().replace("-", "")
+        if encoding in {"utf8", "utf8mb4"}:
+            continue
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 def main():
+    _configure_stdio_utf8()
     install_interrupt_handlers()
     if sys.version_info < (3, 10):
         _CONSOLE.print(

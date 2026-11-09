@@ -222,6 +222,28 @@ def _parse_cli_thread_value(argv_tail: list[str]) -> int | None:
     return None
 
 
+_BAYES_GS_FLAGS = {
+    "-bayesa",
+    "--bayesa",
+    "-bayesb",
+    "--bayesb",
+    "-bayesc",
+    "--bayesc",
+    "-bayesr",
+    "--bayesr",
+}
+
+
+def _argv_requests_bayesian_gs(argv_tail: list[str]) -> bool:
+    for tok in argv_tail:
+        low = str(tok).strip().lower()
+        if low in _BAYES_GS_FLAGS:
+            return True
+        if "=" in low and low.split("=", 1)[0] in _BAYES_GS_FLAGS:
+            return True
+    return False
+
+
 def _apply_early_thread_env_from_cli(module_name: str, argv_tail: list[str]) -> None:
     """
     Pre-apply thread env vars before loading target submodule.
@@ -229,7 +251,6 @@ def _apply_early_thread_env_from_cli(module_name: str, argv_tail: list[str]) -> 
     This helps BLAS backends (especially Accelerate on macOS) pick up user
     thread limits before NumPy/SciPy are imported in submodule top-level code.
     """
-    _ = module_name  # reserved for module-specific overrides if needed later
     t = _parse_cli_thread_value(argv_tail)
     if t is None:
         # Important for macOS Accelerate: set thread env before NumPy/SciPy import
@@ -238,7 +259,24 @@ def _apply_early_thread_env_from_cli(module_name: str, argv_tail: list[str]) -> 
             t = int(detect_effective_threads())
         except Exception:
             t = 1
-    _ = apply_outer_thread_cap(max(1, int(t)), set_jx_threads=True, set_max_keys=True)
+    t = max(1, int(t))
+    if (
+        str(module_name).strip().lower() == "gs"
+        and _argv_requests_bayesian_gs(argv_tail)
+    ):
+        # Bayesian GS kernels already parallelize across markers with Rayon.
+        # Letting OpenMP/BLAS also fan out to `-t` threads oversubscribes the
+        # process (and can trip login-node CPU guards or slow sampling down).
+        # Keep the marker-level worker count at -t, but cap BLAS/OpenMP at 1.
+        from ._common.threads import apply_blas_thread_env
+
+        apply_blas_thread_env(1, set_jx_threads=False, set_max_keys=True)
+        text = str(int(t))
+        os.environ["JX_THREADS"] = text
+        os.environ["RAYON_NUM_THREADS"] = text
+        os.environ["JX_MLM_RUST_THREADS"] = text
+        return
+    _ = apply_outer_thread_cap(t, set_jx_threads=True, set_max_keys=True)
 
 def _load_script_module(name: str):
     target = _SCRIPT_MODULE_ALIASES.get(str(name), str(name))

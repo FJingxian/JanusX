@@ -4828,14 +4828,15 @@ def run_lm_stream_bed_single_entry(
 ) -> None:
     if str(genetic_model).strip().lower() != "add":
         raise ValueError("GWAS currently supports only additive coding (model='add').")
-    rust_symbol = "lm_stream_bed_to_tsv"
+    prefix = _as_plink_input_path(genofile)
+    if prefix is None:
+        raise ValueError("LM rust streaming single-entry route requires PLINK input.")
+    is_pgen = str(prefix).lower().endswith(".pgen")
+    rust_symbol = "lm_pgen_to_tsv_f32" if is_pgen else "lm_stream_bed_to_tsv"
     if not hasattr(jxrs, rust_symbol):
         raise RuntimeError(
             f"Rust extension missing {rust_symbol}. Rebuild/install JanusX extension first."
         )
-    prefix = _as_plink_input_path(genofile)
-    if prefix is None:
-        raise ValueError("LM rust streaming single-entry route requires PLINK BED input.")
 
     process = psutil.Process()
     n_cores = detect_effective_threads()
@@ -4911,7 +4912,7 @@ def run_lm_stream_bed_single_entry(
                 _current_bed_memory_mb(),
                 needs_copy=False,
             )
-            if bool(mmap_limit)
+            if bool(mmap_limit) and not is_pgen
             else None
         )
         if (not bool(chunk_size_user_set)) and int(model_chunk_size) != int(chunk_size):
@@ -4988,7 +4989,7 @@ def run_lm_stream_bed_single_entry(
         prepared_row_flip = None
         prepared_row_missing = None
         prepared_row_maf = None
-        if isinstance(trait_prepared_meta, dict):
+        if isinstance(trait_prepared_meta, dict) and not is_pgen:
             try:
                 prepared_row_indices = np.ascontiguousarray(
                     np.asarray(trait_prepared_meta["row_indices"], dtype=np.int64).reshape(-1),
@@ -5041,12 +5042,20 @@ def run_lm_stream_bed_single_entry(
                     lm_base_kwargs["row_flip"] = prepared_row_flip
                     lm_base_kwargs["row_missing"] = prepared_row_missing
                     lm_base_kwargs["row_maf"] = prepared_row_maf
-                if bool(fused_qc):
+                if bool(fused_qc) and not is_pgen:
                     lm_base_kwargs["fused_qc"] = True
 
                 def _call_lm_stream(ixx_opt: object) -> tuple[int, int]:
                     global _WARNED_LM_STREAM_MMAP_LEGACY
                     kwargs_use = dict(lm_base_kwargs)
+                    if is_pgen:
+                        return jxrs.lm_pgen_to_tsv_f32(
+                            str(prefix),
+                            y_vec,
+                            x_design,
+                            str(tmp_tsv),
+                            **kwargs_use,
+                        )
                     if mmap_window_mb is not None:
                         kwargs_use["mmap_window_mb"] = int(max(1, int(mmap_window_mb)))
                     try:
@@ -5088,6 +5097,8 @@ def run_lm_stream_bed_single_entry(
                 try:
                     kept_rows, scan_all_rows = _call_lm_stream(None)
                 except TypeError:
+                    if is_pgen:
+                        raise
                     # Backward-compat fallback for older extensions that require ixx.
                     ixx = _lm_precompute_ixx_qr(x_design)
                     kept_rows, scan_all_rows = _call_lm_stream(ixx)

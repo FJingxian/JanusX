@@ -3897,7 +3897,50 @@ impl BedChunkReader {
             Some((row_sub, site.into(), af_v, stats.missing_count as f32))
         };
 
-        if let Some(ref snp_indices) = self.snp_indices {
+        if self.snp_indices.is_none() && self.it.is_pgen_source() {
+            // PGEN sequential fast path: decode a contiguous block directly
+            // into row-major dosages instead of seeking the PGEN reader once
+            // per variant through `get_snp_row_raw`.
+            let full_n = self.it.n_samples();
+            let mut raw_block = vec![0.0_f32; chunk_size.saturating_mul(full_n)];
+            while m < chunk_size {
+                let source_start = self.it.cursor();
+                let rows_read = self
+                    .it
+                    .read_next_pgen_block_f32(chunk_size - m, &mut raw_block)
+                    .map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
+                if rows_read == 0 {
+                    break;
+                }
+                let decoded: Vec<Option<(Vec<f32>, SiteInfo, f32, f32)>> = (0..rows_read)
+                    .into_par_iter()
+                    .map(|row_idx| {
+                        let raw_start = row_idx * full_n;
+                        let mut row_sub = Vec::with_capacity(n);
+                        if full_samples {
+                            row_sub.extend_from_slice(&raw_block[raw_start..raw_start + full_n]);
+                        } else {
+                            for &samp_idx in self.sample_indices.iter() {
+                                if samp_idx >= full_n {
+                                    return None;
+                                }
+                                row_sub.push(raw_block[raw_start + samp_idx]);
+                            }
+                        }
+                        let site = self.it.sites[source_start + row_idx].clone();
+                        prepare_one(row_sub, site)
+                    })
+                    .collect();
+                for item in decoded.into_iter().flatten() {
+                    let (row_sub, site, af_v, miss_v) = item;
+                    out.extend_from_slice(&row_sub);
+                    sites.push(site);
+                    af.push(af_v);
+                    miss.push(miss_v);
+                    m += 1;
+                }
+            }
+        } else if let Some(ref snp_indices) = self.snp_indices {
             while m < chunk_size && self.snp_pos < snp_indices.len() {
                 let need = chunk_size - m;
                 let end = (self.snp_pos + need).min(snp_indices.len());
@@ -11524,6 +11567,84 @@ mod tests {
             assert!(reader
                 .next_chunk(py, 3)
                 .expect("finish PGEN reader")
+                .is_none());
+        });
+
+        fs::remove_dir_all(dir).expect("remove temporary PGEN directory");
+    }
+
+    #[test]
+    fn pgen_bed_chunk_reader_prepared_uses_direct_dosage_blocks() {
+        use std::fs;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        pyo3::Python::initialize();
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("janusx_pgen_prepared_f32_{stamp}"));
+        fs::create_dir_all(&dir).expect("create temporary PGEN directory");
+        let prefix = dir.join("tiny");
+        let mut pgen = vec![0x6c, 0x1b, 0x02];
+        pgen.extend_from_slice(&2u32.to_le_bytes());
+        pgen.extend_from_slice(&5u32.to_le_bytes());
+        pgen.push(0); // fixed hard-call storage flags
+        pgen.extend_from_slice(&[0xc4, 0x01, 0xaa, 0x02]);
+        fs::write(prefix.with_extension("pgen"), pgen).expect("write PGEN");
+        fs::write(
+            prefix.with_extension("psam"),
+            "#FID IID\nf1 s1\nf1 s2\nf1 s3\nf1 s4\nf1 s5\n",
+        )
+        .expect("write PSAM");
+        fs::write(
+            prefix.with_extension("pvar"),
+            "#CHROM POS ID REF ALT\n1 10 rs1 A G\n1 20 rs2 C T\n",
+        )
+        .expect("write PVAR");
+
+        pyo3::Python::attach(|py| {
+            use numpy::PyArrayMethods;
+
+            let mut reader = BedChunkReader::new(
+                prefix.to_string_lossy().into_owned(),
+                Some(0.0),
+                Some(1.0),
+                Some(true),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(1.0),
+                Some(true),
+                None,
+            )
+            .expect("construct PGEN chunk reader");
+            let (centered, sites, af, miss) = reader
+                .next_chunk_prepared(py, 3, None, false)
+                .expect("read prepared PGEN chunk")
+                .expect("prepared PGEN chunk should contain variants");
+            assert_eq!(
+                sites
+                    .iter()
+                    .map(|site| site.snp.as_str())
+                    .collect::<Vec<_>>(),
+                ["rs1", "rs2"]
+            );
+            assert_eq!(af.readonly().as_array().to_vec(), vec![0.25_f32, 1.0]);
+            assert_eq!(miss.readonly().as_array().to_vec(), vec![1.0_f32, 0.0]);
+            assert_eq!(centered.readonly().as_array().shape(), &[2, 5]);
+            assert!(reader
+                .next_chunk_prepared(py, 3, None, false)
+                .expect("finish prepared PGEN reader")
                 .is_none());
         });
 

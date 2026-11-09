@@ -2537,7 +2537,7 @@ pub fn lm_stream_bed_to_tsv(
     }
     // An eligible fused call must reach the raw block scanner even when the
     // CLI did not request an explicit mmap window. Keep the established
-    // 512 MiB default used by the LM2 and unified mixed-model BED scanners.
+    // 512 MiB default used by the unified mixed-model BED scanners.
     let raw_scan_window_mb = mmap_window_mb.or(if fused_qc { Some(512usize) } else { None });
     if let Some(window_mb) = raw_scan_window_mb {
         if window_mb == 0 {
@@ -3218,6 +3218,323 @@ pub fn lm_stream_bed_to_tsv(
         }
         writer.finish().map_err(PyRuntimeError::new_err)?;
         Ok((kept_total, seen_total))
+    })
+}
+
+/// Native streaming LM scan for PLINK 2 PGEN input.
+///
+/// Reads hard calls through `PgenReader`, applies the same sample QC and
+/// mean-imputation as the BED LM path, and writes the standard 11-column TSV
+/// with the same `chisq = n * ln(1 + t^2/df)` convention.
+#[pyfunction]
+#[pyo3(signature = (
+    prefix,
+    y,
+    x,
+    out_tsv,
+    sample_ids=None,
+    maf_threshold=0.0,
+    max_missing_rate=1.0,
+    genetic_model="add",
+    het_threshold=0.0,
+    snps_only=false,
+    chunk_size=10000,
+    threads=0,
+    progress_callback=None,
+    progress_every=0,
+))]
+pub fn lm_pgen_to_tsv_f32<'py>(
+    py: Python<'py>,
+    prefix: String,
+    y: PyReadonlyArray1<'py, f64>,
+    x: PyReadonlyArray2<'py, f64>,
+    out_tsv: String,
+    sample_ids: Option<Vec<String>>,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    genetic_model: &str,
+    het_threshold: f32,
+    snps_only: bool,
+    chunk_size: usize,
+    threads: usize,
+    progress_callback: Option<Py<PyAny>>,
+    progress_every: usize,
+) -> PyResult<(usize, usize)> {
+    if chunk_size == 0 {
+        return Err(PyValueError::new_err("chunk_size must be > 0"));
+    }
+    if !(0.0..=0.5).contains(&maf_threshold) {
+        return Err(PyValueError::new_err(
+            "maf_threshold must be within [0, 0.5]",
+        ));
+    }
+    if !(0.0..=1.0).contains(&max_missing_rate) {
+        return Err(PyValueError::new_err(
+            "max_missing_rate must be within [0, 1.0]",
+        ));
+    }
+    if !(0.0..=1.0).contains(&het_threshold) {
+        return Err(PyValueError::new_err(
+            "het_threshold must be within [0, 1.0]",
+        ));
+    }
+    if !genetic_model.trim().eq_ignore_ascii_case("add") {
+        return Err(PyValueError::new_err(
+            "GWAS currently supports only additive coding (genetic_model='add').",
+        ));
+    }
+
+    let y = y.as_slice()?;
+    let x_arr = x.as_array();
+    let n = y.len();
+    let (xn, q0) = (x_arr.shape()[0], x_arr.shape()[1]);
+    if xn != n {
+        return Err(PyRuntimeError::new_err("X.n_rows must equal len(y)"));
+    }
+    if n <= q0 + 1 {
+        return Err(PyRuntimeError::new_err(format!(
+            "n too small: require n > q0+1, got n={n}, q0={q0}"
+        )));
+    }
+
+    let x_flat: Cow<[f64]> = match crate::stats_common::array_standard_slice(&x) {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&x_arr)),
+    };
+    let qr_ctx =
+        LmQrProjection::from_design(x_flat.as_ref(), y, n, q0).map_err(PyRuntimeError::new_err)?;
+    let q_rank = qr_ctx.rank;
+    let y_raw = y.to_vec();
+    let rhs_add_cols = q_rank.saturating_add(1);
+    let rhs_add_f32 = pack_lm_scan_rhs_f32(
+        y_raw.as_slice(),
+        if q_rank > 0 {
+            Some(qr_ctx.q_f32.as_slice())
+        } else {
+            None
+        },
+        q_rank,
+    )
+    .map_err(PyRuntimeError::new_err)?;
+
+    let norm_prefix = crate::pgen::normalize_pgen_prefix(&prefix);
+    let samples = gfcore::read_fam(&norm_prefix).map_err(PyRuntimeError::new_err)?;
+    let n_samples_full = samples.len();
+    if n_samples_full == 0 {
+        return Err(PyRuntimeError::new_err("PSAM contains zero samples"));
+    }
+    let (sample_indices, _sample_ids_ordered) =
+        build_sample_selection(&samples, sample_ids, None).map_err(PyRuntimeError::new_err)?;
+    if sample_indices.len() != n {
+        return Err(PyRuntimeError::new_err(format!(
+            "sample_ids length mismatch: selected n={} but len(y)={n}",
+            sample_indices.len()
+        )));
+    }
+    let full_samples = sample_indices.len() == n_samples_full;
+    let n_snps = crate::pgen::count_pvar_variants(&norm_prefix).map_err(PyRuntimeError::new_err)?;
+    let pgen_path = std::path::PathBuf::from(format!("{norm_prefix}.pgen"));
+    let mut reader = crate::pgen::PgenReader::open(&pgen_path, n_samples_full, n_snps)
+        .map_err(PyRuntimeError::new_err)?;
+    let mut bim_reader = BimChunkReader::open(&norm_prefix).map_err(PyRuntimeError::new_err)?;
+
+    let pool = get_cached_pool(threads)?;
+    let progress_block = if progress_every == 0 {
+        chunk_size.max(1)
+    } else {
+        progress_every.max(1)
+    };
+    let out_tsv_path = out_tsv.clone();
+
+    py.detach(move || -> PyResult<(usize, usize)> {
+        let writer = AsyncTsvWriter::with_config(
+            &out_tsv_path,
+            b"chrom\tpos\tsnp\tallele0\tallele1\taf\tmiss\tbeta\tse\tchisq\tpwald\n",
+            64 * 1024 * 1024,
+            16,
+        )
+        .map_err(PyRuntimeError::new_err)?;
+
+        let mut raw_rows: Vec<f32> = vec![0.0_f32; chunk_size.saturating_mul(n_samples_full)];
+        let mut g_block: Vec<f32> = vec![0.0_f32; chunk_size.saturating_mul(n)];
+        let mut sites: Vec<gfcore::SiteInfo> = Vec::with_capacity(chunk_size);
+        let mut maf: Vec<f32> = Vec::with_capacity(chunk_size);
+        let mut miss: Vec<usize> = Vec::with_capacity(chunk_size);
+        let mut gy_block: Vec<f64> = vec![0.0_f64; chunk_size];
+        let mut xts_block: Vec<f32> = vec![0.0_f32; chunk_size.saturating_mul(rhs_add_cols.max(1))];
+        let mut row_ss: Vec<f64> = vec![0.0_f64; chunk_size];
+        let mut out_buf: Vec<f64> = vec![0.0_f64; chunk_size * 5];
+        let mut qg_tmp: Vec<f64> = vec![0.0_f64; q_rank.max(1)];
+        let mut text = String::with_capacity(chunk_size * 112);
+        let mut kept_total = 0usize;
+        let mut seen_total = 0usize;
+        let mut next_progress = progress_block.max(1);
+        let lm_parallel_rhs =
+            lm_prefer_parallel_small_rhs(chunk_size.max(1), n, rhs_add_cols, pool.as_ref());
+        let blas_threads = if lm_parallel_rhs || rust_sgemm_prefers_rayon_rowmajor_f32_kernel() {
+            1usize
+        } else {
+            threads.max(1)
+        };
+        let _blas_guard = BlasThreadGuard::enter(blas_threads);
+
+        let finalize_row = |mut row_sub: Vec<f32>,
+                            mut site: gfcore::SiteInfo|
+         -> Option<(Vec<f32>, gfcore::SiteInfo, f32, usize)> {
+            let stats = gfcore::process_snp_row_with_stats_preserve_alt(
+                &mut row_sub,
+                &mut site.ref_allele,
+                &mut site.alt_allele,
+                maf_threshold,
+                max_missing_rate,
+                true,
+                true,
+                het_threshold,
+            )?;
+            if snps_only
+                && (!is_simple_snp_allele(&site.ref_allele)
+                    || !is_simple_snp_allele(&site.alt_allele))
+            {
+                return None;
+            }
+            let alt_sum = row_sub.iter().map(|&v| v as f64).sum::<f64>();
+            let mean_model = (alt_sum / n as f64) as f32;
+            for v in row_sub.iter_mut() {
+                *v -= mean_model;
+            }
+            let maf_val = ((alt_sum / n as f64) * 0.5_f64) as f32;
+            Some((row_sub, site, maf_val, stats.missing_count as usize))
+        };
+
+        while seen_total < n_snps {
+            check_ctrlc().map_err(PyRuntimeError::new_err)?;
+            let rows = (n_snps - seen_total).min(chunk_size);
+            reader
+                .read_source_block_f32(
+                    seen_total,
+                    rows,
+                    &mut raw_rows[..rows.saturating_mul(n_samples_full)],
+                )
+                .map_err(PyRuntimeError::new_err)?;
+            let chunk_sites = bim_reader
+                .read_range(seen_total, seen_total + rows)
+                .map_err(PyRuntimeError::new_err)?;
+
+            let decoded: Vec<Option<(Vec<f32>, gfcore::SiteInfo, f32, usize)>> = (0..rows)
+                .into_par_iter()
+                .map(|row_idx| {
+                    let raw_start = row_idx * n_samples_full;
+                    let mut row_sub = Vec::with_capacity(n);
+                    if full_samples {
+                        row_sub.extend_from_slice(&raw_rows[raw_start..raw_start + n_samples_full]);
+                    } else {
+                        for &samp_idx in sample_indices.iter() {
+                            row_sub.push(raw_rows[raw_start + samp_idx]);
+                        }
+                    }
+                    finalize_row(row_sub, chunk_sites[row_idx].clone())
+                })
+                .collect();
+
+            sites.clear();
+            maf.clear();
+            miss.clear();
+            let mut m = 0usize;
+            for item in decoded.into_iter().flatten() {
+                let (row_sub, site, maf_val, miss_count) = item;
+                g_block[m * n..(m + 1) * n].copy_from_slice(&row_sub);
+                sites.push(site);
+                maf.push(maf_val);
+                miss.push(miss_count);
+                m += 1;
+            }
+
+            if m > 0 {
+                let xts = &mut xts_block[..m * rhs_add_cols];
+                row_major_block_mul_mat_f32_lm(
+                    &g_block[..m * n],
+                    m,
+                    n,
+                    rhs_add_f32.as_slice(),
+                    rhs_add_cols,
+                    xts,
+                    pool.as_ref(),
+                );
+                row_major_block_first_col_f32_to_f64(
+                    xts,
+                    m,
+                    rhs_add_cols,
+                    &mut gy_block[..m],
+                    pool.as_ref(),
+                );
+                row_major_block_sumsq_f64(&g_block[..m * n], m, n, &mut row_ss[..m], pool.as_ref());
+                for row_idx in 0..m {
+                    let qg = &xts[row_idx * rhs_add_cols + 1..row_idx * rhs_add_cols + 1 + q_rank];
+                    for (dst, &src) in qg_tmp[..q_rank].iter_mut().zip(qg.iter()) {
+                        *dst = src as f64;
+                    }
+                    let stats = lm_assoc_from_qr_projection_raw(
+                        &qg_tmp[..q_rank],
+                        gy_block[row_idx],
+                        row_ss[row_idx],
+                        &qr_ctx,
+                    );
+                    out_buf[row_idx * 5..(row_idx + 1) * 5].copy_from_slice(&stats);
+                }
+
+                text.clear();
+                append_assoc_block_from_core_sites(
+                    &mut text,
+                    AssocResultLayout::PrecomputedChisqBasic3 {
+                        row_stride: 5,
+                        beta_col: 0,
+                        se_col: 1,
+                        chisq_col: 2,
+                        raw_p_col: 3,
+                    },
+                    "add",
+                    AssocCoreSitesBlock {
+                        sites: &sites[..m],
+                        maf: &maf[..m],
+                        miss: AssocMissBlock::CountUsize {
+                            values: &miss[..m],
+                            n_samples: n,
+                        },
+                    },
+                    &out_buf[..m * 5],
+                )
+                .map_err(PyRuntimeError::new_err)?;
+                send_text_buf(&writer, &mut text).map_err(PyRuntimeError::new_err)?;
+                kept_total = kept_total.saturating_add(m);
+            }
+
+            seen_total = seen_total.saturating_add(rows);
+            if let Some(cb) = progress_callback.as_ref() {
+                if seen_total >= next_progress || seen_total == n_snps {
+                    while next_progress <= seen_total {
+                        next_progress = next_progress.saturating_add(progress_block);
+                        if next_progress == 0 {
+                            break;
+                        }
+                    }
+                    Python::attach(|py2| -> PyResult<()> {
+                        py2.check_signals()?;
+                        cb.call1(py2, (seen_total.min(n_snps), n_snps))?;
+                        Ok(())
+                    })?;
+                }
+            }
+        }
+
+        if let Some(cb) = progress_callback.as_ref() {
+            Python::attach(|py2| -> PyResult<()> {
+                py2.check_signals()?;
+                cb.call1(py2, (n_snps, n_snps))?;
+                Ok(())
+            })?;
+        }
+        writer.finish().map_err(PyRuntimeError::new_err)?;
+        Ok((kept_total, n_snps))
     })
 }
 

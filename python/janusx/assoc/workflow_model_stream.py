@@ -1177,15 +1177,18 @@ def run_chunked_gwas_lmm_lm(
     if model_key == "lm":
         can_single_entry = (
             _as_plink_prefix(genofile) is not None
-            and hasattr(jxrs, "lm_stream_bed_to_tsv")
+            and (
+                hasattr(jxrs, "lm_stream_bed_to_tsv")
+                or hasattr(jxrs, "lm_pgen_to_tsv_f32")
+            )
             and not bool(bimranges)
         )
         if can_single_entry:
             _log_file_only(
                 logger,
                 logging.INFO,
-                "LM route: using rust single-entry BED streaming pipeline "
-                "(positioned reads handled automatically by the default PREAD backend).",
+                "LM route: using rust single-entry PLINK streaming pipeline "
+                "(BED or PGEN; positioned reads handled automatically by the default PREAD backend).",
             )
             run_lm_stream_bed_single_entry(
                 genofile=genofile,
@@ -2431,6 +2434,7 @@ def run_chunked_gwas_streaming_shared(
     model_order = [m for m in model_order if m in model_map]
     if len(model_order) == 0:
         return
+    source_is_pgen = str(_as_plink_input_path(genofile) or "").lower().endswith(".pgen")
     trait_prepared_meta = _resolve_trait_prepared_meta_for_current_filters(
         trait_prepared_meta,
         maf_threshold=float(maf_threshold),
@@ -2941,7 +2945,7 @@ def run_chunked_gwas_streaming_shared(
         miss_rate_chunk = _missing_rate_chunk(
             miss_chunk,
             n_used,
-            already_rate=trait_prepared_meta is not None,
+            already_rate=bool(trait_prepared_meta is not None and not source_is_pgen),
         )
         snp_chunk = _resolve_stream_chunk_snp_names(list(sites))
 
@@ -3035,21 +3039,18 @@ def run_chunked_gwas_streaming_shared(
                         mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
                     )
                 elif trait_prepared_meta is not None:
-                    # BedChunkReaderFromMeta uses the BED-only windowed matrix.
-                    # Keep PGEN selection explicit and feed its prefiltered row
-                    # indices through the native PGEN chunk reader instead.
+                    # PGEN: stream source rows sequentially and repeat the same
+                    # trait-sample QC in Rust. Feeding cached row_indices here
+                    # would force one PGEN seek per variant on large panels.
                     bed_reader = _new_bed_chunk_reader_for_stream(
                         bed_prefix=str(bed_prefix),
-                        maf_threshold=0.0,
-                        max_missing_rate=1.0,
+                        maf_threshold=float(maf_threshold),
+                        max_missing_rate=float(max_missing_rate),
                         sample_ids=sample_sub.tolist(),
                         model=str(genetic_model),
-                        het_threshold=1.0,
+                        het_threshold=float(het_threshold),
                         mmap_window_mb=None,
-                        bimranges=None,
-                        snp_indices=np.asarray(
-                            trait_prepared_meta["row_indices"], dtype=np.int64
-                        ),
+                        bimranges=(bimranges if bimranges else None),
                         logger=logger,
                     )
                 else:

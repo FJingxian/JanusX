@@ -1296,36 +1296,56 @@ where
     if bytes_per_snp == 0 {
         return Err("bytes_per_snp is zero".to_string());
     }
-    let bed_path = format!("{bed_prefix}.bed");
-    let mut bed_window = if let Some(window_mb) = mmap_window_mb.filter(|&v| v > 0) {
-        Some(WindowedBedMatrix::open_lm_lmm(bed_prefix, window_mb)?)
+    let pgen_source = crate::pgen::path_uses_pgen(bed_prefix);
+    let mut bed_window = None;
+    let mut full_mmap = None;
+    let n_snps = if pgen_source {
+        crate::pgen::count_pvar_variants(bed_prefix)?
+    } else {
+        let bed_path = format!("{bed_prefix}.bed");
+        bed_window = if let Some(window_mb) = mmap_window_mb.filter(|&v| v > 0) {
+            Some(WindowedBedMatrix::open_lm_lmm(bed_prefix, window_mb)?)
+        } else {
+            None
+        };
+        full_mmap = if bed_window.is_none() {
+            let bed_file = File::open(&bed_path).map_err(|e| format!("open {bed_path}: {e}"))?;
+            let mmap =
+                unsafe { Mmap::map(&bed_file) }.map_err(|e| format!("mmap {bed_path}: {e}"))?;
+            if mmap.len() < 3 || mmap[0] != 0x6C || mmap[1] != 0x1B || mmap[2] != 0x01 {
+                return Err("only SNP-major BED supported".to_string());
+            }
+            let data_len = mmap.len() - 3;
+            if data_len % bytes_per_snp != 0 {
+                return Err(format!(
+                    "BED payload length {data_len} not a multiple of {bytes_per_snp}"
+                ));
+            }
+            Some(mmap)
+        } else {
+            None
+        };
+        if let Some(window) = bed_window.as_ref() {
+            window.n_source_snps()
+        } else {
+            let mmap = full_mmap
+                .as_ref()
+                .ok_or_else(|| "internal error: missing BED source".to_string())?;
+            (mmap.len() - 3) / bytes_per_snp
+        }
+    };
+    let mut pgen_reader = if pgen_source {
+        let pgen_prefix = crate::pgen::normalize_pgen_prefix(bed_prefix);
+        let pgen_path = std::path::PathBuf::from(format!("{pgen_prefix}.pgen"));
+        Some(crate::pgen::PgenReader::open(
+            &pgen_path,
+            n_samples_full,
+            n_snps,
+        )?)
     } else {
         None
     };
-    let full_mmap = if bed_window.is_none() {
-        let bed_file = File::open(&bed_path).map_err(|e| format!("open {bed_path}: {e}"))?;
-        let mmap = unsafe { Mmap::map(&bed_file) }.map_err(|e| format!("mmap {bed_path}: {e}"))?;
-        if mmap.len() < 3 || mmap[0] != 0x6C || mmap[1] != 0x1B || mmap[2] != 0x01 {
-            return Err("only SNP-major BED supported".to_string());
-        }
-        let data_len = mmap.len() - 3;
-        if data_len % bytes_per_snp != 0 {
-            return Err(format!(
-                "BED payload length {data_len} not a multiple of {bytes_per_snp}"
-            ));
-        }
-        Some(mmap)
-    } else {
-        None
-    };
-    let n_snps = if let Some(window) = bed_window.as_ref() {
-        window.n_source_snps()
-    } else {
-        let mmap = full_mmap
-            .as_ref()
-            .ok_or_else(|| "internal error: missing BED source".to_string())?;
-        (mmap.len() - 3) / bytes_per_snp
-    };
+    let mut pgen_packed: Vec<u8> = Vec::new();
     let mut bim_reader = BimChunkReader::open(bed_prefix)?;
     let prepared_source_rows = if let Some(meta) = prepared_meta {
         let m = meta.row_indices.len();
@@ -1443,32 +1463,71 @@ where
                 chunk_start = chunk_end;
                 return chunk_start < total_scan_units;
             }
-            match bed_window.as_mut() {
-                Some(window) => match window.prepare_source_rows(source_rows, &mut rel_row_indices)
-                {
-                    Ok(slice) => slice,
-                    Err(e) => {
-                        let _ = producer_err_bg.set(e);
+            if pgen_source {
+                let src_start = source_rows[0];
+                let src_end = source_rows[source_rows.len() - 1] + 1;
+                let rows = src_end - src_start;
+                pgen_packed.resize(rows * bytes_per_snp, 0);
+                let reader = match pgen_reader.as_mut() {
+                    Some(reader) => reader,
+                    None => {
+                        let _ =
+                            producer_err_bg.set("internal error: missing PGEN reader".to_string());
                         return false;
                     }
-                },
-                None => {
-                    let mmap = match full_mmap.as_ref() {
-                        Some(mmap) => mmap,
-                        None => {
-                            let _ = producer_err_bg
-                                .set("internal error: missing full BED mmap".to_string());
-                            return false;
+                };
+                if let Err(e) =
+                    reader.read_source_block(src_start, rows, pgen_packed.as_mut_slice())
+                {
+                    let _ = producer_err_bg.set(e);
+                    return false;
+                }
+                pgen_packed.as_slice()
+            } else {
+                match bed_window.as_mut() {
+                    Some(window) => {
+                        match window.prepare_source_rows(source_rows, &mut rel_row_indices) {
+                            Ok(slice) => slice,
+                            Err(e) => {
+                                let _ = producer_err_bg.set(e);
+                                return false;
+                            }
                         }
-                    };
-                    let packed = &mmap[3..];
-                    let src_start = source_rows[0];
-                    let src_end = source_rows[source_rows.len() - 1] + 1;
-                    let start_byte = src_start * bytes_per_snp;
-                    let end_byte = src_end * bytes_per_snp;
-                    &packed[start_byte..end_byte]
+                    }
+                    None => {
+                        let mmap = match full_mmap.as_ref() {
+                            Some(mmap) => mmap,
+                            None => {
+                                let _ = producer_err_bg
+                                    .set("internal error: missing full BED mmap".to_string());
+                                return false;
+                            }
+                        };
+                        let packed = &mmap[3..];
+                        let src_start = source_rows[0];
+                        let src_end = source_rows[source_rows.len() - 1] + 1;
+                        let start_byte = src_start * bytes_per_snp;
+                        let end_byte = src_end * bytes_per_snp;
+                        &packed[start_byte..end_byte]
+                    }
                 }
             }
+        } else if pgen_source {
+            let rows = chunk_end - chunk_start;
+            pgen_packed.resize(rows * bytes_per_snp, 0);
+            let reader = match pgen_reader.as_mut() {
+                Some(reader) => reader,
+                None => {
+                    let _ = producer_err_bg.set("internal error: missing PGEN reader".to_string());
+                    return false;
+                }
+            };
+            if let Err(e) = reader.read_source_block(chunk_start, rows, pgen_packed.as_mut_slice())
+            {
+                let _ = producer_err_bg.set(e);
+                return false;
+            }
+            pgen_packed.as_slice()
         } else {
             match bed_window.as_mut() {
                 Some(window) => match window.read_source_range(chunk_start, chunk_end) {

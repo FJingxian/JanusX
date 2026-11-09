@@ -256,7 +256,8 @@ use gfreader::{
 };
 use glm::{
     lm_assoc_kfile_to_tsv_f32, lm_block_assoc_f32, lm_block_assoc_packed,
-    lm_block_assoc_packed_to_tsv, lm_stream_bed_segments_compact_to_tsv, lm_stream_bed_to_tsv,
+    lm_block_assoc_packed_to_tsv, lm_pgen_to_tsv_f32, lm_stream_bed_segments_compact_to_tsv,
+    lm_stream_bed_to_tsv,
 };
 use gmerge::{convert_genotypes, merge_genotypes, PyConvertStats, PyMergeStats};
 use grm::{
@@ -802,6 +803,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(lm_block_assoc_f32, m)?)?;
     m.add_function(wrap_pyfunction!(algwas_packed_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(lm_stream_bed_to_tsv, m)?)?;
+    m.add_function(wrap_pyfunction!(lm_pgen_to_tsv_f32, m)?)?;
     m.add_function(wrap_pyfunction!(lm_assoc_kfile_to_tsv_f32, m)?)?;
     m.add_function(wrap_pyfunction!(lm_trait_assoc_bed_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(lm_trait_assoc_bed_matrix_to_tsv, m)?)?;

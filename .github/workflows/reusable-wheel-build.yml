@@ -117,7 +117,7 @@ jobs:
                   "prefer_accelerate": "0",
                   "expected_backend": "openblas",
                   "upload_wheel": "true",
-                  "run_smoke_test": "false",
+                  "run_smoke_test": "true",
               },
               {
                   "label": "windows-arm64",
@@ -187,7 +187,7 @@ jobs:
                   "prefer_accelerate": "0",
                   "expected_backend": "openblas",
                   "upload_wheel": "true",
-                  "run_smoke_test": "false",
+                  "run_smoke_test": "true",
               },
               {
                   "label": "windows-arm64",
@@ -507,6 +507,10 @@ jobs:
         if: ${{ matrix.run_smoke_test == 'true' }}
         shell: bash
         run: |
+          # The build steps export OpenBLAS hints for compilation. Clear them
+          # before installing the wheel so the smoke test exercises the
+          # bundled runtime rather than a stale build-time DLL path.
+          unset OPENBLAS_BIN_DIR OPENBLAS_LIB_DIR OPENBLAS_INCLUDE_DIR LIBRARY_BIN LIBRARY_LIB
           PY=python
           command -v python >/dev/null 2>&1 || PY=python3
           "$PY" -m pip install --upgrade pip

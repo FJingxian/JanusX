@@ -9,7 +9,6 @@ use crate::farmcpu::farmcpu_packed_to_tsv;
 use crate::fvlmm::fvlmm_assoc_packed_f32_to_tsv;
 use crate::glm::ixx_from_x_qr;
 use crate::glm::lm_block_assoc_packed_to_tsv;
-use crate::linalg::{chi2_sf_df1, cholesky_gram_inplace, cholesky_solve_into};
 use crate::lmm::lmm_reml_assoc_packed_f32_to_tsv;
 
 fn req_item<'py>(d: &Bound<'py, PyDict>, key: &str) -> PyResult<Bound<'py, PyAny>> {
@@ -50,122 +49,6 @@ fn call_progress(
         )?;
     }
     Ok(())
-}
-
-fn lm_null_ml_from_y_xcov(y: &[f64], xcov: &[f64], n: usize, p_cov: usize) -> Option<f64> {
-    if n == 0 {
-        return None;
-    }
-    let dim = p_cov + 1;
-    if n <= dim {
-        return None;
-    }
-
-    let mut xtx = vec![0.0_f64; dim * dim];
-    let mut xty = vec![0.0_f64; dim];
-    let mut xrow = vec![0.0_f64; dim];
-    xrow[0] = 1.0;
-
-    for i in 0..n {
-        let yi = y[i];
-        for c in 0..p_cov {
-            xrow[c + 1] = xcov[i * p_cov + c];
-        }
-
-        for r in 0..dim {
-            let xr = xrow[r];
-            xty[r] += xr * yi;
-            for c in 0..=r {
-                xtx[r * dim + c] += xr * xrow[c];
-            }
-        }
-    }
-    for r in 0..dim {
-        for c in 0..r {
-            xtx[c * dim + r] = xtx[r * dim + c];
-        }
-    }
-
-    let mut chol = xtx.clone();
-    cholesky_gram_inplace(&mut chol, dim)?;
-
-    let mut beta = vec![0.0_f64; dim];
-    cholesky_solve_into(&chol, dim, &xty, &mut beta);
-
-    let mut rss = 0.0_f64;
-    for i in 0..n {
-        let mut fit = beta[0];
-        for c in 0..p_cov {
-            fit += beta[c + 1] * xcov[i * p_cov + c];
-        }
-        let r = y[i] - fit;
-        rss += r * r;
-    }
-    if !(rss.is_finite() && rss > 0.0) {
-        return None;
-    }
-
-    let n_f = n as f64;
-    let c_ml = n_f * (n_f.ln() - 1.0 - (2.0 * std::f64::consts::PI).ln()) / 2.0;
-    Some(c_ml - 0.5 * n_f * rss.ln())
-}
-
-#[pyfunction]
-#[pyo3(signature = (y, x_cov, lmm_ml0, alpha=0.05, boundary_mixture=true))]
-pub fn gwas_lmm_lm_null_lrt_decision<'py>(
-    _py: Python<'py>,
-    y: PyReadonlyArray1<'py, f64>,
-    x_cov: PyReadonlyArray2<'py, f64>,
-    lmm_ml0: f64,
-    alpha: f64,
-    boundary_mixture: bool,
-) -> PyResult<(bool, f64, f64, f64)> {
-    if !(lmm_ml0.is_finite()) {
-        return Err(PyRuntimeError::new_err("lmm_ml0 must be finite"));
-    }
-    if !(alpha.is_finite() && alpha > 0.0 && alpha < 1.0) {
-        return Err(PyRuntimeError::new_err("alpha must be in (0,1)"));
-    }
-
-    let y_slice = y.as_slice()?;
-    let x_arr = x_cov.as_array();
-    if x_arr.ndim() != 2 {
-        return Err(PyRuntimeError::new_err("x_cov must be 2D"));
-    }
-    let n = y_slice.len();
-    let p_cov = x_arr.shape()[1];
-    if x_arr.shape()[0] != n {
-        return Err(PyRuntimeError::new_err("x_cov rows must equal len(y)"));
-    }
-    if n <= p_cov + 1 {
-        return Err(PyRuntimeError::new_err(
-            "insufficient samples: require n > p_cov + 1",
-        ));
-    }
-    let x_slice: Vec<f64> = match crate::stats_common::array_standard_slice(&x_cov) {
-        Ok(v) => v.to_vec(),
-        Err(_) => crate::stats_common::copy_array_standard_layout(&x_arr),
-    };
-
-    let lm_ml0 = lm_null_ml_from_y_xcov(y_slice, &x_slice, n, p_cov)
-        .ok_or_else(|| PyRuntimeError::new_err("failed to compute LM null log-likelihood"))?;
-
-    let mut lrt_stat = 2.0 * (lmm_ml0 - lm_ml0);
-    if !lrt_stat.is_finite() || lrt_stat < 0.0 {
-        lrt_stat = 0.0;
-    }
-    let mut pval = chi2_sf_df1(lrt_stat);
-    if boundary_mixture {
-        pval *= 0.5;
-    }
-    if !pval.is_finite() {
-        pval = 1.0;
-    }
-    pval = pval.clamp(f64::MIN_POSITIVE, 1.0);
-
-    // H0: Va = 0 (LM). If not significant, prefer LM.
-    let switch_to_lm = pval >= alpha;
-    Ok((switch_to_lm, lrt_stat, pval, lm_ml0))
 }
 
 #[pyfunction]

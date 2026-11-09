@@ -37,7 +37,6 @@ from .workflow import (
     _finalize_gwas_result_tsv,
     _cleanup_gwas_result_tmp,
     _progress_callback_step,
-    _mixed_model_switch_to_lm_decision,
     _resolve_trait_iter,
     _gwas_result_tmp_path,
     _gwas_eigh_from_grm,
@@ -1471,53 +1470,14 @@ def run_chunked_gwas_lmm_lm(
             evd_secs = time.monotonic() - evd_t0
             evd_elapsed = format_elapsed(evd_secs)
             init_log_message = None
-            null_lrt_p: Optional[float] = None
-            if (not bool(force_model)) and effective_model_key in {"lmm", "lmm2", "fvlmm"}:
-                source_label = str(effective_model_label)
-                switch_to_lm, lrt_stat, lrt_p = _mixed_model_switch_to_lm_decision(
-                    y_vec=y_vec,
-                    x_cov=X_cov,
-                    lmm_ml0=getattr(mod, "ML0_model_selection", None),
-                    alpha=0.05,
+            null_log = _format_mixed_model_null_pve_log(mod)
+            if null_log != "":
+                init_log_message = f"{null_log}; eigen-decomposition [{evd_elapsed}]"
+            else:
+                init_log_message = (
+                    f"PVE(null, pheno-scale) ~ {mod.pve:.3f}; "
+                    f"eigen-decomposition [{evd_elapsed}]"
                 )
-                null_lrt_p = float(lrt_p)
-                null_pve_log = _format_mixed_model_null_pve_log(
-                    mod,
-                    null_pvalue=null_lrt_p,
-                    include_se_placeholder=True,
-                    include_pvalue=False,
-                )
-                if switch_to_lm:
-                    logger.warning(
-                        f"Warning: {source_label} switch to LM for trait {pname}: "
-                        f"null LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g} (>=0.05)"
-                        f"{'; ' + null_pve_log if null_pve_log else ''}."
-                    )
-                    stage_threads = max(1, int(threads))
-                    with _gwas_evd_stage_ctx(stage_threads):
-                        mod = LM(y=y_vec, X=X_cov)
-                    init_log_message = (
-                        f"switched from {source_label} null to LM "
-                        f"(LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g}"
-                        f"{'; ' + null_pve_log if null_pve_log else ''}) "
-                        f"[{evd_elapsed}]"
-                    )
-                    effective_model_key = "lm"
-                    effective_model_label = "LM"
-                    effective_model_tag = "lm"
-                    header_pve = None
-
-            if init_log_message is None:
-                null_log = _format_mixed_model_null_pve_log(
-                    mod,
-                    null_pvalue=null_lrt_p,
-                    include_se_placeholder=(null_lrt_p is not None),
-                    include_pvalue=(null_lrt_p is not None),
-                )
-                if null_log != "":
-                    init_log_message = f"{null_log}; eigen-decomposition [{evd_elapsed}]"
-                else:
-                    init_log_message = f"PVE(null, pheno-scale) ~ {mod.pve:.3f}; eigen-decomposition [{evd_elapsed}]"
         else:
             mod = ModelCls(y=y_vec, X=X_cov)
             init_log_message = "streaming scan initialized"
@@ -2735,45 +2695,9 @@ def run_chunked_gwas_streaming_shared(
                 pve_now = None
         ctx["null_pve"] = pve_now
 
-        null_lrt_p: Optional[float] = None
-        if (not bool(force_model)) and effective_model_key in {"lmm", "lmm2", "fvlmm"}:
-            source_label = str(effective_model_label)
-            switch_to_lm, lrt_stat, lrt_p = _mixed_model_switch_to_lm_decision(
-                y_vec=y_vec,
-                x_cov=X_cov,
-                lmm_ml0=getattr(mod, "ML0_model_selection", None),
-                alpha=0.05,
-            )
-            null_lrt_p = float(lrt_p)
-            null_pve_log = _format_mixed_model_null_pve_log(
-                mod,
-                null_pvalue=null_lrt_p,
-                include_se_placeholder=True,
-                include_pvalue=False,
-            )
-            if switch_to_lm:
-                logger.warning(
-                    f"Warning: {source_label} switch to LM for trait {pname}: "
-                    f"null LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g} (>=0.05)"
-                    f"{'; ' + null_pve_log if null_pve_log else ''}."
-                )
-                ctx["init_log"] = (
-                    f"switched from {source_label} null to LM "
-                    f"(LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g}"
-                    f"{'; ' + null_pve_log if null_pve_log else ''}) "
-                    f"[{format_elapsed(float(ctx['evd_secs']))}]"
-                )
-                effective_model_key = "lm"
-                effective_model_label = "LM"
-                effective_model_tag = "lm"
         if ctx["init_log"] is None:
             if mkey in kinship_model_keys:
-                null_log = _format_mixed_model_null_pve_log(
-                    mod,
-                    null_pvalue=null_lrt_p,
-                    include_se_placeholder=(null_lrt_p is not None),
-                    include_pvalue=(null_lrt_p is not None),
-                )
+                null_log = _format_mixed_model_null_pve_log(mod)
                 if null_log != "":
                     if float(ctx["evd_secs"]) > 0.0:
                         ctx["init_log"] = (

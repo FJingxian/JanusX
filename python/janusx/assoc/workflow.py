@@ -1152,62 +1152,6 @@ def _cleanup_gwas_result_tmp(tmp_tsv: str) -> None:
         pass
 
 
-def _mixed_model_switch_to_lm_decision(
-    *,
-    y_vec: np.ndarray,
-    x_cov: np.ndarray,
-    lmm_ml0: Optional[float],
-    alpha: float = 0.05,
-) -> tuple[bool, float, float]:
-    """
-    Decide whether a mixed-model null fit should collapse to LM.
-
-    This compares separately maximized null ML against the plain LM null
-    model under the boundary test H0: Va = 0. Do not pass ML evaluated only
-    at the REML-optimal lambda; that conditional value is for fixed-lambda PLRT.
-    """
-    ml0 = None
-    try:
-        if lmm_ml0 is not None:
-            ml0_tmp = float(lmm_ml0)
-            if np.isfinite(ml0_tmp):
-                ml0 = ml0_tmp
-    except Exception:
-        ml0 = None
-
-    if ml0 is None:
-        raise RuntimeError(
-            "Mixed-model -> LM switch decision requires finite null ML (ml0)."
-        )
-    if not hasattr(jxrs, "gwas_lmm_lm_null_lrt_decision"):
-        raise RuntimeError(
-            "Rust symbol gwas_lmm_lm_null_lrt_decision is unavailable."
-        )
-    y_arr = np.ascontiguousarray(np.asarray(y_vec, dtype=np.float64).reshape(-1))
-    x_arr = np.asarray(x_cov, dtype=np.float64)
-    if x_arr.ndim == 1:
-        x_arr = x_arr.reshape(-1, 1)
-    if x_arr.ndim != 2 or int(x_arr.shape[0]) != int(y_arr.size):
-        raise ValueError("LMM->LM comparison covariates must be a 2D matrix aligned to y")
-    full_design = np.ascontiguousarray(
-        np.column_stack([np.ones(y_arr.size, dtype=np.float64), x_arr]),
-        dtype=np.float64,
-    )
-    reduced_design, _kept, _dropped = _rank_reduce_fixed_effect_design(
-        full_design,
-        warn=False,
-    )
-    x_arr = np.ascontiguousarray(reduced_design[:, 1:], dtype=np.float64)
-    switch_to_lm, lrt_stat, pval, _lm_ml0 = jxrs.gwas_lmm_lm_null_lrt_decision(
-        y_arr,
-        x_arr,
-        float(ml0),
-        float(alpha),
-        True,
-    )
-    return bool(switch_to_lm), float(lrt_stat), float(pval)
-
-
 def _chi2_sf_df1_vec(stat: np.ndarray) -> np.ndarray:
     """
     Survival function for Chi-square(df=1), vectorized.

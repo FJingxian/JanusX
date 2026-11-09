@@ -73,7 +73,6 @@ from .workflow import (
     _log_file_only,
     _log_model_line,
     _make_deferred_bim_metadata,
-    _mixed_model_switch_to_lm_decision,
     _rank_reduce_fixed_effect_design,
     _progress_callback_step,
     _coerce_bim_site_columns,
@@ -6555,23 +6554,6 @@ def _run_mixed_trait_packed_multi_entry(
                 else None
             ),
         }
-        switch_to_lm = False
-        lrt_stat = float("nan")
-        lrt_p = float("nan")
-        if not bool(force_model):
-            switch_to_lm, lrt_stat, lrt_p = _mixed_model_switch_to_lm_decision(
-                y_vec=y_vec,
-                x_cov=shared_x_cov,
-                lmm_ml0=float(ml0_model_selection),
-                alpha=0.05,
-            )
-        state.update(
-            {
-                "switch_to_lm": bool(switch_to_lm),
-                "lrt_stat": float(lrt_stat),
-                "lrt_p": float(lrt_p),
-            }
-        )
         return trait_idx, state
 
     if outer_workers <= 1:
@@ -6600,49 +6582,6 @@ def _run_mixed_trait_packed_multi_entry(
         if not isinstance(state, dict):
             raise RuntimeError(f"{model_label} trait-level null fit produced an empty state.")
         trait_states.append(state)
-
-    if not bool(force_model):
-        switch_state = next(
-            (state for state in trait_states if bool(state.get("switch_to_lm", False))),
-            None,
-        )
-        if switch_state is not None:
-            _emit_warning_line(
-                logger,
-                (
-                    f"{model_label} trait-level fast path disabled: trait {switch_state['trait']} would switch to LM "
-                    f"(null LRT stat={float(switch_state.get('lrt_stat', float('nan'))):.4g}, "
-                    f"p={float(switch_state.get('lrt_p', float('nan'))):.4g}); falling back to serial packed route."
-                ),
-                use_spinner=bool(use_spinner),
-            )
-            fallback_serial(
-                genofile=genofile,
-                pheno=pheno,
-                ids=ids,
-                grm=grm,
-                outprefix=outprefix,
-                maf_threshold=maf_threshold,
-                max_missing_rate=max_missing_rate,
-                genetic_model=genetic_model,
-                het_threshold=het_threshold,
-                chunk_size=chunk_size,
-                qmatrix=qmatrix,
-                cov_all=cov_all,
-                plot=plot,
-                threads=threads,
-                logger=logger,
-                use_spinner=use_spinner,
-                snps_only=bool(snps_only),
-                eff_snp_by_trait=eff_snp_by_trait,
-                summary_rows=summary_rows,
-                saved_paths=saved_paths,
-                trait_names=trait_labels,
-                emit_trait_header=False,
-                preloaded_packed=packed_preload_ready,
-                force_model=bool(force_model),
-            )
-            return
 
     out_tsv = f"{outprefix}.lmm.tsv"
     agg_tmp_tsv = _gwas_result_tmp_path(out_tsv)
@@ -7088,56 +7027,6 @@ def run_lmm_packed_fullrank(
                 header_pve = pve_tmp
         except Exception:
             header_pve = None
-        if not bool(force_model):
-            switch_to_lm, lrt_stat, lrt_p = _mixed_model_switch_to_lm_decision(
-                y_vec=y_vec,
-                x_cov=x_cov,
-                lmm_ml0=getattr(mod, "ML0_model_selection", None),
-                alpha=0.05,
-            )
-            if switch_to_lm:
-                logger.warning(
-                    f"Warning: LMM switch to LM for trait {pname}: "
-                    f"null LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g} (>=0.05)."
-                )
-                _log_model_line(
-                    logger,
-                    "LM",
-                    (
-                        f"switched from LMM null to LM "
-                        f"(LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g}) "
-                        f"[{format_elapsed(evd_secs)}]"
-                    ),
-                    use_spinner=bool(use_spinner),
-                )
-                run_lm_packed_fullrank(
-                    genofile=genofile,
-                    pheno=pheno,
-                    ids=ids,
-                    outprefix=outprefix,
-                    maf_threshold=maf_threshold,
-                    max_missing_rate=max_missing_rate,
-                    genetic_model=genetic_model,
-                    het_threshold=het_threshold,
-                    chunk_size=chunk_size,
-                    qmatrix=qmatrix,
-                    cov_all=cov_all,
-                    plot=plot,
-                    threads=threads,
-                    logger=logger,
-                    use_spinner=use_spinner,
-                    snps_only=bool(snps_only),
-                    eff_snp_by_trait=eff_snp_by_trait,
-                    summary_rows=summary_rows,
-                    saved_paths=saved_paths,
-                    trait_names=[pname],
-                    emit_trait_header=False,
-                    preloaded_packed=packed_preload_ready,
-                    force_model=bool(force_model),
-                )
-                if multi_trait_mode:
-                    logger.info("")
-                continue
         _log_model_line(
             logger,
             "LMM",
@@ -8596,112 +8485,6 @@ def run_splmm_windowed_fullrank(
             null_fit = None
             _stop_prepare_handle()
             continue
-
-        null_ml0 = null_fit.get("ml", None)
-        if (
-            (not bool(force_model))
-            and (null_ml0 is None or not np.isfinite(float(null_ml0)))
-            and str(null_objective_label).strip().lower() == "fastgwa"
-        ):
-            try:
-                raw_lrt_fit, raw_lrt_secs = _run_sparse_raw_lrt_null_fit_task()
-                raw_ml0 = raw_lrt_fit.get("ml", None)
-                if raw_ml0 is not None and np.isfinite(float(raw_ml0)):
-                    null_ml0 = float(raw_ml0)
-                    _log_file_only(
-                        logger,
-                        logging.INFO,
-                        (
-                            f"{model_label_norm}: supplemental raw sparse null fit for LRT "
-                            f"completed for trait {pname} [{format_elapsed(raw_lrt_secs)}]."
-                        ),
-                    )
-            except Exception as ex:
-                _log_file_only(
-                    logger,
-                    logging.INFO,
-                    (
-                        f"{model_label_norm}: supplemental raw sparse null fit for LRT failed "
-                        f"for trait {pname}; retaining approx route without null LRT. reason={ex}"
-                    ),
-                )
-        if (not bool(force_model)) and null_ml0 is not None and np.isfinite(float(null_ml0)):
-            switch_to_lm, lrt_stat, lrt_p = _mixed_model_switch_to_lm_decision(
-                y_vec=y_vec,
-                x_cov=x_cov,
-                lmm_ml0=float(null_ml0),
-                alpha=0.05,
-            )
-            if switch_to_lm:
-                logger.warning(
-                    f"Warning: {model_label_norm} switch to LM for trait {pname}: "
-                    f"null LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g} (>=0.05)."
-                )
-                _log_model_line(
-                    logger,
-                    "LM",
-                    (
-                        f"switched from {model_label_norm} null to LM "
-                        f"(LRT stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g}) "
-                        f"[{format_elapsed(null_secs)}]"
-                    ),
-                    use_spinner=bool(use_spinner),
-                )
-                _stop_prepare_handle()
-                if _trait_has_existing_lm_result():
-                    _log_file_only(
-                        logger,
-                        logging.INFO,
-                        f"LM: reusing prior LM result for trait {pname} after {model_label_norm} fallback.",
-                    )
-                else:
-                    run_lm_stream_bed_single_entry(
-                        genofile=genofile,
-                        pheno=pheno_trait_subset,
-                        ids=ids_trait_subset,
-                        n_snps=int(n_scan_sites_hint),
-                        outprefix=outprefix,
-                        maf_threshold=maf_threshold,
-                        max_missing_rate=max_missing_rate,
-                        genetic_model=genetic_model,
-                        het_threshold=het_threshold,
-                        chunk_size=chunk_size,
-                        qmatrix=qmatrix[keep_idx],
-                        cov_all=(None if cov_all is None else np.ascontiguousarray(cov_all[keep_idx], dtype=np.float64)),
-                        plot=plot,
-                        threads=threads,
-                        logger=logger,
-                        use_spinner=use_spinner,
-                        snps_only=bool(snps_only),
-                        eff_snp_by_trait=eff_snp_by_trait,
-                        summary_rows=summary_rows,
-                        saved_paths=saved_paths,
-                        trait_names=None,
-                        emit_trait_header=False,
-                    )
-                if multi_trait_mode:
-                    logger.info("")
-                scan_meta = None
-                null_fit = None
-                _stop_prepare_handle()
-                continue
-            _log_file_only(
-                logger,
-                logging.INFO,
-                (
-                    f"{model_label_norm}: null LRT retained {model_label_norm} "
-                    f"for trait {pname} (stat={float(lrt_stat):.4g}, p={float(lrt_p):.4g})."
-                ),
-            )
-        elif not bool(force_model):
-            _log_file_only(
-                logger,
-                logging.INFO,
-                (
-                    f"{model_label_norm}: null LRT skipped for trait {pname} "
-                    "because sparse null ML log-likelihood was unavailable or non-finite."
-                ),
-            )
 
         for _buf_key in ("grm", "eigvals", "eigvecs"):
             null_fit.pop(_buf_key, None)

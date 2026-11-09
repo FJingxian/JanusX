@@ -270,8 +270,7 @@ use gstats::{
     gstats_bed_site_stats_compare,
 };
 use gwas_unified::{
-    gwas_lmm_lm_null_lrt_decision, gwas_packed_unified_to_tsv, gwas_trait_model_dispatch_v2,
-    gwas_trait_model_schedule,
+    gwas_packed_unified_to_tsv, gwas_trait_model_dispatch_v2, gwas_trait_model_schedule,
 };
 use gwasio::load_gwas_triplet_fast;
 use gwriter::{HmpStreamWriter, PlinkStreamWriter, VcfStreamWriter};
@@ -941,7 +940,6 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(gwas_packed_unified_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(gwas_trait_model_dispatch_v2, m)?)?;
     m.add_function(wrap_pyfunction!(gwas_trait_model_schedule, m)?)?;
-    m.add_function(wrap_pyfunction!(gwas_lmm_lm_null_lrt_decision, m)?)?;
     m.add_function(wrap_pyfunction!(farmcpu_write_assoc_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_reml_null_f32, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_null_fit_f32, m)?)?;

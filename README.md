@@ -1,6 +1,6 @@
 # JanusX
 
-[CLI Guide](./doc/JanusXcli.md) | [Core API Guide](./doc/JanusXcore.md) | [v2.0.0 Release](./doc/release/v2.0.0.md)
+[CLI Guide](./doc/JanusXcli.md) | [Core API Guide](./doc/JanusXcore.md) | [v2.0.1 Release](./doc/release/v2.0.1.md)
 
 [![GitHub release](https://img.shields.io/github/v/release/FJingxian/JanusX?label=release)](https://github.com/FJingxian/JanusX/releases/latest) ![Python](https://img.shields.io/badge/Python-3.10+-blue.svg) ![License](https://img.shields.io/badge/License-AGPLv3-blue.svg)
 
@@ -49,7 +49,7 @@ powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/FJi
 ### Option A: Python package install
 
 ```Bash
-pip install janusx==2.0.0
+pip install janusx==2.0.1
 ```
 
 ### Option B: Conda / Bioconda

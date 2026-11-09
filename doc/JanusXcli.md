@@ -1,6 +1,6 @@
 # JanusX CLI Guide
 
-Version baseline: `v2.0.0`
+Version baseline: `v2.0.1`
 
 This guide tracks the current command-line surface in this repository. For exact flags of any single module, always prefer:
 

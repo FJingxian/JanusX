@@ -2494,6 +2494,10 @@ impl BedSnpIter {
         if bytes_per_snp == 0 {
             return Err("invalid BED bytes_per_snp (zero)".to_string());
         }
+        // Python may pass an explicit `.bed` path to preserve the selected
+        // PLINK family when a same-prefix PGEN set is also present. This
+        // reader operates on prefixes, so normalize before appending `.bed`.
+        let prefix = normalize_genotype_prefix(prefix);
         let bed_path = format!("{prefix}.bed");
         let mut file = File::open(&bed_path).map_err(|e| e.to_string())?;
         let bed_len = file.metadata().map_err(|e| e.to_string())?.len() as usize;

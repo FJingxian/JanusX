@@ -1372,6 +1372,9 @@ def run_gwas_suite(paths: dict[str, Path], outdir: Path, logdir: Path, *, thread
             str(outdir),
         ]
     )
+    # `-force-model` only changes SPLMM now: LMM/LMM2 no longer fall back to
+    # LM on a null-model LRT. Keep this rerun focused so the suite does not
+    # repeat the expensive dense mixed-model scans just to exercise the flag.
     run(
         [
             "jx",
@@ -1380,11 +1383,6 @@ def run_gwas_suite(paths: dict[str, Path], outdir: Path, logdir: Path, *, thread
             str(sim_prefix),
             "-p",
             str(pheno_txt),
-            "-farmcpu",
-            "-lmm",
-            "-lmm2",
-            "-lm",
-            "-fvlmm",
             "-splmm",
             "-splmm-exact",
             "-k",

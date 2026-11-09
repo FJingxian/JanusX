@@ -305,10 +305,16 @@ def test_run_gwas_suite_emits_common_pca_gwas_and_postgwas_commands(
         "postgwas",
     ]
     gwas_commands = [cmd for cmd in commands if cmd[1] == "gwas"]
-    assert all("-farmcpu" in cmd for cmd in gwas_commands)
-    assert all("-splmm-exact" in cmd for cmd in gwas_commands)
+    assert "-farmcpu" in gwas_commands[0]
+    assert "-splmm-exact" in gwas_commands[0]
     assert "-force-model" not in gwas_commands[0]
     assert "-force-model" in gwas_commands[1]
+    # Only SPLMM still has a force-model fallback after LMM/LMM2 lost the
+    # null-LRT-to-LM switch; the rerun must not repeat other models.
+    assert "-splmm" in gwas_commands[1]
+    assert "-splmm-exact" in gwas_commands[1]
+    for absent in ("-farmcpu", "-lmm", "-lmm2", "-lm", "-fvlmm"):
+        assert absent not in gwas_commands[1]
     postgwas = commands[-1]
     assert postgwas[:3] == ["jx", "postgwas", "-gwasfile"]
     assert str(gwas_file) in postgwas

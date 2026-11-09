@@ -15,7 +15,7 @@ Models:
 Execution mode (automatic)
 --------------------------
   - No explicit "low-memory" flag is required.
-  - Sequential LM/LM2/LMM/LMM2 BED scans use bounded PREAD buffers by default
+  - Sequential LM/LMM/LMM2 BED scans use bounded PREAD buffers by default
     (set JX_LM_LMM_BED_PREAD=0 to retain the windowed mmap reader).
   - Packed BED preload is reserved for FarmCPU and ALGWAS.
   - FvLMM and SparseLMM remain on their existing streaming/mmap BED routes.
@@ -184,7 +184,7 @@ _GWAS_AUTO_MEM_GRM_BLOCK_ROWS = 4096
 _GWAS_AUTO_MEM_COPY_DECODE_BLOCK_ROWS = 8192
 _GWAS_AUTO_MEM_PACKED_BLOCK_ROWS = 4096
 _GWAS_AUTO_MEM_SPLMM_EXACT_BLOCK_ROWS = 8192
-# LM and LM2 allocate two decoded genotype chunks in the Rust scan pipeline.
+# LM allocates two decoded genotype chunks in the Rust scan pipeline.
 _GWAS_WORKING_BUFFERS_LM = 2
 _GWAS_WORKING_BUFFERS_GRM = 2
 _GWAS_WORKING_BUFFERS_PACKED = 2
@@ -343,7 +343,6 @@ def _kinship_fused_qc_eligible(
     route_key = str(route_name).strip().lower()
     env_key_by_model = {
         "lm": "JANUSX_LM_FUSED_QC",
-        "lm2": "JANUSX_LM2_FUSED_QC",
         "lmm": "JANUSX_LMM_FUSED_QC",
         "lmm2": "JANUSX_LMM2_FUSED_QC",
         "fvlmm": "JANUSX_FVLMM_FUSED_QC",
@@ -868,16 +867,6 @@ def _format_gwas_models_executed(args) -> str:
     models: list[str] = []
     if bool(args.lm):
         models.append("LM")
-    if bool(getattr(args, "lm2", None) is not None):
-        lm2_selector = list(getattr(args, "lm2_cov_cols", []) or [])
-        lm2_missing_external_cov = not bool(getattr(args, "cov", None))
-        lm2_will_fallback = bool(getattr(args, "_lm2_fallback_to_lm", False)) or (
-            len(lm2_selector) == 0
-        ) or lm2_missing_external_cov
-        if lm2_will_fallback:
-            models.append("LM2->LM")
-        else:
-            models.append("LM2")
     if bool(args.lmm):
         models.append("LMM")
     if bool(getattr(args, "lmm2", False)):
@@ -893,87 +882,6 @@ def _format_gwas_models_executed(args) -> str:
     if bool(args.algwas):
         models.append("ALGWAS")
     return ", ".join(models) if len(models) > 0 else "None"
-
-
-def _parse_lm2_covariate_selector(
-    value: object,
-    *,
-    label: str = "-lm2/--lm2",
-) -> list[int]:
-    raw = str(value).strip() if value is not None else ""
-    if raw == "" or raw == "__SELF__":
-        return []
-
-    picks: list[int] = []
-    seen: set[int] = set()
-
-    def _push(idx0: int) -> None:
-        if idx0 < 0:
-            raise ValueError(
-                f"{label}: covariate column indices must be >= 0, got {idx0}."
-            )
-        if idx0 not in seen:
-            seen.add(idx0)
-            picks.append(idx0)
-
-    for token in [str(x).strip() for x in raw.split(",") if str(x).strip() != ""]:
-        if ":" in token:
-            left, right = token.split(":", 1)
-            left = left.strip()
-            right = right.strip()
-            if left == "" and right == "":
-                raise ValueError(
-                    f"{label}: invalid empty covariate range '{token}'."
-                )
-            if left == "":
-                start = 0
-            else:
-                if not left.lstrip("+-").isdigit():
-                    raise ValueError(
-                        f"{label}: invalid covariate range start '{left}'."
-                    )
-                start = int(left)
-            if right == "":
-                raise ValueError(
-                    f"{label}: open-ended covariate range '{token}' is not supported; provide an explicit end."
-                )
-            if not right.lstrip("+-").isdigit():
-                raise ValueError(
-                    f"{label}: invalid covariate range end '{right}'."
-                )
-            end = int(right)
-            step = 1 if end >= start else -1
-            for idx1 in range(start, end + step, step):
-                _push(idx1)
-            continue
-        if not token.lstrip("+-").isdigit():
-            raise ValueError(
-                f"{label}: invalid covariate selector '{token}'. Use 0-based indices/ranges like 0, 0:3, :2, 0,3."
-            )
-        _push(int(token))
-    return picks
-
-
-def _resolve_lm2_covariate_indices(
-    cov_all,
-    selector_zero_based: list[int],
-    *,
-    label: str = "-lm2/--lm2",
-) -> np.ndarray:
-    arr = np.asarray(cov_all, dtype=np.float32)
-    if arr.ndim != 2:
-        raise ValueError("LM2 requires a 2D merged covariate matrix.")
-    ncov = int(arr.shape[1])
-    if ncov <= 0:
-        raise ValueError("LM2 requires at least one covariate column from -c.")
-    if len(selector_zero_based) == 0:
-        return np.asarray([], dtype=np.int64)
-    bad = [int(i) for i in selector_zero_based if int(i) < 0 or int(i) >= ncov]
-    if bad:
-        raise ValueError(
-            f"{label}: covariate column index out of range: {bad[0]}. valid=[0..{ncov - 1}]"
-        )
-    return np.asarray(selector_zero_based, dtype=np.int64)
 
 
 def _format_gwas_packed_route_status(
@@ -6539,7 +6447,7 @@ def _gwas_model_working_buffers(model_key: str) -> int:
         return int(_GWAS_WORKING_BUFFERS_COPY)
     if key in {"splmm", "splmm2", "algwas", "farmcpu"}:
         return int(_GWAS_WORKING_BUFFERS_PACKED)
-    if key in {"lm", "lm2"}:
+    if key == "lm":
         return int(_GWAS_WORKING_BUFFERS_LM)
     return 1
 
@@ -6593,7 +6501,7 @@ def _resolve_gwas_auto_decode_memory_gb(
         seen.add(reason_txt)
         candidates.append((float(memory_gb), reason_txt))
 
-    if len(models & {"lm", "lm2"}) > 0:
+    if "lm" in models:
         lm_target_bytes = int(float(_GWAS_AUTO_MEM_LM_TARGET_MB) * 1024.0 * 1024.0)
         lm_rows = int(
             min(
@@ -6608,7 +6516,7 @@ def _resolve_gwas_auto_decode_memory_gb(
                 elem_bytes=4,
                 buffers=_GWAS_WORKING_BUFFERS_LM,
             ),
-            f"LM/LM2 target≈{float(_GWAS_AUTO_MEM_LM_TARGET_MB):g}MB rows={int(lm_rows)}",
+            f"LM target≈{float(_GWAS_AUTO_MEM_LM_TARGET_MB):g}MB rows={int(lm_rows)}",
         )
 
     if len(models & {"lmm", "lmm2", "fvlmm"}) > 0:
@@ -7559,7 +7467,7 @@ def _run_file_dense_fast_once(
         ],
     )
 
-    model_sequence = [m for m in stream_models if m in {"lm", "lm2", "lmm", "lmm2", "fvlmm"}]
+    model_sequence = [m for m in stream_models if m in {"lm", "lmm", "lmm2", "fvlmm"}]
     pheno_aligned, ids = _align_pheno_to_sample_order(pheno, ids)
     trait_iter = list(pheno_aligned.columns)
     multi_trait_mode = len(trait_iter) > 1
@@ -8028,7 +7936,6 @@ def _resolve_gwas_output_prefix(
 
 def parse_args(argv: Optional[list[str]] = None):
     show_dev_help = _dev_help_requested(argv)
-    enable_lm2_arg = bool(show_dev_help or _option_present(argv, "-lm2", "--lm2"))
     enable_lmm2_arg = bool(show_dev_help or _option_present(argv, "-lmm2", "--lmm2"))
     enable_bimrange_arg = bool(show_dev_help or _option_present(argv, "-bimrange", "--bimrange"))
     enable_qtn_vcf_arg = bool(show_dev_help or _option_present(argv, "-qvcf", "--qtn-vcf"))
@@ -8048,7 +7955,6 @@ def parse_args(argv: Optional[list[str]] = None):
     )
     parser.set_defaults(
         snps_only=False,
-        lm2=None,
         lmm2=False,
         bimrange=None,
         qtn_vcf=None,
@@ -8094,19 +8000,6 @@ def parse_args(argv: Optional[list[str]] = None):
             "set JX_LM_LMM_BED_PREAD=0 to use windowed mmap; default: %(default)s)."
         ),
     )
-    if enable_lm2_arg:
-        models_group.add_argument(
-            "-lm2", "--lm2",
-            nargs="?",
-            const="__SELF__",
-            default=None,
-            metavar="COVCOL",
-            help=(
-                "Run LM with SNP-by-covariate interaction terms from selected merged -c covariate columns. "
-                "Column selectors are 0-based and accept items like 0, 0:3, :2, 0,3. "
-                "If no interaction columns are specified, LM2 falls back to the LM fast path."
-            ),
-        )
     models_group.add_argument(
         "-lmm", "--lmm", action="store_true", default=False,
         help=(
@@ -8404,10 +8297,6 @@ def parse_args(argv: Optional[list[str]] = None):
         parser.error("unrecognized arguments: " + " ".join(extras))
     try:
         args.ncol = parse_trait_selector_specs(args.ncol, label="-n/--ncol")
-    except ValueError as e:
-        parser.error(str(e))
-    try:
-        args.lm2_cov_cols = _parse_lm2_covariate_selector(getattr(args, "lm2", None))
     except ValueError as e:
         parser.error(str(e))
     try:
@@ -8841,8 +8730,6 @@ def _run_gwas_pipeline_impl(
     # fastplot reader, so it no longer needs a special plot-disabled route.
     args.plot = _gwas_plot_enabled()
     args.cov = _normalize_cov_inputs(args.cov)
-    args._lm2_cov_idx = None
-    args._lm2_fallback_to_lm = False
     thread_budget = detect_thread_budget_info()
     detected_threads = int(thread_budget["effective_threads"])
     requested_threads = int(args.thread)
@@ -9032,8 +8919,6 @@ def _run_gwas_pipeline_impl(
     scan_bimranges = list(getattr(args, "bimrange_ranges", []) or [])
     if args.lm:
         requested_stream_models.append("lm")
-    if getattr(args, "lm2", None) is not None:
-        requested_stream_models.append("lm2")
     if args.lmm:
         requested_stream_models.append("lmm")
     if getattr(args, "lmm2", False):
@@ -9086,7 +8971,6 @@ def _run_gwas_pipeline_impl(
     qcov_needs_grm = False
     standard_stream_models_requested = bool(
         args.lm
-        or (getattr(args, "lm2", None) is not None)
         or args.lmm
         or getattr(args, "lmm2", False)
         or args.fvlmm
@@ -9116,7 +9000,6 @@ def _run_gwas_pipeline_impl(
     preinspect_warnings: list[str] = []
     if not (
         args.lm
-        or (getattr(args, "lm2", None) is not None)
         or args.lmm
         or getattr(args, "lmm2", False)
         or args.fvlmm
@@ -9125,7 +9008,7 @@ def _run_gwas_pipeline_impl(
         or args.farmcpu
     ):
         logger.error(
-            "No model selected. Use -lm, -lm2, -lmm, -lmm2, -fvlmm, -splmm, -splmm-exact, -farmcpu, and/or -algwas."
+            "No model selected. Use -lm, -lmm, -lmm2, -fvlmm, -splmm, -splmm-exact, -farmcpu, and/or -algwas."
         )
         raise SystemExit(1)
     if args.memory is None:
@@ -9235,7 +9118,7 @@ def _run_gwas_pipeline_impl(
 
     if log:
         lm_lmm_pread_requested = bool(
-            set(requested_stream_models) & {"lm", "lm2", "lmm", "lmm2"}
+            set(requested_stream_models) & {"lm", "lmm", "lmm2"}
         )
         packed_auto_mode = bool(fast_mode)
         packed_route_status_preflight = _format_gwas_packed_route_status(
@@ -9471,7 +9354,7 @@ def _run_gwas_pipeline_impl(
     memmap_mode = bool(standard_stream_models_requested or (not bool(fast_mode)))
     mmap_limit_effective = bool(memmap_mode)
     lm_lmm_pread_requested = bool(
-        set(requested_stream_models) & {"lm", "lm2", "lmm", "lmm2"}
+        set(requested_stream_models) & {"lm", "lmm", "lmm2"}
     )
     _append_advanced_note(
         "FILE packed backend policy: Rust packed/stream via PLINK cache."
@@ -9517,8 +9400,7 @@ def _run_gwas_pipeline_impl(
     force_bed_stream_scan = bool(
         (
             args.lm
-            or (getattr(args, "lm2", None) is not None)
-            or args.lmm
+                or args.lmm
             or getattr(args, "lmm2", False)
             or args.fvlmm
         )
@@ -10072,39 +9954,6 @@ def _run_gwas_pipeline_impl(
                         logging.INFO,
                         f"Packed route resolved: {packed_route_status_resolved}",
                     )
-                if getattr(args, "lm2", None) is not None:
-                    lm2_selector = list(getattr(args, "lm2_cov_cols", []) or [])
-                    if cov_all is None:
-                        args._lm2_fallback_to_lm = True
-                        args._lm2_cov_idx = None
-                        if "lm2" in stream_models:
-                            if "lm" in stream_models:
-                                stream_models = [m for m in stream_models if m != "lm2"]
-                            else:
-                                stream_models = ["lm" if m == "lm2" else m for m in stream_models]
-                        _emit_warning_line(
-                            logger,
-                            "LM2 received no external covariates from -c; falling back to LM.",
-                            use_spinner=bool(use_spinner),
-                        )
-                    elif len(lm2_selector) == 0:
-                        args._lm2_fallback_to_lm = True
-                        args._lm2_cov_idx = None
-                        if "lm2" in stream_models:
-                            if "lm" in stream_models:
-                                stream_models = [m for m in stream_models if m != "lm2"]
-                            else:
-                                stream_models = ["lm" if m == "lm2" else m for m in stream_models]
-                        _emit_warning_line(
-                            logger,
-                            "LM2 received no explicit interaction columns; falling back to LM.",
-                            use_spinner=bool(use_spinner),
-                        )
-                    else:
-                        args._lm2_cov_idx = _resolve_lm2_covariate_indices(
-                            cov_all,
-                            lm2_selector,
-                        )
                 farmcpu_genofile = str(genofile_stream)
                 args.chunksize = _resolve_bed_block_rows_from_memory(
                     float(args._memory_mb),
@@ -10558,47 +10407,6 @@ def _run_gwas_pipeline_impl(
                             bimranges=scan_bimranges,
                         )
 
-                    def _run_route_lm2_stream(
-                        trait_one: list[str],
-                        emit_trait_header_model: bool,
-                        trait_prepared_meta: Union[dict[str, object], None] = None,
-                    ) -> None:
-                        run_chunked_gwas_lmm_lm(
-                            model_name="lm2",
-                            genofile=genofile_stream,
-                            pheno=pheno,
-                            ids=ids,
-                            n_snps=n_snps,
-                            outprefix=outprefix,
-                            maf_threshold=maf_threshold_scan,
-                            max_missing_rate=max_missing_rate_scan,
-                            genetic_model=args.model,
-                            het_threshold=het_threshold_scan,
-                            chunk_size=args.chunksize,
-                            mmap_limit=mmap_limit_effective,
-                            grm=grm,
-                            qmatrix=qmatrix,
-                            cov_all=cov_all,
-                            eff_m=eff_m,
-                            plot=args.plot,
-                            threads=args.thread,
-                            logger=logger,
-                            use_spinner=use_spinner,
-                            snps_only=bool(args.snps_only),
-                            eff_snp_by_trait=eff_snp_by_trait,
-                            summary_rows=gwas_summary_rows,
-                            saved_paths=saved_result_paths,
-                            trait_names=trait_one,
-                            emit_trait_header=bool(emit_trait_header_model),
-                            chunk_size_user_set=bool(
-                                getattr(args, "_chunksize_user_set", True)
-                            ),
-                            force_model=bool(args.force_model),
-                            lm2_covariate_indices=getattr(args, "_lm2_cov_idx", None),
-                            trait_prepared_meta=trait_prepared_meta,
-                            bimranges=scan_bimranges,
-                        )
-
                     def _run_route_lmm_stream(
                         trait_one: list[str],
                         emit_trait_header_model: bool,
@@ -10716,7 +10524,6 @@ def _run_gwas_pipeline_impl(
                         "splmm": _run_route_splmm_windowed,
                         "algwas": _run_route_algwas_packed,
                         "lm_stream": _run_route_lm_stream,
-                        "lm2_stream": _run_route_lm2_stream,
                         "lmm_stream": _run_route_lmm_stream,
                         "lmm2_stream": _run_route_lmm2_stream,
                         "fvlmm_stream": _run_route_fvlmm_stream,
@@ -10726,9 +10533,6 @@ def _run_gwas_pipeline_impl(
                         "lm_stream": "lm_stream",
                         "lm_memmap": "lm_stream",
                         "lm_rust": "lm_stream",
-                        "lm2_stream": "lm2_stream",
-                        "lm2_memmap": "lm2_stream",
-                        "lm2_rust": "lm2_stream",
                         "lmm_stream": "lmm_stream",
                         "lmm_memmap": "lmm_stream",
                         "lmm_rust": "lmm_stream",
@@ -10739,7 +10543,7 @@ def _run_gwas_pipeline_impl(
                         "fvlmm_rust": "fvlmm_stream",
                         "farm": "farmcpu",
                     }
-                    stream_group_routes = {"lm_stream", "lm2_stream", "lmm_stream", "lmm2_stream", "fvlmm_stream"}
+                    stream_group_routes = {"lm_stream", "lmm_stream", "lmm2_stream", "fvlmm_stream"}
                     meta_capable_routes = stream_group_routes | {"splmm", "algwas", "farmcpu"}
                     trait_shared_meta_cache: dict[str, dict[str, object]] = {}
                     global_trait_meta_shared: Union[dict[str, object], None] = None
@@ -10753,8 +10557,6 @@ def _run_gwas_pipeline_impl(
                         if not route:
                             if mk == "lm":
                                 route = "lm_stream"
-                            elif mk == "lm2":
-                                route = "lm2_stream"
                             elif mk == "lmm":
                                 route = "lmm_stream"
                             elif mk == "lmm2":
@@ -10973,8 +10775,6 @@ def _run_gwas_pipeline_impl(
                         model_key = str(model_token or "").lower().strip()
                         if model_key == "lm":
                             binding_available = hasattr(jxrs, "lm_stream_bed_to_tsv")
-                        elif model_key == "lm2":
-                            binding_available = hasattr(jxrs, "lm2_stream_bed_to_tsv")
                         elif model_key == "lmm":
                             binding_available = bool(
                                 hasattr(jxrs, "lmm_reml_assoc_bed_to_tsv_f32")
@@ -11778,7 +11578,7 @@ def _run_gwas_pipeline_impl(
                             model_token=mk,
                         )
 
-                        if route in stream_group_routes and mk != "lm2":
+                        if route in stream_group_routes:
                             group_end = task_idx + 1
                             grouped_models: list[str] = [mk]
                             while group_end < len(normalized_tasks):
@@ -11789,7 +11589,6 @@ def _run_gwas_pipeline_impl(
                                 if (
                                     next_route not in stream_group_routes
                                     or next_trait != trait_token_use
-                                    or next_model == "lm2"
                                 ):
                                     break
                                 grouped_models.append(next_model)

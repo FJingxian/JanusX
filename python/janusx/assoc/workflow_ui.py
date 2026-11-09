@@ -37,7 +37,6 @@ _GWAS_MODEL_DONE_RE = re.compile(
 )
 _GWAS_MODEL_LABELS = {
     "LM",
-    "LM2",
     "LMM",
     "LMM2",
     "FvLMM",

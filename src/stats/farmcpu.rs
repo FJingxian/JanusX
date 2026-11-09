@@ -716,7 +716,8 @@ fn resolve_assoc_chrom_pos_metadata(
     if crate::pgen::path_uses_pgen(prefix) {
         return read_pvar_chrom_pos_selected(prefix, row_indices, expected_len);
     }
-    let bim_path = format!("{prefix}.bim");
+    let bim_prefix = normalize_farmcpu_prefix(prefix);
+    let bim_path = format!("{bim_prefix}.bim");
     let select = match row_indices {
         Some(idx) if idx.is_empty() => return Ok((Vec::new(), Vec::new())),
         Some(idx) => Some(idx),
@@ -725,7 +726,7 @@ fn resolve_assoc_chrom_pos_metadata(
     if let Some(idx) = select {
         if !idx.windows(2).all(|w| w[0] <= w[1]) {
             let (chrom2, pos2, _snp2, _allele02, _allele12) =
-                crate::gfcore::read_bim_columns(prefix, Some(idx))?;
+                crate::gfcore::read_bim_columns(&bim_prefix, Some(idx))?;
             let pos64 = pos2.into_iter().map(|v| v as i64).collect::<Vec<i64>>();
             if chrom2.len() != expected_len || pos64.len() != expected_len {
                 return Err(format!(
@@ -5198,6 +5199,46 @@ mod tests {
         let (snp, allele0, allele1) = stream
             .read_block(&[1usize, 2usize])
             .expect("read selected PVAR fields");
+        assert_eq!(snp, ["rs2", "rs3"]);
+        assert_eq!(allele0, ["C", "G"]);
+        assert_eq!(allele1, ["T", "A"]);
+
+        std::fs::remove_dir_all(root).expect("remove temporary test directory");
+    }
+
+    #[test]
+    fn farmcpu_metadata_accepts_explicit_bed_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "janusx_farmcpu_explicit_bed_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temporary test directory");
+        let prefix = root.join("cohort").to_string_lossy().into_owned();
+        let explicit_bed = format!("{prefix}.bed");
+        std::fs::write(&explicit_bed, [0x6c, 0x1b, 0x01]).expect("write BED marker");
+        std::fs::write(
+            format!("{prefix}.bim"),
+            "1 rs1 0 100 A G\n1 rs2 0 250 C T\n2 rs3 0 900 G A\n",
+        )
+        .expect("write BIM metadata");
+
+        let selected_rows = [0usize, 2usize];
+        let (chrom, pos) = resolve_assoc_chrom_pos_metadata(
+            Some(&explicit_bed),
+            Vec::new(),
+            Vec::new(),
+            Some(&selected_rows),
+            selected_rows.len(),
+        )
+        .expect("read selected BIM coordinates from an explicit BED path");
+        assert_eq!(chrom, ["1", "2"]);
+        assert_eq!(pos, [100, 900]);
+
+        let mut stream =
+            BimSelectedFieldStream::open(&explicit_bed).expect("open BIM field stream");
+        let (snp, allele0, allele1) = stream
+            .read_block(&[1usize, 2usize])
+            .expect("read selected BIM fields from an explicit BED path");
         assert_eq!(snp, ["rs2", "rs3"]);
         assert_eq!(allele0, ["C", "G"]);
         assert_eq!(allele1, ["T", "A"]);

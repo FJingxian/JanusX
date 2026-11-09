@@ -217,6 +217,18 @@ def find_grm(prefix: Path) -> Path:
     return require_any_file("GRM file not found.", candidates)
 
 
+def _gs_file_input_grm_cache_candidates(
+    outdir: Path,
+    *,
+    prefix_name: str,
+) -> list[Path]:
+    # File-input GS first materializes a PLINK BED cache. The shared cache
+    # naming keeps a ".bed" source tag so BED and PGEN inputs cannot collide.
+    return sorted(
+        outdir.glob(f"~{prefix_name}.bed.maf*.geno*.snp0.cGRM.npy")
+    )
+
+
 def find_gs_summary(outdir: Path, prefix_name: str) -> Path:
     return require_any_file(
         "GS summary output missing",
@@ -956,7 +968,7 @@ def validate_gs_file_input_debug_outputs(
     )
     require_any_file(
         "Unified GS/GWAS GRM cache missing for file-input route.",
-        outdir.glob(f"~{prefix_name}.maf*.geno*.snp0.cGRM.npy"),
+        _gs_file_input_grm_cache_candidates(outdir, prefix_name=prefix_name),
     )
     require_no_matching_files(
         outdir,

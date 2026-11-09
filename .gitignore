@@ -23,6 +23,8 @@ test*.gwas.*
 
 # Test outputs
 test*
+!python/tests/
+!python/tests/test_ggval.py
 
 # Tooling
 uv.lock

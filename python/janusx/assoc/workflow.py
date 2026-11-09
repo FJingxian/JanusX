@@ -12363,7 +12363,7 @@ def _run_gwas_pipeline_impl(
         else:
             os.environ["JX_ALGWAS_XTX_CACHE_LOG"] = _prev_algwas_xtx_cache_log
 
-    if terminal_rich:
+    if terminal_rich and run_status == "done":
         lt = time.localtime()
         endinfo = (
             f"\nFinished. Total wall time: {round(time.time() - t_start, 2)} seconds\n"
@@ -12392,6 +12392,8 @@ def _run_gwas_pipeline_impl(
             "elapsed_sec": float(max(time.time() - t_start, 0.0)),
             "traits": [str(x) for x in trait_order],
         }
+    if run_status != "done":
+        raise SystemExit(1)
 
 
 def main(

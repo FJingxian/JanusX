@@ -147,7 +147,7 @@ def test_build_validation_dataset_builds_common_cli_inputs(
         if fmt == "txt":
             for suffix in (".txt", ".id", ".site"):
                 _touch(Path(f"{prefix}{suffix}"))
-        elif fmt == "plink":
+        elif fmt == "bfile":
             for suffix in (".bed", ".bim", ".fam"):
                 _touch(Path(f"{prefix}{suffix}"))
         elif fmt == "hmp":
@@ -176,7 +176,7 @@ def test_build_validation_dataset_builds_common_cli_inputs(
         "gformat",
     ]
     assert commands[1][commands[1].index("-fmt") + 1] == "txt"
-    assert commands[2][commands[2].index("-fmt") + 1] == "plink"
+    assert commands[2][commands[2].index("-fmt") + 1] == "bfile"
     assert commands[3][commands[3].index("-fmt") + 1] == "hmp"
     assert commands[4][commands[4].index("-fmt") + 1] == "vcf"
     assert paths["txt_matrix"].is_file()

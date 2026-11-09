@@ -225,6 +225,8 @@ impl VcfWriter {
         self.written_sites
     }
 
+    #[allow(dead_code)] // Shared native writer API; exercised by unit tests.
+    #[allow(dead_code)] // Shared native writer API; exercised by unit tests.
     pub(crate) fn write_site<S: SiteRecord>(
         &mut self,
         site: &S,
@@ -487,6 +489,23 @@ impl HmpWriter {
     }
 }
 
+#[inline]
+fn encode_bed_row_i8_into(row: &[i8], n_samples: usize, bytes_per_snp: usize, row_buf: &mut [u8]) {
+    for byte_idx in 0..bytes_per_snp {
+        let mut b: u8 = 0;
+        for within in 0..4 {
+            let i = byte_idx * 4 + within;
+            let code: u8 = if i >= n_samples {
+                0b01
+            } else {
+                plink2bits_from_g_i8(row[i])
+            };
+            b |= code << (within * 2);
+        }
+        row_buf[byte_idx] = b;
+    }
+}
+
 pub(crate) struct PlinkBfileWriter {
     fam: BufWriter<File>,
     bim: BufWriter<File>,
@@ -584,19 +603,7 @@ impl PlinkBfileWriter {
 
     #[inline]
     fn encode_row_i8_into(&mut self, row: &[i8]) {
-        for byte_idx in 0..self.bytes_per_snp {
-            let mut b: u8 = 0;
-            for within in 0..4 {
-                let i = byte_idx * 4 + within;
-                let code: u8 = if i >= self.n_samples {
-                    0b01
-                } else {
-                    plink2bits_from_g_i8(row[i])
-                };
-                b |= code << (within * 2);
-            }
-            self.row_buf[byte_idx] = b;
-        }
+        encode_bed_row_i8_into(row, self.n_samples, self.bytes_per_snp, &mut self.row_buf);
     }
 
     pub(crate) fn write_site<S: SiteRecord>(
@@ -755,6 +762,195 @@ impl PlinkBfileWriter {
     }
 }
 
+/// Writer for the PGEN "BED-compatible" hard-call storage mode (0x01).
+///
+/// The payload after the 3-byte PGEN header uses the same 2-bit SNP-major
+/// encoding as a PLINK BED file, so the existing BED row encoder is reused.
+/// Sidecars are written as `#IID` PSAM and `#CHROM POS ID REF ALT` PVAR.
+pub(crate) struct PgenPfileWriter {
+    psam: BufWriter<File>,
+    pvar: BufWriter<File>,
+    pgen: BufWriter<File>,
+    n_samples: usize,
+    bytes_per_snp: usize,
+    row_buf: Vec<u8>,
+    line_buf: Vec<u8>,
+    written_sites: usize,
+}
+
+impl PgenPfileWriter {
+    pub(crate) fn new<S: SampleRecord>(prefix: &str, samples: &[S]) -> Result<Self, String> {
+        if samples.is_empty() {
+            return Err("sample_ids is empty".to_string());
+        }
+        let mut psam = BufWriter::with_capacity(
+            4 * 1024 * 1024,
+            File::create(format!("{prefix}.psam")).map_err(|e| e.to_string())?,
+        );
+        psam.write_all(b"#IID\n").map_err(|e| e.to_string())?;
+        for sample in samples {
+            writeln!(psam, "{}", sample.iid()).map_err(|e| e.to_string())?;
+        }
+        psam.flush().map_err(|e| e.to_string())?;
+
+        let mut pvar = BufWriter::with_capacity(
+            4 * 1024 * 1024,
+            File::create(format!("{prefix}.pvar")).map_err(|e| e.to_string())?,
+        );
+        pvar.write_all(b"#CHROM\tPOS\tID\tREF\tALT\n")
+            .map_err(|e| e.to_string())?;
+
+        let mut pgen = BufWriter::with_capacity(
+            8 * 1024 * 1024,
+            File::create(format!("{prefix}.pgen")).map_err(|e| e.to_string())?,
+        );
+        pgen.write_all(&[0x6C, 0x1B, 0x01])
+            .map_err(|e| e.to_string())?;
+
+        let n_samples = samples.len();
+        let bytes_per_snp = (n_samples + 3) / 4;
+        Ok(Self {
+            psam,
+            pvar,
+            pgen,
+            n_samples,
+            bytes_per_snp,
+            row_buf: vec![0u8; bytes_per_snp],
+            line_buf: Vec::with_capacity(128),
+            written_sites: 0,
+        })
+    }
+
+    #[inline]
+    pub(crate) fn n_samples(&self) -> usize {
+        self.n_samples
+    }
+
+    #[inline]
+    pub(crate) fn written_sites(&self) -> usize {
+        self.written_sites
+    }
+
+    fn write_pvar_row<S: SiteRecord>(
+        &mut self,
+        site: &S,
+        gref: &str,
+        galt: &str,
+    ) -> Result<(), String> {
+        self.line_buf.clear();
+        writeln!(
+            &mut self.line_buf,
+            "{}\t{}\t{}\t{}\t{}",
+            site.chrom(),
+            site.pos(),
+            site_row_id(site),
+            gref,
+            galt
+        )
+        .map_err(|e| e.to_string())?;
+        self.pvar
+            .write_all(&self.line_buf)
+            .map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn write_site<S: SiteRecord>(
+        &mut self,
+        site: &S,
+        gref: &str,
+        galt: &str,
+        row_i8: &[i8],
+    ) -> Result<(), String> {
+        if row_i8.len() != self.n_samples {
+            return Err("Internal error: PGEN row length mismatch".into());
+        }
+        self.write_pvar_row(site, gref, galt)?;
+        encode_bed_row_i8_into(
+            row_i8,
+            self.n_samples,
+            self.bytes_per_snp,
+            &mut self.row_buf,
+        );
+        self.pgen
+            .write_all(&self.row_buf)
+            .map_err(|e| e.to_string())?;
+        self.written_sites = self.written_sites.saturating_add(1);
+        Ok(())
+    }
+
+    pub(crate) fn write_chunk<S: SiteRecord>(
+        &mut self,
+        arr: ArrayView2<'_, i8>,
+        sites: &[S],
+    ) -> Result<(), String> {
+        let shape = arr.shape();
+        if shape.len() != 2 {
+            return Err("geno_chunk must be 2D (m_chunk, n_samples)".into());
+        }
+        let m_chunk = shape[0];
+        let n_samples = shape[1];
+        if n_samples != self.n_samples {
+            return Err(format!(
+                "n_samples mismatch: writer expects {}, got {}",
+                self.n_samples, n_samples
+            ));
+        }
+        if sites.len() != m_chunk {
+            return Err(format!(
+                "sites length mismatch: sites={}, m_chunk={}",
+                sites.len(),
+                m_chunk
+            ));
+        }
+
+        for site in sites.iter() {
+            self.write_pvar_row(site, site.ref_allele(), site.alt_allele())?;
+        }
+
+        let strides = arr.strides();
+        let s0 = strides[0] as isize;
+        let s1 = strides[1] as isize;
+        let base = arr.as_ptr();
+
+        unsafe {
+            for snp in 0..m_chunk {
+                let snp_off = (snp as isize) * s0;
+                for byte_idx in 0..self.bytes_per_snp {
+                    let mut b: u8 = 0;
+                    for within in 0..4 {
+                        let si = byte_idx * 4 + within;
+                        let two = if si < self.n_samples {
+                            let off = snp_off + (si as isize) * s1;
+                            plink2bits_from_g_i8(*base.offset(off))
+                        } else {
+                            0b01
+                        };
+                        b |= two << (within * 2);
+                    }
+                    self.row_buf[byte_idx] = b;
+                }
+                self.pgen
+                    .write_all(&self.row_buf)
+                    .map_err(|e| e.to_string())?;
+                self.written_sites = self.written_sites.saturating_add(1);
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn flush(&mut self) -> Result<(), String> {
+        self.psam.flush().map_err(|e| e.to_string())?;
+        self.pvar.flush().map_err(|e| e.to_string())?;
+        self.pgen.flush().map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    #[allow(dead_code)] // Kept as the symmetric writer finalizer.
+    pub(crate) fn finish(mut self) -> Result<(), String> {
+        self.flush()
+    }
+}
+
 #[pyclass]
 pub struct PlinkStreamWriter {
     inner: PlinkBfileWriter,
@@ -774,6 +970,56 @@ impl PlinkStreamWriter {
             .collect();
         let inner = PlinkBfileWriter::new(&prefix, &samples, phenotype.as_deref())
             .map_err(PyIOError::new_err)?;
+        Ok(Self { inner })
+    }
+
+    fn write_chunk(
+        &mut self,
+        geno_chunk: PyReadonlyArray2<i8>,
+        sites: Vec<PySiteInfo>,
+    ) -> PyResult<()> {
+        self.inner
+            .write_chunk(geno_chunk.as_array(), &sites)
+            .map_err(PyValueError::new_err)
+    }
+
+    fn flush(&mut self) -> PyResult<()> {
+        self.inner.flush().map_err(PyIOError::new_err)
+    }
+
+    fn close(&mut self) -> PyResult<()> {
+        self.flush()
+    }
+
+    #[getter]
+    fn n_samples(&self) -> usize {
+        self.inner.n_samples()
+    }
+
+    #[getter]
+    fn written_snps(&self) -> usize {
+        self.inner.written_sites()
+    }
+}
+
+#[pyclass]
+pub struct PgenStreamWriter {
+    inner: PgenPfileWriter,
+}
+
+#[pymethods]
+impl PgenStreamWriter {
+    #[new]
+    #[pyo3(signature = (prefix, sample_ids))]
+    fn new(prefix: String, sample_ids: Vec<String>) -> PyResult<Self> {
+        if sample_ids.is_empty() {
+            return Err(PyValueError::new_err("sample_ids is empty"));
+        }
+        let samples: Vec<SampleIdRecord> = sample_ids
+            .into_iter()
+            .map(|id| SampleIdRecord { id })
+            .collect();
+        let inner = PgenPfileWriter::new(&prefix, &samples).map_err(PyIOError::new_err)?;
         Ok(Self { inner })
     }
 
@@ -915,5 +1161,73 @@ impl HmpStreamWriter {
     #[getter]
     fn written_snps(&self) -> usize {
         self.inner.as_ref().map(|w| w.written_sites()).unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn temp_prefix(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "janusx_gwriter_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir.join("panel")
+    }
+
+    #[test]
+    fn pgen_writer_roundtrips_bed_compatible_payload() {
+        let prefix = temp_prefix("pgen");
+        let samples = vec![
+            SampleIdRecord {
+                id: "s1".to_string(),
+            },
+            SampleIdRecord {
+                id: "s2".to_string(),
+            },
+            SampleIdRecord {
+                id: "s3".to_string(),
+            },
+        ];
+        let mut writer = PgenPfileWriter::new(prefix.to_str().unwrap(), &samples).unwrap();
+        let sites = vec![
+            CoreSiteInfo {
+                chrom: "1".to_string(),
+                pos: 100,
+                snp: "rs1".to_string(),
+                ref_allele: "A".to_string(),
+                alt_allele: "G".to_string(),
+            },
+            CoreSiteInfo {
+                chrom: "1".to_string(),
+                pos: 200,
+                snp: "rs2".to_string(),
+                ref_allele: "C".to_string(),
+                alt_allele: "T".to_string(),
+            },
+        ];
+        writer.write_site(&sites[0], "A", "G", &[0, 1, 2]).unwrap();
+        writer.write_site(&sites[1], "C", "T", &[2, -1, 0]).unwrap();
+        writer.finish().unwrap();
+
+        let psam = std::fs::read_to_string(format!("{}.psam", prefix.display())).unwrap();
+        assert!(psam.starts_with("#IID\n"));
+        let pvar = std::fs::read_to_string(format!("{}.pvar", prefix.display())).unwrap();
+        assert!(pvar.starts_with("#CHROM\tPOS\tID\tREF\tALT\n"));
+
+        let pgen_path = PathBuf::from(format!("{}.pgen", prefix.display()));
+        let mut reader = crate::pgen::PgenReader::open(&pgen_path, 3, 2).unwrap();
+        let mut out = vec![0.0_f32; 6];
+        reader.read_source_block_f32(0, 2, &mut out).unwrap();
+        assert_eq!(out, vec![0.0, 1.0, 2.0, 2.0, -9.0, 0.0]);
+
+        let _ = std::fs::remove_dir_all(prefix.parent().unwrap());
     }
 }

@@ -499,7 +499,7 @@ def build_validation_dataset(
             "-file",
             str(txt_prefix.with_suffix(".txt")),
             "-fmt",
-            "plink",
+            "bfile",
             "-o",
             str(outdir),
             "-prefix",

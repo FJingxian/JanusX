@@ -37,8 +37,10 @@ def format_output_display(
     fmt = str(out_fmt).lower()
     prefix_disp = format_path_for_display(out_prefix)
     path_disp = format_path_for_display(out_path)
-    if fmt == "plink":
+    if fmt in {"plink", "bfile"}:
         return f"{prefix_disp} (.bed/.bim/.fam)"
+    if fmt == "pfile" or fmt == "pgen":
+        return f"{prefix_disp} (.pgen/.pvar/.psam)"
     if fmt == "npy":
         return f"{prefix_disp} (.npy/.site/.id)"
     if fmt == "txt":

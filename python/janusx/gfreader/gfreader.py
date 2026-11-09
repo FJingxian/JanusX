@@ -24,6 +24,7 @@ from janusx.janusx import (
     PlinkStreamWriter,
     HmpStreamWriter,
     VcfStreamWriter,
+    PgenStreamWriter,
     SiteInfo,
 )
 try:
@@ -2493,12 +2494,15 @@ def _infer_format_from_out(out: str) -> str:
     "vcf"   : VCF or VCF.GZ
     "hmp"   : HMP or HMP.GZ
     "plink" : PLINK prefix (BED/BIM/FAM)
+    "pgen"  : PGEN prefix (PGEN/PVAR/PSAM)
     """
     out = str(out).lower()
     if out.endswith(".vcf") or out.endswith(".vcf.gz"):
         return "vcf"
     if out.endswith(".hmp") or out.endswith(".hmp.gz"):
         return "hmp"
+    if out.endswith(".pgen"):
+        return "pgen"
     return "plink"
 
 def save_genotype_streaming(
@@ -2518,6 +2522,7 @@ def save_genotype_streaming(
         * out endswith .vcf or .vcf.gz  -> write VCF
         * out endswith .hmp or .hmp.gz  -> write HMP
         * otherwise                     -> write PLINK BED/BIM/FAM using `out` as prefix
+    - fmt="pgen" writes PGEN/PVAR/PSAM using `out` as prefix.
 
     This function NEVER materializes the full genotype matrix in memory.
 
@@ -2527,6 +2532,7 @@ def save_genotype_streaming(
         Output target.
         - VCF: path like "out.vcf" or "out.vcf.gz"
         - PLINK: prefix like "out_prefix" (writes out_prefix.bed/.bim/.fam)
+        - PGEN: prefix like "out_prefix" (writes out_prefix.pgen/.pvar/.psam)
 
     sample_ids : list[str]
         Sample IDs (individual IDs). Must match genotype column order.
@@ -2536,7 +2542,7 @@ def save_genotype_streaming(
             geno_chunk : np.ndarray (m_chunk, n_samples) (float32/float64/int8 all ok)
             sites      : list[SiteInfo] of length m_chunk
 
-    fmt : {"auto", "vcf", "hmp", "plink"}
+    fmt : {"auto", "vcf", "hmp", "plink", "pgen"}
         Force output format. "auto" infers from `out`.
 
     flush_every_chunks : int
@@ -2549,8 +2555,8 @@ def save_genotype_streaming(
     - Missing values should be < 0; writer will encode as ./.
     - For PLINK, phenotype is NOT written; Rust side should write -9 in FAM.
     """
-    if fmt not in ("auto", "vcf", "hmp", "plink"):
-        raise ValueError("fmt must be one of: auto, vcf, hmp, plink")
+    if fmt not in ("auto", "vcf", "hmp", "plink", "pgen"):
+        raise ValueError("fmt must be one of: auto, vcf, hmp, plink, pgen")
 
     if not sample_ids:
         raise ValueError("sample_ids is empty")
@@ -2563,6 +2569,8 @@ def save_genotype_streaming(
     # pick writer
     if fmt == "plink":
         w = PlinkStreamWriter(str(out), sample_ids, None)
+    elif fmt == "pgen":
+        w = PgenStreamWriter(str(out), sample_ids)
     elif fmt == "hmp":
         w = HmpStreamWriter(str(out), sample_ids)
     else:

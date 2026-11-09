@@ -251,7 +251,8 @@ Accepted `-k` forms:
 
 ```bash
 jx gformat -vcf example/mouse_hs1940.vcf.gz -o demo -prefix mouse_hs1940
-jx gformat -vcf example/mouse_hs1940.vcf.gz -fmt plink -o demo -prefix mouse_hs1940
+jx gformat -vcf example/mouse_hs1940.vcf.gz -fmt bfile -o demo -prefix mouse_hs1940
+jx gformat -vcf example/mouse_hs1940.vcf.gz -fmt pfile -o demo -prefix mouse_hs1940_pgen
 jx gformat -vcf example/mouse_hs1940.vcf.gz --prune 500 10 0.2 -o demo -prefix mouse_hs1940_pruned
 
 jx gmerge -bfile cohort_a cohort_b -fmt plink -o demo -prefix merged
@@ -264,7 +265,7 @@ Use these modules when you need:
 - LD pruning for downstream GWAS or GS: `gformat --prune`
 - multi-panel merging: `gmerge`
 
-`gformat` defaults to PLINK BED output when `-fmt` is omitted. Set
+`gformat` defaults to BED output (`-fmt bfile`) when `-fmt` is omitted; use `-fmt pfile` for PGEN/PVAR/PSAM. Set
 `JX_GFORMAT_MAX_OUTPUT_SITES=0` to benchmark filtering/extraction/prune stages
 without writing variant rows, or set it to a positive integer to cap BED output.
 `gformat --prune` follows PLINK-style window syntax: a bare number is a variant

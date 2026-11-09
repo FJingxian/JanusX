@@ -12,19 +12,20 @@ Supported inputs
 
 Supported outputs
 -----------------
-- `-fmt plink` : PLINK bed/bim/fam
+- `-fmt bfile` : PLINK BED/BIM/FAM
+- `-fmt pfile` : PLINK 2 PGEN/PVAR/PSAM (BED-compatible hard-call mode 0x01)
 - `-fmt vcf`   : bgzipped VCF
 - `-fmt hmp`   : gzipped HapMap text (.hmp.gz)
 - `-fmt txt`   : `prefix.txt` + `prefix.id` + `prefix.site`
 - `-fmt npy`   : `prefix.npy` + `prefix.id` + `prefix.site`
 - `-fmt kfile` : `prefix.bsite` + `prefix.idv` + `prefix.bim` + `prefix.meta.json`
 
-Default output format is PLINK (`-fmt plink`) when `-fmt` is omitted.
+Default output format is BED (`-fmt bfile`) when `-fmt` is omitted.
 
 Notes
 -----
 - `-file` inputs must carry sibling `prefix.id`.
-- `-file -> vcf/hmp/plink` requires real site metadata via `prefix.bsite`/`prefix.site` or `prefix.bim`.
+- `-file -> vcf/hmp/bfile/pfile` requires real site metadata via `prefix.bsite`/`prefix.site` or `prefix.bim`.
 - `txt/npy` outputs always write headerless `prefix.site` as four columns:
   `CHR POS REF ALT`.
 - `kfile` output treats genotype `1` as missing, filters with `--geno`,
@@ -1237,9 +1238,11 @@ def _resolve_output_target(args) -> tuple[str, str, str]:
         return fmt, base, f"{base}.npy"
     if fmt == "kfile":
         return fmt, base, base
-    if fmt == "plink":
+    if fmt in {"bfile", "pfile"}:
         return fmt, base, base
-    raise ValueError("Unsupported output format. Use one of: plink, vcf, hmp, txt, npy, kfile.")
+    raise ValueError(
+        "Unsupported output format. Use one of: bfile, pfile, vcf, hmp, txt, npy, kfile."
+    )
 
 def _iter_filtered_chunks(
     chunks: Iterator[tuple[np.ndarray, list[SiteInfo]]],
@@ -2384,9 +2387,10 @@ def build_parser() -> CliArgumentParser:
         epilog=minimal_help_epilog(
             [
                 "jx gformat -vcf geno.vcf.gz",
-                "jx gformat -hmp geno.hmp.gz -fmt plink",
+                "jx gformat -hmp geno.hmp.gz -fmt bfile",
                 "jx gformat -bfile geno_prefix -fmt txt -o outdir/panel",
                 "jx gformat -file geno_prefix -fmt vcf",
+                "jx gformat -bfile geno_prefix -fmt pfile",
                 "jx gformat -bfile geno_prefix --prune 500 50 0.2",
                 "jx gformat -bfile geno_prefix --prune 500kb 10 0.2",
             ]
@@ -2415,9 +2419,9 @@ def build_parser() -> CliArgumentParser:
         "-fmt",
         "--fmt",
         dest="format",
-        choices=["plink", "vcf", "hmp", "txt", "npy", "kfile"],
-        default="plink",
-        help="Output genotype format: plink, vcf, hmp (.hmp.gz), txt, npy, kfile (default: plink).",
+        choices=["bfile", "pfile", "vcf", "hmp", "txt", "npy", "kfile"],
+        default="bfile",
+        help="Output genotype format: bfile (BED), pfile (PGEN), vcf, hmp (.hmp.gz), txt, npy, kfile (default: bfile).",
     )
     add_common_out_arg(opt, default=".", help_profile="converted_results")
     add_common_prefix_arg(opt, default=None, help_profile="input_basename")
@@ -2664,7 +2668,7 @@ def main() -> None:
     if not ensure_all_true(checks):
         raise SystemExit(1)
 
-    if args.file and out_fmt in {"vcf", "hmp", "plink"} and (not _has_real_file_sites(gfile)):
+    if args.file and out_fmt in {"vcf", "hmp", "bfile", "pfile"} and (not _has_real_file_sites(gfile)):
         raise ValueError(
             f"{out_fmt.upper()} output from -file input requires real site metadata. "
             "Please provide a matching prefix.bsite/prefix.site or prefix.bim sidecar."
@@ -2757,7 +2761,7 @@ def main() -> None:
         prune_spec is None
         and source_kind == "plink"
         and (not source_is_pgen)
-        and out_fmt == "plink"
+        and out_fmt == "bfile"
         and (not bool(args.snps_only))
         and (not bool(args.biallelic_only))
         and _bed_filter_to_plink_rust is not None
@@ -2965,7 +2969,7 @@ def main() -> None:
         and prune_spec is None
         and (not source_is_pgen)
         and source_kind in {"plink", "vcf", "hmp"}
-        and out_fmt in {"plink", "vcf", "hmp"}
+        and out_fmt in {"bfile", "vcf", "hmp"}
         and push_snp_sites is None
         and push_bim_range is None
         and (not post_filter.active())
@@ -2973,7 +2977,7 @@ def main() -> None:
     )
     if use_rust_convert_direct:
         direct_input = str(gfile if source_kind == "plink" else (source_path or gfile))
-        direct_output = str(out_prefix if out_fmt == "plink" else out_path)
+        direct_output = str(out_prefix if out_fmt == "bfile" else out_path)
         out_n = int(len(keep_sample_ids) if keep_sample_ids is not None else len(sample_ids))
         progress_every = max(1000, int(max(1, int(n_sites)) // 200))
         convert_stats = None
@@ -3012,7 +3016,7 @@ def main() -> None:
                 convert_stats = convert_genotypes(
                     direct_input,
                     direct_output,
-                    out_fmt=str(out_fmt),
+                    out_fmt=("plink" if out_fmt == "bfile" else str(out_fmt)),
                     progress_callback=_on_convert_progress,
                     progress_every=int(progress_every),
                     threads=int(args.thread),
@@ -3039,7 +3043,7 @@ def main() -> None:
             convert_stats = convert_genotypes(
                 direct_input,
                 direct_output,
-                out_fmt=str(out_fmt),
+                out_fmt=("plink" if out_fmt == "bfile" else str(out_fmt)),
                 threads=int(args.thread),
                 snps_only=bool(site_type_snps_only),
                 maf=float(args.maf),
@@ -3199,6 +3203,7 @@ def main() -> None:
         use_packed_prune_fastpath = bool(
             source_kind == "plink"
             and (not source_is_pgen)
+            and out_fmt == "bfile"
             and _bed_packed_ld_prune_maf_priority is not None
             and keep_sample_ids is None
             and push_snp_sites is None
@@ -3212,7 +3217,7 @@ def main() -> None:
         use_selected_stream_prune_direct = bool(
             source_kind == "plink"
             and (not source_is_pgen)
-            and out_fmt == "plink"
+            and out_fmt == "bfile"
             and keep_sample_ids is None
             and has_prune_prefilters
             and _bed_prune_selected_to_plink_rust is not None
@@ -3221,7 +3226,7 @@ def main() -> None:
         use_masked_stream_prune_direct = bool(
             source_kind == "plink"
             and (not source_is_pgen)
-            and out_fmt == "plink"
+            and out_fmt == "bfile"
             and keep_sample_ids is None
             and has_prune_prefilters
             and (not use_selected_stream_prune_direct)
@@ -3238,7 +3243,7 @@ def main() -> None:
                 pass
         use_rust_prune_direct = bool(
             use_packed_prune_fastpath
-            and out_fmt == "plink"
+            and out_fmt == "bfile"
             and keep_sample_ids is None
             and _bed_prune_to_plink_rust is not None
             and prune_streaming_io
@@ -3246,7 +3251,7 @@ def main() -> None:
         use_rust_prune_filtered_direct = bool(
             source_kind == "plink"
             and (not source_is_pgen)
-            and out_fmt == "plink"
+            and out_fmt == "bfile"
             and has_prune_prefilters
             and (not bool(site_type_snps_only))
             and (
@@ -3781,7 +3786,7 @@ def main() -> None:
     # Fast path for PLINK->PLINK when prune was done on packed BED:
     # avoid decode/re-encode by writing BED subset directly.
     if (
-        out_fmt == "plink"
+        out_fmt == "bfile"
         and packed_prune_keep_mask is not None
         and packed_prune_packed is not None
         and packed_prune_source_prefix is not None
@@ -3829,7 +3834,7 @@ def main() -> None:
             total_snps=(int(selected_n_sites) if selected_n_sites is not None else None),
             desc="Writing HMP",
         )
-    elif out_fmt == "plink":
+    elif out_fmt == "bfile":
         Path(out_prefix).parent.mkdir(parents=True, exist_ok=True)
         save_genotype_streaming(
             out_prefix,
@@ -3838,6 +3843,16 @@ def main() -> None:
             fmt="plink",
             total_snps=(int(selected_n_sites) if selected_n_sites is not None else None),
             desc="Writing PLINK",
+        )
+    elif out_fmt == "pfile":
+        Path(out_prefix).parent.mkdir(parents=True, exist_ok=True)
+        save_genotype_streaming(
+            out_prefix,
+            out_sample_ids,
+            output_chunks,
+            fmt="pgen",
+            total_snps=(int(selected_n_sites) if selected_n_sites is not None else None),
+            desc="Writing PGEN",
         )
     elif out_fmt == "txt":
         write_text_output(

@@ -274,7 +274,7 @@ use gwas_unified::{
     gwas_packed_unified_to_tsv, gwas_trait_model_dispatch_v2, gwas_trait_model_schedule,
 };
 use gwasio::load_gwas_triplet_fast;
-use gwriter::{HmpStreamWriter, PlinkStreamWriter, VcfStreamWriter};
+use gwriter::{HmpStreamWriter, PgenStreamWriter, PlinkStreamWriter, VcfStreamWriter};
 use he::he_pcg_bed;
 use heritability::{
     prepare_heritability_broad_sparse_cache, prepare_heritability_trait_workflow,
@@ -729,6 +729,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<HmpChunkReader>()?;
     m.add_class::<TxtChunkReader>()?;
     m.add_class::<PlinkStreamWriter>()?;
+    m.add_class::<PgenStreamWriter>()?;
     m.add_class::<VcfStreamWriter>()?;
     m.add_class::<HmpStreamWriter>()?;
     m.add_class::<GwasAssocTsvWriter>()?;

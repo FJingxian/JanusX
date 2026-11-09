@@ -549,7 +549,7 @@ jobs:
           "$PY" -m pip install --force-reinstall dist/*.whl
           mkdir -p test
           TEST_PREFIX="test/mouse_hs1940"
-          jx gformat -vcf example/mouse_hs1940.vcf.gz -fmt plink -o "$TEST_PREFIX"
+          jx gformat -vcf example/mouse_hs1940.vcf.gz -fmt bfile -o "$TEST_PREFIX"
           jx grm -bfile "$TEST_PREFIX" -o test
           "$PY" - <<'PY'
           import os

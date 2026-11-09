@@ -31,7 +31,7 @@ Keep these CLI contracts in view while changing code:
 - Sample IDs must be aligned across genotype, phenotype, GRM, Q, and covariates.
 - Genotype matrix files are SNP-major: variants by rows, samples by columns.
 - Trait indices are zero-based after the sample-ID column; names and ranges are also accepted.
-- GWAS uses additive genotype coding. `-lm2` adds selected covariate interactions; it is not a non-additive genotype-coding mode.
+- GWAS uses additive genotype coding.
 - File-backed scans should use the module's streaming or packed route; avoid materializing a full genotype matrix without a concrete reason.
 
 For a code change, inspect that module's `-h` output and nearby implementation
@@ -168,7 +168,6 @@ Current model flags:
 - `-splmm` for the approximate GRAMMAR-gamma SparseLMM scan
 - `-splmm-exact` for the exact sparse-Cholesky SparseLMM scan
 - `-farmcpu`
-- `-lm2` for LM with selected SNP-by-covariate interactions
 
 `-splmm-approx` is a legacy spelling; use `-splmm` for new commands. GWAS
 genotype coding is additive across these models.

@@ -221,15 +221,3 @@ jobs:
             --non-interactive \
             --skip-existing \
             wheelhouse/*.whl dist/*.tar.gz
-
-  update-bioconda-pr:
-    name: Update Bioconda PR
-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish_pypi == 'true' && (startsWith(github.ref, 'refs/tags/v') || startsWith(github.event.inputs.ref, 'v') || startsWith(github.event.inputs.ref, 'refs/tags/v')) }}
-    needs:
-      - publish-pypi
-    uses: ./.github/workflows/bioconda-pr-update.yml
-    with:
-      release_tag: ${{ github.event.inputs.ref || github.ref_name }}
-      source_ref: ${{ github.event.inputs.ref || github.ref }}
-      bioconda_fork: FJingxian/bioconda-recipes
-    secrets: inherit

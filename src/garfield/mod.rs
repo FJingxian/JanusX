@@ -14,6 +14,7 @@ mod logic_prepare;
 mod logic_residual_screen;
 mod logic_scan;
 mod max6_cross_window;
+mod max6_gene_stream;
 mod max6_genotype;
 mod max6_null;
 mod max6_pipeline;

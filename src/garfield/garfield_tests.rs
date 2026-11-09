@@ -2,6 +2,120 @@ use super::bs::conditional_split_support_passes;
 use super::*;
 
 #[test]
+fn max6_fused_scan_gate_accepts_geneset_multi_span_groups() {
+    let groups = vec![
+        vec![("1".to_string(), 10, 20), ("2".to_string(), 30, 40)],
+        vec![("3".to_string(), 50, 60)],
+    ];
+    assert!(super::engine::max6_fused_grm_int_scan_supported(
+        "geneset",
+        Some(groups.as_slice())
+    ));
+    assert!(!super::engine::max6_fused_grm_int_scan_supported(
+        "gene",
+        Some(groups.as_slice())
+    ));
+    assert!(!super::engine::max6_fused_grm_int_scan_supported(
+        "geneset", None
+    ));
+}
+
+#[test]
+fn max6_gene_stream_sweep_routes_overlapping_rows_and_closes_in_order() {
+    use super::max6_gene_stream::{Max6GeneInterval, Max6GeneIntervalSweep};
+
+    let mut sweep = Max6GeneIntervalSweep::new(vec![
+        Max6GeneInterval {
+            unit_index: 0,
+            span_index: 0,
+            label: "gene_a".to_string(),
+            chrom: "1".to_string(),
+            start: 10,
+            end: 20,
+        },
+        Max6GeneInterval {
+            unit_index: 1,
+            span_index: 0,
+            label: "gene_b".to_string(),
+            chrom: "1".to_string(),
+            start: 20,
+            end: 30,
+        },
+        Max6GeneInterval {
+            unit_index: 2,
+            span_index: 0,
+            label: "empty_gene".to_string(),
+            chrom: "1".to_string(),
+            start: 40,
+            end: 45,
+        },
+        Max6GeneInterval {
+            unit_index: 3,
+            span_index: 0,
+            label: "gene_c".to_string(),
+            chrom: "2".to_string(),
+            start: 5,
+            end: 15,
+        },
+        Max6GeneInterval {
+            unit_index: 4,
+            span_index: 0,
+            label: "never_seen".to_string(),
+            chrom: "3".to_string(),
+            start: 1,
+            end: 2,
+        },
+    ])
+    .unwrap();
+
+    let mut completed = Vec::new();
+    for (chrom, pos, source_row) in [("1", 10, 10), ("1", 20, 20), ("1", 30, 30)] {
+        completed.extend(sweep.push_variant(chrom, pos, Some(source_row)).unwrap());
+    }
+    assert_eq!(
+        completed
+            .iter()
+            .map(|unit| (unit.unit_index, unit.rows.clone()))
+            .collect::<Vec<_>>(),
+        vec![(0, vec![10, 20])]
+    );
+
+    let completed = sweep.push_variant("1", 50, Some(50)).unwrap();
+    assert_eq!(
+        completed
+            .iter()
+            .map(|unit| (unit.unit_index, unit.rows.clone()))
+            .collect::<Vec<_>>(),
+        vec![(1, vec![20, 30]), (2, Vec::<i32>::new())]
+    );
+    let chromosome_end = sweep.push_variant("2", 10, Some(100)).unwrap();
+    assert_eq!(chromosome_end.len(), 0);
+    let final_units = sweep.finish().unwrap();
+    assert_eq!(final_units.len(), 2);
+    assert_eq!(final_units[0].unit_index, 3);
+    assert_eq!(final_units[0].rows, vec![100]);
+    assert_eq!(final_units[1].unit_index, 4);
+    assert!(final_units[1].rows.is_empty());
+}
+
+#[test]
+fn max6_gene_stream_sweep_rejects_out_of_order_source_rows() {
+    use super::max6_gene_stream::{Max6GeneInterval, Max6GeneIntervalSweep};
+
+    let mut sweep = Max6GeneIntervalSweep::new(vec![Max6GeneInterval {
+        unit_index: 0,
+        span_index: 0,
+        label: "gene_a".to_string(),
+        chrom: "1".to_string(),
+        start: 1,
+        end: 100,
+    }])
+    .unwrap();
+    sweep.push_variant("1", 20, Some(20usize)).unwrap();
+    assert!(sweep.push_variant("1", 19, Some(19usize)).is_err());
+}
+
+#[test]
 fn max6_pgen_row_path_matches_equivalent_bed_input() {
     let pgen_dir = make_temp_dir("max6_pgen_row_path");
     let bed_dir = make_temp_dir("max6_bed_row_path");
@@ -84,6 +198,60 @@ fn max6_pgen_row_path_matches_equivalent_bed_input() {
 
     let _ = fs::remove_dir_all(pgen_dir);
     let _ = fs::remove_dir_all(bed_dir);
+}
+
+#[test]
+fn max6_window_range_source_keeps_explicit_pgen_with_same_prefix_bed() {
+    use super::max6_qc::Max6WindowRangeSource;
+
+    let dir = make_temp_dir("max6_window_pgen_with_bed");
+    let prefix = dir.join("toy");
+    let mut pgen = vec![0x6c, 0x1b, 0x10];
+    pgen.extend_from_slice(&2u32.to_le_bytes());
+    pgen.extend_from_slice(&5u32.to_le_bytes());
+    pgen.push(0);
+    pgen.extend_from_slice(&23u64.to_le_bytes());
+    pgen.extend_from_slice(&[0x00, 2, 2]);
+    pgen.extend_from_slice(&[0xc4, 0x01, 0xaa, 0x02]);
+    fs::write(prefix.with_extension("pgen"), pgen).unwrap();
+    fs::write(
+        prefix.with_extension("psam"),
+        "#FID IID\nf s1\nf s2\nf s3\nf s4\nf s5\n",
+    )
+    .unwrap();
+    fs::write(
+        prefix.with_extension("pvar"),
+        "#CHROM POS ID REF ALT\n1 10 rs1 A G\n1 20 rs2 C T\n",
+    )
+    .unwrap();
+    fs::write(
+        prefix.with_extension("bed"),
+        [0x6c, 0x1b, 0x01, 0x48, 0x02, 0xff, 0x03],
+    )
+    .unwrap();
+    fs::write(prefix.with_extension("fam"), "f s1 0 0 0 -9\n").unwrap();
+    fs::write(prefix.with_extension("bim"), "1 rs1 0 10 A G\n").unwrap();
+
+    let pgen_path = prefix.with_extension("pgen");
+    let _input_kind_override =
+        crate::pgen::scoped_input_kind_override(pgen_path.to_str().unwrap()).unwrap();
+    let make_source = |path: &str| {
+        Max6WindowRangeSource::new(
+            path,
+            &[],
+            0,
+            false,
+            Arc::new(Mutex::new(HashSet::new())),
+            Arc::new(Mutex::new(HashSet::new())),
+        )
+        .unwrap()
+    };
+    let explicit_path_source = make_source(pgen_path.to_str().unwrap());
+    assert!(explicit_path_source.bed.has_pgen_source());
+    let normalized_prefix_source = make_source(prefix.to_str().unwrap());
+    assert!(normalized_prefix_source.bed.has_pgen_source());
+
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -5535,6 +5703,277 @@ fn streamed_window_preparation_matches_full_qc_and_scopes_bimrange() {
         assert_eq!(streamed.label, full_units[full_index].label);
         assert_eq!(streamed_source_rows, expected_source_rows);
     }
+
+    let gene_groups = vec![
+        vec![("2".to_string(), 100, 2_000)],
+        vec![("1".to_string(), 3_500, 5_500)],
+        vec![("1".to_string(), 1_500, 4_500)],
+        vec![("2".to_string(), 3_000, 4_000)],
+    ];
+    let gene_names = vec![
+        "gene_chr2".to_string(),
+        "gene_late".to_string(),
+        "gene_overlap".to_string(),
+        "gene_empty".to_string(),
+    ];
+    let gene_units = build_logic_units_from_groups(
+        full_logic.sites.as_slice(),
+        gene_groups.as_slice(),
+        Some(gene_names.as_slice()),
+    );
+    for ld_tag_r2 in [1.0, 0.80] {
+        let reference = prepare_max6_screen_selection(
+            &full_logic,
+            gene_units.as_slice(),
+            &(0..gene_units.len()).collect::<Vec<_>>(),
+            "gene",
+            &(0..sample_ids.len()).collect::<Vec<_>>(),
+            None,
+            None,
+            ld_tag_r2,
+        )
+        .unwrap();
+        let mut observed = Vec::<(String, Vec<usize>)>::new();
+        let mut collect_selections =
+            |selections: &[Max6StreamWindowSelection], _pool: Option<&rayon::ThreadPool>| {
+                observed.extend(selections.iter().map(|selection| {
+                    (
+                        selection.unit.label.clone(),
+                        selection.prepared_source.selected_global_rows.clone(),
+                    )
+                }));
+                Ok::<(), String>(())
+            };
+        let stream = max6_gene_stream::prepare_max6_interval_streamed_ld_with_callback(
+            "gene",
+            prefix.to_str().unwrap(),
+            sample_ids.as_slice(),
+            sample_indices.as_slice(),
+            gene_groups.as_slice(),
+            gene_names.as_slice(),
+            &[],
+            0.01,
+            0.0,
+            1.0,
+            false,
+            2,
+            0,
+            ld_tag_r2,
+            None,
+            Some(&mut collect_selections),
+            None,
+        )
+        .unwrap();
+        drop(collect_selections);
+        let mut expected = reference
+            .units
+            .iter()
+            .zip(reference.original_unit_indices.iter())
+            .map(|(unit, &unit_index)| {
+                let label = gene_units[unit_index].label.clone();
+                let mut rows = unit
+                    .selected_global_rows
+                    .iter()
+                    .map(|&row| full_source_rows[row])
+                    .collect::<Vec<_>>();
+                rows.sort_unstable();
+                (label, rows)
+            })
+            .collect::<Vec<_>>();
+        for (_, rows) in observed.iter_mut() {
+            rows.sort_unstable();
+        }
+        observed.sort_by(|left, right| left.0.cmp(&right.0));
+        expected.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(observed, expected);
+        assert_eq!(stream.window_pair_count, reference.window_pair_count);
+        assert_eq!(stream.selected_window_count, reference.units.len());
+    }
+
+    let geneset_groups = vec![
+        vec![gene_groups[0][0].clone(), gene_groups[2][0].clone()],
+        vec![gene_groups[1][0].clone(), gene_groups[3][0].clone()],
+        vec![
+            ("1".to_string(), 90_000, 91_000),
+            ("2".to_string(), 90_000, 91_000),
+        ],
+    ];
+    let geneset_names = vec![
+        "geneset_chr2_chr1".to_string(),
+        "geneset_chr1_chr2".to_string(),
+        "geneset_empty".to_string(),
+    ];
+    let geneset_units = build_logic_units_from_groups(
+        full_logic.sites.as_slice(),
+        geneset_groups.as_slice(),
+        Some(geneset_names.as_slice()),
+    );
+    for ld_tag_r2 in [1.0, 0.80] {
+        let reference = prepare_max6_screen_selection(
+            &full_logic,
+            geneset_units.as_slice(),
+            &(0..geneset_units.len()).collect::<Vec<_>>(),
+            "geneset",
+            &(0..sample_ids.len()).collect::<Vec<_>>(),
+            None,
+            None,
+            ld_tag_r2,
+        )
+        .unwrap();
+        let mut observed = Vec::<(usize, Vec<usize>, Option<Vec<usize>>)>::new();
+        let mut collect_selections =
+            |selections: &[Max6StreamWindowSelection], _pool: Option<&rayon::ThreadPool>| {
+                observed.extend(selections.iter().map(|selection| {
+                    (
+                        selection.metadata.original_unit_index,
+                        selection.prepared_source.selected_global_rows.clone(),
+                        selection.prepared_source.pair_groups.clone(),
+                    )
+                }));
+                Ok::<(), String>(())
+            };
+        let stream = max6_gene_stream::prepare_max6_interval_streamed_ld_with_callback(
+            "geneset",
+            prefix.to_str().unwrap(),
+            sample_ids.as_slice(),
+            sample_indices.as_slice(),
+            geneset_groups.as_slice(),
+            geneset_names.as_slice(),
+            &[],
+            0.01,
+            0.0,
+            1.0,
+            false,
+            2,
+            0,
+            ld_tag_r2,
+            None,
+            Some(&mut collect_selections),
+            None,
+        )
+        .unwrap();
+        drop(collect_selections);
+        let mut expected = reference
+            .units
+            .iter()
+            .zip(reference.original_unit_indices.iter())
+            .map(|(unit, &unit_index)| {
+                (
+                    unit_index,
+                    unit.selected_global_rows
+                        .iter()
+                        .map(|&row| full_source_rows[row])
+                        .collect::<Vec<_>>(),
+                    unit.pair_groups.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (_, rows, _) in observed.iter_mut() {
+            rows.sort_unstable();
+        }
+        for (_, rows, _) in expected.iter_mut() {
+            rows.sort_unstable();
+        }
+        observed.sort_by_key(|unit| unit.0);
+        expected.sort_by_key(|unit| unit.0);
+        assert_eq!(observed, expected);
+        assert_eq!(stream.window_pair_count, reference.window_pair_count);
+        assert_eq!(stream.selected_window_count, reference.units.len());
+    }
+
+    let subset_sample_indices = (1..sample_ids.len()).step_by(4).collect::<Vec<_>>();
+    let subset_sample_ids = subset_sample_indices
+        .iter()
+        .map(|&index| sample_ids[index].clone())
+        .collect::<Vec<_>>();
+    let (_, subset_source_rows, subset_logic) = prepare_max6_global_qc_and_logic_bits(
+        prefix.to_str().unwrap(),
+        subset_sample_ids.as_slice(),
+        subset_sample_indices.as_slice(),
+        0.01,
+        0.0,
+        1.0,
+        false,
+        2,
+        0,
+        None,
+    )
+    .unwrap();
+    let subset_units = build_logic_units_from_groups(
+        subset_logic.sites.as_slice(),
+        geneset_groups.as_slice(),
+        Some(geneset_names.as_slice()),
+    );
+    let subset_reference = prepare_max6_screen_selection(
+        &subset_logic,
+        subset_units.as_slice(),
+        &(0..subset_units.len()).collect::<Vec<_>>(),
+        "geneset",
+        &(0..subset_sample_ids.len()).collect::<Vec<_>>(),
+        None,
+        None,
+        1.0,
+    )
+    .unwrap();
+    let mut subset_observed = Vec::<(usize, Vec<usize>)>::new();
+    let mut collect_subset_selections =
+        |selections: &[Max6StreamWindowSelection], _pool: Option<&rayon::ThreadPool>| {
+            subset_observed.extend(selections.iter().map(|selection| {
+                (
+                    selection.metadata.original_unit_index,
+                    selection.prepared_source.selected_global_rows.clone(),
+                )
+            }));
+            Ok::<(), String>(())
+        };
+    let subset_stream = max6_gene_stream::prepare_max6_interval_streamed_ld_with_callback(
+        "geneset",
+        prefix.to_str().unwrap(),
+        subset_sample_ids.as_slice(),
+        subset_sample_indices.as_slice(),
+        geneset_groups.as_slice(),
+        geneset_names.as_slice(),
+        &[],
+        0.01,
+        0.0,
+        1.0,
+        false,
+        2,
+        0,
+        1.0,
+        None,
+        Some(&mut collect_subset_selections),
+        None,
+    )
+    .unwrap();
+    drop(collect_subset_selections);
+    let mut subset_expected = subset_reference
+        .units
+        .iter()
+        .zip(subset_reference.original_unit_indices.iter())
+        .map(|(unit, &unit_index)| {
+            (
+                unit_index,
+                unit.selected_global_rows
+                    .iter()
+                    .map(|&row| subset_source_rows[row])
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    for (_, rows) in subset_observed.iter_mut() {
+        rows.sort_unstable();
+    }
+    for (_, rows) in subset_expected.iter_mut() {
+        rows.sort_unstable();
+    }
+    subset_observed.sort_by_key(|unit| unit.0);
+    subset_expected.sort_by_key(|unit| unit.0);
+    assert_eq!(subset_observed, subset_expected);
+    assert_eq!(
+        subset_stream.window_pair_count,
+        subset_reference.window_pair_count
+    );
 
     drop(full_stream);
     drop(range_stream);

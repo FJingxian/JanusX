@@ -428,6 +428,7 @@ pub(super) struct Max6WindowRangeSource {
     pub(super) pending: VecDeque<(usize, SiteInfo)>,
     pub(super) scan_all: bool,
     pub(super) scan_bimranges: Vec<GarfieldScanBimRange>,
+    pub(super) pack_scope_by_chrom: HashMap<String, Vec<(i64, i64)>>,
     pub(super) pack_scope_padding_bp: i64,
     pub(super) restrict_genotypes_to_scope: bool,
     pub(super) anchor_ready_chroms: Arc<Mutex<HashSet<String>>>,
@@ -446,8 +447,17 @@ impl Max6WindowRangeSource {
         anchor_ready_chroms: Arc<Mutex<HashSet<String>>>,
         tail_scope_complete_chroms: Arc<Mutex<HashSet<String>>>,
     ) -> Result<Self, String> {
-        let bed =
-            BedSnpIter::new_for_grm_window_header_count(prefix, garfield_logic_mmap_window_mb())?;
+        let pgen_source = crate::pgen::path_uses_pgen(prefix);
+        let prefix_base = normalize_plink_prefix(prefix);
+        let reader_prefix = if pgen_source {
+            format!("{prefix_base}.pgen")
+        } else {
+            prefix_base
+        };
+        let bed = BedSnpIter::new_for_grm_window_header_count(
+            reader_prefix.as_str(),
+            garfield_logic_mmap_window_mb(),
+        )?;
         let n_source_rows = bed.n_snps();
         if n_source_rows == 0 {
             return Err("no SNP sites found in genotype input".to_string());
@@ -456,6 +466,35 @@ impl Max6WindowRangeSource {
             .iter()
             .map(|range| chrom_base_view(range.chrom.as_str()).to_ascii_lowercase())
             .collect::<HashSet<_>>();
+        let pack_scope_padding_bp = (extension.max(1) as i64).saturating_mul(2);
+        let mut pack_scope_by_chrom = HashMap::<String, Vec<(i64, i64)>>::new();
+        for range in ranges {
+            let chrom = chrom_base_view(range.chrom.as_str()).to_ascii_lowercase();
+            let start = i64::from(range.bp_start)
+                .saturating_sub(pack_scope_padding_bp)
+                .max(0);
+            let end = i64::from(range.bp_end)
+                .saturating_add(pack_scope_padding_bp)
+                .min(i64::from(i32::MAX));
+            pack_scope_by_chrom
+                .entry(chrom)
+                .or_default()
+                .push((start, end));
+        }
+        for intervals in pack_scope_by_chrom.values_mut() {
+            intervals.sort_unstable();
+            let mut merged = Vec::<(i64, i64)>::with_capacity(intervals.len());
+            for (start, end) in intervals.drain(..) {
+                if let Some(last) = merged.last_mut() {
+                    if start <= last.1.saturating_add(1) {
+                        last.1 = last.1.max(end);
+                        continue;
+                    }
+                }
+                merged.push((start, end));
+            }
+            *intervals = merged;
+        }
         let (max_chunk_rows, metadata_chunk_rows) = if bed.has_pgen_source() {
             (
                 MAX6_WINDOW_STREAM_PGEN_CHUNK_ROWS,
@@ -470,7 +509,7 @@ impl Max6WindowRangeSource {
         let scan_all = selected_chroms.is_empty();
         Ok(Self {
             bed,
-            bim: BimChunkReader::open(prefix)?,
+            bim: BimChunkReader::open(reader_prefix.as_str())?,
             max_chunk_rows,
             metadata_chunk_rows,
             n_source_rows,
@@ -481,7 +520,8 @@ impl Max6WindowRangeSource {
             pending: VecDeque::new(),
             scan_all,
             scan_bimranges: ranges.to_vec(),
-            pack_scope_padding_bp: (extension.max(1) as i64).saturating_mul(2),
+            pack_scope_by_chrom,
+            pack_scope_padding_bp,
             restrict_genotypes_to_scope: restrict_genotypes_to_scope && !ranges.is_empty(),
             anchor_ready_chroms,
             tail_scope_complete_chroms,
@@ -587,11 +627,7 @@ impl Max6WindowRangeSource {
                     self.seen_selected_chroms.insert(chrom.clone());
                 }
                 let in_scope = !self.restrict_genotypes_to_scope
-                    || max6_window_site_in_pack_scope(
-                        &site,
-                        self.scan_bimranges.as_slice(),
-                        self.pack_scope_padding_bp,
-                    );
+                    || self.site_in_pack_scope(site.chrom.as_str(), site.pos);
                 let anchor_not_ready =
                     self.restrict_genotypes_to_scope && !anchor_ready_snapshot.contains(&chrom);
                 if in_scope || anchor_not_ready {
@@ -609,6 +645,18 @@ impl Max6WindowRangeSource {
             self.done = true;
         }
         Ok(())
+    }
+
+    fn site_in_pack_scope(&self, chrom: &str, pos: i32) -> bool {
+        let key = chrom_base_view(chrom).to_ascii_lowercase();
+        let Some(intervals) = self.pack_scope_by_chrom.get(key.as_str()) else {
+            return false;
+        };
+        let pos = i64::from(pos);
+        let index = intervals.partition_point(|&(_, end)| end < pos);
+        intervals
+            .get(index)
+            .is_some_and(|&(start, end)| start <= pos && pos <= end)
     }
 
     pub(super) fn fill_chunk(&mut self, chunk: &mut Max6WindowStreamChunk) -> Result<bool, String> {

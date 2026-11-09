@@ -1,5 +1,17 @@
 use super::*;
 
+pub(super) fn max6_fused_grm_int_scan_supported(
+    unit_kind: &str,
+    groups: Option<&[Vec<(String, i32, i32)>]>,
+) -> bool {
+    match unit_kind {
+        "window" => true,
+        "gene" => groups.is_some_and(|groups| groups.iter().all(|group| group.len() == 1)),
+        "geneset" => groups.is_some(),
+        _ => false,
+    }
+}
+
 pub(super) fn garfield_logic_search_bed_owned(
     prefix: String,
     y: Vec<f64>,
@@ -371,9 +383,9 @@ pub(super) fn garfield_logic_search_bed_owned(
     let scheduler_scan_tasks = new_garfield_scheduler_task_collector();
     let scheduler_permutation_tasks = new_garfield_scheduler_task_collector();
     let unit_kind_lc = unit_kind.trim().to_ascii_lowercase();
-    let fused_window_grm_int_scan = max6_ld_tag_backend
+    let fused_max6_grm_int_scan = max6_ld_tag_backend
         && grm_int_only
-        && unit_kind_lc == "window"
+        && max6_fused_grm_int_scan_supported(unit_kind_lc.as_str(), groups.as_deref())
         && !max6_explicit_audit
         && prepared_max6_universe.is_none()
         && site_keep_precomputed.is_none();
@@ -383,8 +395,8 @@ pub(super) fn garfield_logic_search_bed_owned(
         0,
         1,
         Some(
-            if fused_window_grm_int_scan && (using_external_grm || use_lm_residualization) {
-                "deferring marker QC to the fused window scan"
+            if fused_max6_grm_int_scan && (using_external_grm || use_lm_residualization) {
+                "deferring marker QC to the fused scan"
             } else {
                 "reading PLINK metadata and applying marker QC"
             },
@@ -452,7 +464,7 @@ pub(super) fn garfield_logic_search_bed_owned(
         filtered_sites,
         n_samples_total,
         bytes_per_snp,
-    ) = if fused_window_grm_int_scan && (using_external_grm || use_lm_residualization) {
+    ) = if fused_max6_grm_int_scan && (using_external_grm || use_lm_residualization) {
         let header = BedSnpIter::new_for_grm_window_header_count(
             normalize_plink_prefix(&prefix).as_str(),
             garfield_logic_mmap_window_mb(),
@@ -568,8 +580,8 @@ pub(super) fn garfield_logic_search_bed_owned(
         Some(&format!("rows={}", grm_row_source_indices.len())),
     )?;
     let marker_qc_detail =
-        if fused_window_grm_int_scan && (using_external_grm || use_lm_residualization) {
-            "marker QC will run in the fused window scan".to_string()
+        if fused_max6_grm_int_scan && (using_external_grm || use_lm_residualization) {
+            format!("marker QC will run in the fused {unit_kind_lc} scan")
         } else {
             format!("{} retained marker rows", grm_row_source_indices.len())
         };
@@ -1097,7 +1109,7 @@ pub(super) fn garfield_logic_search_bed_owned(
     )
     .map_err(|error| error.to_string())?;
 
-    if fused_window_grm_int_scan {
+    if fused_max6_grm_int_scan {
         let response = ResponseKind::Continuous;
         let engine = parse_optional_ml_engine(&ml_method)?;
         let importance = parse_importance(&ml_importance)?;
@@ -1140,7 +1152,18 @@ pub(super) fn garfield_logic_search_bed_owned(
             },
             proposal_config,
         );
-        return run_max6_window_fused_grm_int_scan(
+        return run_max6_fused_grm_int_scan(
+            unit_kind_lc.as_str(),
+            if matches!(unit_kind_lc.as_str(), "gene" | "geneset") {
+                grouped_scan_groups_selected.as_deref()
+            } else {
+                None
+            },
+            if matches!(unit_kind_lc.as_str(), "gene" | "geneset") {
+                grouped_scan_group_names_selected.as_deref()
+            } else {
+                None
+            },
             prefix.as_str(),
             selected_sample_ids.as_slice(),
             selected_sample_indices.as_slice(),

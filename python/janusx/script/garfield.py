@@ -1,4 +1,5 @@
 import argparse
+import gzip
 import json
 import logging
 import os
@@ -11,6 +12,7 @@ import tempfile
 import threading
 import time
 from typing import Optional
+from urllib.parse import unquote
 
 import numpy as np
 import pandas as pd
@@ -32,7 +34,6 @@ from janusx.assoc.workflow import (
 )
 from janusx.assoc.workflow_cache import _gwas_cache_prefix_with_params
 from janusx.gfreader import prepare_bed_logic_keep_mask_pure_line
-from janusx.gtools.reader import readanno
 from janusx.script._common.cli_args import (
     add_common_covariate_file_or_site_arg,
     add_common_genotype_source_args,
@@ -1129,6 +1130,68 @@ def _format_genefile_display(paths: list[str]) -> Optional[str]:
     return "; ".join(str(x) for x in paths)
 
 
+_GFF3_ID_ATTR_RE = re.compile(
+    r"(?:^|;|\s)ID=([^;]*?)(?=;|\s+[^\s;=]+=|$)"
+)
+
+
+def _read_gff3_gene_intervals(
+    gff3: str,
+    requested_gene_ids: Optional[set[str]] = None,
+) -> list[tuple[str, int, int, str]]:
+    """Read only GFF3 gene rows, optionally retaining requested IDs only.
+
+    GARFIELD needs just the gene interval columns, so materializing every
+    feature and attribute in a large GFF DataFrame wastes substantial memory.
+    Keep this parser aligned with ``readanno(..., "ID")`` for ID extraction,
+    prefix removal, coordinate conversion, row ordering, and duplicate IDs.
+    """
+    path = Path(gff3)
+    opener = gzip.open if path.suffix.lower() == ".gz" else open
+    rows: list[tuple[str, int, int, str]] = []
+    with opener(path, "rt", encoding="utf-8", errors="replace") as handle:
+        for raw_line in handle:
+            if not raw_line or raw_line.startswith("#"):
+                continue
+            line = raw_line.rstrip("\r\n")
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) < 9:
+                parts = re.split(r"\s+", line, maxsplit=8)
+            if len(parts) < 9 or parts[2] != "gene":
+                continue
+            try:
+                start = int(float(parts[3]))
+                end = int(float(parts[4]))
+            except (TypeError, ValueError, OverflowError):
+                continue
+            attributes = parts[8]
+            if len(parts) > 9:
+                attr_head = attributes.replace(";", " ")
+                attr_tail = " ".join(parts[9:]).strip()
+                attributes = f"{attr_head} {attr_tail}".strip() if attr_tail else attr_head
+            match = _GFF3_ID_ATTR_RE.search(attributes)
+            gene_id = unquote(match.group(1)).strip() if match else "NA"
+            gene_id = re.sub(r"\s+", " ", gene_id)
+            gene_id = re.sub(r"^[^:]*:", "", gene_id)
+            if requested_gene_ids is not None and gene_id not in requested_gene_ids:
+                continue
+            rows.append((str(parts[0]).strip(), start, end, gene_id))
+
+    # readanno sorts by chromosome and start before GARFIELD drops duplicate
+    # IDs. Sorting the much smaller gene-only list preserves that behavior.
+    rows.sort(key=lambda row: (row[0], row[1], row[2]))
+    unique_rows: list[tuple[str, int, int, str]] = []
+    seen_ids: set[str] = set()
+    for row in rows:
+        if row[3] in seen_ids:
+            continue
+        seen_ids.add(row[3])
+        unique_rows.append(row)
+    return unique_rows
+
+
 def _build_interval_groups(
     genefile: str | list[str] | tuple[str, ...],
     gff3: str,
@@ -1141,18 +1204,25 @@ def _build_interval_groups(
     genesets = all_genesets
     if len(genesets) == 0:
         raise ValueError("Gene file list is empty.")
-    dfgff3 = readanno(gff3, "ID").iloc[:, :4].set_index(3)
-    dfgff3 = dfgff3.loc[~dfgff3.index.duplicated()]
+    requested_gene_ids = {gene for genes in genesets for gene in genes}
+    gene_intervals = {
+        gene_id: (chrom, start, end)
+        for chrom, start, end, gene_id in _read_gff3_gene_intervals(
+            gff3,
+            requested_gene_ids,
+        )
+    }
 
     labels: list[str] = []
     groups: list[list[tuple[str, int, int]]] = []
 
     def _iv(gene: str) -> Optional[tuple[str, int, int]]:
-        if gene not in dfgff3.index:
+        interval = gene_intervals.get(gene)
+        if interval is None:
             return None
-        chrom = str(dfgff3.loc[gene, 0])
-        start = int(dfgff3.loc[gene, 1]) - int(extension)
-        end = int(dfgff3.loc[gene, 2]) + int(extension)
+        chrom, gene_start, gene_end = interval
+        start = int(gene_start) - int(extension)
+        end = int(gene_end) + int(extension)
         return (chrom, start, end)
 
     if scan_mode == "gene":
@@ -1190,14 +1260,9 @@ def _build_all_gene_interval_groups(
     gff3: str,
     extension: int,
 ) -> list[list[tuple[str, int, int]]]:
-    dfgff3 = readanno(gff3, "ID").iloc[:, :4].set_index(3)
-    dfgff3 = dfgff3.loc[~dfgff3.index.duplicated()]
     groups: list[list[tuple[str, int, int]]] = []
     ext = max(1, int(extension))
-    for gene_id, row in dfgff3.iterrows():
-        chrom = str(row[0])
-        gene_start = int(row[1])
-        gene_end = int(row[2])
+    for chrom, gene_start, gene_end, gene_id in _read_gff3_gene_intervals(gff3):
         center = (gene_start + gene_end) // 2
         start = center - ext
         end = center + ext
@@ -1628,6 +1693,8 @@ class _GarfieldStageProgress:
             return "Preparing scan genotype bitsets"
         if stage == "garfield_window_fused_scan":
             return "Wscan"
+        if stage == "garfield_gene_fused_scan":
+            return "Gscan"
         if stage == "max6_setup_margins":
             return "Preparing Max6 marker margins"
         if stage == "max6_setup_ld_tags":
@@ -2858,17 +2925,25 @@ def main() -> None:
         and not max6_audit_requested
         and not bool(args.global_stats)
     )
+    fused_max6_gene = bool(
+        str(args.scan_mode).lower() in {"gene", "geneset"}
+        and _is_ld_tag_max6_backend(args.search_backend)
+        and bool(args.grm_int)
+        and not max6_audit_requested
+        and not bool(args.global_stats)
+    )
+    fused_max6_stream = fused_max6_window or fused_max6_gene
     use_prepared_max6 = bool(
         _is_ld_tag_max6_backend(args.search_backend)
         and not max6_audit_requested
-        and not fused_max6_window
+        and not fused_max6_stream
     )
     scan_unit_total: Optional[int] = None
     if (
         args.scan_mode == "window"
         and not args.bimrange
         and not use_prepared_max6
-        and not fused_max6_window
+        and not fused_max6_stream
     ):
         scan_unit_total = _count_window_scan_units_from_bim(
             str(gfile),
@@ -3059,9 +3134,9 @@ def main() -> None:
             # External-GRM Max6 only needs trait-sample QC for the frozen tag
             # rows; the native consumer performs that bounded source-row QC.
             site_keep_trait = None
-        elif fused_max6_window:
-            # The fused native window reader applies trait-sample QC while it
-            # packs the current bounded window batch for LD and pair scanning.
+        elif fused_max6_stream:
+            # The fused native reader applies trait-sample QC while it packs
+            # only rows currently covered by a scan unit.
             site_keep_trait = None
         elif (
             site_keep_trait is None
@@ -3078,7 +3153,7 @@ def main() -> None:
                     dtype=np.bool_,
                 )
             site_keep_trait = prepared_max6_qc_mask
-        elif site_keep_trait is None and not fused_max6_window:
+        elif site_keep_trait is None and not fused_max6_stream:
             site_keep_trait = _prepare_site_keep(
                 genofile=gfile,
                 sample_ids=list(common_ids),

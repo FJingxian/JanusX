@@ -23,7 +23,7 @@ keywords = ["GWAS", "GS", "REML", "Kmer"]
 
 [project.optional-dependencies]
 adamixture = [
-    "adamixture==1.9.6",
+    "janusx-adamixture==1.9.6.post1",
 ]
 ml = [
     "scikit-learn",
@@ -40,7 +40,7 @@ treeplot = [
     "toyplot",
 ]
 full = [
-    "adamixture==1.9.6",
+    "janusx-adamixture==1.9.6.post1",
     "scikit-learn",
     "xgboost",
     "statsmodels",

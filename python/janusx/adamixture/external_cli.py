@@ -40,9 +40,9 @@ def resolve_executable() -> str:
     candidate = shutil.which("adamixture")
     if candidate is None:
         requirement = optional_requirement_for_extra(
+            "janusx-adamixture",
             "adamixture",
-            "adamixture",
-            fallback="adamixture==1.9.6",
+            fallback="janusx-adamixture==1.9.6.post1",
         )
         install_hint = format_install_hint(
             (requirement,),

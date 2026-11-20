@@ -153,34 +153,49 @@ jx <module> -h
 
 ## Module map
 
+The command groups below mirror the sections printed by `jx -h`.
+
 **Genome-wide Association Studies (GWAS)**:
 
-- `grm`
-- `pca`
-- `gwas`
-- `ct` (cis/trans pair scans)
-- `postgwas` (Visualization, `manh` `qq` `ldblock`)
-- `adamixture` (population structure via the upstream ADAMIXTURE CLI)
-- `fst` (windowed population FST)
-- `xpclr` (windowed XP-CLR selection scan)
-
-ADAMIXTURE is an external dependency. Its license and attribution are recorded in
-[THIRD_PARTY_NOTICES.md](./doc/THIRD_PARTY_NOTICES.md).
+- `gwas` — Run genome-wide association analysis (`lm`, `lmm`, `lmm2`, `fvlmm`, `splmm`, `splmm-exact`, and `farmcpu`)
+- `ct` — Test cis/trans effects for nearby phased variant pairs
+- `postgwas` — Post-process GWAS results and create Manhattan, QQ, LD-block, and gene-structure plots
 
 **Genomic Selection (GS)**:
 
-- `gs`
-- `postgs` (Visualization)
+- `gs` — Genomic prediction and model-based selection, including BLUP, Bayesian, and machine-learning models
+- `postgs` — Summarize and visualize GS results
 
-**Epistasis**:
+**Epistasis Association (GARFIELD)**:
 
-- `garfield` (Based on https://github.com/heroalone/Garfield)
+- `garfield` — Run GARFIELD marker-trait and interaction scans
+- `postgarfield` — Post-process GARFIELD results and downstream plots
+
+**K-mer**:
+
+- `kmer` — Run the K-mer counting workflow through KMC
+- `kmerge` — Merge multi-sample KMC databases into a genotype matrix
+- `kstats` — Compute pairwise KMC K-mer statistics
+- `kformat` — Filter and convert JanusX K-mer bitmatrices
+
+**Population Analysis**:
+
+- `adamixture` — Infer population structure through the ADAMIXTURE backend
+- `fst` — Compute windowed population FST
+- `xpclr` — Compute a windowed XP-CLR selection scan
+
+ADAMIXTURE is an external dependency. See the
+[ADAMIXTURE project](https://github.com/AI-sandbox/ADAMIXTURE) for its software and citation information.
 
 **Utility**:
 
-- `gformat` (Conversion between genotype data formats, support fast splicing/filtering/prune)
-- `gmerge` (Merge genotype between samples)
-- `gstats` (State freq/het/missing/ldscore of genotype)
+- `grm` — Build a genomic relationship matrix
+- `pca` — Compute principal components for population structure
+- `gstats` — Compute genotype frequency, heterozygosity, missingness, and LD statistics
+- `reml` — Estimate heritability and BLUE values by REML
+- `gformat` — Convert and filter genotype files across VCF, HMP, PLINK BED, PGEN, text, and NumPy formats
+- `gmerge` — Merge genotype and variant tables
+- `imp` — Run windowed genotype phasing and reference imputation
 
 ---
 

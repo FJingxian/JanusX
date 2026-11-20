@@ -759,7 +759,15 @@ fn windows_find_kmc_zlib_candidate() -> Option<PathBuf> {
         }
     }
 
-    let preferred_names = ["zlibstatic.lib", "zlib.lib", "zlib1.lib", "z.lib"];
+    let preferred_names = [
+        "libzs.lib",
+        "libzsd.lib",
+        "zlibstatic.lib",
+        "zlib.lib",
+        "libz.lib",
+        "zlib1.lib",
+        "z.lib",
+    ];
     for dir in windows_kmc_zlib_probe_dirs() {
         for name in preferred_names {
             let cand = dir.join(name);
@@ -785,7 +793,12 @@ fn windows_find_kmc_zlib_candidate() -> Option<PathBuf> {
             if !name.ends_with(".lib") {
                 continue;
             }
-            if name == "z.lib" || name.starts_with("zlib") {
+            if name == "libzs.lib"
+                || name == "libzsd.lib"
+                || name == "libz.lib"
+                || name == "z.lib"
+                || name.starts_with("zlib")
+            {
                 return Some(path);
             }
         }

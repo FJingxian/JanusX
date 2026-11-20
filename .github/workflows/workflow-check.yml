@@ -49,6 +49,7 @@ jobs:
 
           grep -nF "Build wheels (Linux)" .github/workflows/reusable-wheel-build.yml
           grep -nF "Install OpenBLAS (Windows ARM64 via vcpkg)" .github/workflows/reusable-wheel-build.yml
+          grep -nF '"libzs.lib"' .github/workflows/reusable-wheel-build.yml
           grep -nF "auditwheel repair" .github/workflows/reusable-wheel-build.yml
 
           clear_step_line="$(grep -nF \

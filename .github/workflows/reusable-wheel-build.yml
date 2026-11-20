@@ -322,9 +322,19 @@ jobs:
 
           $installed = Join-Path $vcpkgRoot "installed\$triplet"
           $binDir = Join-Path $installed "bin"
-          $zlibLib = Get-ChildItem -Path "$installed\lib" -Filter "z*.lib" -File | Select-Object -First 1
+          # zlib 1.4 names the Windows static library libzs.lib.  Older
+          # ports used zlibstatic.lib/zlib.lib, so keep those names as
+          # fallbacks instead of assuming the filename starts with z.
+          $zlibNames = @("libzs.lib", "zlibstatic.lib", "zlib.lib", "libz.lib", "zlib1.lib", "z.lib")
+          $zlibLib = $zlibNames |
+            ForEach-Object {
+              Get-Item -LiteralPath (Join-Path "$installed\lib" $_) -ErrorAction SilentlyContinue
+            } |
+            Select-Object -First 1
           if (-not $zlibLib) {
-            throw "No zlib .lib found under $installed\\lib"
+            $availableLibs = (Get-ChildItem -Path "$installed\lib" -Filter "*.lib" -File -ErrorAction SilentlyContinue |
+              Select-Object -ExpandProperty Name) -join ", "
+            throw "No zlib library found under $installed\\lib. Available .lib files: $availableLibs"
           }
           if (Test-Path $binDir) {
             "OPENBLAS_BIN_DIR=$binDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append

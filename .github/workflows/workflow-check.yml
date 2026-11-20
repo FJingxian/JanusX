@@ -41,9 +41,6 @@ jobs:
           grep -nF "uses: ./.github/workflows/reusable-wheel-build.yml" \
             .github/workflows/build-wheel.yml \
             .github/workflows/release.yml
-          grep -nF "uses: ./.github/workflows/reusable-adamixture-build.yml" \
-            .github/workflows/adamixture-wheels.yml \
-            .github/workflows/release.yml
 
           grep -nF "matrix_preset: standard" .github/workflows/build-wheel.yml
           grep -nF "matrix_preset: release" .github/workflows/release.yml
@@ -99,8 +96,6 @@ jobs:
           grep -nF "uses: ./.github/workflows/reusable-sdist-build.yml" .github/workflows/release.yml
           grep -nF "name: Reusable sdist Build" .github/workflows/reusable-sdist-build.yml
           grep -nF "maturin sdist --out dist" .github/workflows/reusable-sdist-build.yml
-          grep -nF "name: Reusable ADAMIXTURE companion build" \
-            .github/workflows/reusable-adamixture-build.yml
 
           if grep -nF \
             -e "maturin sdist --out dist" \

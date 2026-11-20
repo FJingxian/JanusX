@@ -714,25 +714,6 @@ def draw_gene_structure_records(
                     gene_left, gene_right = model_left, model_right
             gene_bounds[gene_idx] = (gene_left, gene_right)
 
-        # Put a white, borderless CDS-height plate behind every gene model.
-        # Manhattan-to-LD connectors are drawn below this plate, so dense
-        # bridge lines cannot visually cut through the gene structure while
-        # the plate still leaves the gene line, UTR, CDS, and labels visible.
-        for gene_idx, (gene_left, gene_right) in gene_bounds.items():
-            y_gene = lane_y.get(gene_idx, y0)
-            ax.add_artist(
-                _GeneFeatureBlockArtist(
-                    ax,
-                    gene_left,
-                    gene_right,
-                    y_gene,
-                    "white",
-                    height_ratio=4.0,
-                    backbone_line_width=line_width,
-                    zorder=0.5,
-                )
-            )
-
         # Work in display edges, so adjacent CDS blocks remain exactly
         # touching and cannot acquire a one-base seam.
         cds_by_gene: dict[object, list[tuple[float, float]]] = {

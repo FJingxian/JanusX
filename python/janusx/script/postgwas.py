@@ -11641,20 +11641,28 @@ def _draw_gene_structure_axis(
         )
 
     # Keep labels subordinate to the structure track.  The feature scale is
-    # slightly expanded so CDS/UTR blocks remain legible after the label is
+    # slightly expanded so CDS blocks remain legible after the label is
     # reduced, while the backbone line stays the thinnest element.
-    # Keep labels close to the visual scale of the UTR blocks.  The outer
+    # Keep labels close to the visual scale of the CDS blocks.  The outer
     # postgwas font size is intentionally larger for Manhattan annotations;
     # gene names should remain a compact caption inside their lane.
     effective_label_size = max(2.5, min(4.0, 0.50 * float(gene_text_size)))
     effective_structure_scale = max(0.85, 1.12 * float(thickness_scale))
     effective_line_width = max(1.20, min(3.00, 2.80 * float(line_width)))
+    # UTRs are hidden in postgwas panels.  Reuse their former dark shade for
+    # the remaining CDS blocks so the compact track keeps the stronger,
+    # darker visual weight used by the previous UTR layer.
+    effective_block_color = (
+        str(utr_color)
+        if (not draw_utr and utr_color is not None)
+        else str(block_color)
+    )
     draw_gene_structure_records(
         ax,
         gene_df_plot,
         arrow_color=arrow_color,
         triangle_color="white",
-        block_color=block_color,
+        block_color=effective_block_color,
         utr_color=utr_color,
         draw_utr=draw_utr,
         line_width=effective_line_width,

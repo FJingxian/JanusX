@@ -138,8 +138,8 @@ def build_parser():
             ]
         ),
         description=(
-            "Merge multi-sample KMC databases into JanusX k-mer bitmatrix output "
-            "(.idv + .bkmer + .bsite + .meta.json) and write <prefix>.kmerge.log."
+            "Merge multi-sample KMC databases into a JanusX k-mer bitmatrix or "
+            "compressed PLINK 2 pfile output and write <prefix>.kmerge.log."
         ),
     )
 
@@ -237,6 +237,16 @@ def build_parser():
         "--force",
         action="store_true",
         help="Overwrite existing output files and tmp-dir.",
+    )
+    advanced.add_argument(
+        "--out-format",
+        choices=("kfile", "pfile"),
+        default="kfile",
+        help=(
+            "Final output format: kfile or PLINK 2 pfile with .pvar.zst "
+            "(IDs use reversible k{K}h<hex>; PLINK command: --pfile PREFIX vzs; "
+            "default: %(default)s)."
+        ),
     )
     return parser
 
@@ -339,6 +349,7 @@ def main() -> int:
                     ("Keep tmp", bool(args.keep_tmp)),
                     ("Resume", bool(args.resume)),
                     ("Force", bool(args.force)),
+                    ("Output format", str(args.out_format)),
                     ("Log file", log_path),
                 ],
             ),
@@ -370,6 +381,7 @@ def main() -> int:
             resume=bool(args.resume),
             keep_tmp=bool(args.keep_tmp),
             force=bool(args.force),
+            out_format=str(args.out_format),
             log_path=get_log_spool_path(logger) or None,
             progress_callback=progress_ui.callback,
         )
@@ -385,10 +397,15 @@ def main() -> int:
         f"Merged {int(summary['n_kmers'])} k-mers across {int(summary['n_samples'])} samples (k={int(summary['k'])}).",
     )
     logger.info("Output files:")
-    logger.info(f"  {format_path_for_display(summary['idv'])}")
-    logger.info(f"  {format_path_for_display(summary['bkmer'])}")
-    logger.info(f"  {format_path_for_display(summary['bsite'])}")
-    logger.info(f"  {format_path_for_display(summary['meta'])}")
+    if str(summary.get("format", args.out_format)) == "pfile":
+        logger.info(f"  {format_path_for_display(summary['pgen'])}")
+        logger.info(f"  {format_path_for_display(summary['pvar'])}")
+        logger.info(f"  {format_path_for_display(summary['psam'])}")
+    else:
+        logger.info(f"  {format_path_for_display(summary['idv'])}")
+        logger.info(f"  {format_path_for_display(summary['bkmer'])}")
+        logger.info(f"  {format_path_for_display(summary['bsite'])}")
+        logger.info(f"  {format_path_for_display(summary['meta'])}")
     logger.info(f"Log file: {format_path_for_display(log_path)}")
     return 0
 

@@ -235,7 +235,11 @@ fn list_run_files(bucket_dir: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = fs::read_dir(bucket_dir)
         .with_context(|| format!("failed to read bucket dir: {}", bucket_dir.display()))?
         .filter_map(|entry| entry.ok().map(|x| x.path()))
-        .filter(|path| path.extension().and_then(|x| x.to_str()) == Some("bin"))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("run_") && name.ends_with(".bin"))
+        })
         .collect::<Vec<_>>();
     paths.sort();
     Ok(paths)

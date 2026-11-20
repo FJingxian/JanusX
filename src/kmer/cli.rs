@@ -4,6 +4,7 @@ use crate::kmer::progress::ProgressFn;
 use crate::kmer::stage1_bucket::{run_stage1, Stage1Config};
 use crate::kmer::stage2_merge::{load_stage2_manifest, run_stage2, Stage2Config};
 use crate::kmer::stage3_concat::{run_stage3, Stage3Config, Stage3Summary};
+use crate::pgen::{count_pgen_variants, count_psam_samples};
 use anyhow::{bail, Context, Result};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
@@ -25,6 +26,7 @@ pub struct KmergeArgs {
     pub tmp_dir: Option<PathBuf>,
     pub max_run_size_mb: usize,
     pub bucket_bits: u8,
+    pub out_format: String,
     pub batch_size: usize,
     pub min_count: u32,
     pub resume: bool,
@@ -52,6 +54,7 @@ pub struct KmergeArgs {
         resume = false,
         keep_tmp = false,
         force = false,
+        out_format = "kfile",
         log_path = None,
         progress_callback = None
     )
@@ -73,6 +76,7 @@ pub fn kmerge_run_py(
     resume: bool,
     keep_tmp: bool,
     force: bool,
+    out_format: &str,
     log_path: Option<String>,
     progress_callback: Option<Py<PyAny>>,
 ) -> PyResult<Py<PyDict>> {
@@ -92,6 +96,7 @@ pub fn kmerge_run_py(
         resume,
         keep_tmp,
         force,
+        out_format: out_format.to_ascii_lowercase(),
         log_path: log_path.map(PathBuf::from),
         progress_callback: progress_callback.map(Arc::new),
     };
@@ -101,10 +106,28 @@ pub fn kmerge_run_py(
         .map_err(|err| PyRuntimeError::new_err(err.to_string()))?;
 
     let out = PyDict::new(py);
-    out.set_item("idv", summary.idv_path.to_string_lossy().as_ref())?;
-    out.set_item("bkmer", summary.bkmer_path.to_string_lossy().as_ref())?;
-    out.set_item("bsite", summary.bsite_path.to_string_lossy().as_ref())?;
-    out.set_item("meta", summary.meta_path.to_string_lossy().as_ref())?;
+    out.set_item("format", &summary.output_format)?;
+    if let Some(path) = summary.idv_path.as_ref() {
+        out.set_item("idv", path.to_string_lossy().as_ref())?;
+    }
+    if let Some(path) = summary.bkmer_path.as_ref() {
+        out.set_item("bkmer", path.to_string_lossy().as_ref())?;
+    }
+    if let Some(path) = summary.bsite_path.as_ref() {
+        out.set_item("bsite", path.to_string_lossy().as_ref())?;
+    }
+    if let Some(path) = summary.meta_path.as_ref() {
+        out.set_item("meta", path.to_string_lossy().as_ref())?;
+    }
+    if let Some(path) = summary.pgen_path.as_ref() {
+        out.set_item("pgen", path.to_string_lossy().as_ref())?;
+    }
+    if let Some(path) = summary.pvar_path.as_ref() {
+        out.set_item("pvar", path.to_string_lossy().as_ref())?;
+    }
+    if let Some(path) = summary.psam_path.as_ref() {
+        out.set_item("psam", path.to_string_lossy().as_ref())?;
+    }
     out.set_item("n_samples", summary.n_samples)?;
     out.set_item("n_kmers", summary.n_kmers)?;
     out.set_item("bytes_per_col", summary.bytes_per_col)?;
@@ -124,6 +147,9 @@ pub fn run_kmerge(args: KmergeArgs) -> Result<Stage3Summary> {
     }
     if args.bucket_bits == 0 {
         bail!("bucket_bits must be > 0");
+    }
+    if args.out_format != "kfile" && args.out_format != "pfile" {
+        bail!("out_format must be kfile or pfile");
     }
 
     let out_dir = args
@@ -150,15 +176,26 @@ pub fn run_kmerge(args: KmergeArgs) -> Result<Stage3Summary> {
 
     prepare_output_space(&out_dir, &tmp_dir, &args, &samples)?;
 
-    if args.resume
-        && is_stage_done(&tmp_dir.join("stage3.done"))
-        && out_dir.join(format!("{}.meta.json", args.prefix)).is_file()
-    {
+    let final_ready = if args.out_format == "pfile" {
+        out_dir.join(format!("{}.pgen", args.prefix)).is_file()
+            && out_dir.join(format!("{}.psam", args.prefix)).is_file()
+            && (out_dir.join(format!("{}.pvar", args.prefix)).is_file()
+                || out_dir.join(format!("{}.pvar.zst", args.prefix)).is_file())
+    } else {
+        out_dir.join(format!("{}.meta.json", args.prefix)).is_file()
+    };
+    if args.resume && is_stage_done(&tmp_dir.join("stage3.done")) && final_ready {
         emit_run_line(
             log_path,
             "Stage 3/3: resume hit, reusing existing final outputs",
         )?;
-        return load_existing_summary(&out_dir, &args.prefix);
+        return load_existing_summary(
+            &out_dir,
+            &args.prefix,
+            &args.out_format,
+            k,
+            samples.len() as u64,
+        );
     }
 
     let max_records_per_flush =
@@ -246,6 +283,7 @@ pub fn run_kmerge(args: KmergeArgs) -> Result<Stage3Summary> {
         min_count: args.min_count,
         freq: args.freq,
         bucket_bits: args.bucket_bits,
+        out_format: &args.out_format,
         progress_callback: stage3_progress.clone(),
         progress_total: stage3_total.max(1),
     })?;
@@ -307,12 +345,21 @@ fn prepare_output_space(
     fs::create_dir_all(out_dir)
         .with_context(|| format!("failed to create output dir: {}", out_dir.display()))?;
 
-    let outputs = [
-        out_dir.join(format!("{}.idv", args.prefix)),
-        out_dir.join(format!("{}.bkmer", args.prefix)),
-        out_dir.join(format!("{}.bsite", args.prefix)),
-        out_dir.join(format!("{}.meta.json", args.prefix)),
-    ];
+    let outputs = if args.out_format == "pfile" {
+        vec![
+            out_dir.join(format!("{}.pgen", args.prefix)),
+            out_dir.join(format!("{}.pvar", args.prefix)),
+            out_dir.join(format!("{}.pvar.zst", args.prefix)),
+            out_dir.join(format!("{}.psam", args.prefix)),
+        ]
+    } else {
+        vec![
+            out_dir.join(format!("{}.idv", args.prefix)),
+            out_dir.join(format!("{}.bkmer", args.prefix)),
+            out_dir.join(format!("{}.bsite", args.prefix)),
+            out_dir.join(format!("{}.meta.json", args.prefix)),
+        ]
+    };
 
     if !args.resume {
         for path in outputs.iter() {
@@ -321,6 +368,15 @@ fn prepare_output_space(
                     "output file already exists: {} (use --force to overwrite)",
                     path.display()
                 );
+            }
+        }
+        if args.force {
+            for path in outputs.iter() {
+                if path.exists() {
+                    fs::remove_file(path).with_context(|| {
+                        format!("failed to remove existing output: {}", path.display())
+                    })?;
+                }
             }
         }
         if tmp_dir.exists() {
@@ -344,17 +400,61 @@ fn prepare_output_space(
     Ok(())
 }
 
-fn load_existing_summary(out_dir: &Path, prefix: &str) -> Result<Stage3Summary> {
+fn load_existing_summary(
+    out_dir: &Path,
+    prefix: &str,
+    out_format: &str,
+    k: u32,
+    n_samples: u64,
+) -> Result<Stage3Summary> {
+    if out_format == "pfile" {
+        let pgen_path = out_dir.join(format!("{prefix}.pgen"));
+        let pvar_path = if out_dir.join(format!("{prefix}.pvar.zst")).is_file() {
+            out_dir.join(format!("{prefix}.pvar.zst"))
+        } else {
+            out_dir.join(format!("{prefix}.pvar"))
+        };
+        let psam_path = out_dir.join(format!("{prefix}.psam"));
+        let n_kmers = count_pgen_variants(pgen_path.to_string_lossy().as_ref(), n_samples as usize)
+            .map_err(anyhow::Error::msg)? as u64;
+        let psam_samples = count_psam_samples(psam_path.to_string_lossy().as_ref())
+            .map_err(anyhow::Error::msg)? as u64;
+        if psam_samples != n_samples {
+            bail!(
+                "pfile sample count mismatch: psam={}, expected={}",
+                psam_samples,
+                n_samples
+            );
+        }
+        return Ok(Stage3Summary {
+            output_format: "pfile".to_string(),
+            idv_path: None,
+            bkmer_path: None,
+            bsite_path: None,
+            meta_path: None,
+            pgen_path: Some(pgen_path),
+            pvar_path: Some(pvar_path),
+            psam_path: Some(psam_path),
+            n_samples,
+            n_kmers,
+            bytes_per_col: n_samples.div_ceil(8),
+            k,
+        });
+    }
     let meta_path = out_dir.join(format!("{}.meta.json", prefix));
     let file = File::open(&meta_path)
         .with_context(|| format!("failed to open meta file: {}", meta_path.display()))?;
     let meta: KmergeMeta = serde_json::from_reader(file)
         .with_context(|| format!("failed to parse meta file: {}", meta_path.display()))?;
     Ok(Stage3Summary {
-        idv_path: out_dir.join(meta.idv_file),
-        bkmer_path: out_dir.join(meta.bkmer_file),
-        bsite_path: out_dir.join(meta.bsite_file),
-        meta_path,
+        output_format: "kfile".to_string(),
+        idv_path: Some(out_dir.join(meta.idv_file)),
+        bkmer_path: Some(out_dir.join(meta.bkmer_file)),
+        bsite_path: Some(out_dir.join(meta.bsite_file)),
+        meta_path: Some(meta_path),
+        pgen_path: None,
+        pvar_path: None,
+        psam_path: None,
         n_samples: meta.n_samples,
         n_kmers: meta.n_kmers,
         bytes_per_col: meta.bytes_per_col,

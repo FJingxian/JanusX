@@ -666,7 +666,7 @@ pub(crate) fn prepare_grm_bsite_block(
         let p = presence as f64 / selected_n as f64;
         let maf = p.min(1.0 - p);
         let variance = 2.0 * p * (1.0 - p);
-        if maf >= maf_threshold as f64 && variance > 1e-12 {
+        if crate::gfreader::maf_passes_threshold(maf, maf_threshold) && variance > 1e-12 {
             retained_row_offsets.push(row);
             row_center.push((2.0 * p) as f32);
             if method == 1 {

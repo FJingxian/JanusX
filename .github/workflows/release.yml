@@ -11,6 +11,18 @@ on:
         description: "Publish to official PyPI (requires PYPI_API_TOKEN); skips TestPyPI in this run"
         required: false
         default: "false"
+      adamixture_repository:
+        description: "ADAMIXTURE repository used for the companion wheel"
+        required: false
+        default: "FJingxian/ADAMIXTURE"
+      adamixture_ref:
+        description: "ADAMIXTURE branch, tag, or commit"
+        required: false
+        default: "main"
+      adamixture_version:
+        description: "janusx-adamixture companion version"
+        required: false
+        default: "1.9.6.post1"
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -129,6 +141,18 @@ jobs:
       source_ref: ${{ github.event.inputs.ref || github.ref }}
       package_version: ${{ needs.resolve-package-version.outputs.package_version }}
 
+  build-adamixture:
+    name: Build ADAMIXTURE companion wheels
+    uses: ./.github/workflows/reusable-adamixture-build.yml
+    with:
+      source_repository: ${{ github.event.inputs.adamixture_repository || 'FJingxian/ADAMIXTURE' }}
+      source_ref: ${{ github.event.inputs.adamixture_ref || 'main' }}
+      package_version: ${{ github.event.inputs.adamixture_version || '1.9.6.post1' }}
+      target: all
+      retention_days: "14"
+    secrets:
+      checkout_token: ${{ secrets.checkout_token }}
+
   publish:
     name: Publish to TestPyPI
     if: ${{ (github.event_name != 'workflow_dispatch' || github.event.inputs.publish_pypi != 'true') && (startsWith(github.ref, 'refs/tags/v') || startsWith(github.event.inputs.ref, 'v') || startsWith(github.event.inputs.ref, 'refs/tags/v')) }}
@@ -136,6 +160,7 @@ jobs:
     needs:
       - build-wheels
       - build-sdist
+      - build-adamixture
     permissions:
       contents: read
     steps:
@@ -152,6 +177,13 @@ jobs:
           name: sdist
           path: dist
 
+      - name: Download ADAMIXTURE companion artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: adamixture-*
+          path: adamixture-dist
+          merge-multiple: true
+
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
@@ -160,7 +192,7 @@ jobs:
       - name: Install build tools
         run: |
           python -m pip install --upgrade pip
-          python -m pip install maturin==1.9.4
+          python -m pip install maturin==1.9.4 twine
 
       - name: Publish to TestPyPI
         env:
@@ -176,6 +208,20 @@ jobs:
             --skip-existing \
             wheelhouse/*.whl dist/*.tar.gz
 
+      - name: Publish ADAMIXTURE companion to TestPyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.TEST_PYPI_API_TOKEN }}
+        run: |
+          if [[ -z "${TWINE_PASSWORD:-}" ]]; then
+            echo "Missing TEST_PYPI_API_TOKEN secret."
+            exit 1
+          fi
+          python -m twine upload \
+            --repository-url https://test.pypi.org/legacy/ \
+            --skip-existing \
+            adamixture-dist/*
+
   publish-pypi:
     name: Publish to PyPI
     if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish_pypi == 'true' && (startsWith(github.ref, 'refs/tags/v') || startsWith(github.event.inputs.ref, 'v') || startsWith(github.event.inputs.ref, 'refs/tags/v')) }}
@@ -183,6 +229,7 @@ jobs:
     needs:
       - build-wheels
       - build-sdist
+      - build-adamixture
     permissions:
       contents: read
     steps:
@@ -199,6 +246,13 @@ jobs:
           name: sdist
           path: dist
 
+      - name: Download ADAMIXTURE companion artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: adamixture-*
+          path: adamixture-dist
+          merge-multiple: true
+
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
@@ -207,7 +261,7 @@ jobs:
       - name: Install build tools
         run: |
           python -m pip install --upgrade pip
-          python -m pip install maturin==1.9.4
+          python -m pip install maturin==1.9.4 twine
 
       - name: Publish to PyPI
         env:
@@ -221,3 +275,16 @@ jobs:
             --non-interactive \
             --skip-existing \
             wheelhouse/*.whl dist/*.tar.gz
+
+      - name: Publish ADAMIXTURE companion to PyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: |
+          if [[ -z "${TWINE_PASSWORD:-}" ]]; then
+            echo "Missing PYPI_API_TOKEN secret."
+            exit 1
+          fi
+          python -m twine upload \
+            --skip-existing \
+            adamixture-dist/*

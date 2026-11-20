@@ -28,7 +28,8 @@ JanusX (Joint Association and Novel Utility for Selection) is a GWAS and genomic
 - Genomic Selection (GS): `BLUP`, `BayesA/B/C/R`, PLS/KRR, and ML models (`RF/ET/GBDT/XGB/SVM/ENET`)
 - Streaming genotype IO for VCF/HMP/PLINK BED and PLINK 2 PGEN
 - Post-analysis workflows: `postgwas`, `postgs`
-- Utility workflows: `grm`, `pca`, `gformat`, `gmerge`, `fastpop` (including FST and XP-CLR)
+- Population analysis: `adamixture`, `fst`, and `xpclr`
+- Utility workflows: `grm`, `pca`, `gformat`, and `gmerge`
 
 ---
 
@@ -159,12 +160,12 @@ jx <module> -h
 - `gwas`
 - `ct` (cis/trans pair scans)
 - `postgwas` (Visualization, `manh` `qq` `ldblock`)
-- `fastpop` (population structure, FST, and XP-CLR)
+- `adamixture` (population structure via the upstream ADAMIXTURE CLI)
+- `fst` (windowed population FST)
+- `xpclr` (windowed XP-CLR selection scan)
 
-Attribution note:
-
-- FastPop is JanusX's own population-structure workflow and public name for this module.
-- Historical JanusX releases referenced ADAMIXTURE as a related implementation; the BSD-3-Clause attribution notice is recorded in [THIRD_PARTY_NOTICES.md](./doc/THIRD_PARTY_NOTICES.md).
+ADAMIXTURE is an external dependency. Its license and attribution are recorded in
+[THIRD_PARTY_NOTICES.md](./doc/THIRD_PARTY_NOTICES.md).
 
 **Genomic Selection (GS)**:
 

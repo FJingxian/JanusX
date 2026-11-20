@@ -51,6 +51,14 @@ jobs:
           grep -nF "Install OpenBLAS (Windows ARM64 via vcpkg)" .github/workflows/reusable-wheel-build.yml
           grep -nF '"libzs.lib"' .github/workflows/reusable-wheel-build.yml
           grep -nF "auditwheel repair" .github/workflows/reusable-wheel-build.yml
+          grep -nF "actions/upload-artifact/merge@v4" .github/workflows/reusable-wheel-build.yml
+          grep -nF "delete-merged: true" .github/workflows/reusable-wheel-build.yml
+          grep -nF "name: wheels-all" .github/workflows/reusable-wheel-build.yml
+          grep -nF "abi3-py310" Cargo.toml
+          grep -nF "Wheel builds must use one CPython 3.10 abi3 build" \
+            .github/workflows/reusable-wheel-build.yml
+          grep -nF "Wheel matrix labels changed" \
+            .github/workflows/reusable-wheel-build.yml
 
           clear_step_line="$(grep -nF \
             "      - name: Clear build-only Windows OpenBLAS hints" \

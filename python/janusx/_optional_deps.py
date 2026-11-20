@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, requires as distribution_requires
 import os
+import re
 import sys
 from typing import Any, Sequence
 
@@ -20,6 +22,42 @@ _OPTIONAL_DEPENDENCIES: dict[str, OptionalDependencySpec] = {
     "toytree": OptionalDependencySpec(packages=("toytree", "toyplot"), extra="treeplot"),
     "toyplot": OptionalDependencySpec(packages=("toyplot", "toytree"), extra="treeplot"),
 }
+
+
+def optional_requirement_for_extra(
+    package_name: str,
+    extra: str,
+    *,
+    fallback: str,
+) -> str:
+    """Return the installed distribution's pinned requirement for an extra."""
+    wanted_package = re.sub(r"[-_.]+", "-", str(package_name).strip().lower())
+    wanted_extra = str(extra).strip().lower()
+    try:
+        requirements = distribution_requires("janusx") or ()
+    except PackageNotFoundError:
+        requirements = ()
+    for raw in requirements:
+        payload, separator, marker = str(raw).partition(";")
+        match = re.match(r"\s*([A-Za-z0-9_.-]+)", payload)
+        if match is None:
+            continue
+        normalized = re.sub(r"[-_.]+", "-", match.group(1).lower())
+        if normalized != wanted_package:
+            continue
+        extra_matches = bool(
+            separator
+            and re.search(
+                rf"""\bextra\s*==\s*['"]{re.escape(wanted_extra)}['"]""",
+                marker,
+            )
+        )
+        if not extra_matches:
+            continue
+        requirement = payload.strip()
+        if requirement:
+            return requirement
+    return str(fallback).strip()
 
 
 def _normalize_package_list(packages: Sequence[str]) -> list[str]:

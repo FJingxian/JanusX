@@ -210,6 +210,35 @@ jobs:
           if preset not in presets:
               raise SystemExit(f"Unsupported matrix preset: {preset}")
 
+          expected_labels = {
+              "standard": {
+                  "linux-x86_64",
+                  "linux-aarch64",
+                  "macos-arm64",
+                  "windows-x86_64",
+                  "windows-arm64",
+              },
+              "release": {
+                  "linux-x86_64",
+                  "linux-aarch64",
+                  "macos-arm64-accelerate",
+                  "windows-x86_64",
+                  "windows-arm64",
+              },
+          }
+          labels = {entry["label"] for entry in presets[preset]}
+          if labels != expected_labels[preset]:
+              raise SystemExit(
+                  f"Wheel matrix labels changed for {preset}: {sorted(labels)}"
+              )
+
+          python_versions = {entry["python-version"] for entry in presets[preset]}
+          if python_versions != {"3.10"}:
+              raise SystemExit(
+                  "Wheel builds must use one CPython 3.10 abi3 build per platform, "
+                  f"got Python versions {sorted(python_versions)}"
+              )
+
           entries = presets[preset]
           if target != "all":
               entries = [entry for entry in entries if entry["label"] == target]
@@ -222,7 +251,10 @@ jobs:
               fh.write("matrix<<EOF\n")
               fh.write(json.dumps(matrix))
               fh.write("\nEOF\n")
-          print(f"[wheel-matrix] preset={preset} target={target} entries={len(entries)}")
+          print(
+              f"[wheel-matrix] preset={preset} target={target} "
+              f"entries={len(entries)} abi=abi3-py310"
+          )
           PY
 
   build-wheels:
@@ -644,7 +676,6 @@ jobs:
 
       - name: Upload final wheel artifact
         if: ${{ matrix.upload_wheel == 'true' && inputs.retention_days != '' }}
-        id: upload_custom_retention
         uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.label }}
@@ -655,7 +686,6 @@ jobs:
 
       - name: Upload final wheel artifact
         if: ${{ matrix.upload_wheel == 'true' && inputs.retention_days == '' }}
-        id: upload_default_retention
         uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.label }}
@@ -668,15 +698,39 @@ jobs:
         shell: bash
         env:
           RUN_URL: ${{ format('https://github.com/{0}/actions/runs/{1}', github.repository, github.run_id) }}
-          ARTIFACT_URL: ${{ steps.upload_custom_retention.outputs['artifact-url'] || steps.upload_default_retention.outputs['artifact-url'] }}
         run: |
           WHEEL_NAME="$(basename wheelhouse/*.whl)"
-          DOWNLOAD_URL="${ARTIFACT_URL:-$RUN_URL}"
           cat <<EOF >> "$GITHUB_STEP_SUMMARY"
           ### ${{ matrix.label }}
           - Wheel: \`${WHEEL_NAME}\`
-          - Artifact: \`wheels-${{ matrix.label }}\`
-          - Download: [artifact or run link](${DOWNLOAD_URL})
+          - Platform artifact: \`wheels-${{ matrix.label }}\`
+          - Download: individual artifacts are merged into \`wheels-all\` at the end of the workflow.
           - Run page: [workflow run](${RUN_URL})
           - Note: artifact download requires GitHub login and remains valid until the artifact or run expires.
           EOF
+
+  bundle-wheels:
+    name: Bundle wheels
+    needs:
+      - build-wheels
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Merge platform wheels into one artifact
+        if: ${{ inputs.retention_days != '' }}
+        uses: actions/upload-artifact/merge@v4
+        with:
+          name: wheels-all
+          pattern: wheels-*
+          delete-merged: true
+          retention-days: ${{ inputs.retention_days }}
+
+      - name: Merge platform wheels into one artifact
+        if: ${{ inputs.retention_days == '' }}
+        uses: actions/upload-artifact/merge@v4
+        with:
+          name: wheels-all
+          pattern: wheels-*
+          delete-merged: true

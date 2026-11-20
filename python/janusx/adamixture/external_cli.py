@@ -17,6 +17,11 @@ from typing import Callable, Optional
 
 import numpy as np
 
+from janusx._optional_deps import (
+    format_install_hint,
+    optional_requirement_for_extra,
+)
+
 
 class ExternalAdmixtureError(RuntimeError):
     """Raised when the ADAMIXTURE process cannot complete a run."""
@@ -34,9 +39,20 @@ def resolve_executable() -> str:
         )
     candidate = shutil.which("adamixture")
     if candidate is None:
+        requirement = optional_requirement_for_extra(
+            "adamixture",
+            "adamixture",
+            fallback="adamixture==1.9.6",
+        )
+        install_hint = format_install_hint(
+            (requirement,),
+            extra="adamixture",
+            entrypoint="jx",
+        )
         raise ExternalAdmixtureError(
             "ADAMIXTURE backend requires the 'adamixture' executable. "
-            "Install adamixture or set JANUSX_ADMIXTURE_BIN."
+            f"{install_hint} Alternatively, set JANUSX_ADMIXTURE_BIN "
+            "to a compatible executable."
         )
     return str(candidate)
 

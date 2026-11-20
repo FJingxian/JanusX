@@ -178,6 +178,7 @@ pub(crate) struct PgenReader {
     record_length_bytes: usize,
     fixed_data_offset: u64,
     current_block: Option<usize>,
+    block_payload_loaded: bool,
     block_meta: BlockMeta,
     block_records: Vec<u8>,
     block_record_cursor: usize,
@@ -193,9 +194,9 @@ impl PgenReader {
     pub(crate) fn open(
         path: &Path,
         n_samples: usize,
-        n_variants_from_pvar: usize,
+        n_variants_expected: usize,
     ) -> Result<Self, String> {
-        if n_samples == 0 || n_variants_from_pvar == 0 {
+        if n_samples == 0 || n_variants_expected == 0 {
             return Err("PGEN input contains zero samples or variants".to_string());
         }
         let raw_file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
@@ -222,7 +223,7 @@ impl PgenReader {
             0x01 => {
                 let expected = 3u64
                     .checked_add(
-                        (bytes_per_variant as u64).saturating_mul(n_variants_from_pvar as u64),
+                        (bytes_per_variant as u64).saturating_mul(n_variants_expected as u64),
                     )
                     .ok_or_else(|| format!("{}: PGEN size overflow", path.display()))?;
                 if file_size != expected {
@@ -242,7 +243,7 @@ impl PgenReader {
                     n_samples_header,
                     n_variants,
                     n_samples,
-                    n_variants_from_pvar,
+                    n_variants_expected,
                 )?;
                 if header_format & 0x0f != 0 {
                     return Err(format!(
@@ -288,7 +289,7 @@ impl PgenReader {
                     n_samples_header,
                     n_variants,
                     n_samples,
-                    n_variants_from_pvar,
+                    n_variants_expected,
                 )?;
                 let format = (header_format & 0x0f) as usize;
                 if format > 7 {
@@ -392,7 +393,7 @@ impl PgenReader {
             file_size,
             mode,
             n_samples,
-            n_variants: n_variants_from_pvar,
+            n_variants: n_variants_expected,
             bytes_per_variant,
             variant_block_offsets,
             block_meta_offsets,
@@ -400,6 +401,7 @@ impl PgenReader {
             record_length_bytes,
             fixed_data_offset,
             current_block: None,
+            block_payload_loaded: false,
             block_meta: BlockMeta::default(),
             block_records: Vec::new(),
             block_record_cursor: 0,
@@ -417,7 +419,10 @@ impl PgenReader {
                     .seek(SeekFrom::Start(out.fixed_data_offset))
                     .map_err(|e| format!("seek {} genotype data: {e}", out.path.display()))?;
             }
-            StorageMode::Variable => out.load_block(0)?,
+            // Variable PGEN metadata and payload are loaded on demand. Avoid
+            // reading the first full variant block when the caller will only
+            // sample a handful of random rows (for example, SparseLMM gamma).
+            StorageMode::Variable => {}
         }
         Ok(out)
     }
@@ -458,6 +463,188 @@ impl PgenReader {
         for row in 0..rows {
             let range = row * self.bytes_per_variant..(row + 1) * self.bytes_per_variant;
             self.read_variant_into(&mut out[range])?;
+        }
+        Ok(rows)
+    }
+
+    /// Read arbitrary source rows without loading complete PGEN variant-block
+    /// payloads. Variable records are decoded from their nearest independent
+    /// anchor, and the output remains in the caller's requested order.
+    pub(crate) fn read_source_rows_sparse(
+        &mut self,
+        source_rows: &[usize],
+        out: &mut [u8],
+    ) -> Result<(), String> {
+        let expected_len = source_rows
+            .len()
+            .checked_mul(self.bytes_per_variant)
+            .ok_or_else(|| "sparse PGEN output size overflow".to_string())?;
+        if out.len() < expected_len {
+            return Err(format!(
+                "sparse PGEN destination is too small: got {}, need {expected_len}",
+                out.len()
+            ));
+        }
+        if let Some(&source_row) = source_rows.iter().find(|&&row| row >= self.n_variants) {
+            return Err(format!(
+                "PGEN source row {source_row} exceeds variant count {}",
+                self.n_variants
+            ));
+        }
+        if source_rows.is_empty() {
+            return Ok(());
+        }
+
+        if matches!(self.mode, StorageMode::Variable) {
+            let mut order = (0..source_rows.len()).collect::<Vec<_>>();
+            order.sort_unstable_by_key(|&output_row| source_rows[output_row]);
+            let mut start = 0usize;
+            while start < order.len() {
+                let block_idx = source_rows[order[start]] / PGEN_BLOCK_VARIANTS;
+                self.load_block_metadata(block_idx)?;
+                let mut end = start + 1;
+                while end < order.len()
+                    && source_rows[order[end]] / PGEN_BLOCK_VARIANTS == block_idx
+                {
+                    end += 1;
+                }
+                for &output_row in &order[start..end] {
+                    let source_row = source_rows[output_row];
+                    let output_start = output_row * self.bytes_per_variant;
+                    self.read_variable_sparse_row(
+                        source_row,
+                        &mut out[output_start..output_start + self.bytes_per_variant],
+                    )?;
+                }
+                start = end;
+            }
+            return Ok(());
+        }
+
+        let mut raw = vec![0u8; self.bytes_per_variant];
+        let mut current = vec![0u8; self.bytes_per_variant];
+        let mut base = vec![0u8; self.bytes_per_variant];
+        for (output_row, &source_row) in source_rows.iter().enumerate() {
+            let output_start = output_row * self.bytes_per_variant;
+            let output = &mut out[output_start..output_start + self.bytes_per_variant];
+            let source_offset = self
+                .fixed_data_offset
+                .checked_add(
+                    (source_row as u64)
+                        .checked_mul(self.bytes_per_variant as u64)
+                        .ok_or_else(|| "PGEN sparse row offset overflow".to_string())?,
+                )
+                .ok_or_else(|| "PGEN sparse row offset overflow".to_string())?;
+            match self.mode {
+                StorageMode::BedCompat => {
+                    crate::gload::read_file_exact_at(self.file.get_ref(), output, source_offset)?;
+                }
+                StorageMode::FixedHardcall => {
+                    crate::gload::read_file_exact_at(self.file.get_ref(), &mut raw, source_offset)?;
+                    decode_packed_record(
+                        0,
+                        &raw,
+                        self.n_samples,
+                        source_row,
+                        &self.path,
+                        &mut current,
+                        &mut base,
+                    )?;
+                    for (dst, &category_byte) in output.iter_mut().zip(&current) {
+                        *dst = pgen_category_byte_to_row_byte(category_byte);
+                    }
+                    clear_unused_output_lanes(output, self.n_samples);
+                }
+                StorageMode::Variable => unreachable!(),
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn read_source_block_phase_bits(
+        &mut self,
+        source_start: usize,
+        requested_rows: usize,
+        hardcall_rows: &[u8],
+        phase_present: &mut [u64],
+        phase_orientation: &mut [u64],
+    ) -> Result<usize, String> {
+        if source_start > self.n_variants {
+            return Err(format!(
+                "PGEN source row {source_start} exceeds variant count {}",
+                self.n_variants
+            ));
+        }
+        let rows = requested_rows.min(self.n_variants - source_start);
+        let words_per_row = self.n_samples.div_ceil(64);
+        let hardcall_len = rows
+            .checked_mul(self.bytes_per_variant)
+            .ok_or_else(|| "PGEN hardcall block size overflow".to_owned())?;
+        let phase_len = rows
+            .checked_mul(words_per_row)
+            .ok_or_else(|| "PGEN phase block size overflow".to_owned())?;
+        if hardcall_rows.len() < hardcall_len
+            || phase_present.len() < phase_len
+            || phase_orientation.len() < phase_len
+        {
+            return Err("invalid PGEN phase block buffers".to_owned());
+        }
+        phase_present[..phase_len].fill(0);
+        phase_orientation[..phase_len].fill(0);
+        if rows == 0 || !matches!(self.mode, StorageMode::Variable) {
+            return Ok(rows);
+        }
+
+        let mut processed = 0usize;
+        while processed < rows {
+            let source_variant = source_start + processed;
+            let block_idx = source_variant / PGEN_BLOCK_VARIANTS;
+            self.load_block(block_idx)?;
+            let block_start = block_idx * PGEN_BLOCK_VARIANTS;
+            let local_start = source_variant - block_start;
+            let block_rows = self.block_meta.record_types.len();
+            let local_rows = (rows - processed).min(block_rows - local_start);
+            let phase_start = processed * words_per_row;
+            let phase_end = phase_start + local_rows * words_per_row;
+            let hardcall_start = processed * self.bytes_per_variant;
+            let hardcall_end = hardcall_start + local_rows * self.bytes_per_variant;
+            let record_types = &self.block_meta.record_types;
+            let record_offsets = &self.block_meta.record_offsets;
+            let block_records = &self.block_records;
+            let path = &self.path;
+            phase_present[phase_start..phase_end]
+                .par_chunks_mut(words_per_row)
+                .zip(phase_orientation[phase_start..phase_end].par_chunks_mut(words_per_row))
+                .zip(hardcall_rows[hardcall_start..hardcall_end].par_chunks(self.bytes_per_variant))
+                .enumerate()
+                .try_for_each(
+                    |(local_row, ((present_row, orientation_row), hardcall_row))| {
+                        let row = local_start + local_row;
+                        let record_type = record_types[row];
+                        if record_type & 0x08 != 0 {
+                            return Err(format!(
+                                "{}: multi-allelic PGEN hard calls are not supported (variant {})",
+                                path.display(),
+                                block_start + row
+                            ));
+                        }
+                        if record_type & 0x10 == 0 {
+                            return Ok(());
+                        }
+                        let record = &block_records[record_offsets[row]..record_offsets[row + 1]];
+                        decode_phase_bits_for_record(
+                            path,
+                            block_start + row,
+                            record_type,
+                            record,
+                            hardcall_row,
+                            self.n_samples,
+                            present_row,
+                            orientation_row,
+                        )
+                    },
+                )?;
+            processed += local_rows;
         }
         Ok(rows)
     }
@@ -697,6 +884,30 @@ impl PgenReader {
     }
 
     fn load_block(&mut self, block_idx: usize) -> Result<(), String> {
+        self.load_block_metadata(block_idx)?;
+        if self.block_payload_loaded {
+            return Ok(());
+        }
+        let block_data_offset = self.variant_block_offsets[block_idx];
+        let block_bytes = *self
+            .block_meta
+            .record_offsets
+            .last()
+            .ok_or_else(|| "PGEN block has no record offsets".to_string())?;
+        self.file
+            .seek(SeekFrom::Start(block_data_offset))
+            .map_err(|e| format!("seek {} variant block: {e}", self.path.display()))?;
+        self.block_records.resize(block_bytes, 0);
+        self.file
+            .read_exact(&mut self.block_records)
+            .map_err(|e| format!("read {} variant block payload: {e}", self.path.display()))?;
+        self.block_record_cursor = 0;
+        self.record_offset = block_data_offset;
+        self.block_payload_loaded = true;
+        Ok(())
+    }
+
+    fn load_block_metadata(&mut self, block_idx: usize) -> Result<(), String> {
         if self.current_block == Some(block_idx) {
             return Ok(());
         }
@@ -810,15 +1021,6 @@ impl PgenReader {
                 self.path.display()
             )
         })?;
-        self.file
-            .seek(SeekFrom::Start(block_data_offset))
-            .map_err(|e| format!("seek {} variant block: {e}", self.path.display()))?;
-        self.block_records.resize(block_bytes, 0);
-        self.file
-            .read_exact(&mut self.block_records)
-            .map_err(|e| format!("read {} variant block payload: {e}", self.path.display()))?;
-        self.block_record_cursor = 0;
-        self.record_offset = block_data_offset;
         let mut record_offsets = Vec::with_capacity(rows + 1);
         let mut record_cursor = 0usize;
         let mut anchor_rows = Vec::with_capacity(rows);
@@ -836,7 +1038,7 @@ impl PgenReader {
         record_offsets.push(record_cursor);
         if record_cursor != block_bytes {
             return Err(format!(
-                "{}: PGEN block record lengths do not match loaded payload",
+                "{}: PGEN block record lengths do not match indexed payload",
                 self.path.display()
             ));
         }
@@ -847,6 +1049,61 @@ impl PgenReader {
             anchor_rows,
         };
         self.current_block = Some(block_idx);
+        self.block_records.clear();
+        self.block_record_cursor = 0;
+        self.record_offset = block_data_offset;
+        self.block_payload_loaded = false;
+        Ok(())
+    }
+
+    fn read_variable_sparse_row(&self, source_row: usize, out: &mut [u8]) -> Result<(), String> {
+        let block_idx = source_row / PGEN_BLOCK_VARIANTS;
+        let block_start = block_idx * PGEN_BLOCK_VARIANTS;
+        let local_row = source_row - block_start;
+        if out.len() < self.bytes_per_variant
+            || self.current_block != Some(block_idx)
+            || local_row >= self.block_meta.record_types.len()
+        {
+            return Err("invalid sparse PGEN row request".to_string());
+        }
+        let first_anchor_idx = self
+            .block_meta
+            .anchor_rows
+            .partition_point(|&anchor| anchor <= local_row)
+            .saturating_sub(1);
+        let anchor_row = *self
+            .block_meta
+            .anchor_rows
+            .get(first_anchor_idx)
+            .ok_or_else(|| format!("PGEN block {block_idx} has no preceding anchor"))?;
+        let byte_start = self.block_meta.record_offsets[anchor_row];
+        let byte_end = self.block_meta.record_offsets[local_row + 1];
+        let mut record_bytes = vec![0u8; byte_end - byte_start];
+        if !record_bytes.is_empty() {
+            let file_offset = self.variant_block_offsets[block_idx]
+                .checked_add(byte_start as u64)
+                .ok_or_else(|| "PGEN sparse row offset overflow".to_string())?;
+            crate::gload::read_file_exact_at(self.file.get_ref(), &mut record_bytes, file_offset)?;
+        }
+        let mut current = vec![0u8; self.bytes_per_variant];
+        let mut base = vec![0u8; self.bytes_per_variant];
+        for row in anchor_row..=local_row {
+            let start = self.block_meta.record_offsets[row] - byte_start;
+            let end = self.block_meta.record_offsets[row + 1] - byte_start;
+            decode_packed_record(
+                self.block_meta.record_types[row],
+                &record_bytes[start..end],
+                self.n_samples,
+                block_start + row,
+                &self.path,
+                &mut current,
+                &mut base,
+            )?;
+        }
+        for (dst, &category_byte) in out[..self.bytes_per_variant].iter_mut().zip(&current) {
+            *dst = pgen_category_byte_to_row_byte(category_byte);
+        }
+        clear_unused_output_lanes(&mut out[..self.bytes_per_variant], self.n_samples);
         Ok(())
     }
 
@@ -1394,7 +1651,7 @@ impl PgenReader {
             }
             StorageMode::Variable => {
                 let block_idx = self.next_variant / PGEN_BLOCK_VARIANTS;
-                if self.current_block != Some(block_idx) {
+                if self.current_block != Some(block_idx) || !self.block_payload_loaded {
                     self.load_block(block_idx)?;
                 }
                 let local_idx = self.next_variant - block_idx * PGEN_BLOCK_VARIANTS;
@@ -1544,6 +1801,145 @@ fn decode_packed_record(
     Ok(())
 }
 
+fn hardcall_track_end(record: &[u8], compression: u8, n_samples: usize) -> Result<usize, String> {
+    let packed_len = n_samples.div_ceil(4);
+    let mut pos = match compression {
+        0 => {
+            if record.len() < packed_len {
+                return Err("truncated uncompressed PGEN hard-call track".to_string());
+            }
+            packed_len
+        }
+        1 => {
+            let one_bit_end = 1usize
+                .checked_add(n_samples.div_ceil(8))
+                .ok_or_else(|| "PGEN one-bit array size overflow".to_string())?;
+            if record.len() < one_bit_end {
+                return Err("truncated one-bit PGEN hard-call track".to_string());
+            }
+            one_bit_end
+        }
+        2 | 3 | 4 | 6 | 7 => 0,
+        5 => return Ok(0),
+        other => return Err(format!("unsupported PGEN compression mode {other}")),
+    };
+    if matches!(compression, 1 | 2 | 3 | 4 | 6 | 7) {
+        apply_difflist(record, &mut pos, n_samples, |_, _| {})?;
+    }
+    Ok(pos)
+}
+
+fn decode_phase_bits_for_record(
+    path: &Path,
+    source_variant: usize,
+    record_type: u8,
+    record: &[u8],
+    hardcall_row: &[u8],
+    n_samples: usize,
+    phase_present: &mut [u64],
+    phase_orientation: &mut [u64],
+) -> Result<(), String> {
+    if phase_present.len() != n_samples.div_ceil(64)
+        || phase_orientation.len() != phase_present.len()
+        || hardcall_row.len() < n_samples.div_ceil(4)
+    {
+        return Err("invalid PGEN phase row buffers".to_owned());
+    }
+    let aux2_start = hardcall_track_end(record, record_type & 0x07, n_samples)
+        .map_err(|err| format!("{}: variant {source_variant}: {err}", path.display()))?;
+    let aux2 = record.get(aux2_start..).ok_or_else(|| {
+        format!(
+            "{}: truncated PGEN phase auxiliary track at variant {source_variant}",
+            path.display()
+        )
+    })?;
+    let Some(&header) = aux2.first() else {
+        return Err(format!(
+            "{}: empty PGEN phase auxiliary track at variant {source_variant}",
+            path.display()
+        ));
+    };
+    let het_count = (0..n_samples)
+        .filter(|&sample| packed_row_code(hardcall_row, sample) == 0b10)
+        .count();
+    let (info_start, info_end, phase_mask) = if header & 1 == 0 {
+        let info_bytes = (het_count + 1).div_ceil(8);
+        if aux2.len() < info_bytes {
+            return Err(format!(
+                "{}: truncated PGEN phase-info bits at variant {source_variant}",
+                path.display()
+            ));
+        }
+        (0usize, info_bytes, None)
+    } else {
+        let presence_bytes = (het_count + 1).div_ceil(8);
+        if aux2.len() < presence_bytes {
+            return Err(format!(
+                "{}: truncated PGEN phase-present mask at variant {source_variant}",
+                path.display()
+            ));
+        }
+        let phase_count = (0..het_count)
+            .filter(|&het_idx| bit_at(aux2, het_idx + 1))
+            .count();
+        let info_bytes = phase_count.div_ceil(8);
+        let info_end = presence_bytes
+            .checked_add(info_bytes)
+            .ok_or_else(|| "PGEN phase-info length overflow".to_owned())?;
+        if aux2.len() < info_end {
+            return Err(format!(
+                "{}: truncated PGEN phase-info bits at variant {source_variant}",
+                path.display()
+            ));
+        }
+        (presence_bytes, info_end, Some(aux2))
+    };
+
+    let mut het_idx = 0usize;
+    let mut phase_idx = 0usize;
+    for sample in 0..n_samples {
+        if packed_row_code(hardcall_row, sample) != 0b10 {
+            continue;
+        }
+        let phase_available = phase_mask
+            .map(|presence| bit_at(presence, het_idx + 1))
+            .unwrap_or(true);
+        het_idx += 1;
+        if !phase_available {
+            continue;
+        }
+        let orientation = if header & 1 == 0 {
+            bit_at(aux2, het_idx)
+        } else {
+            let phase = bit_at(&aux2[info_start..info_end], phase_idx);
+            phase_idx += 1;
+            phase
+        };
+        set_phase_bit(phase_present, sample);
+        if orientation {
+            set_phase_bit(phase_orientation, sample);
+        }
+    }
+    Ok(())
+}
+
+#[inline]
+fn set_phase_bit(bits: &mut [u64], sample: usize) {
+    bits[sample >> 6] |= 1u64 << (sample & 63);
+}
+
+#[inline]
+fn packed_row_code(row: &[u8], sample: usize) -> u8 {
+    (row[sample >> 2] >> ((sample & 3) * 2)) & 0x03
+}
+
+#[inline]
+fn bit_at(bytes: &[u8], bit_index: usize) -> bool {
+    bytes
+        .get(bit_index >> 3)
+        .is_some_and(|byte| (byte >> (bit_index & 7)) & 1 != 0)
+}
+
 fn decode_one_bit_packed(
     record: &[u8],
     n_samples: usize,
@@ -1620,11 +2016,17 @@ fn validate_dimensions(
     header_samples: usize,
     header_variants: usize,
     psam_samples: usize,
-    pvar_variants: usize,
+    expected_variants: usize,
 ) -> Result<(), String> {
-    if header_samples != psam_samples || header_variants != pvar_variants {
+    if header_samples != psam_samples {
         return Err(format!(
-            "{}: PGEN/PVAR/PSAM dimension mismatch (pgen={header_samples} samples x {header_variants} variants, psam={psam_samples}, pvar={pvar_variants})",
+            "{}: PGEN/PSAM sample count mismatch (pgen={header_samples}, psam={psam_samples})",
+            path.display()
+        ));
+    }
+    if header_variants != expected_variants {
+        return Err(format!(
+            "{}: PGEN variant count mismatch (header={header_variants}, expected={expected_variants})",
             path.display()
         ));
     }
@@ -1988,7 +2390,7 @@ fn difflist_sample_id_width(n_samples: usize) -> usize {
 pub(crate) fn normalize_pgen_prefix(path_or_prefix: &str) -> String {
     let path = path_or_prefix.trim();
     let lower = path.to_ascii_lowercase();
-    for suffix in [".pgen", ".pvar", ".psam"] {
+    for suffix in [".pvar.zst", ".pgen", ".pvar", ".psam"] {
         if lower.ends_with(suffix) {
             return path[..path.len() - suffix.len()].to_string();
         }
@@ -2011,7 +2413,7 @@ fn input_kind_override_key(path_or_prefix: &str) -> String {
 
 fn explicit_input_kind(path_or_prefix: &str) -> Option<bool> {
     let lower = path_or_prefix.trim().to_ascii_lowercase();
-    if [".pgen", ".pvar", ".psam"]
+    if [".pgen", ".pvar.zst", ".pvar", ".psam"]
         .iter()
         .any(|suffix| lower.ends_with(suffix))
     {
@@ -2151,9 +2553,32 @@ pub(crate) fn read_psam_iids(path_or_prefix: &str) -> Result<Vec<String>, String
     Ok(sample_ids)
 }
 
-fn count_non_comment_rows(path: &Path) -> Result<usize, String> {
+pub(crate) fn open_text_reader(path: &Path) -> Result<Box<dyn BufRead + Send>, String> {
     let file = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    let mut reader = BufReader::with_capacity(1 << 20, file);
+    if path
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .ends_with(".zst")
+    {
+        let decoder = zstd::stream::read::Decoder::new(BufReader::with_capacity(1 << 20, file))
+            .map_err(|e| format!("open zstd reader {}: {e}", path.display()))?;
+        Ok(Box::new(BufReader::new(decoder)))
+    } else {
+        Ok(Box::new(BufReader::with_capacity(1 << 20, file)))
+    }
+}
+
+pub(crate) fn pvar_path_for_prefix(prefix: &str) -> PathBuf {
+    let compressed = PathBuf::from(format!("{prefix}.pvar.zst"));
+    if compressed.is_file() {
+        compressed
+    } else {
+        PathBuf::from(format!("{prefix}.pvar"))
+    }
+}
+
+fn count_non_comment_rows(path: &Path) -> Result<usize, String> {
+    let mut reader = open_text_reader(path)?;
     let mut line = Vec::with_capacity(256);
     let mut count = 0usize;
     let mut line_idx = 0usize;
@@ -2189,9 +2614,8 @@ pub(crate) fn count_psam_samples(path_or_prefix: &str) -> Result<usize, String> 
 
 pub(crate) fn read_pvar_sites(path_or_prefix: &str) -> Result<Vec<PgenSite>, String> {
     let prefix = normalize_pgen_prefix(path_or_prefix);
-    let path = PathBuf::from(format!("{prefix}.pvar"));
-    let file = std::fs::File::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    let reader = BufReader::new(file);
+    let path = pvar_path_for_prefix(&prefix);
+    let reader = open_text_reader(&path)?;
     let mut header: Option<Vec<String>> = None;
     let mut sites = Vec::new();
     for (line_idx, line) in reader.lines().enumerate() {
@@ -2272,7 +2696,7 @@ pub(crate) fn read_pvar_sites(path_or_prefix: &str) -> Result<Vec<PgenSite>, Str
 
 pub(crate) fn count_pvar_variants(path_or_prefix: &str) -> Result<usize, String> {
     let prefix = normalize_pgen_prefix(path_or_prefix);
-    let path = PathBuf::from(format!("{prefix}.pvar"));
+    let path = pvar_path_for_prefix(&prefix);
     let count = count_non_comment_rows(&path)?;
     if count == 0 {
         return Err(format!("{} contains zero variants", path.display()));
@@ -2369,13 +2793,18 @@ mod tests {
 
     fn variable_pgen(n_samples: usize, records: &[(u8, Vec<u8>)]) -> Vec<u8> {
         let block_count = records.len().div_ceil(PGEN_BLOCK_VARIANTS);
+        let wide_record_types = records.iter().any(|(record_type, _)| record_type >> 4 != 0);
         let mut block_metas = Vec::with_capacity(block_count);
         for block in records.chunks(PGEN_BLOCK_VARIANTS) {
             let mut meta = Vec::with_capacity(block.len().div_ceil(2) + block.len());
-            for pair in block.chunks(2) {
-                let low = pair[0].0;
-                let high = pair.get(1).map(|entry| entry.0).unwrap_or(0);
-                meta.push(low | (high << 4));
+            if wide_record_types {
+                meta.extend(block.iter().map(|(record_type, _)| *record_type));
+            } else {
+                for pair in block.chunks(2) {
+                    let low = pair[0].0;
+                    let high = pair.get(1).map(|entry| entry.0).unwrap_or(0);
+                    meta.push(low | (high << 4));
+                }
             }
             for (_, record) in block {
                 assert!(record.len() < 256);
@@ -2396,7 +2825,7 @@ mod tests {
         bytes.extend_from_slice(&[0x6c, 0x1b, 0x10]);
         bytes.extend_from_slice(&(records.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&(n_samples as u32).to_le_bytes());
-        bytes.push(0); // 4-bit record type and 1-byte record length.
+        bytes.push(if wide_record_types { 4 } else { 0 }); // Record-type width and 1-byte length.
         for offset in record_offsets {
             bytes.extend_from_slice(&offset.to_le_bytes());
         }
@@ -2953,5 +3382,60 @@ mod tests {
         );
         assert_eq!(all_rows[PGEN_BLOCK_VARIANTS], 0xff);
         assert_eq!(all_rows[PGEN_BLOCK_VARIANTS + 1], 0xfc);
+    }
+
+    #[test]
+    fn sparse_random_rows_match_sequential_variable_pgen_decode() {
+        let records = [
+            (6u8, vec![0]),       // Anchor: all alternate.
+            (2u8, vec![1, 0, 0]), // LD diff-list from the anchor.
+            (3u8, vec![1, 0, 0]), // Inverted LD diff-list.
+            (5u8, vec![]),        // Zero-length reference anchor.
+            (4u8, vec![0]),       // Reference with a diff-list.
+            (2u8, vec![1, 0, 0]), // Another LD diff-list.
+        ];
+        let file = TempPgen::new(&variable_pgen(4, &records));
+        let mut sequential = PgenReader::open(&file.0, 4, records.len()).unwrap();
+        let mut all_rows = vec![0u8; records.len()];
+        assert_eq!(
+            sequential
+                .read_source_block(0, records.len(), &mut all_rows)
+                .unwrap(),
+            records.len()
+        );
+
+        let requested = [5usize, 1, 4, 2, 0, 3, 1];
+        let mut expected = vec![0u8; requested.len()];
+        for (dst, &source_row) in expected.iter_mut().zip(&requested) {
+            *dst = all_rows[source_row];
+        }
+
+        let mut sparse = PgenReader::open(&file.0, 4, records.len()).unwrap();
+        let mut observed = vec![0u8; requested.len()];
+        sparse
+            .read_source_rows_sparse(&requested, &mut observed)
+            .unwrap();
+        assert_eq!(observed, expected);
+    }
+
+    #[test]
+    fn phase_bits_decode_fully_phased_heterozygotes() {
+        let records = [(0x10u8, vec![0x05, 0x02])];
+        let file = TempPgen::new(&variable_pgen(4, &records));
+        let mut reader = PgenReader::open(&file.0, 4, records.len()).unwrap();
+        let mut hardcalls = [0u8; 1];
+        assert_eq!(reader.read_source_block(0, 1, &mut hardcalls).unwrap(), 1);
+        assert_eq!(hardcalls, [0x0a]);
+
+        let mut present = [0u64; 1];
+        let mut orientation = [0u64; 1];
+        assert_eq!(
+            reader
+                .read_source_block_phase_bits(0, 1, &hardcalls, &mut present, &mut orientation,)
+                .unwrap(),
+            1
+        );
+        assert_eq!(present, [0b11]);
+        assert_eq!(orientation, [0b01]);
     }
 }

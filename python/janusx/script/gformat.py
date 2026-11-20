@@ -13,7 +13,7 @@ Supported inputs
 Supported outputs
 -----------------
 - `-fmt bfile` : PLINK BED/BIM/FAM
-- `-fmt pfile` : PLINK 2 PGEN/PVAR/PSAM (BED-compatible hard-call mode 0x01)
+- `-fmt pfile` : PLINK 2 PGEN/PVAR/PSAM (native hard-call mode 0x10)
 - `-fmt vcf`   : bgzipped VCF
 - `-fmt hmp`   : gzipped HapMap text (.hmp.gz)
 - `-fmt txt`   : `prefix.txt` + `prefix.id` + `prefix.site`
@@ -733,8 +733,11 @@ def _resolve_prune_mask_mmap_window_mb() -> int | None:
 def _inspect_plink_prefix_light(prefix: str) -> tuple[list[str], int]:
     p = str(prefix)
     is_pgen = _is_pgen_prefix(p)
-    if p.lower().endswith((".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam")):
-        p = str(Path(p).with_suffix(""))
+    low = p.lower()
+    for suffix in (".pvar.zst", ".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"):
+        if low.endswith(suffix):
+            p = p[: -len(suffix)]
+            break
     if is_pgen:
         sample_ids, n_sites = inspect_genotype_file(f"{p}.pgen")
         return [str(sid) for sid in sample_ids], int(n_sites)

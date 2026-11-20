@@ -110,9 +110,16 @@ pub struct SiteInfo {
     pub alt_allele: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BimRangeSelection {
+    Keep,
+    Skip,
+    Stop,
+}
+
 pub struct BimChunkReader {
     path: PathBuf,
-    reader: BufReader<File>,
+    reader: Box<dyn BufRead + Send>,
     next_row: usize,
     pvar_columns: Option<PvarColumnIndices>,
 }
@@ -145,14 +152,22 @@ struct PvarLineFields<'a> {
 impl BimChunkReader {
     pub fn open(prefix: &str) -> Result<Self, String> {
         let pgen_source = genotype_prefix_uses_pgen(prefix);
-        let prefix = normalize_genotype_prefix(prefix);
+        let prefix = if pgen_source {
+            crate::pgen::normalize_pgen_prefix(prefix)
+        } else {
+            normalize_genotype_prefix(prefix)
+        };
         let path = if pgen_source {
-            PathBuf::from(format!("{prefix}.pvar"))
+            crate::pgen::pvar_path_for_prefix(&prefix)
         } else {
             PathBuf::from(format!("{prefix}.bim"))
         };
-        let file = File::open(&path).map_err(|e| e.to_string())?;
-        let mut reader = BufReader::new(file);
+        let mut reader = if pgen_source {
+            crate::pgen::open_text_reader(&path)?
+        } else {
+            let file = File::open(&path).map_err(|e| e.to_string())?;
+            Box::new(BufReader::new(file))
+        };
         let pvar_columns = if pgen_source {
             Some({
                 let mut line = String::new();
@@ -243,6 +258,80 @@ impl BimChunkReader {
             sites.push(site);
         }
         Ok(sites)
+    }
+
+    pub(crate) fn next_site(&mut self) -> Result<Option<SiteInfo>, String> {
+        self.read_next_site()
+    }
+
+    /// Read a sequential BIM/PVAR range while materializing only rows accepted
+    /// by `select`. Every row is still parsed and validated. The callback sees
+    /// borrowed metadata, so callers can inspect chromosome and position
+    /// without allocating a complete `SiteInfo` for skipped rows.
+    pub(crate) fn read_range_filtered<F>(
+        &mut self,
+        start: usize,
+        end: usize,
+        mut select: F,
+    ) -> Result<(Vec<(usize, SiteInfo)>, usize), String>
+    where
+        F: FnMut(usize, &str, i32) -> Result<BimRangeSelection, String>,
+    {
+        if start > end {
+            return Err(format!("invalid BIM range: start {start} > end {end}"));
+        }
+        if start < self.next_row {
+            return Err(format!(
+                "BIM range must be read sequentially: requested start {start} < current {}",
+                self.next_row
+            ));
+        }
+
+        let mut line = String::new();
+        while self.next_row < start {
+            self.read_next_line_into(&mut line)?.ok_or_else(|| {
+                format!(
+                    "BIM ended early: needed row {start} but only saw {} rows from {}",
+                    self.next_row,
+                    self.path.display()
+                )
+            })?;
+        }
+
+        let expected_rows = end.saturating_sub(start);
+        let mut sites = Vec::with_capacity(expected_rows.min(4096));
+        let mut scanned = 0usize;
+        for _ in 0..expected_rows {
+            let row_idx = self.read_next_line_into(&mut line)?.ok_or_else(|| {
+                format!(
+                    "BIM ended early: needed row {end} but only saw {} rows from {}",
+                    self.next_row,
+                    self.path.display()
+                )
+            })?;
+            scanned = scanned.saturating_add(1);
+            let line = line.trim_end();
+            let (selection, site) = if let Some(columns) = self.pvar_columns {
+                let fields = parse_pvar_fields(&self.path, row_idx + 1, line, columns)?;
+                let selection = select(row_idx, fields.chrom, fields.pos)?;
+                let site = (selection == BimRangeSelection::Keep)
+                    .then(|| site_info_from_pvar_fields(fields));
+                (selection, site)
+            } else {
+                let fields = parse_bim_fields(&self.path, row_idx + 1, line)?;
+                let selection = select(row_idx, fields.chrom, fields.pos)?;
+                let site = (selection == BimRangeSelection::Keep)
+                    .then(|| site_info_from_bim_fields(fields));
+                (selection, site)
+            };
+            if let Some(site) = site {
+                sites.push((row_idx, site));
+            }
+            if selection == BimRangeSelection::Stop {
+                break;
+            }
+        }
+        Ok((sites, scanned))
     }
 
     /// Read a sequential BIM range while materializing only rows selected by
@@ -413,7 +502,15 @@ impl BimChunkReader {
 fn normalize_genotype_prefix(path_or_prefix: &str) -> String {
     let mut prefix = path_or_prefix.trim().to_string();
     let lower = prefix.to_ascii_lowercase();
-    for suffix in [".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"] {
+    for suffix in [
+        ".bed",
+        ".bim",
+        ".fam",
+        ".pgen",
+        ".pvar.zst",
+        ".pvar",
+        ".psam",
+    ] {
         if lower.ends_with(suffix) {
             prefix.truncate(prefix.len().saturating_sub(suffix.len()));
             break;
@@ -621,7 +718,10 @@ pub fn read_bim_columns(
 // ---------------------------
 pub fn open_text_maybe_gz(path: &Path) -> Result<Box<dyn BufRead + Send + Sync>, String> {
     let file = File::open(path).map_err(|e| e.to_string())?;
-    if path.extension().map(|e| e == "gz").unwrap_or(false) {
+    if path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("gz"))
+    {
         Ok(Box::new(BufReader::new(MultiGzDecoder::new(file))))
     } else {
         Ok(Box::new(BufReader::new(file)))
@@ -687,9 +787,9 @@ fn process_snp_row_with_precomputed_counts_impl(
         return None;
     }
 
-    let missing_rate = (1.0 - (non_missing as f64 / n_samples)) as f32;
+    let missing_rate = 1.0 - (non_missing as f64 / n_samples);
     let missing_count = row.len().saturating_sub(non_missing) as u32;
-    if missing_rate > max_missing_rate {
+    if !crate::gfreader::rate_within_threshold(missing_rate, max_missing_rate) {
         return None;
     }
 
@@ -705,8 +805,7 @@ fn process_snp_row_with_precomputed_counts_impl(
 
     if apply_het_filter {
         let het_rate = het_count as f64 / non_missing as f64;
-        let max_het = het_threshold as f64;
-        if het_rate > max_het {
+        if !crate::gfreader::rate_within_threshold(het_rate, het_threshold) {
             return None;
         }
     }
@@ -722,8 +821,8 @@ fn process_snp_row_with_precomputed_counts_impl(
         alt_sum = 2.0 * non_missing as f64 - raw_alt_sum;
     }
 
-    let maf = alt_freq.min(1.0 - alt_freq) as f32;
-    if maf < maf_threshold {
+    let maf = alt_freq.min(1.0 - alt_freq);
+    if !crate::gfreader::maf_passes_threshold(maf, maf_threshold) {
         return None;
     }
 
@@ -931,6 +1030,292 @@ struct TxtPaths {
 enum TxtMatrixKind {
     NpyF32,
     Bin01,
+}
+
+/// A row-oriented numeric hard-call matrix reader used by `jx imp`.
+/// Unlike `TxtSnpIter`, this keeps site metadata in a sequential reader rather
+/// than retaining one allocated `SiteInfo` per variant.
+pub(crate) struct ImpNumericReader {
+    samples: Vec<String>,
+    mmap: Mmap,
+    data_offset: usize,
+    n_samples: usize,
+    n_variants: usize,
+    row_bytes: usize,
+    next_variant: usize,
+    sites: ImpSiteStream,
+    sites_checked: bool,
+}
+
+enum ImpSiteStream {
+    Bim(BimChunkReader),
+    Text(ImpTextSiteReader),
+}
+
+struct ImpTextSiteReader {
+    path: PathBuf,
+    reader: BufReader<File>,
+    line_no: usize,
+    delimiter: Option<char>,
+    header_seen: bool,
+    idx_chr: usize,
+    idx_pos: usize,
+    idx_ref: usize,
+    idx_alt: usize,
+    idx_id: Option<usize>,
+}
+
+impl ImpTextSiteReader {
+    fn open(path: &Path) -> Result<Self, String> {
+        Ok(Self {
+            path: path.to_path_buf(),
+            reader: BufReader::new(
+                File::open(path)
+                    .map_err(|e| format!("open site metadata {}: {e}", path.display()))?,
+            ),
+            line_no: 0,
+            delimiter: None,
+            header_seen: false,
+            idx_chr: 0,
+            idx_pos: 1,
+            idx_ref: 2,
+            idx_alt: 3,
+            idx_id: None,
+        })
+    }
+
+    fn next_site(&mut self) -> Result<Option<SiteInfo>, String> {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let n = self
+                .reader
+                .read_line(&mut line)
+                .map_err(|e| format!("{}:{}: {e}", self.path.display(), self.line_no + 1))?;
+            if n == 0 {
+                return Ok(None);
+            }
+            self.line_no += 1;
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if self.header_seen && trimmed.starts_with('#') {
+                continue;
+            }
+            if self.delimiter.is_none() {
+                self.delimiter = infer_text_delimiter(trimmed);
+            }
+            let toks = split_line_tokens(trimmed, self.delimiter);
+            if toks.is_empty() {
+                continue;
+            }
+            if !self.header_seen {
+                self.header_seen = true;
+                let low = toks
+                    .iter()
+                    .map(|x| x.trim().to_ascii_lowercase())
+                    .collect::<Vec<_>>();
+                let pick = |candidates: &[&str]| {
+                    low.iter()
+                        .position(|value| candidates.iter().any(|candidate| value == candidate))
+                };
+                if let (Some(chr), Some(pos), Some(ref_allele), Some(alt_allele)) = (
+                    pick(&["#chrom", "chrom", "chr", "chromosome"]),
+                    pick(&["pos", "bp", "position", "ps"]),
+                    pick(&["ref", "a0", "allele0", "allele_0", "ref_allele"]),
+                    pick(&["alt", "a1", "allele1", "allele_1", "alt_allele"]),
+                ) {
+                    self.idx_chr = chr;
+                    self.idx_pos = pos;
+                    self.idx_ref = ref_allele;
+                    self.idx_alt = alt_allele;
+                    self.idx_id = pick(&["snp", "id", "marker", "marker_id", "rs", "rsid"]);
+                    continue;
+                }
+                if trimmed.starts_with('#') {
+                    continue;
+                }
+            }
+            if self.idx_pos == 1 && self.idx_ref == 2 && self.idx_alt == 3 && toks.len() >= 6 {
+                let strand = toks[1];
+                if matches!(strand, "+" | "-" | "0" | "1") && toks[3].parse::<i32>().is_ok() {
+                    self.idx_pos = 3;
+                    self.idx_ref = 4;
+                    self.idx_alt = 5;
+                }
+            }
+            let needed = self
+                .idx_chr
+                .max(self.idx_pos)
+                .max(self.idx_ref)
+                .max(self.idx_alt);
+            if toks.len() <= needed {
+                return Err(format!(
+                    "malformed site metadata at {}:{}: {trimmed}",
+                    self.path.display(),
+                    self.line_no
+                ));
+            }
+            let chrom = toks[self.idx_chr].to_owned();
+            let pos = toks[self.idx_pos].parse::<i32>().map_err(|_| {
+                format!(
+                    "invalid site position at {}:{}: {}",
+                    self.path.display(),
+                    self.line_no,
+                    toks[self.idx_pos]
+                )
+            })?;
+            let id = self
+                .idx_id
+                .and_then(|index| toks.get(index))
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty() && *value != ".")
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("{chrom}_{pos}"));
+            return Ok(Some(SiteInfo {
+                chrom,
+                pos,
+                snp: id,
+                ref_allele: toks[self.idx_ref].to_owned(),
+                alt_allele: toks[self.idx_alt].to_owned(),
+            }));
+        }
+    }
+}
+
+impl ImpSiteStream {
+    fn next_site(&mut self) -> Result<Option<SiteInfo>, String> {
+        match self {
+            Self::Bim(reader) => reader.next_site(),
+            Self::Text(reader) => reader.next_site(),
+        }
+    }
+}
+
+impl ImpNumericReader {
+    pub(crate) fn open(path: &Path) -> Result<Self, String> {
+        let path_text = path.to_string_lossy();
+        let paths = resolve_txt_paths(&path_text)?;
+        if paths.bin_path.is_some() || path.extension().is_some_and(|ext| ext == "bin") {
+            return Err(format!(
+                "{} is a BIN01/k-mer presence matrix (0/1 presence, not diploid genotypes); convert to 0/1/2 hard calls before phasing",
+                path.display()
+            ));
+        }
+        let samples = read_id_file(&paths.id_path)?;
+        let n_samples = samples.len();
+        let (matrix_path, n_variants, n_cols) = if let Some(txt_path) = paths.txt_path.as_ref() {
+            let (rows, cols) = ensure_cached_text_npy(txt_path, &paths.npy_path, None, n_samples)?;
+            (paths.npy_path.clone(), rows, cols)
+        } else {
+            (paths.npy_path.clone(), 0, 0)
+        };
+        let file = File::open(&matrix_path).map_err(|e| {
+            format!(
+                "open numeric genotype matrix {}: {e}",
+                matrix_path.display()
+            )
+        })?;
+        let mmap = unsafe { Mmap::map(&file) }
+            .map_err(|e| format!("map numeric genotype matrix {}: {e}", matrix_path.display()))?;
+        let (mapped_variants, mapped_samples, data_offset) = parse_npy_f32_header(&mmap[..])?;
+        let (n_variants, n_cols) = if n_variants == 0 {
+            (mapped_variants, mapped_samples)
+        } else {
+            (n_variants, n_cols)
+        };
+        if mapped_variants != n_variants || mapped_samples != n_cols || n_cols != n_samples {
+            return Err(format!(
+                "numeric matrix shape mismatch for {}: NPY=({mapped_variants},{mapped_samples}), IDs={}, expected rows={n_variants}",
+                matrix_path.display(),
+                n_samples
+            ));
+        }
+        let row_bytes = n_samples
+            .checked_mul(4)
+            .ok_or_else(|| "numeric genotype row byte size overflow".to_string())?;
+        let sites = if let Some(bim_path) = paths.src_bim_path.as_ref() {
+            let prefix = bim_path.with_extension("");
+            ImpSiteStream::Bim(BimChunkReader::open(&prefix.to_string_lossy())?)
+        } else if let Some(site_path) = paths.src_site_path.as_ref() {
+            let ext = site_path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            if matches!(ext.to_ascii_lowercase().as_str(), "bsite") {
+                return Err(format!(
+                    "streaming numeric input does not read binary site metadata {}; provide a text .site or .bim sidecar",
+                    site_path.display()
+                ));
+            }
+            ImpSiteStream::Text(ImpTextSiteReader::open(site_path)?)
+        } else {
+            return Err(format!(
+                "numeric input {} requires a .site/.bim sidecar with chromosome, position, REF, and ALT",
+                path.display()
+            ));
+        };
+        Ok(Self {
+            samples,
+            mmap,
+            data_offset,
+            n_samples,
+            n_variants,
+            row_bytes,
+            next_variant: 0,
+            sites,
+            sites_checked: false,
+        })
+    }
+
+    pub(crate) fn samples(&self) -> &[String] {
+        &self.samples
+    }
+
+    pub(crate) fn next_row(&mut self) -> Result<Option<(Vec<f32>, SiteInfo)>, String> {
+        if self.next_variant >= self.n_variants {
+            if !self.sites_checked {
+                self.sites_checked = true;
+                if self.sites.next_site()?.is_some() {
+                    return Err(
+                        "site metadata contains more rows than the numeric genotype matrix"
+                            .to_owned(),
+                    );
+                }
+            }
+            return Ok(None);
+        }
+        let start = self
+            .data_offset
+            .checked_add(
+                self.next_variant
+                    .checked_mul(self.row_bytes)
+                    .ok_or_else(|| "numeric genotype row offset overflow".to_string())?,
+            )
+            .ok_or_else(|| "numeric genotype row offset overflow".to_string())?;
+        let end = start
+            .checked_add(self.row_bytes)
+            .ok_or_else(|| "numeric genotype row end overflow".to_string())?;
+        let bytes = self.mmap.get(start..end).ok_or_else(|| {
+            format!(
+                "truncated NPY genotype data at variant {}",
+                self.next_variant + 1
+            )
+        })?;
+        let values = bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect::<Vec<_>>();
+        let site = self.sites.next_site()?.ok_or_else(|| {
+            format!(
+                "site metadata ended before numeric matrix row {}",
+                self.next_variant + 1
+            )
+        })?;
+        self.next_variant += 1;
+        Ok(Some((values, site)))
+    }
 }
 
 fn cache_prefix_path(prefix: &Path) -> PathBuf {
@@ -1748,15 +2133,19 @@ fn validate_bim_line(path: &Path, line_no: usize, line: &str) -> Result<(), Stri
 }
 
 #[inline]
-fn parse_bim_line(path: &Path, line_no: usize, line: &str) -> Result<SiteInfo, String> {
-    let fields = parse_bim_fields(path, line_no, line)?;
-    Ok(SiteInfo {
+fn site_info_from_bim_fields(fields: BimLineFields<'_>) -> SiteInfo {
+    SiteInfo {
         chrom: fields.chrom.to_string(),
         pos: fields.pos,
         snp: fields.snp.to_string(),
         ref_allele: fields.ref_allele.to_string(),
         alt_allele: fields.alt_allele.to_string(),
-    })
+    }
+}
+
+#[inline]
+fn parse_bim_line(path: &Path, line_no: usize, line: &str) -> Result<SiteInfo, String> {
+    parse_bim_fields(path, line_no, line).map(site_info_from_bim_fields)
 }
 
 #[inline]
@@ -1843,20 +2232,24 @@ fn validate_pvar_line(
 }
 
 #[inline]
+fn site_info_from_pvar_fields(fields: PvarLineFields<'_>) -> SiteInfo {
+    SiteInfo {
+        chrom: fields.chrom.to_string(),
+        pos: fields.pos,
+        snp: fields.snp.to_string(),
+        ref_allele: fields.ref_allele.to_string(),
+        alt_allele: fields.alt_allele.to_string(),
+    }
+}
+
+#[inline]
 fn parse_pvar_line(
     path: &Path,
     line_no: usize,
     line: &str,
     columns: PvarColumnIndices,
 ) -> Result<SiteInfo, String> {
-    let fields = parse_pvar_fields(path, line_no, line, columns)?;
-    Ok(SiteInfo {
-        chrom: fields.chrom.to_string(),
-        pos: fields.pos,
-        snp: fields.snp.to_string(),
-        ref_allele: fields.ref_allele.to_string(),
-        alt_allele: fields.alt_allele.to_string(),
-    })
+    parse_pvar_fields(path, line_no, line, columns).map(site_info_from_pvar_fields)
 }
 
 fn read_bim_columns_file(
@@ -2421,7 +2814,7 @@ impl BedSnpIter {
             fill_missing,
             apply_het_filter,
             het_threshold,
-            true,
+            false,
         )
     }
 
@@ -2762,9 +3155,9 @@ impl BedSnpIter {
     }
 
     /// Lightweight constructor with mmap windowing for GRM streaming path:
-    /// parses FAM count and BED shape, skips full BIM metadata parse.
+    /// parses FAM count and genotype shape, skips the full PVAR count pass.
     pub fn new_for_grm_window(prefix: &str, mmap_window_mb: usize) -> Result<Self, String> {
-        Self::new_for_grm_window_count_mode(prefix, mmap_window_mb, true)
+        Self::new_for_grm_window_count_mode(prefix, mmap_window_mb, false)
     }
 
     /// GARFIELD's range-bounded preparation reads BIM/PVAR rows alongside the
@@ -3479,6 +3872,36 @@ impl BedSnpIter {
             }
         }
         Ok(())
+    }
+
+    /// Ensure a contiguous BED window starts at `snp_idx` so a fused consumer
+    /// can consume its entire metadata run without crossing an mmap boundary.
+    /// PGEN sources already provide block-level reads and use their existing
+    /// decoded window.
+    pub(crate) fn ensure_window_cover_rows(
+        &mut self,
+        snp_idx: usize,
+        rows: usize,
+    ) -> Result<usize, String> {
+        if self.pgen_source.is_some() {
+            self.ensure_window_for_snp(snp_idx)?;
+            return Ok(self.mapped_contiguous_snps_from(snp_idx));
+        }
+        if snp_idx >= self.n_snps {
+            return Err("SNP index out of range".to_string());
+        }
+        if self.window_snps.is_some() {
+            let window_end = self.window_start_snp.saturating_add(self.window_len_snps);
+            let available = if snp_idx < self.window_start_snp || snp_idx >= window_end {
+                0
+            } else {
+                window_end.saturating_sub(snp_idx)
+            };
+            if available < rows {
+                self.remap_window(snp_idx)?;
+            }
+        }
+        Ok(self.mapped_contiguous_snps_from(snp_idx))
     }
 
     pub fn mapped_contiguous_snps_from(&self, snp_idx: usize) -> usize {

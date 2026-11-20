@@ -1,11 +1,9 @@
 from typing import Union
-from contextlib import contextmanager
 import gzip
 import os
 import warnings
 import shutil
 import sys
-import time
 import tempfile
 import numpy as np
 from tqdm import tqdm
@@ -13,6 +11,8 @@ from janusx._plink import (
     detect_existing_plink_kind,
     explicit_plink_kind,
     normalize_plink_prefix,
+    open_text_auto,
+    pvar_path_for_prefix,
 )
 from janusx.janusx import (
     BedChunkReader,
@@ -57,6 +57,10 @@ try:
     from janusx.janusx import prepare_bed_logic_meta_selected as _prepare_bed_logic_meta_selected
 except Exception:
     _prepare_bed_logic_meta_selected = None
+try:
+    from janusx.janusx import PgenChunkReader as _PgenChunkReader
+except Exception:
+    _PgenChunkReader = None
 
 try:
     from janusx.script._common.progress import build_rich_progress as _build_rich_progress
@@ -68,6 +72,7 @@ from janusx.script._common.grmio import (
     genotype_cache_permission_retry_message as _genotype_cache_permission_retry_message,
     genotype_cache_staged_input_message as _genotype_cache_staged_input_message,
 )
+from janusx.script._common.cache_lock import cache_generation_lock
 
 _WARNED_BED_MODEL_FALLBACK = False
 _GENO_CACHE_ENV = "JANUSX_CACHE_DIR"
@@ -459,41 +464,13 @@ def _vcf_cache_prefix(
     return f"{_cache_prefix(prefix, cache_dir=cache_dir)}{mode_tag}"
 
 
-@contextmanager
 def _cache_lock(lock_key: str, timeout_s: float = 7200.0, poll_s: float = 0.2):
-    lock_path = f"{lock_key}.lock"
-    start = time.monotonic()
-    fd = None
-    while True:
-        try:
-            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-            os.write(fd, f"{os.getpid()}\n".encode("utf-8"))
-            break
-        except FileExistsError:
-            try:
-                age = time.time() - os.path.getmtime(lock_path)
-                if age > timeout_s:
-                    os.remove(lock_path)
-                    continue
-            except Exception:
-                pass
-            if (time.monotonic() - start) > timeout_s:
-                raise TimeoutError(f"Timeout waiting cache lock: {lock_path}")
-            time.sleep(poll_s)
-    try:
-        yield
-    finally:
-        if fd is not None:
-            try:
-                os.close(fd)
-            except Exception:
-                pass
-        try:
-            os.remove(lock_path)
-        except FileNotFoundError:
-            pass
-        except Exception:
-            pass
+    return cache_generation_lock(
+        lock_key,
+        timeout_s=timeout_s,
+        poll_s=poll_s,
+        label="genotype cache",
+    )
 
 
 def _is_bed_prefix(path_or_prefix: str) -> bool:
@@ -509,7 +486,11 @@ def _is_pgen_prefix(path_or_prefix: str) -> bool:
     if resolved is None or resolved[0] != "pfile":
         return False
     prefix = resolved[1]
-    return all(os.path.isfile(f"{prefix}.{ext}") for ext in ("pgen", "pvar", "psam"))
+    return (
+        os.path.isfile(f"{prefix}.pgen")
+        and (os.path.isfile(f"{prefix}.pvar") or os.path.isfile(f"{prefix}.pvar.zst"))
+        and os.path.isfile(f"{prefix}.psam")
+    )
 
 
 def _is_plink_prefix(path_or_prefix: str) -> bool:
@@ -517,8 +498,13 @@ def _is_plink_prefix(path_or_prefix: str) -> bool:
     if resolved is None:
         return False
     kind, prefix = resolved
-    extensions = ("pgen", "pvar", "psam") if kind == "pfile" else ("bed", "bim", "fam")
-    return all(os.path.isfile(f"{prefix}.{ext}") for ext in extensions)
+    if kind == "pfile":
+        return (
+            os.path.isfile(f"{prefix}.pgen")
+            and (os.path.isfile(f"{prefix}.pvar") or os.path.isfile(f"{prefix}.pvar.zst"))
+            and os.path.isfile(f"{prefix}.psam")
+        )
+    return all(os.path.isfile(f"{prefix}.{ext}") for ext in ("bed", "bim", "fam"))
 
 
 def _strip_known_suffix(path_or_prefix: str) -> str:
@@ -533,6 +519,7 @@ def _strip_known_suffix(path_or_prefix: str) -> str:
         ".bim",
         ".fam",
         ".pgen",
+        ".pvar.zst",
         ".pvar",
         ".psam",
         ".hmp",
@@ -568,12 +555,22 @@ def _normalize_matrix_prefix(prefix: str, kind: str) -> str:
 
 
 def _plink_missing_files(prefix: str) -> list[str]:
-    extensions = (
-        ("pgen", "pvar", "psam")
-        if not os.path.exists(f"{prefix}.bed")
-        and any(os.path.exists(f"{prefix}.{ext}") for ext in ("pgen", "pvar", "psam"))
-        else ("bed", "bim", "fam")
-    )
+    if (
+        not os.path.exists(f"{prefix}.bed")
+        and any(
+            os.path.exists(f"{prefix}.{ext}")
+            for ext in ("pgen", "pvar", "pvar.zst", "psam")
+        )
+    ):
+        missing = []
+        if not os.path.isfile(f"{prefix}.pgen"):
+            missing.append(f"{prefix}.pgen")
+        if not (os.path.isfile(f"{prefix}.pvar") or os.path.isfile(f"{prefix}.pvar.zst")):
+            missing.append(f"{prefix}.pvar[.zst]")
+        if not os.path.isfile(f"{prefix}.psam"):
+            missing.append(f"{prefix}.psam")
+        return missing
+    extensions = ("bed", "bim", "fam")
     return [
         f"{prefix}.{ext}"
         for ext in extensions
@@ -582,11 +579,14 @@ def _plink_missing_files(prefix: str) -> list[str]:
 
 
 def _pgen_missing_files(prefix: str) -> list[str]:
-    return [
-        f"{prefix}.{ext}"
-        for ext in ("pgen", "pvar", "psam")
-        if not os.path.isfile(f"{prefix}.{ext}")
-    ]
+    missing = []
+    if not os.path.isfile(f"{prefix}.pgen"):
+        missing.append(f"{prefix}.pgen")
+    if not (os.path.isfile(f"{prefix}.pvar") or os.path.isfile(f"{prefix}.pvar.zst")):
+        missing.append(f"{prefix}.pvar[.zst]")
+    if not os.path.isfile(f"{prefix}.psam"):
+        missing.append(f"{prefix}.psam")
+    return missing
 
 
 def _raise_plink_prefix_error(prefix: str) -> None:
@@ -824,8 +824,15 @@ def _resolve_input(path_or_prefix: str, force_kind: Union[str, None] = None):
     explicit_plink = explicit_plink_kind(p)
     if explicit_plink is not None:
         prefix = normalize_plink_prefix(p)
-        family = ("pgen", "pvar", "psam") if explicit_plink == "pfile" else ("bed", "bim", "fam")
-        missing = [f"{prefix}.{ext}" for ext in family if not os.path.isfile(f"{prefix}.{ext}")]
+        if explicit_plink == "pfile":
+            required = [
+                f"{prefix}.pgen",
+                pvar_path_for_prefix(prefix),
+                f"{prefix}.psam",
+            ]
+        else:
+            required = [f"{prefix}.{ext}" for ext in ("bed", "bim", "fam")]
+        missing = [path for path in required if not os.path.isfile(path)]
         if missing:
             label = "PLINK 2 PGEN" if explicit_plink == "pfile" else "PLINK BED"
             lines = [f"{label} prefix is incomplete or not found: {prefix}"]
@@ -1535,16 +1542,33 @@ def _count_plink_bim_rows(prefix: str) -> int:
     if resolved is None:
         raise FileNotFoundError(f"Cannot resolve PLINK variant metadata for {prefix}")
     kind, plink_prefix = resolved
-    variant_suffix = "pvar" if kind == "pfile" else "bim"
-    variant_path = f"{plink_prefix}.{variant_suffix}"
+    if kind == "pfile" and _PgenChunkReader is not None:
+        # PGEN stores the variant count in its binary header.  Use the native
+        # reader for inspection so opening a large PFILE does not first scan
+        # the entire companion PVAR text file.  The reader still consumes
+        # PVAR rows sequentially when genotype/site data are requested.
+        try:
+            reader = _PgenChunkReader(prefix=plink_prefix)
+            n_snps = int(reader.n_snps)
+            if n_snps > 0:
+                return n_snps
+        except Exception:
+            # Keep a compatibility fallback for wheels built before the
+            # native PGEN header-count path was available.
+            pass
+    variant_path = (
+        pvar_path_for_prefix(plink_prefix)
+        if kind == "pfile"
+        else f"{plink_prefix}.bim"
+    )
     n_snps = 0
-    with open(variant_path, "r", encoding="utf-8", errors="replace") as handle:
+    with open_text_auto(variant_path, errors="replace") as handle:
         for line in handle:
             row = line.strip()
             if row and not row.startswith("#"):
                 n_snps += 1
     if n_snps <= 0:
-        label = "PVAR" if variant_path.endswith(".pvar") else "BIM"
+        label = "PVAR" if variant_path.lower().endswith((".pvar", ".pvar.zst")) else "BIM"
         raise ValueError(f"{label} contains zero variants: {variant_path}")
     return n_snps
 
@@ -1702,6 +1726,38 @@ def bed_chunk_reader(
         mmap_window_mb=mmap_window_mb,
         preserve_alt_orientation=bool(preserve_alt_orientation),
     )
+    can_stream_pgen = (
+        _PgenChunkReader is not None
+        and _is_pgen_prefix(prefix)
+        and snp_range is None
+        and snp_indices is None
+        and bim_range is None
+        and snp_sites is None
+        and chr_keys is None
+        and bp_min is None
+        and bp_max is None
+        and not ranges
+        and mmap_window_mb is None
+    )
+    if can_stream_pgen:
+        reader = _PgenChunkReader(
+            prefix=prefix,
+            maf_threshold=float(maf),
+            max_missing_rate=float(missing_rate),
+            fill_missing=bool(impute),
+            sample_ids=sample_ids,
+            sample_indices=sample_indices,
+            model=model,
+            het_threshold=float(het),
+            preserve_alt_orientation=bool(preserve_alt_orientation),
+        )
+        while True:
+            out = reader.next_chunk(chunk_size)
+            if out is None:
+                break
+            geno, sites = out
+            yield np.asarray(geno, dtype=np.float32), sites
+        return
     try:
         reader = BedChunkReader(
             **base_kwargs,
@@ -2338,7 +2394,9 @@ def inspect_genotype_file(
 
     n_snps : int
         Number of SNPs in the file.
-        - For PLINK BED: exact count from BIM.
+        - For PLINK BED: exact count from BED/BIM metadata.
+        - For PLINK 2 PGEN: exact count from the PGEN header; PVAR rows are
+          validated as they are consumed.
         - For VCF     : count from cached PLINK BIM after conversion.
         - For HMP     : count from cached PLINK BIM when cache path is available;
                         otherwise direct HMP row count.

@@ -19,6 +19,8 @@ from janusx._plink import (
     detect_existing_plink_kind,
     explicit_plink_kind,
     normalize_plink_prefix,
+    open_text_auto,
+    pvar_path_for_prefix,
 )
 from ._common.cli_args import (
     add_common_genotype_source_args,
@@ -473,10 +475,10 @@ def _open_text_writer(path: str):
 
 
 def _iter_pvar_rows(prefix: str):
-    pvar_path = f"{normalize_plink_prefix(prefix)}.pvar"
+    pvar_path = pvar_path_for_prefix(normalize_plink_prefix(prefix))
     columns: list[str] | None = None
     try:
-        with open(pvar_path, "r", encoding="utf-8", buffering=8 * 1024 * 1024) as handle:
+        with open_text_auto(pvar_path, buffering=8 * 1024 * 1024) as handle:
             for line_no, line in enumerate(handle, start=1):
                 content = line.strip()
                 if not content or content.startswith("##"):

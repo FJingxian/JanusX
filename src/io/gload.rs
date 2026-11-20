@@ -423,7 +423,11 @@ impl PackedBedSourceReader {
                     "PGEN/PSAM sample count mismatch: reader was given {n_samples_full}, PSAM has {psam_samples}"
                 ));
             }
-            let n_snps = crate::pgen::count_pvar_variants(&pgen_prefix)?;
+            // The PGEN header already contains the authoritative variant
+            // count.  Counting PVAR rows here turns opening a large PGEN
+            // into a full scan of the companion text file before any
+            // progress callback can be emitted.
+            let n_snps = crate::pgen::count_pgen_variants(&pgen_prefix, n_samples_full)?;
             let pgen_path = Path::new(&format!("{pgen_prefix}.pgen")).to_path_buf();
             let reader = crate::pgen::PgenReader::open(&pgen_path, n_samples_full, n_snps)?;
             return Ok(Self {
@@ -504,6 +508,56 @@ impl PackedBedSourceReader {
             }
         }
         Ok(rows)
+    }
+
+    /// Read a small, arbitrarily ordered set of source rows. PGEN uses direct
+    /// reads from the nearest LD-compression anchor so sampling does not load
+    /// a complete 65k-variant block for every candidate.
+    pub(crate) fn read_source_rows_sparse(
+        &mut self,
+        source_rows: &[usize],
+        out: &mut [u8],
+    ) -> Result<(), String> {
+        let expected_len = source_rows
+            .len()
+            .checked_mul(self.bytes_per_snp)
+            .ok_or_else(|| "sparse BED source output size overflow".to_string())?;
+        if out.len() < expected_len {
+            return Err(format!(
+                "sparse BED source destination is too small: got {}, need {expected_len}",
+                out.len()
+            ));
+        }
+        if let Some(&source_row) = source_rows.iter().find(|&&row| row >= self.n_snps) {
+            return Err(format!(
+                "BED source row {source_row} exceeds marker count {}",
+                self.n_snps
+            ));
+        }
+        match &mut self.source {
+            PackedBedSource::Bed(file) => {
+                for (output_row, &source_row) in source_rows.iter().enumerate() {
+                    let offset = (BED_HEADER_LEN as u64)
+                        .checked_add(
+                            (source_row as u64)
+                                .checked_mul(self.bytes_per_snp as u64)
+                                .ok_or_else(|| "BED sparse row offset overflow".to_string())?,
+                        )
+                        .ok_or_else(|| "BED sparse row offset overflow".to_string())?;
+                    let output_start = output_row * self.bytes_per_snp;
+                    read_file_exact_at(
+                        file,
+                        &mut out[output_start..output_start + self.bytes_per_snp],
+                        offset,
+                    )
+                    .map_err(|e| format!("read BED source row {source_row}: {e}"))?;
+                }
+            }
+            PackedBedSource::Pgen(reader) => {
+                reader.read_source_rows_sparse(source_rows, out)?;
+            }
+        }
+        Ok(())
     }
 
     /// Reads a row-major f32 hard-call matrix, decoding PGEN category bytes
@@ -1793,7 +1847,15 @@ pub fn open_bed_mmap_unified(
 fn normalize_plink_prefix(prefix: &str) -> String {
     let mut out = prefix.trim().to_string();
     let lower = out.to_ascii_lowercase();
-    for suffix in [".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"] {
+    for suffix in [
+        ".bed",
+        ".bim",
+        ".fam",
+        ".pgen",
+        ".pvar.zst",
+        ".pvar",
+        ".psam",
+    ] {
         if lower.ends_with(suffix) {
             out.truncate(out.len().saturating_sub(suffix.len()));
             break;

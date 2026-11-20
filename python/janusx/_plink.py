@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import io
 import os
+from contextlib import contextmanager
+from typing import Iterator, TextIO
+
+import zstandard
 
 
 _BFILE_SUFFIXES = (".bed", ".bim", ".fam")
-_PFILE_SUFFIXES = (".pgen", ".pvar", ".psam")
+_PFILE_SUFFIXES = (".pgen", ".pvar.zst", ".pvar", ".psam")
 
 
 def explicit_plink_kind(path_or_prefix: str) -> str | None:
@@ -65,8 +70,10 @@ def detect_existing_plink_kind(path_or_prefix: str) -> tuple[str, str] | None:
     bfile_complete = all(
         os.path.isfile(f"{prefix}{suffix}") for suffix in _BFILE_SUFFIXES
     )
-    pfile_complete = all(
-        os.path.isfile(f"{prefix}{suffix}") for suffix in _PFILE_SUFFIXES
+    pfile_complete = (
+        os.path.isfile(f"{prefix}.pgen")
+        and (os.path.isfile(f"{prefix}.pvar") or os.path.isfile(f"{prefix}.pvar.zst"))
+        and os.path.isfile(f"{prefix}.psam")
     )
     if explicit_kind is not None:
         return (explicit_kind, prefix)
@@ -80,3 +87,37 @@ def detect_existing_plink_kind(path_or_prefix: str) -> tuple[str, str] | None:
     if bfile_complete:
         return "bfile", prefix
     return None
+
+
+def pvar_path_for_prefix(prefix: str) -> str:
+    """Return the existing zstd or plain PVAR sidecar for a pfile prefix."""
+    normalized = normalize_plink_prefix(str(prefix))
+    compressed = f"{normalized}.pvar.zst"
+    if os.path.isfile(compressed):
+        return compressed
+    return f"{normalized}.pvar"
+
+
+@contextmanager
+def open_text_auto(
+    path: str,
+    *,
+    encoding: str = "utf-8",
+    errors: str = "strict",
+    buffering: int = -1,
+) -> Iterator[TextIO]:
+    """Open plain or zstd-compressed text with the same streaming interface."""
+    if str(path).lower().endswith(".zst"):
+        with open(path, "rb", buffering=buffering) as raw:
+            with zstandard.ZstdDecompressor().stream_reader(
+                raw, read_across_frames=True
+            ) as decoder:
+                with io.TextIOWrapper(
+                    decoder, encoding=encoding, errors=errors
+                ) as text:
+                    yield text
+        return
+    with open(
+        path, "r", encoding=encoding, errors=errors, buffering=buffering
+    ) as text:
+        yield text

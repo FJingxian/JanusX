@@ -230,7 +230,15 @@ pub(crate) fn build_snp_indices(
 fn normalize_plink_prefix_local(p: &str) -> String {
     let s = p.trim();
     let low = s.to_ascii_lowercase();
-    for suffix in [".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"] {
+    for suffix in [
+        ".bed",
+        ".bim",
+        ".fam",
+        ".pgen",
+        ".pvar.zst",
+        ".pvar",
+        ".psam",
+    ] {
         if low.ends_with(suffix) {
             return s[..s.len() - suffix.len()].to_string();
         }
@@ -242,9 +250,17 @@ fn normalize_plink_prefix_local(p: &str) -> String {
 fn is_plink_path_or_prefix_local(path_or_prefix: &str) -> bool {
     let p = path_or_prefix.trim();
     let lower = p.to_ascii_lowercase();
-    if [".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"]
-        .iter()
-        .any(|suffix| lower.ends_with(suffix))
+    if [
+        ".bed",
+        ".bim",
+        ".fam",
+        ".pgen",
+        ".pvar.zst",
+        ".pvar",
+        ".psam",
+    ]
+    .iter()
+    .any(|suffix| lower.ends_with(suffix))
     {
         return true;
     }
@@ -256,9 +272,9 @@ fn is_plink_path_or_prefix_local(path_or_prefix: &str) -> bool {
         return true;
     }
     !Path::new(&format!("{prefix}.bed")).exists()
-        && [".pgen", ".pvar", ".psam"]
-            .iter()
-            .all(|suffix| Path::new(&format!("{prefix}{suffix}")).is_file())
+        && Path::new(&format!("{prefix}.pgen")).is_file()
+        && crate::pgen::pvar_path_for_prefix(&prefix).is_file()
+        && Path::new(&format!("{prefix}.psam")).is_file()
 }
 
 #[inline]
@@ -1919,7 +1935,7 @@ pub(crate) fn evaluate_packed_row_keep_and_flip(
     let n_samples_f = n_samples as f64;
     let non_missing_f = non_missing as f64;
     let missing_rate = 1.0 - (non_missing_f / n_samples_f);
-    if missing_rate > (max_missing_rate as f64) {
+    if !rate_within_threshold(missing_rate, max_missing_rate) {
         return (false, false);
     }
 
@@ -1929,8 +1945,7 @@ pub(crate) fn evaluate_packed_row_keep_and_flip(
 
     if apply_het_filter {
         let het_rate = (het_count as f64) / non_missing_f;
-        let max_het = het_threshold as f64;
-        if het_rate > max_het {
+        if !rate_within_threshold(het_rate, het_threshold) {
             return (false, false);
         }
     }
@@ -1941,7 +1956,7 @@ pub(crate) fn evaluate_packed_row_keep_and_flip(
         alt_freq = 1.0 - alt_freq;
     }
     let maf = alt_freq.min(1.0 - alt_freq);
-    if maf < (maf_threshold as f64) {
+    if !maf_passes_threshold(maf, maf_threshold) {
         return (false, false);
     }
     (true, flip)
@@ -1961,7 +1976,7 @@ fn evaluate_packed_row_keep_and_flip_pure_line(
     }
     let logic_missing = logic_missing.min(n_samples);
     let missing_rate = (logic_missing as f64) / (n_samples as f64);
-    if missing_rate > (max_missing_rate as f64) {
+    if !rate_within_threshold(missing_rate, max_missing_rate) {
         return (false, false);
     }
 
@@ -1976,7 +1991,7 @@ fn evaluate_packed_row_keep_and_flip_pure_line(
         alt_freq = 1.0 - alt_freq;
     }
     let maf = alt_freq.min(1.0 - alt_freq);
-    if maf < (maf_threshold as f64) {
+    if !maf_passes_threshold(maf, maf_threshold) {
         return (false, false);
     }
     (true, flip)
@@ -2007,6 +2022,28 @@ pub(crate) fn packed_row_stats_from_counts(
 /// frequency. `alt_sum` is an integer-valued count carried as `f64` by the
 /// streaming GRM decoders; realistic sample counts are exactly representable.
 #[inline]
+pub(crate) fn maf_passes_threshold(maf: f64, maf_threshold: f32) -> bool {
+    if !maf.is_finite() {
+        return false;
+    }
+    // CLI thresholds arrive as f32. Promoting f32(0.05) to f64 yields
+    // 0.050000000745..., which would incorrectly reject exact boundary MAF.
+    const HALF_F32_ULP: f64 = 0.5 * (f32::EPSILON as f64);
+    maf + HALF_F32_ULP >= f64::from(maf_threshold)
+}
+
+#[inline]
+pub(crate) fn rate_within_threshold(rate: f64, threshold: f32) -> bool {
+    if !rate.is_finite() {
+        return false;
+    }
+    // Missingness and heterozygosity are upper bounds. Apply the same
+    // inclusive f32-boundary correction used for the lower-bound MAF.
+    const HALF_F32_ULP: f64 = 0.5 * (f32::EPSILON as f64);
+    rate <= f64::from(threshold) + HALF_F32_ULP
+}
+
+#[inline]
 pub(crate) fn maf_passes_threshold_from_counts(
     alt_sum: f64,
     non_missing: usize,
@@ -2021,7 +2058,7 @@ pub(crate) fn maf_passes_threshold_from_counts(
     }
     let minor_alleles = alt_sum.min(total_alleles - alt_sum);
     let maf = minor_alleles / total_alleles;
-    maf >= maf_threshold as f64
+    maf_passes_threshold(maf, maf_threshold)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2064,11 +2101,13 @@ pub(crate) fn evaluate_packed_snp_qc(
         0.0_f32
     };
     let apply_het_filter = het_threshold > 0.0_f32;
-    let keep = if missing_rate > max_missing_rate {
+    let keep = if !rate_within_threshold(f64::from(missing_rate), max_missing_rate) {
         false
     } else if non_missing == 0 {
         maf_threshold <= 0.0_f32
-    } else if apply_het_filter && ((het as f64) / (non_missing as f64)) > (het_threshold as f64) {
+    } else if apply_het_filter
+        && !rate_within_threshold((het as f64) / (non_missing as f64), het_threshold)
+    {
         false
     } else {
         maf_passes_threshold_from_counts(alt_sum as f64, non_missing, maf_threshold)
@@ -2158,15 +2197,16 @@ fn pure_line_filter_status_from_logic_counts(
     } else {
         0.0_f32
     };
-    let maf = alt_freq.min(1.0_f32 - alt_freq).max(0.0_f32);
-    let mut status = if missing_rate > max_missing_rate {
+    let alt_freq_f64 = f64::from(alt_freq);
+    let maf = alt_freq_f64.min(1.0_f64 - alt_freq_f64).max(0.0_f64);
+    let mut status = if !rate_within_threshold(f64::from(missing_rate), max_missing_rate) {
         PURE_LINE_FILTER_FAIL_MISSING
     } else if usable_homo == 0 {
         PURE_LINE_FILTER_FAIL_NO_NON_MISSING
-    } else if maf < maf_threshold {
-        PURE_LINE_FILTER_FAIL_MAF
-    } else {
+    } else if maf_passes_threshold(maf, maf_threshold) {
         PURE_LINE_FILTER_KEEP
+    } else {
+        PURE_LINE_FILTER_FAIL_MAF
     };
     if has_het {
         status |= PURE_LINE_FILTER_FLAG_HAS_HET;
@@ -4086,6 +4126,181 @@ impl BedChunkReader {
         #[allow(deprecated)]
         let miss_arr = PyArray1::from_owned_array(py, Array1::from_vec(miss)).into_bound();
         Ok(Some((py_mat, sites, maf_arr, miss_arr)))
+    }
+}
+
+// -------- PgenChunkReader --------
+#[pyclass]
+pub struct PgenChunkReader {
+    reader: crate::pgen::PgenReader,
+    sites: std::sync::Mutex<core::BimChunkReader>,
+    next_row: usize,
+    n_samples_full: usize,
+    n_snps: usize,
+    sample_indices: Vec<usize>,
+    sample_ids: Vec<String>,
+    maf: f32,
+    miss: f32,
+    fill_missing: bool,
+    apply_het_filter: bool,
+    het_threshold: f32,
+    preserve_alt_orientation: bool,
+    sites_checked: bool,
+}
+
+#[pymethods]
+impl PgenChunkReader {
+    #[new]
+    #[pyo3(signature = (
+        prefix,
+        maf_threshold=None,
+        max_missing_rate=None,
+        fill_missing=None,
+        sample_ids=None,
+        sample_indices=None,
+        model=None,
+        het_threshold=None,
+        preserve_alt_orientation=None,
+    ))]
+    fn new(
+        prefix: String,
+        maf_threshold: Option<f32>,
+        max_missing_rate: Option<f32>,
+        fill_missing: Option<bool>,
+        sample_ids: Option<Vec<String>>,
+        sample_indices: Option<Vec<usize>>,
+        model: Option<String>,
+        het_threshold: Option<f32>,
+        preserve_alt_orientation: Option<bool>,
+    ) -> PyResult<Self> {
+        validate_additive_model(model.as_deref(), "model")?;
+        let normalized = crate::pgen::normalize_pgen_prefix(&prefix);
+        let all_sample_ids =
+            crate::pgen::read_psam_iids(&normalized).map_err(PyRuntimeError::new_err)?;
+        let n_samples_full = all_sample_ids.len();
+        let n_snps = crate::pgen::count_pgen_variants(&normalized, n_samples_full)
+            .map_err(PyRuntimeError::new_err)?;
+        let pgen_path = PathBuf::from(format!("{normalized}.pgen"));
+        let reader = crate::pgen::PgenReader::open(&pgen_path, n_samples_full, n_snps)
+            .map_err(PyRuntimeError::new_err)?;
+        let (sample_indices, selected_sample_ids) =
+            build_sample_selection(&all_sample_ids, sample_ids, sample_indices)
+                .map_err(PyRuntimeError::new_err)?;
+        let het = het_threshold.unwrap_or(1.0);
+        if !(0.0..=1.0).contains(&het) {
+            return Err(PyValueError::new_err(
+                "het_threshold must be within [0, 1.0]",
+            ));
+        }
+        Ok(Self {
+            reader,
+            sites: std::sync::Mutex::new(
+                core::BimChunkReader::open(&normalized).map_err(PyRuntimeError::new_err)?,
+            ),
+            next_row: 0,
+            n_samples_full,
+            n_snps,
+            sample_indices,
+            sample_ids: selected_sample_ids,
+            maf: maf_threshold.unwrap_or(0.0),
+            miss: max_missing_rate.unwrap_or(1.0),
+            fill_missing: fill_missing.unwrap_or(true),
+            apply_het_filter: het < 1.0,
+            het_threshold: het,
+            preserve_alt_orientation: preserve_alt_orientation.unwrap_or(false),
+            sites_checked: false,
+        })
+    }
+
+    #[getter]
+    fn n_samples(&self) -> usize {
+        self.sample_indices.len()
+    }
+
+    #[getter]
+    fn n_snps(&self) -> usize {
+        self.n_snps
+    }
+
+    #[getter]
+    fn sample_ids(&self) -> Vec<String> {
+        self.sample_ids.clone()
+    }
+
+    fn next_chunk<'py>(
+        &mut self,
+        py: Python<'py>,
+        chunk_size: usize,
+    ) -> PyResult<Option<(Bound<'py, PyArray2<f32>>, Vec<SiteInfo>)>> {
+        if chunk_size == 0 {
+            return Err(PyValueError::new_err("chunk_size must be > 0"));
+        }
+        if self.sample_indices.is_empty() {
+            return Ok(None);
+        }
+        if self.next_row >= self.n_snps {
+            if !self.sites_checked {
+                self.sites
+                    .lock()
+                    .map_err(|_| PyRuntimeError::new_err("PGEN site reader lock is poisoned"))?
+                    .ensure_exhausted(self.n_snps)
+                    .map_err(PyRuntimeError::new_err)?;
+                self.sites_checked = true;
+            }
+            return Ok(None);
+        }
+        let n_selected = self.sample_indices.len();
+        let mut data = Vec::with_capacity(chunk_size.saturating_mul(n_selected));
+        let mut sites = Vec::with_capacity(chunk_size);
+        while sites.len() < chunk_size && self.next_row < self.n_snps {
+            let source_start = self.next_row;
+            let requested = (chunk_size - sites.len()).min(self.n_snps - source_start);
+            let mut raw = vec![0.0f32; requested.saturating_mul(self.n_samples_full)];
+            let rows = self
+                .reader
+                .read_source_block_f32(source_start, requested, &mut raw)
+                .map_err(PyRuntimeError::new_err)?;
+            if rows == 0 {
+                break;
+            }
+            let source_sites = self
+                .sites
+                .lock()
+                .map_err(|_| PyRuntimeError::new_err("PGEN site reader lock is poisoned"))?
+                .read_range(source_start, source_start + rows)
+                .map_err(PyRuntimeError::new_err)?;
+            self.next_row = source_start + rows;
+
+            for row in 0..rows {
+                let raw_row = &raw[row * self.n_samples_full..(row + 1) * self.n_samples_full];
+                let start = data.len();
+                data.extend(self.sample_indices.iter().map(|&sample| raw_row[sample]));
+                let mut site = source_sites[row].clone();
+                let keep = process_bed_chunk_row(
+                    &mut data[start..],
+                    &mut site,
+                    self.maf,
+                    self.miss,
+                    self.fill_missing,
+                    self.apply_het_filter,
+                    self.het_threshold,
+                    self.preserve_alt_orientation,
+                );
+                if keep {
+                    sites.push(SiteInfo::from(site));
+                } else {
+                    data.truncate(start);
+                }
+            }
+        }
+        if sites.is_empty() {
+            return Ok(None);
+        }
+        let mat = Array2::from_shape_vec((sites.len(), n_selected), data)
+            .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+        #[allow(deprecated)]
+        let py_mat = PyArray2::from_owned_array(py, mat).into_bound();
+        Ok(Some((py_mat, sites)))
     }
 }
 
@@ -6092,12 +6307,16 @@ pub(crate) fn prepare_bed_logic_meta_owned_for_stats_samples_sparse_windowed(
                     } else {
                         0.0_f32
                     };
-                    let keep = if missing_rate > max_missing_rate {
+                    let keep = if !rate_within_threshold(f64::from(missing_rate), max_missing_rate)
+                    {
                         false
                     } else if non_missing == 0 {
                         maf_threshold <= 0.0_f32
                     } else if apply_het_filter
-                        && ((het_count as f64) / (non_missing as f64)) > (het_threshold as f64)
+                        && !rate_within_threshold(
+                            (het_count as f64) / (non_missing as f64),
+                            het_threshold,
+                        )
                     {
                         false
                     } else {
@@ -6379,7 +6598,7 @@ fn prepare_pgen_fused_qc_packed_owned_for_stats_samples(
                     return false;
                 }
                 let missing_rate = stats.missing_rate().unwrap_or(1.0_f32);
-                if missing_rate > max_missing_rate {
+                if !rate_within_threshold(f64::from(missing_rate), max_missing_rate) {
                     return false;
                 }
                 let non_missing = stats.sample_count.saturating_sub(stats.missing_count);
@@ -6387,8 +6606,10 @@ fn prepare_pgen_fused_qc_packed_owned_for_stats_samples(
                     return maf_threshold <= 0.0_f32;
                 }
                 if het_threshold > 0.0_f32
-                    && (stats.heterozygote_count as f64) / (non_missing as f64)
-                        > het_threshold as f64
+                    && !rate_within_threshold(
+                        (stats.heterozygote_count as f64) / (non_missing as f64),
+                        het_threshold,
+                    )
                 {
                     return false;
                 }
@@ -6696,12 +6917,13 @@ fn prepare_bed_logic_meta_and_packed_owned_for_candidate_rows(
                 } else {
                     0.0_f32
                 };
-                let pass_num = if missing_rate > max_missing_rate {
+                let pass_num = if !rate_within_threshold(f64::from(missing_rate), max_missing_rate)
+                {
                     false
                 } else if non_missing == 0 {
                     maf_threshold <= 0.0_f32
                 } else if apply_het_filter
-                    && (het as f64) / (non_missing as f64) > het_threshold as f64
+                    && !rate_within_threshold((het as f64) / (non_missing as f64), het_threshold)
                 {
                     false
                 } else {
@@ -7057,12 +7279,12 @@ fn prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window_internal(
         } else {
             0.0_f32
         };
-        let pass_num = if missing_rate > max_missing_rate {
+        let pass_num = if !rate_within_threshold(f64::from(missing_rate), max_missing_rate) {
             false
         } else if non_missing == 0 {
             maf_threshold <= 0.0_f32
         } else if apply_het_filter
-            && ((het_count as f64) / (non_missing as f64)) > (het_threshold as f64)
+            && !rate_within_threshold((het_count as f64) / (non_missing as f64), het_threshold)
         {
             false
         } else {
@@ -8983,9 +9205,8 @@ pub(crate) fn is_simple_snp_allele(a: &str) -> bool {
 }
 
 fn read_pvar_simple_snp_allele_mask(prefix: &str) -> Result<Vec<u8>, String> {
-    let path = PathBuf::from(format!("{prefix}.pvar"));
-    let file = File::open(&path).map_err(|error| format!("open {}: {error}", path.display()))?;
-    let mut reader = BufReader::with_capacity(1 << 20, file);
+    let path = crate::pgen::pvar_path_for_prefix(prefix);
+    let mut reader = crate::pgen::open_text_reader(&path)?;
     let mut line = String::new();
     let mut line_no = 0usize;
     let mut ref_idx = None;
@@ -11016,7 +11237,7 @@ mod tests {
         count_packed_row_pure_line_counts_selected_with_excluded_fast,
         count_packed_row_pure_line_counts_selected_with_excluded_lut, evaluate_packed_bed_row_qc,
         evaluate_packed_row_keep_and_flip, evaluate_packed_snp_qc,
-        format_zero_sites_pure_line_error, maf_passes_threshold_from_counts,
+        format_zero_sites_pure_line_error, maf_passes_threshold, maf_passes_threshold_from_counts,
         precompute_excluded_sample_indices,
         prepare_bed_logic_meta_and_packed_owned_for_stats_samples,
         prepare_bed_logic_meta_and_packed_owned_for_stats_samples_with_ranges,
@@ -11027,25 +11248,27 @@ mod tests {
         prepare_bed_logic_meta_owned_for_stats_samples_pure_line_intervals,
         prepare_bed_logic_meta_owned_for_stats_samples_pure_line_with_mmap_window,
         prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window,
-        pure_line_filter_status_from_counts, pure_line_filter_status_reason,
+        pure_line_filter_status_from_counts, pure_line_filter_status_reason, rate_within_threshold,
         read_compact_max6_bim_rows, BedChunkReader, CompactMax6SiteMetadata,
         PURE_LINE_FILTER_FAIL_MISSING, PURE_LINE_FILTER_KEEP,
     };
 
     #[test]
     fn packed_snp_qc_uses_the_shared_count_based_maf_boundary() {
-        // f32(0.1) rounds above the exact rational 2 / 20. Keep the same
-        // count-based comparison used by GRM and the other BED QC paths.
+        // f32(0.1) rounds above the exact rational 2 / 20. The inclusive
+        // boundary must still retain the variant, matching PLINK/GCTA.
         let observed = evaluate_packed_snp_qc(0, 2, 0, 10, 0.1_f32, 1.0, 1.0);
         assert_eq!(
             observed.keep,
             maf_passes_threshold_from_counts(2.0, 10, 0.1_f32)
         );
-        assert!(!observed.keep);
+        assert!(observed.keep);
+        assert!(maf_passes_threshold(0.05, 0.05_f32));
+        assert!(!maf_passes_threshold_from_counts(1.0, 21, 0.05_f32));
     }
 
     #[test]
-    fn fused_bed_qc_matches_prepared_het_threshold_rounding() {
+    fn fused_bed_qc_keeps_exact_het_threshold_boundary() {
         let mut codes = vec![0b10u8; 7];
         codes.extend([0b00u8; 3]);
         let packed = pack_plink_codes(&codes);
@@ -11061,9 +11284,10 @@ mod tests {
             0.7,
         );
 
-        // 7 / 10 is greater than f32(0.7) when compared as f64. The fused
-        // kernels previously rounded 7 / 10 to f32 first and incorrectly kept it.
-        assert!(!observed.keep);
+        // A rate of exactly 7 / 10 must pass an inclusive 0.7 upper bound.
+        assert!(observed.keep);
+        assert!(rate_within_threshold(0.7, 0.7_f32));
+        assert!(!rate_within_threshold(0.700001, 0.7_f32));
         assert!((observed.alt_freq - 0.35).abs() < 1e-6);
         assert_eq!(observed.missing_count, 0);
     }

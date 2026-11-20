@@ -682,7 +682,13 @@ impl PgenWriter {
     }
 }
 
-fn publish_without_overwrite(source: &Path, destination: &Path) -> std::io::Result<()> {
+/// Publish a completed file without replacing an existing destination.
+///
+/// Some SMB implementations reject hard links with `ENOTSUP` (errno 45)
+/// even when ordinary rename and copy operations are supported.  Fall back to
+/// a create-new copy in that case so callers retain the no-overwrite contract
+/// on those filesystems.
+pub(crate) fn publish_without_overwrite(source: &Path, destination: &Path) -> std::io::Result<()> {
     match fs::hard_link(source, destination) {
         Ok(()) => Ok(()),
         Err(error)
@@ -814,8 +820,10 @@ fn set_bit(bytes: &mut [u8], bit: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::encode_phase_track;
+    use super::{encode_phase_track, publish_without_overwrite};
     use crate::imp::types::{DiploidCall, DiploidCalls};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn phase_track_preserves_mixed_phased_and_unphased_heterozygotes() {
@@ -855,5 +863,31 @@ mod tests {
         ]);
 
         assert_eq!(encode_phase_track(&calls).unwrap(), vec![0b0000_0100]);
+    }
+
+    #[test]
+    fn publish_without_overwrite_preserves_contents_and_rejects_existing_output() {
+        let parent = std::env::var_os("JANUSX_PUBLISH_TEST_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos();
+        let root = parent.join(format!(
+            "janusx-publish-without-overwrite-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::write(&source, b"VCF payload\n").unwrap();
+
+        publish_without_overwrite(&source, &destination).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"VCF payload\n");
+        let second = publish_without_overwrite(&source, &destination).unwrap_err();
+        assert_eq!(second.kind(), std::io::ErrorKind::AlreadyExists);
+
+        fs::remove_dir_all(&root).unwrap();
     }
 }

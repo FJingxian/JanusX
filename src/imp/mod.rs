@@ -988,12 +988,13 @@ where
     match result {
         Ok(summary) => {
             if let Some(temp_output) = temp_output.as_ref() {
-                std::fs::hard_link(temp_output, &config.output).map_err(|err| {
-                    format!(
-                        "publish VCF output {} without replacing an existing file: {err}",
-                        config.output.display(),
-                    )
-                })?;
+                crate::pgen_writer::publish_without_overwrite(temp_output, &config.output)
+                    .map_err(|err| {
+                        format!(
+                            "publish VCF output {} without replacing an existing file: {err}",
+                            config.output.display(),
+                        )
+                    })?;
                 if std::fs::remove_file(temp_output).is_ok() {
                     if let Some(guard) = temp_guard.as_mut() {
                         guard.armed = false;

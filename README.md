@@ -62,18 +62,6 @@ conda create -n janusx \
   janusx
 ```
 
-### Build wheels with GitHub Actions
-
-Repository collaborators with write access can open
-[Build Wheels](https://github.com/FJingxian/JanusX/actions/workflows/build-wheel.yml),
-choose **Run workflow**, and select the source, platform, and whether to include the source
-distribution. Download `wheels-all` and, when selected, `sdist` from that workflow run. GitHub
-Actions artifacts require a GitHub login.
-
-Users without write access to this repository should fork the repository, enable Actions in their
-fork if GitHub asks, and run **Build Wheels** there. Build outputs are uploaded as Actions artifacts
-in that user's fork; the workflow does not create GitHub Releases.
-
 ---
 
 ## Quick start

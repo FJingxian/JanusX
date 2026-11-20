@@ -148,11 +148,19 @@ jobs:
         if: ${{ matrix.platform == 'macos' }}
         shell: bash
         run: |
-          brew install libomp
-          OPENMP_DIR="$(brew --prefix libomp)"
+          curl -Ls https://micro.mamba.pm/api/micromamba/osx-arm64/latest | tar -xvj -C /tmp bin/micromamba
+          /tmp/bin/micromamba create -y -p /tmp/openmp-arm -c conda-forge --platform osx-arm64 llvm-openmp
+          /tmp/bin/micromamba create -y -p /tmp/openmp-x86 -c conda-forge --platform osx-64 llvm-openmp
+          mkdir -p /tmp/openmp/lib /tmp/openmp/include
+          cp -r /tmp/openmp-arm/include/* /tmp/openmp/include/
+          lipo -create \
+            /tmp/openmp-arm/lib/libomp.dylib \
+            /tmp/openmp-x86/lib/libomp.dylib \
+            -output /tmp/openmp/lib/libomp.dylib
+          lipo -info /tmp/openmp/lib/libomp.dylib
           {
-            echo "OPENMP_DIR=${OPENMP_DIR}"
-            echo "CIBW_ENVIRONMENT_MACOS=MACOSX_DEPLOYMENT_TARGET=11.0 OPENMP_DIR=${OPENMP_DIR} CC=/usr/bin/clang CFLAGS=\"-Xpreprocessor -fopenmp -I${OPENMP_DIR}/include\" LDFLAGS=\"-L${OPENMP_DIR}/lib -lomp -Wl,-rpath,${OPENMP_DIR}/lib\" SETUPTOOLS_SCM_PRETEND_VERSION=${SETUPTOOLS_SCM_PRETEND_VERSION}"
+            echo "OPENMP_DIR=/tmp/openmp"
+            echo "CIBW_ENVIRONMENT_MACOS=MACOSX_DEPLOYMENT_TARGET=11.0 OPENMP_DIR=/tmp/openmp CC=/usr/bin/clang CFLAGS=\"-Xpreprocessor -fopenmp -I/tmp/openmp/include\" LDFLAGS=\"-L/tmp/openmp/lib -lomp -Wl,-rpath,/tmp/openmp/lib\" SETUPTOOLS_SCM_PRETEND_VERSION=${SETUPTOOLS_SCM_PRETEND_VERSION}"
           } >> "$GITHUB_ENV"
 
       - name: Build wheels (Linux)

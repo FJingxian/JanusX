@@ -62,6 +62,42 @@ conda create -n janusx \
   janusx
 ```
 
+### Build wheels with GitHub Actions
+
+Repository collaborators with write access can open
+[Build Wheels](https://github.com/FJingxian/JanusX/actions/workflows/build-wheel.yml),
+choose **Run workflow**, and select the source, platform, and whether to include the source
+distribution. Manual builds publish the selected wheels and optional source distribution as a
+public `build-<run_id>` prerelease by default. These Release assets can be downloaded without a
+GitHub account; the workflow's Actions artifacts remain available to authenticated GitHub users.
+
+Users without write access to this repository can fork it and run the same workflow in their
+fork, or call the reusable workflow from another repository. Add this workflow to the caller
+repository:
+
+```yaml
+name: Build JanusX wheels
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    permissions:
+      actions: write
+      contents: write
+    uses: FJingxian/JanusX/.github/workflows/build-wheel.yml@main
+    with:
+      source_repository: FJingxian/JanusX
+      source_ref: main
+      target: all
+      include_sdist: true
+      publish_github_release: true
+```
+
+The reusable workflow stores its Actions artifacts and public prerelease assets in the caller's
+repository, so external users can build without receiving write access to the JanusX repository.
+
 ---
 
 ## Quick start

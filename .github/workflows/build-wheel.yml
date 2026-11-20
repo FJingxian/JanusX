@@ -108,7 +108,7 @@ on:
       publish_github_release:
         description: "Publish wheels as a public prerelease for anonymous download"
         required: false
-        default: false
+        default: true
         type: boolean
       retention_days:
         description: "Artifact retention days"

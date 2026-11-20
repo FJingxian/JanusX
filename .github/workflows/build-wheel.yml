@@ -891,10 +891,13 @@ jobs:
           notes="Source: ${SOURCE_REF}
 
           Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" "${files[@]}" --clobber
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" "${files[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
           else
             gh release create "$tag" "${files[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \
               --title "$title" \
               --notes "$notes" \

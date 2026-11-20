@@ -68,6 +68,11 @@ on:
         required: true
         default: false
         type: boolean
+      publish_github_release:
+        description: "Publish wheels as a public prerelease for anonymous download"
+        required: true
+        default: true
+        type: boolean
       retention_days:
         description: "Artifact retention days"
         required: true
@@ -97,6 +102,11 @@ on:
         type: string
       include_sdist:
         description: "Also build the source distribution"
+        required: false
+        default: false
+        type: boolean
+      publish_github_release:
+        description: "Publish wheels as a public prerelease for anonymous download"
         required: false
         default: false
         type: boolean
@@ -744,9 +754,10 @@ jobs:
           ### ${{ matrix.label }}
           - Wheel: \`${WHEEL_NAME}\`
           - Platform artifact: \`wheels-${{ matrix.label }}\`
-          - Download: individual artifacts are merged into \`wheels-all\` at the end of the workflow.
+          - Actions artifact: individual files are merged into \`wheels-all\`. GitHub Actions artifacts require a GitHub login.
+          - Anonymous download: use the matching public prerelease linked at the end of this workflow.
           - Run page: [workflow run](${RUN_URL})
-          - Note: artifact download requires GitHub login and remains valid until the artifact or run expires.
+          - Retention: Actions artifacts remain valid until the artifact or run expires.
           EOF
 
   bundle-wheels:
@@ -837,3 +848,57 @@ jobs:
           name: sdist
           path: dist/*.tar.gz
           if-no-files-found: error
+
+  publish-build-assets:
+    name: Publish downloadable build assets
+    needs:
+      - bundle-wheels
+      - build-sdist
+    if: ${{ always() && inputs.publish_github_release && needs.bundle-wheels.result == 'success' && (needs.build-sdist.result == 'success' || needs.build-sdist.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download wheels
+        uses: actions/download-artifact@v8
+        with:
+          name: wheels-all
+          path: release-assets
+
+      - name: Download source distribution
+        if: ${{ inputs.include_sdist }}
+        uses: actions/download-artifact@v8
+        with:
+          name: sdist
+          path: release-assets
+
+      - name: Publish prerelease assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+          files=(release-assets/**/*.whl release-assets/**/*.tar.gz)
+          if (( ${#files[@]} == 0 )); then
+            echo "No build assets found."
+            exit 1
+          fi
+          tag="build-${GITHUB_RUN_ID}"
+          title="Build artifacts ${GITHUB_RUN_ID}"
+          notes="Source: ${SOURCE_REF}
+
+          Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${files[@]}" --clobber
+          else
+            gh release create "$tag" "${files[@]}" \
+              --target "$GITHUB_SHA" \
+              --title "$title" \
+              --notes "$notes" \
+              --prerelease
+          fi
+          echo "### Downloadable build assets" >> "$GITHUB_STEP_SUMMARY"
+          echo "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${tag}" >> "$GITHUB_STEP_SUMMARY"

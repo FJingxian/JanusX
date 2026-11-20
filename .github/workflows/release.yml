@@ -153,13 +153,14 @@ jobs:
       - resolve-package-version
     permissions:
       actions: write
-      contents: read
+      contents: write
     uses: ./.github/workflows/build-wheel.yml
     with:
       source_ref: ${{ inputs.source }}
       package_version: ${{ needs.resolve-package-version.outputs.package_version }}
       target: all
       include_sdist: true
+      publish_github_release: false
       retention_days: ${{ inputs.retention_days }}
     secrets:
       checkout_token: ${{ secrets.checkout_token }}

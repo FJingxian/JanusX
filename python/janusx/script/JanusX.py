@@ -33,7 +33,9 @@ Modules:
     pca           Principal component analysis for population structure
     gstats        Genotype basic statistics and LD score
     reml          Estimate broad/narrow heritability and BLUE by REML
-    fastpop       FastPop ancestry inference
+    adamixture    Population structure inference via ADAMIXTURE
+    fst           Windowed population FST
+    xpclr         Windowed XP-CLR selection scan
     gformat       Convert genotype files across plink/vcf/txt/npy
     gmerge        Merge genotype/variant tables
 '''
@@ -143,15 +145,23 @@ _CLI_MODULE_SECTIONS = [
         ],
     ),
     (
+        "Population Analysis",
+        [
+            ("adamixture", "Population structure inference via ADAMIXTURE"),
+            ("fst", "Compute windowed population FST"),
+            ("xpclr", "Compute windowed XP-CLR selection scan"),
+        ],
+    ),
+    (
         "Utility",
         [
             ("grm", "Build genomic relationship matrix"),
             ("pca", "Principal component analysis for population structure"),
             ("gstats", "Genotype basic statistics and LD score"),
             ("reml", "Estimate broad/narrow heritability and BLUE by REML"),
-            ("fastpop", "FastPop structure, windowed FST, and XP-CLR"),
             ("gformat", "Convert genotype files across plink/vcf/txt/npy"),
             ("gmerge", "Merge genotype/variant tables"),
+            ("imp", "Windowed genotype phasing and reference imputation"),
         ],
     ),
 ]
@@ -159,7 +169,7 @@ _CLI_MODULE_SECTIONS = [
 _MODULE_NAMES = [
     "gwas", "ct", "fvlmm2", "postgwas", "postgarfield", "postbsa",
     "garfield", "grm", "pca", "gstats", "gs", "reml", "postgs",
-    "sim", "simulation", "gblupbench", "garfieldbench", "fastpop", "adamixture", "tree", "gformat", "gmerge", "hybrid", "webui",
+    "sim", "simulation", "adamixture", "fst", "xpclr", "tree", "gformat", "gmerge", "imp", "hybrid", "webui",
     "fastq2vcf", "fastq2count", "kmer", "kmerge", "kstats", "kformat", "view", "treeplot", "refcheck",
 ]
 _SCRIPT_MODULE_ALIASES = {

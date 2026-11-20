@@ -22,7 +22,11 @@ import numpy as np
 
 from janusx.assoc.workflow import load_or_build_grm_with_cache
 from janusx.assoc.workflow_cache import _gwas_cache_prefix_with_params
-from janusx._plink import detect_existing_plink_kind
+from janusx._plink import (
+    detect_existing_plink_kind,
+    open_text_auto,
+    pvar_path_for_prefix,
+)
 from janusx.gfreader import (
     inspect_genotype_file,
     prepare_bed_logic_keep_mask_pure_line,
@@ -240,14 +244,14 @@ def _plink_variant_metadata_path(path_or_prefix: str) -> str:
     if resolved is None:
         raise FileNotFoundError(f"Cannot resolve PLINK variant metadata for {path_or_prefix}")
     kind, prefix = resolved
-    return f"{prefix}.pvar" if kind == "pfile" else f"{prefix}.bim"
+    return pvar_path_for_prefix(prefix) if kind == "pfile" else f"{prefix}.bim"
 
 
 def _iter_plink_variant_chrom_pos(path_or_prefix: str):
     variant_path = _plink_variant_metadata_path(path_or_prefix)
-    is_pvar = variant_path.lower().endswith(".pvar")
+    is_pvar = variant_path.lower().endswith((".pvar", ".pvar.zst"))
     columns: list[str] | None = None
-    with open(variant_path, "r", encoding="utf-8", errors="replace") as handle:
+    with open_text_auto(variant_path, errors="replace") as handle:
         for line_no, line in enumerate(handle, start=1):
             text = line.strip()
             if not text or text.startswith("##"):

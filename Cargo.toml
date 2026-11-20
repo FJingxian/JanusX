@@ -2,7 +2,7 @@
 name = "janusx"
 version = "2.0.1"
 edition = "2021"
-rust-version = "1.74"
+rust-version = "1.75"
 description = "A suite of genotyping tools for genome-wide association study and genomic selection"
 license = "AGPL-3.0-or-later"
 readme = "README.md"
@@ -31,7 +31,8 @@ simd-avx512 = []
 pyo3 = { version = "0.27.2", features = ["abi3-py310", "generate-import-lib"] }
 numpy = "0.27.1"
 csv = "1.4.0"
-flate2 = "1.1.8"
+flate2 = { version = "1.1.8", default-features = false, features = ["runtime_detection", "zlib-rs"] }
+zstd = "0.13"
 memmap2 = "0.9.9"
 libc = "0.2.180"
 rayon = "1.10"

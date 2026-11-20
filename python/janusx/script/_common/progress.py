@@ -146,12 +146,14 @@ def _safe_write(text: str, *, flush: bool = True) -> None:
         sys.stdout.flush()
 
 
-def _supports_live_ansi(stream) -> bool:
+def _supports_live_ansi(stream, *, force_tty: bool = False) -> bool:
     if os.environ.get("NO_COLOR") is not None:
         return False
     if os.environ.get("TERM", "").lower() == "dumb":
         return False
-    if not hasattr(stream, "isatty") or not stream.isatty():
+    if (not bool(force_tty)) and (
+        not hasattr(stream, "isatty") or not stream.isatty()
+    ):
         return False
     if os.name != "nt":
         return True
@@ -173,10 +175,10 @@ def _supports_live_ansi(stream) -> bool:
         return False
 
 
-def _clear_current_console_line() -> None:
+def _clear_current_console_line(*, assume_tty: bool = False) -> None:
     # Prefer ANSI erase-in-line to avoid writing terminal-width spaces, which
     # can themselves wrap after a resize and leave a blank line artifact.
-    if _supports_live_ansi(sys.stdout):
+    if _supports_live_ansi(sys.stdout, force_tty=assume_tty):
         _safe_write("\r\033[2K\r")
         return
     # Conservative fallback for non-ANSI environments.
@@ -584,12 +586,16 @@ class CliStatus:
         self.timeout = float(timeout)
         self.show_elapsed = bool(show_elapsed)
         self.use_process = bool(use_process)
+        # Snapshot the terminal mode once. Live renderers and log handlers can
+        # temporarily wrap stdout, and re-querying isatty() mid-run can flip
+        # the backend or leave stale spinner text on Windows consoles.
+        self._stdout_is_tty = stdout_is_tty()
         # Restrict spinner animation to interactive TTY only; in non-TTY
         # contexts keep output clean and emit only completion lines.
         self._animate = bool(
             self.enabled
             and self.animate
-            and stdout_is_tty()
+            and self._stdout_is_tty
             and (bool(force_animate) or should_animate_status(self.desc))
         )
         self._backend = "none"
@@ -610,7 +616,7 @@ class CliStatus:
             body = _truncate_console_text(self._running_line(), reserve=2)
             frame_text = (
                 f"{_CYAN}{frame}{_RESET}"
-                if stdout_is_tty()
+                if self._stdout_is_tty
                 else str(frame)
             )
             line = f"\r{frame_text} {body}"
@@ -649,7 +655,7 @@ class CliStatus:
                             float(self._start_ts),
                             self._proc_stop_evt,
                             int(os.getpid()),
-                            bool(self.enabled and stdout_is_tty()),
+                            bool(self.enabled and self._stdout_is_tty),
                         ),
                         daemon=True,
                     )
@@ -660,7 +666,7 @@ class CliStatus:
                 self._proc = None
                 self._proc_stop_evt = None
 
-        if _HAS_RICH and stdout_is_tty():
+        if _HAS_RICH and self._stdout_is_tty:
             try:
                 ensure_rich_spinner_registered()
                 assert Console is not None
@@ -776,11 +782,11 @@ class CliStatus:
         if self._done:
             return
         self._stop_spinner()
-        if self._backend in ("plain", "process") and stdout_is_tty():
+        if self._backend in ("plain", "process") and self._stdout_is_tty:
             # Clear the in-place spinner line before printing completion text,
             # otherwise outputs like "- Computing ...✔︎ ...Finished" may glue
             # together on terminals that keep cursor at line tail.
-            _clear_current_console_line()
+            _clear_current_console_line(assume_tty=True)
         symbol = _SUCCESS_SYMBOL
         line = self._compose_line(symbol, str(message), elapsed_parts=elapsed_parts)
         if should_animate_status(message) or is_completed_status_text(message):
@@ -819,9 +825,9 @@ class CliStatus:
         if self._done:
             return
         self._stop_spinner()
-        if self._backend in ("plain", "process") and stdout_is_tty():
+        if self._backend in ("plain", "process") and self._stdout_is_tty:
             # Keep failure output aligned with complete(): remove stale spinner line.
-            _clear_current_console_line()
+            _clear_current_console_line(assume_tty=True)
         if is_skip_status_text(message):
             plain = str(message)
             if self.show_elapsed:
@@ -859,19 +865,19 @@ class CliStatus:
             )
             return
         self._stop_spinner()
-        if self._backend in ("plain", "process") and stdout_is_tty():
-            _clear_current_console_line()
+        if self._backend in ("plain", "process") and self._stdout_is_tty:
+            _clear_current_console_line(assume_tty=True)
         self._done = True
 
     def __exit__(self, exc_type, exc, tb) -> None:
         if not self._done:
             self._stop_spinner()
-            if self._backend in ("plain", "process") and stdout_is_tty():
+            if self._backend in ("plain", "process") and self._stdout_is_tty:
                 # When status context exits without complete()/fail(), ensure
                 # the in-place spinner line is cleared before next log line.
                 # This avoids glued outputs like:
                 #   "- Waiting ... [1.4s]position... [10.5s]"
-                _clear_current_console_line()
+                _clear_current_console_line(assume_tty=True)
 
 
 def rich_progress_available() -> bool:
@@ -1131,8 +1137,10 @@ class ProgressBarAdapter:
         self._backend = "none"
         self._finished = False
         self._start_ts = time.monotonic()
+        # See CliStatus: keep the terminal decision stable for this adapter.
+        self._stdout_is_tty = stdout_is_tty()
         self._animate = bool(
-            (force_animate or should_animate_status(self.desc)) and stdout_is_tty()
+            (force_animate or should_animate_status(self.desc)) and self._stdout_is_tty
         )
         self._show_postfix = bool(show_postfix)
         self._keep_display = bool(keep_display)
@@ -1166,7 +1174,7 @@ class ProgressBarAdapter:
                     self._task_id = None
                     self._backend = "none"
 
-            if self._backend == "none" and _HAS_TQDM and stdout_is_tty():
+            if self._backend == "none" and _HAS_TQDM and self._stdout_is_tty:
                 assert _tqdm_auto is not None
                 self._tqdm = _tqdm_auto(
                     total=self.total,
@@ -1218,6 +1226,35 @@ class ProgressBarAdapter:
         elif self._backend == "tqdm" and self._tqdm is not None:
             self._tqdm.total = self.total
             self._tqdm.refresh()
+
+    def emit_line(self, message: str, *, success: bool = False) -> None:
+        """Print a line without breaking an active progress renderer.
+
+        Rich's ``Progress`` owns the live terminal region.  Printing through a
+        separate ``Console`` while that region is active can glue the next
+        status line to the progress row.  Use the renderer's own console so it
+        temporarily removes and redraws the live row around the message.
+        """
+
+        text = str(message)
+        line = f"{_SUCCESS_SYMBOL} {text}" if success and text else text
+        if self._backend == "rich" and self._progress is not None:
+            try:
+                rendered = _rich_status_text(line, style="green" if success else None)
+                self._progress.console.print(rendered)
+                return
+            except Exception:
+                pass
+        if self._backend == "tqdm" and self._tqdm is not None:
+            try:
+                self._tqdm.write(_safe_console_text(line))
+                return
+            except Exception:
+                pass
+        if success:
+            print_success(text, force_color=bool(self._stdout_is_tty))
+        else:
+            _safe_print(line)
 
     def finish(
         self,

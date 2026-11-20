@@ -123,10 +123,18 @@ mod gmerge;
 mod gwasio;
 #[path = "io/gwriter.rs"]
 mod gwriter;
+#[path = "imp/mod.rs"]
+mod imp;
+#[path = "io/imp_reader.rs"]
+mod imp_reader;
+#[path = "io/imp_vcf_writer.rs"]
+mod imp_vcf_writer;
 #[path = "kmer/mod.rs"]
 pub mod kmer;
 #[path = "io/pgen.rs"]
 mod pgen;
+#[path = "io/pgen_writer.rs"]
+mod pgen_writer;
 #[path = "io/pipeline.rs"]
 mod pipeline;
 #[path = "io/sim.rs"]
@@ -251,8 +259,8 @@ use gfreader::{
     load_site_info, prepare_bed_2bit_packed, prepare_bed_fused_qc_packed,
     prepare_bed_logic_keep_mask, prepare_bed_logic_keep_mask_pure_line,
     prepare_bed_logic_meta_selected, scan_bed_2bit_packed_stats, BedChunkReader,
-    BedChunkReaderFromMeta, BedMmapReader, HmpChunkReader, NpyMmapReader, SiteInfo, TxtChunkReader,
-    VcfChunkReader,
+    BedChunkReaderFromMeta, BedMmapReader, HmpChunkReader, NpyMmapReader, PgenChunkReader,
+    SiteInfo, TxtChunkReader, VcfChunkReader,
 };
 use glm::{
     lm_assoc_kfile_to_tsv_f32, lm_block_assoc_f32, lm_block_assoc_packed,
@@ -716,6 +724,77 @@ fn fastq2vcf_run_py(args: Vec<String>) -> PyResult<i32> {
 // PyO3 module exports
 // ============================================================
 
+#[pyfunction]
+#[pyo3(signature = (options_json, progress_callback=None))]
+fn imp_run(
+    py: Python<'_>,
+    options_json: String,
+    progress_callback: Option<Py<PyAny>>,
+) -> PyResult<String> {
+    let config = serde_json::from_str::<imp::ImpConfig>(&options_json)
+        .map_err(|error| PyRuntimeError::new_err(format!("invalid imp options: {error}")))?;
+    let callback = progress_callback.map(|callback| callback.clone_ref(py));
+    let summary = py
+        .detach(move || {
+            imp::run_imp_with_progress(config, |event| {
+                emit_imp_progress_callback(callback.as_ref(), event)
+            })
+        })
+        .map_err(PyRuntimeError::new_err)?;
+    serde_json::to_string(&summary)
+        .map_err(|error| PyRuntimeError::new_err(format!("serialize imp summary: {error}")))
+}
+
+#[pyfunction]
+#[pyo3(signature = (input, output_prefix, progress_callback=None))]
+fn imp_convert_to_pgen(
+    py: Python<'_>,
+    input: String,
+    output_prefix: String,
+    progress_callback: Option<Py<PyAny>>,
+) -> PyResult<String> {
+    let input = PathBuf::from(input);
+    let output_prefix = PathBuf::from(output_prefix);
+    let callback = progress_callback.map(|callback| callback.clone_ref(py));
+    let summary = py
+        .detach(move || {
+            imp::convert_to_pgen_with_progress(&input, &output_prefix, |event| {
+                emit_imp_progress_callback(callback.as_ref(), event)
+            })
+        })
+        .map_err(PyRuntimeError::new_err)?;
+    serde_json::to_string(&summary).map_err(|error| {
+        PyRuntimeError::new_err(format!("serialize imp conversion summary: {error}"))
+    })
+}
+
+fn emit_imp_progress_callback(
+    callback: Option<&Py<PyAny>>,
+    event: &imp::ImpProgress,
+) -> Result<(), String> {
+    if let Some(callback) = callback {
+        Python::attach(|py| -> PyResult<()> {
+            py.check_signals()?;
+            callback.call1(
+                py,
+                (
+                    event.stage.as_str(),
+                    event.chrom.as_str(),
+                    event.window_index,
+                    event.markers as u64,
+                    event.variants_written,
+                    event.samples as u64,
+                ),
+            )?;
+            Ok(())
+        })
+        .map_err(|error| error.to_string())?;
+    } else {
+        Python::attach(|py| py.check_signals()).map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 #[pymodule]
 fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<AdmxBedBackend>()?;
@@ -723,6 +802,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<AdmxBedTrainingSession>()?;
     m.add_class::<BedChunkReader>()?;
     m.add_class::<BedChunkReaderFromMeta>()?;
+    m.add_class::<PgenChunkReader>()?;
     m.add_class::<BedMmapReader>()?;
     m.add_class::<NpyMmapReader>()?;
     m.add_class::<VcfChunkReader>()?;
@@ -748,6 +828,8 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<PyMax6PreparedGenotypeUniverse>()?;
     m.add_class::<Bin01StreamWriter>()?;
     m.add_class::<KfileChunkReader>()?;
+    m.add_function(wrap_pyfunction!(imp_run, m)?)?;
+    m.add_function(wrap_pyfunction!(imp_convert_to_pgen, m)?)?;
     m.add_function(wrap_pyfunction!(popcount_py, m)?)?;
     m.add_function(wrap_pyfunction!(and_popcount_py, m)?)?;
     m.add_function(wrap_pyfunction!(bitand_assign_py, m)?)?;

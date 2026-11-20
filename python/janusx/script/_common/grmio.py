@@ -5,16 +5,19 @@ import logging
 import os
 import re
 import shutil
-import time
 import warnings
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Sequence
 
 import numpy as np
-from janusx._plink import detect_existing_plink_kind, explicit_plink_kind
+from janusx._plink import (
+    detect_existing_plink_kind,
+    explicit_plink_kind,
+    pvar_path_for_prefix,
+)
 
 from .pathcheck import safe_expanduser, safe_resolve
+from .cache_lock import cache_generation_lock
 
 
 _WARNED_GENOTYPE_CACHE_FALLBACK_KEYS: set[str] = set()
@@ -141,6 +144,7 @@ def _normalize_genotype_cache_stem(genofile: str) -> str:
             ".bim",
             ".fam",
             ".pgen",
+            ".pvar.zst",
             ".pvar",
             ".psam",
             ".txt",
@@ -299,41 +303,13 @@ def grm_cache_paths_legacy(
     return grm_path, f"{grm_path}.id"
 
 
-@contextmanager
 def grm_cache_lock(lock_key: str, timeout_s: float = 7200.0, poll_s: float = 0.2):
-    lock_path = f"{lock_key}.lock"
-    start = time.monotonic()
-    fd = None
-    while True:
-        try:
-            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-            os.write(fd, f"{os.getpid()}\n".encode("utf-8"))
-            break
-        except FileExistsError:
-            try:
-                age = time.time() - os.path.getmtime(lock_path)
-                if age > timeout_s:
-                    os.remove(lock_path)
-                    continue
-            except Exception:
-                pass
-            if (time.monotonic() - start) > timeout_s:
-                raise TimeoutError(f"Timeout waiting cache lock: {lock_path}")
-            time.sleep(poll_s)
-    try:
-        yield
-    finally:
-        if fd is not None:
-            try:
-                os.close(fd)
-            except Exception:
-                pass
-        try:
-            os.remove(lock_path)
-        except FileNotFoundError:
-            pass
-        except Exception:
-            pass
+    return cache_generation_lock(
+        lock_key,
+        timeout_s=timeout_s,
+        poll_s=poll_s,
+        label="GRM/cache",
+    )
 
 
 def _resolve_file_input_matrix(genofile: str) -> tuple[str | None, str | None]:
@@ -377,8 +353,15 @@ def latest_genotype_mtime(genofile: str) -> float | None:
     resolved = detect_existing_plink_kind(raw)
     if resolved is not None:
         kind, prefix = resolved
-        extensions = ("bed", "bim", "fam") if kind == "bfile" else ("pgen", "pvar", "psam")
-        paths = [f"{prefix}.{ext}" for ext in extensions]
+        paths = (
+            [f"{prefix}.bed", f"{prefix}.bim", f"{prefix}.fam"]
+            if kind == "bfile"
+            else [
+                f"{prefix}.pgen",
+                pvar_path_for_prefix(prefix),
+                f"{prefix}.psam",
+            ]
+        )
         if all(os.path.isfile(path) for path in paths):
             return max(os.path.getmtime(path) for path in paths)
         if explicit_plink_kind(raw) is not None:

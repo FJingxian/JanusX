@@ -583,7 +583,16 @@ def _init_macos_openblas_path() -> None:
     if len(pkg_dirs) == 0:
         pkg_dirs = [Path(__file__).resolve().parent]
 
+    site_roots: list[Path] = []
+    for raw in [*site.getsitepackages(), site.getusersitepackages()]:
+        try:
+            site_roots.append(Path(str(raw)))
+        except Exception:
+            continue
+
     library_dirs = [Path(sys.prefix) / "lib", Path(sys.base_prefix) / "lib"]
+    for site_root in site_roots:
+        library_dirs.append(site_root / "janusx.libs")
     for pkg_dir in pkg_dirs:
         library_dirs.extend([pkg_dir / ".dylibs", pkg_dir / ".libs", pkg_dir.parent / "janusx.libs"])
     _validate_macos_library_environment(library_dirs)
@@ -620,6 +629,10 @@ def _init_macos_openblas_path() -> None:
             continue
         seen_prefixes.add(lib_dir)
         candidate_groups.append(sorted(lib_dir.glob("libopenblas*.dylib")))
+    for site_root in site_roots:
+        candidate_groups.append(
+            sorted((site_root / "janusx.libs").glob("libopenblas*.dylib"))
+        )
     wheel_local_cands: list[Path] = []
     for pkg_dir in pkg_dirs:
         wheel_local_cands.extend(sorted((pkg_dir / ".dylibs").glob("libopenblas*.dylib")))

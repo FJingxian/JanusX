@@ -16,6 +16,8 @@ from janusx._plink import (
     detect_existing_plink_kind,
     explicit_plink_kind,
     normalize_plink_prefix as _normalize_plink_prefix,
+    open_text_auto,
+    pvar_path_for_prefix,
 )
 
 from janusx.gfreader import (
@@ -120,7 +122,8 @@ def strip_default_prefix_suffix(name: str) -> str:
         base = base[: -len(".hmp.gz")]
     else:
         for ext in (
-            ".vcf", ".hmp", ".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam",
+            ".vcf", ".hmp", ".bed", ".bim", ".fam", ".pgen", ".pvar.zst",
+            ".pvar", ".psam",
             ".txt", ".tsv", ".csv", ".npy", ".bin",
         ):
             if low.endswith(ext):
@@ -417,9 +420,11 @@ def plink_snp_mask(prefix: str) -> np.ndarray:
     mask: list[bool] = []
     is_pgen = _is_pgen_prefix(prefix)
     plink_prefix = normalize_plink_prefix(prefix)
-    variant_path = f"{plink_prefix}.pvar" if is_pgen else f"{plink_prefix}.bim"
+    variant_path = (
+        pvar_path_for_prefix(plink_prefix) if is_pgen else f"{plink_prefix}.bim"
+    )
     columns: list[str] | None = None
-    with open(variant_path, "r", encoding="utf-8", errors="ignore") as fh:
+    with open_text_auto(variant_path, errors="ignore") as fh:
         for ln, line in enumerate(fh, start=1):
             s = line.strip()
             if s == "" or s.startswith("##"):

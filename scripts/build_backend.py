@@ -643,6 +643,8 @@ def _rewrite_macos_extension_install_names(
 def _inject_artifacts_into_wheel(
     wheel_path: Path,
     artifacts: list[tuple[Path, Path]],
+    *,
+    require_bundled_extension: bool,
 ) -> None:
     if len(artifacts) == 0:
         return
@@ -665,7 +667,8 @@ def _inject_artifacts_into_wheel(
             if rel.as_posix().startswith("janusx.libs/")
         ]
         _rewrite_macos_dylib_install_names(root, mac_rel)
-        _rewrite_macos_extension_install_names(root, mac_rel)
+        if require_bundled_extension:
+            _rewrite_macos_extension_install_names(root, mac_rel)
 
         _rewrite_record(root)
 
@@ -676,6 +679,48 @@ def _inject_artifacts_into_wheel(
                     arc = p.relative_to(root).as_posix()
                     zf.write(p, arcname=arc)
         rebuilt.replace(wheel_path)
+
+
+def _inject_runtime_artifacts(
+    wheel_directory: str,
+    wheel_name: str,
+    win_dlls: list[Path],
+    mac_dylibs: list[Path],
+    *,
+    require_bundled_extension: bool,
+) -> None:
+    fasttree_files = _collect_fasttree_artifacts()
+    if len(fasttree_files) == 0:
+        raise RuntimeError(
+            "FastTree executable was not produced under target/janusx-artifacts after wheel build; "
+            "build.rs may not have run or did not finish the FastTree bundle step."
+        )
+
+    artifacts: list[tuple[Path, Path]] = []
+    for fasttree_file in fasttree_files:
+        artifacts.append((fasttree_file, Path("janusx") / "bin" / fasttree_file.name))
+    for dll in win_dlls:
+        artifacts.append((dll, Path("janusx") / dll.name))
+    for dylib in mac_dylibs:
+        artifacts.append((dylib, Path("janusx.libs") / dylib.name))
+
+    if len(artifacts) == 0:
+        return
+
+    wheel_path = Path(wheel_directory).resolve() / wheel_name
+    _inject_artifacts_into_wheel(
+        wheel_path,
+        artifacts,
+        require_bundled_extension=require_bundled_extension,
+    )
+    joined_fasttree = ", ".join(f"janusx/bin/{p.name}" for p in fasttree_files)
+    print(f"[build-backend] injected FastTree artifacts: {joined_fasttree}", flush=True)
+    if win_dlls:
+        joined = ", ".join(sorted(d.name for d in win_dlls))
+        print(f"[build-backend] injected runtime DLLs: {joined}", flush=True)
+    if mac_dylibs:
+        joined = ", ".join(sorted(d.name for d in mac_dylibs))
+        print(f"[build-backend] injected macOS dylibs: {joined}", flush=True)
 
 
 def get_requires_for_build_wheel(config_settings: dict[str, Any] | None = None) -> list[str]:
@@ -724,10 +769,28 @@ def build_editable(
     config_settings: dict[str, Any] | None = None,
     metadata_directory: str | None = None,
 ) -> str:
+    win_dlls = _collect_windows_runtime_dlls()
+    mac_dylibs = _collect_macos_openblas_dylibs()
+    if sys.platform.startswith("win") and _env_flag("JANUSX_REQUIRE_OPENBLAS"):
+        has_openblas_dll = any("openblas" in p.name.lower() for p in win_dlls)
+        if not has_openblas_dll:
+            raise RuntimeError(
+                "JANUSX_REQUIRE_OPENBLAS=1 but no OpenBLAS runtime DLL was found for wheel bundling. "
+                "Set OPENBLAS_BIN_DIR/OPENBLAS_LIB_DIR or use a conda env with OpenBLAS in Library/bin."
+            )
+    _ensure_maturin_on_path()
     fn = getattr(_MATURIN, "build_editable", None)
     if fn is None:
         return build_wheel(wheel_directory, config_settings, metadata_directory)
-    return fn(wheel_directory, config_settings, metadata_directory)
+    wheel_name = fn(wheel_directory, config_settings, metadata_directory)
+    _inject_runtime_artifacts(
+        wheel_directory,
+        wheel_name,
+        win_dlls,
+        mac_dylibs,
+        require_bundled_extension=False,
+    )
+    return wheel_name
 
 
 def build_wheel(
@@ -765,30 +828,11 @@ def build_wheel(
             config_settings,
         )
 
-    fasttree_files = _collect_fasttree_artifacts()
-    if len(fasttree_files) == 0:
-        raise RuntimeError(
-            "FastTree executable was not produced under target/janusx-artifacts after wheel build; "
-            "build.rs may not have run or did not finish the FastTree bundle step."
-        )
-
-    artifacts: list[tuple[Path, Path]] = []
-    for fasttree_file in fasttree_files:
-        artifacts.append((fasttree_file, Path("janusx") / "bin" / fasttree_file.name))
-    for dll in win_dlls:
-        artifacts.append((dll, Path("janusx") / dll.name))
-    for dylib in mac_dylibs:
-        artifacts.append((dylib, Path("janusx.libs") / dylib.name))
-
-    if len(artifacts) > 0:
-        wheel_path = Path(wheel_directory).resolve() / wheel_name
-        _inject_artifacts_into_wheel(wheel_path, artifacts)
-        joined_fasttree = ", ".join(f"janusx/bin/{p.name}" for p in fasttree_files)
-        print(f"[build-backend] injected FastTree artifacts: {joined_fasttree}", flush=True)
-        if win_dlls:
-            joined = ", ".join(sorted(d.name for d in win_dlls))
-            print(f"[build-backend] injected runtime DLLs: {joined}", flush=True)
-        if mac_dylibs:
-            joined = ", ".join(sorted(d.name for d in mac_dylibs))
-            print(f"[build-backend] injected macOS dylibs: {joined}", flush=True)
+    _inject_runtime_artifacts(
+        wheel_directory,
+        wheel_name,
+        win_dlls,
+        mac_dylibs,
+        require_bundled_extension=True,
+    )
     return wheel_name

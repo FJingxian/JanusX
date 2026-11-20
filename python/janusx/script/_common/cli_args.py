@@ -75,7 +75,7 @@ def _resolve_genotype_source_help(
     profile: str,
 ) -> str:
     if str(kind) == "pfile":
-        return "PLINK 2 PGEN prefix (.pgen/.pvar/.psam)."
+        return "PLINK 2 PGEN prefix (.pgen/.pvar(.zst)/.psam)."
     key = str(profile).strip().lower()
     table: dict[str, dict[str, str]] = {
         "default": {
@@ -97,12 +97,6 @@ def _resolve_genotype_source_help(
             "bfile": "PLINK BED prefix (.bed/.bim/.fam).",
         },
         "admixture": {
-            "vcf": "VCF/VCF.GZ genotype file.",
-            "hmp": "HMP/HMP.GZ genotype file.",
-            "file": "Text/NumPy genotype matrix prefix (requires sidecar .id).",
-            "bfile": "PLINK BED prefix (.bed/.bim/.fam).",
-        },
-        "fastpop": {
             "vcf": "VCF/VCF.GZ genotype file.",
             "hmp": "HMP/HMP.GZ genotype file.",
             "file": "Text/NumPy genotype matrix prefix (requires sidecar .id).",
@@ -344,11 +338,6 @@ def _resolve_prefix_help(profile: str) -> str:
 def _resolve_memory_help(profile: str) -> str:
     key = str(profile).strip().lower()
     table = {
-        "fastpop_decode": (
-            "Working memory budget in GB for FastPop streamed genotype loading/decode. "
-            "This controls internal chunk sizing rather than total process RSS "
-            "(default: %(default)s)."
-        ),
         "gwas_decode": (
             "Target BED decode block size in GB for memmap/packed kernels. "
             "This only controls per-block decode/window sizing, not global process memory "

@@ -98,6 +98,7 @@ def _default_prefix_from_genofile(path: str) -> str:
         ".bim",
         ".fam",
         ".pgen",
+        ".pvar.zst",
         ".pvar",
         ".psam",
         ".txt",

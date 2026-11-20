@@ -854,18 +854,18 @@ pub(super) fn prepare_max6_window_streamed_ld_with_callback(
         anchor_ready_chroms,
         tail_scope_complete_chroms,
     )?;
-    let source_marker_count = source.n_source_rows;
+    let source_marker_count = source.n_source_rows();
     if let Some(callback) = on_progress.as_deref_mut() {
         callback(0, source_marker_count)?;
     }
-    let n_samples_total = source.bed.n_samples();
+    let n_samples_total = source.n_samples();
     if sample_indices.iter().any(|&index| index >= n_samples_total) {
         return Err("selected sample index out of range for Max6 window stream".to_string());
     }
     let n_samples = sample_indices.len();
     let row_words = words_for_samples(n_samples);
-    let bytes_per_variant = source.bed.bytes_per_snp();
-    let default_chunk_rows = source.max_chunk_rows.max(1);
+    let bytes_per_variant = source.bytes_per_snp();
+    let default_chunk_rows = source.max_chunk_rows().max(1);
     let (chunk_rows, task_batch_byte_limit) = if logic_mem_budget_bytes == 0 {
         (default_chunk_rows, 64usize * 1024 * 1024)
     } else {
@@ -885,7 +885,8 @@ pub(super) fn prepare_max6_window_streamed_ld_with_callback(
         let task_limit = (budget / 4).min(64 * 1024 * 1024).max(1);
         (chunk_rows, task_limit)
     };
-    source.max_chunk_rows = chunk_rows;
+    source.set_max_chunk_rows(chunk_rows);
+    let selected_rows_seen = source.selected_rows_seen();
     let sample_identity =
         n_samples == n_samples_total && sample_indices_are_identity(sample_indices);
     let sample_plan = build_logic_sample_plan(sample_indices);
@@ -947,17 +948,12 @@ pub(super) fn prepare_max6_window_streamed_ld_with_callback(
     let mut chrom_pool = HashMap::<String, Arc<str>>::new();
     let mut unsupported_order = false;
 
-    crate::pipeline::run_double_buffer(
+    let (mut metadata_source, mut genotype_source) = source.into_sources();
+    crate::pipeline::run_three_stage(
         2,
         || Max6WindowStreamChunk::new(chunk_rows, bytes_per_variant, row_words),
-        |chunk| match source.fill_chunk(chunk) {
-            Ok(more) => more,
-            Err(error) => {
-                chunk.clear();
-                chunk.error = Some(error);
-                false
-            }
-        },
+        || metadata_source.next_run(),
+        |run, chunk| genotype_source.fill_chunk(run, chunk),
         |chunk| {
             if let Some(error) = chunk.error.take() {
                 return Err(error);
@@ -1266,7 +1262,7 @@ pub(super) fn prepare_max6_window_streamed_ld_with_callback(
     }
 
     if qc_row_count == 0 {
-        if !scan_bimranges.is_empty() && source.seen_selected_chroms.is_empty() {
+        if !scan_bimranges.is_empty() && !selected_rows_seen.load(Ordering::Relaxed) {
             return Err("--bimrange matched no BIM/PVAR chromosomes".to_string());
         }
         return Err(format_zero_sites_pure_line_error(
@@ -1428,13 +1424,11 @@ pub(super) fn run_max6_fused_grm_int_scan(
     let scan_started = Instant::now();
 
     let pair_path = out_prefix.map(max6_grmmax6_pairs_output_path);
-    let pair_tmp_path = pair_path.as_ref().map(|path| {
-        std::path::PathBuf::from(format!(
-            "{path}.tmp.{}.{}",
-            std::process::id(),
-            GARFIELD_BITS_MMAP_SEQ.fetch_add(1, Ordering::Relaxed)
-        ))
-    });
+    let pair_tmp_path = if let Some(path) = pair_path.as_ref() {
+        Some(reserve_stream_temp_path(path)?)
+    } else {
+        None
+    };
     let _pair_tmp_owner = pair_tmp_path
         .as_ref()
         .map(|path| Max6BitsTempFileOwner { path: path.clone() });
@@ -1459,9 +1453,17 @@ pub(super) fn run_max6_fused_grm_int_scan(
     } else {
         None
     };
-    let provenance_writer = if let Some(path) = provenance_path.as_ref() {
+    let provenance_tmp_path = if let Some(path) = provenance_path.as_ref() {
+        Some(reserve_stream_temp_path(path)?)
+    } else {
+        None
+    };
+    let _provenance_tmp_owner = provenance_tmp_path
+        .as_ref()
+        .map(|path| Max6BitsTempFileOwner { path: path.clone() });
+    let provenance_writer = if let Some(path) = provenance_tmp_path.as_ref() {
         Some(crate::stats_common::AsyncTsvWriter::with_config(
-            path,
+            path.to_string_lossy().as_ref(),
             b"output_row_index\tunit_index_zero_based\tunit_label\n",
             8 * 1024 * 1024,
             2,
@@ -2117,6 +2119,17 @@ pub(super) fn run_max6_fused_grm_int_scan(
             )
         })?;
     }
+    if let (Some(tmp_path), Some(final_path)) =
+        (provenance_tmp_path.as_ref(), provenance_path.as_ref())
+    {
+        fs::rename(tmp_path, final_path).map_err(|error| {
+            format!(
+                "publish fused Max6 provenance output '{}' from '{}': {error}",
+                final_path,
+                tmp_path.display()
+            )
+        })?;
+    }
     let scan_wall_seconds = scan_started.elapsed().as_secs_f64();
     let total_wall_seconds = total_wall_t0.elapsed().as_secs_f64();
     let mut result = GarfieldLogicPipelineResult::default();
@@ -2196,7 +2209,7 @@ pub(super) fn prepare_max6_window_stream(
         ));
     }
 
-    let mut source = Max6WindowRangeSource::new(
+    let source = Max6WindowRangeSource::new(
         prefix,
         scan_bimranges,
         extension,
@@ -2204,14 +2217,15 @@ pub(super) fn prepare_max6_window_stream(
         Arc::new(Mutex::new(HashSet::new())),
         Arc::new(Mutex::new(HashSet::new())),
     )?;
-    let source_marker_count = source.n_source_rows;
-    let n_samples_total = source.bed.n_samples();
+    let source_marker_count = source.n_source_rows();
+    let n_samples_total = source.n_samples();
     if sample_indices.iter().any(|&index| index >= n_samples_total) {
         return Err("selected sample index out of range for Max6 window stream".to_string());
     }
     let n_samples = sample_indices.len();
     let row_words = words_for_samples(n_samples);
-    let bytes_per_variant = source.bed.bytes_per_snp();
+    let bytes_per_variant = source.bytes_per_snp();
+    let selected_rows_seen = source.selected_rows_seen();
     let sample_identity =
         n_samples == n_samples_total && sample_indices_are_identity(sample_indices);
     let sample_plan = build_logic_sample_plan(sample_indices);
@@ -2255,17 +2269,12 @@ pub(super) fn prepare_max6_window_stream(
 
     let max_writer_block_rows = 8192usize;
     let mut bits_writer = Max6StreamingLogicBitsAccumulator::new(row_words, max_writer_block_rows)?;
-    crate::pipeline::run_double_buffer(
+    let (mut metadata_source, mut genotype_source) = source.into_sources();
+    crate::pipeline::run_three_stage(
         2,
         || Max6WindowStreamChunk::new(MAX6_WINDOW_STREAM_CHUNK_ROWS, bytes_per_variant, row_words),
-        |chunk| match source.fill_chunk(chunk) {
-            Ok(more) => more,
-            Err(error) => {
-                chunk.clear();
-                chunk.error = Some(error);
-                false
-            }
-        },
+        || metadata_source.next_run(),
+        |run, chunk| genotype_source.fill_chunk(run, chunk),
         |chunk| {
             if let Some(error) = chunk.error.take() {
                 return Err(error);
@@ -2377,7 +2386,7 @@ pub(super) fn prepare_max6_window_stream(
     )?;
 
     if window_sites.is_empty() {
-        if !scan_bimranges.is_empty() && source.seen_selected_chroms.is_empty() {
+        if !scan_bimranges.is_empty() && !selected_rows_seen.load(Ordering::Relaxed) {
             return Err("--bimrange matched no BIM/PVAR chromosomes".to_string());
         }
         return Err(format_zero_sites_pure_line_error(

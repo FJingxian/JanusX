@@ -774,18 +774,18 @@ pub(super) fn prepare_max6_interval_streamed_ld_with_callback(
         anchor_ready,
         tail_scope_complete,
     )?;
-    let source_marker_count = source.n_source_rows;
+    let source_marker_count = source.n_source_rows();
     if let Some(callback) = on_progress.as_deref_mut() {
         callback(0, source_marker_count)?;
     }
-    let n_samples_total = source.bed.n_samples();
+    let n_samples_total = source.n_samples();
     if sample_indices.iter().any(|&index| index >= n_samples_total) {
         return Err("selected sample index out of range for Max6 gene stream".to_string());
     }
     let n_samples = sample_ids.len();
     let row_words = words_for_samples(n_samples);
-    let bytes_per_variant = source.bed.bytes_per_snp();
-    let default_chunk_rows = source.max_chunk_rows.max(1);
+    let bytes_per_variant = source.bytes_per_snp();
+    let default_chunk_rows = source.max_chunk_rows().max(1);
     let (chunk_rows, task_batch_byte_limit) = if logic_mem_budget_bytes == 0 {
         (default_chunk_rows, 64usize * 1024 * 1024)
     } else {
@@ -801,7 +801,8 @@ pub(super) fn prepare_max6_interval_streamed_ld_with_callback(
         let task_limit = (budget / 4).min(64 * 1024 * 1024).max(1);
         (chunk_rows, task_limit)
     };
-    source.max_chunk_rows = chunk_rows;
+    source.set_max_chunk_rows(chunk_rows);
+    let selected_rows_seen = source.selected_rows_seen();
     let n_samples_source = n_samples_total;
     let sample_identity =
         n_samples == n_samples_source && sample_indices_are_identity(sample_indices);
@@ -912,17 +913,12 @@ pub(super) fn prepare_max6_interval_streamed_ld_with_callback(
             Ok::<(), String>(())
         };
 
-    crate::pipeline::run_double_buffer(
+    let (mut metadata_source, mut genotype_source) = source.into_sources();
+    crate::pipeline::run_three_stage(
         2,
         || Max6WindowStreamChunk::new(chunk_rows, bytes_per_variant, row_words),
-        |chunk| match source.fill_chunk(chunk) {
-            Ok(more) => more,
-            Err(error) => {
-                chunk.clear();
-                chunk.error = Some(error);
-                false
-            }
-        },
+        || metadata_source.next_run(),
+        |run, chunk| genotype_source.fill_chunk(run, chunk),
         |chunk| {
             if let Some(error) = chunk.error.take() {
                 return Err(error);
@@ -1075,7 +1071,7 @@ pub(super) fn prepare_max6_interval_streamed_ld_with_callback(
         &mut on_batch,
     )?;
     if qc_row_count == 0 {
-        if !scan_bimranges.is_empty() && source.seen_selected_chroms.is_empty() {
+        if !scan_bimranges.is_empty() && !selected_rows_seen.load(Ordering::Relaxed) {
             return Err("--bimrange matched no BIM/PVAR chromosomes".to_string());
         }
         return Err(format_zero_sites_pure_line_error(

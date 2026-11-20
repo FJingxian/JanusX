@@ -797,8 +797,16 @@ pub(super) fn run_max6_grmmax6_pipeline(
     // before constructing the observed-scan pool so `-t` does not leave two
     // independent Rayon pools resident at once.
     drop(screen_pool);
-    let pair_spool_path = out_prefix
-        .map(|prefix| format!("{prefix}.max6_grmmax6.pairs.tsv.tmp.{}", std::process::id()));
+    let pair_spool_path = if let Some(prefix) = out_prefix {
+        let final_path = format!("{prefix}.max6_grmmax6.pairs.tsv");
+        Some(
+            reserve_stream_temp_path(final_path.as_str())?
+                .to_string_lossy()
+                .into_owned(),
+        )
+    } else {
+        None
+    };
     let mut pair_spool = if let Some(path) = pair_spool_path.as_ref() {
         Some(BufWriter::with_capacity(
             MAX6_GRMMAX6_IO_BUFFER_BYTES,
@@ -809,12 +817,16 @@ pub(super) fn run_max6_grmmax6_pipeline(
         None
     };
     let pair_provenance_spool_path = if grm_int_only && write_provenance {
-        out_prefix.map(|prefix| {
-            format!(
-                "{prefix}.max6_grmmax6.provenance.tsv.tmp.{}",
-                std::process::id()
+        if let Some(prefix) = out_prefix {
+            let final_path = format!("{prefix}.max6_grmmax6.provenance.tsv");
+            Some(
+                reserve_stream_temp_path(final_path.as_str())?
+                    .to_string_lossy()
+                    .into_owned(),
             )
-        })
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -2132,7 +2144,22 @@ pub(super) fn run_max6_grmmax6_pipeline(
         if let Some(mut writer) = pair_spool.take() {
             writer.flush().map_err(|error| error.to_string())?;
         }
-        write_max6_grmmax6_pairs_tsv(pair_path.as_str(), spool_path, grm_int_only)?;
+        let pair_publish_tmp_path = reserve_stream_temp_path(pair_path.as_str())?;
+        let _pair_publish_tmp_owner = Max6BitsTempFileOwner {
+            path: pair_publish_tmp_path.clone(),
+        };
+        write_max6_grmmax6_pairs_tsv(
+            pair_publish_tmp_path.to_string_lossy().as_ref(),
+            spool_path,
+            grm_int_only,
+        )?;
+        fs::rename(pair_publish_tmp_path.as_path(), pair_path.as_str()).map_err(|error| {
+            format!(
+                "publish Max6 pair output '{}' from '{}': {error}",
+                pair_path,
+                pair_publish_tmp_path.display()
+            )
+        })?;
         fs::remove_file(spool_path).map_err(|error| {
             format!("failed to remove Max6 pair spool '{}': {error}", spool_path)
         })?;
@@ -2144,7 +2171,25 @@ pub(super) fn run_max6_grmmax6_pipeline(
                 writer.flush().map_err(|error| error.to_string())?;
             }
             let provenance_path = max6_grm_int_provenance_output_path(prefix);
-            write_max6_grm_int_provenance_tsv(provenance_path.as_str(), provenance_spool_path)?;
+            let provenance_publish_tmp_path = reserve_stream_temp_path(provenance_path.as_str())?;
+            let _provenance_publish_tmp_owner = Max6BitsTempFileOwner {
+                path: provenance_publish_tmp_path.clone(),
+            };
+            write_max6_grm_int_provenance_tsv(
+                provenance_publish_tmp_path.to_string_lossy().as_ref(),
+                provenance_spool_path,
+            )?;
+            fs::rename(
+                provenance_publish_tmp_path.as_path(),
+                provenance_path.as_str(),
+            )
+            .map_err(|error| {
+                format!(
+                    "publish Max6 provenance output '{}' from '{}': {error}",
+                    provenance_path,
+                    provenance_publish_tmp_path.display()
+                )
+            })?;
             fs::remove_file(provenance_spool_path).map_err(|error| {
                 format!(
                     "failed to remove Max6 provenance spool '{}': {error}",

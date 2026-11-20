@@ -185,7 +185,15 @@ pub(super) fn write_subset_id_sidecar(
 pub(super) fn normalize_plink_prefix(path_or_prefix: &str) -> String {
     let s = path_or_prefix.trim();
     let low = s.to_ascii_lowercase();
-    for suffix in [".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"] {
+    for suffix in [
+        ".bed",
+        ".bim",
+        ".fam",
+        ".pgen",
+        ".pvar.zst",
+        ".pvar",
+        ".psam",
+    ] {
         if low.ends_with(suffix) {
             return s[..s.len() - suffix.len()].to_string();
         }
@@ -332,7 +340,7 @@ pub(super) fn encode_row_to_bits(
                 return None;
             }
             let missing_rate = (logic_missing as f32) / (n_samples as f32);
-            if missing_rate > geno {
+            if !crate::gfreader::rate_within_threshold(f64::from(missing_rate), geno) {
                 return None;
             }
             let usable_homo = n_samples.saturating_sub(logic_missing);
@@ -341,7 +349,7 @@ pub(super) fn encode_row_to_bits(
             }
             let alt_freq = (c2 as f32) / (usable_homo as f32);
             let maf_obs = alt_freq.min(1.0_f32 - alt_freq).max(0.0_f32);
-            if maf_obs < maf {
+            if !crate::gfreader::maf_passes_threshold(f64::from(maf_obs), maf) {
                 return None;
             }
             let mode02 = if c2 > c0 { 2u8 } else { 0u8 };

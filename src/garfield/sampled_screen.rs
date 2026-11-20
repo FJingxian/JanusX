@@ -3,6 +3,7 @@
 //! threshold.
 
 use super::logic_residual_screen::{self, FourCellGate, OneCellMarginTable};
+use super::output::reserve_stream_temp_path;
 use super::score::PackedYSumLookup;
 use super::{GarfieldLogicBits, Max6ScreenCalibration, Max6ScreenPreparedUniverse};
 use rayon::prelude::*;
@@ -3683,7 +3684,7 @@ fn strata_value(counts: &PairStrataCounts) -> Value {
 }
 
 fn write_atomic(path: &str, bytes: &[u8]) -> Result<(), String> {
-    let temp = format!("{path}.tmp.{}", std::process::id());
+    let temp = reserve_stream_temp_path(path)?;
     let result = (|| {
         let mut file = BufWriter::new(File::create(&temp).map_err(|error| error.to_string())?);
         file.write_all(bytes).map_err(|error| error.to_string())?;
@@ -3704,7 +3705,7 @@ fn write_atomic_stream(
     path: &str,
     write_contents: impl FnOnce(&mut BufWriter<File>) -> Result<(), String>,
 ) -> Result<(), String> {
-    let temp = format!("{path}.tmp.{}", std::process::id());
+    let temp = reserve_stream_temp_path(path)?;
     let result = (|| {
         let file = File::create(&temp).map_err(|error| error.to_string())?;
         let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, file);

@@ -1,4 +1,6 @@
 use super::*;
+use crate::gfcore::BimRangeSelection;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct Max6FusedRowQc {
@@ -279,17 +281,18 @@ pub(super) fn scan_max6_row_qc_and_pack_logic(
     };
     let maf = alt_freq.min(1.0 - alt_freq).max(0.0);
 
-    let reason = if missing_rate > max_missing_rate {
-        MAX6_FUSED_QC_FAIL_MISSING
-    } else if usable_homo == 0 {
-        MAX6_FUSED_QC_FAIL_NO_HOMOZYGOUS
-    } else if maf < maf_threshold {
-        MAX6_FUSED_QC_FAIL_MAF
-    } else if !simple_snp_alleles {
-        MAX6_FUSED_QC_FAIL_NON_SIMPLE_SNP
-    } else {
-        MAX6_FUSED_QC_KEEP
-    };
+    let reason =
+        if !crate::gfreader::rate_within_threshold(f64::from(missing_rate), max_missing_rate) {
+            MAX6_FUSED_QC_FAIL_MISSING
+        } else if usable_homo == 0 {
+            MAX6_FUSED_QC_FAIL_NO_HOMOZYGOUS
+        } else if !crate::gfreader::maf_passes_threshold(f64::from(maf), maf_threshold) {
+            MAX6_FUSED_QC_FAIL_MAF
+        } else if !simple_snp_alleles {
+            MAX6_FUSED_QC_FAIL_NON_SIMPLE_SNP
+        } else {
+            MAX6_FUSED_QC_KEEP
+        };
     let row_flip = alt_freq > 0.5_f32;
     let keep = reason == MAX6_FUSED_QC_KEEP;
     if keep {
@@ -416,9 +419,14 @@ pub(super) fn max6_window_stream_scope_finish_bp(
 /// over selected chromosomes and decode only rows inside window scope plus the
 /// first QC-passing row needed to anchor the chromosome's window grid.
 pub(super) struct Max6WindowRangeSource {
+    pub(super) metadata: Max6WindowMetadataSource,
     pub(super) bed: BedSnpIter,
-    pub(super) bim: BimChunkReader,
     pub(super) max_chunk_rows: usize,
+}
+
+pub(super) struct Max6WindowMetadataSource {
+    pub(super) bim: BimChunkReader,
+    pub(super) max_run_rows: usize,
     pub(super) metadata_chunk_rows: usize,
     pub(super) n_source_rows: usize,
     pub(super) next_metadata_row: usize,
@@ -436,6 +444,17 @@ pub(super) struct Max6WindowRangeSource {
     pub(super) last_chrom_max_pos: Option<i32>,
     pub(super) done: bool,
     pub(super) validated_full_metadata: bool,
+    pub(super) selected_rows_seen: Arc<AtomicBool>,
+}
+
+pub(super) struct Max6WindowGenotypeSource {
+    pub(super) bed: BedSnpIter,
+    pub(super) max_chunk_rows: usize,
+}
+
+pub(super) struct Max6WindowMetadataRun {
+    pub(super) sites: Vec<SiteInfo>,
+    pub(super) source_rows: Vec<usize>,
 }
 
 impl Max6WindowRangeSource {
@@ -495,7 +514,7 @@ impl Max6WindowRangeSource {
             }
             *intervals = merged;
         }
-        let (max_chunk_rows, metadata_chunk_rows) = if bed.has_pgen_source() {
+        let (mut max_chunk_rows, metadata_chunk_rows) = if bed.has_pgen_source() {
             (
                 MAX6_WINDOW_STREAM_PGEN_CHUNK_ROWS,
                 MAX6_WINDOW_STREAM_PGEN_METADATA_ROWS,
@@ -506,31 +525,80 @@ impl Max6WindowRangeSource {
                 MAX6_WINDOW_STREAM_METADATA_ROWS,
             )
         };
+        if !bed.has_pgen_source() {
+            max_chunk_rows = max_chunk_rows.min(bed.mapped_contiguous_snps_from(0).max(1));
+        }
         let scan_all = selected_chroms.is_empty();
         Ok(Self {
+            metadata: Max6WindowMetadataSource {
+                bim: BimChunkReader::open(reader_prefix.as_str())?,
+                max_run_rows: max_chunk_rows,
+                metadata_chunk_rows,
+                n_source_rows,
+                next_metadata_row: 0,
+                selected_chroms,
+                seen_selected_chroms: HashSet::new(),
+                last_chrom: None,
+                pending: VecDeque::new(),
+                scan_all,
+                scan_bimranges: ranges.to_vec(),
+                pack_scope_by_chrom,
+                pack_scope_padding_bp,
+                restrict_genotypes_to_scope: restrict_genotypes_to_scope && !ranges.is_empty(),
+                anchor_ready_chroms,
+                tail_scope_complete_chroms,
+                last_chrom_max_pos: None,
+                done: false,
+                validated_full_metadata: false,
+                selected_rows_seen: Arc::new(AtomicBool::new(false)),
+            },
             bed,
-            bim: BimChunkReader::open(reader_prefix.as_str())?,
             max_chunk_rows,
-            metadata_chunk_rows,
-            n_source_rows,
-            next_metadata_row: 0,
-            selected_chroms,
-            seen_selected_chroms: HashSet::new(),
-            last_chrom: None,
-            pending: VecDeque::new(),
-            scan_all,
-            scan_bimranges: ranges.to_vec(),
-            pack_scope_by_chrom,
-            pack_scope_padding_bp,
-            restrict_genotypes_to_scope: restrict_genotypes_to_scope && !ranges.is_empty(),
-            anchor_ready_chroms,
-            tail_scope_complete_chroms,
-            last_chrom_max_pos: None,
-            done: false,
-            validated_full_metadata: false,
         })
     }
 
+    pub(super) fn n_source_rows(&self) -> usize {
+        self.metadata.n_source_rows
+    }
+
+    pub(super) fn n_samples(&self) -> usize {
+        self.bed.n_samples()
+    }
+
+    pub(super) fn bytes_per_snp(&self) -> usize {
+        self.bed.bytes_per_snp()
+    }
+
+    pub(super) fn max_chunk_rows(&self) -> usize {
+        self.max_chunk_rows
+    }
+
+    pub(super) fn set_max_chunk_rows(&mut self, rows: usize) {
+        self.metadata.max_run_rows = rows.max(1);
+        self.max_chunk_rows = rows.max(1);
+    }
+
+    pub(super) fn selected_rows_seen(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.metadata.selected_rows_seen)
+    }
+
+    pub(super) fn into_sources(self) -> (Max6WindowMetadataSource, Max6WindowGenotypeSource) {
+        let Self {
+            metadata,
+            bed,
+            max_chunk_rows,
+        } = self;
+        (
+            metadata,
+            Max6WindowGenotypeSource {
+                bed,
+                max_chunk_rows,
+            },
+        )
+    }
+}
+
+impl Max6WindowMetadataSource {
     pub(super) fn mark_chromosome_tail_scope_complete(
         &mut self,
         chrom: &str,
@@ -571,15 +639,6 @@ impl Max6WindowRangeSource {
         let end = start
             .saturating_add(self.metadata_chunk_rows)
             .min(self.n_source_rows);
-        let sites = self.bim.read_range(start, end)?;
-        if sites.len() != end.saturating_sub(start) {
-            return Err(format!(
-                "BIM/PVAR chunk length mismatch: read {}, expected {} rows at {start}",
-                sites.len(),
-                end.saturating_sub(start)
-            ));
-        }
-        self.next_metadata_row = end;
         let anchor_ready_snapshot = if self.restrict_genotypes_to_scope {
             self.anchor_ready_chroms
                 .lock()
@@ -588,52 +647,80 @@ impl Max6WindowRangeSource {
         } else {
             HashSet::new()
         };
-        for (offset, site) in sites.into_iter().enumerate() {
-            let source_row = start + offset;
-            let chrom = chrom_base_view(site.chrom.as_str()).to_ascii_lowercase();
-            let changed = self
-                .last_chrom
+        let selected_chroms = &self.selected_chroms;
+        let pack_scope_by_chrom = &self.pack_scope_by_chrom;
+        let selected_rows_seen = Arc::clone(&self.selected_rows_seen);
+        let scan_all = self.scan_all;
+        let restrict_genotypes_to_scope = self.restrict_genotypes_to_scope;
+        let mut last_chrom = std::mem::take(&mut self.last_chrom);
+        let mut last_chrom_max_pos = self.last_chrom_max_pos.take();
+        let mut seen_selected_chroms = std::mem::take(&mut self.seen_selected_chroms);
+        let mut completed_tail_scopes = Vec::<(String, i32)>::new();
+        let mut halted = false;
+        let (sites, scanned_rows) = self.bim.read_range_filtered(start, end, |_, chrom, pos| {
+            let chrom = chrom_base_view(chrom);
+            let same_chrom = last_chrom
                 .as_ref()
-                .is_some_and(|previous| previous != &chrom);
+                .is_some_and(|previous| previous.eq_ignore_ascii_case(chrom));
+            let changed = !same_chrom;
             if changed {
-                if let (Some(previous), Some(max_pos)) =
-                    (self.last_chrom.clone(), self.last_chrom_max_pos)
-                {
-                    self.mark_chromosome_tail_scope_complete(previous.as_str(), max_pos)?;
+                if let (Some(previous), Some(max_pos)) = (last_chrom.as_ref(), last_chrom_max_pos) {
+                    completed_tail_scopes.push((previous.clone(), max_pos));
                 }
-                self.last_chrom_max_pos = None;
+                last_chrom_max_pos = None;
             }
-            if !self.scan_all {
-                if changed
-                    && self.seen_selected_chroms.len() == self.selected_chroms.len()
-                    && self
-                        .last_chrom
-                        .as_ref()
-                        .is_some_and(|previous| self.selected_chroms.contains(previous))
-                    && !self.selected_chroms.contains(&chrom)
-                {
-                    self.done = true;
-                    break;
-                }
+            if !scan_all
+                && changed
+                && seen_selected_chroms.len() == selected_chroms.len()
+                && last_chrom
+                    .as_ref()
+                    .is_some_and(|previous| chrom_set_contains(selected_chroms, previous))
+                && !chrom_set_contains(selected_chroms, chrom)
+            {
+                halted = true;
+                return Ok(BimRangeSelection::Stop);
             }
-            self.last_chrom = Some(chrom.clone());
-            let selected = self.scan_all || self.selected_chroms.contains(&chrom);
-            if selected {
-                self.last_chrom_max_pos = Some(
-                    self.last_chrom_max_pos
-                        .map_or(site.pos, |previous| previous.max(site.pos)),
-                );
-                if !self.scan_all {
-                    self.seen_selected_chroms.insert(chrom.clone());
-                }
-                let in_scope = !self.restrict_genotypes_to_scope
-                    || self.site_in_pack_scope(site.chrom.as_str(), site.pos);
-                let anchor_not_ready =
-                    self.restrict_genotypes_to_scope && !anchor_ready_snapshot.contains(&chrom);
-                if in_scope || anchor_not_ready {
-                    self.pending.push_back((source_row, site));
+            if changed {
+                last_chrom = Some(chrom.to_ascii_lowercase());
+            }
+            let selected = scan_all || chrom_set_contains(selected_chroms, chrom);
+            if !selected {
+                return Ok(BimRangeSelection::Skip);
+            }
+            selected_rows_seen.store(true, Ordering::Relaxed);
+            last_chrom_max_pos = Some(last_chrom_max_pos.map_or(pos, |previous| previous.max(pos)));
+            if !scan_all {
+                if let Some(chrom) = last_chrom.as_ref() {
+                    seen_selected_chroms.insert(chrom.clone());
                 }
             }
+            let in_scope = !restrict_genotypes_to_scope
+                || site_in_pack_scope_map(pack_scope_by_chrom, chrom, pos);
+            let anchor_not_ready =
+                restrict_genotypes_to_scope && !chrom_set_contains(&anchor_ready_snapshot, chrom);
+            if in_scope || anchor_not_ready {
+                Ok(BimRangeSelection::Keep)
+            } else {
+                Ok(BimRangeSelection::Skip)
+            }
+        })?;
+        self.next_metadata_row = start.saturating_add(scanned_rows);
+        self.pending.extend(sites);
+        self.last_chrom = last_chrom;
+        self.last_chrom_max_pos = last_chrom_max_pos;
+        self.seen_selected_chroms = seen_selected_chroms;
+        for (chrom, max_pos) in completed_tail_scopes {
+            self.mark_chromosome_tail_scope_complete(chrom.as_str(), max_pos)?;
+        }
+        if halted {
+            self.done = true;
+            return Ok(());
+        }
+        if self.next_metadata_row != end {
+            return Err(format!(
+                "BIM/PVAR chunk scan stopped prematurely at {}/{} rows",
+                self.next_metadata_row, end
+            ));
         }
         if self.next_metadata_row >= self.n_source_rows && !self.done {
             if let (Some(chrom), Some(max_pos)) = (self.last_chrom.clone(), self.last_chrom_max_pos)
@@ -647,41 +734,20 @@ impl Max6WindowRangeSource {
         Ok(())
     }
 
-    fn site_in_pack_scope(&self, chrom: &str, pos: i32) -> bool {
-        let key = chrom_base_view(chrom).to_ascii_lowercase();
-        let Some(intervals) = self.pack_scope_by_chrom.get(key.as_str()) else {
-            return false;
-        };
-        let pos = i64::from(pos);
-        let index = intervals.partition_point(|&(_, end)| end < pos);
-        intervals
-            .get(index)
-            .is_some_and(|&(start, end)| start <= pos && pos <= end)
-    }
-
-    pub(super) fn fill_chunk(&mut self, chunk: &mut Max6WindowStreamChunk) -> Result<bool, String> {
-        chunk.clear();
+    pub(super) fn next_run(&mut self) -> Result<Option<Max6WindowMetadataRun>, String> {
         while self.pending.is_empty() && !self.done {
             self.read_metadata_chunk()?;
         }
         let Some(&(first_source_row, _)) = self.pending.front() else {
-            return Ok(false);
+            return Ok(None);
         };
-        self.bed.set_cursor(first_source_row);
-        let max_rows = if self.bed.has_pgen_source() {
-            self.max_chunk_rows
-        } else {
-            self.bed.ensure_window_for_snp(first_source_row)?;
-            self.max_chunk_rows
-                .min(self.bed.mapped_contiguous_snps_from(first_source_row))
+        let max_rows = self.max_run_rows.max(1);
+        let mut run = Max6WindowMetadataRun {
+            sites: Vec::with_capacity(max_rows),
+            source_rows: Vec::with_capacity(max_rows),
         };
-        if max_rows == 0 {
-            return Err(format!(
-                "empty mapped genotype block at source row {first_source_row}"
-            ));
-        }
         let mut next_source_row = first_source_row;
-        while chunk.sites.len() < max_rows {
+        while run.sites.len() < max_rows {
             let Some((source_row, _)) = self.pending.front() else {
                 break;
             };
@@ -689,13 +755,70 @@ impl Max6WindowRangeSource {
                 break;
             }
             let (source_row, site) = self.pending.pop_front().expect("front checked");
-            chunk.source_rows.push(source_row);
-            chunk.sites.push(site);
+            run.source_rows.push(source_row);
+            run.sites.push(site);
             next_source_row = source_row.saturating_add(1);
         }
-        if chunk.sites.is_empty() {
+        if run.sites.is_empty() {
             return Err("streaming genotype source failed to advance".to_string());
         }
+        Ok(Some(run))
+    }
+}
+
+fn chrom_set_contains(chroms: &HashSet<String>, chrom: &str) -> bool {
+    chroms.contains(chrom)
+        || chroms
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(chrom))
+}
+
+fn site_in_pack_scope_map(
+    intervals_by_chrom: &HashMap<String, Vec<(i64, i64)>>,
+    chrom: &str,
+    pos: i32,
+) -> bool {
+    let Some(intervals) = intervals_by_chrom.get(chrom).or_else(|| {
+        intervals_by_chrom
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(chrom))
+            .map(|(_, intervals)| intervals)
+    }) else {
+        return false;
+    };
+    let pos = i64::from(pos);
+    let index = intervals.partition_point(|&(_, end)| end < pos);
+    intervals
+        .get(index)
+        .is_some_and(|&(start, end)| start <= pos && pos <= end)
+}
+
+impl Max6WindowGenotypeSource {
+    pub(super) fn fill_chunk(
+        &mut self,
+        run: Max6WindowMetadataRun,
+        chunk: &mut Max6WindowStreamChunk,
+    ) -> Result<bool, String> {
+        chunk.clear();
+        let Some(&first_source_row) = run.source_rows.first() else {
+            return Ok(false);
+        };
+        self.bed.set_cursor(first_source_row);
+        let max_rows = if self.bed.has_pgen_source() {
+            self.max_chunk_rows
+        } else {
+            self.bed
+                .ensure_window_cover_rows(first_source_row, run.sites.len())?
+                .min(self.max_chunk_rows)
+        };
+        if run.sites.len() > max_rows {
+            return Err(format!(
+                "streaming metadata run has {} rows but genotype reader can map {max_rows} rows from source row {first_source_row}",
+                run.sites.len()
+            ));
+        }
+        chunk.sites = run.sites;
+        chunk.source_rows = run.source_rows;
 
         let bytes_per_variant = self.bed.bytes_per_snp();
         chunk

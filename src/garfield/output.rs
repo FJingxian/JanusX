@@ -1,5 +1,56 @@
 use super::*;
 
+/// Reserve a readable stream-output spool beside its final path.
+///
+/// `prefix.tsv` becomes `prefix.tmp.tsv`; when that name is occupied, use
+/// `prefix.tmp.1.tsv`, `prefix.tmp.2.tsv`, ... .  The reservation prevents
+/// concurrent GARFIELD runs from selecting the same writer path.  Callers
+/// fill the empty file and rename it only after the stream has completed.
+pub(super) fn reserve_stream_temp_path(final_path: &str) -> Result<std::path::PathBuf, String> {
+    let final_path = std::path::Path::new(final_path);
+    let parent = final_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let file_name = final_path
+        .file_name()
+        .ok_or_else(|| format!("output path has no file name: {}", final_path.display()))?
+        .to_string_lossy();
+    let (stem, suffix) = match final_path.extension() {
+        Some(ext) => {
+            let ext = format!(".{}", ext.to_string_lossy());
+            let stem_len = file_name.len().saturating_sub(ext.len());
+            (file_name[..stem_len].to_string(), ext)
+        }
+        None => (file_name.to_string(), String::new()),
+    };
+    for index in 0..100_000usize {
+        let name = if index == 0 {
+            format!("{stem}.tmp{suffix}")
+        } else {
+            format!("{stem}.tmp.{index}{suffix}")
+        };
+        let candidate = parent.join(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(_) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "reserve stream output spool '{}': {error}",
+                    candidate.display()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "could not reserve stream output spool beside {}",
+        final_path.display()
+    ))
+}
+
 #[inline]
 pub(super) fn plink2bits_from_logic_g(g: i8) -> u8 {
     match g {

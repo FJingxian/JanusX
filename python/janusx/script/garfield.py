@@ -21,6 +21,8 @@ from janusx._plink import (
     canonical_plink_input_path,
     detect_existing_plink_kind,
     normalize_plink_prefix,
+    open_text_auto,
+    pvar_path_for_prefix,
 )
 
 from janusx.assoc.workflow import (
@@ -1310,7 +1312,9 @@ def _count_window_scan_units_from_bim(
         return 0
     kind, raw_prefix = resolved
     is_pgen = kind == "pfile"
-    variant_path = f"{raw_prefix}.pvar" if is_pgen else f"{raw_prefix}.bim"
+    variant_path = (
+        pvar_path_for_prefix(raw_prefix) if is_pgen else f"{raw_prefix}.bim"
+    )
     if not os.path.exists(variant_path):
         return 0
 
@@ -1321,7 +1325,7 @@ def _count_window_scan_units_from_bim(
     chrom_index = 0
     pos_index = 3
     row_idx = 0
-    with open(variant_path, "r", encoding="utf-8") as f:
+    with open_text_auto(variant_path) as f:
         for line in f:
             stripped = line.strip()
             if not stripped:
@@ -1805,6 +1809,17 @@ class _GarfieldStageProgress:
             elapsed = format_elapsed(time.monotonic() - self._start_ts)
             print_success(f"{self.scan_desc} ...Finished [{elapsed}]", force_color=True)
 
+    def emit_above(self, message: str) -> None:
+        """Print a plain line above the active live progress region."""
+        text = str(message)
+        if self._rich is not None and self._task_id is not None:
+            try:
+                self._rich.console.print(text, highlight=False, markup=False)
+                return
+            except Exception:
+                pass
+        print(text, flush=True)
+
     @property
     def elapsed_text(self) -> str:
         return format_elapsed(time.monotonic() - self._start_ts)
@@ -1815,12 +1830,16 @@ def _run_scan_with_progress(
     *,
     use_spinner: bool,
     invoke,
+    progress: _GarfieldStageProgress | None = None,
 ):
     if not bool(use_spinner):
         with CliStatus(f"{desc}...", enabled=False, timeout=0.1):
             return invoke(None)
 
-    stage_progress = _GarfieldStageProgress(scan_desc=desc, enabled=bool(use_spinner))
+    stage_progress = progress or _GarfieldStageProgress(
+        scan_desc=desc,
+        enabled=bool(use_spinner),
+    )
 
     def _progress_cb(*event) -> None:
         if len(event) == 4:
@@ -3214,15 +3233,28 @@ def main() -> None:
                 use_spinner=use_spinner,
             )
 
+        scan_progress = (
+            _GarfieldStageProgress(scan_desc=scan_desc, enabled=True)
+            if bool(use_spinner)
+            else None
+        )
+
+        def _emit_scan_summary(message: str) -> None:
+            text = str(message)
+            if bool(use_spinner):
+                assert scan_progress is not None
+                _emit_garfield_file_only_line(logger, text)
+                scan_progress.emit_above(text)
+            else:
+                logger.info(text)
+
         def _on_scan_stage(stage, done, total, meta):
             if stage == "garfield_null_summary":
                 null_summary = json.loads(meta)
                 pve = null_summary.get("full_pve")
-                _emit_plain_info_line(
-                    logger,
+                _emit_scan_summary(
                     f"GARFIELD null-model PVE for '{trait_name}': "
-                    f"full={float(pve) if pve is not None else float('nan'):.4g}",
-                    use_spinner=use_spinner,
+                    f"full={float(pve) if pve is not None else float('nan'):.4g}"
                 )
 
         # Rust handles residualization, genotype-only LD-tag compression,
@@ -3231,6 +3263,7 @@ def main() -> None:
         result = _run_scan_with_progress(
             scan_desc,
             use_spinner=use_spinner,
+            progress=scan_progress,
             invoke=lambda progress_cb: garfield_logic_search_bed(
                 gfile,
                 np.asarray(y_common, dtype=np.float64),

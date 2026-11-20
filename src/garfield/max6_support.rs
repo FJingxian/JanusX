@@ -135,18 +135,21 @@ pub(super) fn build_max6_prepared_input_fingerprint(
     config: &Max6PreparationConfigFingerprint,
 ) -> Result<Max6PreparedInputFingerprint, String> {
     let base = normalize_plink_prefix(prefix);
-    let input_extensions = if crate::pgen::path_uses_pgen(base.as_str()) {
-        ["pgen", "pvar", "psam"]
+    let input_paths = if crate::pgen::path_uses_pgen(base.as_str()) {
+        vec![
+            Path::new(&format!("{base}.pgen")).to_path_buf(),
+            crate::pgen::pvar_path_for_prefix(&base),
+            Path::new(&format!("{base}.psam")).to_path_buf(),
+        ]
     } else {
         ["bed", "bim", "fam"]
+            .into_iter()
+            .map(|extension| Path::new(&format!("{base}.{extension}")).to_path_buf())
+            .collect()
     };
-    let files = input_extensions
-        .into_iter()
-        .map(|extension| {
-            Max6PreparedFileFingerprint::from_path(Path::new(
-                format!("{base}.{extension}").as_str(),
-            ))
-        })
+    let files = input_paths
+        .iter()
+        .map(|path| Max6PreparedFileFingerprint::from_path(path))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Max6PreparedInputFingerprint {
         files,

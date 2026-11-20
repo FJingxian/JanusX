@@ -11,10 +11,46 @@ on:
         default: ""
         type: string
       source_ref:
-        description: "Branch, tag or commit to build (use main or a v* tag)"
+        description: "Source to build"
         required: true
         default: "main"
-        type: string
+        type: choice
+        # GitHub choice inputs are static. Add future release tags here.
+        options:
+          - main
+          - v2.0.2
+          - v2.0.1-imp-release-20261117
+          - v2.0.1
+          - v2.0.0
+          - v1.0.27
+          - v1.0.26
+          - v1.0.25
+          - v1.0.24
+          - v1.0.23
+          - v1.0.22
+          - v1.0.21
+          - v1.0.20
+          - v1.0.19
+          - v1.0.18
+          - v1.0.17
+          - v1.0.16
+          - v1.0.15
+          - v1.0.14
+          - v1.0.13
+          - v1.0.12
+          - v1.0.11
+          - v1.0.10
+          - v1.0.9
+          - v1.0.8
+          - v1.0.7
+          - v1.0.6
+          - v1.0.5
+          - v1.0.4
+          - v1.0.3
+          - v1.0.2
+          - v1.0.1
+          - v1.0.0
+          - v0.1.0
       target:
         description: "Platform to build"
         required: true
@@ -75,6 +111,10 @@ on:
 
 permissions:
   contents: read
+
+concurrency:
+  group: build-wheels-${{ github.workflow }}-${{ inputs.source_ref }}-${{ inputs.target }}
+  cancel-in-progress: true
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -253,6 +293,14 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Restore Cargo build cache
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: cargo-target-${{ matrix.label }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'build.rs', 'src/**/*', 'scripts/build_backend.py') }}
+          restore-keys: |
+            cargo-target-${{ matrix.label }}-
+
       - name: Install build tools
         if: ${{ matrix.platform != 'linux' }}
         run: |
@@ -263,7 +311,6 @@ jobs:
         if: ${{ matrix.platform == 'macos' }}
         shell: bash
         run: |
-          brew update
           brew list --versions openblas >/dev/null 2>&1 || brew install openblas
           command -v pkg-config >/dev/null 2>&1 || brew install pkgconf
           OPENBLAS_PREFIX="$(brew --prefix openblas)"
@@ -285,13 +332,29 @@ jobs:
             --github-env "$env:GITHUB_ENV" `
             --verbose
 
+      - name: Restore vcpkg binary cache
+        if: ${{ matrix.label == 'windows-arm64' }}
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/vcpkg-binary-cache
+          key: vcpkg-openblas-arm64-windows-static-md-v1
+
       - name: Install OpenBLAS (Windows ARM64 via vcpkg)
         if: ${{ matrix.label == 'windows-arm64' }}
         shell: pwsh
         run: |
-          $vcpkgRoot = Join-Path $env:RUNNER_TEMP "vcpkg"
-          git clone --depth=1 https://github.com/microsoft/vcpkg $vcpkgRoot
-          & "$vcpkgRoot\bootstrap-vcpkg.bat" -disableMetrics
+          $binaryCache = Join-Path $env:RUNNER_TEMP "vcpkg-binary-cache"
+          New-Item -ItemType Directory -Force -Path $binaryCache | Out-Null
+          "VCPKG_BINARY_SOURCES=clear;files,$binaryCache,readwrite" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
+          if (-not $vcpkgRoot -or -not (Test-Path $vcpkgRoot)) {
+            $vcpkgRoot = Join-Path $env:RUNNER_TEMP "vcpkg"
+            git clone --depth=1 https://github.com/microsoft/vcpkg $vcpkgRoot
+          }
+          if (-not (Test-Path "$vcpkgRoot\vcpkg.exe")) {
+            & "$vcpkgRoot\bootstrap-vcpkg.bat" -disableMetrics
+          }
 
           # Keep static-md for ARM64 cross-build; Rust side will detect static
           # layout and switch OpenBLAS extern linkage to kind=static.
@@ -331,6 +394,19 @@ jobs:
           "JANUSX_ZLIB_LIB_DIR=$installed\lib" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "JANUSX_ZLIB_LIB=$($zlibLib.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
+      - name: Restore Linux OpenBLAS cache
+        if: ${{ matrix.platform == 'linux' }}
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/janusx-openblas-cache
+          key: openblas-${{ matrix.label }}-0.3.33-shared-${{ hashFiles('scripts/ci/build_linux_openblas.sh') }}
+
+      - name: Prepare Linux OpenBLAS cache directory
+        if: ${{ matrix.platform == 'linux' }}
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/janusx-openblas-cache/prefix"
+
       - name: Build wheels (Linux)
         if: ${{ matrix.platform == 'linux' }}
         shell: bash
@@ -341,6 +417,7 @@ jobs:
 
           docker run --rm \
             -v "$PWD:/io" \
+            -v "${RUNNER_TEMP}/janusx-openblas-cache:/openblas-cache" \
             -w /io \
             "$IMAGE" \
             bash -lc "
@@ -355,7 +432,16 @@ jobs:
               ${INTERP} -m pip install -U pip
               ${INTERP} -m pip install maturin==1.9.4 build 'numpy>=1.23' 'pybind11>=2.13' auditwheel
               export OPENBLAS_VERSION=0.3.33
-              . /io/scripts/ci/build_linux_openblas.sh
+              if [[ -s /openblas-cache/prefix/lib/libopenblas.so ]]; then
+                echo '[janusx] using cached Linux OpenBLAS'
+                export OPENBLAS_LIB_DIR=/openblas-cache/prefix/lib
+                export OPENBLAS_INCLUDE_DIR=/openblas-cache/prefix/include
+              else
+                export OPENBLAS_BUILD_ROOT=/openblas-cache/build
+                export OPENBLAS_PREFIX=/openblas-cache/prefix
+                . /io/scripts/ci/build_linux_openblas.sh
+              fi
+              rm -rf /openblas-cache/build
               export JANUSX_REQUIRE_OPENBLAS=1
               export JANUSX_STRICT_KMC_BIND=1
               ${INTERP} -m build --wheel --outdir dist_raw --no-isolation

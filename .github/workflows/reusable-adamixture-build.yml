@@ -1,0 +1,247 @@
+name: Reusable ADAMIXTURE companion build
+
+on:
+  workflow_call:
+    inputs:
+      source_repository:
+        description: "ADAMIXTURE fork to build"
+        required: false
+        type: string
+        default: "FJingxian/ADAMIXTURE"
+      source_ref:
+        description: "ADAMIXTURE branch, tag, or commit"
+        required: false
+        type: string
+        default: "main"
+      package_version:
+        description: "Companion distribution version"
+        required: false
+        type: string
+        default: "1.9.6.post1"
+      target:
+        description: "Build target"
+        required: false
+        type: string
+        default: "all"
+      retention_days:
+        description: "Artifact retention days"
+        required: false
+        type: string
+        default: "14"
+    secrets:
+      checkout_token:
+        required: false
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+  CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-* cp315-*"
+  CIBW_SKIP: "pp* *musllinux* *i686*"
+  CIBW_TEST_COMMAND: "python -c \"import adamixture; print('adamixture import ok')\""
+
+jobs:
+  prepare:
+    name: Prepare ADAMIXTURE matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+    steps:
+      - name: Select target matrix
+        id: select
+        shell: bash
+        env:
+          TARGET: ${{ inputs.target }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+
+          target = (os.environ.get("TARGET") or "all").strip() or "all"
+          entries = [
+              {
+                  "label": "linux-x86_64",
+                  "runner": "ubuntu-latest",
+                  "platform": "linux",
+                  "cibw_archs": "x86_64",
+                  "manylinux_image": "manylinux_2_28",
+              },
+              {
+                  "label": "linux-aarch64",
+                  "runner": "ubuntu-24.04-arm",
+                  "platform": "linux",
+                  "cibw_archs": "aarch64",
+                  "manylinux_image": "manylinux_2_28",
+              },
+              {
+                  "label": "macos",
+                  "runner": "macos-15",
+                  "platform": "macos",
+                  "cibw_archs": "x86_64 arm64",
+                  "manylinux_image": "",
+              },
+              {
+                  "label": "windows-x86_64",
+                  "runner": "windows-2025-vs2026",
+                  "platform": "windows",
+                  "cibw_archs": "AMD64",
+                  "manylinux_image": "",
+              },
+          ]
+          if target != "all":
+              entries = [entry for entry in entries if entry["label"] == target]
+              if not entries:
+                  raise SystemExit(f"Unsupported ADAMIXTURE target: {target!r}")
+
+          out = os.environ["GITHUB_OUTPUT"]
+          with open(out, "a", encoding="utf-8") as fh:
+              fh.write("matrix<<EOF\n")
+              fh.write(json.dumps({"include": entries}))
+              fh.write("\nEOF\n")
+          print(f"[adamixture-matrix] target={target} entries={len(entries)}")
+          PY
+
+  build-wheels:
+    name: Build ADAMIXTURE wheels (${{ matrix.label }})
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Checkout JanusX build helpers
+        uses: actions/checkout@v6
+        with:
+          path: janusx-ci
+          token: ${{ secrets.checkout_token != '' && secrets.checkout_token || github.token }}
+
+      - name: Checkout ADAMIXTURE fork
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.source_repository }}
+          ref: ${{ inputs.source_ref }}
+          path: adamixture-source
+          token: ${{ secrets.checkout_token != '' && secrets.checkout_token || github.token }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install wheel builder
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install cibuildwheel build
+
+      - name: Prepare companion distribution metadata
+        shell: bash
+        env:
+          ADAMIXTURE_VERSION: ${{ inputs.package_version }}
+        run: |
+          python janusx-ci/scripts/ci/prepare_adamixture_dist.py adamixture-source
+          echo "SETUPTOOLS_SCM_PRETEND_VERSION=${ADAMIXTURE_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Configure OpenMP (macOS)
+        if: ${{ matrix.platform == 'macos' }}
+        shell: bash
+        run: |
+          brew install libomp
+          OPENMP_DIR="$(brew --prefix libomp)"
+          {
+            echo "OPENMP_DIR=${OPENMP_DIR}"
+            echo "CIBW_ENVIRONMENT_MACOS=MACOSX_DEPLOYMENT_TARGET=11.0 OPENMP_DIR=${OPENMP_DIR} CC=/usr/bin/clang CFLAGS=\"-Xpreprocessor -fopenmp -I${OPENMP_DIR}/include\" LDFLAGS=\"-L${OPENMP_DIR}/lib -lomp -Wl,-rpath,${OPENMP_DIR}/lib\" SETUPTOOLS_SCM_PRETEND_VERSION=${SETUPTOOLS_SCM_PRETEND_VERSION}"
+          } >> "$GITHUB_ENV"
+
+      - name: Build wheels (Linux)
+        if: ${{ matrix.platform == 'linux' }}
+        shell: bash
+        env:
+          CIBW_ARCHS_LINUX: ${{ matrix.cibw_archs }}
+          CIBW_MANYLINUX_X86_64_IMAGE: ${{ matrix.manylinux_image }}
+          CIBW_MANYLINUX_AARCH64_IMAGE: ${{ matrix.manylinux_image }}
+          CIBW_ENVIRONMENT_LINUX: "CFLAGS=-fopenmp LDFLAGS=-fopenmp SETUPTOOLS_SCM_PRETEND_VERSION=${{ inputs.package_version }}"
+        run: |
+          python -m cibuildwheel adamixture-source --output-dir wheelhouse
+
+      - name: Build wheels (macOS/Windows)
+        if: ${{ matrix.platform != 'linux' }}
+        shell: bash
+        env:
+          CIBW_ARCHS_MACOS: ${{ matrix.platform == 'macos' && matrix.cibw_archs || '' }}
+          CIBW_ARCHS_WINDOWS: ${{ matrix.platform == 'windows' && matrix.cibw_archs || '' }}
+        run: |
+          python -m cibuildwheel adamixture-source --output-dir wheelhouse
+
+      - name: Validate companion wheels
+        shell: bash
+        run: |
+          python - <<'PY'
+          import glob
+          import os
+          import zipfile
+
+          wheels = sorted(glob.glob("wheelhouse/janusx_adamixture-*.whl"))
+          if not wheels:
+              raise SystemExit("No janusx-adamixture wheels were produced")
+          for wheel in wheels:
+              with zipfile.ZipFile(wheel) as archive:
+                  names = archive.namelist()
+              if not any(name.startswith("adamixture/") for name in names):
+                  raise SystemExit(f"Missing adamixture package in {wheel}")
+          print(f"[adamixture-build] produced {len(wheels)} wheel(s)")
+          PY
+
+      - name: Upload companion wheels
+        uses: actions/upload-artifact@v7
+        with:
+          name: adamixture-wheels-${{ matrix.label }}
+          path: wheelhouse/janusx_adamixture-*.whl
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention_days }}
+          compression-level: 0
+
+  build-sdist:
+    name: Build ADAMIXTURE source distribution
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout JanusX build helpers
+        uses: actions/checkout@v6
+        with:
+          path: janusx-ci
+          token: ${{ secrets.checkout_token != '' && secrets.checkout_token || github.token }}
+
+      - name: Checkout ADAMIXTURE fork
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.source_repository }}
+          ref: ${{ inputs.source_ref }}
+          path: adamixture-source
+          token: ${{ secrets.checkout_token != '' && secrets.checkout_token || github.token }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Build source distribution
+        shell: bash
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ inputs.package_version }}
+        run: |
+          python -m pip install --upgrade pip build Cython numpy setuptools_scm
+          python janusx-ci/scripts/ci/prepare_adamixture_dist.py adamixture-source
+          python -m build --sdist --outdir dist --no-isolation adamixture-source
+
+      - name: Upload companion source distribution
+        uses: actions/upload-artifact@v7
+        with:
+          name: adamixture-sdist
+          path: dist/janusx_adamixture-*.tar.gz
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention_days }}
+          compression-level: 0

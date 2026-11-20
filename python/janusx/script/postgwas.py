@@ -83,17 +83,23 @@ mpl.use("Agg")
 from janusx.bioplotkit import (
     GWASPLOT,
     LDblock,
+    prepare_ldblock_display,
     apply_integer_xticks,
     apply_integer_yticks,
     resolve_manhattan_chr_gap,
 )
-from janusx.bioplotkit.geneplot import draw_gene_structure_records
+from janusx.bioplotkit.geneplot import (
+    draw_gene_structure_records,
+    gene_structure_lane_count,
+)
 from janusx.gfreader import load_genotype_chunks, prepare_cli_input_cache
 
 import matplotlib.pyplot as plt
 from matplotlib import colors as mcolors
 from matplotlib.markers import MarkerStyle
-from matplotlib.patches import ConnectionPatch, Patch
+from matplotlib.collections import LineCollection
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 from matplotlib.ticker import FuncFormatter, MaxNLocator
 import pandas as pd
 import numpy as np
@@ -122,6 +128,8 @@ from janusx._plink import (
     detect_existing_plink_kind,
     explicit_plink_kind,
     normalize_plink_prefix as _shared_normalize_plink_prefix,
+    open_text_auto,
+    pvar_path_for_prefix,
 )
 from janusx.assoc.null_model_sidecar import (
     FineMapSkip,
@@ -162,6 +170,32 @@ _POSTGWAS_LEGEND_SIZE_SCALE = 1.35
 _POSTGWAS_LEGEND_SIZE_MIN_BONUS = 2.0
 _POSTGWAS_LD_LINK_Y = 0.0
 _POSTGWAS_RASTERIZE_THRESHOLD = 50_000
+_POSTGWAS_TOP_LD_NEUTRAL_COLOR = "#8c8c8c"
+_POSTGWAS_TOP_MARKER_COLOR = "#c43e3e"
+_POSTGWAS_TOP_LD_BLOCKS = (
+    (0.0, 0.2),
+    (0.2, 0.4),
+    (0.4, 0.6),
+    (0.6, 0.8),
+    (0.8, 1.0),
+)
+# High-contrast journal-style LD anchors.  The first two bins are separated
+# deliberately so low and intermediate LD remain distinguishable in dense
+# local panels and small legends.
+_POSTGWAS_TOP_LD_REFERENCE_PALETTE = (
+    "#173F5F",  # deep navy, 0.0-0.2
+    "#2878B5",  # publication blue, 0.2-0.4
+    "#4DBBD5",  # cyan/teal, 0.4-0.6
+    "#E6AB02",  # amber, 0.6-0.8
+    "#D73027",  # red, 0.8-1.0
+)
+_POSTGWAS_REFERENCE_PALETTE = (
+    "#2f6690",  # deep blue
+    "#4f86a6",  # blue
+    "#6aaec2",  # cyan
+    "#f2c15b",  # yellow
+    "#d95b50",  # red
+)
 _PANEL_WIDTH_IN = 8.0
 _PANEL_LEFT_IN = 0.95
 _PANEL_RIGHT_IN = 0.20
@@ -896,10 +930,39 @@ def _resolve_postgwas_gene_panel_height_in(
     font_size: float,
     *,
     width_in: float = _PANEL_WIDTH_IN,
+    lane_count: int = 1,
 ) -> float:
-    base_height = float(width_in) / 20.0
+    # Keep the middle panel compact while assigning one equal slot to each
+    # adaptive gene lane.  The gene elements themselves are sized in display
+    # pixels below, so the panel does not need to grow just to make CDS/UTR
+    # blocks visible.
     text_height = max(0.0, float(font_size)) / 72.0
-    return max(base_height, text_height * 3.6)
+    lanes = max(1, int(lane_count))
+    lane_slot_height = max(0.24, min(0.34, float(width_in) / 28.0))
+    lane_gap = max(0.04, min(0.06, float(width_in) / 180.0))
+    outer_margin = max(0.10, 1.0 * text_height)
+    slot_height = (
+        lanes * lane_slot_height
+        + max(0, lanes - 1) * lane_gap
+        + outer_margin
+    )
+    return max(
+        slot_height,
+        text_height * (2.2 + 0.40 * lanes),
+    )
+
+
+def _resolve_postgwas_gene_axis_ylim(
+    lane_count: int,
+    *,
+    y_offset: float = 0.0,
+    route_gutter: float = 0.0,
+) -> tuple[float, float]:
+    """Return equal-lane y limits and an optional connector gutter."""
+    lanes = max(1, int(lane_count))
+    lower = float(y_offset) - max(0.0, float(route_gutter))
+    upper = float(y_offset) + float(lanes)
+    return lower, upper
 
 
 def _apply_postgwas_gene_panel_layout(
@@ -932,12 +995,17 @@ def _resolve_postgwas_bridge_panel_height_in(
     *,
     width_in: float = _PANEL_WIDTH_IN,
     use_gene_bridge: bool = True,
+    lane_count: int = 1,
 ) -> float:
     if not bool(use_gene_bridge):
         return 0.24
-    gene_h_in = _resolve_postgwas_gene_panel_height_in(font_size, width_in=width_in)
+    gene_h_in = _resolve_postgwas_gene_panel_height_in(
+        font_size,
+        width_in=width_in,
+        lane_count=lane_count,
+    )
     return max(
-        min(gene_h_in, float(width_in) / 9.0),
+        gene_h_in,
         float(width_in) / 15.0,
     )
 
@@ -1316,6 +1384,62 @@ def _resolve_ldblock_style(
     }
 
 
+def _resolve_postgwas_gene_feature_colors(
+    spec: Optional[Tuple[str, Any]],
+    *,
+    scatter_colors: Optional[Sequence[str]] = None,
+) -> dict[str, str]:
+    """Resolve gene feature colors from the same palette as the SNP points.
+
+    Use the first palette color as the gene family color, then derive a light
+    CDS and a dark UTR shade from that same color.  This keeps a highlight
+    color such as GARFIELD red reserved for the Manhattan interaction layer.
+    ``scatter_colors`` supplies the active first series color when no explicit
+    palette was provided.  The thin gene backbone is always black.
+    """
+    base_color: Optional[str] = None
+    if spec is not None:
+        mode, payload = spec
+        if mode == "list":
+            values = list(payload)
+            if len(values) > 0:
+                try:
+                    base_color = mcolors.to_hex(mcolors.to_rgba(values[0]))
+                except (TypeError, ValueError):
+                    base_color = None
+        elif mode == "cmap":
+            cmap = plt.get_cmap(str(payload))
+            base_color = mcolors.to_hex(cmap(0.0))
+
+    if base_color is None and scatter_colors is not None:
+        values = (
+            [scatter_colors]
+            if isinstance(scatter_colors, str)
+            else list(scatter_colors)
+        )
+        for value in values:
+            try:
+                base_color = mcolors.to_hex(mcolors.to_rgba(value))
+                break
+            except (TypeError, ValueError):
+                continue
+
+    if base_color is None:
+        base_color = str(_POSTGWAS_REFERENCE_PALETTE[0])
+
+    # Use moderate, neutral shades.  For the reference GWAS gray
+    # (#aeb3b8), this produces a light gray CDS and a deep gray UTR instead
+    # of promoting the red interaction series into the gene model.
+    light = _blend_hex_color(base_color, "#ffffff", 0.38)
+    dark = _blend_hex_color(base_color, "#000000", 0.45)
+
+    return {
+        "cds_color": str(light),
+        "utr_color": str(dark),
+        "line_color": "black",
+    }
+
+
 def _resolve_manhattan_colors(spec: Optional[Tuple[str, Any]], n_chr: int) -> Optional[list[str]]:
     if spec is None:
         return None
@@ -1558,7 +1682,10 @@ def _manhattan_colors_for_subset(
 
     full_colors = _resolve_manhattan_colors(spec, len(full_order))
     if full_colors is None:
-        full_colors = [("black" if i % 2 == 0 else "grey") for i in range(len(full_order))]
+        full_colors = [
+            _POSTGWAS_REFERENCE_PALETTE[i % len(_POSTGWAS_REFERENCE_PALETTE)]
+            for i in range(len(full_order))
+        ]
 
     color_by_chr = {chrom: full_colors[i % len(full_colors)] for i, chrom in enumerate(full_order)}
     return [color_by_chr[c] for c in subset_order]
@@ -2257,10 +2384,14 @@ def _postgwas_resolve_prepared_bim_rows(
     kind = _postgwas_plink_kind(genotype_prefix)
     prefix = _normalize_plink_prefix(genotype_prefix)
     is_pgen = kind == "pfile"
-    variant_path = Path(f"{prefix}.pvar" if is_pgen else f"{prefix}.bim")
+    variant_path = Path(
+        pvar_path_for_prefix(prefix) if is_pgen else f"{prefix}.bim"
+    )
     variant_label = "PVAR" if is_pgen else "BIM"
     try:
-        with variant_path.open("rt", encoding="utf-8", errors="replace") as handle:
+        with open_text_auto(
+            str(variant_path), errors="replace"
+        ) as handle:
             scanner = (
                 _postgwas_scan_pvar_candidates
                 if is_pgen
@@ -6625,7 +6756,7 @@ def _is_existing_pgen_prefix(path_or_prefix: object) -> bool:
         return False
     return (
         os.path.isfile(f"{prefix}.pgen")
-        and os.path.isfile(f"{prefix}.pvar")
+        and os.path.isfile(pvar_path_for_prefix(prefix))
         and os.path.isfile(f"{prefix}.psam")
     )
 
@@ -6912,11 +7043,16 @@ def _format_bimrange_title(item: tuple[str, int, int]) -> str:
 def _ld_bimrange_spans(
     ld_keys: list[tuple[str, int]],
     bimrange_tuples: list[tuple[str, int, int]],
+    *,
+    site_to_bin: Optional[Sequence[int]] = None,
 ) -> list[dict[str, object]]:
     """
     Build LD index spans for each bimrange.
     x coordinate in LD panel:
-      SNP i center -> x = i + 0.5
+      display bin i center -> x = i + 0.5
+
+    When ``site_to_bin`` is supplied, ``ld_keys`` remains in raw SNP order
+    while the returned coordinates are in aggregated display-bin space.
     """
     if len(ld_keys) == 0 or len(bimrange_tuples) == 0:
         return []
@@ -6936,6 +7072,7 @@ def _ld_bimrange_spans(
             }
         )
 
+    mapping = None if site_to_bin is None else np.asarray(site_to_bin, dtype=np.int64)
     for idx, (k_chrom, k_pos) in enumerate(ld_keys):
         kk = str(k_chrom)
         pp = int(k_pos)
@@ -6948,10 +7085,15 @@ def _ld_bimrange_spans(
                 break
         if hit_sid is None:
             continue
+        display_idx = int(idx)
+        if mapping is not None:
+            if idx >= int(mapping.shape[0]):
+                continue
+            display_idx = int(mapping[idx])
         seg = spans_meta[hit_sid]
         if seg["first"] is None:
-            seg["first"] = int(idx)
-        seg["last"] = int(idx)
+            seg["first"] = display_idx
+        seg["last"] = display_idx
         seg["count"] = int(seg["count"]) + 1
 
     out: list[dict[str, object]] = []
@@ -6979,6 +7121,100 @@ def _ld_bimrange_spans(
                 ),
             }
         )
+    return out
+
+
+def _prepare_postgwas_ld_display(
+    ld_mat: np.ndarray,
+    ld_keys: Sequence[tuple[str, int]],
+    bimrange_tuples: Sequence[tuple[str, int, int]],
+    *,
+    target_bins: Optional[int],
+    logger: Optional[logging.Logger] = None,
+    label: str = "LD block",
+) -> object:
+    """Prepare a compact LD display while retaining raw SNP row identity."""
+    matrix = np.asarray(ld_mat)
+    raw_n = int(matrix.shape[0]) if matrix.ndim == 2 else 0
+    segment_spans: list[tuple[int, int]] = []
+    if raw_n > 0 and len(ld_keys) == raw_n and len(bimrange_tuples) > 0:
+        raw_spans = _ld_bimrange_spans(
+            list(ld_keys),
+            [tuple(item) for item in bimrange_tuples],
+        )
+        segment_spans = [
+            (int(span["first"]), int(span["last"]) + 1)
+            for span in raw_spans
+            if span.get("first") is not None and span.get("last") is not None
+        ]
+    display = prepare_ldblock_display(
+        matrix,
+        target_bins=target_bins,
+        segment_spans=segment_spans or None,
+        reducer="mean",
+    )
+    display_n = int(display.matrix.shape[0])
+    if logger is not None:
+        if display_n < raw_n:
+            logger.info(
+                "%s display aggregation: %d raw SNPs -> %d bins "
+                "(mean r² per bin pair; segment boundaries preserved).",
+                label,
+                raw_n,
+                display_n,
+            )
+        else:
+            logger.info("%s display uses the raw %d-SNP grid.", label, raw_n)
+    return display
+
+
+def _align_ld_matrix_to_site_keys(
+    ld_mat: np.ndarray,
+    matrix_keys: Sequence[tuple[str, int]],
+    target_keys: Sequence[tuple[str, int]],
+) -> np.ndarray:
+    """Put a partial genotype LD matrix back on the full requested SNP grid.
+
+    ``--ldblock-all`` is defined by the Manhattan SNP universe.  A genotype
+    backend can return fewer rows when a requested coordinate is absent from
+    the genotype file, so the matrix must be expanded before display and
+    bridge coordinates are built.  Missing rows remain zero-LD slots; their
+    Manhattan-to-LD connector is still retained.
+    """
+    target = [
+        (_normalize_chr(chrom), int(pos))
+        for chrom, pos in target_keys
+    ]
+    target_n = max(2, len(target))
+    out = np.zeros((target_n, target_n), dtype=np.float32)
+    matrix = np.asarray(ld_mat, dtype=np.float32)
+    if (
+        matrix.ndim != 2
+        or matrix.shape[0] != matrix.shape[1]
+        or len(matrix_keys) == 0
+        or matrix.shape[0] == 0
+    ):
+        return out
+
+    target_index = {key: index for index, key in enumerate(target)}
+    source_indices: list[int] = []
+    target_indices: list[int] = []
+    seen: set[tuple[str, int]] = set()
+    source_n = min(int(matrix.shape[0]), len(matrix_keys))
+    for source_index, key in enumerate(matrix_keys[:source_n]):
+        normalized = (_normalize_chr(key[0]), int(key[1]))
+        target_index_value = target_index.get(normalized)
+        if target_index_value is None or normalized in seen:
+            continue
+        seen.add(normalized)
+        source_indices.append(int(source_index))
+        target_indices.append(int(target_index_value))
+
+    if len(source_indices) == 0:
+        return out
+    source_arr = np.asarray(source_indices, dtype=np.int64)
+    target_arr = np.asarray(target_indices, dtype=np.int64)
+    out[np.ix_(target_arr, target_arr)] = matrix[np.ix_(source_arr, source_arr)]
     return out
 
 
@@ -7139,6 +7375,671 @@ def _lead_vs_all_r2(
     r2 = np.square(corr)
     r2 = np.nan_to_num(r2, nan=0.0, posinf=0.0, neginf=0.0)
     return r2.astype(np.float32, copy=False)
+
+
+def _postgwas_top_variant_metadata_path(
+    genotype_prefix: object,
+) -> tuple[str, Path, str]:
+    kind = _postgwas_plink_kind(genotype_prefix)
+    prefix = _normalize_plink_prefix(genotype_prefix)
+    if kind == "pfile":
+        return kind, Path(pvar_path_for_prefix(prefix)), "PVAR"
+    if kind == "bfile":
+        return kind, Path(f"{prefix}.bim"), "BIM"
+    raise ValueError("-top requires a PLINK -bfile or -pfile input.")
+
+
+def _postgwas_iter_variant_metadata(
+    genotype_prefix: object,
+) -> Iterable[tuple[str, str, int, Optional[str]]]:
+    """Yield raw and normalized chromosome metadata from BIM/PVAR."""
+    kind, variant_path, variant_label = _postgwas_top_variant_metadata_path(
+        genotype_prefix
+    )
+    if not variant_path.is_file():
+        raise FileNotFoundError(f"{variant_label} file not found: {variant_path}")
+
+    with open_text_auto(str(variant_path), errors="replace") as handle:
+        columns: Optional[dict[str, int]] = None
+        for line_number, line in enumerate(handle, start=1):
+            stripped = line.strip()
+            if stripped == "":
+                continue
+            if kind == "pfile":
+                if stripped.startswith("##"):
+                    continue
+                tokens = stripped.split()
+                if stripped.startswith("#"):
+                    columns = {
+                        value.lstrip("#").upper(): index
+                        for index, value in enumerate(tokens)
+                    }
+                    required = {"CHROM", "POS", "ID"}
+                    missing = required.difference(columns)
+                    if missing:
+                        raise ValueError(
+                            f"PVAR header is missing required columns: {', '.join(sorted(missing))}"
+                        )
+                    continue
+                if columns is None:
+                    raise ValueError("PVAR header is missing.")
+                try:
+                    raw_chrom = str(tokens[columns["CHROM"]]).strip()
+                    chrom = _normalize_chr(raw_chrom)
+                    pos = int(float(tokens[columns["POS"]]))
+                    snp_id = _postgwas_variant_token(tokens[columns["ID"]])
+                except (IndexError, TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"Malformed PVAR row at line {line_number}"
+                    ) from exc
+            else:
+                tokens = stripped.split()
+                if len(tokens) < 4:
+                    raise ValueError(f"Malformed BIM row at line {line_number}")
+                raw_chrom = str(tokens[0]).strip()
+                chrom = _normalize_chr(raw_chrom)
+                try:
+                    pos = int(float(tokens[3]))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"Invalid BIM position at line {line_number}"
+                    ) from exc
+                snp_id = _postgwas_variant_token(tokens[1])
+
+            if raw_chrom == "":
+                continue
+            yield raw_chrom, chrom, pos, snp_id
+
+
+def _postgwas_resolve_top_site(
+    genotype_prefix: object,
+    top_spec: object,
+) -> tuple[tuple[str, int], str]:
+    """Resolve ``-top`` from an exact SNP ID or ``chr:pos`` coordinate."""
+    text = str(top_spec).strip()
+    if text == "":
+        raise ValueError("-top cannot be empty.")
+
+    coordinate_match = re.fullmatch(r"(.+):([0-9]+)", text)
+    requested_site: Optional[tuple[str, int]] = None
+    requested_id: Optional[str] = None
+    if coordinate_match is not None:
+        requested_site = (
+            _normalize_chr(coordinate_match.group(1)),
+            int(coordinate_match.group(2)),
+        )
+    else:
+        requested_id = text
+
+    _, _, variant_label = _postgwas_top_variant_metadata_path(genotype_prefix)
+    hits: list[tuple[str, int, Optional[str]]] = []
+    for _, chrom, pos, snp_id in _postgwas_iter_variant_metadata(genotype_prefix):
+        if requested_site is not None:
+            if (chrom, pos) == requested_site:
+                hits.append((chrom, pos, snp_id))
+        elif snp_id == requested_id:
+            hits.append((chrom, pos, snp_id))
+
+    if len(hits) == 0:
+        target = (
+            f"{requested_site[0]}:{requested_site[1]}"
+            if requested_site is not None
+            else repr(requested_id)
+        )
+        raise ValueError(f"-top variant {target} was not found in {variant_label}.")
+
+    unique_sites = list(dict.fromkeys((chrom, int(pos)) for chrom, pos, _ in hits))
+    if len(unique_sites) != 1:
+        raise ValueError(
+            f"-top SNP ID {requested_id!r} is ambiguous in {variant_label}: "
+            + ", ".join(f"{chrom}:{pos}" for chrom, pos in unique_sites[:8])
+        )
+    site = unique_sites[0]
+    resolved_label = str(requested_id) if requested_id is not None else f"{site[0]}:{site[1]}"
+    return site, resolved_label
+
+
+def _postgwas_expand_top_specs(raw_top: object) -> list[str]:
+    """Normalize repeated and comma/semicolon-separated ``-top`` values."""
+    if raw_top is None:
+        return []
+    if isinstance(raw_top, (list, tuple)):
+        raw_values = list(raw_top)
+    else:
+        raw_values = [raw_top]
+
+    specs: list[str] = []
+    for raw_value in raw_values:
+        text = str(raw_value).strip()
+        if text == "":
+            continue
+        for item in re.split(r"[,;]", text):
+            value = str(item).strip()
+            if value != "":
+                specs.append(value)
+    return specs
+
+
+def _postgwas_bimrange_index_for_site(
+    site: tuple[str, int],
+    bimranges: Sequence[tuple[str, int, int]],
+) -> Optional[int]:
+    """Return the local-range index containing a normalized SNP site."""
+    chrom, position = _normalize_chr(site[0]), int(site[1])
+    for index, (range_chrom, start, end) in enumerate(bimranges):
+        if (
+            _normalize_chr(range_chrom) == chrom
+            and int(start) <= position <= int(end)
+        ):
+            return int(index)
+    return None
+
+
+def _postgwas_resolve_top_entries(
+    genotype_prefix: object,
+    raw_top: object,
+    bimranges: Optional[Sequence[tuple[str, int, int]]],
+) -> list[tuple[tuple[str, int], str, Optional[int]]]:
+    """Resolve one top SNP per local range, preserving a single-value shortcut.
+
+    The returned tuple is ``(site, display_label, range_index)``.  One top
+    value can still be used for a whole local plot; with multiple bimranges,
+    repeated values are matched in the sorted/merged bimrange order.
+    """
+    specs = _postgwas_expand_top_specs(raw_top)
+    if len(specs) == 0:
+        return []
+
+    ranges = list(bimranges or [])
+    if len(ranges) <= 1 and len(specs) > 1:
+        raise ValueError(
+            "Multiple -top values require one -bimrange per top SNP."
+        )
+    if len(ranges) > 1 and len(specs) not in {1, len(ranges)}:
+        raise ValueError(
+            f"Received {len(specs)} -top values for {len(ranges)} bimranges; "
+            "provide one -top per bimrange, or one value to apply to the whole plot."
+        )
+
+    entries: list[tuple[tuple[str, int], str, Optional[int]]] = []
+    for index, spec in enumerate(specs):
+        site, label = _postgwas_resolve_top_site(genotype_prefix, spec)
+        range_index: Optional[int]
+        if len(ranges) == len(specs) and len(ranges) > 1:
+            range_index = int(index)
+            containing_range = _postgwas_bimrange_index_for_site(site, ranges)
+            if containing_range != range_index:
+                range_text = _format_bimrange_tuple(ranges[range_index])
+                raise ValueError(
+                    f"-top {label} resolves to {site[0]}:{site[1]}, which is outside "
+                    f"its corresponding bimrange {range_text}."
+                )
+        else:
+            range_index = None
+        entries.append((site, label, range_index))
+    return entries
+
+
+def _postgwas_find_genotype_sites(
+    genotype_prefix: object,
+    requested_sites: Sequence[tuple[str, int]],
+) -> dict[tuple[str, int], tuple[str, int]]:
+    """Map normalized sites to the exact chromosome spelling in BIM/PVAR."""
+    requested: list[tuple[str, int]] = []
+    for chrom, pos in requested_sites:
+        key = (_normalize_chr(chrom), int(pos))
+        if key not in requested:
+            requested.append(key)
+    wanted = set(requested)
+    found: dict[tuple[str, int], tuple[str, int]] = {}
+    if len(wanted) == 0:
+        return found
+
+    for raw_chrom, chrom, pos, _ in _postgwas_iter_variant_metadata(genotype_prefix):
+        key = (chrom, int(pos))
+        if key in wanted and key not in found:
+            found[key] = (raw_chrom, int(pos))
+            if len(found) == len(wanted):
+                break
+    return found
+
+
+def _postgwas_load_genotype_rows_allow_missing(
+    genofile: str,
+    sites: Sequence[tuple[str, int]],
+    *,
+    chunk_size: int,
+    query_sites: Optional[Sequence[tuple[str, int]]] = None,
+) -> tuple[np.ndarray, list[tuple[str, int]]]:
+    """Load a bounded site block while retaining only sites found in genotype."""
+    requested: list[tuple[str, int]] = []
+    for chrom, pos in sites:
+        key = (_normalize_chr(chrom), int(pos))
+        if key not in requested:
+            requested.append(key)
+    if len(requested) == 0:
+        return np.zeros((0, 0), dtype=np.float32), []
+
+    exact_query_sites = (
+        [(str(chrom).strip(), int(pos)) for chrom, pos in query_sites]
+        if query_sites is not None
+        else list(requested)
+    )
+    if len(exact_query_sites) != len(requested):
+        raise ValueError(
+            "Exact genotype query sites must correspond one-to-one with requested sites."
+        )
+
+    row_by_key: dict[tuple[str, int], np.ndarray] = {}
+    try:
+        chunks = load_genotype_chunks(
+            str(genofile),
+            chunk_size=max(1, int(chunk_size)),
+            maf=0.0,
+            missing_rate=1.0,
+            impute=True,
+            snp_sites=exact_query_sites,
+        )
+        for chunk, returned_sites in chunks:
+            genotype = np.asarray(chunk, dtype=np.float32)
+            if genotype.ndim != 2 or genotype.shape[0] != len(returned_sites):
+                raise RuntimeError(
+                    "-top genotype chunk and site metadata have inconsistent shapes"
+                )
+            for row_index, site in enumerate(returned_sites):
+                key = (_normalize_chr(getattr(site, "chrom")), int(getattr(site, "pos")))
+                if key not in row_by_key:
+                    row_by_key[key] = np.array(
+                        genotype[row_index], dtype=np.float32, copy=True
+                    )
+    except (RuntimeError, ValueError) as exc:
+        message = str(exc).lower()
+        if "snp site" in message and (
+            "not found" in message or "no snps matched" in message
+        ):
+            return np.zeros((0, 0), dtype=np.float32), []
+        raise
+
+    matched = [site for site in requested if site in row_by_key]
+    if len(matched) == 0:
+        return np.zeros((0, 0), dtype=np.float32), []
+    rows = np.vstack([row_by_key[site] for site in matched]).astype(
+        np.float32, copy=False
+    )
+    return np.ascontiguousarray(rows), matched
+
+
+def _postgwas_compute_top_ld_r2(
+    genofile: str,
+    top_site: tuple[str, int],
+    candidate_sites: Sequence[tuple[str, int]],
+    *,
+    logger: Optional[logging.Logger] = None,
+    block_size: int = 20_000,
+) -> tuple[dict[tuple[str, int], float], int]:
+    """Compute top-SNP r2 values in bounded genotype blocks."""
+    unique_candidates: list[tuple[str, int]] = []
+    for chrom, pos in candidate_sites:
+        key = (_normalize_chr(chrom), int(pos))
+        if key not in unique_candidates:
+            unique_candidates.append(key)
+
+    genotype_sites = _postgwas_find_genotype_sites(
+        genofile,
+        [top_site, *unique_candidates],
+    )
+    top_query_site = genotype_sites.get(top_site)
+    if top_query_site is None:
+        raise RuntimeError(
+            f"genotype data for top SNP {top_site[0]}:{top_site[1]} could not be loaded"
+        )
+
+    lead_block, lead_keys = _postgwas_load_genotype_rows_allow_missing(
+        genofile,
+        [top_site],
+        chunk_size=1,
+        query_sites=[top_query_site],
+    )
+    if len(lead_keys) != 1 or lead_block.shape[0] != 1:
+        raise RuntimeError(
+            f"genotype data for top SNP {top_site[0]}:{top_site[1]} could not be loaded"
+        )
+    lead = np.ascontiguousarray(lead_block[:1], dtype=np.float32)
+    r2_by_site: dict[tuple[str, int], float] = {top_site: 1.0}
+    unique_candidate_set = set(unique_candidates)
+    matched_candidates = [
+        site
+        for site in genotype_sites
+        if site != top_site and site in unique_candidate_set
+    ]
+    missing = len(unique_candidates) - sum(
+        1 for site in unique_candidates if site in genotype_sites
+    )
+    if len(matched_candidates) > 0:
+        query_sites = [genotype_sites[site] for site in matched_candidates]
+        try:
+            chunks = load_genotype_chunks(
+                str(genofile),
+                chunk_size=max(1, int(block_size)),
+                maf=0.0,
+                missing_rate=1.0,
+                impute=True,
+                snp_sites=query_sites,
+            )
+            for block, returned_sites in chunks:
+                genotype = np.asarray(block, dtype=np.float32)
+                if genotype.ndim != 2 or genotype.shape[0] != len(returned_sites):
+                    raise RuntimeError(
+                        "-top genotype chunk and site metadata have inconsistent shapes"
+                    )
+                if genotype.shape[0] == 0:
+                    continue
+                if genotype.shape[1] != lead.shape[1]:
+                    raise RuntimeError(
+                        "-top genotype blocks have inconsistent sample counts"
+                    )
+                r2_values = _lead_vs_all_r2(
+                    np.vstack((lead, genotype))
+                )[1:]
+                for site, value in zip(returned_sites, r2_values.tolist()):
+                    key = (
+                        _normalize_chr(getattr(site, "chrom")),
+                        int(getattr(site, "pos")),
+                    )
+                    r2_by_site[key] = float(np.clip(value, 0.0, 1.0))
+        except (RuntimeError, ValueError) as exc:
+            message = str(exc).lower()
+            if "snp site" in message and (
+                "not found" in message or "no snps matched" in message
+            ):
+                missing += len(matched_candidates)
+            else:
+                raise
+
+    if logger is not None and missing > 0:
+        logger.warning(
+            "Warning: -top could not find genotype rows for %d Manhattan SNP(s); "
+            "those points use neutral gray.",
+            int(missing),
+        )
+    return r2_by_site, int(missing)
+
+
+def _resolve_top_ld_cmap(
+    spec: Optional[Tuple[str, Any]],
+) -> mcolors.Colormap:
+    """Resolve the LD gradient used by ``-top``.
+
+    The default uses a high-contrast journal-style palette: deep navy,
+    publication blue, cyan/teal, amber, and red.  An explicit ``-palette``
+    controls this gradient directly.
+    """
+    if spec is None:
+        return mcolors.LinearSegmentedColormap.from_list(
+            "janusx_top_ld_reference",
+            list(_POSTGWAS_TOP_LD_REFERENCE_PALETTE),
+        )
+    mode, payload = spec
+    if mode == "list":
+        colors = [mcolors.to_hex(mcolors.to_rgba(c)) for c in list(payload)]
+        if len(colors) == 1:
+            colors = _expand_single_palette_color(colors[0])
+        return mcolors.LinearSegmentedColormap.from_list(
+            "janusx_top_ld_palette", colors
+        )
+    return plt.get_cmap(str(payload))
+
+
+def _postgwas_top_ld_color(ld_cmap: mcolors.Colormap, r2: object) -> str:
+    try:
+        value = float(r2)
+    except (TypeError, ValueError):
+        return str(_POSTGWAS_TOP_LD_NEUTRAL_COLOR)
+    if not np.isfinite(value):
+        return str(_POSTGWAS_TOP_LD_NEUTRAL_COLOR)
+    try:
+        return mcolors.to_hex(ld_cmap(float(np.clip(value, 0.0, 1.0))))
+    except (TypeError, ValueError):
+        return str(_POSTGWAS_TOP_LD_NEUTRAL_COLOR)
+
+
+def _draw_postgwas_top_ld_manhattan(
+    ax: plt.Axes,
+    plotmodel: GWASPLOT,
+    *,
+    top_ld_cmap: mcolors.Colormap,
+    base_color_by_chr: dict[str, str],
+    r2_by_site: dict[tuple[str, int], float],
+    top_site: tuple[str, int],
+    marker: str,
+    min_logp: float,
+    max_logp: Optional[float],
+    y_min: Optional[float],
+    y_label: Optional[str],
+    scatter_size: float,
+    scatter_alpha: Optional[float],
+    rasterized: bool,
+    ignore: Optional[list[object]] = None,
+    top_sites: Optional[Sequence[tuple[str, int]]] = None,
+    r2_by_top: Optional[Sequence[dict[tuple[str, int], float]]] = None,
+    top_index_by_site: Optional[dict[tuple[str, int], int]] = None,
+) -> Optional[tuple[float, float]]:
+    """Draw a Manhattan layer shaded by r2 to one or more top SNPs.
+
+    ``top_index_by_site`` assigns each plotted SNP to the top SNP for its
+    local bimrange. Points are drawn from low to high r2 so stronger-LD
+    points remain visible on top when markers overlap. The original
+    single-top arguments remain supported for callers that do not use
+    multiple local ranges.
+    """
+    resolved_top_sites = list(top_sites or [top_site])
+    if len(resolved_top_sites) == 0:
+        resolved_top_sites = [top_site]
+    resolved_r2_by_top = list(r2_by_top or [r2_by_site])
+    if len(resolved_r2_by_top) < len(resolved_top_sites):
+        resolved_r2_by_top.extend(
+            [{} for _ in range(len(resolved_top_sites) - len(resolved_r2_by_top))]
+        )
+    df = plotmodel.df.iloc[plotmodel.minidx, -3:].copy()
+    df["y"] = plotmodel._to_logp(df["y"])
+    if min_logp is not None:
+        df = df[df["y"] >= float(min_logp)]
+    if max_logp is not None:
+        df = df[df["y"] <= float(max_logp)]
+
+    axis_y_label = "-log10(p-value)" if y_label is None else str(y_label)
+    if df.shape[0] == 0:
+        ax.text(0.5, 0.5, "No SNPs", ha="center", va="center", transform=ax.transAxes)
+        ax.set_xticks(plotmodel.ticks_loc, plotmodel.chr_labels)
+        ax.set_xlabel("Chromosome")
+        ax.set_ylabel(axis_y_label)
+        return None
+
+    chr_by_id = getattr(plotmodel, "_chr_label_by_id", {})
+    colors: list[str] = []
+    draw_r2: list[float] = []
+    top_candidates: list[list[tuple[float, float]]] = [
+        [] for _ in resolved_top_sites
+    ]
+    for index, x_value, y_value in df[["x", "y"]].itertuples(
+        index=True,
+        name=None,
+    ):
+        try:
+            chromosome = _normalize_chr(chr_by_id.get(int(index[0]), index[0]))
+            position = int(index[1])
+        except (IndexError, TypeError, ValueError):
+            chromosome = ""
+            position = -1
+        site_key = (chromosome, position)
+        top_index: Optional[int] = None
+        if top_index_by_site is not None:
+            top_index = top_index_by_site.get(site_key)
+        elif len(resolved_top_sites) == 1:
+            top_index = 0
+        r2_value: object = None
+        if top_index is not None and 0 <= int(top_index) < len(resolved_r2_by_top):
+            r2_value = resolved_r2_by_top[int(top_index)].get(site_key)
+            colors.append(
+                _postgwas_top_ld_color(
+                    top_ld_cmap,
+                    r2_value,
+                )
+            )
+        else:
+            colors.append(str(_POSTGWAS_TOP_LD_NEUTRAL_COLOR))
+        try:
+            numeric_r2 = float(r2_value)
+        except (TypeError, ValueError):
+            numeric_r2 = -1.0
+        draw_r2.append(
+            float(np.clip(numeric_r2, 0.0, 1.0))
+            if np.isfinite(numeric_r2)
+            else -1.0
+        )
+        for candidate_index, candidate_site in enumerate(resolved_top_sites):
+            if site_key == candidate_site:
+                top_candidates[candidate_index].append(
+                    (float(x_value), float(y_value))
+                )
+
+    if ignore is None:
+        ignore = []
+    draw_mask = ~df.index.isin(ignore)
+    draw_indices = np.flatnonzero(draw_mask)
+    if draw_indices.size > 1:
+        # Stable ascending order keeps the input order for tied LD values,
+        # while ensuring the largest r2 values are rendered last.
+        draw_order = np.argsort(
+            np.asarray(draw_r2, dtype=float)[draw_indices],
+            kind="mergesort",
+        )
+        draw_indices = draw_indices[draw_order]
+    draw_df = df.iloc[draw_indices][["x", "y"]]
+    draw_colors = np.asarray(colors, dtype=object)[draw_indices]
+    plot_kwargs: dict[str, object] = {
+        "alpha": float(scatter_alpha) if scatter_alpha is not None else 0.78,
+        "rasterized": rasterized,
+        "zorder": 2,
+    }
+    plot_kwargs.update(_marker_scatter_style(str(marker)))
+    ax.scatter(
+        draw_df["x"],
+        draw_df["y"],
+        color=draw_colors,
+        marker=str(marker),
+        s=float(scatter_size),
+        **plot_kwargs,
+    )
+
+    if plotmodel._chr_separators.size > 0:
+        for xsep in plotmodel._chr_separators:
+            if np.isfinite(xsep):
+                ax.axvline(
+                    float(xsep),
+                    ymin=0.0,
+                    ymax=1.0 / 3.0,
+                    linestyle="--",
+                    color="lightgrey",
+                    linewidth=0.6,
+                    alpha=0.8,
+                    zorder=0,
+                )
+    ax.set_xticks(plotmodel.ticks_loc, plotmodel.chr_labels)
+    if plotmodel._chr_bounds_min.size > 0 and plotmodel._chr_bounds_max.size > 0:
+        xmin = float(plotmodel._chr_bounds_min[0]) - float(plotmodel._edge_padding_x)
+        xmax = float(plotmodel._chr_bounds_max[-1]) + float(plotmodel._edge_padding_x)
+    else:
+        xmin = float(df["x"].min())
+        xmax = float(df["x"].max())
+    if xmax > xmin:
+        ax.set_xlim(xmin, xmax)
+    else:
+        eps = max(1e-9, abs(xmin) * 1e-9)
+        ax.set_xlim(xmin - eps, xmax + eps)
+    ax.margins(x=0.0)
+    base_ymin = float(min_logp) if min_logp is not None else 0.0
+    if y_min is not None:
+        base_ymin = float(y_min)
+    ymax = float(df["y"].max())
+    top = ymax + 0.1 * ymax if ymax > 0 else (base_ymin + 1.0)
+    if top <= base_ymin:
+        top = base_ymin + 1.0
+    ax.set_ylim([base_ymin, top])
+    ax.set_xlabel("Chromosome")
+    ax.set_ylabel(axis_y_label)
+    apply_integer_yticks(ax)
+
+    visible_top_candidates = [
+        (index, max(candidates, key=lambda item: item[1]))
+        for index, candidates in enumerate(top_candidates)
+        if len(candidates) > 0
+    ]
+    if len(visible_top_candidates) == 0:
+        return None
+    for top_index, (top_x, top_y) in visible_top_candidates:
+        top_marker_color = str(_POSTGWAS_TOP_MARKER_COLOR)
+        ax.scatter(
+            [top_x],
+            [top_y],
+            marker="D",
+            s=max(1.0, float(scatter_size) * 1.5),
+            color=top_marker_color,
+            edgecolors="none",
+            linewidths=0.0,
+            zorder=12,
+        )
+
+    legend_handles: list[object] = []
+    for top_index, _ in visible_top_candidates:
+        top_marker_color = str(_POSTGWAS_TOP_MARKER_COLOR)
+        if len(resolved_top_sites) == 1:
+            top_legend_label = "Top SNP"
+        else:
+            # Keep long SNP IDs out of the plot area.  The command log still
+            # records the exact IDs, while the compact legend distinguishes
+            # the top marker assigned to each bimrange.
+            top_legend_label = f"Top {top_index + 1}"
+        legend_handles.append(
+            Line2D(
+                [0],
+                [0],
+                marker="D",
+                linestyle="None",
+                markerfacecolor=top_marker_color,
+                markeredgecolor="none",
+                markeredgewidth=0.0,
+                markersize=6.0,
+                label=top_legend_label,
+            )
+        )
+    for low, high in _POSTGWAS_TOP_LD_BLOCKS:
+        legend_handles.append(
+            Patch(
+                facecolor=_postgwas_top_ld_color(
+                    top_ld_cmap, (float(low) + float(high)) / 2.0
+                ),
+                edgecolor="none",
+                label=f"{low:g}–{high:g}",
+            )
+        )
+    ax.legend(
+        handles=legend_handles,
+        title=r"LD $r^2$",
+        loc="upper right",
+        frameon=False,
+        fontsize=max(5.0, min(7.0, 4.0 + float(scatter_size) * 0.10)),
+        title_fontsize=max(5.5, min(8.0, 4.5 + float(scatter_size) * 0.11)),
+        borderaxespad=0.25,
+        borderpad=0.25,
+        handlelength=1.0,
+        handleheight=0.75,
+        handletextpad=0.3,
+        labelspacing=0.12,
+        markerscale=0.75,
+    )
+    first_top = visible_top_candidates[0][1]
+    return float(first_top[0]), float(first_top[1])
 
 
 def _clean_anno_token(value: object) -> str:
@@ -10517,7 +11418,13 @@ def _load_gene_like_records_from_anno(
     features = ["gene", "five_prime_UTR", "three_prime_UTR", "CDS"]
 
     if _postgwas_annotation_is_gff(annofile, annotation_kind=annotation_kind):
-        if gff_rust_index is not None:
+        # Keep the Parent attribute for transcript-aware gene-panel layout.
+        # The Rust fast path currently returns only feature IDs, which loses
+        # transcript identity and makes multi-isoform panels look fragmented.
+        if (
+            gff_rust_index is not None
+            and os.environ.get("JANUSX_USE_RUST_GENE_PANEL") == "1"
+        ):
             try:
                 chroms = [str(x[0]) for x in bimrange_tuples]
                 starts = [int(x[1]) for x in bimrange_tuples]
@@ -10560,7 +11467,7 @@ def _load_gene_like_records_from_anno(
                 start=int(start),
                 end=int(end),
                 features=features,
-                attr="ID",
+                attr=["ID", "Parent"],
             )
             if hit.shape[0] == 0:
                 continue
@@ -10574,6 +11481,17 @@ def _load_gene_like_records_from_anno(
         out = out.dropna(subset=["start", "end"]).copy()
         out["start"] = out["start"].astype(int)
         out["end"] = out["end"].astype(int)
+        def _normalize_gene_panel_attribute(row: pd.Series) -> object:
+            value = row["attribute"]
+            if str(row["feature"]).lower() != "gene":
+                return value
+            if isinstance(value, (list, tuple, np.ndarray)) and len(value) > 0:
+                values = list(value)
+                values[0] = str(values[0]).removeprefix("gene:")
+                return values
+            return str(value).removeprefix("gene:")
+
+        out["attribute"] = out.apply(_normalize_gene_panel_attribute, axis=1)
         return out[out_cols]
 
     bed = bedreader(annofile)
@@ -10695,35 +11613,62 @@ def _draw_gene_structure_axis(
     *,
     arrow_color: str = "black",
     block_color: str = "grey",
+    utr_color: Optional[str] = None,
+    draw_utr: bool = False,
     line_width: float = 0.5,
-    arrow_step: float = 1_000.0,
+    arrow_step: float = 5_000.0,
     thickness_scale: float = 1.0,
     y_offset: float = 0.0,
+    label_offset: float = 0.24,
     gene_text_size: float = _POSTGWAS_DEFAULT_FONT_SIZE,
 ) -> None:
     """
-    Draw gene/CDS/UTR structure into `ax` using projected x coordinates.
+    Draw gene/CDS structure into `ax` using projected x coordinates.
+
+    Postgwas panels hide UTR blocks by default because dense alternative UTR
+    annotations can dominate a compact multi-gene track.  The lower-level
+    geneplot API keeps UTR rendering available for callers that need it.
     """
     gene_df_plot = gene_df.copy()
     if "attribute" in gene_df_plot.columns:
-        gene_df_plot["attribute"] = gene_df_plot["attribute"].map(_sanitize_plot_text)
+        def _sanitize_gene_attribute(value: object) -> object:
+            if isinstance(value, (list, tuple, np.ndarray)):
+                return [_sanitize_plot_text(item) for item in value]
+            return _sanitize_plot_text(value)
 
+        gene_df_plot["attribute"] = gene_df_plot["attribute"].map(
+            _sanitize_gene_attribute
+        )
+
+    # Keep labels subordinate to the structure track.  The feature scale is
+    # slightly expanded so CDS/UTR blocks remain legible after the label is
+    # reduced, while the backbone line stays the thinnest element.
+    # Keep labels close to the visual scale of the UTR blocks.  The outer
+    # postgwas font size is intentionally larger for Manhattan annotations;
+    # gene names should remain a compact caption inside their lane.
+    effective_label_size = max(2.5, min(4.0, 0.50 * float(gene_text_size)))
+    effective_structure_scale = max(0.85, 1.12 * float(thickness_scale))
+    effective_line_width = max(1.20, min(3.00, 2.80 * float(line_width)))
     draw_gene_structure_records(
         ax,
         gene_df_plot,
         arrow_color=arrow_color,
+        triangle_color="white",
         block_color=block_color,
-        line_width=line_width,
+        utr_color=utr_color,
+        draw_utr=draw_utr,
+        line_width=effective_line_width,
         arrow_step=arrow_step,
-        gene_text_size=float(gene_text_size),
-        thickness_scale=thickness_scale,
+        gene_text_size=effective_label_size,
+        thickness_scale=effective_structure_scale,
         y_offset=y_offset,
+        label_offset=max(0.22, min(0.32, 1.15 * float(label_offset))),
         unknown_strand_as_plus=False,
         label_bbox={
             "facecolor": "white",
-            "alpha": 0.55,
+            "alpha": 0.78,
             "edgecolor": "none",
-            "pad": 0.2,
+            "boxstyle": "round,pad=0.15",
         },
     )
 
@@ -10738,6 +11683,8 @@ def _draw_manh_gene_ld_links(
     gene_route_y: float = -0.08,
     force_line_color: Optional[str] = None,
     nonsig_line_color: str = "grey",
+    link_linewidth: float = 0.35,
+    link_alpha: float = 0.9,
 ) -> None:
     """
     Draw connectors:
@@ -10756,6 +11703,10 @@ def _draw_manh_gene_ld_links(
         return
 
     edge_margin_n = 0.004
+    upper_segments: list[np.ndarray] = []
+    diagonal_segments: list[np.ndarray] = []
+    line_colors: list[str] = []
+    to_figure = fig.transFigure.inverted()
     for x_top, x_ld, is_sig in pairs:
         if not (np.isfinite(x_top) and np.isfinite(x_ld)):
             continue
@@ -10769,34 +11720,45 @@ def _draw_manh_gene_ld_links(
             line_color = str(force_line_color)
         else:
             line_color = "red" if bool(is_sig) else str(nonsig_line_color)
-        upper = ConnectionPatch(
-            xyA=(float(x_top), y_manh_ref),
-            xyB=(x_top_g, float(gene_route_y)),
-            coordsA=ax_manh.transData,
-            coordsB=ax_gene.transData,
-            color=line_color,
-            linewidth=0.35,
-            alpha=0.9,
+        # Convert both cross-axis segments into figure coordinates once and
+        # draw them as two batched collections.  This keeps all-site bridges
+        # editable in SVG while avoiding one ConnectionPatch artist per SNP.
+        p_top = ax_manh.transData.transform((float(x_top), y_manh_ref))
+        p_route = ax_gene.transData.transform((x_top_g, float(gene_route_y)))
+        p_ld = ax_ld.transData.transform((float(x_ld), float(_POSTGWAS_LD_LINK_Y)))
+        p_top_fig = to_figure.transform(p_top)
+        p_route_fig = to_figure.transform(p_route)
+        p_ld_fig = to_figure.transform(p_ld)
+        if not np.isfinite(
+            np.asarray([*p_top_fig, *p_route_fig, *p_ld_fig], dtype=float)
+        ).all():
+            continue
+        upper_segments.append(np.asarray([p_top_fig, p_route_fig], dtype=float))
+        diagonal_segments.append(np.asarray([p_route_fig, p_ld_fig], dtype=float))
+        line_colors.append(line_color)
+
+    if upper_segments:
+        upper_collection = LineCollection(
+            upper_segments,
+            colors=line_colors,
+            linewidths=float(link_linewidth),
+            alpha=float(link_alpha),
+            transform=fig.transFigure,
             clip_on=False,
-            zorder=0.2,
+            zorder=0.1,
         )
-        ax_gene.add_artist(upper)
-        # Draw diagonal segment in real cross-axes geometry so mapping
-        # remains correct even if LD panel width is narrower than middle panel.
-        # Start from a dedicated routing lane below the gene structure so
-        # connectors do not cover the gene body/label.
-        diag = ConnectionPatch(
-            xyA=(x_top_g, float(gene_route_y)),
-            xyB=(float(x_ld), float(_POSTGWAS_LD_LINK_Y)),
-            coordsA=ax_gene.transData,
-            coordsB=ax_ld.transData,
-            color=line_color,
-            linewidth=0.35,
-            alpha=0.9,
+        ax_gene.add_collection(upper_collection, autolim=False)
+    if diagonal_segments:
+        diagonal_collection = LineCollection(
+            diagonal_segments,
+            colors=line_colors,
+            linewidths=float(link_linewidth),
+            alpha=float(link_alpha),
+            transform=fig.transFigure,
             clip_on=False,
-            zorder=10.0,
+            zorder=-0.1,
         )
-        ax_ld.add_artist(diag)
+        ax_ld.add_collection(diagonal_collection, autolim=False)
 
 
 def _format_input_files(files: list[str]) -> str:
@@ -11757,10 +12719,6 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             args,
             manh_ratio=manh_ratio_for_font,
         )
-        gene_panel_h_in = _resolve_postgwas_gene_panel_height_in(
-            float(manh_fontsize_target),
-            width_in=width_in,
-        )
         manh_loc_fontsize = float(manh_fontsize_target)
         manh_ylim = None
         manh_height_in = None
@@ -11784,6 +12742,15 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
         pending_manh_path: Optional[str] = None
 
         plot_colors = None
+        top_site: Optional[tuple[str, int]] = None
+        top_ld_r2_by_site: dict[tuple[str, int], float] = {}
+        top_sites: list[tuple[str, int]] = []
+        top_ld_r2_by_top: list[dict[tuple[str, int], float]] = []
+        top_index_by_site: dict[tuple[str, int], int] = {}
+        top_labels: list[str] = []
+        top_ld_base_colors: dict[str, str] = {}
+        top_ld_cmap = _resolve_top_ld_cmap(args.palette_spec)
+        top_ld_label: Optional[str] = None
         ldblock_style = _resolve_ldblock_style(args.ldblock_palette_spec)
         if plotmodel is not None:
             plot_colors = _manhattan_colors_for_subset(
@@ -11791,6 +12758,135 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 full_chr_labels,
                 df[chr_col].drop_duplicates().tolist(),
             )
+            top_ld_base_colors = {}
+            for i, label in enumerate(plotmodel.chr_labels):
+                try:
+                    base_color = mcolors.to_hex(
+                        mcolors.to_rgba(plot_colors[i % len(plot_colors)])
+                    )
+                except (TypeError, ValueError):
+                    base_color = str(_POSTGWAS_TOP_LD_NEUTRAL_COLOR)
+                top_ld_base_colors[_normalize_chr(label)] = base_color
+            if (
+                bool(getattr(args, "_postgwas_top_enabled", False))
+                and args.manh_ratio is not None
+                and args.plink_input is not None
+            ):
+                try:
+                    stored_top_entries = list(
+                        getattr(args, "_postgwas_top_entries", []) or []
+                    )
+                    if len(stored_top_entries) == 0:
+                        stored_top_site = getattr(args, "_postgwas_top_site", None)
+                        if not (
+                            isinstance(stored_top_site, (tuple, list))
+                            and len(stored_top_site) == 2
+                        ):
+                            stored_top_site, stored_top_label = _postgwas_resolve_top_site(
+                                args.plink_input,
+                                args.top,
+                            )
+                        else:
+                            stored_top_site = (
+                                _normalize_chr(stored_top_site[0]),
+                                int(stored_top_site[1]),
+                            )
+                            stored_top_label = str(
+                                getattr(args, "_postgwas_top_label", None)
+                                or getattr(args, "top", "")
+                            )
+                        stored_top_entries = [
+                            (stored_top_site, str(stored_top_label), None)
+                        ]
+
+                    top_sites = [
+                        (_normalize_chr(entry[0][0]), int(entry[0][1]))
+                        for entry in stored_top_entries
+                    ]
+                    top_labels = [str(entry[1]) for entry in stored_top_entries]
+                    top_site = top_sites[0]
+                    top_ld_label = top_labels[0] if len(top_labels) > 0 else None
+                    candidate_sites: list[tuple[str, int]] = []
+                    numeric_positions = pd.to_numeric(df[pos_col], errors="coerce")
+                    position_values = numeric_positions.to_numpy(
+                        dtype=np.float64,
+                        na_value=np.nan,
+                    )
+                    for chrom, position in zip(df[chr_col], position_values):
+                        if not np.isfinite(position):
+                            continue
+                        candidate_sites.append(
+                            (_normalize_chr(chrom), int(round(float(position))))
+                        )
+                    unique_candidate_sites = list(dict.fromkeys(candidate_sites))
+                    if len(top_sites) == 1:
+                        top_index_by_site = {
+                            site: 0 for site in unique_candidate_sites
+                        }
+                        candidate_sites_by_top = [unique_candidate_sites]
+                    else:
+                        candidate_sites_by_top = [
+                            [] for _ in range(len(top_sites))
+                        ]
+                        ranges = list(args.bimrange_tuples or [])
+                        range_to_top = {
+                            int(entry[2]): top_index
+                            for top_index, entry in enumerate(stored_top_entries)
+                            if entry[2] is not None
+                        }
+                        for site in unique_candidate_sites:
+                            range_index = _postgwas_bimrange_index_for_site(
+                                site,
+                                ranges,
+                            )
+                            top_index = range_to_top.get(range_index)
+                            if top_index is None:
+                                continue
+                            top_index_by_site[site] = int(top_index)
+                            candidate_sites_by_top[int(top_index)].append(site)
+
+                    for top_index, site in enumerate(top_sites):
+                        r2_map, missing_top_rows = _postgwas_compute_top_ld_r2(
+                            str(args.plink_input),
+                            site,
+                            candidate_sites_by_top[top_index],
+                            logger=logger,
+                        )
+                        top_ld_r2_by_top.append(r2_map)
+                        logger.info(
+                            "-top %s resolved to %s:%d; computed LD r2 for %d/%d "
+                            "Manhattan site(s)%s.",
+                            str(top_labels[top_index]),
+                            str(site[0]),
+                            int(site[1]),
+                            int(len(r2_map)),
+                            int(len(candidate_sites_by_top[top_index])),
+                            f" (missing={int(missing_top_rows)})"
+                            if int(missing_top_rows) > 0
+                            else "",
+                        )
+                    top_ld_r2_by_site = (
+                        top_ld_r2_by_top[0]
+                        if len(top_ld_r2_by_top) > 0
+                        else {}
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Warning: -top was ignored for %s: %s",
+                        src,
+                        exc,
+                    )
+                    top_site = None
+                    top_ld_r2_by_site = {}
+                    top_sites = []
+                    top_ld_r2_by_top = []
+                    top_index_by_site = {}
+                    top_labels = []
+                    top_ld_label = None
+        gene_feature_style = _resolve_postgwas_gene_feature_colors(
+            args.palette_spec,
+            scatter_colors=plot_colors,
+        )
         qq_point_color = _resolve_qq_point_color(args.palette_spec)
         qq_band_color = str(_QQ_BAND_COLOR)
         circle_links_df: Optional[pd.DataFrame] = None
@@ -11889,6 +12985,53 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     ax.get_xlim(),
                 )
 
+            def _draw_manhattan_base(
+                *,
+                ignore: Optional[list[object]] = None,
+            ) -> Optional[tuple[float, float]]:
+                if top_site is not None and len(top_ld_r2_by_site) > 0:
+                    return _draw_postgwas_top_ld_manhattan(
+                        ax,
+                        plotmodel,
+                        top_ld_cmap=top_ld_cmap,
+                        base_color_by_chr=top_ld_base_colors,
+                        r2_by_site=top_ld_r2_by_site,
+                        top_site=top_site,
+                        marker=single_marker,
+                        min_logp=manh_min_logp,
+                        max_logp=manh_max_logp,
+                        y_min=manh_ymin,
+                        y_label=_postgwas_manhattan_y_label(
+                            p_col,
+                            no_logtrans=no_logtrans,
+                        ),
+                        scatter_size=single_scatter_size,
+                        scatter_alpha=single_alpha,
+                        rasterized=rasterized,
+                        ignore=ignore,
+                        top_sites=top_sites,
+                        r2_by_top=top_ld_r2_by_top,
+                        top_index_by_site=top_index_by_site,
+                    )
+                plotmodel.manhattan(
+                    None,
+                    ax=ax,
+                    color_set=plot_colors,
+                    marker=single_marker,
+                    min_logp=manh_min_logp,
+                    max_logp=manh_max_logp,
+                    y_min=manh_ymin,
+                    y_label=_postgwas_manhattan_y_label(
+                        p_col,
+                        no_logtrans=no_logtrans,
+                    ),
+                    s=single_scatter_size,
+                    alpha=(float(single_alpha) if single_alpha is not None else 0.78),
+                    ignore=ignore,
+                    rasterized=rasterized,
+                )
+                return None
+
             if args.highlight:
                 # Match by coordinate, not by unique MultiIndex lookup:
                 # GARFIELD may have multiple rows at one endpoint.
@@ -11898,22 +13041,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 )
                 if not bool(np.any(hl_mask)):
                     logger.warning("Nothing to highlight. Check the BED file.")
-                    plotmodel.manhattan(
-                        None,
-                        ax=ax,
-                        color_set=plot_colors,
-                        marker=single_marker,
-                        min_logp=manh_min_logp,
-                        max_logp=manh_max_logp,
-                        y_min=manh_ymin,
-                        y_label=_postgwas_manhattan_y_label(
-                            p_col,
-                            no_logtrans=no_logtrans,
-                        ),
-                        s=single_scatter_size,
-                        alpha=(float(single_alpha) if single_alpha is not None else 0.78),
-                        rasterized=rasterized,
-                    )
+                    _draw_manhattan_base()
                     _overlay_postgwas_manhattan_hits(
                         ax,
                         plotmodel,
@@ -11977,23 +13105,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                             zorder=11,
                         )
 
-                    plotmodel.manhattan(
-                        None,
-                        ax=ax,
-                        color_set=plot_colors,
-                        marker=single_marker,
-                        min_logp=manh_min_logp,
-                        max_logp=manh_max_logp,
-                        y_min=manh_ymin,
-                        y_label=_postgwas_manhattan_y_label(
-                            p_col,
-                            no_logtrans=no_logtrans,
-                        ),
-                        s=single_scatter_size,
-                        alpha=(float(single_alpha) if single_alpha is not None else 0.78),
-                        ignore=hl_index,
-                        rasterized=rasterized,
-                    )
+                    _draw_manhattan_base(ignore=hl_index)
                     _overlay_postgwas_manhattan_hits(
                         ax,
                         plotmodel,
@@ -12008,22 +13120,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         ignore=hl_index,
                     )
             else:
-                plotmodel.manhattan(
-                    None,
-                    ax=ax,
-                    color_set=plot_colors,
-                    marker=single_marker,
-                    min_logp=manh_min_logp,
-                    max_logp=manh_max_logp,
-                    y_min=manh_ymin,
-                    y_label=_postgwas_manhattan_y_label(
-                        p_col,
-                        no_logtrans=no_logtrans,
-                    ),
-                    s=single_scatter_size,
-                    alpha=(float(single_alpha) if single_alpha is not None else 0.78),
-                    rasterized=rasterized,
-                )
+                _draw_manhattan_base()
                 _overlay_postgwas_manhattan_hits(
                     ax,
                     plotmodel,
@@ -12301,21 +13398,56 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         threads=int(max(0, int(getattr(args, "thread", 0)))),
                         logger=logger,
                     )
-                    # Keep Manhattan->gene/LD mapping lines even when genotype lookup fails:
-                    # fallback to GWAS-derived ld_site_keys if no matched genotype SNP is returned.
-                    if len(sig_keys) > 0:
-                        ld_site_keys = sig_keys
+                    if ld_use_all_sites and ld_mat.shape[0] >= 2:
+                        requested_keys = set(ld_site_keys)
+                        matched_keys = requested_keys.intersection(sig_keys)
+                        missing_n = int(len(requested_keys) - len(matched_keys))
+                        if missing_n > 0:
+                            logger.warning(
+                                f"Warning: {missing_n} requested all-site LD row(s) "
+                                "are absent from genotype data; keeping zero-LD slots "
+                                "for the Manhattan-to-LD bridge."
+                            )
+                        ld_mat = _align_ld_matrix_to_site_keys(
+                            ld_mat,
+                            sig_keys,
+                            ld_site_keys,
+                        )
+                        logger.info(
+                            f"LD block built from {len(matched_keys)}/{len(ld_site_keys)} all SNPs; "
+                            "the full Manhattan SNP grid is retained for bridging."
+                        )
+                    else:
+                        # Threshold mode keeps the historical matched-genotype
+                        # grid.  All-site mode is handled above so its bridge
+                        # always retains every requested Manhattan coordinate.
+                        if not ld_use_all_sites and len(sig_keys) > 0:
+                            ld_site_keys = sig_keys
                     if ld_mat.shape[0] < 2:
                         logger.warning(
                             "Warning: Requested SNPs were not found in genotype data; drawing empty LD block."
                         )
                         ld_mat = np.zeros((n_sig_sites, n_sig_sites), dtype=np.float32)
                         ld_overlay_text = "No matched SNPs"
-                    else:
+                    elif not ld_use_all_sites:
                         mode_text = "all SNPs" if ld_use_all_sites else "threshold-passing SNPs"
                         logger.info(f"LD block built from {len(sig_keys)} {mode_text}.")
 
             region_ranges = args.bimrange_tuples if args.bimrange_tuples is not None else []
+            ld_display = _prepare_postgwas_ld_display(
+                ld_mat,
+                ld_site_keys,
+                region_ranges,
+                target_bins=(
+                    0
+                    if ld_use_all_sites
+                    else getattr(args, "ldblock_bins", 128)
+                ),
+                logger=logger,
+                label="LD block",
+            )
+            ld_display_mat = ld_display.matrix
+            ld_site_to_bin = ld_display.site_to_bin
             region_layout = (
                 bim_layout
                 if len(bim_layout) > 0
@@ -12356,25 +13488,29 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     )
                 else:
                     use_gene_bridge = True
+                    gene_lane_count = gene_structure_lane_count(
+                        gene_track_df,
+                        gene_text_size=float(manh_fontsize_target),
+                    )
 
             ld_cmap = "Greys"
-            gene_block_color = "grey"
-            gene_line_color = "black"
             if ldblock_style is not None:
                 ld_cmap = ldblock_style["ld_cmap"]
-                gene_block_color = str(ldblock_style["gene_block_color"])
-                gene_line_color = str(ldblock_style["gene_line_color"])
+            gene_block_color = str(gene_feature_style["cds_color"])
+            gene_utr_color = str(gene_feature_style["utr_color"])
+            gene_line_color = "black"
 
             def _draw_ld_axis(ax: plt.Axes) -> None:
                 LDblock(
-                    ld_mat,
+                    ld_display_mat,
                     ax=ax,
                     vmin=0,
                     vmax=1,
                     cmap=ld_cmap,
                     rasterize_threshold=100,
+                    block_intervals=ld_display.block_intervals,
                 )
-                n_ld = max(2, int(ld_mat.shape[0]))
+                n_ld = max(2, int(ld_display_mat.shape[0]))
                 # Keep LD triangle body filling the whole panel width.
                 ax.set_xlim(0.5, float(n_ld) - 0.5)
                 ax.margins(x=0.0)
@@ -12395,14 +13531,27 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 if plotmodel is None or len(ld_site_keys) == 0:
                     return []
 
-                # Keep mapping behavior consistent with Manhattan plotting:
-                # use compressed subset (minidx), then select by ld mode.
-                map_df = plotmodel.df.iloc[plotmodel.minidx, -3:].copy()
+                # ``--ldblock-all`` must bridge every SNP shown by the
+                # Manhattan panel.  The normal Manhattan renderer may use
+                # ``minidx`` for dense data, but that compression would drop
+                # valid all-site bridge coordinates.
+                if ld_use_all_sites:
+                    map_df = plotmodel.df.iloc[:, -3:].copy()
+                else:
+                    map_df = plotmodel.df.iloc[plotmodel.minidx, -3:].copy()
                 p_vals = pd.to_numeric(map_df["y"], errors="coerce").to_numpy(dtype=float)
                 keep_mask = _postgwas_valid_p_mask(
                     p_vals,
                     no_logtrans=no_logtrans,
                 )
+                y_plot = _postgwas_plot_logp_values(
+                    p_vals,
+                    no_logtrans=no_logtrans,
+                )
+                keep_mask = keep_mask & np.isfinite(y_plot)
+                keep_mask = keep_mask & (y_plot >= float(manh_min_logp))
+                if manh_max_logp is not None:
+                    keep_mask = keep_mask & (y_plot <= float(manh_max_logp))
                 if not ld_use_all_sites:
                     keep_mask = keep_mask & _postgwas_significant_p_mask(
                         p_vals,
@@ -12440,16 +13589,20 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         # For duplicated SNP keys, keep x and merge significance with OR.
                         key_to_meta[key] = (old_x, bool(old_sig or is_sig))
 
-                n_ld = int(ld_mat.shape[0])
-                keys = ld_site_keys[:n_ld]
+                raw_n = min(
+                    int(ld_mat.shape[0]),
+                    int(len(ld_site_keys)),
+                    int(ld_site_to_bin.shape[0]),
+                )
+                keys = ld_site_keys[:raw_n]
                 pairs: list[tuple[float, float, bool]] = []
                 for i, key in enumerate(keys):
                     meta = key_to_meta.get((str(key[0]), int(key[1])))
                     if meta is None:
                         continue
                     x_top, is_sig = meta
-                    # In LDblock, SNP i is centered around x=i+0.5 near the top edge.
-                    x_ld = float(i) + 0.5
+                    # Map each raw SNP to the center of its aggregated display bin.
+                    x_ld = float(ld_site_to_bin[i]) + 0.5
                     pairs.append((x_top, x_ld, bool(is_sig)))
                 return pairs
 
@@ -12514,7 +13667,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 gene_xlim = (0.0, 1.0)
             gene_plot_xlim = manh_xlim if manh_xlim is not None else gene_xlim
 
-            ld_n_sites = max(2, int(ld_mat.shape[0]))
+            ld_n_sites = max(2, int(ld_display_mat.shape[0]))
             ld_h_in = width_in / effective_ldblock_ratio
             ld_min_h_in = width_in * _ld_min_height_over_width(ld_n_sites)
             ld_h_in = max(float(ld_h_in), float(ld_min_h_in))
@@ -12554,7 +13707,15 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             _save_figure_and_close(fig_ld, ld_path)
 
             if use_gene_bridge:
-                gene_h_in = gene_panel_h_in
+                gene_h_in = _resolve_postgwas_gene_panel_height_in(
+                    float(manh_fontsize_target),
+                    width_in=width_in,
+                    lane_count=gene_lane_count,
+                )
+                logger.info(
+                    f"Gene structure panel: {gene_lane_count} lanes, "
+                    f"height={gene_h_in:.2f} in."
+                )
                 fig_gene = plt.figure(
                     figsize=(width_in, gene_h_in),
                     dpi=dpi,
@@ -12565,8 +13726,9 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                     gene_track_df,
                     arrow_color=gene_line_color,
                     block_color=gene_block_color,
+                    utr_color=gene_utr_color,
                     line_width=1.0,
-                    arrow_step=1_000.0,
+                    arrow_step=5_000.0,
                     gene_text_size=manh_fontsize_target,
                 )
                 ax_gene.set_xlim(gene_plot_xlim)
@@ -12586,12 +13748,24 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 manhld_manh_h_in = width_in / manhld_manh_ratio
                 gene_bridge_scale = 0.8
                 mid_gene_y_offset = 0.03
-                mid_gene_ymin = -0.18
-                mid_gene_ymax = 0.22
+                if use_gene_bridge:
+                    mid_gene_ymin, mid_gene_ymax = _resolve_postgwas_gene_axis_ylim(
+                        gene_lane_count,
+                        y_offset=mid_gene_y_offset,
+                        route_gutter=0.18,
+                    )
+                    mid_gene_route_y = mid_gene_ymin + 0.45 * (
+                        mid_gene_y_offset - mid_gene_ymin
+                    )
+                else:
+                    mid_gene_ymin = -0.18
+                    mid_gene_ymax = 0.22
+                    mid_gene_route_y = mid_gene_ymin
                 mid_h_in = _resolve_postgwas_bridge_panel_height_in(
                     float(manh_fontsize_target),
                     width_in=width_in,
                     use_gene_bridge=use_gene_bridge,
+                    lane_count=gene_lane_count if use_gene_bridge else 1,
                 )
                 if ld_panel_xspan is None:
                     ld_panel_frac_in_manh = 1.0
@@ -12605,7 +13779,7 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                 ld_h_in_combo_min = (
                     width_in
                     * ld_panel_frac_in_manh
-                    * _ld_min_height_over_width(max(2, int(ld_mat.shape[0])))
+                    * _ld_min_height_over_width(max(2, int(ld_display_mat.shape[0])))
                 )
                 ld_h_in_combo = max(0.5, float(ld_h_in_combo), float(ld_h_in_combo_min))
                 fig_manhld, combo_axes, _combo_panel_w_in, _combo_panel_heights = _create_stacked_panel_figure(
@@ -12629,8 +13803,9 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         gene_track_df,
                         arrow_color=gene_line_color,
                         block_color=gene_block_color,
+                        utr_color=gene_utr_color,
                         line_width=0.8,
-                        arrow_step=1_000.0,
+                        arrow_step=5_000.0,
                         thickness_scale=gene_bridge_scale,
                         y_offset=mid_gene_y_offset,
                         gene_text_size=float(_tmp_fontsize),
@@ -12665,8 +13840,10 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
                         ax_manhld_top,
                         ax_manhld_bot,
                         bridge_pairs,
-                        gene_route_y=-0.17 * gene_bridge_scale + mid_gene_y_offset,
+                        gene_route_y=mid_gene_route_y,
                         nonsig_line_color="grey",
+                        link_linewidth=(0.18 if ld_use_all_sites else 0.35),
+                        link_alpha=(0.35 if ld_use_all_sites else 0.9),
                     )
                 else:
                     _draw_bridge_axis(
@@ -12692,6 +13869,113 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             gene_path = None
             manhld_path = None
 
+        # ----------------- Manhattan + gene structure -----------------
+        # This panel is useful without LD blocks: it keeps the local GWAS
+        # x-axis and the annotation x-axis exactly aligned while reusing the
+        # same Manhattan renderer (including -top LD shading/marker).
+        manhgene_path = None
+        if (
+            args.manh_ratio is not None
+            and args.anno_file
+            and args.bimrange_tuples is not None
+            and len(args.bimrange_tuples) > 0
+        ):
+            region_ranges = list(args.bimrange_tuples)
+            region_layout = (
+                bim_layout
+                if len(bim_layout) > 0
+                else _build_layout_from_bimrange_tuples(
+                    region_ranges,
+                    interval_ratio=float(args.interval),
+                )
+            )
+            if anno_is_gff and gff_rust_index_cache is None and gff_query_cache is None:
+                gff_query_cache = _postgwas_get_gff_query(
+                    args.anno_file,
+                    use_shared=use_shared_gff,
+                    current=gff_query_cache,
+                )
+            gene_raw = _load_gene_like_records_from_anno(
+                args.anno_file,
+                region_ranges,
+                logger,
+                annotation_kind=getattr(args, "_postgwas_annotation_kind", None),
+                gff_query=gff_query_cache,
+                gff_rust_index=gff_rust_index_cache,
+            )
+            gene_track_df = _project_gene_records_to_plot_x(
+                gene_raw,
+                region_ranges,
+                region_layout,
+                use_segmented_x=len(region_layout) > 1,
+            )
+            if gene_track_df.shape[0] == 0:
+                logger.warning(
+                    "Warning: No gene-structure records found for --manh/--gff/--bimrange; "
+                    "Manhattan+gene panel skipped."
+                )
+            else:
+                gene_label_size = min(7.0, float(manh_fontsize_target))
+                lane_count = gene_structure_lane_count(
+                    gene_track_df,
+                    gene_text_size=gene_label_size,
+                )
+                gene_h_in = _resolve_postgwas_gene_panel_height_in(
+                    float(manh_fontsize_target),
+                    width_in=width_in,
+                    lane_count=lane_count,
+                )
+                fig_manhgene, combo_axes, _, _ = _create_stacked_panel_figure(
+                    panel_width_in=width_in,
+                    panel_heights_in=[width_in / float(args.manh_ratio), gene_h_in],
+                    dpi=dpi,
+                    # The multi-bimrange x labels include both Mb ticks and a
+                    # chromosome caption below the axis.  Leave a real gutter
+                    # before the gene panel so those labels cannot be covered.
+                    vspace_in=max(_PANEL_STACK_VSPACE_IN, 0.28),
+                )
+                ax_manhgene, ax_gene = combo_axes
+                ax_manhgene.set_zorder(5)
+                ax_gene.set_zorder(1)
+                ax_manhgene.tick_params(axis="x", pad=4)
+                _draw_manhattan_axis(ax_manhgene)
+                _draw_gene_structure_axis(
+                    ax_gene,
+                    gene_track_df,
+                    arrow_color="black",
+                    block_color=str(gene_feature_style["cds_color"]),
+                    utr_color=str(gene_feature_style["utr_color"]),
+                    line_width=1.0,
+                    arrow_step=5_000.0,
+                    gene_text_size=gene_label_size,
+                )
+                ax_gene.set_xlim(ax_manhgene.get_xlim())
+                if len(region_layout) > 1:
+                    _apply_multi_bimrange_manhattan_axis(
+                        ax_manhgene,
+                        region_layout,
+                        label_fontsize=float(manh_fontsize_target),
+                    )
+                elif len(region_ranges) == 1:
+                    seg = region_layout[0] if region_layout else None
+                    if seg is not None:
+                        _apply_bimrange_manhattan_axis(
+                            ax_manhgene,
+                            seg["chrom"],
+                            int(seg["start"]),
+                            int(seg["end"]),
+                        )
+                        ax_gene.set_xlim(ax_manhgene.get_xlim())
+                _apply_postgwas_gene_panel_layout(
+                    fig_manhgene,
+                    ax_gene,
+                    x_align_bounds=ax_manhgene.get_position().bounds,
+                )
+                manhgene_path = os.path.join(
+                    args.out, f"{output_stem}.manhgene.{args.format}"
+                )
+                _save_figure_and_close(fig_manhgene, manhgene_path)
+
         saved_paths: list[tuple[str, str]] = []
         if manh_path is not None:
             saved_paths.append(("Manhattan", manh_path))
@@ -12705,6 +13989,8 @@ def GWASplot(file: str, args, logger:logging.Logger) -> None:
             saved_paths.append(("Gene structure", gene_path))
         if manhld_path is not None:
             saved_paths.append(("Manhattan+LD", manhld_path))
+        if manhgene_path is not None:
+            saved_paths.append(("Manhattan+gene", manhgene_path))
 
         if len(saved_paths) == 1:
             log_success(
@@ -12998,6 +14284,10 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
     )
     series_labels = [f"{i + 1}:{os.path.basename(path)}" for i, path in enumerate(files)]
     ldblock_style = _resolve_ldblock_style(args.ldblock_palette_spec)
+    gene_feature_style = _resolve_postgwas_gene_feature_colors(
+        args.palette_spec,
+        scatter_colors=series_colors,
+    )
 
     frames_raw: list[pd.DataFrame] = []
     chrom_sets: list[tuple[int, str, set[str]]] = []
@@ -13402,8 +14692,16 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
         )
 
     def _draw_merge_ld_axis(ax: plt.Axes, *, font_size: float) -> None:
-        LDblock(ld_mat, ax=ax, vmin=0, vmax=1, cmap=ld_cmap, rasterize_threshold=100)
-        n_ld = max(2, int(ld_mat.shape[0]))
+        LDblock(
+            ld_display_mat,
+            ax=ax,
+            vmin=0,
+            vmax=1,
+            cmap=ld_cmap,
+            rasterize_threshold=100,
+            block_intervals=ld_display.block_intervals,
+        )
+        n_ld = max(2, int(ld_display_mat.shape[0]))
         ax.set_xlim(0.5, float(n_ld) - 0.5)
         ax.margins(x=0.0)
         if ld_overlay_text:
@@ -13452,13 +14750,19 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                 old_x, old_sig = key_to_meta[key]
                 key_to_meta[key] = (old_x, bool(old_sig or is_sig))
         pairs: list[tuple[float, float, bool]] = []
-        n_ld = int(ld_mat.shape[0])
-        for i, key in enumerate(ld_keys[:n_ld]):
+        raw_n = min(
+            int(ld_mat.shape[0]),
+            int(len(ld_keys)),
+            int(ld_site_to_bin.shape[0]),
+        )
+        for i, key in enumerate(ld_keys[:raw_n]):
             meta = key_to_meta.get((str(key[0]), int(key[1])))
             if meta is None:
                 continue
             x_top, is_sig = meta
-            pairs.append((float(x_top), float(i) + 0.5, bool(is_sig)))
+            pairs.append(
+                (float(x_top), float(ld_site_to_bin[i]) + 0.5, bool(is_sig))
+            )
         return pairs
 
     def _draw_merge_bridge_axis(
@@ -13742,30 +15046,59 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                     threads=int(max(0, int(getattr(args, "thread", 0)))),
                     logger=logger,
                 )
-                missing_n = int(len(ld_sites) - len(set(sig_keys)))
-                if missing_n > 0:
-                    logger.warning(
-                        f"Warning: {missing_n} requested LD sites are not in genotype data and were ignored."
+                if ld_use_all_sites and ld_mat.shape[0] >= 2:
+                    requested_keys = set(ld_site_keys)
+                    matched_keys = requested_keys.intersection(sig_keys)
+                    missing_n = int(len(requested_keys) - len(matched_keys))
+                    if missing_n > 0:
+                        logger.warning(
+                            f"Warning: {missing_n} requested all-site LD row(s) "
+                            "are absent from genotype data; keeping zero-LD slots "
+                            "for the Manhattan-to-LD bridge."
+                        )
+                    ld_mat = _align_ld_matrix_to_site_keys(
+                        ld_mat,
+                        sig_keys,
+                        ld_site_keys,
                     )
-                if len(sig_keys) > 0:
-                    ld_site_keys = sig_keys
+                    logger.info(
+                        f"Merge LD block built from {len(matched_keys)}/{len(ld_site_keys)} "
+                        "all SNPs; the full Manhattan SNP grid is retained for bridging."
+                    )
+                else:
+                    if not ld_use_all_sites and len(sig_keys) > 0:
+                        ld_site_keys = sig_keys
                 if ld_mat.shape[0] < 2:
                     logger.warning(
                         "Warning: Requested SNPs were not found in genotype data; drawing empty LD block."
                     )
                     ld_mat = np.zeros((n_sig_sites, n_sig_sites), dtype=np.float32)
                     ld_overlay_text = "No matched SNPs"
-                else:
+                elif not ld_use_all_sites:
                     mode_text = "all SNPs" if ld_use_all_sites else "threshold-passing SNPs"
                     logger.info(f"Merge LD block built from {len(sig_keys)} {mode_text}.")
 
+        ld_display = _prepare_postgwas_ld_display(
+            ld_mat,
+            ld_site_keys,
+            region_ranges,
+            target_bins=(
+                0
+                if ld_use_all_sites
+                else getattr(args, "ldblock_bins", 128)
+            ),
+            logger=logger,
+            label="Merge LD block",
+        )
+        ld_display_mat = ld_display.matrix
+        ld_site_to_bin = ld_display.site_to_bin
+
         ld_cmap = "Greys"
-        gene_block_color = "grey"
-        gene_line_color = "black"
         if ldblock_style is not None:
             ld_cmap = ldblock_style["ld_cmap"]
-            gene_block_color = str(ldblock_style["gene_block_color"])
-            gene_line_color = str(ldblock_style["gene_line_color"])
+        gene_block_color = str(gene_feature_style["cds_color"])
+        gene_utr_color = str(gene_feature_style["utr_color"])
+        gene_line_color = "black"
 
         gene_track_df = pd.DataFrame(
             columns=["feature", "strand", "attribute", "x_start", "x_end"]
@@ -13823,6 +15156,10 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                     )
                 else:
                     use_gene_bridge = True
+                    gene_lane_count = gene_structure_lane_count(
+                        gene_track_df,
+                        gene_text_size=float(manh_fontsize if manh_fontsize is not None else 6.0),
+                    )
                     if len(region_layout) > 0:
                         gene_xlim = (
                             float(region_layout[0]["x_start"]),
@@ -13842,6 +15179,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                     gene_h_in = _resolve_postgwas_gene_panel_height_in(
                         gene_fontsize,
                         width_in=width_in,
+                        lane_count=gene_lane_count,
                     )
 
                     fig_gene = plt.figure(
@@ -13854,8 +15192,9 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                         gene_track_df,
                         arrow_color=gene_line_color,
                         block_color=gene_block_color,
+                        utr_color=gene_utr_color,
                         line_width=1.0,
-                        arrow_step=1_000.0,
+                        arrow_step=5_000.0,
                         gene_text_size=gene_fontsize,
                     )
                     ax_gene.set_xlim(gene_plot_xlim)
@@ -13868,7 +15207,13 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                     _save_figure_and_close(fig_gene, gene_path)
 
         ld_h_in = width_in / effective_ldblock_ratio
-        ld_h_in = max(float(ld_h_in), float(width_in * _ld_min_height_over_width(max(2, int(ld_mat.shape[0])))))
+        ld_h_in = max(
+            float(ld_h_in),
+            float(
+                width_in
+                * _ld_min_height_over_width(max(2, int(ld_display_mat.shape[0])))
+            ),
+        )
         fig_ld = plt.figure(figsize=(width_in, ld_h_in), dpi=300)
         ax_ld = fig_ld.add_subplot(111)
         ld_fontsize = float(
@@ -13908,12 +15253,24 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
         manhld_manh_h_in = width_in / float(manhld_ratio)
         gene_bridge_scale = 0.8
         mid_gene_y_offset = 0.03
-        mid_gene_ymin = -0.18
-        mid_gene_ymax = 0.22
+        if use_gene_bridge:
+            mid_gene_ymin, mid_gene_ymax = _resolve_postgwas_gene_axis_ylim(
+                gene_lane_count,
+                y_offset=mid_gene_y_offset,
+                route_gutter=0.18,
+            )
+            mid_gene_route_y = mid_gene_ymin + 0.45 * (
+                mid_gene_y_offset - mid_gene_ymin
+            )
+        else:
+            mid_gene_ymin = -0.18
+            mid_gene_ymax = 0.22
+            mid_gene_route_y = mid_gene_ymin
         mid_h_in = _resolve_postgwas_bridge_panel_height_in(
             manhld_fontsize,
             width_in=width_in,
             use_gene_bridge=use_gene_bridge,
+            lane_count=gene_lane_count if use_gene_bridge else 1,
         )
         if args.ldblock_xspan is None:
             ld_panel_frac_in_manh = 1.0
@@ -13927,7 +15284,7 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
         ld_h_in_combo_min = (
             width_in
             * ld_panel_frac_in_manh
-            * _ld_min_height_over_width(max(2, int(ld_mat.shape[0])))
+            * _ld_min_height_over_width(max(2, int(ld_display_mat.shape[0])))
         )
         ld_h_in_combo = max(0.5, float(ld_h_in_combo), float(ld_h_in_combo_min))
         fig_manhld, combo_axes, _combo_panel_w_in, _combo_panel_heights = _create_stacked_panel_figure(
@@ -13957,8 +15314,9 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                 gene_track_df,
                 arrow_color=gene_line_color,
                 block_color=gene_block_color,
+                utr_color=gene_utr_color,
                 line_width=1.0,
-                arrow_step=1_000.0,
+                arrow_step=5_000.0,
                 thickness_scale=gene_bridge_scale,
                 y_offset=mid_gene_y_offset,
                 gene_text_size=manhld_fontsize,
@@ -13990,8 +15348,10 @@ def _run_postgwas_merge_manhattan(args, logger: logging.Logger) -> None:
                 ax_manhld_top,
                 ax_manhld_bot,
                 bridge_pairs,
-                gene_route_y=-0.17 * gene_bridge_scale + mid_gene_y_offset,
+                gene_route_y=mid_gene_route_y,
                 nonsig_line_color="grey",
+                link_linewidth=(0.18 if ld_use_all_sites else 0.35),
+                link_alpha=(0.35 if ld_use_all_sites else 0.9),
             )
         else:
             _draw_merge_bridge_axis(
@@ -14124,17 +15484,38 @@ def _run_postgwas_ldblock_only(args, logger: logging.Logger) -> None:
     if args.genofile is None:
         ld_site_keys = []
 
+    region_ranges = list(args.bimrange_tuples)
+    ld_display = _prepare_postgwas_ld_display(
+        ld_mat,
+        ld_site_keys,
+        region_ranges,
+        target_bins=(
+            0
+            if args.ldblock_mode == "all"
+            else getattr(args, "ldblock_bins", 128)
+        ),
+        logger=logger,
+        label="LD-only block",
+    )
+    ld_display_mat = ld_display.matrix
+    ld_site_to_bin = ld_display.site_to_bin
+
     ldblock_style = _resolve_ldblock_style(args.ldblock_palette_spec)
+    gene_feature_style = _resolve_postgwas_gene_feature_colors(
+        args.palette_spec,
+    )
     ld_cmap = "Greys"
-    gene_block_color = "grey"
-    gene_line_color = "black"
     if ldblock_style is not None:
         ld_cmap = ldblock_style["ld_cmap"]
-        gene_block_color = str(ldblock_style["gene_block_color"])
-        gene_line_color = str(ldblock_style["gene_line_color"])
+    gene_block_color = str(gene_feature_style["cds_color"])
+    gene_utr_color = str(gene_feature_style["utr_color"])
+    gene_line_color = "black"
 
-    region_ranges = list(args.bimrange_tuples)
-    ld_spans = _ld_bimrange_spans(ld_site_keys, region_ranges)
+    ld_spans = _ld_bimrange_spans(
+        ld_site_keys,
+        region_ranges,
+        site_to_bin=ld_site_to_bin,
+    )
     show_ld_titles = True  # LD-only has no Manhattan panel above.
 
     gene_track_df = pd.DataFrame(columns=["feature", "strand", "attribute", "x_start", "x_end"])
@@ -14177,16 +15558,24 @@ def _run_postgwas_ldblock_only(args, logger: logging.Logger) -> None:
             )
         else:
             use_gene_panel = True
+            gene_lane_count = gene_structure_lane_count(
+                gene_track_df,
+                gene_text_size=float(ld_fontsize),
+            )
 
     ld_h_in = width_in / float(args.ldblock_ratio)
     ld_h_in = max(
         float(ld_h_in),
-        float(width_in * _ld_min_height_over_width(max(2, int(ld_mat.shape[0])))),
+        float(
+            width_in
+            * _ld_min_height_over_width(max(2, int(ld_display_mat.shape[0])))
+        ),
     )
     if use_gene_panel:
         gene_h_in = _resolve_postgwas_gene_panel_height_in(
             float(ld_fontsize),
             width_in=width_in,
+            lane_count=gene_lane_count if use_gene_panel else 1,
         )
         fig_ld = plt.figure(figsize=(width_in, gene_h_in + ld_h_in), dpi=300)
         gs = fig_ld.add_gridspec(2, 1, height_ratios=[gene_h_in, ld_h_in], hspace=0.03)
@@ -14197,6 +15586,7 @@ def _run_postgwas_ldblock_only(args, logger: logging.Logger) -> None:
             gene_track_df,
             arrow_color=gene_line_color,
             block_color=gene_block_color,
+            utr_color=gene_utr_color,
             line_width=0.9,
             arrow_step=1.0,
             gene_text_size=ld_fontsize,
@@ -14206,8 +15596,16 @@ def _run_postgwas_ldblock_only(args, logger: logging.Logger) -> None:
         ax_ld = fig_ld.add_subplot(111)
         ax_gene = None
 
-    LDblock(ld_mat, ax=ax_ld, vmin=0, vmax=1, cmap=ld_cmap, rasterize_threshold=100)
-    n_ld = max(2, int(ld_mat.shape[0]))
+    LDblock(
+        ld_display_mat,
+        ax=ax_ld,
+        vmin=0,
+        vmax=1,
+        cmap=ld_cmap,
+        rasterize_threshold=100,
+        block_intervals=ld_display.block_intervals,
+    )
+    n_ld = max(2, int(ld_display_mat.shape[0]))
     ax_ld.set_xlim(0.5, float(n_ld) - 0.5)
     ax_ld.margins(x=0.0)
     if ld_overlay_text:
@@ -14815,6 +16213,17 @@ def main(argv: Optional[list[str]] = None):
         ),
     )
     manh_group.add_argument(
+        "-top", "--top", dest="top", type=str, action="append", default=None,
+        metavar="SNP_ID|CHR:POS",
+        help=(
+            "Shade single-file Manhattan points by LD r2 to the requested top SNP "
+            "and mark that SNP with a diamond. Repeat -top once per -bimrange "
+            "to use a separate top SNP for each local range; one value applies "
+            "to the whole plot. Requires -manh with exactly one GWAS file "
+            "together with -bfile or -pfile; otherwise the option is ignored."
+        ),
+    )
+    manh_group.add_argument(
         "-interval", "--interval", type=float, default=0.5,
         help=(
             "Chromosome-gap ratio for Manhattan x-axis spacing in [0,1]. "
@@ -14952,6 +16361,7 @@ def main(argv: Optional[list[str]] = None):
         help=(
             "Enable LD block inverted triangle plotting with aspect ratio (width/height), "
             "using all SNPs in selected bimrange. Requires --bimrange. "
+            "The display always keeps one cell per selected SNP; --ldblock-bins is ignored. "
             "You can also pass x-span in Manhattan-width fraction, e.g. 0.2:0.8 or 0.2-0.8 "
             "(then ratio defaults to 2). "
             "If only ratio is given, x-span defaults to 0:1. "
@@ -14969,6 +16379,18 @@ def main(argv: Optional[list[str]] = None):
             "Supports cmap names (e.g. tab10/tab20) or color lists "
             "like 'white;yellow;red' or 'white,yellow,red'. "
             "If omitted, LD block keeps default greyscale."
+        ),
+    )
+    ldblock_group.add_argument(
+        "-ldblock-bins", "--ldblock-bins",
+        dest="ldblock_bins",
+        type=int,
+        default=128,
+        help=(
+            "Maximum number of display bins used to aggregate dense LD blocks "
+            "(default 128). Aggregation preserves each bimrange boundary and "
+            "uses mean r² per bin pair; set 0 to keep every SNP. "
+            "This option applies to --ldblock; --ldblock-all always keeps the full SNP grid."
         ),
     )
 
@@ -15062,7 +16484,7 @@ def main(argv: Optional[list[str]] = None):
         help=(
             "Shared scatter marker size for Manhattan, merged Manhattan, QQ, and merged QQ "
             "Single/non-merge uses the first value only; merge mode cycles values by GWAS file. "
-            f"Default: {_DEFAULT_SCATTER_SIZE:g}."
+            f"Default: {_DEFAULT_SCATTER_SIZE:g}; local --bimrange plots use 36 unless set explicitly."
         ),
     )
     common_group.add_argument(
@@ -15482,6 +16904,10 @@ def main(argv: Optional[list[str]] = None):
         logger.error(str(e))
         raise SystemExit(1)
 
+    if int(getattr(args, "ldblock_bins", 128)) < 0:
+        logger.error("--ldblock-bins must be 0 or a positive integer.")
+        raise SystemExit(1)
+
     try:
         if args.ldclump is not None:
             args.ldclump_window_bp, args.ldclump_r2 = _parse_ldclump_spec(args.ldclump)
@@ -15540,6 +16966,13 @@ def main(argv: Optional[list[str]] = None):
         args.ldblock_ratio = None
         args.ldblock_xspan = None
         args.ldblock_mode = None
+
+    # Local Manhattan panels contain far fewer points than whole-genome plots.
+    # Use a larger default marker so the points occupy a similar visual weight
+    # to the reference local-plot style, while preserving an explicit choice.
+    if args.bimrange_tuples is not None and args.scatter_size_spec is None:
+        args.scatter_size = max(float(args.scatter_size), 36.0)
+        args._postgwas_single_scatter_size = float(args.scatter_size)
 
     args.genofile = args.plink_input or args.vcf or args.hmp or args.geno
     _validate_postgwas_finemap_args(args, parser)
@@ -15676,6 +17109,60 @@ def main(argv: Optional[list[str]] = None):
         single_plot_requested = False
         args._postgwas_single_requested = False
 
+    args._postgwas_top_enabled = False
+    args._postgwas_top_site = None
+    args._postgwas_top_label = None
+    args._postgwas_top_entries = []
+    args._postgwas_top_sites = []
+    args._postgwas_top_labels = []
+    top_specs = _postgwas_expand_top_specs(getattr(args, "top", None))
+    if len(top_specs) > 0:
+        if args.manh_ratio is None or len(args.gwasfile) != 1:
+            logger.warning(
+                "Warning: -top requires -manh with exactly one GWAS file for "
+                "single-file Manhattan plotting; "
+                "the option is ignored."
+            )
+        elif args.plink_input is None or not _is_existing_plink_prefix(args.plink_input):
+            logger.warning(
+                "Warning: -top requires an existing -bfile or -pfile input; "
+                "the option is ignored."
+            )
+        else:
+            try:
+                top_entries = _postgwas_resolve_top_entries(
+                    args.plink_input,
+                    top_specs,
+                    args.bimrange_tuples,
+                )
+            except Exception as exc:
+                logger.warning("Warning: -top was ignored: %s", exc)
+            else:
+                args._postgwas_top_enabled = True
+                args._postgwas_top_entries = list(top_entries)
+                args._postgwas_top_sites = [entry[0] for entry in top_entries]
+                args._postgwas_top_labels = [str(entry[1]) for entry in top_entries]
+                if len(top_entries) > 0:
+                    args._postgwas_top_site = top_entries[0][0]
+                    args._postgwas_top_label = str(top_entries[0][1])
+                for top_index, (top_site, top_label, range_index) in enumerate(
+                    top_entries,
+                    start=1,
+                ):
+                    range_suffix = (
+                        f" for bimrange {int(range_index) + 1}"
+                        if range_index is not None
+                        else ""
+                    )
+                    logger.info(
+                        "-top %d %s resolved to %s:%d%s.",
+                        int(top_index),
+                        str(top_label),
+                        str(top_site[0]),
+                        int(top_site[1]),
+                        range_suffix,
+                    )
+
     if not hasattr(args, "fullscatter"):
         args.fullscatter = bool(getattr(args, "full", False))
 
@@ -15772,7 +17259,9 @@ def main(argv: Optional[list[str]] = None):
             else "auto (matplotlib + CJK fallback)"
         )
         single_manh_pal_text = (
-            "default (black/grey)" if args.palette_spec is None else str(args.palette)
+            "default (blue/cyan/yellow/red)"
+            if args.palette_spec is None
+            else str(args.palette)
         )
         single_qq_pal_text = (
             "default (black; band=grey)"

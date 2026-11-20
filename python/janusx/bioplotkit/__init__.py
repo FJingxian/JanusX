@@ -14,6 +14,8 @@ _LAZY_EXPORTS: dict[str, tuple[str, str | None]] = {
     "apply_integer_yticks": ("janusx.bioplotkit.manhanden", "apply_integer_yticks"),
     "resolve_manhattan_chr_gap": ("janusx.bioplotkit.manhanden", "resolve_manhattan_chr_gap"),
     "LDblock": ("janusx.bioplotkit.LDBlock", "LDblock"),
+    "LDblockDisplay": ("janusx.bioplotkit.LDBlock", "LDblockDisplay"),
+    "prepare_ldblock_display": ("janusx.bioplotkit.LDBlock", "prepare_ldblock_display"),
     "gsplot": ("janusx.bioplotkit.gsplot", None),
     "color_set": ("janusx.bioplotkit.sci_set", "color_set"),
     "marker_set": ("janusx.bioplotkit.sci_set", "marker_set"),

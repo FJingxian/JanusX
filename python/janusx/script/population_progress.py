@@ -1,4 +1,4 @@
-"""Low-overhead terminal progress for the FastPop Rust scans."""
+"""Low-overhead terminal progress for population scans."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ def _stage_bounds(total: int, weights: Sequence[float]) -> tuple[int, ...]:
     return tuple(bounds)
 
 
-class FastPopProgress:
+class PopulationScanProgress:
     """Render coarse Rust scan progress without entering the SNP hot loop.
 
     The Rust backend reports ``(stage, done, total)`` only at BED block

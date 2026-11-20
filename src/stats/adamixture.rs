@@ -1271,7 +1271,7 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
                     packed_row_nonmissing_alt_sumsq_full(row, n_samples);
 
                 let miss_rate = 1.0_f64 - (non_missing as f64 / n_samples_f64);
-                if miss_rate > cfg.missing_rate as f64 {
+                if !crate::gfreader::rate_within_threshold(miss_rate, cfg.missing_rate) {
                     return None;
                 }
                 if non_missing == 0 {
@@ -1284,7 +1284,7 @@ fn try_build_packed_bed_backend(cfg: &StreamRsvdConfig) -> Result<Option<PackedB
                 let p = alt_sum / (2.0 * non_missing as f64);
                 let flip = p > 0.5;
                 let p_minor = if flip { 1.0 - p } else { p };
-                if p_minor < cfg.maf as f64 {
+                if !crate::gfreader::maf_passes_threshold(p_minor, cfg.maf) {
                     return None;
                 }
                 let row_mean = alt_sum / non_missing as f64;

@@ -1,1860 +1,832 @@
-# -*- coding: utf-8 -*-
-"""
-JanusX: FastPop ancestry inference (Rust-kernel backend)
+"""JanusX wrapper for the upstream ADAMIXTURE population analysis CLI.
 
-Examples
---------
-  jx fastpop -bfile data/geno -k 8 -o out/cohort
-  jx fastpop -vcf data/geno.vcf.gz -k 6 -t 16
+``jx adamixture`` owns the JanusX command line contract and output naming.
+Fitting, genotype decoding, optimisation and CV are delegated to the installed
+``adamixture`` executable so there is one implementation of the model.  Marker
+coordinates are referenced from the BED ``.bim`` or PGEN ``.pvar`` used by the
+run; no per-K ``.P.site`` copies are emitted.
 """
 
 from __future__ import annotations
 
 import argparse
-import ctypes
 import gzip
+import io
 import logging
-import math
 import os
+import re
+import shlex
 import socket
 import sys
-import threading
+import tempfile
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
 
-from janusx import janusx as jxrs
-from janusx.adamixture import ADAMixtureConfig, evaluate_adamixture_cverror, train_adamixture
-from janusx.adamixture.core import (
-    _admx_py_mem_debug,
-    _is_admx_memory_limit_error,
-    load_genotype_u8_matrix,
+from janusx.adamixture.external_cli import (
+    ExternalAdmixtureError,
+    resolve_executable,
+    run as run_external_adamixture,
 )
-from janusx.gfreader import inspect_genotype_file
-from ._common.interrupt import force_exit
+from janusx.gfreader import (
+    inspect_genotype_file,
+    load_genotype_chunks,
+    prepare_cli_input_cache,
+    save_genotype_streaming,
+)
 from ._common.cli_args import (
     add_common_genotype_source_args,
-    add_common_memory_arg,
     add_common_out_arg,
     add_common_prefix_arg,
     add_common_thread_arg,
-    add_common_variant_filter_args,
 )
-from ._common.config_render import emit_cli_configuration
-from ._common.genoio import determine_genotype_source_from_args, strip_default_prefix_suffix
 from ._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
+from ._common.config_render import emit_cli_configuration
+from ._common.genoio import (
+    determine_genotype_source_from_args,
+    genotype_load_status_done,
+    genotype_load_status_fail,
+    genotype_load_status_open,
+)
 from ._common.log import setup_logging
 from ._common.outprefix import apply_output_prefix_compat
-from ._common.memory import (
-    DEFAULT_DECODE_MEMORY_GB,
-    decode_memory_gb_to_mb,
-    resolve_decode_block_rows,
-)
 from ._common.pathcheck import (
-    ensure_all_true,
     ensure_file_exists,
     ensure_file_input_exists,
-    format_path_for_display,
     ensure_plink_prefix_exists,
+    format_path_for_display,
 )
 from ._common.progress import (
     CliStatus,
-    build_rich_progress,
+    ProgressBarAdapter,
+    _emit_to_file_handlers,
+    format_elapsed,
     log_success,
     print_failure,
     print_success,
-    rich_progress_available,
     stdout_is_tty,
 )
-from ._common.threads import (
-    apply_blas_thread_env,
-    detect_effective_threads,
-    format_requested_thread_usage,
-    maybe_warn_non_openblas,
-    require_openblas_by_default,
+from ._common.threads import detect_effective_threads
+
+
+_DEFAULT_CV_FOLDS = 5
+
+
+def _log_detail(logger: logging.Logger, message: str, *args: object) -> None:
+    """Write diagnostic details to the run log without terminal noise."""
+
+    try:
+        rendered = str(message) % args if args else str(message)
+    except Exception:
+        rendered = " ".join([str(message), *(str(arg) for arg in args)])
+    if _emit_to_file_handlers(logger, logging.INFO, rendered):
+        return
+    # Keep a useful fallback when logging was intentionally disabled or a
+    # filesystem log could not be opened.
+    logger.info(str(message), *args)
+
+
+_ADAMIXTURE_KEY_LINE_PATTERNS = (
+    r"\b(?:iteration|iter(?:ation)?|epoch|round)\b",
+    r"priming iteration",
+    r"final log[- ]likelihood",
+    r"\b(?:converged|convergence)\b",
+    r"cross[- ]validation",
+    r"\bcv(?: index| score| error)?\b",
+    r"\bcompleted in\b",
+    r"total elapsed time",
+    r"q and p matrices saved",
+    r"\b(?:warning|error|failed)\b",
 )
 
-_DEFAULT_CVERROR_FOLDS = 5
-_ADMX_PROGRESS_BAR_WIDTH = 24
 
+def _adamixture_key_line(line: str) -> str | None:
+    """Keep useful upstream progress without copying its verbose banner."""
 
-def _popstruct_brand() -> dict[str, str]:
-    raw = str(os.environ.get("JANUSX_POPSTRUCT_BRAND", "")).strip().lower()
-    if raw == "fastpop":
-        return {
-            "display": "FastPop",
-            "cli": "fastpop",
-            "app_title": "JanusX - FastPop",
-            "config_title": "FASTPOP CONFIG",
-            "summary_stem": "fastpop",
-            "plot_stem": "fastpop",
-            "run_log_stem": "fastpop",
-            "logger_name": "janusx.fastpop.bootstrap",
-        }
-    return {
-        # Keep `jx adamixture` as a CLI/output alias, but present the module as
-        # FastPop everywhere user-facing.
-        "display": "FastPop",
-        "cli": "adamixture",
-        "app_title": "JanusX - FastPop",
-        "config_title": "FASTPOP CONFIG",
-        "summary_stem": "fastpop",
-        "plot_stem": "fastpop",
-        "run_log_stem": "fastpop",
-        "logger_name": "janusx.fastpop.bootstrap",
-    }
-
-
-def _parse_cv_spec(cv_raw: Optional[str]) -> tuple[bool, int, str]:
-    """
-    Parse CV option:
-      - None        -> disabled
-      - ""/omitted  -> argparse const handles as default folds
-      - "N>=2"      -> N-fold CVerror
-      - "0"         -> disabled
-    Returns: (enabled, cv_value_for_cfg, label)
-    """
-    if cv_raw is None:
-        return False, 0, "off"
-    raw = str(cv_raw).strip().lower()
-    if raw in {"", "none"}:
-        return False, 0, "off"
-    try:
-        n = int(raw)
-    except Exception as ex:
-        raise ValueError(
-            f"Invalid -cv/--cv value: {cv_raw!r}. Use no arg or integer folds."
-        ) from ex
-    if n < 0:
-        raise ValueError(f"-cv/--cv must be >= 0, got {n}.")
-    if n == 0:
-        return False, 0, "off"
-    if n < 2:
-        raise ValueError(f"-cv/--cv must be >= 2 when enabled, got {n}.")
-    return True, int(n), f"{int(n)}-fold"
-
-
-def _option_present(argv: Optional[list[str]], *flags: str) -> bool:
-    args = list(sys.argv[1:] if argv is None else argv)
-    wanted = {str(x) for x in flags}
-    for tok in args:
-        cur = str(tok)
-        if cur in wanted:
-            return True
-        for flag in wanted:
-            if cur.startswith(f"{flag}="):
-                return True
-    return False
-
-
-def _bool_env(name: str, default: bool = True) -> bool:
-    raw = str(os.environ.get(name, "")).strip().lower()
-    if raw == "":
-        return bool(default)
-    return raw not in {"0", "false", "no", "off"}
-
-
-def _resolve_admx_rss_cap_gb_from_env() -> Optional[float]:
-    for name in ("JANUSX_ADMX_MAX_FOOTPRINT_GB", "JANUSX_ADMX_MAX_RSS_GB"):
-        raw = str(os.environ.get(name, "")).strip()
-        if raw == "":
-            continue
-        try:
-            value = float(raw)
-        except Exception:
-            continue
-        if math.isfinite(value) and value > 0.0:
-            return float(value)
+    text = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", str(line)).strip()
+    if not text:
+        return None
+    lowered = text.lower()
+    if any(re.search(pattern, lowered) for pattern in _ADAMIXTURE_KEY_LINE_PATTERNS):
+        return text
     return None
 
 
-class _AdmixtureMemoryWatchdog:
-    def __init__(self, *, limit_gb: float, logger: logging.Logger, interval_s: float = 0.2) -> None:
-        self.limit_gb = float(limit_gb)
-        self.logger = logger
-        self.interval_s = float(max(0.05, interval_s))
-        self.limit_bytes = int(self.limit_gb * (1024.0**3))
-        self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-        self._started = False
-        self._psutil = None
-        self._mac_proc_pid_rusage = None
-        self._mac_rusage_info_v4 = None
+def _adamixture_invocation_command(argv: Optional[list[str]] = None) -> str:
+    """Render the public launcher command consistently in the run log."""
 
-    def start(self) -> None:
-        if not (math.isfinite(self.limit_gb) and self.limit_gb > 0.0):
-            return
+    tokens = [str(value) for value in (sys.argv[1:] if argv is None else argv)]
+    return shlex.join(["jx", "adamixture", *tokens])
+
+
+def _parse_k_spec(raw_spec: str) -> list[int]:
+    """Parse a single K, an inclusive range, or a comma-separated list."""
+
+    raw = str(raw_spec or "").strip()
+    if not raw:
+        raise ValueError("Empty -k/--k specification.")
+    values: list[int] = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        parts = token.replace(":", "..").split("..")
         try:
-            import psutil  # type: ignore
-        except Exception as ex:
-            self.logger.warning(
-                f"RSS watchdog unavailable: failed to import psutil ({ex})."
-            )
-            return
-        self._psutil = psutil
-        self._thread = threading.Thread(
-            target=self._run,
-            name="janusx-fastpop-rss-watchdog",
-            daemon=True,
-        )
-        self._thread.start()
-        self._started = True
-        limit_label = f"{self.limit_gb:.2f}"
-        self.logger.info(
-            f"{'Memory limit':<22}: {limit_label} GB "
-            "(0 disables; macOS uses current phys_footprint, other platforms use RSS)"
-        )
-
-    def stop(self) -> None:
-        if not self._started:
-            return
-        self._stop.set()
-        if self._thread is not None and self._thread.is_alive():
-            self._thread.join(timeout=0.5)
-
-    def _mac_current_footprint_bytes(self) -> Optional[int]:
-        if sys.platform != "darwin":
-            return None
-        try:
-            if self._mac_proc_pid_rusage is None or self._mac_rusage_info_v4 is None:
-                class RUsageInfoV4(ctypes.Structure):
-                    _fields_ = [
-                        ("ri_uuid", ctypes.c_uint8 * 16),
-                        ("ri_user_time", ctypes.c_uint64),
-                        ("ri_system_time", ctypes.c_uint64),
-                        ("ri_pkg_idle_wkups", ctypes.c_uint64),
-                        ("ri_interrupt_wkups", ctypes.c_uint64),
-                        ("ri_pageins", ctypes.c_uint64),
-                        ("ri_wired_size", ctypes.c_uint64),
-                        ("ri_resident_size", ctypes.c_uint64),
-                        ("ri_phys_footprint", ctypes.c_uint64),
-                        ("ri_proc_start_abstime", ctypes.c_uint64),
-                        ("ri_proc_exit_abstime", ctypes.c_uint64),
-                        ("ri_child_user_time", ctypes.c_uint64),
-                        ("ri_child_system_time", ctypes.c_uint64),
-                        ("ri_child_pkg_idle_wkups", ctypes.c_uint64),
-                        ("ri_child_interrupt_wkups", ctypes.c_uint64),
-                        ("ri_child_pageins", ctypes.c_uint64),
-                        ("ri_child_elapsed_abstime", ctypes.c_uint64),
-                        ("ri_diskio_bytesread", ctypes.c_uint64),
-                        ("ri_diskio_byteswritten", ctypes.c_uint64),
-                        ("ri_cpu_time_qos_default", ctypes.c_uint64),
-                        ("ri_cpu_time_qos_maintenance", ctypes.c_uint64),
-                        ("ri_cpu_time_qos_background", ctypes.c_uint64),
-                        ("ri_cpu_time_qos_utility", ctypes.c_uint64),
-                        ("ri_cpu_time_qos_legacy", ctypes.c_uint64),
-                        ("ri_cpu_time_qos_user_initiated", ctypes.c_uint64),
-                        ("ri_cpu_time_qos_user_interactive", ctypes.c_uint64),
-                        ("ri_billed_system_time", ctypes.c_uint64),
-                        ("ri_serviced_system_time", ctypes.c_uint64),
-                        ("ri_logical_writes", ctypes.c_uint64),
-                        ("ri_lifetime_max_phys_footprint", ctypes.c_uint64),
-                        ("ri_instructions", ctypes.c_uint64),
-                        ("ri_cycles", ctypes.c_uint64),
-                        ("ri_billed_energy", ctypes.c_uint64),
-                        ("ri_serviced_energy", ctypes.c_uint64),
-                        ("ri_interval_max_phys_footprint", ctypes.c_uint64),
-                        ("ri_runnable_time", ctypes.c_uint64),
-                    ]
-
-                lib = ctypes.CDLL(None)
-                fn = lib.proc_pid_rusage
-                fn.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
-                fn.restype = ctypes.c_int
-                self._mac_proc_pid_rusage = fn
-                self._mac_rusage_info_v4 = RUsageInfoV4
-            info = self._mac_rusage_info_v4()
-            rc = int(self._mac_proc_pid_rusage(int(os.getpid()), 4, ctypes.byref(info)))
-            if rc != 0:
-                return None
-            return int(info.ri_phys_footprint)
-        except Exception:
-            return None
-
-    def _proc_tree_memory_bytes(self) -> Optional[tuple[int, str]]:
-        if self._psutil is None:
-            return None
-        try:
-            proc = self._psutil.Process(os.getpid())
-            rss_total = int(proc.memory_info().rss)
-        except Exception:
-            return None
-        try:
-            for child in proc.children(recursive=True):
-                try:
-                    rss_total += int(child.memory_info().rss)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        footprint = self._mac_current_footprint_bytes()
-        if footprint is not None and int(footprint) >= int(rss_total):
-            return int(footprint), "phys_footprint"
-        return int(rss_total), "rss"
-
-    def _run(self) -> None:
-        while not self._stop.wait(self.interval_s):
-            mem = self._proc_tree_memory_bytes()
-            if mem is None:
-                continue
-            mem_bytes, metric = mem
-            if mem_bytes <= self.limit_bytes:
-                continue
-            mem_gb = float(mem_bytes) / (1024.0**3)
-            limit_label = f"{self.limit_gb:.2f}"
-            brand = _popstruct_brand()
-            msg = (
-                f"{brand['display']} task aborted: memory limit exceeded "
-                f"(limit={limit_label} GB, {metric}={mem_gb:.2f} GB)."
-            )
-            try:
-                self.logger.error(msg)
-            except Exception:
-                pass
-            force_exit(137, msg)
-
-
-def _bed_stream_session_available(source_label: str) -> bool:
-    return str(source_label).upper() == "BFILE" and (
-        hasattr(jxrs, "AdmxBedTrainingSession") or hasattr(jxrs, "AdmxBedBackend")
-    )
-
-
-def _plink_prefix_from_pathlike(genotype_path: str) -> Optional[str]:
-    raw = str(Path(str(genotype_path)).expanduser())
-    prefix = raw[:-4] if raw.lower().endswith(".bed") else raw
-    if Path(f"{prefix}.bed").exists() and Path(f"{prefix}.fam").exists():
-        return prefix
-    return None
-
-
-def _try_read_plink_sample_ids(genotype_path: str) -> Optional[list[str]]:
-    prefix = _plink_prefix_from_pathlike(genotype_path)
-    if prefix is None:
-        return None
-    fam_path = Path(f"{prefix}.fam")
-    sample_ids: list[str] = []
-    with open(fam_path, "r", encoding="utf-8") as fr:
-        for line in fr:
-            toks = str(line).strip().split()
-            if len(toks) >= 2:
-                sample_ids.append(str(toks[1]))
-            elif len(toks) == 1:
-                sample_ids.append(str(toks[0]))
-            else:
-                sample_ids.append("")
-    return sample_ids
-
-
-def _open_text_auto(path: str):
-    if str(path).lower().endswith(".gz"):
-        return gzip.open(path, "rt", encoding="utf-8", errors="ignore")
-    return open(path, "r", encoding="utf-8", errors="ignore")
-
-
-def _lightweight_sample_count(
-    genotype_path: str,
-    *,
-    source_label: str,
-    snps_only: bool,
-    maf: float,
-    missing_rate: float,
-) -> Optional[int]:
-    src = str(source_label).strip().upper()
-    if src == "BFILE":
-        ids = _try_read_plink_sample_ids(genotype_path)
-        return (None if ids is None or len(ids) <= 0 else int(len(ids)))
-
-    if src == "VCF":
-        with _open_text_auto(genotype_path) as fr:
-            for line in fr:
-                if line.startswith("#CHROM"):
-                    toks = str(line).rstrip("\r\n").split()
-                    return max(0, int(len(toks) - 9))
-        return None
-
-    if src == "HMP":
-        with _open_text_auto(genotype_path) as fr:
-            for line in fr:
-                raw = str(line).strip()
-                if raw == "" or raw.startswith("#"):
-                    continue
-                toks = raw.split()
-                return max(0, int(len(toks) - 11))
-        return None
-
-    sample_ids, _n_snps = inspect_genotype_file(
-        genotype_path,
-        snps_only=bool(snps_only),
-        maf=float(maf),
-        missing_rate=float(missing_rate),
-    )
-    return int(len(sample_ids)) if len(sample_ids) > 0 else None
-
-
-def _resolve_fastpop_chunk_rows(
-    *,
-    genotype_path: str,
-    source_label: str,
-    snps_only: bool,
-    maf: float,
-    missing_rate: float,
-    memory_mb: float,
-) -> int:
-    sample_count: Optional[int] = None
-    try:
-        sample_count = _lightweight_sample_count(
-            genotype_path,
-            source_label=source_label,
-            snps_only=bool(snps_only),
-            maf=float(maf),
-            missing_rate=float(missing_rate),
-        )
-    except Exception:
-        sample_count = None
-
-    if sample_count is not None and int(sample_count) > 0:
-        return int(
-            max(
-                1000,
-                resolve_decode_block_rows(
-                    int(sample_count),
-                    float(memory_mb),
-                    elem_bytes=4,
-                    buffers=1,
-                    min_rows=1000,
-                ),
-            )
-        )
-
-    budget_bytes = int(max(1.0, float(memory_mb)) * 1024.0 * 1024.0)
-    fallback_rows = int(budget_bytes // (8192 * 4))
-    return int(max(1000, fallback_rows))
-
-
-def _align_fastpop_block_rows(rows: int) -> int:
-    rows_i = max(1, int(rows))
-    if rows_i < 256:
-        return rows_i
-    return max(256, (rows_i // 256) * 256)
-
-
-def _admx_k_prime_hint(k: int, n: int) -> int:
-    k_eff = min(max(1, int(k)), max(1, int(n)))
-    return int(min(max(k_eff + 10, 20), max(1, int(n))))
-
-
-def _fastpop_operator_auto_memory_mb(sample_count: int, max_k: int) -> int:
-    n = max(1, int(sample_count))
-    rows = _align_fastpop_block_rows(min(4096, max(256, n)))
-    kp = _admx_k_prime_hint(int(max_k), n)
-    decode_row_bytes = n * 4
-    operator_bytes = [
-        rows * (decode_row_bytes * 2 + kp * 4),
-        rows * (decode_row_bytes * 2),
-        rows * decode_row_bytes,
-    ]
-    peak_bytes = max(operator_bytes)
-    return int(max(128, math.ceil(float(peak_bytes) / (1024.0 * 1024.0))))
-
-
-def _resolve_fastpop_memory_mb(
-    *,
-    genotype_path: str,
-    source_label: str,
-    snps_only: bool,
-    maf: float,
-    missing_rate: float,
-    requested_memory_gb: float,
-    max_k: int,
-    user_set: bool,
-) -> int:
-    requested_mb = int(
-        max(
-            1,
-            round(
-                decode_memory_gb_to_mb(
-                    requested_memory_gb,
-                    default_gb=DEFAULT_DECODE_MEMORY_GB,
-                    arg_name="-mem/--memory",
-                )
-            ),
-        )
-    )
-    if bool(user_set):
-        return requested_mb
-
-    sample_count: Optional[int] = None
-    try:
-        sample_count = _lightweight_sample_count(
-            genotype_path,
-            source_label=source_label,
-            snps_only=bool(snps_only),
-            maf=float(maf),
-            missing_rate=float(missing_rate),
-        )
-    except Exception:
-        sample_count = None
-    if sample_count is None or int(sample_count) <= 0:
-        return requested_mb
-    return int(max(requested_mb, _fastpop_operator_auto_memory_mb(int(sample_count), int(max_k))))
-
-
-def _format_fastpop_memory_cfg(
-    memory_mb: float | int | None,
-    *,
-    user_set: bool,
-) -> str:
-    if memory_mb is None:
-        return "NA"
-    label = f"{(float(memory_mb) / 1024.0):.2f} GB"
-    return f"{label} ({'fixed' if user_set else 'auto'})"
-
-
-def _apply_fastpop_rust_memory_budget_env(memory_mb: int, *, user_set: bool) -> None:
-    target_mb = str(int(max(1, int(memory_mb))))
-    override_names = (
-        "JANUSX_RSVD_BLOCK_MB",
-        "JANUSX_BED_BLOCK_TARGET_MB",
-    )
-    existing_names = (
-        "JANUSX_RSVD_BLOCK_MB",
-        "JX_RSVD_BLOCK_MB",
-        "JANUSX_BED_BLOCK_TARGET_MB",
-        "JX_BED_BLOCK_TARGET_MB",
-    )
-    if bool(user_set):
-        for name in override_names:
-            os.environ[name] = target_mb
-        return
-    if any(str(os.environ.get(name, "")).strip() != "" for name in existing_names):
-        return
-    os.environ["JANUSX_BED_BLOCK_TARGET_MB"] = target_mb
-
-
-def _mute_stdout_info_logs(
-    logger: logging.Logger,
-) -> list[tuple[logging.Handler, int]]:
-    muted: list[tuple[logging.Handler, int]] = []
-    for handler in logger.handlers:
-        if isinstance(handler, logging.StreamHandler) and getattr(handler, "stream", None) is sys.stdout:
-            muted.append((handler, handler.level))
-            handler.setLevel(logging.WARNING)
-    return muted
-
-
-def _restore_handler_levels(muted: list[tuple[logging.Handler, int]]) -> None:
-    for handler, level in muted:
-        handler.setLevel(level)
-
-
-class _AdmixtureBatchProgress:
-    """Two-line rich progress for multi-K mode."""
-
-    def __init__(
-        self,
-        *,
-        enabled: bool,
-        total_k: int,
-        cv_enabled: bool,
-        cv_label: str,
-    ) -> None:
-        self.enabled = bool(enabled and rich_progress_available())
-        self.total_k = int(max(1, int(total_k)))
-        self.cv_enabled = bool(cv_enabled)
-        self.cv_label = str(cv_label)
-        self._progress = None
-        self._task_k = None
-        self._task_cv = None
-
-    def __enter__(self) -> "_AdmixtureBatchProgress":
-        if not self.enabled:
-            return self
-        self._progress = build_rich_progress(
-            description_template="[green]{task.description}",
-            show_spinner=False,
-            show_bar=True,
-            show_percentage=True,
-            show_elapsed=True,
-            show_remaining=False,
-            bar_width=int(_ADMX_PROGRESS_BAR_WIDTH),
-            transient=False,
-        )
-        if self._progress is None:
-            self.enabled = False
-            return self
-        self._progress.__enter__()
-        self._task_k = self._progress.add_task("K progress", total=self.total_k)
-        self._task_cv = self._progress.add_task("CV progress", total=1)
-        self._progress.update(self._task_cv, completed=0, total=1)
-        return self
-
-    def start_k(self, *, k: int) -> None:
-        if not self.enabled or self._progress is None or self._task_cv is None:
-            return
-        if self.cv_enabled:
-            self._progress.reset(
-                self._task_cv,
-                description=f"CV folds (K={int(k)})",
-                total=1,
-                completed=0,
-            )
+            numbers = [int(x) for x in parts if x != ""]
+        except ValueError as exc:
+            raise ValueError(f"Invalid K specification: {raw_spec!r}.") from exc
+        if len(numbers) == 1:
+            values.append(numbers[0])
+        elif len(numbers) in (2, 3):
+            start, stop = numbers[:2]
+            step = numbers[2] if len(numbers) == 3 else 1
+            if step == 0:
+                raise ValueError("K range step cannot be zero.")
+            if (stop - start) * step < 0:
+                raise ValueError(f"K range has an incompatible step: {token!r}.")
+            values.extend(range(start, stop + (1 if step > 0 else -1), step))
         else:
-            self._progress.reset(
-                self._task_cv,
-                description=f"CV off (K={int(k)})",
-                total=1,
-                completed=1,
-            )
-
-    def cv_start(self, *, k: int, folds: int) -> None:
-        if not self.enabled or self._progress is None or self._task_cv is None:
-            return
-        total = max(1, int(folds))
-        self._progress.reset(
-            self._task_cv,
-            description=f"CV folds (K={int(k)})",
-            total=total,
-            completed=0,
-        )
-
-    def cv_advance(self, *, steps: int = 1) -> None:
-        if not self.enabled or self._progress is None or self._task_cv is None:
-            return
-        self._progress.advance(self._task_cv, int(max(1, int(steps))))
-
-    def cv_complete(self) -> None:
-        if not self.enabled or self._progress is None or self._task_cv is None:
-            return
-        task = self._progress.tasks[self._task_cv]
-        self._progress.update(self._task_cv, completed=task.total)
-
-    def advance_k(self, *, steps: int = 1) -> None:
-        if not self.enabled or self._progress is None or self._task_k is None:
-            return
-        self._progress.advance(self._task_k, int(max(1, int(steps))))
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        if self._progress is not None:
-            self._progress.__exit__(exc_type, exc, tb)
-            self._progress = None
+            raise ValueError(f"Invalid K specification: {token!r}.")
+    values = sorted(set(int(x) for x in values))
+    if not values or any(x <= 0 for x in values):
+        raise ValueError("K values must be positive integers.")
+    return values
 
 
-class _AdmixtureCliProgress:
-    def __init__(self, logger: logging.Logger, *, enabled: bool) -> None:
-        self.logger = logger
-        self.enabled = bool(enabled)
-        self._status: Optional[CliStatus] = None
-        self._adam_max_iter = 0
-
-    def _start(self, desc: str) -> None:
-        self.close()
-        self._status = CliStatus(str(desc), enabled=self.enabled)
-        self._status.__enter__()
-
-    def _update_desc(self, desc: str) -> None:
-        if self._status is not None:
-            self._status.desc = str(desc)
-
-    def _complete(self, message: str) -> None:
-        if self._status is not None:
-            self._status.complete(str(message))
-            self._status = None
-
-    def fail(self, message: str) -> None:
-        if self._status is not None:
-            self._status.fail(str(message))
-            self._status = None
-
-    def close(self) -> None:
-        if self._status is not None:
-            self._status.__exit__(None, None, None)
-            self._status = None
-
-    def on_event(self, event: str, payload: dict[str, Any]) -> None:
-        e = str(event)
-        if e == "data_loaded":
-            m = int(payload.get("m", 0))
-            n = int(payload.get("n", 0))
-            if self.enabled:
-                print_success(
-                    f"Loaded genotype matrix (SNPs={m}, samples={n})",
-                    force_color=True,
-                )
-                print(f"Data shape: SNPs={m}, samples={n}", flush=True)
-            return
-
-        if e == "rsvd_start":
-            self._start("RSVD")
-            return
-        if e == "rsvd_done":
-            self._complete("RSVD ...Finished")
-            return
-
-        if e == "als_start":
-            self._start("ALS initialization")
-            return
-        if e == "als_done":
-            self._complete("ALS initialization ...Finished")
-            return
-
-        if e == "adam_start":
-            self._adam_max_iter = int(payload.get("max_iter", 0))
-            self._start(f"ADAM-EM iter 0/{self._adam_max_iter}")
-            return
-        if e == "adam_iter":
-            it = int(payload.get("iteration", 0))
-            ll = float(payload.get("ll", float("nan")))
-            lr = float(payload.get("lr", float("nan")))
-            if np.isfinite(ll) and np.isfinite(lr):
-                self._update_desc(
-                    f"ADAM-EM iter {it}/{self._adam_max_iter} "
-                    f"ll={ll:.3f} lr={lr:.3e}"
-                )
-            return
-        if e == "adam_done":
-            self._complete("ADAM-EM optimization ...Finished")
-            return
+def _parse_cv_spec(raw: Optional[str]) -> tuple[int, str]:
+    if raw is None:
+        return 0, "off"
+    text = str(raw).strip()
+    folds = _DEFAULT_CV_FOLDS if text == "" else int(text)
+    if folds == 0:
+        return 0, "off"
+    if folds < 2:
+        raise ValueError("-cv/--cv must be >= 2 when enabled.")
+    return int(folds), f"{int(folds)}-fold"
 
 
-def _resolve_input(args, logger) -> tuple[str, str, str]:
-    gfile, auto_prefix = determine_genotype_source_from_args(args)
-
-    checks = []
+def _resolve_input(args: argparse.Namespace, logger: logging.Logger) -> tuple[str, str, str]:
+    genotype_path, auto_prefix = determine_genotype_source_from_args(args)
     if args.vcf:
-        checks.append(ensure_file_exists(logger, gfile, "VCF file"))
-        source_label = "VCF"
+        if not ensure_file_exists(logger, genotype_path, "VCF file"):
+            raise FileNotFoundError(genotype_path)
+        source = "VCF"
     elif args.hmp:
-        checks.append(ensure_file_exists(logger, gfile, "HMP file"))
-        source_label = "HMP"
+        if not ensure_file_exists(logger, genotype_path, "HMP file"):
+            raise FileNotFoundError(genotype_path)
+        source = "HMP"
     elif args.file:
-        checks.append(ensure_file_input_exists(logger, gfile, label="FILE genotype input"))
-        source_label = "FILE"
+        if not ensure_file_input_exists(logger, genotype_path, label="FILE genotype input"):
+            raise FileNotFoundError(genotype_path)
+        source = "FILE"
     elif args.bfile or args.pfile:
-        source_path = gfile
-        bprefix = str(Path(gfile).with_suffix("")) if str(gfile).lower().endswith((".bed", ".pgen")) else gfile
-        checks.append(ensure_plink_prefix_exists(logger, source_path, label="PLINK prefix"))
-        gfile = source_path
-        auto_prefix = os.path.basename(bprefix.rstrip("/\\"))
-        source_label = "PFILE" if args.pfile else "BFILE"
+        if not ensure_plink_prefix_exists(logger, genotype_path, label="PLINK prefix"):
+            raise FileNotFoundError(genotype_path)
+        source = "PFILE" if args.pfile else "BFILE"
     else:
-        raise ValueError("One genotype input is required: -vcf / -hmp / -file / -bfile.")
-
-    if not ensure_all_true(checks):
-        raise FileNotFoundError("Input validation failed.")
-
-    auto_prefix = strip_default_prefix_suffix(auto_prefix)
-    return gfile, source_label, auto_prefix
+        raise ValueError("One genotype input is required.")
+    return str(genotype_path), source, str(auto_prefix)
 
 
-def _site_line_from_obj(site: Any) -> str:
-    chrom = "0"
-    pos = 0
-    ref = "N"
-    alt = "N"
-    try:
-        if hasattr(site, "chrom") and hasattr(site, "pos"):
-            chrom = str(getattr(site, "chrom"))
-            pos = int(getattr(site, "pos"))
-            if hasattr(site, "ref_allele"):
-                ref = str(getattr(site, "ref_allele"))
-            if hasattr(site, "alt_allele"):
-                alt = str(getattr(site, "alt_allele"))
-            return f"{chrom}\t{pos}\t{ref}\t{alt}"
-        if isinstance(site, (tuple, list)):
-            if len(site) >= 4:
-                chrom = str(site[0])
-                pos = int(site[1])
-                ref = str(site[2])
-                alt = str(site[3])
-                return f"{chrom}\t{pos}\t{ref}\t{alt}"
-            if len(site) >= 2:
-                chrom = str(site[0])
-                pos = int(site[1])
-                return f"{chrom}\t{pos}\t{ref}\t{alt}"
-    except Exception:
-        pass
-    return f"{chrom}\t{pos}\t{ref}\t{alt}"
+def _read_fam_ids(prefix: str) -> list[str]:
+    result: list[str] = []
+    with open(f"{prefix}.fam", "r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            fields = line.strip().split()
+            if fields:
+                result.append(fields[1] if len(fields) > 1 else fields[0])
+    return result
 
 
-def _safe_sample_ids_and_site_lines(
+def _read_psam_ids(prefix: str) -> list[str]:
+    path = Path(f"{prefix}.psam")
+    if not path.is_file():
+        return []
+    result: list[str] = []
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if not line.strip() or line.startswith("#"):
+                continue
+            fields = line.rstrip("\r\n").split("\t")
+            result.append(fields[1] if len(fields) > 1 else fields[0])
+    return result
+
+
+def _count_pvar_sites(prefix: str) -> int:
+    candidates = [Path(f"{prefix}.pvar"), Path(f"{prefix}.pvar.zst"), Path(f"{prefix}.pvar.gz")]
+    path = next((p for p in candidates if p.is_file()), None)
+    if path is None:
+        return 0
+    if path.suffix == ".zst":
+        try:
+            import zstandard as zstd
+
+            with path.open("rb") as raw:
+                reader = zstd.ZstdDecompressor().stream_reader(raw)
+                with io.TextIOWrapper(reader, encoding="utf-8", errors="replace") as text:
+                    return sum(
+                        1
+                        for line in text
+                        if line.strip() and not line.startswith("#")
+                    )
+        except Exception:
+            return 0
+    elif path.suffix == ".gz":
+        with gzip.open(path, "rt", encoding="utf-8", errors="replace") as handle:
+            return sum(1 for line in handle if line.strip() and not line.startswith("#"))
+    else:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            return sum(1 for line in handle if line.strip() and not line.startswith("#"))
+
+
+def _read_vcf_metadata(path: str) -> tuple[list[str], int]:
+    ids: list[str] = []
+    n_sites = 0
+    opener = gzip.open if str(path).lower().endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if line.startswith("#CHROM"):
+                fields = line.rstrip("\r\n").split("\t")
+                ids = [str(x) for x in fields[9:]]
+                continue
+            if not line or line.startswith("#"):
+                continue
+            if len(line.rstrip("\r\n").split("\t")) >= 5:
+                n_sites += 1
+    return ids, n_sites
+
+
+def _count_bim_sites(prefix: str) -> int:
+    with open(f"{prefix}.bim", "r", encoding="utf-8", errors="replace") as handle:
+        return sum(1 for line in handle if line.strip())
+
+
+def _inspect_sample_and_site_count(
     genotype_path: str,
-    *,
-    snps_only: bool,
-    maf: float,
-    missing_rate: float,
-    expected_n: int,
-    expected_m: int,
-    logger: logging.Logger,
-) -> tuple[list[str], Optional[list[str]]]:
-    sample_ids: list[str] = []
-    site_lines: Optional[list[str]] = None
-    if _plink_prefix_from_pathlike(genotype_path) is not None:
-        try:
-            sample_ids = list(_try_read_plink_sample_ids(genotype_path) or [])
-            site_lines = None
-        except Exception as ex:
-            logger.warning(f"Failed to read PLINK sample IDs for Q/P output: {ex}")
-            sample_ids = []
-            site_lines = None
-    else:
-        try:
-            sample_ids_raw, site_rows_raw = inspect_genotype_file(
-                genotype_path,
-                snps_only=bool(snps_only),
-                maf=float(maf),
-                missing_rate=float(missing_rate),
-            )
-            sample_ids = [str(x) for x in sample_ids_raw]
-            if isinstance(site_rows_raw, (list, tuple, np.ndarray)):
-                site_lines = [_site_line_from_obj(x) for x in site_rows_raw]
-        except Exception as ex:
-            logger.warning(f"Failed to inspect sample/site IDs for Q/P output: {ex}")
-            sample_ids = []
-            site_lines = None
+    source: str,
+) -> tuple[list[str], int]:
+    """Read sample IDs and a site count without materialising all marker rows."""
 
-    if len(sample_ids) != int(expected_n):
-        if len(sample_ids) > 0:
-            logger.warning(
-                "Sample ID count mismatch for Q output "
-                f"(ids={len(sample_ids)}, expected={int(expected_n)}). "
-                "Fallback to generated sample IDs."
-            )
-        sample_ids = [f"S{i+1}" for i in range(int(expected_n))]
-
-    if site_lines is not None and len(site_lines) != int(expected_m):
-        if len(site_lines) > 0:
-            logger.warning(
-                "Site row count mismatch for P.site output "
-                f"(sites={len(site_lines)}, expected={int(expected_m)}). "
-                "Fallback to streamed generated site rows."
-            )
-        site_lines = None
-
-    return sample_ids, site_lines
-
-
-def _write_q_txt_with_row_ids(
-    out_path: str,
-    row_ids: list[str],
-    mat: np.ndarray,
-) -> None:
-    arr = np.asarray(mat, dtype=np.float64)
-    if arr.ndim != 2:
-        raise ValueError(f"Matrix must be 2D, got shape={arr.shape}")
-    if len(row_ids) != int(arr.shape[0]):
-        raise ValueError(
-            f"Row ID length mismatch: ids={len(row_ids)}, rows={int(arr.shape[0])}"
-        )
-    with open(out_path, "w", encoding="utf-8") as fw:
-        for rid, row in zip(row_ids, arr):
-            vals = "\t".join(f"{float(v):.8f}" for v in row)
-            fw.write(f"{rid}\t{vals}\n")
-
-
-def _resolve_p_npy_dtype() -> np.dtype:
-    raw = str(os.environ.get("JANUSX_ADMX_P_DTYPE", "float32")).strip().lower()
-    if raw in {"float32", "f4", "single"}:
-        return np.dtype(np.float32)
-    if raw in {"float64", "f8", "double"}:
-        return np.dtype(np.float64)
-    raise ValueError(
-        "Invalid JANUSX_ADMX_P_DTYPE. Use float32 or float64."
+    if source == "BFILE":
+        prefix = str(genotype_path)
+        if prefix.lower().endswith(".bed"):
+            prefix = prefix[:-4]
+        return _read_fam_ids(prefix), _count_bim_sites(prefix)
+    if source == "PFILE":
+        prefix = str(genotype_path)
+        if prefix.lower().endswith(".pgen"):
+            prefix = prefix[:-5]
+        return _read_psam_ids(prefix), _count_pvar_sites(prefix)
+    if source == "VCF":
+        return _read_vcf_metadata(genotype_path)
+    ids, n_snps = inspect_genotype_file(
+        genotype_path, snps_only=False, maf=0.0, missing_rate=1.0
     )
+    return [str(x) for x in ids], int(n_snps)
 
 
-def _stable_unique(items: list[str]) -> list[str]:
-    seen = set()
-    out: list[str] = []
-    for x in items:
-        s = str(x)
-        if s in seen:
-            continue
-        seen.add(s)
-        out.append(s)
-    return out
-
-
-def _parse_tag_samples(
-    tag_raw: Optional[str],
+def _normalize_sample_metadata(
+    ids: list[str],
     *,
+    expected_n: int,
     logger: logging.Logger,
 ) -> list[str]:
-    raw = ("" if tag_raw is None else str(tag_raw)).strip()
-    if raw == "":
-        return []
-
-    p = Path(raw)
-    if p.exists() and p.is_file():
-        tags: list[str] = []
-        with open(p, "r", encoding="utf-8") as fr:
-            for line in fr:
-                x = str(line).strip()
-                if x == "":
-                    continue
-                tags.append(x)
-        return _stable_unique(tags)
-
-    parts = [x.strip() for x in raw.split(",") if x.strip() != ""]
-    if len(parts) == 0:
+    ids = list(ids)
+    if len(ids) != int(expected_n):
         logger.warning(
-            f"--tag specification is empty after parsing: {tag_raw!r}. "
-            "No x-axis labels will be displayed."
+            "Sample ID count differs from ADAMIXTURE Q rows; using generated IDs "
+            f"(metadata={len(ids)}, Q={int(expected_n)})."
         )
+        ids = [f"S{i + 1}" for i in range(int(expected_n))]
+    return ids
+
+
+def _inspect_admixture_input(
+    genotype_path: str,
+    source: str,
+) -> tuple[list[str], int]:
+    """Read sample IDs and a marker count for the opening CLI status line."""
+
+    source_upper = str(source).upper()
+    if source_upper in {"BFILE", "PFILE", "VCF"}:
+        ids, n_snps = _inspect_sample_and_site_count(genotype_path, source_upper)
+        # PVAR.ZST and some VCF readers may not expose metadata when an
+        # optional decompressor is unavailable.  Fall back to the common
+        # inspector for counts/IDs.
+        if not ids or n_snps <= 0:
+            try:
+                fallback_ids, fallback_n_snps = inspect_genotype_file(
+                    genotype_path,
+                    snps_only=False,
+                    maf=0.0,
+                    missing_rate=1.0,
+                )
+                if not ids:
+                    ids = [str(x) for x in fallback_ids]
+                if n_snps <= 0:
+                    n_snps = int(fallback_n_snps)
+            except Exception:
+                pass
+        return ids, int(n_snps)
+
+    ids, n_snps = inspect_genotype_file(
+        genotype_path,
+        snps_only=False,
+        maf=0.0,
+        missing_rate=1.0,
+    )
+    return [str(x) for x in ids], int(n_snps)
+
+
+def _write_q(path: str, ids: list[str], matrix: np.ndarray) -> None:
+    arr = np.asarray(matrix, dtype=np.float64)
+    with open(path, "w", encoding="utf-8") as handle:
+        for sample_id, row in zip(ids, arr):
+            values = "\t".join(f"{float(x):.8f}" for x in row)
+            handle.write(f"{sample_id}\t{values}\n")
+
+
+def _write_p(path: str, matrix: np.ndarray) -> None:
+    np.save(path, np.asarray(matrix, dtype=np.float32))
+
+
+def _read_tag_values(raw: Optional[str]) -> list[str]:
+    if not raw:
         return []
-    return _stable_unique(parts)
+    path = Path(str(raw)).expanduser()
+    if path.is_file():
+        return [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return [x.strip() for x in str(raw).split(",") if x.strip()]
 
 
-def _render_structure_plot(
-    *,
-    q_mat: np.ndarray,
-    q_ids: list[str],
-    out_path: str,
-    tag_samples: list[str],
+def _render_plot(
+    q: np.ndarray,
+    ids: list[str],
+    path: str,
+    tags: list[str],
     logger: logging.Logger,
-) -> tuple[Optional[str], dict[str, Any]]:
+) -> Optional[str]:
     try:
         from janusx.bioplotkit.popstructure import plot_admixture_structure
-    except Exception as ex:
-        logger.warning(f"Failed to import popstructure plotting helper: {ex}")
-        return None, {}
 
-    try:
-        meta = plot_admixture_structure(
-            np.asarray(q_mat, dtype=np.float64),
-            sample_ids=list(q_ids),
-            out_path=str(out_path),
-            tag_samples=list(tag_samples),
+        plot_admixture_structure(
+            np.asarray(q, dtype=np.float64),
+            sample_ids=list(ids),
+            out_path=str(path),
+            tag_samples=list(tags),
             show_xticks=False,
             dpi=300,
         )
-        missing = list(meta.get("tag_missing", []))
-        if len(missing) > 0:
-            logger.warning(
-                f"{len(missing)} tagged sample(s) were not found in Q sample IDs: "
-                + ", ".join(missing[:10])
-                + (" ..." if len(missing) > 10 else "")
-            )
-        return str(out_path), meta
-    except Exception as ex:
-        logger.warning(f"Failed to render structure plot: {ex}")
-        return None, {}
+        return str(path)
+    except Exception as exc:
+        logger.warning(f"Failed to render JanusX structure plot: {exc}")
+        return None
 
 
-def _write_p_site_lines(
-    out_site_path: str,
-    site_lines: Optional[list[str]],
-    n_rows: int,
-) -> None:
-    with open(out_site_path, "w", encoding="utf-8") as fw:
-        if site_lines is None:
-            for i in range(int(n_rows)):
-                fw.write(f"0\t{i+1}\tN\tN\n")
-            return
-        if len(site_lines) != int(n_rows):
-            raise ValueError(
-                f"P.site row count mismatch: sites={len(site_lines)}, rows={int(n_rows)}"
-            )
-        for line in site_lines:
-            text = str(line).rstrip("\n")
-            fw.write(f"{text}\n")
-
-
-def _write_p_npy(
-    out_npy_path: str,
-    mat: np.ndarray,
-) -> None:
-    arr = np.asarray(mat)
-    if arr.ndim != 2:
-        raise ValueError(f"P matrix must be 2D, got shape={arr.shape}")
-
-    dtype = _resolve_p_npy_dtype()
-    chunk_rows_raw = str(os.environ.get("JANUSX_ADMX_P_MEMMAP_CHUNK", "4096")).strip()
-    try:
-        chunk_rows = max(1, int(chunk_rows_raw))
-    except Exception:
-        chunk_rows = 4096
-
-    mm = np.lib.format.open_memmap(
-        out_npy_path,
-        mode="w+",
-        dtype=dtype,
-        shape=(int(arr.shape[0]), int(arr.shape[1])),
-    )
-    try:
-        for start in range(0, int(arr.shape[0]), int(chunk_rows)):
-            end = min(int(arr.shape[0]), int(start + int(chunk_rows)))
-            mm[start:end, :] = np.asarray(arr[start:end, :], dtype=dtype)
-    finally:
-        del mm
-
-
-def _try_write_bed_p_site_file(
+def _prepare_adamixture_input(
+    source: str,
     genotype_path: str,
-    *,
-    snps_only: bool,
-    maf: float,
-    missing_rate: float,
-    memory_mb: int,
-    out_site_path: str,
-    logger: logging.Logger,
-) -> bool:
-    if not hasattr(jxrs, "AdmxBedBackend"):
-        return False
-    try:
-        backend = jxrs.AdmxBedBackend(
-            str(genotype_path),
-            bool(snps_only),
-            float(maf),
-            float(missing_rate),
-            int(max(0, int(memory_mb))),
-        )
-        if not hasattr(backend, "write_site_file"):
-            return False
-        backend.write_site_file(str(out_site_path))
-        return True
-    except Exception as ex:
-        logger.warning(
-            f"Failed to stream BED P.site from backend ({ex}); fallback to generated site rows."
-        )
-        return False
+    threads: int,
+    temp_dir: str | None = None,
+) -> tuple[str, str]:
+    """Resolve one reusable BED/PGEN input for the external ADAMIXTURE run.
 
-
-def _parse_k_spec(k_spec: str) -> list[int]:
+    VCF/HMP and matrix inputs are converted through the shared JanusX cache
+    layer once per command.  Existing BED/PGEN inputs are passed through so
+    their BIM/PVAR remains the authoritative marker metadata.  Cache conversion
+    is intentionally persistent and reusable instead of being repeated for
+    every K value.  Legacy JanusX PGEN files using storage mode 0x01 are
+    converted to a temporary BED fileset because the upstream reader rejects
+    that mode. Native PGEN files are passed through directly.
     """
-    Parse K specification:
-      - single value: "8"
-      - inclusive range: "1..10" or "1:10"
-      - inclusive range with step: "1..10..3", "1:10:3", or "1..10:3"
-      - list: "1,5,8"
-      - mixed: "1..10:3,5,8"
-    """
-    raw = str(k_spec or "").strip()
-    if raw == "":
-        raise ValueError("Empty -k/--k specification.")
-    if ";" in raw:
-        raise ValueError(
-            "Semicolon-separated K list is not supported for shell compatibility. "
-            "Use comma-separated form, e.g. -k 1,5,8."
-        )
 
-    tokens = []
-    for seg in raw.split(","):
-        x = seg.strip()
-        if x:
-            tokens.append(x)
-    if len(tokens) == 0:
-        raise ValueError(f"Invalid -k/--k specification: {k_spec!r}")
-
-    values: list[int] = []
-    for tok in tokens:
-        if ".." in tok:
-            norm = tok.replace("..", ":")
-            parts = [x.strip() for x in norm.split(":") if x.strip() != ""]
-            if len(parts) not in (2, 3):
-                raise ValueError(f"Invalid K range token: {tok!r}")
-            lo, hi = int(parts[0]), int(parts[1])
-            step_abs = abs(int(parts[2])) if len(parts) == 3 else 1
-            if step_abs <= 0:
-                raise ValueError(f"K range step must be non-zero: {tok!r}")
-            step = int(step_abs if hi >= lo else -step_abs)
-            stop = int(hi + (1 if step > 0 else -1))
-            values.extend(list(range(int(lo), stop, int(step))))
-            continue
-        if ":" in tok:
-            parts = tok.split(":")
-            if len(parts) not in (2, 3):
-                raise ValueError(f"Invalid K range token: {tok!r}")
-            lo, hi = int(parts[0]), int(parts[1])
-            step_abs = abs(int(parts[2])) if len(parts) == 3 else 1
-            if step_abs <= 0:
-                raise ValueError(f"K range step must be non-zero: {tok!r}")
-            step = int(step_abs if hi >= lo else -step_abs)
-            stop = int(hi + (1 if step > 0 else -1))
-            values.extend(list(range(int(lo), stop, int(step))))
-            continue
-        values.append(int(tok))
-
-    if len(values) == 0:
-        raise ValueError(f"Invalid -k/--k specification: {k_spec!r}")
-
-    deduped: list[int] = []
-    seen = set()
-    for v in values:
-        if int(v) < 1:
-            raise ValueError(f"K must be >= 1, got {v}.")
-        if int(v) not in seen:
-            deduped.append(int(v))
-            seen.add(int(v))
-    return deduped
-
-
-def _write_cverror_summary_tsv(
-    out_tsv: str,
-    rows: list[dict[str, Any]],
-) -> None:
-    with open(out_tsv, "w", encoding="utf-8") as fw:
-        fw.write(
-            "\t".join(
-                [
-                    "K",
-                    "CVerror",
-                    "CVerror_SE",
-                    "CV_folds",
-                    "WallTime_sec",
-                    "Q_output",
-                    "P_npy_output",
-                    "P_site_output",
-                    "Structure_plot",
-                    "Log_file",
-                ]
-            )
-            + "\n"
-        )
-        for r in rows:
-            fw.write(
-                "\t".join(
-                    [
-                        str(int(r["k"])),
-                        f"{float(r['cverror']):.6f}",
-                        f"{float(r['cverror_se']):.6f}",
-                        str(int(r["cv_folds"])),
-                        f"{float(r['wall']):.3f}",
-                        str(r["q_out"]),
-                        str(r["p_npy_out"]),
-                        str(r["p_site_out"]),
-                        str(r.get("structure_plot", "")),
-                        str(r["log_path"]),
-                    ]
-                )
-                + "\n"
-            )
-
-
-def _log_cverror_summary(
-    logger: logging.Logger,
-    rows: list[dict[str, Any]],
-    summary_tsv: str,
-) -> None:
-    if len(rows) == 0:
-        return
-    logger.info("-" * 60)
-    row_fmt = "{k:<4} {cv:<10} {se:<10} {folds:<8} {time:<10}"
-    logger.info(
-        row_fmt.format(
-            k="K",
-            cv="CVerror",
-            se="SE",
-            folds="CVfolds",
-            time="time(sec)",
-        )
-    )
-    for r in rows:
-        logger.info(
-            row_fmt.format(
-                k=int(r["k"]),
-                cv=f"{float(r['cverror']):.6f}",
-                se=f"{float(r['cverror_se']):.6f}",
-                folds=int(r["cv_folds"]),
-                time=f"{float(r['wall']):.2f}",
-            )
-        )
-    best = min(rows, key=lambda x: float(x["cverror"]))
-    logger.info("-" * 60)
-    logger.info(
-        f"Best K by CVerror: K={int(best['k'])} "
-        f"(CVerror={float(best['cverror']):.6f}, SE={float(best['cverror_se']):.6f})"
-    )
-    logger.info(f"CVerror summary TSV: {format_path_for_display(summary_tsv)}")
-
-
-def _log_outputs_summary(
-    logger: logging.Logger,
-    rows: list[dict[str, Any]],
-) -> None:
-    if len(rows) == 0:
-        return
-    logger.info("-" * 60)
-    logger.info("Output files:")
-    for r in rows:
-        k = int(r["k"])
-        logger.info(f"K={k:<4} Q: {format_path_for_display(str(r['q_out']))}")
-        logger.info(f"K={k:<4} P.npy: {format_path_for_display(str(r['p_npy_out']))}")
-        logger.info(f"K={k:<4} P.site: {format_path_for_display(str(r['p_site_out']))}")
-        if r.get("structure_plot"):
-            logger.info(
-                f"K={k:<4} STRUCT: "
-                f"{format_path_for_display(str(r['structure_plot']))}"
-            )
-        logger.info(f"K={k:<4} LOG: {format_path_for_display(str(r['log_path']))}")
-
-
-def _run_single_k(
-    *,
-    genotype_path: str,
-    source_label: str,
-    prefix: str,
-    outdir: str,
-    k: int,
-    k_spec: str,
-    k_index: int,
-    total_k: int,
-    args: argparse.Namespace,
-    detected_threads: int,
-    requested_threads: int,
-    resolved_threads: int,
-    enable_spinner: bool,
-    emit_config_to_stdout: bool,
-    batch_progress: Optional[_AdmixtureBatchProgress],
-    cv_enabled: bool,
-    cv_value: int,
-    cv_label: str,
-    tag_samples: list[str],
-    shared_g: Optional[np.ndarray],
-) -> dict[str, Any]:
-    brand = _popstruct_brand()
-    use_batch_progress = bool(batch_progress is not None and batch_progress.enabled)
-    log_path = os.path.join(outdir, f"{prefix}.{int(k)}.{brand['run_log_stem']}.log")
-    logger = setup_logging(log_path)
-    apply_blas_thread_env(int(resolved_threads))
-    if not use_batch_progress:
-        logger.info("")
-    if (int(total_k) > 1) and (not use_batch_progress):
-        logger.info(
-            f"K scan progress: {int(k_index)}/{int(total_k)} "
-            f"(K={int(k)}, spec={k_spec})"
-        )
-
-    q_out = os.path.join(outdir, f"{prefix}.{int(k)}.Q.txt")
-    p_npy_out = os.path.join(outdir, f"{prefix}.{int(k)}.P.npy")
-    p_site_out = os.path.join(outdir, f"{prefix}.{int(k)}.P.site")
-    structure_fmt = "svg"
-    structure_out = os.path.join(outdir, f"{prefix}.{int(k)}.{brand['plot_stem']}.{structure_fmt}")
-    plot_enabled = not bool(getattr(args, "no_plot", False))
-
-    model_rows = [
-        ("K", int(k)),
-        ("Solver", str(args.solver)),
-        ("max_iter", int(args.max_iter)),
-        ("check", int(args.check)),
-        ("tol", float(args.tol)),
-        ("CVerror", (str(cv_label) if cv_enabled else "off")),
-        ("Tag labels", ("off" if len(tag_samples) == 0 else f"{len(tag_samples)} sample(s)")),
-        ("Structure plot", ("on" if plot_enabled else "off")),
-    ]
-    if int(total_k) > 1:
-        model_rows.append(("K spec", str(k_spec)))
-
-    cfg_mute: list[tuple[logging.Handler, int]] = []
-    if not emit_config_to_stdout:
-        cfg_mute = _mute_stdout_info_logs(logger)
-    try:
-        _admx_py_mem_debug(
-            "cli/run_single_k/before_config",
-            f"k={int(k)} source={source_label} bed_stream={bool(_bed_stream_session_available(source_label))}",
-        )
-        emit_cli_configuration(
-            logger,
-            app_title=brand["app_title"],
-            config_title=brand["config_title"],
-            host=socket.gethostname(),
-            sections=[
-                (
-                    "Input/Output",
-                    [
-                        ("Genotype", genotype_path),
-                        ("Input type", source_label),
-                        ("MAF threshold", float(args.maf)),
-                        ("Miss threshold", float(args.geno)),
-                        ("Output dir", outdir),
-                        ("Prefix", prefix),
-                    ],
-                ),
-                (
-                    "Runtime",
-                    [
-                        (
-                            "Threads",
-                            format_requested_thread_usage(
-                                requested_threads=int(requested_threads),
-                                using_threads=int(resolved_threads),
-                                detected_threads=int(detected_threads),
-                            ),
-                        ),
-                        (
-                            "Memory",
-                            _format_fastpop_memory_cfg(
-                                getattr(args, "_resolved_memory_mb", None),
-                                user_set=bool(getattr(args, "_memory_user_set", False)),
-                            ),
-                        ),
-                        ("Seed", int(args.seed)),
-                    ],
-                ),
-                ("Model", model_rows),
-            ],
-            footer_rows=[
-                ("Output prefix", os.path.join(outdir, prefix)),
-                ("Q output", q_out),
-                ("P output (.npy)", p_npy_out),
-                ("P site (.site)", p_site_out),
-                ("Structure plot", (structure_out if plot_enabled else "disabled")),
-                ("Log file", log_path),
-            ],
-            emit_to_stdout=bool(emit_config_to_stdout),
-        )
-        _admx_py_mem_debug("cli/run_single_k/after_config", f"k={int(k)}")
-    finally:
-        _restore_handler_levels(cfg_mute)
-
-    cfg = ADAMixtureConfig(
-        genotype_path=genotype_path,
-        k=int(k),
-        outdir=outdir,
-        prefix=prefix,
-        seed=int(args.seed),
-        threads=max(1, int(resolved_threads)),
-        chunk_size=int(max(1000, int(getattr(args, "_resolved_chunk_rows", 50000)))),
-        memory_mb=int(max(0, int(getattr(args, "_resolved_memory_mb", 0)))),
-        snps_only=bool(args.snps_only),
-        maf=float(args.maf),
-        geno=float(args.geno),
-        solver=str(args.solver),
-        max_iter=max(1, int(args.max_iter)),
-        check=max(1, int(args.check)),
-        tol=float(args.tol),
-        cv=int(cv_value if cv_enabled else 0),
-    )
-
-    progress_ui: Optional[_AdmixtureCliProgress] = None
-    callback = None
-    muted: list[tuple[logging.Handler, int]] = []
-    cverror_result: Optional[dict[str, float]] = None
-    structure_plot_path: Optional[str] = None
-    bed_stream_session = _bed_stream_session_available(source_label)
-    t_one = time.time()
-    try:
-        _admx_py_mem_debug(
-            "cli/run_single_k/before_progress_setup",
-            f"k={int(k)} use_batch_progress={bool(use_batch_progress)} enable_spinner={bool(enable_spinner)}",
-        )
-        if use_batch_progress:
-            muted = _mute_stdout_info_logs(logger)
-        elif enable_spinner:
-            progress_ui = _AdmixtureCliProgress(logger, enabled=True)
-            callback = progress_ui.on_event
-            muted = _mute_stdout_info_logs(logger)
-        _admx_py_mem_debug(
-            "cli/run_single_k/before_train",
-            f"k={int(k)} bed_stream={bool(bed_stream_session)} shared_g={shared_g is not None}",
-        )
+    source_upper = str(source).upper()
+    if source_upper == "BFILE":
+        return genotype_path, source_upper
+    if source_upper == "PFILE":
+        pgen_path = str(genotype_path)
+        if not pgen_path.lower().endswith(".pgen"):
+            pgen_path = f"{pgen_path}.pgen"
         try:
-            p_mat, q_mat, m, n = train_adamixture(
-                cfg,
-                logger,
-                callback=callback,
-                g_matrix=(None if bed_stream_session else shared_g),
+            with open(pgen_path, "rb") as handle:
+                header = handle.read(3)
+        except OSError as exc:
+            raise RuntimeError(f"Cannot read PGEN header: {pgen_path}: {exc}") from exc
+        if len(header) != 3 or header[:2] != b"\x6c\x1b":
+            raise RuntimeError(f"Invalid PGEN header: {pgen_path}")
+        if header[2] != 0x01:
+            return genotype_path, source_upper
+        if not temp_dir:
+            raise RuntimeError(
+                "A temporary directory is required for legacy mode-0x01 PFILE conversion."
             )
-            _admx_py_mem_debug(
-                "cli/run_single_k/after_train",
-                f"k={int(k)} m={int(m)} n={int(n)}",
+        prefix = str(Path(temp_dir) / "input")
+        try:
+            psam_prefix = str(genotype_path)
+            if psam_prefix.lower().endswith(".pgen"):
+                psam_prefix = psam_prefix[:-5]
+            sample_ids = _read_psam_ids(psam_prefix)
+            if not sample_ids:
+                raise RuntimeError(f"PFILE has no readable sample IDs: {genotype_path}")
+            save_genotype_streaming(
+                prefix,
+                sample_ids,
+                load_genotype_chunks(
+                    genotype_path,
+                    chunk_size=8192,
+                    maf=0.0,
+                    missing_rate=1.0,
+                    impute=False,
+                    model="add",
+                    snps_only=False,
+                    force_kind="pfile",
+                ),
+                fmt="plink",
+                # Keep this compatibility conversion quiet; the main CLI
+                # reports the real genotype load and K progress below.
+                total_snps=None,
+                desc="Preparing ADAMIXTURE genotype",
             )
-        finally:
-            if progress_ui is not None:
-                progress_ui.close()
-            if not use_batch_progress:
-                _restore_handler_levels(muted)
-        q_ids, p_site_lines = _safe_sample_ids_and_site_lines(
-            genotype_path,
-            snps_only=bool(args.snps_only),
-            maf=float(args.maf),
-            missing_rate=float(args.geno),
-            expected_n=int(n),
-            expected_m=int(m),
-            logger=logger,
-        )
-        _write_q_txt_with_row_ids(q_out, q_ids, np.asarray(q_mat, dtype=np.float64))
-        p_arr = np.asarray(p_mat, dtype=np.float32)
-        site_written = False
-        if bed_stream_session:
-            site_written = _try_write_bed_p_site_file(
-                genotype_path,
-                snps_only=bool(args.snps_only),
-                maf=float(args.maf),
-                missing_rate=float(args.geno),
-                memory_mb=int(max(0, int(getattr(args, "_resolved_memory_mb", 0)))),
-                out_site_path=p_site_out,
-                logger=logger,
-            )
-            if site_written:
-                logger.info("P.site metadata      : BED backend stream")
-        if not site_written:
-            _write_p_site_lines(
-                p_site_out,
-                p_site_lines,
-                int(p_arr.shape[0]),
-            )
-        _write_p_npy(
-            p_npy_out,
-            p_arr,
-        )
-        if plot_enabled:
-            structure_plot_path, _plot_meta = _render_structure_plot(
-                q_mat=np.asarray(q_mat, dtype=np.float64),
-                q_ids=list(q_ids),
-                out_path=str(structure_out),
-                tag_samples=list(tag_samples),
-                logger=logger,
-            )
-        else:
-            logger.info("Structure plot      : skipped (--no-plot)")
-        if cv_enabled:
-            cv_progress_callback = None
-            if use_batch_progress:
-                def _cv_progress(event: str, payload: dict[str, Any]) -> None:
-                    if batch_progress is None:
-                        return
-                    e = str(event)
-                    if e == "cv_start":
-                        batch_progress.cv_start(
-                            k=int(k),
-                            folds=int(payload.get("folds", 1)),
-                        )
-                        return
-                    if e == "cv_fold_done":
-                        batch_progress.cv_advance(steps=1)
-                        return
-                    if e == "cv_done":
-                        batch_progress.cv_complete()
-                        return
-                cv_progress_callback = _cv_progress
-            cv_status: Optional[CliStatus] = None
-            cv_muted: list[tuple[logging.Handler, int]] = []
-            if (not use_batch_progress) and enable_spinner:
-                cv_muted = _mute_stdout_info_logs(logger)
-                cv_status = CliStatus("CVerror estimation", enabled=True)
-                cv_status.__enter__()
-            try:
-                cverror_result = evaluate_adamixture_cverror(
-                    cfg,
-                    logger,
-                    progress_callback=cv_progress_callback,
-                    g_full=shared_g,
-                )
-                if cv_status is not None:
-                    cv_status.complete("CVerror estimation ...Finished")
-            except Exception:
-                if cv_status is not None:
-                    cv_status.fail("CVerror estimation ...Failed")
-                raise
-            finally:
-                if cv_status is not None:
-                    cv_status.__exit__(None, None, None)
-                _restore_handler_levels(cv_muted)
-    except Exception as e:
-        _restore_handler_levels(muted)
-        if progress_ui is not None:
-            try:
-                progress_ui.fail(f"{brand['display']} ...Failed")
-            except Exception:
-                pass
-        if _is_admx_memory_limit_error(e):
-            msg = str(e)
-            logger.error(msg)
-            print_failure(f"{brand['display']} memory limit exceeded", force_color=True)
-            force_exit(137, msg)
-        logger.exception(f"{brand['display']} failed: {e}")
-        print_failure(f"{brand['display']} ...Failed", force_color=True)
-        raise
+        except Exception as exc:
+            raise RuntimeError(f"PFILE to BED conversion failed: {exc}") from exc
+        return prefix + ".bed", "BFILE"
+    if source_upper not in {"VCF", "HMP", "FILE"}:
+        return genotype_path, source_upper
 
-    _restore_handler_levels(muted)
-    wall = float(time.time() - t_one)
-    end_mute: list[tuple[logging.Handler, int]] = []
-    if use_batch_progress:
-        end_mute = _mute_stdout_info_logs(logger)
-    try:
-        logger.info(f"Q output: {format_path_for_display(q_out)}")
-        logger.info(f"P output (.npy): {format_path_for_display(p_npy_out)}")
-        logger.info(f"P site (.site): {format_path_for_display(p_site_out)}")
-        if structure_plot_path is not None:
-            logger.info(
-                f"Structure plot: {format_path_for_display(str(structure_plot_path))}"
-            )
-        if cv_enabled:
-            if cverror_result is None:
-                raise RuntimeError("Internal error: CVerror result is missing.")
-            logger.info(
-                "CVerror: "
-                f"{float(cverror_result['cverror']):.6f} "
-                f"(SE={float(cverror_result['cverror_se']):.6f}, "
-                f"folds={int(cverror_result['cv_folds'])})"
-            )
-        now = datetime.now()
-        logger.info("")
-        log_success(logger, f"K={int(k)} finished in {wall:.2f} seconds")
-        logger.info(now.strftime("%Y-%m-%d %H:%M:%S"))
-    finally:
-        _restore_handler_levels(end_mute)
-    row = {
-        "k": int(k),
-        "cverror": (None if cverror_result is None else float(cverror_result["cverror"])),
-        "cverror_se": (None if cverror_result is None else float(cverror_result["cverror_se"])),
-        "cv_folds": (0 if cverror_result is None else int(cverror_result["cv_folds"])),
-        "wall": float(wall),
-        "q_out": q_out,
-        "p_npy_out": p_npy_out,
-        "p_site_out": p_site_out,
-        "structure_plot": (None if structure_plot_path is None else str(structure_plot_path)),
-        "log_path": log_path,
-    }
-    return row
+    cache_prefix = prepare_cli_input_cache(
+        genotype_path,
+        snps_only=False,
+        prefer_plink_for_txt=True,
+        force_kind=source_upper.lower(),
+        threads=max(1, int(threads)),
+    )
+    cache_prefix = str(cache_prefix)
+    bed_path = cache_prefix if cache_prefix.lower().endswith(".bed") else f"{cache_prefix}.bed"
+    if not Path(bed_path).is_file():
+        raise RuntimeError(
+            "ADAMIXTURE genotype cache was not created: "
+            f"{bed_path}"
+        )
+    return bed_path, "BFILE"
+
+
+def _marker_metadata_path(genotype_path: str, source: str) -> str | None:
+    """Return the BIM/PVAR used by the external run, if it is available."""
+
+    raw = str(genotype_path)
+    source_upper = str(source).upper()
+    if source_upper == "BFILE":
+        prefix = raw[:-4] if raw.lower().endswith(".bed") else raw
+        candidate = Path(f"{prefix}.bim")
+        return str(candidate) if candidate.is_file() else None
+    if source_upper == "PFILE":
+        prefix = raw[:-5] if raw.lower().endswith(".pgen") else raw
+        for suffix in (".pvar", ".pvar.zst", ".pvar.gz"):
+            candidate = Path(f"{prefix}{suffix}")
+            if candidate.is_file():
+                return str(candidate)
+    return None
 
 
 def _build_parser() -> CliArgumentParser:
-    brand = _popstruct_brand()
-    cli = f"jx {brand['cli']}"
-    help_profile = ("fastpop" if brand["cli"] == "fastpop" else "admixture")
     parser = CliArgumentParser(
-        prog=cli,
+        prog="jx adamixture",
         formatter_class=cli_help_formatter(),
-        epilog=minimal_help_epilog([
-            f"{cli} -bfile data/geno -k 8 -o out/cohort",
-            f"{cli} -vcf data/geno.vcf.gz -k 1..10 -t 16",
-        ]),
+        epilog=(
+            minimal_help_epilog([
+                "jx adamixture -bfile data/geno -k 8 -o out/cohort",
+                "jx adamixture -pfile data/geno -k 1..10 -t 16",
+            ])
+            + "\n  https://github.com/AI-sandbox/ADAMIXTURE"
+        ),
+        description="Population structure inference delegated to the ADAMIXTURE CLI.",
     )
-    parser.set_defaults(snps_only=False)
+    required = parser.add_argument_group("Input and model")
+    genotype = required.add_mutually_exclusive_group(required=True)
+    add_common_genotype_source_args(genotype, include_file=True, help_profile="adamixture")
+    required.add_argument("-k", "--k", required=True, help="K value, range, or comma-separated list.")
 
-    req_geno = parser.add_argument_group("Required Genotype Input (Choose one)")
-    geno = req_geno.add_mutually_exclusive_group(required=True)
-    add_common_genotype_source_args(geno, include_file=True, help_profile=help_profile)
-    req_model = parser.add_argument_group("Required Nclusters")
-    req_model.add_argument(
-        "-k",
-        "--k",
-        type=str,
-        required=True,
-        help=(
-            "K spec: single (8), range (1..10 or 1:10), "
-            "stepped range (1..10..3, 1:10:3, or 1..10:3), or list (1,5,8)."
-        ),
-    )
-    input_output = parser.add_argument_group("Input/Output Arguments")
-    add_common_out_arg(input_output, default=".", help_profile="current_dir")
-    add_common_prefix_arg(input_output, default=None, help_profile="simple")
-    input_output.add_argument(
-        "-tag",
-        "--tag",
-        type=str,
-        default=None,
-        help=(
-            "Optional sample labels for structure x-axis. "
-            "Use a file path (one sample ID per line) or comma-separated sample IDs."
-        ),
-    )
-    input_output.add_argument(
-        "--no-plot",
-        action="store_true",
-        default=False,
-        help="Skip structure plot rendering and only write Q/P/site/log outputs.",
-    )
-    add_common_variant_filter_args(
-        input_output,
-        help_profile="loading_stage",
-        include_maf=True,
-        include_geno=True,
-        include_het=False,
-        maf_default=0.02,
-        geno_default=0.05,
-    )
-    runtime = parser.add_argument_group("Runtime Arguments")
-    add_common_thread_arg(
-        runtime,
-        default_threads=detect_effective_threads(),
-        dest="thread",
-    )
+    output = parser.add_argument_group("Output")
+    add_common_out_arg(output, default=".", help_profile="current_dir")
+    add_common_prefix_arg(output, default=None, help_profile="simple")
+    output.add_argument("-tag", "--tag", default=None, help="Sample labels file or comma-separated sample IDs.")
+    output.add_argument("--no-plot", action="store_true", help="Skip JanusX structure plot rendering.")
+
+    runtime = parser.add_argument_group("ADAMIXTURE runtime")
+    add_common_thread_arg(runtime, default_threads=max(1, int(detect_effective_threads())), dest="thread")
+    runtime.add_argument("-seed", "--seed", type=int, default=42)
+    runtime.add_argument("--algorithm", choices=("brqn", "adamem"), default="adamem")
+    runtime.add_argument("--device", choices=("cpu", "mps", "gpu"), default="cpu")
+    runtime.add_argument("--n-inits", dest="n_inits", type=int, default=1)
+    runtime.add_argument("-max-iter", "--max-iter", dest="max_iter", type=int, default=500)
+    runtime.add_argument("-tol", "--tol", type=float, default=1e-5)
     runtime.add_argument(
-        "-threads",
-        "--threads",
-        dest="thread",
-        type=int,
-        default=argparse.SUPPRESS,
-        help=argparse.SUPPRESS,
-    )
-    runtime.add_argument("-seed", "--seed", type=int, default=42, help="Random seed (default: 42).")
-    add_common_memory_arg(
-        runtime,
-        default=DEFAULT_DECODE_MEMORY_GB,
-        help_text=(
-            "Working memory budget in GB for FastPop streamed genotype loading/decode "
-            "and Rust BED block sizing. "
-            "When omitted, FastPop auto-resolves the largest decode budget needed by "
-            "its main operators for preferred block shapes; explicit -mem keeps the "
-            "requested fixed budget (default: %(default)s)."
-        ),
-        dest="memory",
-        include_hidden_legacy_single_dash_alias=True,
-    )
-
-    model = parser.add_argument_group("Model/Optimization Arguments")
-    model.add_argument(
-        "-solver",
-        "--solver",
-        type=str,
-        default="adam-em",
-        choices=["auto", "adam", "adam-em"],
-        help="Optimization solver (default: adam-em).",
-    )
-    model.add_argument(
-        "-max-iter",
-        "--max-iter",
-        dest="max_iter",
-        type=int,
-        default=500,
-        help="Maximum optimization iterations (default: 500).",
-    )
-    model.add_argument(
-        "-check",
-        "--check",
-        type=int,
-        default=5,
-        help=(
-            "Log-likelihood check interval during Adam-EM (default: 5). "
-            "Larger values reduce full-data scans and can speed up large BED runs."
-        ),
-    )
-    model.add_argument(
-        "-tol",
-        "--tol",
-        type=float,
-        default=1e-5,
-        help="Convergence tolerance (default: 1e-5).",
-    )
-    model.add_argument(
-        "-cv",
-        "--cv",
-        nargs="?",
-        default=None,
-        const=str(_DEFAULT_CVERROR_FOLDS),
-        metavar="N",
-        help=(
-            "Enable CVerror. No value -> 5-fold; integer N -> N-fold. "
-            "Omit -cv to disable CVerror."
-        ),
+        "-cv", "--cv", nargs="?", const=str(_DEFAULT_CV_FOLDS), default=None, metavar="N",
+        help="Delegate N-fold cross-validation to ADAMIXTURE (default 5 when omitted).",
     )
     return parser
 
 
-def main() -> None:
-    brand = _popstruct_brand()
-    argv = sys.argv[1:]
+def main() -> int:
     parser = _build_parser()
     args = parser.parse_args()
-    if not (0.0 <= float(args.maf) <= 0.5):
-        parser.error("-maf must be within [0, 0.5].")
-    if not (0.0 <= float(args.geno) <= 1.0):
-        parser.error("-geno must be within [0, 1.0].")
-    if float(args.tol) <= 0:
-        parser.error("-tol/--tol must be > 0.")
-    if int(args.max_iter) <= 0:
-        parser.error("-max-iter/--max-iter must be a positive integer.")
-    if int(args.check) <= 0:
-        parser.error("-check/--check must be a positive integer.")
     if int(args.thread) <= 0:
-        parser.error("-t/--thread must be a positive integer.")
-    args._memory_user_set = bool(_option_present(argv, "-mem", "--memory", "-memory"))
+        parser.error("-t/--thread must be positive")
+    if int(args.max_iter) <= 0:
+        parser.error("-max-iter/--max-iter must be positive")
+    if float(args.tol) <= 0:
+        parser.error("-tol/--tol must be positive")
+    if int(args.n_inits) <= 0:
+        parser.error("--n-inits must be positive")
     try:
-        k_values = _parse_k_spec(str(args.k))
-    except Exception as ex:
-        parser.error(str(ex))
-    try:
-        cv_enabled, cv_value, cv_label = _parse_cv_spec(args.cv)
-    except Exception as ex:
-        parser.error(str(ex))
-    detected_threads = detect_effective_threads()
-    requested_threads = int(args.thread)
-    thread_capped = False
-    resolved_threads = int(args.thread)
-    if int(resolved_threads) > int(detected_threads):
-        thread_capped = True
-        resolved_threads = int(detected_threads)
+        k_values = _parse_k_spec(args.k)
+        cv_folds, cv_label = _parse_cv_spec(args.cv)
+    except (TypeError, ValueError) as exc:
+        parser.error(str(exc))
 
-    t0 = time.time()
-
-    tmp_logger = logging.getLogger(brand["logger_name"])
-    if not tmp_logger.handlers:
-        h = logging.StreamHandler()
-        h.setFormatter(logging.Formatter("%(message)s"))
-        tmp_logger.addHandler(h)
-    tmp_logger.setLevel(logging.INFO)
-    tmp_logger.propagate = False
-    rss_cap_gb = _resolve_admx_rss_cap_gb_from_env()
-    rss_watchdog = _AdmixtureMemoryWatchdog(
-        limit_gb=float(0.0 if rss_cap_gb is None else rss_cap_gb),
-        logger=tmp_logger,
-    )
+    bootstrap = logging.getLogger("janusx.adamixture.bootstrap")
+    bootstrap.handlers.clear()
+    bootstrap.addHandler(logging.NullHandler())
+    bootstrap.setLevel(logging.INFO)
+    bootstrap.propagate = False
     try:
-        rss_watchdog.start()
-        genotype_path, source_label, auto_prefix = _resolve_input(args, tmp_logger)
-    except Exception as e:
-        print_failure(str(e), force_color=True)
+        executable = resolve_executable()
+        genotype_path, source, auto_prefix = _resolve_input(args, bootstrap)
+    except (ExternalAdmixtureError, OSError, ValueError) as exc:
+        print_failure(str(exc), force_color=True)
         raise
+
     outdir, outprefix, prefix = apply_output_prefix_compat(
-        args,
-        auto_prefix,
-        argv=argv,
-        fallback_prefix=brand["cli"],
+        args, auto_prefix, argv=sys.argv[1:], fallback_prefix="adamixture"
     )
     os.makedirs(outdir, exist_ok=True)
-    tag_samples = _parse_tag_samples(args.tag, logger=tmp_logger)
-    args._resolved_memory_mb = _resolve_fastpop_memory_mb(
-        genotype_path=genotype_path,
-        source_label=source_label,
-        snps_only=bool(args.snps_only),
-        maf=float(args.maf),
-        missing_rate=float(args.geno),
-        requested_memory_gb=float(getattr(args, "memory", DEFAULT_DECODE_MEMORY_GB)),
-        max_k=int(max(k_values)),
-        user_set=bool(getattr(args, "_memory_user_set", False)),
-    )
-    os.environ["JANUSX_ADMX_LOAD_MB"] = str(int(max(1, int(args._resolved_memory_mb))))
-    _apply_fastpop_rust_memory_budget_env(
-        int(max(1, int(args._resolved_memory_mb))),
-        user_set=bool(getattr(args, "_memory_user_set", False)),
+    tags = _read_tag_values(args.tag)
+    total_started = time.time()
+    rows: list[dict[str, Any]] = []
+    log_path = f"{outprefix}.adamixture.log"
+    logger = setup_logging(log_path)
+    _log_detail(logger, "=" * 60)
+    _log_detail(logger, "JanusX - ADAMIXTURE")
+    _log_detail(logger, "=" * 60)
+    _log_detail(logger, "[ Command ]")
+    _log_detail(logger, "  %s", _adamixture_invocation_command())
+    _log_detail(logger, "")
+
+    genotype_src = format_path_for_display(str(genotype_path))
+
+    emit_cli_configuration(
+        logger,
+        app_title="JanusX - ADAMIXTURE",
+        config_title="ADAMIXTURE CONFIG",
+        host=socket.gethostname(),
+        sections=[
+            ("Input", [("Genotype", genotype_path), ("Input type", source), ("K", args.k)]),
+            ("ADAMIXTURE", [
+                ("Executable", executable),
+                ("Threads", int(args.thread)),
+                ("Seed", int(args.seed)),
+                ("Algorithm", str(args.algorithm)),
+                ("Device", str(args.device)),
+                ("Initialisations", int(args.n_inits)),
+                ("Max iter", int(args.max_iter)),
+                ("Tol", float(args.tol)),
+                ("CV", cv_label),
+            ]),
+        ],
+        footer_rows=[("Output prefix", outprefix)],
     )
 
-    multi_k = len(k_values) > 1
-    enable_spinner = bool(stdout_is_tty())
-    bed_stream_session = _bed_stream_session_available(source_label)
-    use_geno_cache = _bool_env("JANUSX_ADMX_CACHE_GENO", True)
-    effective_geno_cache = bool(use_geno_cache and (not bed_stream_session))
-    args._resolved_chunk_rows = _resolve_fastpop_chunk_rows(
-        genotype_path=genotype_path,
-        source_label=source_label,
-        snps_only=bool(args.snps_only),
-        maf=float(args.maf),
-        missing_rate=float(args.geno),
-        memory_mb=float(getattr(args, "_resolved_memory_mb", DEFAULT_DECODE_MEMORY_GB * 1024.0)),
+    inspect_t0 = time.monotonic()
+    with CliStatus(
+        genotype_load_status_open(genotype_src),
+        enabled=stdout_is_tty(),
+        # Metadata inspection is Python-side and does not need the separate
+        # process spinner used by long native GRM calls.
+        use_process=False,
+    ) as load_status:
+        try:
+            input_ids, input_n_snps = _inspect_admixture_input(
+                genotype_path,
+                source,
+            )
+        except Exception:
+            load_status.fail(genotype_load_status_fail(genotype_src))
+            raise
+        load_status.complete(
+            genotype_load_status_done(
+                genotype_src,
+                n_samples=len(input_ids),
+                n_snps=input_n_snps,
+            ),
+        )
+    input_metadata_elapsed = max(0.0, time.monotonic() - inspect_t0)
+    _log_detail(
+        logger,
+        "Input metadata: n=%d, nSNP=%d, elapsed=%.3fs",
+        len(input_ids),
+        int(input_n_snps),
+        input_metadata_elapsed,
     )
-    if multi_k:
-        if cv_enabled:
-            cv_msg = str(cv_label)
-        else:
-            cv_msg = "off"
-        print_success(
-            f"K-scan mode: {len(k_values)} K values ({args.k})",
-            force_color=True,
-        )
-        print(
-            f"CVerror={cv_msg}, solver={args.solver}, "
-            f"max_iter={int(args.max_iter)}, check={int(args.check)}, "
-            f"threads={int(resolved_threads)}, "
-            f"memory={_format_fastpop_memory_cfg(getattr(args, '_resolved_memory_mb', None), user_set=bool(getattr(args, '_memory_user_set', False)))}, "
-            f"geno_cache={'on' if effective_geno_cache else 'off'}, "
-            f"bed_stream={'on' if bed_stream_session else 'off'}, "
-            f"tag={'on' if len(tag_samples) > 0 else 'off'}",
-            flush=True,
-        )
-    if bed_stream_session:
-        if hasattr(jxrs, "AdmxBedTrainingSession"):
-            tmp_logger.info(
-                "BED Rust training session detected: model training will call fit_k() "
-                "on the persistent packed BED backend instead of dense shared_g cache."
-            )
-        else:
-            tmp_logger.info(
-                "BED stream session detected: model training will use low-memory BED backend "
-                "instead of dense shared_g cache."
-            )
-        if use_geno_cache:
-            tmp_logger.info(
-                "Skipping dense genotype preload because BED stream session is available."
-            )
-        if cv_enabled:
-            tmp_logger.info(
-                "CVerror will use the BED foldmask stream backend when available, "
-                "avoiding dense g_full and per-fold g_train copies."
-            )
-    if thread_capped:
-        tmp_logger.warning(
-            f"Warning: Requested threads={requested_threads} exceeds detected available={detected_threads}; "
-            f"using {int(resolved_threads)}."
-        )
-    apply_blas_thread_env(int(resolved_threads))
-    # maybe_warn_non_openblas(
-    #     logger=tmp_logger,
-    #     strict=require_openblas_by_default(),
-    # )
-    shared_g: Optional[np.ndarray] = None
-    if effective_geno_cache:
-        shared_g = load_genotype_u8_matrix(
-            genotype_path,
-            chunk_size=int(max(1000, int(getattr(args, "_resolved_chunk_rows", 50000)))),
-            snps_only=bool(args.snps_only),
-            maf=float(args.maf),
-            missing_rate=float(args.geno),
-        )
-    summary_rows: list[dict[str, Any]] = []
+
+    # Normalize VCF/HMP/matrix inputs once before the K loop. ADAMIXTURE then
+    # reads the same BED/PGEN payload for every K. Native PGEN is passed
+    # through directly; only legacy mode-0x01 PGEN needs a BED fallback.
+    input_temp_dir = (
+        tempfile.TemporaryDirectory(prefix=f".{prefix}.input.", dir=outdir)
+        if source == "PFILE"
+        else None
+    )
     try:
-        with _AdmixtureBatchProgress(
-            enabled=bool(multi_k),
-            total_k=int(len(k_values)),
-            cv_enabled=bool(cv_enabled),
-            cv_label=str(cv_label),
-        ) as batch_progress:
-            for idx, k in enumerate(k_values, start=1):
-                batch_progress.start_k(k=int(k))
-                row = _run_single_k(
-                    genotype_path=genotype_path,
-                    source_label=source_label,
-                    prefix=prefix,
-                    outdir=outdir,
-                    k=int(k),
-                    k_spec=str(args.k),
-                    k_index=int(idx),
-                    total_k=int(len(k_values)),
-                    args=args,
-                    detected_threads=int(detected_threads),
-                    requested_threads=int(requested_threads),
-                    resolved_threads=int(resolved_threads),
-                    enable_spinner=bool(enable_spinner),
-                    emit_config_to_stdout=bool(not multi_k),
-                    batch_progress=batch_progress,
-                    cv_enabled=bool(cv_enabled),
-                    cv_value=int(cv_value),
-                    cv_label=str(cv_label),
-                    tag_samples=list(tag_samples),
-                    shared_g=shared_g,
+        run_path, run_source = _prepare_adamixture_input(
+            source,
+            genotype_path,
+            int(args.thread),
+            input_temp_dir.name if input_temp_dir is not None else None,
+        )
+    except Exception:
+        if input_temp_dir is not None:
+            input_temp_dir.cleanup()
+        raise
+    # Keep the user's persistent PVAR as the marker reference. For legacy
+    # mode-0x01 PGEN, the external reader consumes the temporary BED payload,
+    # but marker coordinates still come from the original PVAR.
+    marker_path = (
+        _marker_metadata_path(genotype_path, source)
+        if source == "PFILE"
+        else _marker_metadata_path(run_path, run_source)
+    )
+    _log_detail(logger, "ADAMIXTURE genotype input: %s (%s)", run_path, run_source)
+
+    multi_k_tty = bool(len(k_values) > 1 and stdout_is_tty())
+    single_k_tty = bool(len(k_values) == 1 and stdout_is_tty())
+    k_progress = ProgressBarAdapter(
+        total=len(k_values),
+        desc=("ADAMIXTURE" if single_k_tty else "ADAMIXTURE K scan"),
+        show_spinner=True,
+        show_postfix=False,
+        keep_display=False,
+        show_remaining=True,
+        emit_done=not single_k_tty,
+        force_animate=not single_k_tty,
+        log_unit="K",
+        show_bar=not single_k_tty,
+        show_percentage=not single_k_tty,
+    )
+
+    try:
+        for index, k in enumerate(k_values, start=1):
+            k_i = int(k)
+            _log_detail(logger, "ADAMIXTURE executable: %s", executable)
+            _log_detail(logger, "Input: %s (%s)", genotype_path, source)
+            _log_detail(logger, "K=%d, threads=%d, seed=%d", k_i, int(args.thread), int(args.seed))
+            _log_detail(
+                logger,
+                "algorithm=%s, device=%s, n_inits=%d",
+                args.algorithm,
+                args.device,
+                int(args.n_inits),
+            )
+            _log_detail(
+                logger,
+                "max_iter=%d, tol=%.6g, CV=%s",
+                int(args.max_iter),
+                float(args.tol),
+                cv_label,
+            )
+            k_progress.set_desc(f"ADAMIXTURE K={k_i} ({index}/{len(k_values)})")
+
+            def _stream_key_line(line: str) -> None:
+                key_line = _adamixture_key_line(line)
+                if key_line is not None:
+                    _log_detail(logger, "K=%d | %s", k_i, key_line)
+                    if len(k_values) == 1 and stdout_is_tty():
+                        k_progress.emit_line(f"K={k_i} | {key_line}")
+
+            q_mat, p_mat, elapsed = run_external_adamixture(
+                genotype_path=run_path,
+                outdir=outdir,
+                prefix=prefix,
+                k=k_i,
+                threads=int(args.thread),
+                seed=int(args.seed),
+                max_iter=int(args.max_iter),
+                tol=float(args.tol),
+                algorithm=str(args.algorithm),
+                device=str(args.device),
+                n_inits=int(args.n_inits),
+                cv_folds=int(cv_folds),
+                stream_callback=_stream_key_line,
+            )
+            _log_detail(logger, "K=%d | external run wall time: %.3fs", k_i, float(elapsed))
+            k_progress.set_desc(f"Writing ADAMIXTURE K={k_i} outputs")
+            ids = _normalize_sample_metadata(
+                input_ids,
+                expected_n=int(q_mat.shape[0]),
+                logger=logger,
+            )
+            q_out = f"{outprefix}.{k_i}.Q.txt"
+            p_out = f"{outprefix}.{k_i}.P.npy"
+            _write_q(q_out, ids, q_mat)
+            _write_p(p_out, p_mat)
+            plot_out = None
+            if not bool(args.no_plot):
+                k_progress.set_desc(f"Plotting ADAMIXTURE K={k_i}")
+                plot_out = _render_plot(
+                    q_mat, ids, f"{outprefix}.{k_i}.adamixture.svg", tags, logger
                 )
-                summary_rows.append(row)
-                batch_progress.advance_k(steps=1)
-    finally:
-        rss_watchdog.stop()
+            _log_detail(logger, "Q output: %s", format_path_for_display(q_out))
+            _log_detail(logger, "P output: %s", format_path_for_display(p_out))
+            if plot_out:
+                _log_detail(
+                    logger,
+                    "Structure plot: %s",
+                    format_path_for_display(plot_out),
+                )
+            completion = (
+                f"ADAMIXTURE K={k_i} ...Finished "
+                f"[{format_elapsed(float(elapsed))}]"
+            )
+            _emit_to_file_handlers(logger, logging.INFO, completion)
+            if multi_k_tty:
+                # Keep a single live row for a K sweep.  The next K will
+                # replace this description in place; no completion line
+                # is printed for every K.
+                k_progress.update(1)
+                k_progress.set_desc(f"✔︎ {completion}")
+            elif stdout_is_tty():
+                # Single-K TTY runs show the filtered iteration details;
+                # the final generic completion line is emitted below.
+                k_progress.update(1)
+            else:
+                k_progress.emit_line(completion, success=True)
+            rows.append({
+                "k": k_i,
+                "q": q_out,
+                "p": p_out,
+                "plot": plot_out,
+                "log": str(getattr(logger, "_janusx_log_path", log_path)),
+                "wall": elapsed,
+            })
+            if not multi_k_tty and not stdout_is_tty():
+                k_progress.update(1)
+    except Exception as exc:
+        k_progress.close(show_done=False)
+        if input_temp_dir is not None:
+            input_temp_dir.cleanup()
+        print_failure(f"ADAMIXTURE failed: {exc}", force_color=True)
+        raise
+    else:
+        # Close the aggregate live bar silently; the terminal receives one
+        # generic completion line after the saved-output report below.
+        k_progress.finish()
+        k_progress.close(show_done=False)
 
-    summary_log = f"{outprefix}.{brand['summary_stem']}.summary.log"
-    logger = setup_logging(summary_log)
-    if cv_enabled:
-        cv_rows = [r for r in summary_rows if r.get("cverror") is not None]
-        summary_tsv = f"{outprefix}.{brand['summary_stem']}.cverror.summary.tsv"
-        _write_cverror_summary_tsv(summary_tsv, cv_rows)
-        logger.info("")
-        _log_cverror_summary(logger, cv_rows, summary_tsv)
-    logger.info("")
-    _log_outputs_summary(logger, summary_rows)
+    total_elapsed = max(0.0, time.time() - total_started)
+    final_status = f"ADAMIXTURE ...Finished [{format_elapsed(total_elapsed)}]"
+    _log_detail(logger, final_status)
+    if multi_k_tty:
+        print_success(final_status, force_color=True)
 
-    wall = float(time.time() - t0)
-    now = datetime.now()
-    logger.info("")
-    logger.info(f"Summary log: {format_path_for_display(summary_log)}")
-    logger.info(f"Output prefix: {format_path_for_display(outprefix)}")
-    logger.info(f"Output dir: {format_path_for_display(outdir)}")
-    log_success(logger, f"Finished. Total wall time: {wall:.2f} seconds")
-    logger.info(now.strftime("%Y-%m-%d %H:%M:%S"))
+    _log_detail(logger, "ADAMIXTURE outputs:")
+    for row in rows:
+        _log_detail(
+            logger,
+            "K=%d: Q=%s P=%s",
+            row["k"],
+            row["q"],
+            row["p"],
+        )
+    saved_lines = ["Saved ADAMIXTURE outputs:"]
+    if marker_path is not None:
+        saved_lines.insert(
+            0,
+            f"Marker metadata: {format_path_for_display(marker_path)}",
+        )
+    for row in rows:
+        saved_lines.append(f"  K={int(row['k'])}:")
+        saved_lines.append(f"    {format_path_for_display(row['q'])}")
+        saved_lines.append(f"    {format_path_for_display(row['p'])}")
+        if row.get("plot"):
+            saved_lines.append(f"    {format_path_for_display(row['plot'])}")
+    log_success(
+        logger,
+        "\n".join(saved_lines),
+    )
+    endinfo = (
+        f"\nTotal wall time: "
+        f"{round(total_elapsed, 2)} seconds\n"
+        f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}"
+    )
+    log_success(logger, endinfo)
+    if input_temp_dir is not None:
+        input_temp_dir.cleanup()
+    return 0
 
 
 if __name__ == "__main__":
     from janusx.script._common.interrupt import install_interrupt_handlers
+
     install_interrupt_handlers()
     main()

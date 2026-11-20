@@ -1,4 +1,4 @@
-"""XP-CLR command exposed as ``jx fastpop xpclr``."""
+"""XP-CLR command exposed as ``jx xpclr``."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from ._common.outprefix import apply_output_prefix_compat
 from ._common.pathcheck import format_path_for_display
 from ._common.progress import CliStatus, format_elapsed, log_success
 from ._common.threads import detect_effective_threads
-from .fastpop_progress import FastPopProgress
+from .population_progress import PopulationScanProgress
 
 try:
     from janusx import janusx as jxrs
@@ -35,18 +35,18 @@ def _require_backend() -> None:
     if jxrs is None or not hasattr(jxrs, "xpclr_bed_to_tsv"):
         raise RuntimeError(
             "Rust XP-CLR backend is unavailable. Rebuild/install JanusX before running "
-            "jx fastpop xpclr."
+            "jx xpclr."
         )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = CliArgumentParser(
-        prog="jx fastpop xpclr",
+        prog="jx xpclr",
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog(
             [
-                "jx fastpop xpclr -bfile cohort -p1 pop1.txt -p2 pop2.txt -window 50000 -step 50000 -o results/cohort_xpclr",
-                "jx fastpop xpclr -bfile cohort -p1 pop1.txt -p2 pop2.txt -map mapfile.snp -ld 0.95",
+                "jx xpclr -bfile cohort -p1 pop1.txt -p2 pop2.txt -window 50000 -step 50000 -o results/cohort_xpclr",
+                "jx xpclr -bfile cohort -p1 pop1.txt -p2 pop2.txt -map mapfile.snp -ld 0.95",
             ]
         ),
         description=(
@@ -121,7 +121,7 @@ def main() -> int:
     out_dir, output_prefix, _out_stem = apply_output_prefix_compat(
         args,
         stem,
-        fallback_prefix="fastpop_xpclr",
+        fallback_prefix="xpclr",
     )
     os.makedirs(out_dir, exist_ok=True)
     output_path = f"{output_prefix}.xpclr.tsv"
@@ -129,7 +129,7 @@ def main() -> int:
     logger = setup_logging(log_path)
     emit_cli_configuration(
         logger,
-        app_title="JanusX fastpop xpclr",
+        app_title="JanusX - XP-CLR",
         config_title="Windowed XP-CLR",
         host=socket.gethostname(),
         sections=[
@@ -159,7 +159,7 @@ def main() -> int:
     )
 
     start = time.monotonic()
-    progress = FastPopProgress(
+    progress = PopulationScanProgress(
         description="Computing windowed XP-CLR",
         stages=2,
         stage_labels=("XP-CLR omega", "XP-CLR windows"),
@@ -199,12 +199,25 @@ def main() -> int:
     finally:
         progress.close()
     elapsed = max(0.0, time.monotonic() - start)
+    # Import the plotting stack only after the Rust scan completes.  This
+    # keeps ``jx xpclr -h`` and the population scan startup path lightweight.
+    from janusx.assoc.workflow_ui import _run_fast_manhattan_from_tsv_with_status
+
+    plot_svg = f"{output_prefix}.xpclr.svg"
+    _plot_elapsed, plot_paths = _run_fast_manhattan_from_tsv_with_status(
+        output_path,
+        outsvg=plot_svg,
+        score_col="XPCLR",
+        score_label="XP-CLR",
+    )
     log_success(
         logger,
         f"Windowed XP-CLR finished [{format_elapsed(elapsed)}]; "
         f"windows={int(n_windows)}, valid={int(n_valid)}",
     )
     log_success(logger, f"XP-CLR table saved: {format_path_for_display(output_path)}")
+    for path in plot_paths:
+        log_success(logger, f"XP-CLR Manhattan plot saved: {format_path_for_display(path)}")
     return 0
 
 

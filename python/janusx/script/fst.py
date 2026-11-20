@@ -1,4 +1,4 @@
-"""Windowed FST command exposed as ``jx fastpop fst``."""
+"""Windowed FST command exposed as ``jx fst``."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from ._common.outprefix import apply_output_prefix_compat
 from ._common.pathcheck import format_path_for_display
 from ._common.progress import CliStatus, format_elapsed, log_success
 from ._common.threads import detect_effective_threads
-from .fastpop_progress import FastPopProgress
+from .population_progress import PopulationScanProgress
 
 try:
     from janusx import janusx as jxrs
@@ -35,18 +35,18 @@ def _require_backend() -> None:
     if jxrs is None or not hasattr(jxrs, "fst_bed_window_to_tsv"):
         raise RuntimeError(
             "Rust windowed FST backend is unavailable. Rebuild/install JanusX before running "
-            "jx fastpop fst."
+            "jx fst."
         )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = CliArgumentParser(
-        prog="jx fastpop fst",
+        prog="jx fst",
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog(
             [
-                "jx fastpop fst -bfile cohort -p1 pop1.txt -p2 pop2.txt -window 50000 -step 50000 -o results/cohort_fst",
-                "jx fastpop fst -bfile cohort -within groups.tsv -matrix -window 50000 -step 50000 -o results/cohort_fst",
+                "jx fst -bfile cohort -p1 pop1.txt -p2 pop2.txt -window 50000 -step 50000 -o results/cohort_fst",
+                "jx fst -bfile cohort -within groups.tsv -matrix -window 50000 -step 50000 -o results/cohort_fst",
             ]
         ),
         description=(
@@ -125,7 +125,7 @@ def main() -> int:
     out_dir, output_prefix, _out_stem = apply_output_prefix_compat(
         args,
         stem,
-        fallback_prefix="fastpop_fst",
+        fallback_prefix="fst",
     )
     os.makedirs(out_dir, exist_ok=True)
     output_path = f"{output_prefix}.windowed.fst"
@@ -133,7 +133,7 @@ def main() -> int:
     logger = setup_logging(log_path)
     emit_cli_configuration(
         logger,
-        app_title="JanusX fastpop fst",
+        app_title="JanusX - FST",
         config_title="Windowed FST",
         host=socket.gethostname(),
         sections=[
@@ -161,7 +161,7 @@ def main() -> int:
     )
 
     start = time.monotonic()
-    progress = FastPopProgress(
+    progress = PopulationScanProgress(
         description="Computing windowed FST",
         stage_labels=("FST scan",),
         log_unit="site",
@@ -196,12 +196,26 @@ def main() -> int:
     finally:
         progress.close()
     elapsed = max(0.0, time.monotonic() - start)
+    # Import the plotting stack only after the Rust scan completes.  This
+    # keeps ``jx fst -h`` and the population scan startup path lightweight.
+    from janusx.assoc.workflow_ui import _run_fast_manhattan_from_tsv_with_status
+
+    plot_svg = f"{output_path}.svg"
+    _plot_elapsed, plot_paths = _run_fast_manhattan_from_tsv_with_status(
+        output_path,
+        outsvg=plot_svg,
+        score_col="weightedFst",
+        score_label=f"{str(args.method).upper()} weighted FST",
+        group_cols=("pop1", "pop2") if bool(args.matrix) else (),
+    )
     log_success(
         logger,
         f"Windowed FST finished [{format_elapsed(elapsed)}]; "
         f"rows={int(n_rows)}, comparisons={int(n_pairs)}",
     )
     log_success(logger, f"FST table saved: {format_path_for_display(output_path)}")
+    for path in plot_paths:
+        log_success(logger, f"FST Manhattan plot saved: {format_path_for_display(path)}")
     return 0
 
 

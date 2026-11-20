@@ -1,19 +1,34 @@
 name: Release
 
+run-name: release/${{ inputs.target_index || 'testpypi' }} @ ${{ inputs.ref || 'main' }}
+
 on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Git ref (tag/sha/branch) to build from"
-        required: false
-        default: ""
-      publish_pypi:
-        description: "Publish to official PyPI (requires PYPI_API_TOKEN); skips TestPyPI in this run"
-        required: false
-        default: "false"
+        description: "Branch, tag or commit to build (main for TestPyPI; v* tag for PyPI)"
+        required: true
+        default: "main"
+        type: string
+      target_index:
+        description: "Package index"
+        required: true
+        default: "testpypi"
+        type: choice
+        options:
+          - testpypi
+          - pypi
+      retention_days:
+        description: "Artifact retention days"
+        required: true
+        default: "14"
+        type: string
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+permissions:
+  contents: read
 
 jobs:
   resolve-package-version:
@@ -22,131 +37,113 @@ jobs:
     outputs:
       package_version: ${{ steps.resolve.outputs.package_version }}
       base_version: ${{ steps.resolve.outputs.base_version }}
-      is_dev: ${{ steps.resolve.outputs.is_dev }}
     steps:
-      - name: Resolve package version for TestPyPI/PyPI
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Resolve version
         id: resolve
         shell: bash
         env:
-          RAW_REF: ${{ github.event.inputs.ref || github.ref_name }}
-          EVENT_NAME: ${{ github.event_name }}
-          PUBLISH_PYPI: ${{ github.event.inputs.publish_pypi }}
+          RAW_REF: ${{ inputs.ref }}
+          TARGET_INDEX: ${{ inputs.target_index }}
         run: |
           python - <<'PY'
           import os
           import re
+          import tomllib
           import urllib.error
           import urllib.request
+          from pathlib import Path
 
           raw_ref = (os.environ.get("RAW_REF") or "").strip()
-          event_name = (os.environ.get("EVENT_NAME") or "").strip()
-          publish_pypi = (os.environ.get("PUBLISH_PYPI") or "").strip().lower() == "true"
-          out = os.environ["GITHUB_OUTPUT"]
+          target_index = (os.environ.get("TARGET_INDEX") or "").strip().lower()
+          if target_index not in {"testpypi", "pypi"}:
+              raise SystemExit(f"Unsupported package index: {target_index!r}")
 
-          ref = raw_ref
-          if ref.startswith("refs/tags/"):
-              ref = ref[len("refs/tags/") :]
+          ref = raw_ref[len("refs/tags/"):] if raw_ref.startswith("refs/tags/") else raw_ref
+          is_tag = ref.startswith("v")
+          if target_index == "pypi" and not is_tag:
+              raise SystemExit("PyPI publishing requires a v* tag ref")
 
-          if not ref.startswith("v"):
-              with open(out, "a", encoding="utf-8") as f:
-                  f.write("base_version=\n")
-                  f.write("package_version=\n")
-                  f.write("is_dev=false\n")
-              print(f"[version-resolve] non-tag ref, skip sync: {raw_ref!r}")
-              raise SystemExit(0)
+          if is_tag:
+              base_version = ref[1:]
+          else:
+              project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+              base_version = str(project["project"]["version"]).strip()
 
-          base_version = ref[1:]
-          if base_version == "":
-              raise SystemExit(f"Invalid empty version from ref: {raw_ref!r}")
           if not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z.\-+]*", base_version):
-              raise SystemExit(f"Unsupported version format from ref: {raw_ref!r}")
+              raise SystemExit(f"Unsupported package version: {base_version!r}")
 
-          use_dev_suffix = not (event_name == "workflow_dispatch" and publish_pypi)
           package_version = base_version
-          is_dev = False
-          force_dev_suffix = False
-
-          if use_dev_suffix:
-              def version_exists(ver: str) -> bool:
-                  url = f"https://test.pypi.org/pypi/janusx/{ver}/json"
+          if target_index == "testpypi":
+              def version_exists(version: str) -> bool:
+                  url = f"https://test.pypi.org/pypi/janusx/{version}/json"
                   try:
-                      with urllib.request.urlopen(url, timeout=20) as r:
-                          return getattr(r, "status", 200) == 200
+                      with urllib.request.urlopen(url, timeout=20) as response:
+                          return getattr(response, "status", 200) == 200
                   except urllib.error.HTTPError as exc:
                       if exc.code == 404:
                           return False
                       raise
-                  except Exception:
-                      raise
 
-              def next_available_dev_version() -> str:
-                  next_dev = 1
-                  while next_dev <= 9999 and version_exists(f"{base_version}.dev{next_dev}"):
-                      next_dev += 1
-                  if next_dev > 9999:
-                      raise SystemExit(
-                          f"Exhausted TestPyPI dev suffixes for base version {base_version}"
-                      )
-                  return f"{base_version}.dev{next_dev}"
+              dev_number = 1
+              while dev_number <= 9999:
+                  candidate = f"{base_version}.dev{dev_number}"
+                  if not version_exists(candidate):
+                      package_version = candidate
+                      break
+                  dev_number += 1
+              else:
+                  raise SystemExit(
+                      f"Exhausted TestPyPI dev suffixes for {base_version}"
+                  )
 
-              if re.fullmatch(r"\d+\.\d+\.\d+", base_version):
-                  release_parts = tuple(int(part) for part in base_version.split("."))
-                  force_dev_suffix = release_parts >= (1, 0, 26)
-
-              try:
-                  if force_dev_suffix or version_exists(base_version):
-                      package_version = next_available_dev_version()
-                      is_dev = True
-              except Exception as exc:
-                  raise SystemExit(f"Failed to query TestPyPI version index: {exc}")
-
-          with open(out, "a", encoding="utf-8") as f:
-              f.write(f"base_version={base_version}\n")
-              f.write(f"package_version={package_version}\n")
-              f.write(f"is_dev={'true' if is_dev else 'false'}\n")
+          output = os.environ["GITHUB_OUTPUT"]
+          with open(output, "a", encoding="utf-8") as handle:
+              handle.write(f"base_version={base_version}\n")
+              handle.write(f"package_version={package_version}\n")
           print(
-              f"[version-resolve] base={base_version} package={package_version} "
-              f"use_dev_suffix={use_dev_suffix} force_dev_suffix={force_dev_suffix}"
+              f"[version-resolve] index={target_index} ref={raw_ref} "
+              f"base={base_version} package={package_version}"
           )
           PY
 
-  build-wheels:
-    name: Build wheels
+  build-packages:
+    name: Build release artifacts
     needs:
       - resolve-package-version
-    uses: ./.github/workflows/reusable-wheel-build.yml
+    permissions:
+      actions: write
+      contents: read
+    uses: ./.github/workflows/build-wheel.yml
     with:
-      source_ref: ${{ github.event.inputs.ref || github.ref }}
+      source_ref: ${{ inputs.ref }}
       package_version: ${{ needs.resolve-package-version.outputs.package_version }}
-      matrix_preset: release
-
-  build-sdist:
-    name: Build sdist
-    needs:
-      - resolve-package-version
-    uses: ./.github/workflows/reusable-sdist-build.yml
-    with:
-      source_ref: ${{ github.event.inputs.ref || github.ref }}
-      package_version: ${{ needs.resolve-package-version.outputs.package_version }}
+      target: all
+      include_sdist: true
+      retention_days: ${{ inputs.retention_days }}
+    secrets:
+      checkout_token: ${{ secrets.checkout_token }}
 
   publish:
-    name: Publish to TestPyPI
-    if: ${{ (github.event_name != 'workflow_dispatch' || github.event.inputs.publish_pypi != 'true') && (startsWith(github.ref, 'refs/tags/v') || startsWith(github.event.inputs.ref, 'v') || startsWith(github.event.inputs.ref, 'refs/tags/v')) }}
-    runs-on: ubuntu-latest
+    name: Publish ${{ inputs.target_index }}
     needs:
-      - build-wheels
-      - build-sdist
+      - build-packages
+    runs-on: ubuntu-latest
     permissions:
       contents: read
     steps:
-      - name: Download wheel artifacts
+      - name: Download wheels
         uses: actions/download-artifact@v8
         with:
           pattern: wheels-*
           path: wheelhouse
           merge-multiple: true
 
-      - name: Download sdist artifact
+      - name: Download source distribution
         uses: actions/download-artifact@v8
         with:
           name: sdist
@@ -157,67 +154,26 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install build tools
+      - name: Install upload tool
         run: |
           python -m pip install --upgrade pip
           python -m pip install maturin==1.9.4
 
-      - name: Publish to TestPyPI
+      - name: Publish package
         env:
-          MATURIN_PYPI_TOKEN: ${{ secrets.TEST_PYPI_API_TOKEN }}
+          TARGET_INDEX: ${{ inputs.target_index }}
+          MATURIN_PYPI_TOKEN: ${{ inputs.target_index == 'pypi' && secrets.PYPI_API_TOKEN || secrets.TEST_PYPI_API_TOKEN }}
         run: |
+          set -euo pipefail
           if [[ -z "${MATURIN_PYPI_TOKEN:-}" ]]; then
-            echo "Missing TEST_PYPI_API_TOKEN secret."
+            echo "Missing token for ${TARGET_INDEX}."
             exit 1
           fi
-          maturin upload \
-            --repository-url https://test.pypi.org/legacy/ \
-            --non-interactive \
-            --skip-existing \
-            wheelhouse/*.whl dist/*.tar.gz
-
-  publish-pypi:
-    name: Publish to PyPI
-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish_pypi == 'true' && (startsWith(github.ref, 'refs/tags/v') || startsWith(github.event.inputs.ref, 'v') || startsWith(github.event.inputs.ref, 'refs/tags/v')) }}
-    runs-on: ubuntu-latest
-    needs:
-      - build-wheels
-      - build-sdist
-    permissions:
-      contents: read
-    steps:
-      - name: Download wheel artifacts
-        uses: actions/download-artifact@v8
-        with:
-          pattern: wheels-*
-          path: wheelhouse
-          merge-multiple: true
-
-      - name: Download sdist artifact
-        uses: actions/download-artifact@v8
-        with:
-          name: sdist
-          path: dist
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-
-      - name: Install build tools
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install maturin==1.9.4
-
-      - name: Publish to PyPI
-        env:
-          MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
-        run: |
-          if [[ -z "${MATURIN_PYPI_TOKEN:-}" ]]; then
-            echo "Missing PYPI_API_TOKEN secret."
-            exit 1
+          args=(
+            --non-interactive
+            --skip-existing
+          )
+          if [[ "${TARGET_INDEX}" == "testpypi" ]]; then
+            args+=(--repository-url https://test.pypi.org/legacy/)
           fi
-          maturin upload \
-            --non-interactive \
-            --skip-existing \
-            wheelhouse/*.whl dist/*.tar.gz
+          maturin upload "${args[@]}" wheelhouse/*.whl dist/*.tar.gz

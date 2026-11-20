@@ -1299,9 +1299,10 @@ fn parse_pvar_ldsc_meta(
     prefix: &str,
     require_cm: bool,
 ) -> Result<(Vec<i32>, Vec<i64>, Vec<f64>), String> {
-    let pvar_path = format!("{}.pvar", crate::pgen::normalize_pgen_prefix(prefix));
-    let file = File::open(&pvar_path).map_err(|e| format!("{pvar_path}: {e}"))?;
-    let reader = BufReader::new(file);
+    let pvar_path = crate::pgen::pvar_path_for_prefix(&crate::pgen::normalize_pgen_prefix(prefix))
+        .to_string_lossy()
+        .into_owned();
+    let reader = crate::pgen::open_text_reader(std::path::Path::new(&pvar_path))?;
     let mut header: Option<Vec<String>> = None;
     let mut chrom_codes = Vec::<i32>::new();
     let mut positions = Vec::<i64>::new();

@@ -609,8 +609,9 @@ class GWASPLOT:
     -----
     - Internally, chromosomes are mapped to integer codes 1..K for plotting.
     - The main DataFrame is stored as self.df with a MultiIndex (chr, pos).
-    - A global index list self.minidx encodes which SNPs are retained when
-      compression is enabled (used by both Manhattan and QQ plots).
+    - A global integer index array self.minidx encodes which SNPs are retained
+      for the compressed Manhattan plot.  QQ always uses the complete p-value
+      vector so its null distribution is not significance-enriched.
     """
 
     def __init__(
@@ -643,17 +644,15 @@ class GWASPLOT:
         if compression:
             n_snp = int(df.shape[0])
             if n_snp == 0:
-                self.minidx = []
+                self.minidx = np.empty(0, dtype=np.int64)
             else:
                 # target: ~100,000 SNPs for display
                 chunk_size = n_snp // 100_000 if n_snp >= 100_000 else 1
 
-                # Use numpy arrays to avoid expensive pandas sort/copy chains.
-                pvals = (
-                    _sanitize_logpvalues(df[pvalue])
-                    if self.pvalue_is_log10
-                    else _sanitize_pvalues(df[pvalue])
-                )
+                # The column was sanitized once above.  Reusing its contiguous
+                # float array avoids allocating a second full p-value vector
+                # just to choose Manhattan compression rows.
+                pvals = df[pvalue].to_numpy(dtype=np.float64, copy=False)
 
                 # Keep all highly significant SNPs without compression. In
                 # logP mode, significance increases with the value rather
@@ -698,9 +697,12 @@ class GWASPLOT:
                 keep_idx_small = np.flatnonzero(~mask_large_p)
 
                 # final kept SNP indices for plotting
-                self.minidx = np.concatenate([keep_idx_large, keep_idx_small]).tolist()
+                self.minidx = np.concatenate([keep_idx_large, keep_idx_small]).astype(
+                    np.int64,
+                    copy=False,
+                )
         else:
-            self.minidx = df.index.to_list()
+            self.minidx = df.index.to_numpy(dtype=np.int64, copy=False)
 
         # ---- (2) Core columns copy to avoid side effects ----
         df = df[[chr, pos, pvalue]].copy()
@@ -737,7 +739,7 @@ class GWASPLOT:
             label_to_pos = np.empty(df.shape[0], dtype=np.int64)
             sorted_labels = df.index.to_numpy(dtype=np.int64, copy=False)
             label_to_pos[sorted_labels] = np.arange(df.shape[0], dtype=np.int64)
-            self.minidx = label_to_pos[orig_labels].tolist()
+            self.minidx = label_to_pos[orig_labels]
         self.chr_ids = df[chr].unique()
 
         # ---- (4) Build cumulative genomic x-coordinate (vectorized) ----
@@ -1756,12 +1758,15 @@ class GWASPLOT:
             gs = GridSpec(12, 1, figure=fig)
             ax = fig.add_subplot(gs[0:12, 0])
 
+        # Keep one mutable p-value array through sanitization and sorting.  The
+        # previous path created a sanitized array and then a second sorted copy,
+        # which doubled QQ's peak working memory for large GWAS tables.
         p = self.df["y"].to_numpy(dtype=np.float64, copy=True)
         n = p.size
         if n == 0:
             raise ValueError("No p-values found for QQ plot.")
         if self.pvalue_is_log10:
-            p = _sanitize_logpvalues(p)
+            p[~np.isfinite(p)] = 0.0
             if sig_p_threshold is None:
                 sig_thr = float(np.log10(max(1, n)))
             else:
@@ -1770,7 +1775,7 @@ class GWASPLOT:
                 sig_thr = float(np.log10(max(1, n)))
         else:
             p[~np.isfinite(p)] = 1.0
-            p = np.clip(p, np.finfo(np.float64).tiny, 1.0)
+            np.clip(p, np.finfo(np.float64).tiny, 1.0, out=p)
             if sig_p_threshold is None:
                 sig_thr = 1.0 / float(n)
             else:
@@ -1786,10 +1791,12 @@ class GWASPLOT:
         # Full sorted p-values are the canonical QQ backbone. The ordering is
         # reversed for logP because larger values are more significant.
         if self.pvalue_is_log10:
-            p_sorted = np.sort(p, kind="mergesort")[::-1]
+            p.sort(kind="mergesort")
+            p_sorted = p[::-1]
             sig_n = int(np.sum(p_sorted >= sig_thr))
         else:
-            p_sorted = np.sort(p, kind="mergesort")
+            p.sort(kind="mergesort")
+            p_sorted = p
             sig_n = int(np.searchsorted(p_sorted, sig_thr, side="right"))
 
         if resolved_mode == "full":

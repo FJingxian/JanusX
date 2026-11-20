@@ -1,25 +1,22 @@
-"""Versioned GWAS null-model sidecar schema and matching helpers.
+"""Legacy GWAS null-model sidecar schema and matching helpers.
 
-The sidecar is deliberately implemented with the Python standard library only.
-It is embedded in the human-readable GWAS log between versioned sentinels so
-future readers can ignore ordinary log text and older logs can remain valid.
+The current GWAS pipeline no longer generates or fingerprints these records.
+The reader remains for compatibility with historical logs until the next
+fine-mapping design replaces this format.
 """
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 import hashlib
-from importlib import metadata as importlib_metadata
 import json
-import logging
 import math
 from pathlib import Path
 import re
 import struct
-from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 
-from janusx._plink import detect_existing_plink_kind
+from janusx._plink import detect_existing_plink_kind, pvar_path_for_prefix
 
 
 SIDECAR_SCHEMA_V1 = "janusx.gwas-null-model/v1"
@@ -59,25 +56,6 @@ class FileFingerprintV1:
     sha256: str
 
 
-@dataclass
-class GwasSidecarRunContext:
-    genotype_prefix: Path
-    phenotype_file: Path
-    phenotype_id_column: str
-    covariate_file: Path | None
-    covariate_columns: tuple[str, ...]
-    kinship_file: Path
-    kinship_id_file: Path
-    genotype_filters: dict[str, object]
-    fingerprint_cache: dict[Path, FileFingerprintV1] = field(default_factory=dict)
-    # When present, this is the exact numerical Q/PC matrix used by GWAS,
-    # persisted in the workflow's versioned NPZ source format.  The sidecar
-    # stores only its fingerprint and column identity; values remain external
-    # to the file-only log block.
-    qmatrix_file: Path | None = None
-    qmatrix_columns: tuple[str, ...] = ()
-
-
 @dataclass(frozen=True)
 class GwasNullModelSidecarV1:
     schema: str
@@ -113,14 +91,12 @@ class GwasNullModelSidecarV1:
     qmatrix_columns: tuple[str, ...] = ()
     phenotype_trait_index: int | None = None
     # Raw phenotype data-column index before any -n/--ncol subset or reorder.
-    # The existing phenotype_trait_index is retained for old records and is
-    # populated with this same raw index for newly emitted records.
+    # The field is retained for historical records.
     phenotype_trait_source_index: int | None = None
 
 
 __all__ = [
     "FileFingerprintV1",
-    "GwasSidecarRunContext",
     "GwasNullModelSidecarV1",
     "SIDECAR_BEGIN_V1",
     "SIDECAR_END_V1",
@@ -130,9 +106,7 @@ __all__ = [
     "SidecarError",
     "SidecarFormatError",
     "SidecarNotFound",
-    "build_fvlmm_sidecar",
     "discover_matching_sidecar",
-    "emit_sidecar_to_file_log",
     "find_matching_sidecar",
     "fingerprint_file",
     "hash_ordered_sample_ids",
@@ -173,183 +147,6 @@ def hash_ordered_sample_ids(sample_ids: Iterable[str]) -> str:
         digest.update(_HASH_LENGTH.pack(len(encoded)))
         digest.update(encoded)
     return digest.hexdigest()
-
-
-def build_fvlmm_sidecar(
-    context: GwasSidecarRunContext,
-    result_file: str | Path,
-    trait: str,
-    sample_ids: Iterable[str],
-    lambda_null: float,
-    sigma_g2: float | None,
-    sigma_e2: float | None,
-    pve: float,
-    grm_trace_mean: float,
-    effective_snp_count: int,
-    phenotype_trait_index: int | None = None,
-    phenotype_trait_source_index: int | None = None,
-) -> GwasNullModelSidecarV1:
-    """Build one FvLMM sidecar from the finalized result and fitted null."""
-
-    if not isinstance(context, GwasSidecarRunContext):
-        raise TypeError("context must be GwasSidecarRunContext")
-
-    result_path = Path(result_file).expanduser()
-    if not result_path.is_file():
-        raise FileNotFoundError(f"FvLMM result file not found: {result_path}")
-    if result_path.stat().st_size <= 0:
-        raise ValueError(f"FvLMM result file is empty: {result_path}")
-
-    ordered_sample_ids = list(sample_ids)
-    if len(ordered_sample_ids) == 0:
-        raise ValueError("FvLMM sidecar sample IDs must not be empty")
-
-    genotype_suffixes = _plink_source_suffixes(context.genotype_prefix)
-    genotype_prefix = _normalize_genotype_prefix(context.genotype_prefix)
-    genotype_paths = tuple(Path(f"{genotype_prefix}{suffix}") for suffix in genotype_suffixes)
-
-    kinship_id_path = Path(context.kinship_id_file).expanduser()
-    kinship_shape_n = _count_nonempty_lines(kinship_id_path)
-    if kinship_shape_n <= 0:
-        raise ValueError(f"kinship ID file is empty: {kinship_id_path}")
-
-    covariate_columns = tuple(str(column) for column in context.covariate_columns)
-    qmatrix_columns = tuple(str(column) for column in context.qmatrix_columns)
-    fixed_effect_columns = ("Intercept",) + covariate_columns
-    result_fingerprint = fingerprint_file(result_path)
-
-    record = GwasNullModelSidecarV1(
-        schema=SIDECAR_SCHEMA_V1,
-        created_at=_sidecar_created_at(),
-        janusx_version=_janusx_version(),
-        result=result_fingerprint,
-        model="fvlmm",
-        trait=str(trait),
-        z_columns=("beta", "se"),
-        effective_snp_count=int(effective_snp_count),
-        genotype_prefix=str(genotype_prefix.resolve()),
-        genotype_files=tuple(
-            _cached_fingerprint(context, path) for path in genotype_paths
-        ),
-        phenotype_file=_cached_fingerprint(context, context.phenotype_file),
-        phenotype_id_column=str(context.phenotype_id_column),
-        phenotype_trait_column=str(trait),
-        covariate_file=(
-            None
-            if context.covariate_file is None
-            else _cached_fingerprint(context, context.covariate_file)
-        ),
-        covariate_columns=covariate_columns,
-        kinship_file=_cached_fingerprint(context, context.kinship_file),
-        kinship_id_file=_cached_fingerprint(context, kinship_id_path),
-        kinship_format="dense",
-        kinship_shape=(kinship_shape_n, kinship_shape_n),
-        sample_count=len(ordered_sample_ids),
-        sample_order_sha256=hash_ordered_sample_ids(ordered_sample_ids),
-        lambda_null=float(lambda_null),
-        sigma_g2=(None if sigma_g2 is None else float(sigma_g2)),
-        sigma_e2=(None if sigma_e2 is None else float(sigma_e2)),
-        pve=float(pve),
-        grm_trace_mean=float(grm_trace_mean),
-        fixed_effect_columns=fixed_effect_columns,
-        genotype_filters=dict(context.genotype_filters),
-        allele_coding="A1_effect",
-        qmatrix_file=(
-            None
-            if context.qmatrix_file is None
-            else _cached_fingerprint(context, context.qmatrix_file)
-        ),
-        qmatrix_columns=qmatrix_columns,
-        phenotype_trait_index=(
-            None
-            if phenotype_trait_index is None
-            else int(phenotype_trait_index)
-        ),
-        phenotype_trait_source_index=(
-            None
-            if phenotype_trait_source_index is None
-            else int(phenotype_trait_source_index)
-        ),
-    )
-    _validate_record(record)
-    return record
-
-
-def emit_sidecar_to_file_log(
-    logger: Any, record: GwasNullModelSidecarV1
-) -> None:
-    """Write one serialized sidecar block through file handlers only."""
-
-    block = serialize_sidecar_block(record)
-    if not isinstance(logger, logging.Logger):
-        raise TypeError("logger must be a logging.Logger")
-    if not logger.isEnabledFor(logging.INFO):
-        return
-
-    handlers: list[logging.FileHandler] = []
-    seen_handlers: set[int] = set()
-    current: logging.Logger | None = logger
-    while current is not None:
-        for handler in current.handlers:
-            if not isinstance(handler, logging.FileHandler):
-                continue
-            handler_id = id(handler)
-            if handler_id in seen_handlers:
-                continue
-            seen_handlers.add(handler_id)
-            if handler.level <= logging.INFO:
-                handlers.append(handler)
-        if not current.propagate:
-            break
-        current = current.parent
-
-    if not handlers:
-        raise RuntimeError("no INFO-level file handler available for sidecar log")
-
-    log_record = logger.makeRecord(
-        logger.name,
-        logging.INFO,
-        __file__,
-        0,
-        block.rstrip("\n"),
-        (),
-        None,
-    )
-    for handler in handlers:
-        handler.handle(log_record)
-
-
-def _cached_fingerprint(
-    context: GwasSidecarRunContext, path: str | Path
-) -> FileFingerprintV1:
-    canonical = Path(path).expanduser().resolve()
-    cached = context.fingerprint_cache.get(canonical)
-    if cached is None:
-        cached = fingerprint_file(canonical)
-        context.fingerprint_cache[canonical] = cached
-    return cached
-
-
-def _count_nonempty_lines(path: str | Path) -> int:
-    count = 0
-    with Path(path).expanduser().open("r", encoding="utf-8", errors="replace") as handle:
-        for line in handle:
-            if line.strip() != "":
-                count += 1
-    return count
-
-
-def _sidecar_created_at() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-
-
-def _janusx_version() -> str:
-    for distribution_name in ("janusx", "JanusX"):
-        try:
-            return str(importlib_metadata.version(distribution_name))
-        except importlib_metadata.PackageNotFoundError:
-            continue
-    return "unknown"
 
 
 def serialize_sidecar_block(record: GwasNullModelSidecarV1) -> str:
@@ -532,11 +329,12 @@ def validate_sidecar_dependencies(
             "sidecar genotype fingerprint set must contain a BED/BIM/FAM or PGEN/PVAR/PSAM triplet"
         )
     genotype_suffixes = tuple(
-        Path(item.basename).suffix.lower() for item in record.genotype_files
+        _plink_component_suffix(item.basename) for item in record.genotype_files
     )
     if genotype_suffixes not in (
         (".bed", ".bim", ".fam"),
         (".pgen", ".pvar", ".psam"),
+        (".pgen", ".pvar.zst", ".psam"),
     ):
         raise FineMapSkip(
             "sidecar genotype fingerprint set must contain a BED/BIM/FAM or PGEN/PVAR/PSAM triplet"
@@ -615,7 +413,7 @@ def validate_sidecar_dependencies(
 def _normalize_genotype_prefix(path: str | Path) -> Path:
     text = str(Path(path).expanduser())
     lower = text.lower()
-    for suffix in (".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"):
+    for suffix in (".bed", ".bim", ".fam", ".pgen", ".pvar.zst", ".pvar", ".psam"):
         if lower.endswith(suffix):
             text = text[: -len(suffix)]
             break
@@ -630,8 +428,19 @@ def _plink_source_suffixes(genotype_prefix: str | Path) -> tuple[str, str, str]:
     if kind == "bfile" and Path(f"{prefix}.bed").is_file():
         return (".bed", ".bim", ".fam")
     if kind == "pfile" and Path(f"{prefix}.pgen").is_file():
-        return (".pgen", ".pvar", ".psam")
+        return (
+            ".pgen",
+            _plink_component_suffix(pvar_path_for_prefix(prefix)),
+            ".psam",
+        )
     raise FileNotFoundError(f"No PLINK {kind} source found at prefix: {prefix}")
+
+
+def _plink_component_suffix(path: str | Path) -> str:
+    text = str(path).lower()
+    if text.endswith(".pvar.zst"):
+        return ".pvar.zst"
+    return Path(text).suffix
 
 
 def _dependency_search_roots(

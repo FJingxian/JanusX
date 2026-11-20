@@ -43,7 +43,6 @@ from .workflow import (
     _gwas_evd_stage_ctx,
     _gwas_fvlmm_scan_stage_ctx,
     _gwas_scan_stage_ctx,
-    _gwas_report_logger,
     _log_file_only,
     _log_model_line,
     _resolve_stream_scan_chunk_size,
@@ -52,7 +51,6 @@ from .workflow import (
     _run_result_write_with_status,
     _safe_trait_file_label,
     _stream_model_pve,
-    _phenotype_source_column_index,
     _trait_values_and_mask,
     build_rich_progress,
     detect_effective_threads,
@@ -61,11 +59,6 @@ from .workflow import (
     rich_progress_available,
     run_lm_stream_bed_single_entry,
     should_animate_status,
-)
-from .null_model_sidecar import (
-    GwasSidecarRunContext,
-    build_fvlmm_sidecar,
-    emit_sidecar_to_file_log,
 )
 from .workflow_ui import _GwasProgressLog
 
@@ -134,57 +127,6 @@ def _missing_rate_chunk(
         raise ValueError("BED chunk has no selected samples.")
     values = np.asarray(missing, dtype=np.float64)
     return values if already_rate else values / float(n)
-
-
-def _emit_fvlmm_sidecar_after_publication(
-    *,
-    context: Optional[GwasSidecarRunContext],
-    result_file: str,
-    trait: object,
-    phenotype_trait_index: Optional[int] = None,
-    phenotype: Optional[pd.DataFrame] = None,
-    sample_ids: object,
-    mod: object,
-    effective_snp_count: int,
-    logger: logging.Logger,
-) -> None:
-    if context is None:
-        return
-    try:
-        raw_trait_index = phenotype_trait_index
-        if phenotype is not None:
-            source_index = _phenotype_source_column_index(phenotype, trait)
-            if source_index is not None:
-                raw_trait_index = int(source_index)
-        record = build_fvlmm_sidecar(
-            context=context,
-            result_file=result_file,
-            trait=trait,
-            phenotype_trait_index=raw_trait_index,
-            phenotype_trait_source_index=raw_trait_index,
-            sample_ids=sample_ids,
-            lambda_null=float(getattr(mod, "lbd_null")),
-            sigma_g2=(
-                None
-                if getattr(mod, "sigma_g2_null", None) is None
-                else float(getattr(mod, "sigma_g2_null"))
-            ),
-            sigma_e2=(
-                None
-                if getattr(mod, "sigma_e2_null", None) is None
-                else float(getattr(mod, "sigma_e2_null"))
-            ),
-            pve=float(getattr(mod, "pve")),
-            grm_trace_mean=float(getattr(mod, "trace_mean")),
-            effective_snp_count=int(effective_snp_count),
-        )
-        emit_sidecar_to_file_log(_gwas_report_logger(logger), record)
-    except Exception as exc:
-        _log_file_only(
-            logger,
-            logging.WARNING,
-            f"FvLMM null-model sidecar unavailable for trait {trait}: {exc}",
-        )
 
 
 def _resolve_trait_prepared_meta_for_current_filters(
@@ -1129,7 +1071,6 @@ def run_chunked_gwas_lmm_lm(
     trait_prepared_meta: Optional[dict[str, object]] = None,
     fused_qc: bool = False,
     bimranges: Optional[list[tuple[str, int, int]]] = None,
-    null_sidecar_context: Optional[GwasSidecarRunContext] = None,
 ) -> None:
     """
     Run LM/LMM/LMM2/FvLMM GWAS through the maintained windowed BED path.
@@ -1327,7 +1268,6 @@ def run_chunked_gwas_lmm_lm(
                 emit_trait_header=bool(emit_trait_header),
                 trait_prepared_meta=trait_prepared_meta,
                 bimranges=bimranges,
-                null_sidecar_context=null_sidecar_context,
             )
             if multi_trait_mode and trait_idx < len(trait_iter) - 1:
                 logger.info("")
@@ -1520,7 +1460,8 @@ def run_chunked_gwas_lmm_lm(
             scan_threads = int(n_cores)
         # Scan stage policy:
         # - Default stream kernels use Rayon=`-t`, BLAS=1
-        # - FvLMM uses BLAS=`-t`, Rayon=1 because G x U SGEMM dominates
+        # - FvLMM uses BLAS=`-t` and Rayon=`-t` by default; the conservative
+        #   BLAS-only plan remains available through JX_FVLMM_SCAN_STAGE.
         # - Python worker fan-out kept at 1 to avoid nested oversubscription.
         max_inflight = 1
         workers = 1
@@ -1640,6 +1581,7 @@ def run_chunked_gwas_lmm_lm(
             str(tmp_tsv),
             genetic_model=str(genetic_model),
         )
+        writer_closed = False
 
         _use_fvlmm_tsv_fastpath = (
             str(effective_model_key).lower() == "fvlmm"
@@ -2124,17 +2066,49 @@ def run_chunked_gwas_lmm_lm(
                         raise RuntimeError(
                             "Rust-only GWAS scan requires rust symbol BedChunkReader."
                         )
-                    bed_reader = _new_bed_chunk_reader_for_stream(
-                        bed_prefix=str(bed_prefix),
-                        maf_threshold=float(maf_threshold),
-                        max_missing_rate=float(max_missing_rate),
-                        sample_ids=sample_sub.tolist(),
-                        model=str(genetic_model),
-                        het_threshold=float(het_threshold),
-                        mmap_window_mb=(int(mmap_window_mb) if mmap_window_mb is not None else None),
-                        bimranges=(bimranges if trait_prepared_meta is None else None),
-                        logger=logger,
-                    )
+                    source_is_pgen = str(bed_prefix).lower().endswith(".pgen")
+                    if trait_prepared_meta is not None and not source_is_pgen:
+                        bed_reader = _new_bed_chunk_reader_from_meta_for_stream(
+                            bed_prefix=str(bed_prefix),
+                            row_indices=np.asarray(
+                                trait_prepared_meta["row_indices"],
+                                dtype=np.int64,
+                            ),
+                            row_flip=np.asarray(
+                                trait_prepared_meta["row_flip"],
+                                dtype=np.bool_,
+                            ),
+                            row_missing=np.asarray(
+                                trait_prepared_meta["missing_rate"],
+                                dtype=np.float32,
+                            ),
+                            row_maf=np.asarray(
+                                trait_prepared_meta["maf"],
+                                dtype=np.float32,
+                            ),
+                            sample_ids=sample_sub.tolist(),
+                            mmap_window_mb=(
+                                int(mmap_window_mb)
+                                if mmap_window_mb is not None
+                                else None
+                            ),
+                        )
+                    else:
+                        bed_reader = _new_bed_chunk_reader_for_stream(
+                            bed_prefix=str(bed_prefix),
+                            maf_threshold=float(maf_threshold),
+                            max_missing_rate=float(max_missing_rate),
+                            sample_ids=sample_sub.tolist(),
+                            model=str(genetic_model),
+                            het_threshold=float(het_threshold),
+                            mmap_window_mb=(
+                                int(mmap_window_mb)
+                                if mmap_window_mb is not None
+                                else None
+                            ),
+                            bimranges=(bimranges if bimranges else None),
+                            logger=logger,
+                        )
                     if not hasattr(bed_reader, "next_chunk_prepared"):
                         raise RuntimeError(
                             "Rust-only GWAS scan requires BedChunkReader.next_chunk_prepared."
@@ -2242,6 +2216,12 @@ def run_chunked_gwas_lmm_lm(
                         while len(inflight) > 0:
                             _drain_completed(wait_for_one=True)
                     writer.flush()
+                    # Drain the bounded asynchronous writer before marking
+                    # the scan complete.  Previously close() ran only from
+                    # ``finally`` after pbar.finish(), which made the writer
+                    # drain appear as an unexplained post-scan stall.
+                    writer.close()
+                    writer_closed = True
                     if use_rust_assoc_writer:
                         has_results = int(writer.rows_written) > 0
                         wrote_header = bool(has_results)
@@ -2269,10 +2249,11 @@ def run_chunked_gwas_lmm_lm(
                     if pbar is not None:
                         pbar.close(show_done=False)
                     ex.shutdown(wait=False, cancel_futures=True)
-                    try:
-                        writer.close()
-                    except Exception:
-                        pass
+                    if not writer_closed:
+                        try:
+                            writer.close()
+                        except Exception:
+                            pass
                     if interrupted and os.path.exists(tmp_tsv):
                         try:
                             os.remove(tmp_tsv)
@@ -2325,18 +2306,6 @@ def run_chunked_gwas_lmm_lm(
             use_spinner=False,
             emit_done_line=False,
         )
-        if str(effective_model_key).lower() == "fvlmm":
-            _emit_fvlmm_sidecar_after_publication(
-                context=null_sidecar_context,
-                result_file=out_tsv,
-                trait=pname,
-                phenotype_trait_index=getattr(pname, "col_idx", None),
-                phenotype=pheno_aligned,
-                sample_ids=trait_ids,
-                mod=mod,
-                effective_snp_count=int(done_snps),
-                logger=logger,
-            )
         saved_paths.append(str(out_tsv))
         _log_model_line(
             logger,
@@ -2419,7 +2388,6 @@ def run_chunked_gwas_streaming_shared(
     emit_trait_header: bool = True,
     trait_prepared_meta: Optional[dict[str, object]] = None,
     bimranges: Optional[list[tuple[str, int, int]]] = None,
-    null_sidecar_context: Optional[GwasSidecarRunContext] = None,
 ) -> None:
     """
     Shared-chunk streaming GWAS for multiple models on one trait.
@@ -2631,6 +2599,7 @@ def run_chunked_gwas_streaming_shared(
             "tmp_tsv": "",
             "out_tsv": "",
             "writer": None,
+            "writer_closed": False,
             "init_log": None,
             "skip_scan": False,
             "null_pve": None,
@@ -3112,6 +3081,10 @@ def run_chunked_gwas_streaming_shared(
                 writer = ctx.get("writer")
                 if writer is not None:
                     writer.flush()
+                    # The scan progress represents a complete output stage;
+                    # wait for queued formatting/writes before showing 100%.
+                    writer.close()
+                    ctx["writer_closed"] = True
                     if use_rust_assoc_writer:
                         ctx["has_results"] = int(writer.rows_written) > 0
                         ctx["wrote_header"] = bool(ctx["has_results"])
@@ -3158,7 +3131,7 @@ def run_chunked_gwas_streaming_shared(
                     except Exception:
                         pass
                 writer_obj = ctx.get("writer")
-                if writer_obj is not None:
+                if writer_obj is not None and not bool(ctx.get("writer_closed", False)):
                     try:
                         writer_obj.close()
                     except Exception:
@@ -3238,25 +3211,16 @@ def run_chunked_gwas_streaming_shared(
                 }
             )
             if os.path.exists(tmp_tsv):
-                os.remove(tmp_tsv)
+                try:
+                    os.remove(tmp_tsv)
+                except OSError:
+                    pass
         if has_results:
             _run_result_write_with_status(
                 lambda: _finalize_gwas_result_tsv(tmp_tsv, out_tsv, genofile, logger=logger),
                 use_spinner=False,
                 emit_done_line=False,
             )
-            if str(ctx.get("model_key", "")).lower() == "fvlmm":
-                _emit_fvlmm_sidecar_after_publication(
-                    context=null_sidecar_context,
-                    result_file=out_tsv,
-                    trait=trait_selector,
-                    phenotype_trait_index=getattr(trait_selector, "col_idx", None),
-                    phenotype=pheno_aligned,
-                    sample_ids=trait_ids,
-                    mod=ctx.get("mod"),
-                    effective_snp_count=int(done_snps),
-                    logger=logger,
-                )
             saved_paths.append(str(out_tsv))
             _log_model_line(
                 logger,
@@ -3273,7 +3237,6 @@ def run_chunked_gwas_streaming_shared(
                     use_spinner=bool(use_spinner),
                     emit_done_line=False,
                 )
-
             summary_rows.append(
                 {
                     "phenotype": str(pname),

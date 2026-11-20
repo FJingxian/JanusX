@@ -45,6 +45,10 @@ _GWAS_MODEL_LABELS = {
     "FarmCPU",
 }
 _FASTPLOT_FIGSIZE = (16.0, 4.0)
+# The GWAS fastplot Manhattan panel occupies two of the four mosaic columns
+# in a 16x4 inch canvas.  A standalone population plot therefore uses an
+# 8x4 inch canvas so its physical plotting area has the same aspect ratio.
+_FASTPLOT_MANHATTAN_FIGSIZE = (8.0, 4.0)
 _FASTPLOT_DPI = 300
 _FASTPLOT_SCATTER_SIZE = 8.0
 _FASTPLOT_HIST_BINS = 15
@@ -165,6 +169,9 @@ class _GwasProgressLog:
 
     def __init__(self, logger, model: str, total: int, *, trait: str = "", unit: str = "SNP"):
         self.logger = logger
+        # Keep the run's console mode even if live rendering wraps stdout.
+        terminal_rich = getattr(logger, "_janusx_gwas_terminal_rich", None)
+        self._file_only = stdout_is_tty() if terminal_rich is None else bool(terminal_rich)
         self.model = " ".join(str(model).split())
         self.trait = " ".join(str(trait).split())
         self.total = max(0, int(total))
@@ -207,7 +214,7 @@ class _GwasProgressLog:
         # get retried on every native progress callback.
         self.last_emit = now
         try:
-            if stdout_is_tty():
+            if self._file_only:
                 _log_file_only(self.logger, logging.INFO, line)
             else:
                 self.logger.info(line)
@@ -407,6 +414,9 @@ class _ProgressAdapter(_BaseProgressAdapter):
         self._memory_text = ""
         self._memory_until_tick = 0
         self._log_finished = False
+        self._progress_log = progress_log or _GwasProgressLog(
+            logger, desc, total, trait=trait, unit=log_unit,
+        )
         super().__init__(
             total=total,
             desc=desc,
@@ -420,9 +430,6 @@ class _ProgressAdapter(_BaseProgressAdapter):
             logger=logger,
             log_unit=log_unit,
             description_template="[green]{task.description:<10}",
-        )
-        self._progress_log = progress_log or _GwasProgressLog(
-            logger, desc, total, trait=trait, unit=log_unit,
         )
 
     def _active_memory_text(self) -> str:
@@ -533,12 +540,12 @@ def fastplot(
 
         from janusx.bioplotkit import GWASPLOT, apply_integer_yticks
 
+        # One plot model is sufficient for both panels.  ``GWASPLOT.qq``
+        # deliberately computes its ranks from the complete ``self.df`` and
+        # does not use ``self.minidx`` (the Manhattan compression index), so a
+        # second ``GWASPLOT(..., compression=False)`` would retain another
+        # full copy of every locus for no statistical or visual benefit.
         gwasplot = GWASPLOT(plot_results, interval_rate=_FASTPLOT_MANHATTAN_INTERVAL_RATE)
-        gwasplot_qq = GWASPLOT(
-            plot_results,
-            interval_rate=_FASTPLOT_MANHATTAN_INTERVAL_RATE,
-            compression=False,
-        )
         scatter_size = _FASTPLOT_SCATTER_SIZE
 
         # A: phenotype distribution
@@ -604,7 +611,7 @@ def fastplot(
 
         # C: QQ plot
         manh_ymin, manh_ymax = axes["B"].get_ylim()
-        gwasplot_qq.qq(
+        gwasplot.qq(
             ax=axes["C"],
             scatter_size=scatter_size,
             axis_min=0.0,
@@ -678,6 +685,270 @@ def _run_fastplot_with_status(
     return max(time.time() - viz_t0, 0.0)
 
 
+def _read_fastplot_tsv(out_tsv: str) -> pd.DataFrame:
+    """Read only the three columns needed by the GWAS diagnostic plot.
+
+    GWAS result files can contain many effect/model columns and millions of
+    rows.  Keep chromosome labels categorical and parse the numeric columns at
+    the CSV boundary so the plot path does not retain an object-backed copy of
+    the chromosome column or perform a second p-value conversion.  A fallback
+    keeps the historical tolerant handling for a non-numeric p-value token.
+    """
+    usecols = ["chrom", "pos", "pwald"]
+    dtype_map: dict[str, object] = {
+        "chrom": "category",
+        "pos": "int64",
+        "pwald": "float64",
+    }
+    try:
+        return pd.read_csv(
+            out_tsv,
+            sep="\t",
+            usecols=usecols,
+            dtype=dtype_map,
+        )
+    except (TypeError, ValueError):
+        # Preserve the old permissive behavior for files containing tokens
+        # such as ``NA`` or other non-numeric p-value text.
+        plot_df = pd.read_csv(
+            out_tsv,
+            sep="\t",
+            usecols=usecols,
+            dtype={"chrom": "category", "pos": "int64"},
+        )
+        plot_df["pwald"] = pd.to_numeric(plot_df["pwald"], errors="coerce")
+        return plot_df
+
+
+def _resolve_population_plot_column(columns, requested: str) -> str:
+    """Resolve a population-scan column while tolerating header case."""
+
+    names = [str(column) for column in columns]
+    wanted = str(requested)
+    if wanted in names:
+        return wanted
+    wanted_lower = wanted.lower()
+    for name in names:
+        if name.lower() == wanted_lower:
+            return name
+    raise ValueError(
+        f"population scan table is missing column {wanted!r}; "
+        f"available columns: {', '.join(names)}"
+    )
+
+
+def _read_population_manhattan_tsv(
+    out_tsv: str,
+    *,
+    chrom_col: str,
+    start_col: str,
+    end_col: str,
+    score_col: str,
+    group_cols: tuple[str, ...] = (),
+) -> tuple[pd.DataFrame, tuple[str, ...]]:
+    """Read the compact window columns needed by a population Manhattan plot."""
+
+    header = pd.read_csv(out_tsv, sep="\t", nrows=0)
+    resolved = {
+        "chrom": _resolve_population_plot_column(header.columns, chrom_col),
+        "start": _resolve_population_plot_column(header.columns, start_col),
+        "end": _resolve_population_plot_column(header.columns, end_col),
+        "score": _resolve_population_plot_column(header.columns, score_col),
+    }
+    resolved_groups = tuple(
+        _resolve_population_plot_column(header.columns, column)
+        for column in group_cols
+    )
+    usecols = list(dict.fromkeys([*resolved.values(), *resolved_groups]))
+    table = pd.read_csv(out_tsv, sep="\t", usecols=usecols)
+    rename_map = {value: key for key, value in resolved.items()}
+    table = table.rename(columns=rename_map)
+
+    start = pd.to_numeric(table["start"], errors="coerce")
+    end = pd.to_numeric(table["end"], errors="coerce")
+    score = pd.to_numeric(table["score"], errors="coerce")
+    chrom = table["chrom"].astype("string")
+    finite = (
+        chrom.notna()
+        & start.notna()
+        & end.notna()
+        & score.notna()
+        & np.isfinite(start.to_numpy(dtype=np.float64, copy=False))
+        & np.isfinite(end.to_numpy(dtype=np.float64, copy=False))
+        & np.isfinite(score.to_numpy(dtype=np.float64, copy=False))
+    )
+    out = pd.DataFrame(
+        {
+            "chrom": chrom,
+            # Window statistics are placed at the window midpoint.  This
+            # matches the genomic placement of a locus while avoiding a
+            # systematic left-edge shift for wide windows.
+            "pos": np.rint((start + end) / 2.0),
+            "score": score,
+        }
+    )
+    for column in resolved_groups:
+        out[column] = table[column].astype("string")
+        finite &= out[column].notna().to_numpy(dtype=bool, copy=False)
+    out = out.loc[np.asarray(finite, dtype=bool)].reset_index(drop=True)
+    if not out.empty:
+        # Pandas 3/4 deprecates the Series ``copy=`` keyword under
+        # copy-on-write; assignment already materializes the compact columns.
+        out["pos"] = out["pos"].astype(np.int64)
+        out["score"] = out["score"].astype(np.float64)
+    return out, resolved_groups
+
+
+def _safe_population_plot_token(value: object) -> str:
+    token = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value).strip())
+    token = token.strip("._")
+    return token or "group"
+
+
+def _fast_population_manhattan(
+    results: pd.DataFrame,
+    *,
+    outsvg: str,
+    score_label: str,
+    title: str = "",
+) -> None:
+    """Render one fast, GWAS-style Manhattan SVG for window statistics."""
+
+    from janusx.bioplotkit import GWASPLOT, apply_integer_yticks
+
+    plot_df = results[["chrom", "pos", "score"]].copy()
+    if plot_df.empty:
+        fig = plt.figure(figsize=_FASTPLOT_MANHATTAN_FIGSIZE, dpi=_FASTPLOT_DPI)
+        try:
+            ax = fig.add_subplot(111)
+            ax.text(0.5, 0.5, "No valid windows", ha="center", va="center", transform=ax.transAxes)
+            ax.set_xlabel("Chromosome")
+            ax.set_ylabel(str(score_label))
+            if str(title).strip():
+                ax.set_title(str(title))
+            fig.tight_layout()
+            fig.savefig(outsvg, format="svg", transparent=False, facecolor="white")
+        finally:
+            plt.close(fig)
+        return
+
+    # GWASPLOT already owns the chromosome ordering, gap calculation,
+    # compression and axis styling used by GWAS fastplot.  Treat the scan
+    # statistic as a precomputed -log10-like score so no p-value transform is
+    # applied; the y-axis remains labelled with the actual statistic.
+    gwasplot = GWASPLOT(
+        plot_df,
+        chr="chrom",
+        pos="pos",
+        pvalue="score",
+        interval_rate=_FASTPLOT_MANHATTAN_INTERVAL_RATE,
+        pvalue_is_log10=True,
+    )
+    fig = plt.figure(figsize=_FASTPLOT_MANHATTAN_FIGSIZE, dpi=_FASTPLOT_DPI)
+    try:
+        ax = fig.add_subplot(111)
+        gwasplot.manhattan(
+            None,
+            ax=ax,
+            color_set=["black", "grey"],
+            marker="o",
+            min_logp=None,
+            y_label=str(score_label),
+            s=_FASTPLOT_SCATTER_SIZE,
+            alpha=0.78,
+            rasterized=True,
+        )
+        finite_scores = pd.to_numeric(plot_df["score"], errors="coerce").to_numpy(
+            dtype=np.float64,
+            copy=False,
+        )
+        finite_scores = finite_scores[np.isfinite(finite_scores)]
+        if finite_scores.size > 0:
+            low = float(np.min(finite_scores))
+            high = float(np.max(finite_scores))
+            span = max(high - low, 1e-12)
+            pad = max(0.05 * span, 1e-6)
+            # Keep the conventional zero baseline for non-negative FST, while
+            # retaining negative XP-CLR-normalized values when they occur.
+            bottom = 0.0 if low >= 0.0 else low - pad
+            top = high + pad
+            if top <= bottom:
+                top = bottom + 1.0
+            ax.set_ylim(bottom, top)
+            apply_integer_yticks(ax)
+        if str(title).strip():
+            ax.set_title(str(title))
+        fig.tight_layout()
+        fig.savefig(outsvg, format="svg", transparent=False, facecolor="white")
+    finally:
+        plt.close(fig)
+
+
+def _run_fast_manhattan_from_tsv_with_status(
+    out_tsv: str,
+    *,
+    outsvg: str,
+    score_col: str,
+    score_label: str,
+    chrom_col: str = "chrom",
+    start_col: str = "start",
+    end_col: str = "end",
+    group_cols: tuple[str, ...] = (),
+    use_spinner: bool = False,
+) -> tuple[float, list[str]]:
+    """Render population-scan Manhattan SVG(s) with the GWAS fastplot style."""
+
+    viz_t0 = time.time()
+    plot_df, resolved_groups = _read_population_manhattan_tsv(
+        out_tsv,
+        chrom_col=chrom_col,
+        start_col=start_col,
+        end_col=end_col,
+        score_col=score_col,
+        group_cols=group_cols,
+    )
+    group_columns = tuple(resolved_groups)
+    base_svg = str(outsvg)
+    if base_svg.lower().endswith(".svg"):
+        base_stem = base_svg[:-4]
+    else:
+        base_stem = base_svg
+
+    jobs: list[tuple[pd.DataFrame, str, str]] = []
+    if group_columns:
+        if plot_df.empty:
+            jobs.append((plot_df, base_svg, ""))
+        else:
+            for key, group in plot_df.groupby(list(group_columns), sort=False, dropna=False):
+                key_values = key if isinstance(key, tuple) else (key,)
+                tokens = [_safe_population_plot_token(value) for value in key_values]
+                path = f"{base_stem}.{'_vs_'.join(tokens)}.svg"
+                title = " vs ".join(str(value) for value in key_values)
+                jobs.append((group, path, title))
+    else:
+        jobs.append((plot_df, base_svg, ""))
+
+    with CliStatus(
+        "Rendering Manhattan plot...",
+        enabled=True,
+        use_process=bool(use_spinner),
+    ) as task:
+        try:
+            with runtime_thread_stage(blas_threads=1, rayon_threads=1):
+                for group, path, title in jobs:
+                    _fast_population_manhattan(
+                        group,
+                        outsvg=path,
+                        score_label=str(score_label),
+                        title=title,
+                    )
+        except Exception:
+            task.fail("Rendering Manhattan plot ...Failed")
+            raise
+        task.complete("Rendering Manhattan plot ...Finished")
+    return max(time.time() - viz_t0, 0.0), [path for _group, path, _title in jobs]
+
+
 def _run_fastplot_from_tsv_with_status(
     out_tsv: str,
     phenosub: np.ndarray,
@@ -690,19 +961,11 @@ def _run_fastplot_from_tsv_with_status(
     emit_done_line: bool = False,
 ) -> float:
     viz_t0 = time.time()
-    usecols = ["chrom", "pos", "pwald"]
-    dtype_map: dict[str, object] = {"chrom": str, "pos": "int64"}
     plot_style_norm = _normalize_fastplot_style(plot_style)
     if bool(use_spinner):
         with CliStatus("Visualizing ...", enabled=True, use_process=False) as task:
             try:
-                plot_df = pd.read_csv(
-                    out_tsv,
-                    sep="\t",
-                    usecols=usecols,
-                    dtype=dtype_map,
-                )
-                plot_df["pwald"] = pd.to_numeric(plot_df["pwald"], errors="coerce")
+                plot_df = _read_fastplot_tsv(out_tsv)
                 with runtime_thread_stage(blas_threads=1, rayon_threads=1):
                     fastplot(
                         plot_df,
@@ -718,13 +981,7 @@ def _run_fastplot_from_tsv_with_status(
             if bool(emit_done_line):
                 task.complete("Visualizing ...Finished")
     else:
-        plot_df = pd.read_csv(
-            out_tsv,
-            sep="\t",
-            usecols=usecols,
-            dtype=dtype_map,
-        )
-        plot_df["pwald"] = pd.to_numeric(plot_df["pwald"], errors="coerce")
+        plot_df = _read_fastplot_tsv(out_tsv)
         with runtime_thread_stage(blas_threads=1, rayon_threads=1):
             fastplot(
                 plot_df,

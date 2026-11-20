@@ -181,7 +181,11 @@ from janusx.gs.progress import (
     trace_preparation,
 )
 from janusx.script._common.genocache import configure_genotype_cache_from_out
-from janusx._plink import detect_existing_plink_kind
+from janusx._plink import (
+    detect_existing_plink_kind,
+    open_text_auto,
+    pvar_path_for_prefix,
+)
 from janusx.script._common.threads import (
     detect_thread_budget_info,
     detect_rust_blas_backend,
@@ -1924,7 +1928,7 @@ def _read_plink_bim_marker_meta(
     kind, prefix = resolved
     is_pgen = kind == "pfile"
     if is_pgen:
-        variant_path = f"{prefix}.pvar"
+        variant_path = pvar_path_for_prefix(prefix)
         columns: list[str] | None = None
     else:
         variant_path = prefix if str(prefix).lower().endswith(".bim") else f"{prefix}.bim"
@@ -1938,7 +1942,7 @@ def _read_plink_bim_marker_meta(
     snp: list[str] = []
     ref: list[str] = []
     alt: list[str] = []
-    with open(variant_path, "r", encoding="utf-8", errors="replace") as fh:
+    with open_text_auto(variant_path, errors="replace") as fh:
         for line_no, line in enumerate(fh, start=1):
             s = str(line).strip()
             if s == "":

@@ -1300,7 +1300,7 @@ where
     let mut bed_window = None;
     let mut full_mmap = None;
     let n_snps = if pgen_source {
-        crate::pgen::count_pvar_variants(bed_prefix)?
+        crate::pgen::count_pgen_variants(bed_prefix, n_samples_full)?
     } else {
         let bed_path = format!("{bed_prefix}.bed");
         bed_window = if let Some(window_mb) = mmap_window_mb.filter(|&v| v > 0) {

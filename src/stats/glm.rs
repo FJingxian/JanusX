@@ -1945,11 +1945,11 @@ fn lm_stream_bed_segments_compact_windowed_unified(
                 };
                 let non_missing = n.saturating_sub(missing);
                 let miss_rate = if n > 0 {
-                    missing as f32 / n as f32
+                    missing as f64 / n as f64
                 } else {
-                    1.0_f32
+                    1.0_f64
                 };
-                if miss_rate > max_missing_rate {
+                if !crate::gfreader::rate_within_threshold(miss_rate, max_missing_rate) {
                     return None;
                 }
                 if non_missing == 0 {
@@ -1963,15 +1963,18 @@ fn lm_stream_bed_segments_compact_windowed_unified(
                     };
                 }
                 if het_threshold > 0.0 {
-                    let het_rate = het as f32 / non_missing as f32;
-                    if het_rate > het_threshold {
+                    let het_rate = het as f64 / non_missing as f64;
+                    if !crate::gfreader::rate_within_threshold(het_rate, het_threshold) {
                         return None;
                     }
                 }
                 let alt_sum = het.saturating_add(hom_alt.saturating_mul(2));
                 let alt_freq = alt_sum as f32 / (2.0_f32 * non_missing as f32);
-                let maf = alt_freq.min(1.0_f32 - alt_freq);
-                if maf < maf_threshold {
+                if !crate::gfreader::maf_passes_threshold_from_counts(
+                    alt_sum as f64,
+                    non_missing,
+                    maf_threshold,
+                ) {
                     return None;
                 }
 
@@ -3332,7 +3335,8 @@ pub fn lm_pgen_to_tsv_f32<'py>(
         )));
     }
     let full_samples = sample_indices.len() == n_samples_full;
-    let n_snps = crate::pgen::count_pvar_variants(&norm_prefix).map_err(PyRuntimeError::new_err)?;
+    let n_snps = crate::pgen::count_pgen_variants(&norm_prefix, n_samples_full)
+        .map_err(PyRuntimeError::new_err)?;
     let pgen_path = std::path::PathBuf::from(format!("{norm_prefix}.pgen"));
     let mut reader = crate::pgen::PgenReader::open(&pgen_path, n_samples_full, n_snps)
         .map_err(PyRuntimeError::new_err)?;

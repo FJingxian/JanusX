@@ -1406,7 +1406,7 @@ fn grm_stream_row_prepare_from_counts_f64(
     }
     if het_thr > 0.0_f32 && non_missing > 0 {
         let het_rate = (het_count as f64) / (non_missing as f64);
-        if het_rate > het_thr as f64 {
+        if !crate::gfreader::rate_within_threshold(het_rate, het_thr) {
             return None;
         }
     }
@@ -1414,7 +1414,7 @@ fn grm_stream_row_prepare_from_counts_f64(
         return None;
     }
     let missing_rate = 1.0_f64 - (non_missing as f64 / n_samples as f64);
-    if missing_rate > miss_thr as f64 {
+    if !crate::gfreader::rate_within_threshold(missing_rate, miss_thr) {
         return None;
     }
     if non_missing == 0 {
@@ -1503,7 +1503,7 @@ fn grm_stream_row_prepare_from_counts_f32(
     }
     if het_thr > 0.0_f32 && non_missing > 0 {
         let het_rate = (het_count as f64) / (non_missing as f64);
-        if het_rate > het_thr as f64 {
+        if !crate::gfreader::rate_within_threshold(het_rate, het_thr) {
             return None;
         }
     }
@@ -1511,7 +1511,7 @@ fn grm_stream_row_prepare_from_counts_f32(
         return None;
     }
     let missing_rate = 1.0_f64 - (non_missing as f64 / n_samples as f64);
-    if missing_rate > miss_thr as f64 {
+    if !crate::gfreader::rate_within_threshold(missing_rate, miss_thr) {
         return None;
     }
     if non_missing == 0 {
@@ -2957,6 +2957,21 @@ fn grm_decode_threads_default_for_backend(total_threads: usize, backend: &str) -
         // OpenBLAS-backed GRM on large real datasets tends to be GEMM/SYRK-bound,
         // so dedicating extra cores to decode usually steals time from BLAS.
         "openblas" => 1,
+        // Accelerate exposes a threaded/unthreaded mode rather than an exact
+        // thread-count setter.  Once the BLAS guard enables the threaded mode,
+        // it can use the available cores while Rayon decodes the next block.
+        // Four decode workers hid the mounted-volume read/decode latency in
+        // the macOS benchmark; cap the decode side so it does not overwhelm
+        // smaller machines or compete excessively with the BLAS kernel.
+        "accelerate" => {
+            if total_threads >= 8 {
+                (total_threads / 2).max(2).min(4)
+            } else if total_threads >= 4 {
+                2
+            } else {
+                1
+            }
+        }
         _ => {
             if total_threads >= 8 {
                 (total_threads / 4).max(2).min(4)
@@ -6714,10 +6729,10 @@ mod tests {
     }
 
     #[test]
-    fn grm_decode_threads_accelerate_keeps_legacy_defaults() {
+    fn grm_decode_threads_accelerate_uses_four_decode_workers_on_eight_threads() {
         assert_eq!(grm_decode_threads_default_for_backend(1, "accelerate"), 1);
         assert_eq!(grm_decode_threads_default_for_backend(4, "accelerate"), 2);
-        assert_eq!(grm_decode_threads_default_for_backend(8, "accelerate"), 2);
+        assert_eq!(grm_decode_threads_default_for_backend(8, "accelerate"), 4);
         assert_eq!(grm_decode_threads_default_for_backend(16, "accelerate"), 4);
     }
 

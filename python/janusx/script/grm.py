@@ -153,7 +153,7 @@ _GRM_WORKING_BUFFERS_SPARSE = 2
 def _normalize_plink_prefix_path(path_or_prefix: str) -> str:
     p = str(path_or_prefix).strip()
     low = p.lower()
-    for suffix in (".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"):
+    for suffix in (".bed", ".bim", ".fam", ".pgen", ".pvar.zst", ".pvar", ".psam"):
         if low.endswith(suffix):
             return p[: -len(suffix)]
     return p

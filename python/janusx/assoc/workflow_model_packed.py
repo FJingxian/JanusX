@@ -27,6 +27,7 @@ from janusx.script._common.memory import (
     resolve_decode_block_rows as _common_resolve_decode_block_rows,
     resolve_decode_mmap_window_mb as _common_resolve_decode_mmap_window_mb,
 )
+from janusx._plink import open_text_auto, pvar_path_for_prefix
 from janusx.script._common.genoio import (
     inspect_genotype_file,
     open_plink_bed_payload_memmap,
@@ -86,6 +87,7 @@ from .workflow import (
     _run_result_write_with_status,
     _safe_trait_file_label,
     _splmm_fused_qc_eligible,
+    _splmm_fused_qc_source_available,
     _filter_trait_prepared_meta_by_bimranges,
     _site_tuple_parts,
     _subset_square_matrix_identity_aware,
@@ -1036,6 +1038,11 @@ def _ensure_splmm_sparse_grm(
 
     build_ok = False
     build_result = None
+    sync_warning_messages: list[str] = []
+
+    def _queue_sync_warning(message: str) -> None:
+        sync_warning_messages.append(str(message))
+
     build_t0 = time.monotonic()
     try:
         if use_dense_extract:
@@ -1046,6 +1053,7 @@ def _ensure_splmm_sparse_grm(
                 abs_threshold=False,
                 progress_callback=_progress_cb,
                 progress_every=1,
+                sync_warning_callback=_queue_sync_warning,
             )
         elif use_fused_stream:
             from janusx.script.grm import (
@@ -1125,6 +1133,12 @@ def _ensure_splmm_sparse_grm(
                     pbar.finish()
             finally:
                 pbar.close(show_done=False)
+    for warning_message in sync_warning_messages:
+        _emit_warning_line(
+            logger,
+            warning_message,
+            use_spinner=bool(use_spinner),
+        )
     built_path = sparse_path
     built_n_samples = None
     built_nnz = None
@@ -2299,9 +2313,11 @@ def _iter_bim_active_rows(prefix: str, active_row_idx: np.ndarray):
     target = int(row_idx[ptr])
     is_pgen = _is_pgen_prefix(str(prefix))
     plink_prefix = normalize_plink_prefix(str(prefix))
-    variant_path = f"{plink_prefix}.pvar" if is_pgen else f"{plink_prefix}.bim"
+    variant_path = (
+        pvar_path_for_prefix(plink_prefix) if is_pgen else f"{plink_prefix}.bim"
+    )
     source_idx = 0
-    with open(variant_path, "r", encoding="utf-8", errors="replace") as fh:
+    with open_text_auto(variant_path, errors="replace") as fh:
         for line in fh:
             if not line.strip() or (is_pgen and line.lstrip().startswith("#")):
                 continue
@@ -6606,9 +6622,10 @@ def _run_mixed_trait_packed_multi_entry(
     )
     pbar_done = 0
 
+    agg_tmp_stem, agg_tmp_suffix = os.path.splitext(agg_tmp_tsv)
     trait_tmp_paths = (
         [
-            f"{agg_tmp_tsv}.{trait_idx:06d}.trait.tsv"
+            f"{agg_tmp_stem}.{trait_idx:06d}.trait{agg_tmp_suffix}"
             for trait_idx in range(trait_total)
         ]
         if not use_direct_result_agg
@@ -8098,16 +8115,12 @@ def run_splmm_windowed_fullrank(
             if scan_mode_norm == "exact"
             else hasattr(jxrs, "splmm_assoc_pcg_bed_to_tsv_fused_approx")
         )
-        selected_bfile_prefix = _as_bfile_prefix(str(prefix))
         fused_qc_raw_requested = _splmm_fused_qc_eligible(
             route_name="splmm",
             genetic_model=genetic_model,
             scan_mode=scan_mode_norm,
             row_stat_mode=row_stat_mode,
-            bed_exists=bool(
-                selected_bfile_prefix is not None
-                and os.path.isfile(f"{selected_bfile_prefix}.bed")
-            ),
+            source_available=_splmm_fused_qc_source_available(str(prefix)),
             sparse_grm_available=bool(
                 trait_sparse_kinship_path
                 and os.path.exists(str(trait_sparse_kinship_path))
@@ -8500,6 +8513,108 @@ def run_splmm_windowed_fullrank(
         for _buf_key in ("grm", "eigvals", "eigvecs"):
             null_fit.pop(_buf_key, None)
 
+        def _make_splmm_gamma_progress():
+            state: dict[str, object] = {
+                "started": None,
+                "elapsed": 0.0,
+                "done": False,
+                "current_done": 0,
+                "current_total": 1,
+                "pbar": None,
+            }
+
+            def _close(success: bool) -> None:
+                pbar = state.get("pbar")
+                if pbar is None:
+                    return
+                try:
+                    total_use = int(max(1, int(state.get("current_total", 1))))
+                    done_use = int(max(0, int(state.get("current_done", 0))))
+                    if success and done_use < total_use:
+                        pbar.update(total_use - done_use)
+                    if success:
+                        pbar.finish()
+                except Exception:
+                    pass
+                try:
+                    pbar.close(show_done=False)
+                except Exception:
+                    pass
+                state["pbar"] = None
+
+            def _progress(stage: int, done: int, total: int) -> None:
+                nonlocal peak_rss
+                if int(stage) != 8:
+                    return
+                now = time.monotonic()
+                if state.get("started") is None:
+                    state["started"] = now
+                try:
+                    done_i = int(done)
+                    total_i = int(total)
+                except Exception:
+                    return
+                # A fused attempt may fall back to the established memmap
+                # route after partially reporting stage 8.  A fresh zero
+                # callback starts a new Gamma phase and must not inherit the
+                # completed bar or elapsed time from the failed attempt.
+                if done_i == 0 and (
+                    bool(state.get("done", False))
+                    or int(state.get("current_done", 0)) > 0
+                ):
+                    _close(False)
+                    state["started"] = now
+                    state["elapsed"] = 0.0
+                    state["done"] = False
+                    state["current_done"] = 0
+                    state["current_total"] = 1
+                total_use = int(max(1, total_i if total_i > 0 else 1))
+                done_use = int(max(0, min(done_i, total_use)))
+                previous_total = int(state.get("current_total", 1))
+                state["current_total"] = total_use
+                if bool(use_spinner) and state.get("pbar") is None:
+                    _stop_prepare_handle()
+                    state["pbar"] = _ProgressAdapter(
+                        total=total_use,
+                        desc=f"{model_label_norm} gamma",
+                        force_animate=True,
+                        logger=logger,
+                    )
+                elif bool(use_spinner) and total_use != previous_total:
+                    try:
+                        state["pbar"].set_total(total_use)  # type: ignore[union-attr]
+                    except Exception:
+                        pass
+                previous_done = int(state.get("current_done", 0))
+                stepv = int(max(0, done_use - previous_done))
+                pbar = state.get("pbar")
+                if stepv > 0 and pbar is not None:
+                    try:
+                        pbar.update(stepv)
+                    except Exception:
+                        pass
+                state["current_done"] = done_use
+                try:
+                    peak_rss = max(peak_rss, process.memory_info().rss)
+                except Exception:
+                    pass
+                if done_use >= total_use:
+                    started = state.get("started")
+                    if started is not None:
+                        state["elapsed"] = max(now - float(started), 0.0)
+                    state["done"] = True
+                    _close(True)
+
+            def _finish(success: bool) -> None:
+                started = state.get("started")
+                if started is not None and not bool(state.get("done", False)):
+                    state["elapsed"] = max(time.monotonic() - float(started), 0.0)
+                _close(success)
+
+            return _progress, _finish, state
+
+        gamma_progress, gamma_finish, gamma_state = _make_splmm_gamma_progress()
+
         def _make_splmm_scan_progress():
             current_done = 0
             current_total = 1
@@ -8507,6 +8622,7 @@ def run_splmm_windowed_fullrank(
 
             def _progress(_stage: int, done: int, total: int) -> None:
                 nonlocal current_done, current_total, current_pbar, peak_rss
+                gamma_finish(True)
                 try:
                     done_i = int(done)
                     total_i = int(total)
@@ -8628,7 +8744,7 @@ def run_splmm_windowed_fullrank(
         arr = None
         wrote_direct_tsv = False
         scan_route_desc = (
-            f"sparse Cholesky {effective_scan_mode} scan (fused BED QC+association; double-buffered)"
+            f"sparse Cholesky {effective_scan_mode} scan (fused BED/PGEN QC+association; double-buffered)"
             if use_fused_raw_scan
             else (
                 "sparse Cholesky scan (memmap; preloaded row stats)"
@@ -8669,7 +8785,9 @@ def run_splmm_windowed_fullrank(
                             threads=int(threads),
                             block_rows=int(block_rows_use),
                             memory_mb=float(_current_bed_memory_mb()),
-                            stage1_progress_callback=None,
+                            stage1_progress_callback=(
+                                gamma_progress if effective_scan_mode == "approx" else None
+                            ),
                             scan_progress_callback=sparse_progress,
                             progress_every=int(max(512, min(int(block_rows_use), 4096))),
                         )
@@ -8684,7 +8802,7 @@ def run_splmm_windowed_fullrank(
                         )
                         scan_route_desc = (
                             f"sparse Cholesky {effective_scan_mode} scan "
-                            "(fused BED QC+association; double-buffered); "
+                            "(fused BED/PGEN QC+association; double-buffered); "
                             "Rust TSV writer"
                         )
                     except Exception as fused_error:
@@ -8696,7 +8814,7 @@ def run_splmm_windowed_fullrank(
                         _emit_warning_line(
                             logger,
                             (
-                                "SparseLMM fused BED scan could not complete; reverting to the "
+                                "SparseLMM fused BED/PGEN scan could not complete; reverting to the "
                                 "established QC metadata "
                                 f"scan. reason={error_text.split('SPLMM_FUSED_FALLBACK:', 1)[-1].strip()}"
                             ),
@@ -8806,7 +8924,9 @@ def run_splmm_windowed_fullrank(
                         row_missing=trait_scan_miss,
                         row_indices=trait_row_idx,
                         sparse_jxgrm_path=str(trait_sparse_kinship_path),
-                        stage1_progress_callback=None,
+                        stage1_progress_callback=(
+                            gamma_progress if effective_scan_mode == "approx" else None
+                        ),
                         scan_progress_callback=sparse_progress,
                         progress_every=int(max(512, min(int(block_rows_use), 4096))),
                         rhat_tol=1e-3,
@@ -8843,7 +8963,9 @@ def run_splmm_windowed_fullrank(
                         row_missing=trait_scan_miss,
                         row_indices=trait_row_idx,
                         sparse_jxgrm_path=str(trait_sparse_kinship_path),
-                        stage1_progress_callback=None,
+                        stage1_progress_callback=(
+                            gamma_progress if effective_scan_mode == "approx" else None
+                        ),
                         scan_progress_callback=sparse_progress,
                         progress_every=int(max(512, min(int(block_rows_use), 4096))),
                         rhat_tol=1e-3,
@@ -8857,6 +8979,7 @@ def run_splmm_windowed_fullrank(
                     )
             scan_ok = True
         finally:
+            gamma_finish(scan_ok)
             sparse_finish(scan_ok)
             if (not scan_ok) and wrote_direct_tsv:
                 _cleanup_gwas_result_tmp(tmp_tsv)
@@ -8892,7 +9015,9 @@ def run_splmm_windowed_fullrank(
         if use_fused_raw_scan:
             n_trait_sites = int(written_rows)
 
-        scan_secs = max(time.monotonic() - scan_t0, 0.0)
+        gamma_secs = max(float(gamma_state.get("elapsed", 0.0)), 0.0)
+        scan_secs = max(time.monotonic() - scan_t0 - gamma_secs, 0.0)
+        null_stage_secs = max(null_secs + gamma_secs, 0.0)
         peak_rss = max(peak_rss, process.memory_info().rss)
 
         if not wrote_direct_tsv:
@@ -8990,9 +9115,10 @@ def run_splmm_windowed_fullrank(
             f"V^-1X converged={str(x_conv_all).lower()} ({x_max_iters} iters, relres={x_max_rel_res:.2e})"
         )
         _timing_diag_msg = (
-            f"trait timing: prepare_wall={format_elapsed(null_secs)}, "
+            f"trait timing: prepare_wall={format_elapsed(null_stage_secs)}, "
             f"scan_meta={format_elapsed(scan_meta_secs)}, "
             f"null_fit={format_elapsed(null_fit_secs)}, "
+            f"gamma={format_elapsed(gamma_secs)}, "
             f"scan={format_elapsed(scan_secs)}"
         )
         if not (np.isfinite(rust_total_secs) and rust_total_secs > 0.0):
@@ -9102,10 +9228,11 @@ def run_splmm_windowed_fullrank(
                 "pve": (float(null_pve) if np.isfinite(null_pve) else None),
                 "avg_cpu": float(avg_cpu),
                 "peak_rss_gb": float(peak_rss_gb),
-                "gwas_time_s": float(null_secs + scan_secs),
-                "splmm_prepare_wall_s": float(null_secs),
+                "gwas_time_s": float(null_stage_secs + scan_secs),
+                "splmm_prepare_wall_s": float(null_stage_secs),
                 "splmm_scan_meta_s": float(scan_meta_secs),
                 "splmm_null_fit_s": float(null_fit_secs),
+                "splmm_gamma_s": float(gamma_secs),
                 "splmm_scan_s": float(scan_secs),
                 "viz_time_s": float(viz_secs),
                 "splmm_sigma_scale_reml": (
@@ -9145,7 +9272,7 @@ def run_splmm_windowed_fullrank(
         )
 
         done_times = [
-            f"Null {format_elapsed(null_secs)}",
+            f"Null {format_elapsed(null_stage_secs)}",
             f"Scan {format_elapsed(scan_secs)}",
         ]
         if plot:

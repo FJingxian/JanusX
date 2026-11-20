@@ -530,7 +530,7 @@ struct PvarColumnIndices {
 }
 
 fn read_pvar_header(
-    reader: &mut BufReader<File>,
+    reader: &mut dyn BufRead,
     path: &str,
 ) -> Result<(PvarColumnIndices, usize), String> {
     let mut line = String::new();
@@ -579,7 +579,15 @@ fn read_pvar_header(
 fn normalize_farmcpu_prefix(prefix: &str) -> String {
     let mut normalized = prefix.trim().to_string();
     let lower = normalized.to_ascii_lowercase();
-    for suffix in [".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"] {
+    for suffix in [
+        ".bed",
+        ".bim",
+        ".fam",
+        ".pgen",
+        ".pvar.zst",
+        ".pvar",
+        ".psam",
+    ] {
         if lower.ends_with(suffix) {
             normalized.truncate(normalized.len().saturating_sub(suffix.len()));
             break;
@@ -594,9 +602,10 @@ fn read_pvar_chrom_pos_selected(
     expected_len: usize,
 ) -> Result<(Vec<String>, Vec<i64>), String> {
     let prefix = crate::pgen::normalize_pgen_prefix(prefix);
-    let path = format!("{prefix}.pvar");
-    let file = File::open(&path).map_err(|e| format!("{path}: {e}"))?;
-    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, file);
+    let path = crate::pgen::pvar_path_for_prefix(&prefix)
+        .to_string_lossy()
+        .into_owned();
+    let mut reader = crate::pgen::open_text_reader(std::path::Path::new(&path))?;
     let (columns, mut line_no) = read_pvar_header(&mut reader, &path)?;
 
     let mut requested = row_indices
@@ -795,7 +804,7 @@ fn resolve_assoc_chrom_pos_metadata(
 
 struct BimSelectedFieldStream {
     metadata_path: String,
-    reader: BufReader<File>,
+    reader: Box<dyn BufRead + Send>,
     next_line_no: usize,
     next_row_idx: usize,
     pvar_columns: Option<PvarColumnIndices>,
@@ -810,12 +819,18 @@ impl BimSelectedFieldStream {
             normalize_farmcpu_prefix(prefix)
         };
         let metadata_path = if is_pgen {
-            format!("{normalized_prefix}.pvar")
+            crate::pgen::pvar_path_for_prefix(&normalized_prefix)
+                .to_string_lossy()
+                .into_owned()
         } else {
             format!("{normalized_prefix}.bim")
         };
-        let file = File::open(&metadata_path).map_err(|e| format!("{metadata_path}: {e}"))?;
-        let mut reader = BufReader::with_capacity(8 * 1024 * 1024, file);
+        let mut reader = if is_pgen {
+            crate::pgen::open_text_reader(std::path::Path::new(&metadata_path))?
+        } else {
+            let file = File::open(&metadata_path).map_err(|e| format!("{metadata_path}: {e}"))?;
+            Box::new(BufReader::with_capacity(8 * 1024 * 1024, file))
+        };
         let (pvar_columns, next_line_no) = if is_pgen {
             let (columns, line_no) = read_pvar_header(&mut reader, &metadata_path)?;
             (Some(columns), line_no)

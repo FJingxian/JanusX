@@ -85,6 +85,8 @@ from janusx._plink import (
     detect_existing_plink_kind,
     explicit_plink_kind,
     normalize_plink_prefix,
+    open_text_auto,
+    pvar_path_for_prefix,
 )
 import pandas as pd
 try:
@@ -101,15 +103,11 @@ from janusx.gfreader import (
 from janusx.pyBLUP.QK2 import QK
 from janusx import janusx as jxrs
 from janusx.script._common.log import (
-    _append_log_footer,
-    _log_run_footer_status,
-    setup_logging,
-)
-from janusx.assoc.runlog import (
-    GwasRunLease,
-    GwasRunLockError,
     create_local_log_spool,
-    publish_log_spool,
+    log_file_fingerprint,
+    publish_log_spool_stacked,
+    reserve_log_path,
+    setup_logging,
 )
 from janusx.script._common.config_render import emit_cli_configuration
 from janusx.script._common.cli_args import (
@@ -137,6 +135,7 @@ from janusx.script._common.genoio import (
     packed_preload_is_ready,
 )
 from janusx.script._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
+from janusx.script._common.cli_ranges import normalize_chromosome_key, parse_cli_range
 from janusx.script._common.pathcheck import (
     ensure_all_true,
     ensure_file_exists,
@@ -209,7 +208,6 @@ from janusx.script._common.grmio import (
     read_id_file as _read_grm_id_file,
     resolve_grm_id_path,
 )
-from janusx.assoc.null_model_sidecar import GwasSidecarRunContext
 
 
 def _resolve_pyblup_assoc_symbol(name: str):
@@ -303,7 +301,7 @@ def _splmm_fused_qc_eligible(
     genetic_model: str,
     scan_mode: str,
     row_stat_mode: str,
-    bed_exists: bool,
+    source_available: bool,
     sparse_grm_available: bool,
     packed_preload_ready: bool,
     prepared_scan_meta_ready: bool,
@@ -320,12 +318,32 @@ def _splmm_fused_qc_eligible(
         enabled
         and str(scan_mode).strip().lower() in {"approx", "exact"}
         and str(row_stat_mode).strip().lower() == "strict-train"
-        and bool(bed_exists)
+        and bool(source_available)
         and bool(sparse_grm_available)
         and not bool(packed_preload_ready)
         and not bool(prepared_scan_meta_ready)
         and bool(fused_binding_available)
     )
+
+
+def _splmm_fused_qc_source_available(path_or_prefix: str) -> bool:
+    """Check that the selected BED or PGEN source has its required sidecars."""
+    resolved = detect_existing_plink_kind(str(path_or_prefix))
+    if resolved is None:
+        return False
+    source_kind, prefix = resolved
+    if source_kind == "bfile":
+        return all(
+            os.path.isfile(f"{prefix}{suffix}")
+            for suffix in (".bed", ".bim", ".fam")
+        )
+    if source_kind == "pfile":
+        return bool(
+            os.path.isfile(f"{prefix}.pgen")
+            and os.path.isfile(pvar_path_for_prefix(prefix))
+            and os.path.isfile(f"{prefix}.psam")
+        )
+    return False
 
 
 def _kinship_fused_qc_eligible(
@@ -373,6 +391,47 @@ def _kinship_fused_qc_eligible(
         and bool(source_available)
         and not bool(prepared_meta_ready)
         and bool(fused_binding_available)
+    )
+
+
+def _pgen_stream_qc_bypasses_prepared_meta(
+    *,
+    model_token: str,
+    route_name: str,
+    genetic_model: str,
+    row_stat_mode: str,
+    prepared_meta_ready: bool,
+    rust_bindings: object,
+) -> bool:
+    """Use PGEN's in-scan QC instead of a separate trait metadata scan."""
+    model_key = str(model_token).strip().lower()
+    scan_binding_by_model = {
+        "lm": ("lm_pgen_to_tsv_f32", None),
+        "lmm": ("lmm_reml_assoc_bed_to_tsv_f32", "JX_DISABLE_LMM_UNIFIED"),
+        "lmm2": ("lmm_reml_lmm2_assoc_bed_to_tsv_f32", "JX_DISABLE_LMM2_UNIFIED"),
+    }
+    binding_spec = scan_binding_by_model.get(model_key)
+    binding_scan_available = False
+    if binding_spec is not None:
+        binding_name, disable_env = binding_spec
+        binding_scan_available = bool(
+            hasattr(rust_bindings, binding_name)
+            and (disable_env is None or os.environ.get(disable_env) != "1")
+        )
+    reader_cls = getattr(rust_bindings, "BedChunkReader", None)
+    chunk_scan_available = bool(
+        reader_cls is not None and hasattr(reader_cls, "next_chunk_prepared")
+    )
+    if binding_spec is None or not (binding_scan_available or chunk_scan_available):
+        return False
+    return _kinship_fused_qc_eligible(
+        model_token=model_key,
+        route_name=route_name,
+        genetic_model=genetic_model,
+        row_stat_mode=row_stat_mode,
+        source_available=True,
+        prepared_meta_ready=prepared_meta_ready,
+        fused_binding_available=True,
     )
 
 
@@ -441,7 +500,7 @@ def _packed_model_fused_qc_eligible(
         elif (
             source_kind == "pfile"
             and os.path.isfile(pgen_path)
-            and os.path.isfile(f"{source_prefix}.pvar")
+            and os.path.isfile(pvar_path_for_prefix(source_prefix))
             and os.path.isfile(f"{source_prefix}.psam")
             and n_snps is not None
             and int(n_snps) > 0
@@ -602,164 +661,6 @@ def _gwas_report_logger(logger: logging.Logger) -> logging.Logger:
     except Exception:
         pass
     return logger
-
-
-def _sidecar_table_columns(path: str | Path) -> tuple[str, ...]:
-    try:
-        with Path(path).expanduser().open(
-            "r", encoding="utf-8", errors="replace"
-        ) as handle:
-            first_line = next(
-                (line.strip() for line in handle if line.strip() != ""), ""
-            )
-    except Exception:
-        return ()
-    if first_line == "":
-        return ()
-    if "\t" in first_line:
-        columns = first_line.split("\t")
-    elif "," in first_line:
-        columns = first_line.split(",")
-    else:
-        columns = first_line.split()
-    columns = tuple(str(column).strip() for column in columns)
-    if len(columns) < 2:
-        return ()
-    try:
-        float(columns[1])
-    except (TypeError, ValueError):
-        return columns
-    return ()
-
-
-def _persist_gwas_qmatrix_source(
-    *,
-    genotype_prefix: Path,
-    sample_ids: object,
-    qmatrix: object,
-) -> Path:
-    """Persist the exact in-memory Q matrix used by the GWAS design.
-
-    The NPZ contains only two fixed keys (``sample_ids`` and ``qmatrix``),
-    retains the matrix dtype/values without text rounding, and is named from a
-    content digest.  The sidecar fingerprints this file; the numerical values
-    are therefore reproducible while remaining outside the file-only log.
-    """
-
-    ids = np.asarray(sample_ids, dtype=str).reshape(-1)
-    values = np.asarray(qmatrix)
-    if values.ndim != 2 or values.shape[0] != ids.size or values.shape[1] <= 0:
-        raise ValueError("Q/PC matrix source has an invalid shape")
-    if ids.size == 0 or len(set(str(value) for value in ids.tolist())) != ids.size:
-        raise ValueError("Q/PC matrix source has invalid sample IDs")
-    if not np.issubdtype(values.dtype, np.number):
-        raise ValueError("Q/PC matrix source must be numeric")
-    if not np.all(np.isfinite(values)):
-        raise ValueError("Q/PC matrix source contains non-finite values")
-
-    values = np.ascontiguousarray(values)
-    digest = hashlib.sha256()
-    for sample_id in ids.tolist():
-        encoded = str(sample_id).encode("utf-8")
-        digest.update(len(encoded).to_bytes(8, byteorder="big", signed=False))
-        digest.update(encoded)
-    digest.update(str(values.dtype).encode("ascii"))
-    digest.update(str(tuple(int(value) for value in values.shape)).encode("ascii"))
-    digest.update(values.tobytes(order="C"))
-    source_path = Path(
-        f"{genotype_prefix}.gwas-qmatrix-{digest.hexdigest()[:24]}.npz"
-    )
-    np.savez(source_path, sample_ids=ids, qmatrix=values)
-    return source_path
-
-
-def _build_gwas_sidecar_context(
-    *,
-    genotype_prefix: str,
-    phenotype_file: str,
-    cov_inputs: object,
-    qmatrix: np.ndarray | None,
-    cov_all: np.ndarray | None,
-    sample_ids: object | None = None,
-    kinship_file: str | None,
-    maf_threshold: float,
-    max_missing_rate: float,
-    het_threshold: float,
-    snps_only: bool,
-    genetic_model: str,
-) -> GwasSidecarRunContext | None:
-    prefix = _as_plink_input_path(str(genotype_prefix))
-    kinship_text = str(kinship_file or "").strip()
-    if prefix is None or kinship_text == "":
-        return None
-
-    cov_files, cov_sites = _split_cov_sources(_normalize_cov_inputs(cov_inputs))
-    cov_file: Path | None = None
-    for candidate in cov_files:
-        candidate_path = Path(candidate).expanduser()
-        if candidate_path.is_file():
-            cov_file = candidate_path
-            break
-
-    q_count = 0
-    try:
-        q_count = int(np.asarray(qmatrix).shape[1])
-    except (AttributeError, IndexError, TypeError, ValueError):
-        q_count = 0
-    cov_count = 0
-    if cov_all is not None:
-        try:
-            cov_count = int(np.asarray(cov_all).shape[1])
-        except (AttributeError, IndexError, TypeError, ValueError):
-            cov_count = 0
-    covariate_columns = [f"PC{index}" for index in range(1, q_count + 1)]
-    if cov_file is not None:
-        file_columns = _sidecar_table_columns(cov_file)
-        if len(file_columns) > 1:
-            covariate_columns.extend(file_columns[1:])
-    while len(covariate_columns) < q_count + cov_count:
-        index = len(covariate_columns) - q_count + 1
-        covariate_columns.append(f"Covariate{index}")
-    if len(cov_sites) > 0 and cov_count > 0 and cov_file is None:
-        covariate_columns = [
-            *covariate_columns[:q_count],
-            *[f"Covariate{index}" for index in range(1, cov_count + 1)],
-        ]
-    kinship_path = Path(kinship_text).expanduser()
-    direct_kinship_id_path = Path(f"{kinship_path}.id")
-
-    qmatrix_file: Path | None = None
-    if q_count > 0:
-        if sample_ids is None:
-            raise ValueError(
-                "sample IDs are required to persist the GWAS Q/PC matrix source"
-            )
-        qmatrix_file = _persist_gwas_qmatrix_source(
-            genotype_prefix=Path(prefix),
-            sample_ids=sample_ids,
-            qmatrix=qmatrix,
-        )
-
-    phenotype_columns = _sidecar_table_columns(phenotype_file)
-    phenotype_id_column = phenotype_columns[0] if phenotype_columns else "sample"
-    return GwasSidecarRunContext(
-        genotype_prefix=Path(prefix),
-        phenotype_file=Path(phenotype_file).expanduser(),
-        phenotype_id_column=phenotype_id_column,
-        covariate_file=cov_file,
-        covariate_columns=tuple(covariate_columns),
-        kinship_file=kinship_path,
-        kinship_id_file=direct_kinship_id_path,
-        genotype_filters={
-            "maf": float(maf_threshold),
-            "max_missing_rate": float(max_missing_rate),
-            "het_threshold": float(het_threshold),
-            "snps_only": bool(snps_only),
-            "genetic_model": str(genetic_model),
-        },
-        qmatrix_file=qmatrix_file,
-        qmatrix_columns=tuple(f"PC{index}" for index in range(1, q_count + 1)),
-    )
 
 
 def _gwas_stream_logger(logger: logging.Logger) -> Optional[logging.Logger]:
@@ -1138,12 +1039,46 @@ def _replace_file_with_retry(
 
 
 def _gwas_result_tmp_path(out_tsv: str) -> str:
-    return f"{str(out_tsv)}.tmp.{os.getpid()}.{uuid.uuid4().hex}"
+    """Reserve a human-readable result spool beside the final TSV.
+
+    ``prefix.tsv`` uses ``prefix.tmp.tsv`` for its first writer.  If that
+    name is already present, the allocator uses ``prefix.tmp.1.tsv``, then
+    ``prefix.tmp.2.tsv`` and so on.  The empty reservation is created with
+    ``O_EXCL`` so concurrent GWAS processes cannot select the same spool;
+    the Rust writer fills it and the caller atomically renames it only after
+    the scan completes successfully.
+    """
+    path = str(out_tsv)
+    stem, suffix = os.path.splitext(path)
+    base = f"{stem}.tmp"
+    parent = os.path.dirname(path) or os.curdir
+    os.makedirs(parent, mode=0o755, exist_ok=True)
+    for index in range(100_000):
+        candidate = f"{base}{suffix}" if index == 0 else f"{base}.{index}{suffix}"
+        try:
+            fd = os.open(
+                candidate,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0),
+                0o644,
+            )
+        except FileExistsError:
+            continue
+        else:
+            os.close(fd)
+            return candidate
+    raise OSError(f"Could not reserve a GWAS result spool for {path}")
 
 
 def _cleanup_gwas_result_tmp(tmp_tsv: str) -> None:
+    """Remove a reserved/intermediate GWAS result path, never a final file."""
     path = str(tmp_tsv).strip()
     if not path:
+        return
+    # All result spools created by `_gwas_result_tmp_path` carry `.tmp` in
+    # their basename.  Keep this guard because cleanup runs from exception
+    # paths; a bad caller must not turn an interrupted scan into deletion of
+    # the user's completed TSV.
+    if ".tmp" not in os.path.basename(path):
         return
     try:
         if os.path.exists(path):
@@ -1572,36 +1507,6 @@ def _trait_exact_match_indices(
         if same:
             out.append(int(idx))
     return out
-
-
-def _phenotype_source_column_index(
-    pheno_aligned: pd.DataFrame,
-    trait_name: object,
-) -> int | None:
-    """Return the raw phenotype data-column index for a trait selector.
-
-    ``_TraitRef.col_idx`` addresses the currently loaded frame, which may be
-    a reordered/subset view created by ``-n/--ncol``.  ``load_phenotype`` keeps
-    the original data-column positions in ``selected_ncol``; use that mapping
-    before any selector is stringified.
-    """
-    trait_ref = _trait_ref_from_selector(pheno_aligned, trait_name)
-    if trait_ref is None:
-        resolved = _resolve_trait_iter(pheno_aligned, [trait_name])
-        if len(resolved) != 1 or not isinstance(resolved[0], _TraitRef):
-            return None
-        trait_ref = resolved[0]
-    local_index = int(trait_ref.col_idx)
-    selected_ncol = pheno_aligned.attrs.get("selected_ncol")
-    if isinstance(selected_ncol, (list, tuple, np.ndarray)):
-        if len(selected_ncol) == int(pheno_aligned.shape[1]) and 0 <= local_index < len(selected_ncol):
-            try:
-                raw_index = int(selected_ncol[local_index])
-            except (TypeError, ValueError, OverflowError):
-                return local_index
-            if raw_index >= 0:
-                return raw_index
-    return local_index
 
 
 def _trait_values_and_mask(
@@ -2056,8 +1961,15 @@ def latest_genotype_mtime(genofile: str) -> Union[float, None]:
     resolved = detect_existing_plink_kind(raw)
     if resolved is not None:
         kind, prefix = resolved
-        extensions = ("bed", "bim", "fam") if kind == "bfile" else ("pgen", "pvar", "psam")
-        paths = [f"{prefix}.{ext}" for ext in extensions]
+        paths = (
+            [f"{prefix}.bed", f"{prefix}.bim", f"{prefix}.fam"]
+            if kind == "bfile"
+            else [
+                f"{prefix}.pgen",
+                pvar_path_for_prefix(prefix),
+                f"{prefix}.psam",
+            ]
+        )
         if all(os.path.isfile(path) for path in paths):
             return max(os.path.getmtime(path) for path in paths)
         if explicit_plink_kind(raw) is not None:
@@ -2271,49 +2183,17 @@ def _validate_kfile_cli_contract(
 
 
 def _normalize_bimrange_chr(value: object) -> str:
-    text = str(value).strip()
-    if text.lower().startswith("chr"):
-        text = text[3:]
-    return text.upper()
+    return normalize_chromosome_key(value)
 
 
 def _parse_scan_bimrange(value: object) -> tuple[str, int, int]:
-    text = str(value).strip()
-    match = re.match(r"^([^:]+):([0-9]*\.?[0-9]+)(?:-|:)([0-9]*\.?[0-9]+)$", text)
-    if match is None:
+    parsed = parse_cli_range(value, allow_chrom_only=False)
+    if parsed.start is None or parsed.end is None:
         raise ValueError(
             f"Invalid -bimrange/--bimrange format: {value}. "
             "Use chr:start-end (or chr:start:end)."
         )
-    chrom = str(match.group(1)).strip()
-    start_raw = str(match.group(2)).strip()
-    end_raw = str(match.group(3)).strip()
-    start_num = float(start_raw)
-    end_num = float(end_raw)
-
-    def _looks_like_bp_integer(token: str) -> bool:
-        tok = str(token).strip()
-        if "." in tok:
-            return False
-        tok = tok.lstrip("0")
-        if tok == "":
-            tok = "0"
-        return len(tok) > 6
-
-    use_bp_input = _looks_like_bp_integer(start_raw) or _looks_like_bp_integer(end_raw)
-    if use_bp_input:
-        start_bp = int(round(start_num))
-        end_bp = int(round(end_num))
-        if start_bp < 0 or end_bp < 0:
-            raise ValueError("Invalid -bimrange/--bimrange: start/end must be >= 0 (bp).")
-    else:
-        if start_num < 0 or end_num < 0:
-            raise ValueError("Invalid -bimrange/--bimrange: start/end must be >= 0 (Mb).")
-        start_bp = int(round(start_num * 1_000_000))
-        end_bp = int(round(end_num * 1_000_000))
-    if start_bp > end_bp:
-        start_bp, end_bp = end_bp, start_bp
-    return chrom, int(start_bp), int(end_bp)
+    return parsed.chrom_original, int(parsed.start), int(parsed.end)
 
 
 def _format_scan_bimrange(item: tuple[str, int, int]) -> str:
@@ -5577,9 +5457,9 @@ def _read_bim_sites(prefix: str) -> list[tuple[str, int, str, str, str]]:
         raise FileNotFoundError(f"Cannot resolve PLINK variant metadata for {prefix}")
     kind, raw_prefix = resolved
     is_pgen = kind == "pfile"
-    variant_path = f"{raw_prefix}.pvar" if is_pgen else f"{raw_prefix}.bim"
+    variant_path = pvar_path_for_prefix(raw_prefix) if is_pgen else f"{raw_prefix}.bim"
     columns: list[str] | None = None
-    with open(variant_path, "r", encoding="utf-8", errors="ignore") as fh:
+    with open_text_auto(variant_path, errors="ignore") as fh:
         for ln, line in enumerate(fh, start=1):
             s = line.strip()
             if s == "" or s.startswith("##"):
@@ -6045,7 +5925,7 @@ def _resolve_gwas_snp_bim_path(genofile: str) -> Union[str, None]:
     if path == "":
         return None
     low_path = path.lower()
-    if low_path.endswith((".bim", ".pvar")) and os.path.isfile(path):
+    if low_path.endswith((".bim", ".pvar", ".pvar.zst")) and os.path.isfile(path):
         return path
 
     # Marker-oriented kfiles produced by ``gformat -fmt kfile`` intentionally
@@ -6059,7 +5939,11 @@ def _resolve_gwas_snp_bim_path(genofile: str) -> Union[str, None]:
     selected_kind = explicit_plink_kind(path)
     if selected_kind is not None:
         plink_prefix = normalize_plink_prefix(path)
-        variant_path = f"{plink_prefix}.pvar" if selected_kind == "pfile" else f"{plink_prefix}.bim"
+        variant_path = (
+            pvar_path_for_prefix(plink_prefix)
+            if selected_kind == "pfile"
+            else f"{plink_prefix}.bim"
+        )
         return variant_path if os.path.isfile(variant_path) else None
 
     if is_kfile_source:
@@ -6070,7 +5954,11 @@ def _resolve_gwas_snp_bim_path(genofile: str) -> Union[str, None]:
     resolved = detect_existing_plink_kind(path)
     if resolved is not None:
         kind, plink_prefix = resolved
-        variant_path = f"{plink_prefix}.pvar" if kind == "pfile" else f"{plink_prefix}.bim"
+        variant_path = (
+            pvar_path_for_prefix(plink_prefix)
+            if kind == "pfile"
+            else f"{plink_prefix}.bim"
+        )
         if os.path.isfile(variant_path):
             return variant_path
 
@@ -6092,8 +5980,8 @@ def _iter_plink_variant_sites(
     variant_path: str,
 ) -> Iterator[tuple[str, int, str, str, str]]:
     """Stream normalized marker records from a PLINK BIM or PVAR file."""
-    is_pvar = str(variant_path).lower().endswith(".pvar")
-    with open(variant_path, "r", encoding="utf-8", errors="replace") as fh:
+    is_pvar = str(variant_path).lower().endswith((".pvar", ".pvar.zst"))
+    with open_text_auto(variant_path, errors="replace") as fh:
         for line_no, raw in enumerate(fh, start=1):
             line = raw.strip()
             if line == "" or line.startswith("#"):
@@ -6341,6 +6229,8 @@ def _finalize_gwas_result_tsv(
         str(genofile),
         logger=logger,
     ):
+        return
+    if os.path.abspath(str(tmp_tsv)) == os.path.abspath(str(out_tsv)):
         return
     _replace_file_with_retry(str(tmp_tsv), str(out_tsv))
 
@@ -6671,10 +6561,12 @@ def _resolve_fvlmm_scan_stage_mode() -> str:
     if raw in {"generic", "scan", "blas_1_rayon_t"}:
         return "generic"
     # Dense FvLMM projection and the per-marker association scan both benefit
-    # from the requested thread budget. Keep the outer Rayon runtime at one
-    # thread to avoid adding a second, unconstrained layer of parallelism.
+    # from the requested thread budget.  The full stage is now the default:
+    # Rayon covers BED decode/scan work while BLAS covers the dense kernels.
+    # Users on systems where nested runtimes compete can explicitly restore
+    # the conservative plan with ``JX_FVLMM_SCAN_STAGE=blas_t_rayon_1``.
     # Accelerate controls single/multi-thread mode, not an exact core cap.
-    return "blas_t_rayon_1"
+    return "full"
 
 
 @contextmanager
@@ -6683,8 +6575,8 @@ def _gwas_fvlmm_scan_stage_ctx(threads: int):
     FvLMM scan stage.
 
     Modes:
-    - `full` (legacy opt-in): BLAS=t, Rayon=t
-    - `blas_t_rayon_1` (default): BLAS=t, outer Rayon=1, Rust projection=t,
+    - `full` (default): BLAS=t, Rayon=t
+    - `blas_t_rayon_1`: BLAS=t, outer Rayon=1, Rust projection=t,
       association=t
     - `generic`: reuse the generic GWAS scan stage (BLAS=1, Rayon=t)
 
@@ -7704,6 +7596,17 @@ def _run_file_dense_fast_once(
                 use_spinner=False,
                 emit_done_line=False,
             )
+            # The result table contains effect/model columns that plotting
+            # never reads.  Detach the three plotting columns and release the
+            # full table before constructing GWASPLOT's working arrays; this
+            # matters for dense FILE routes with millions of markers.
+            plot_df = (
+                res_df[["chrom", "pos", "pwald"]].copy()
+                if bool(args.plot)
+                else None
+            )
+            del res_df
+            del _write_dense_result
             saved_paths.append(str(out_tsv))
             _log_model_line(
                 logger,
@@ -7714,13 +7617,14 @@ def _run_file_dense_fast_once(
 
             if bool(args.plot):
                 viz_secs = _run_fastplot_with_status(
-                    res_df[["chrom", "pos", "pwald"]],
+                    plot_df,
                     y_vec,
                     xlabel=str(pname),
                     outpdf=out_svg,
                     use_spinner=bool(use_spinner),
                     emit_done_line=False,
                 )
+                del plot_df
 
             summary_rows.append(
                 {
@@ -8439,7 +8343,7 @@ def _prepare_qtn_packed_preload(
 
 
 def _resolve_gwas_output_for_runlog(args) -> tuple[str, str, str]:
-    """Resolve genotype and output paths before acquiring the run-prefix lock."""
+    """Resolve genotype and output paths before starting the GWAS run."""
     legacy_prefix = getattr(args, "prefix", None)
     gfile, prefix = _determine_genotype_source_raw(
         vcf=getattr(args, "vcf", None),
@@ -8474,8 +8378,8 @@ def _write_gwas_stderr(message: str) -> None:
         pass
 
 
-def _finish_gwas_runlog(context: dict[str, Any], status: str) -> str:
-    """Close the local log, publish once, and release this run's prefix lease."""
+def _finish_gwas_runlog(context: dict[str, Any]) -> str:
+    """Close and publish the run log without a persistent prefix lock."""
     if bool(context.get("finalized", False)):
         return str(context.get("published_log_path", context.get("spool_path", "")))
 
@@ -8517,32 +8421,25 @@ def _finish_gwas_runlog(context: dict[str, Any], status: str) -> str:
         )
 
     spool_path = str(context.get("spool_path", ""))
-    run_id = str(context.get("run_id", ""))
     outprefix = str(context.get("outprefix", ""))
     stable_log_path = str(context.get("log_path", f"{outprefix}.gwas.log"))
-    terminal_status = "done" if str(status) == "done" else "failed"
-    if not bool(getattr(handler, "janusx_io_failed", False)) and os.path.isfile(
-        spool_path
-    ):
-        try:
-            if _log_run_footer_status(spool_path, run_id) is None:
-                _append_log_footer(
-                    spool_path,
-                    f"GWAS run status: {terminal_status}; run_id: {run_id}",
-                )
-        except OSError as exc:
-            handler_failed = True
-            _write_gwas_stderr(
-                "Warning: could not finalize the local GWAS log spool; "
-                f"preserve {spool_path} ({exc})"
-            )
 
     published_path = spool_path
     log_published = False
     if not handler_failed:
         try:
-            publish_log_spool(spool_path, stable_log_path)
-            published_path = stable_log_path
+            # Live snapshots advance the handler baseline.  Use that latest
+            # local-spool fingerprint so a run does not archive its own
+            # snapshots as a collision at finalization.  A different process
+            # changing the destination is still detected and stacked.
+            final_baseline = getattr(handler, "_publish_baseline", None)
+            if final_baseline is None:
+                final_baseline = context.get("initial_log_fingerprint")
+            published_path = publish_log_spool_stacked(
+                spool_path,
+                stable_log_path,
+                final_baseline,
+            )
             log_published = True
             try:
                 os.remove(spool_path)
@@ -8557,14 +8454,6 @@ def _finish_gwas_runlog(context: dict[str, Any], status: str) -> str:
                 f"the local log is preserved at {spool_path} ({exc})"
             )
 
-    lease = context.get("lease")
-    if lease is not None:
-        lease.mark_terminal(str(status) if log_published else "failed")
-        if not lease.release():
-            _write_gwas_stderr(
-                "Warning: JanusX could not release the GWAS output lock; "
-                f"the next run may need to recover it: {lease.lock_path}"
-            )
     context["published_log_path"] = published_path
     context["finalized"] = True
     return published_path
@@ -8577,45 +8466,35 @@ def _run_gwas_pipeline(
     log: bool = True,
     return_result: bool = False,
 ):
-    """Run GWAS with a per-prefix lease and a local log spool."""
+    """Run GWAS with a local log spool and PLINK-style output replacement."""
     if args is None:
         args = parse_args(argv)
     run_id = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
     gfile, out_dir, outprefix = _resolve_gwas_output_for_runlog(args)
     os.makedirs(out_dir, 0o755, exist_ok=True)
-    spool_path = create_local_log_spool(run_id, prefix="janusx-gwas")
-    lease = GwasRunLease(outprefix, run_id)
+    requested_log_path = f"{outprefix}.gwas.log"
+    # Reserve the visible destination before starting the worker.  This keeps
+    # the log readable while the run is active and preserves an existing or
+    # interrupted run as ``prefix.gwas.1.log``, ``.2.log``, ... .
+    stable_log_path = reserve_log_path(requested_log_path)
+    initial_log_fingerprint = log_file_fingerprint(stable_log_path)
     try:
-        lease.acquire(spool_path)
-    except (GwasRunLockError, OSError) as exc:
+        spool_path = create_local_log_spool(run_id, prefix="janusx-gwas")
+    except BaseException:
+        # Do not leave an empty reservation if local temporary storage is
+        # unavailable before the pipeline has a chance to create its spool.
         try:
-            os.remove(spool_path)
+            if os.path.isfile(stable_log_path) and os.path.getsize(stable_log_path) == 0:
+                os.remove(stable_log_path)
         except OSError:
             pass
-        if lease.acquired:
-            lease.mark_terminal("failed")
-            lease.release()
-        _write_gwas_stderr(f"✘ Error: {exc}")
-        if return_result:
-            return {
-                "status": "failed",
-                "error": str(exc),
-                "genofile": gfile,
-                "outprefix": outprefix,
-                "log_file": "",
-                "summary_rows": [],
-                "result_files": [],
-                "elapsed_sec": 0.0,
-                "traits": [],
-            }
-        raise SystemExit(1) from None
+        raise
 
     context: dict[str, Any] = {
-        "run_id": run_id,
         "outprefix": outprefix,
-        "log_path": f"{outprefix}.gwas.log",
+        "log_path": stable_log_path,
         "spool_path": os.path.abspath(spool_path),
-        "lease": lease,
+        "initial_log_fingerprint": initial_log_fingerprint,
         "file_handler": None,
         "finalized": False,
     }
@@ -8628,7 +8507,6 @@ def _run_gwas_pipeline(
             _runlog_context=context,
         )
     except BaseException:
-        context["status"] = "failed"
         logger = context.get("logger")
         if logger is not None:
             try:
@@ -8641,11 +8519,10 @@ def _run_gwas_pipeline(
                     fh.write("GWAS pipeline exited unexpectedly. See the console traceback.\n")
             except OSError:
                 pass
-        _finish_gwas_runlog(context, "failed")
+        _finish_gwas_runlog(context)
         raise
 
-    status = str(context.get("status", "failed"))
-    published_log_path = _finish_gwas_runlog(context, status)
+    published_log_path = _finish_gwas_runlog(context)
     if isinstance(result, dict):
         result["log_file"] = published_log_path
     return result
@@ -8661,8 +8538,6 @@ def _run_gwas_pipeline_impl(
 ):
     t_start = time.time()
     use_spinner = bool(stdout_is_tty())
-    run_id = str(_runlog_context["run_id"])
-    run_created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     run_status = "done"
     run_error = ""
     if args is None:
@@ -8712,7 +8587,7 @@ def _run_gwas_pipeline_impl(
         out_was_explicit=bool(getattr(args, "_out_was_explicit", False)),
     )
     if os.path.abspath(str(outprefix)) != os.path.abspath(str(_runlog_context["outprefix"])):
-        raise RuntimeError("GWAS output prefix changed after its run lock was acquired.")
+        raise RuntimeError("GWAS output prefix changed during pipeline setup.")
     args.out = str(out_dir)
     args.out_dir = str(out_dir)
     args.outprefix = str(outprefix)
@@ -8726,7 +8601,11 @@ def _run_gwas_pipeline_impl(
         spool_path=spool_path,
         manage_lifecycle=False,
         acquire_lock=False,
+        # Publish live snapshots during the scan.  The reserved path is unique
+        # for this run, so the final stack check only handles an external
+        # writer that changed that path after the last snapshot.
         publish_interval=5.0,
+        process_lock_path="",
     )
     _runlog_context["logger"] = logger
     _runlog_context["outprefix"] = str(outprefix)
@@ -8736,9 +8615,6 @@ def _run_gwas_pipeline_impl(
             actual_spool_path = os.path.abspath(str(getattr(_h, "baseFilename", spool_path)))
             if actual_spool_path != os.path.abspath(spool_path):
                 _runlog_context["spool_path"] = actual_spool_path
-                lease = _runlog_context.get("lease")
-                if lease is not None:
-                    lease.set_spool_path(actual_spool_path)
                 try:
                     os.remove(spool_path)
                 except OSError:
@@ -9558,8 +9434,6 @@ def _run_gwas_pipeline_impl(
 
                     splmm_post_grm_hook = _prepare_splmm_sparse_after_grm
             post_grm_hook: Optional[Callable[[str, Optional[str]], None]] = splmm_post_grm_hook
-            null_sidecar_context: Optional[GwasSidecarRunContext] = None
-            sidecar_grm_path: list[Optional[str]] = [None]
             qtn_post_grm_requested = bool(qtn_input_requested and (args.farmcpu or args.algwas))
             if qtn_post_grm_requested:
                 base_post_grm_hook = post_grm_hook
@@ -9587,26 +9461,6 @@ def _run_gwas_pipeline_impl(
                         _prepare_qtn_after_grm(stream_genofile_ready, loaded_dense_grm_path)
 
                     post_grm_hook = _prepare_splmm_then_qtn_after_grm
-            if bool(args.fvlmm):
-                sidecar_post_grm_hook = post_grm_hook
-
-                def _capture_sidecar_grm_path(
-                    stream_genofile_ready: str,
-                    loaded_dense_grm_path: Optional[str],
-                ) -> None:
-                    loaded_text = str(loaded_dense_grm_path or "").strip()
-                    if loaded_text != "":
-                        sidecar_grm_path[0] = loaded_text
-                    else:
-                        requested_grm = str(getattr(args, "grm", "")).strip()
-                        if requested_grm not in {"", "1", "2"}:
-                            sidecar_grm_path[0] = requested_grm
-                    if sidecar_post_grm_hook is not None:
-                        sidecar_post_grm_hook(
-                            stream_genofile_ready, loaded_dense_grm_path
-                        )
-
-                post_grm_hook = _capture_sidecar_grm_path
             if kfile_mode:
                 if terminal_rich:
                     _section(terminal_logger, "GWAS task")
@@ -9656,18 +9510,6 @@ def _run_gwas_pipeline_impl(
                     ),
                     inverse_normal=bool(getattr(args, "intrans", False)),
                 )
-                if bool(args.fvlmm):
-                    # The versioned FvLMM sidecar schema intentionally
-                    # fingerprints a PLINK BED/BIM/FAM triplet for downstream
-                    # fine-mapping.  A k-file has no BED dependency, so do not
-                    # silently pretend that the BED sidecar was emitted.
-                    _emit_warning_line(
-                        logger,
-                        "FvLMM null-model sidecar is unavailable for -kfile; "
-                        "the sidecar schema requires a PLINK BED/BIM/FAM source.",
-                        use_spinner=bool(use_spinner),
-                    )
-
                 # The BED route prepares SparseLMM through post_grm_hook.  A
                 # k-file has no BED prefix, so that hook is intentionally not
                 # involved here.  Materialize one persistent sparse GRM from
@@ -9871,21 +9713,6 @@ def _run_gwas_pipeline_impl(
                     scanmeta_outprefix=str(outprefix),
                     inverse_normal=bool(getattr(args, "intrans", False)),
                 )
-                if bool(args.fvlmm):
-                    null_sidecar_context = _build_gwas_sidecar_context(
-                        genotype_prefix=str(genofile_stream),
-                        phenotype_file=str(args.pheno),
-                        cov_inputs=args.cov,
-                        qmatrix=qmatrix,
-                        cov_all=cov_all,
-                        sample_ids=np.asarray(ids, dtype=str),
-                        kinship_file=sidecar_grm_path[0],
-                        maf_threshold=float(maf_threshold_scan),
-                        max_missing_rate=float(max_missing_rate_scan),
-                        het_threshold=float(het_threshold_scan),
-                        snps_only=bool(args.snps_only),
-                        genetic_model=str(args.model),
-                    )
                 packed_route_status_resolved = _format_gwas_packed_route_resolution(
                     original_genofile=str(gfile),
                     stream_genofile=str(genofile_stream),
@@ -10305,7 +10132,6 @@ def _run_gwas_pipeline_impl(
                             ),
                             force_model=bool(args.force_model),
                             trait_prepared_meta=trait_prepared_meta,
-                            null_sidecar_context=null_sidecar_context,
                             bimranges=scan_bimranges,
                         )
 
@@ -10683,19 +10509,16 @@ def _run_gwas_pipeline_impl(
                             if cfg is not None
                             else None
                         )
-                        selected_bfile_prefix = (
-                            _as_bfile_prefix(str(prefix_meta))
-                            if prefix_meta is not None
-                            else None
-                        )
                         return _splmm_fused_qc_eligible(
                             route_name=route_key,
                             genetic_model=str(args.model),
                             scan_mode=scan_mode,
                             row_stat_mode=gwas_row_stat_mode,
-                            bed_exists=bool(
-                                selected_bfile_prefix is not None
-                                and os.path.isfile(f"{selected_bfile_prefix}.bed")
+                            source_available=bool(
+                                prefix_meta is not None
+                                and _splmm_fused_qc_source_available(
+                                    str(prefix_meta)
+                                )
                             ),
                             sparse_grm_available=bool(
                                 sparse_path is not None
@@ -10741,6 +10564,25 @@ def _run_gwas_pipeline_impl(
                             if prefix_meta is not None
                             else None
                         )
+                        if (
+                            resolved_source is not None
+                            and resolved_source[0] == "pfile"
+                            and model_key in {"lm", "lmm", "lmm2"}
+                        ):
+                            # PGEN scans apply trait-sample QC while reading
+                            # association blocks. Prepared row indices are
+                            # intentionally bypassed for sequential PGEN reads,
+                            # so precomputing them would decode the PGEN twice.
+                            return _pgen_stream_qc_bypasses_prepared_meta(
+                                model_token=model_key,
+                                route_name=route_key,
+                                genetic_model=str(args.model),
+                                row_stat_mode=gwas_row_stat_mode,
+                                prepared_meta_ready=(
+                                    str(trait_token) in trait_shared_meta_cache
+                                ),
+                                rust_bindings=jxrs,
+                            )
                         packed_source_available = bool(
                             resolved_source is not None
                             and resolved_source[0] == "bfile"
@@ -10751,10 +10593,11 @@ def _run_gwas_pipeline_impl(
                             and model_key == "fvlmm"
                             and resolved_source is not None
                             and resolved_source[0] == "pfile"
-                            and all(
-                                os.path.isfile(f"{resolved_source[1]}.{suffix}")
-                                for suffix in ("pgen", "pvar", "psam")
+                            and os.path.isfile(f"{resolved_source[1]}.pgen")
+                            and os.path.isfile(
+                                pvar_path_for_prefix(resolved_source[1])
                             )
+                            and os.path.isfile(f"{resolved_source[1]}.psam")
                         ):
                             # FvLMM's PREAD source reader natively accepts PGEN;
                             # its mmap/window readers are BED-only.
@@ -11570,7 +11413,6 @@ def _run_gwas_pipeline_impl(
                                     emit_trait_header=bool(emit_trait_header_model),
                                     trait_prepared_meta=trait_meta_shared,
                                     bimranges=scan_bimranges,
-                                    null_sidecar_context=null_sidecar_context,
                                 )
                                 next_idx = group_end
                                 trait_done = (
@@ -12081,20 +11923,12 @@ def _run_gwas_pipeline_impl(
             except Exception:
                 pass
             try:
-                _log_file_only(
-                    logger,
-                    logging.INFO,
-                    f"GWAS run status: failed; run_id: {run_id}",
-                )
-                _finish_gwas_runlog(_runlog_context, "failed")
+                _finish_gwas_runlog(_runlog_context)
             except Exception:
                 pass
             try:
                 logging.shutdown()
             finally:
-                lease = _runlog_context.get("lease")
-                if lease is not None:
-                    lease.mark_terminal("failed")
                 os._exit(130)
     except Exception as e:
         run_status = "failed"
@@ -12119,10 +11953,6 @@ def _run_gwas_pipeline_impl(
     _emit_report_kv(report_logger, "Total Wall Time", f"{max(time.time() - t_start, 0.0):.2f}s")
     _emit_report_kv(report_logger, "Finished At", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     report_logger.info(_REPORT_RULE)
-    _log_file_only(logger, logging.INFO, f"GWAS run status: {run_status}; run_id: {run_id}")
-
-    _runlog_context["status"] = str(run_status)
-
     if bool(return_result):
         return {
             "status": str(run_status),

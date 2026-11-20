@@ -752,11 +752,12 @@ def _run_with_algo_progress(
     n_snps: Optional[int] = None,
 ):
     t0 = time.monotonic()
+    is_tty = stdout_is_tty()
     suffix = _algo_metrics_suffix(n_samples=n_samples, n_snps=n_snps)
     # CliStatus animates only for loading/computing-like prefixes.
     status_desc_raw = f"Computing {algo_name}{suffix} ..."
     status_desc = status_desc_raw
-    if stdout_is_tty():
+    if is_tty:
         try:
             cols = int(shutil.get_terminal_size((80, 20)).columns)
         except Exception:
@@ -769,7 +770,7 @@ def _run_with_algo_progress(
             else:
                 status_desc = status_desc_raw[: max_desc - 3] + "..."
 
-    if stdout_is_tty():
+    if is_tty:
         with CliStatus(status_desc, enabled=True, use_process=True) as task:
             try:
                 result = fn()

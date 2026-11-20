@@ -64,12 +64,13 @@
 use memmap2::{Mmap, MmapMut, MmapOptions};
 use numpy::ndarray::Array2;
 use numpy::{PyArray2, PyReadonlyArray1, PyReadonlyArray2};
-use pyo3::exceptions::PyRuntimeError;
+use pyo3::exceptions::{PyRuntimeError, PyRuntimeWarning};
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -118,6 +119,41 @@ const SPGRM_DECODE_STRIPE_ESTIMATE: usize = 2;
 const SPGRM_GCTA_IMPORT_SUFFIX: &str = ".gcta.spgrm";
 const KFILE_PREPARED_CACHE_MAGIC: &[u8; 8] = b"JXKPC01\0";
 const KFILE_PREPARED_CACHE_VERSION: u32 = 1;
+const SPGRM_SYNC_UNSUPPORTED_WARNING: &str = "Filesystem does not support syncing sparse GRM writes; buffers were flushed, continuing without a storage-level durability guarantee.";
+
+#[derive(Debug, PartialEq, Eq)]
+enum SyncDataOutcome {
+    Synced,
+    Unsupported,
+}
+
+fn classify_sync_data_result(
+    result: std::io::Result<()>,
+    context: &str,
+) -> Result<SyncDataOutcome, String> {
+    match result {
+        Ok(()) => Ok(SyncDataOutcome::Synced),
+        Err(error) if is_unsupported_sync_error(&error) => Ok(SyncDataOutcome::Unsupported),
+        Err(error) => Err(format!("{context} failed: {error}")),
+    }
+}
+
+fn is_unsupported_sync_error(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::Unsupported {
+        return true;
+    }
+
+    #[cfg(unix)]
+    if let Some(code) = error.raw_os_error() {
+        return code == libc::ENOTSUP || code == libc::EOPNOTSUPP;
+    }
+
+    false
+}
+
+fn sync_sparse_grm_data(file: &File, context: &str) -> Result<SyncDataOutcome, String> {
+    classify_sync_data_result(file.sync_data(), context)
+}
 const KFILE_PREPARED_CACHE_BLOCK_COUNT_OFFSET: u64 = 36;
 
 static KFILE_PREPARED_CACHE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1642,7 +1678,8 @@ impl SpgrmCscStreamWriter {
         Ok(())
     }
 
-    fn finish(mut self) -> Result<(), String> {
+    fn finish(mut self) -> Result<bool, String> {
+        let mut unsupported_sync = false;
         while self.current_col < self.n_samples {
             self.col_ptr[self.current_col + 1] = self.written as u64;
             self.current_col += 1;
@@ -1656,10 +1693,10 @@ impl SpgrmCscStreamWriter {
         self.row_writer
             .flush()
             .map_err(|e| format!("flush sparse GRM row payload failed: {e}"))?;
-        self.row_writer
-            .get_ref()
-            .sync_data()
-            .map_err(|e| format!("sync sparse GRM row payload failed: {e}"))?;
+        unsupported_sync |= matches!(
+            sync_sparse_grm_data(self.row_writer.get_ref(), "sync sparse GRM row payload")?,
+            SyncDataOutcome::Unsupported
+        );
         let row_end = (2usize * std::mem::size_of::<u64>())
             .saturating_add((self.n_samples + 1).saturating_mul(std::mem::size_of::<u64>()))
             .saturating_add(self.nnz.saturating_mul(std::mem::size_of::<u32>()));
@@ -1675,10 +1712,10 @@ impl SpgrmCscStreamWriter {
         self.value_writer
             .flush()
             .map_err(|e| format!("flush sparse GRM value payload failed: {e}"))?;
-        self.value_writer
-            .get_ref()
-            .sync_data()
-            .map_err(|e| format!("sync sparse GRM value payload failed: {e}"))?;
+        unsupported_sync |= matches!(
+            sync_sparse_grm_data(self.value_writer.get_ref(), "sync sparse GRM value payload")?,
+            SyncDataOutcome::Unsupported
+        );
         self.meta_file
             .seek(SeekFrom::Start(2u64 * std::mem::size_of::<u64>() as u64))
             .map_err(|e| format!("seek sparse GRM col_ptr payload failed: {e}"))?;
@@ -1688,11 +1725,11 @@ impl SpgrmCscStreamWriter {
         col_writer
             .flush()
             .map_err(|e| format!("flush sparse GRM col_ptr payload failed: {e}"))?;
-        col_writer
-            .get_ref()
-            .sync_data()
-            .map_err(|e| format!("sync sparse GRM file failed: {e}"))?;
-        Ok(())
+        unsupported_sync |= matches!(
+            sync_sparse_grm_data(col_writer.get_ref(), "sync sparse GRM file")?,
+            SyncDataOutcome::Unsupported
+        );
+        Ok(unsupported_sync)
     }
 }
 
@@ -1814,14 +1851,14 @@ impl SpgrmCscTempPayloadWriter {
         Ok(())
     }
 
-    fn finish(mut self) -> Result<(usize, usize), String> {
+    fn finish(mut self) -> Result<(usize, usize, bool), String> {
         while self.current_col < self.n_samples {
             self.col_ptr[self.current_col + 1] = self.written as u64;
             self.current_col += 1;
         }
         let row_path = self.row_path.clone();
         let value_path = self.value_path.clone();
-        let result = (|| -> Result<(usize, usize), String> {
+        let result = (|| -> Result<(usize, usize, bool), String> {
             self.row_writer
                 .flush()
                 .map_err(|e| format!("flush sparse GRM temp row payload failed: {e}"))?;
@@ -1832,16 +1869,18 @@ impl SpgrmCscTempPayloadWriter {
                 .row_writer
                 .into_inner()
                 .map_err(|e| format!("close sparse GRM temp row payload failed: {}", e.error()))?;
-            row_file
-                .sync_data()
-                .map_err(|e| format!("sync sparse GRM temp row payload failed: {e}"))?;
+            let mut unsupported_sync = matches!(
+                sync_sparse_grm_data(&row_file, "sync sparse GRM temp row payload")?,
+                SyncDataOutcome::Unsupported
+            );
             drop(row_file);
             let value_file = self.value_writer.into_inner().map_err(|e| {
                 format!("close sparse GRM temp value payload failed: {}", e.error())
             })?;
-            value_file
-                .sync_data()
-                .map_err(|e| format!("sync sparse GRM temp value payload failed: {e}"))?;
+            unsupported_sync |= matches!(
+                sync_sparse_grm_data(&value_file, "sync sparse GRM temp value payload")?,
+                SyncDataOutcome::Unsupported
+            );
             drop(value_file);
 
             let mut out_file = OpenOptions::new()
@@ -1893,10 +1932,11 @@ impl SpgrmCscTempPayloadWriter {
             })?;
             std::io::copy(&mut value_reader, &mut out_file)
                 .map_err(|e| format!("append sparse GRM value payload failed: {e}"))?;
-            out_file
-                .sync_data()
-                .map_err(|e| format!("sync sparse GRM file failed: {e}"))?;
-            Ok((self.n_samples, self.written))
+            unsupported_sync |= matches!(
+                sync_sparse_grm_data(&out_file, "sync sparse GRM file")?,
+                SyncDataOutcome::Unsupported
+            );
+            Ok((self.n_samples, self.written, unsupported_sync))
         })();
         let _ = std::fs::remove_file(&row_path);
         let _ = std::fs::remove_file(&value_path);
@@ -3047,7 +3087,8 @@ fn merge_chunked_entries_to_jxgrm_streaming(
 ) -> Result<(usize, usize), String> {
     let mut writer = SpgrmCscTempPayloadWriter::new(out_path, n_samples)?;
     for_each_merged_chunk_entry(chunk_paths, |entry| writer.push(entry))?;
-    writer.finish()
+    let (n_samples, nnz, _unsupported_sync) = writer.finish()?;
+    Ok((n_samples, nnz))
 }
 
 fn merge_chunked_entries_to_jxgrm(
@@ -6029,7 +6070,7 @@ fn spgrm_dense_npy_to_jxgrm_core(
     abs_threshold: bool,
     progress_callback: Option<&Py<PyAny>>,
     progress_every: usize,
-) -> Result<(String, usize, usize), String> {
+) -> Result<(String, usize, usize, bool), String> {
     if !threshold.is_finite() {
         return Err("Sparse GRM threshold must be finite".to_string());
     }
@@ -6116,8 +6157,8 @@ fn spgrm_dense_npy_to_jxgrm_core(
             col + 1 == n_samples,
         )?;
     }
-    writer.finish()?;
-    Ok((out_path, n_samples, nnz))
+    let unsupported_sync = writer.finish()?;
+    Ok((out_path, n_samples, nnz, unsupported_sync))
 }
 
 #[pyfunction]
@@ -6898,7 +6939,8 @@ pub fn spgrm_dense_f32_to_jxgrm<'py>(
     threshold=0.05_f64,
     abs_threshold=false,
     progress_callback=None,
-    progress_every=0
+    progress_every=0,
+    sync_warning_callback=None
 ))]
 pub fn spgrm_dense_npy_to_jxgrm<'py>(
     py: Python<'py>,
@@ -6908,18 +6950,31 @@ pub fn spgrm_dense_npy_to_jxgrm<'py>(
     abs_threshold: bool,
     progress_callback: Option<Py<PyAny>>,
     progress_every: usize,
+    sync_warning_callback: Option<Py<PyAny>>,
 ) -> PyResult<(String, usize, usize)> {
-    py.detach(move || {
-        spgrm_dense_npy_to_jxgrm_core(
-            &npy_path,
-            &out_prefix,
-            threshold,
-            abs_threshold,
-            progress_callback.as_ref(),
-            progress_every,
-        )
-    })
-    .map_err(map_err_string_to_py)
+    let (out_path, n_samples, nnz, unsupported_sync) = py
+        .detach(move || {
+            spgrm_dense_npy_to_jxgrm_core(
+                &npy_path,
+                &out_prefix,
+                threshold,
+                abs_threshold,
+                progress_callback.as_ref(),
+                progress_every,
+            )
+        })
+        .map_err(map_err_string_to_py)?;
+    if unsupported_sync {
+        if let Some(callback) = sync_warning_callback {
+            callback.call1(py, (SPGRM_SYNC_UNSUPPORTED_WARNING,))?;
+        } else {
+            let message = CString::new(SPGRM_SYNC_UNSUPPORTED_WARNING)
+                .expect("static sparse GRM sync warning contains no NUL byte");
+            let category = py.get_type::<PyRuntimeWarning>();
+            pyo3::PyErr::warn(py, &category, message.as_c_str(), 1)?;
+        }
+    }
+    Ok((out_path, n_samples, nnz))
 }
 
 #[cfg(test)]
@@ -6933,6 +6988,40 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicUsizeOrdering};
 
     static KFILE_FIXTURE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn sparse_grm_sync_tolerates_unsupported_but_preserves_other_errors() {
+        assert_eq!(
+            classify_sync_data_result(
+                Err(std::io::Error::from(std::io::ErrorKind::Unsupported)),
+                "sync sparse GRM row payload",
+            ),
+            Ok(SyncDataOutcome::Unsupported)
+        );
+        assert_eq!(
+            classify_sync_data_result(Ok(()), "sync sparse GRM row payload"),
+            Ok(SyncDataOutcome::Synced)
+        );
+
+        #[cfg(unix)]
+        for code in [libc::ENOTSUP, libc::EOPNOTSUPP] {
+            assert_eq!(
+                classify_sync_data_result(
+                    Err(std::io::Error::from_raw_os_error(code)),
+                    "sync sparse GRM row payload",
+                ),
+                Ok(SyncDataOutcome::Unsupported)
+            );
+        }
+
+        let error = classify_sync_data_result(
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            "sync sparse GRM row payload",
+        )
+        .expect_err("permission errors must remain fatal");
+        assert!(error.contains("sync sparse GRM row payload failed"));
+        assert!(error.len() > "sync sparse GRM row payload failed: ".len());
+    }
 
     struct KfileFixture {
         dir: PathBuf,

@@ -63,6 +63,9 @@ class GSProgressLog:
 
     def __init__(self, logger, model: str, trait: str, folds: int, *, start_method=True):
         self.logger = logger
+        # Keep the run's console mode even if live rendering wraps stdout.
+        terminal_rich = getattr(logger, "_janusx_gs_terminal_rich", None)
+        self._file_only = stdout_is_tty() if terminal_rich is None else bool(terminal_rich)
         self.model = " ".join(str(model).split())
         self.trait = " ".join(str(trait).split())
         self.folds = max(0, int(folds))
@@ -109,7 +112,7 @@ class GSProgressLog:
             f"GS [{self.trait}] {self.model:<10} {stage:<7}{count}"
             f" | elapsed={format_elapsed(elapsed)} ETA={remaining} {status}"
         )
-        if stdout_is_tty():
+        if self._file_only:
             _emit_to_file_handlers(self.logger, logging.INFO, line)
         else:
             self.logger.info(line)

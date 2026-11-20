@@ -948,11 +948,14 @@ pub fn bed_packed_signed_hash_f32<'py>(
                 if !maf.is_finite() {
                     continue;
                 }
-                if maf < min_maf || maf > 0.5_f32 {
+                if !crate::gfreader::maf_passes_threshold(f64::from(maf), min_maf) || maf > 0.5_f32
+                {
                     continue;
                 }
                 if let Some(miss) = row_missing_vec.as_ref().map(|x| x[row_idx]) {
-                    if !miss.is_finite() || miss > max_missing {
+                    if !miss.is_finite()
+                        || !crate::gfreader::rate_within_threshold(f64::from(miss), max_missing)
+                    {
                         continue;
                     }
                 }
@@ -1257,11 +1260,15 @@ pub fn bed_packed_signed_hash_ztz_stats_f64<'py>(
                     if !maf.is_finite() {
                         continue;
                     }
-                    if maf < min_maf || maf > 0.5_f32 {
+                    if !crate::gfreader::maf_passes_threshold(f64::from(maf), min_maf)
+                        || maf > 0.5_f32
+                    {
                         continue;
                     }
                     if let Some(miss) = row_missing_vec.as_ref().map(|x| x[row_idx]) {
-                        if !miss.is_finite() || miss > max_missing {
+                        if !miss.is_finite()
+                            || !crate::gfreader::rate_within_threshold(f64::from(miss), max_missing)
+                        {
                             continue;
                         }
                     }
@@ -1640,11 +1647,14 @@ pub fn bed_packed_signed_hash_kernels_f64<'py>(
                 if !maf.is_finite() {
                     continue;
                 }
-                if maf < min_maf || maf > 0.5_f32 {
+                if !crate::gfreader::maf_passes_threshold(f64::from(maf), min_maf) || maf > 0.5_f32
+                {
                     continue;
                 }
                 if let Some(miss) = row_missing_vec.as_ref().map(|x| x[row_idx]) {
-                    if !miss.is_finite() || miss > max_missing {
+                    if !miss.is_finite()
+                        || !crate::gfreader::rate_within_threshold(f64::from(miss), max_missing)
+                    {
                         continue;
                     }
                 }

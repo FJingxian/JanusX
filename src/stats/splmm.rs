@@ -1138,6 +1138,75 @@ fn splmm_raw_bim_static_eligible(
         })
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SplmmRawQcRow {
+    alt_freq: f32,
+    missing_rate: f32,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn splmm_raw_qc_block_parallel(
+    packed_block: &[u8],
+    rows_here: usize,
+    n_samples_full: usize,
+    sample_indices: &[usize],
+    sample_identity: bool,
+    excluded_sample_indices: Option<&[usize]>,
+    n_selected: usize,
+    maf_threshold: f32,
+    max_missing_rate: f32,
+    het_threshold: f32,
+    snps_only: bool,
+    ranges: &[SplmmRawBimRange],
+    block_sites: Option<&[crate::gfcore::SiteInfo]>,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Vec<Option<SplmmRawQcRow>> {
+    let bytes_per_snp = n_samples_full.div_ceil(4);
+    let mut qc_rows = vec![None; rows_here];
+    let mut run = || {
+        qc_rows
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(local_row, output)| {
+                if let Some(sites) = block_sites {
+                    if !splmm_raw_bim_static_eligible(&sites[local_row], snps_only, ranges) {
+                        return;
+                    }
+                }
+                let row_start = local_row * bytes_per_snp;
+                let packed_row = &packed_block[row_start..row_start + bytes_per_snp];
+                let (missing, het, hom_alt) = count_packed_row_counts_selected_prevalidated(
+                    packed_row,
+                    n_samples_full,
+                    sample_indices,
+                    excluded_sample_indices,
+                    sample_identity,
+                );
+                let qc = evaluate_packed_snp_qc(
+                    missing,
+                    het,
+                    hom_alt,
+                    n_selected,
+                    maf_threshold,
+                    max_missing_rate,
+                    het_threshold,
+                );
+                if qc.keep {
+                    *output = Some(SplmmRawQcRow {
+                        alt_freq: qc.alt_freq,
+                        missing_rate: qc.missing_rate,
+                    });
+                }
+            });
+    };
+    if let Some(pool) = pool {
+        pool.install(run);
+    } else {
+        run();
+    }
+    qc_rows
+}
+
 /// Sample a bounded, deterministic reservoir from rows passing static BIM
 /// filters. With no static filters, sample BED rows directly without scanning
 /// the BIM. Genotype QC is deferred to the selected rows.
@@ -1317,6 +1386,7 @@ fn splmm_raw_estimate_gamma(
     ranges: &[SplmmRawBimRange],
     threads: usize,
     pool: Option<&rayon::ThreadPool>,
+    progress_callback: Option<&Py<PyAny>>,
 ) -> Result<SplmmRawGammaInfo, String> {
     if rhat_markers == 0 {
         return Err("SPLMM_FUSED_FALLBACK: rhat_markers must be > 0".to_string());
@@ -1326,6 +1396,12 @@ fn splmm_raw_estimate_gamma(
         .n_snps()
         .min(1024usize.max(rhat_markers.saturating_mul(32)));
     let static_t0 = Instant::now();
+    // Stage 8 is shared with the regular approximate path.  The first
+    // callback lets the Python side replace the indeterminate preparation
+    // indicator before candidate selection, while the second callback
+    // installs the final candidate-based total once the bounded candidate
+    // list is known.
+    emit_progress_callback(progress_callback, 8, 0, 1)?;
     let (candidates, n_static) = splmm_raw_static_candidate_rows(
         prefix,
         reader.n_snps(),
@@ -1341,57 +1417,80 @@ fn splmm_raw_estimate_gamma(
         ));
     }
     let static_select_secs = static_t0.elapsed().as_secs_f64();
+    let mut gamma_progress_total = candidates.len().saturating_add(1).max(1);
+    emit_progress_callback(progress_callback, 8, 0, gamma_progress_total)?;
     let n = sample_indices.len();
     let decode_plan =
         AdditiveDecodePlan::from_sample_indices(reader.n_samples_full(), sample_indices);
-    let mut row = vec![0u8; reader.bytes_per_snp()];
+    const CANDIDATE_READ_BATCH_ROWS: usize = 256;
+    let bytes_per_snp = reader.bytes_per_snp();
+    let candidate_batch_size = CANDIDATE_READ_BATCH_ROWS.min(candidates.len().max(1));
+    let mut packed_batch = vec![0u8; candidate_batch_size.saturating_mul(bytes_per_snp)];
     let mut marker = vec![0.0_f64; n];
     let mut markers_col_major = Vec::<f64>::with_capacity(n.saturating_mul(qc_target));
     let mut qc_valid = 0usize;
     let mut attempts = 0usize;
     let qc_t0 = Instant::now();
-    for source_row in candidates.iter().copied() {
+    for candidate_start in (0..candidates.len()).step_by(candidate_batch_size) {
         if qc_valid >= qc_target {
             break;
         }
-        attempts += 1;
-        if reader.read_source_block(source_row, 1, &mut row)? != 1 {
-            return Err(format!(
-                "BED ended while reading Gamma candidate source row {source_row}"
-            ));
+        let candidate_end = (candidate_start + candidate_batch_size).min(candidates.len());
+        let candidate_batch = &candidates[candidate_start..candidate_end];
+        let batch_bytes = candidate_batch.len() * bytes_per_snp;
+        reader.read_source_rows_sparse(candidate_batch, &mut packed_batch[..batch_bytes])?;
+        for batch_row in 0..candidate_batch.len() {
+            if qc_valid >= qc_target {
+                break;
+            }
+            attempts += 1;
+            if progress_callback.is_some() && (attempts % 256 == 0 || attempts == candidates.len())
+            {
+                emit_progress_callback(progress_callback, 8, attempts, gamma_progress_total)?;
+            }
+            let row_start = batch_row * bytes_per_snp;
+            let row = &packed_batch[row_start..row_start + bytes_per_snp];
+            let (missing, het, hom_alt) = count_packed_row_counts_selected_prevalidated(
+                row,
+                reader.n_samples_full(),
+                sample_indices,
+                excluded_sample_indices,
+                sample_identity,
+            );
+            let qc = evaluate_packed_snp_qc(
+                missing,
+                het,
+                hom_alt,
+                n_selected,
+                maf_threshold,
+                max_missing_rate,
+                het_threshold,
+            );
+            if !qc.keep {
+                continue;
+            }
+            decode_packed_row_model_enum_into_f64(
+                row,
+                qc.row_flip,
+                qc.alt_freq,
+                n,
+                PackedGeneticModel::Add,
+                sample_identity,
+                decode_plan.sample_byte_idx(),
+                decode_plan.sample_bit_shift(),
+                &mut marker,
+            );
+            markers_col_major.extend_from_slice(&marker);
+            qc_valid += 1;
         }
-        let (missing, het, hom_alt) = count_packed_row_counts_selected_prevalidated(
-            &row,
-            reader.n_samples_full(),
-            sample_indices,
-            excluded_sample_indices,
-            sample_identity,
-        );
-        let qc = evaluate_packed_snp_qc(
-            missing,
-            het,
-            hom_alt,
-            n_selected,
-            maf_threshold,
-            max_missing_rate,
-            het_threshold,
-        );
-        if !qc.keep {
-            continue;
-        }
-        decode_packed_row_model_enum_into_f64(
-            &row,
-            qc.row_flip,
-            qc.alt_freq,
-            n,
-            PackedGeneticModel::Add,
-            sample_identity,
-            decode_plan.sample_byte_idx(),
-            decode_plan.sample_bit_shift(),
-            &mut marker,
-        );
-        markers_col_major.extend_from_slice(&marker);
-        qc_valid += 1;
+    }
+    // Most runs stop as soon as enough QC-valid markers have been collected,
+    // so replace the bounded candidate-list estimate with the number of
+    // rows actually attempted before entering the sparse fit.  The final
+    // extra slot remains reserved for that fit.
+    gamma_progress_total = attempts.saturating_add(1).max(1);
+    if progress_callback.is_some() {
+        emit_progress_callback(progress_callback, 8, attempts, gamma_progress_total)?;
     }
     if qc_valid < qc_target {
         return Err(format!(
@@ -1411,6 +1510,15 @@ fn splmm_raw_estimate_gamma(
             pool,
         )
         .map_err(splmm_raw_gamma_error)?;
+    // Reserve the final progress slot for the sparse Gamma fit itself.  This
+    // keeps slow external-storage solves visible instead of appearing to
+    // stall after candidate decoding reaches its last reported row.
+    emit_progress_callback(
+        progress_callback,
+        8,
+        gamma_progress_total,
+        gamma_progress_total,
+    )?;
     if splmm_top_level_timing_enabled() {
         eprintln!(
             "SparseLMM approx gamma timing: static_select={:.3}s, candidate_qc_decode={:.3}s, sparse_solve_reduce={:.3}s, requested={}, candidates={}, qc_valid={}, used={}",
@@ -1473,32 +1581,26 @@ fn splmm_raw_process_assoc_block_single_buffer(
     let mut source_rows = Vec::<usize>::with_capacity(rows_here);
     let mut alt_freq = Vec::<f32>::with_capacity(rows_here);
     let mut missing_rate = Vec::<f32>::with_capacity(rows_here);
-    for local_row in 0..rows_here {
-        if let Some(sites) = block_sites {
-            if !splmm_raw_bim_static_eligible(&sites[local_row], snps_only, ranges) {
-                continue;
-            }
-        }
-        let packed_row = &packed_block[local_row * bytes_per_snp..(local_row + 1) * bytes_per_snp];
-        let (missing, het, hom_alt) = count_packed_row_counts_selected_prevalidated(
-            packed_row,
-            n_samples_full,
-            sample_indices,
-            excluded_sample_indices,
-            sample_identity,
-        );
-        let qc = evaluate_packed_snp_qc(
-            missing,
-            het,
-            hom_alt,
-            n_selected,
-            maf_threshold,
-            max_missing_rate,
-            het_threshold,
-        );
-        if !qc.keep {
+    let qc_rows = splmm_raw_qc_block_parallel(
+        packed_block,
+        rows_here,
+        n_samples_full,
+        sample_indices,
+        sample_identity,
+        excluded_sample_indices,
+        n_selected,
+        maf_threshold,
+        max_missing_rate,
+        het_threshold,
+        snps_only,
+        ranges,
+        block_sites,
+        pool,
+    );
+    for (local_row, qc) in qc_rows.into_iter().enumerate() {
+        let Some(qc) = qc else {
             continue;
-        }
+        };
         packed_rel_rows.push(local_row);
         source_rows.push(source_start + local_row);
         alt_freq.push(qc.alt_freq);
@@ -1528,6 +1630,10 @@ fn splmm_raw_process_assoc_block_single_buffer(
     } else {
         None
     };
+    // fastGWA's approximate score uses the centered marker against the
+    // phenotype residual from the null fit.  Keep the score sum once so the
+    // packed kernel can apply g'a - mean(g)1'a without another pass.
+    let score_sum = model.score_vec().iter().map(|&v| v as f64).sum::<f64>();
     let mut results = vec![0.0_f64; source_rows.len().saturating_mul(3)];
     let assoc_t0 = stage_timing.then(Instant::now);
     let mut run = || {
@@ -1561,7 +1667,7 @@ fn splmm_raw_process_assoc_block_single_buffer(
                     let (score, sum_g, sumsq) =
                         dot_sum_sumsq_intercept_f32_row(genotype, score_f32);
                     (
-                        score as f64,
+                        score as f64 - (sum_g as f64 / n as f64) * score_sum,
                         residualized_sumsq_scalar(xtx00_inv, sum_g as f64, sumsq),
                         sumsq,
                     )
@@ -1682,32 +1788,26 @@ fn splmm_raw_scan_exact_block_single_buffer(
     let mut source_rows = Vec::<usize>::with_capacity(rows_here);
     let mut alt_freq = Vec::<f32>::with_capacity(rows_here);
     let mut missing_rate = Vec::<f32>::with_capacity(rows_here);
-    for local_row in 0..rows_here {
-        if let Some(sites) = block_sites {
-            if !splmm_raw_bim_static_eligible(&sites[local_row], snps_only, ranges) {
-                continue;
-            }
-        }
-        let packed_row = &packed_block[local_row * bytes_per_snp..(local_row + 1) * bytes_per_snp];
-        let (missing, het, hom_alt) = count_packed_row_counts_selected_prevalidated(
-            packed_row,
-            n_samples_full,
-            sample_indices,
-            excluded_sample_indices,
-            sample_identity,
-        );
-        let qc = evaluate_packed_snp_qc(
-            missing,
-            het,
-            hom_alt,
-            sample_indices.len(),
-            maf_threshold,
-            max_missing_rate,
-            het_threshold,
-        );
-        if !qc.keep {
+    let qc_rows = splmm_raw_qc_block_parallel(
+        packed_block,
+        rows_here,
+        n_samples_full,
+        sample_indices,
+        sample_identity,
+        excluded_sample_indices,
+        sample_indices.len(),
+        maf_threshold,
+        max_missing_rate,
+        het_threshold,
+        snps_only,
+        ranges,
+        block_sites,
+        pool,
+    );
+    for (local_row, qc) in qc_rows.into_iter().enumerate() {
+        let Some(qc) = qc else {
             continue;
-        }
+        };
         packed_rel_rows.push(local_row);
         source_rows.push(source_start + local_row);
         alt_freq.push(qc.alt_freq);
@@ -2418,7 +2518,8 @@ fn prepare_prefix_input_from_external_meta<'py>(
     let (bytes_per_snp, n_snps_bed) = if pgen_source {
         (
             n_samples_full.div_ceil(4),
-            crate::pgen::count_pvar_variants(&bed_prefix).map_err(PyRuntimeError::new_err)?,
+            crate::pgen::count_pgen_variants(&bed_prefix, n_samples_full)
+                .map_err(PyRuntimeError::new_err)?,
         )
     } else {
         inspect_plink_bed_shape_local(&bed_prefix, n_samples_full)
@@ -4338,7 +4439,6 @@ fn exact_scan_blocks_core<G: GenotypeMatrix>(
             scan_sample_idx.len()
         ));
     }
-
     let decode_plan =
         AdditiveDecodePlan::from_sample_indices(input.stats.n_samples_full, scan_sample_idx);
     let sample_identity = decode_plan.sample_identity();
@@ -4568,6 +4668,7 @@ fn grammar_scan_blocks_core<G: GenotypeMatrix>(
             scan_sample_idx.len()
         ));
     }
+    let score_sum = score_vec.iter().sum::<f64>();
 
     let decode_plan =
         AdditiveDecodePlan::from_sample_indices(input.stats.n_samples_full, scan_sample_idx);
@@ -4694,7 +4795,9 @@ fn grammar_scan_blocks_core<G: GenotypeMatrix>(
                                 let local_idx = tile_row_start + local_off;
                                 let dot_row =
                                     &dot_slice[local_idx * rhs_cols..(local_idx + 1) * rhs_cols];
-                                let score = score_scale * (dot_row[0] as f64);
+                                let score = score_scale
+                                    * ((dot_row[0] as f64)
+                                        - (dot_row[1] as f64 / n as f64) * score_sum);
                                 let xts0 = dot_row[1] as f64;
                                 let s_m_s =
                                     residualized_sumsq_scalar(xtx00_inv, xts0, ss_slice[local_idx]);
@@ -6893,6 +6996,10 @@ fn splmm_fused_approx_assoc_to_tsv(
     let input_prepare_secs = total_t0.elapsed().as_secs_f64();
     emit_progress_callback(stage1_progress_callback.as_ref(), 0, 0, 1)?;
 
+    // Include PGEN header/reader initialization in the visible Gamma phase.
+    // On a remote filesystem this used to sit between the null-model status
+    // and the first stage-8 callback, which looked like a silent stall.
+    emit_progress_callback(stage1_progress_callback.as_ref(), 8, 0, 1)?;
     let mut reader = PackedBedSourceReader::open(&bed_prefix, n_samples_full)?;
     let factor_t0 = Instant::now();
     let factor = sparse_splmm_load_factor(
@@ -6930,6 +7037,7 @@ fn splmm_fused_approx_assoc_to_tsv(
         &bimranges,
         threads,
         pool.as_deref(),
+        stage1_progress_callback.as_ref(),
     )?;
     let model = fit.build_scan_model(&x_design, gamma_info.gamma)?;
     let score_f32 = cast_f64_slice_to_f32(model.score_vec())?;
@@ -6954,17 +7062,10 @@ fn splmm_fused_approx_assoc_to_tsv(
             if gamma_info.n_used >= 100 {
                 "null-filtered"
             } else {
-                "all-valid-residualized"
+                "all-valid-raw-centered"
             },
         );
     }
-    emit_progress_callback(
-        stage1_progress_callback.as_ref(),
-        8,
-        gamma_info.n_qc_valid,
-        gamma_info.n_qc_valid.max(1),
-    )?;
-
     let n_snps = reader.n_snps();
     let block_plan = splmm_fused_block_plan(
         memory_mb,
@@ -7948,7 +8049,7 @@ pub fn splmm_assoc_pcg_kfile_to_tsv<'py>(
                     run_kfile_splmm_tsv_writer(&out_tsv_owned, |sink| {
                     grammar_scan_blocks_core(
                         &mut input,
-                        x_design.as_slice(),
+                        scan_model.scan_design(),
                         scan_model.score_vec(),
                         1.0,
                         scan_model.xtx_chol(),
@@ -9039,6 +9140,60 @@ mod tests {
         row
     }
 
+    #[test]
+    fn splmm_raw_parallel_qc_matches_serial_counts_and_keeps_source_order() {
+        let codes = [
+            [0b00, 0b10, 0b11, 0b00],
+            [0b10, 0b10, 0b00, 0b11],
+            [0b01, 0b01, 0b11, 0b00],
+            [0b00, 0b10, 0b11, 0b00],
+        ];
+        let packed_rows = codes.map(|row| pack_plink_codes(&row));
+        let packed_block = packed_rows.concat();
+        let sample_indices = [0usize, 1, 2, 3];
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(3)
+                .build()
+                .expect("build test QC pool"),
+        );
+        let observed = splmm_raw_qc_block_parallel(
+            &packed_block,
+            packed_rows.len(),
+            4,
+            &sample_indices,
+            true,
+            None,
+            sample_indices.len(),
+            0.1,
+            0.25,
+            1.0,
+            false,
+            &[],
+            None,
+            Some(&pool),
+        );
+
+        let kept_rows = observed
+            .iter()
+            .enumerate()
+            .filter_map(|(row, qc)| qc.map(|_| row))
+            .collect::<Vec<_>>();
+        assert_eq!(kept_rows, vec![0, 1, 3]);
+        for (row, qc) in observed.iter().enumerate() {
+            let (missing, het, hom_alt) = count_packed_row_counts(&packed_rows[row], 4);
+            let expected = evaluate_packed_snp_qc(missing, het, hom_alt, 4, 0.1, 0.25, 1.0);
+            assert_eq!(qc.is_some(), expected.keep, "QC keep mismatch at row {row}");
+            if let Some(qc) = qc {
+                assert_eq!(qc.alt_freq, expected.alt_freq, "AF mismatch at row {row}");
+                assert_eq!(
+                    qc.missing_rate, expected.missing_rate,
+                    "missingness mismatch at row {row}"
+                );
+            }
+        }
+    }
+
     fn write_fixed_pgen(prefix: &std::path::Path, bed_rows: &[Vec<u8>], n_samples: usize) {
         let bytes_per_variant = n_samples.div_ceil(4);
         let mut pgen = vec![0x6c, 0x1b, 0x02];
@@ -9328,6 +9483,7 @@ mod tests {
             false,
             &[],
             1,
+            None,
             None,
         )
         .unwrap();
@@ -10513,6 +10669,8 @@ mod tests {
         let mut out = vec![0.0_f64; prepared.n_rows() * 3];
         let mut xts = vec![0.0_f64; p];
         let mut alpha = vec![0.0_f64; p];
+        let intercept_only = p == 1 && x_design.iter().all(|&value| value == 1.0_f64);
+        let score_sum = py_vec.iter().sum::<f64>();
         for row_idx in 0..prepared.n_rows() {
             let g = decode_test_row(prepared, row_idx, scan_sample_idx, gm);
             xts.fill(0.0);
@@ -10526,6 +10684,9 @@ mod tests {
                 for j in 0..p {
                     xts[j] += x_row[j] * gi;
                 }
+            }
+            if intercept_only {
+                spy -= (xts[0] / n as f64) * score_sum;
             }
             let s_m_s = residualized_sumsq_from_xtx_chol(xtx_chol, p, &xts, &mut alpha, s_sq);
             let denom = r_hat * s_m_s;

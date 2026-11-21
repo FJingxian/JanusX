@@ -579,8 +579,8 @@ def build_parser(argv: Sequence[str] | None = None) -> CliArgumentParser:
         epilog=minimal_help_epilog(
             [
                 "jx imp -vcf target.vcf.gz -o phased -fmt vcf",
-                "jx imp -pfile target -ref reference -fmt pgen -o imputed",
-                "jx imp -hmp target.hmp.gz -fmt pgen -o phased",
+                "jx imp -pfile target -ref reference -fmt pfile -o imputed",
+                "jx imp -hmp target.hmp.gz -fmt pfile -o phased",
                 "jx imp -bfile target -ref reference.vcf.gz -o imputed",
                 "jx imp -h -dev",
             ]
@@ -842,14 +842,14 @@ def build_parser(argv: Sequence[str] | None = None) -> CliArgumentParser:
         "--out",
         required=True,
         help=(
-            "Output prefix. VCF output appends .vcf.gz; PGEN output creates "
+            "Output prefix. VCF output appends .vcf.gz; PFILE output creates "
             ".pgen, .pvar, and .psam."
         ),
     )
     output.add_argument(
         "-fmt",
         "--format",
-        choices=("vcf", "pgen"),
+        choices=("vcf", "pfile"),
         default="vcf",
         help="Output genotype format (default: %(default)s).",
     )
@@ -1089,7 +1089,7 @@ def main() -> int:
                 }
             ),
             "output": str(output),
-            "format": args.format,
+            "format": "pgen" if args.format == "pfile" else "vcf",
             "threads": int(args.threads),
             "seed": int(args.seed),
             "window": float(args.window),
@@ -1129,7 +1129,7 @@ def main() -> int:
     )
     processing_elapsed = reporter.elapsed_seconds()
     reporter.close()
-    if str(args.format).lower() == "pgen":
+    if str(args.format).lower() == "pfile":
         generated_outputs = [
             Path(f"{output}.pgen"),
             Path(f"{output}.pvar"),
@@ -1279,7 +1279,7 @@ def main() -> int:
             force_color=True,
         )
         saved_lines = "\n".join(f"  {path}" for path in generated_outputs)
-        saved_format = "PGEN" if str(args.format).lower() == "pgen" else "VCF"
+        saved_format = "PFILE" if str(args.format).lower() == "pfile" else "VCF"
         terminal_logger.info(
             f"Saved genotype in {saved_format} format:\n{saved_lines}"
         )

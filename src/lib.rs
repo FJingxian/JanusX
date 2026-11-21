@@ -59,6 +59,8 @@ mod ld;
 mod lm_trait;
 #[path = "stats/lmm.rs"]
 mod lmm;
+#[path = "stats/lmm_common.rs"]
+mod lmm_common;
 #[path = "stats/logreg.rs"]
 mod logreg;
 #[path = "stats/mixed_ld.rs"]
@@ -1005,7 +1007,6 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rust_eigh_from_matrix_file_f64, m)?)?;
     m.add_function(wrap_pyfunction!(rust_eigh_from_matrix_file_subset_f64, m)?)?;
     m.add_function(wrap_pyfunction!(rust_eigh_from_array_f64_inplace, m)?)?;
-    m.add_function(wrap_pyfunction!(fastlmm_prepare_lowrank_f64, m)?)?;
     m.add_function(wrap_pyfunction!(top_fit_model_py, m)?)?;
     m.add_function(wrap_pyfunction!(top_rank_to_target_sample_py, m)?)?;
     m.add_function(wrap_pyfunction!(top_rank_to_target_values_py, m)?)?;

@@ -44,10 +44,9 @@ use crate::gload::{PackedBedSourceReader, WindowedBedMatrix};
 use crate::kmer::KfileAssocSource;
 use crate::linalg::{chi2_sf_df1, cholesky_gram_inplace, cholesky_solve_into, normal_sf};
 use crate::lmm_common::{
-    assoc_rotate_prefers_rayon_rowmajor_f32_kernel, choose_fvlmm_blas_tile_rows, dot_loop,
-    elapsed_nanos_to_secs, env_positive_usize, fill_packed_missing_block,
-    fvlmm_rotate_kernel_prefers_tiled, missing_count_from_rate, missing_rate_from_count,
-    normalize_default_assoc_threads_for_backend, record_elapsed_nanos, resolve_snp_name,
+    assoc_rotate_prefers_rayon_rowmajor_f32_kernel, dot_loop, elapsed_nanos_to_secs,
+    env_positive_usize, fill_packed_missing_block, fvlmm_rotate_kernel_prefers_tiled,
+    missing_count_from_rate, missing_rate_from_count, record_elapsed_nanos, resolve_snp_name,
     rotate_snp_block_with_ut_blas_fvlmm as rotate_snp_block_with_ut_blas, stage_assoc_threads_or,
     stage_proj_threads_or, AssocScratch, SnpCounts, StreamingChunk,
 };

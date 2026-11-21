@@ -160,6 +160,17 @@ def _check_macos_bundled_openblas_signature_and_probe_load() -> None:
                     f"codesign verification failed for {extension}: {detail}"
                 )
 
+    bundled_openmp = sorted(
+        name
+        for name in dylib_names
+        if name.lower().startswith(("libomp", "libgomp", "libiomp"))
+    )
+    if bundled_openmp:
+        raise RuntimeError(
+            "macOS wheel must bundle pthreads OpenBLAS without OpenMP runtime dylibs; found: "
+            + ", ".join(bundled_openmp)
+        )
+
     libopenblas_path = _find_bundled_openblas()
     if os.path.basename(libopenblas_path) not in dylib_names:
         raise RuntimeError(
@@ -188,6 +199,10 @@ def _check_macos_bundled_openblas_signature_and_probe_load() -> None:
             if dep.startswith("/usr/lib/") or dep.startswith("/System/Library/"):
                 continue
             dep_name = Path(dep).name
+            if dep_name.lower().startswith(("libomp", "libgomp", "libiomp")):
+                raise RuntimeError(
+                    f"bundled dylib {os.path.basename(dylib)} must not link OpenMP runtime: {dep}"
+                )
             if dep_name not in dylib_names:
                 raise RuntimeError(
                     f"bundled dylib {os.path.basename(dylib)} references non-bundled dependency {dep}"
@@ -205,7 +220,19 @@ def _check_macos_bundled_openblas_signature_and_probe_load() -> None:
         raise RuntimeError(f"JX_OPENBLAS_LIB_PATH does not exist: {libpath}")
 
     print(f"[check_installed_runtime] probing_cdll={libpath}")
-    _ = ctypes.CDLL(libpath)
+    lib = ctypes.CDLL(libpath)
+    if not hasattr(lib, "openblas_get_parallel"):
+        raise RuntimeError(
+            "bundled macOS OpenBLAS lacks the required openblas_get_parallel symbol"
+        )
+    lib.openblas_get_parallel.restype = ctypes.c_int
+    parallel = int(lib.openblas_get_parallel())
+    print(f"[check_installed_runtime] macos_openblas_parallel={parallel}")
+    if parallel != 1:
+        raise RuntimeError(
+            "bundled macOS OpenBLAS must use pthreads (openblas_get_parallel=1), "
+            f"got {parallel}"
+        )
     print("[check_installed_runtime] macOS bundled OpenBLAS load probe passed")
 
 
@@ -222,6 +249,12 @@ def main() -> int:
         action="store_true",
         default=False,
         help="Require bundled OpenBLAS to be threaded (not SINGLE_THREADED).",
+    )
+    parser.add_argument(
+        "--require-pthreads-openblas",
+        action="store_true",
+        default=False,
+        help="Require bundled OpenBLAS to use pthreads (openblas_get_parallel() == 1, not OpenMP).",
     )
     parser.add_argument(
         "--check-kmc-load",
@@ -242,7 +275,10 @@ def main() -> int:
     args = parser.parse_args()
 
     need_native_import = (
-        args.require_openblas or args.require_threaded_openblas or args.check_kmc_load
+        args.require_openblas
+        or args.require_threaded_openblas
+        or args.require_pthreads_openblas
+        or args.check_kmc_load
     )
     if need_native_import:
         import janusx.janusx as jx
@@ -252,7 +288,7 @@ def main() -> int:
         if args.require_openblas and backend != "openblas":
             raise SystemExit(f"Strict mode failed: expected openblas backend, got {backend!r}")
 
-    if args.require_threaded_openblas:
+    if args.require_threaded_openblas or args.require_pthreads_openblas:
         libpath = _find_bundled_openblas()
         lib = _load_openblas_cdll(libpath)
         print(f"[check_installed_runtime] bundled_openblas={libpath}")
@@ -272,6 +308,11 @@ def main() -> int:
         # Some binaries may still contain "SINGLE_THREADED" text in their
         # string table, so treat it as advisory unless runtime reports
         # non-parallel behavior.
+        if args.require_pthreads_openblas and parallel != 1:
+            raise SystemExit(
+                "Strict mode failed: OpenBLAS runtime must use pthreads (parallel=1), "
+                f"got openblas_get_parallel={parallel} (config={cfg!r})."
+            )
         if parallel == 0:
             raise SystemExit(
                 "Strict mode failed: OpenBLAS runtime reports no threading "

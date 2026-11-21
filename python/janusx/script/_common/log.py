@@ -742,6 +742,119 @@ def _process_file_lock(path: str) -> Iterator[None]:
 _LOG_SESSIONS: dict[str, "NfsSafeFileHandler"] = {}
 _LOG_SESSIONS_LOCK = threading.RLock()
 _ATEXIT_REGISTERED = False
+_EXCEPTION_HOOKS_INSTALLED = False
+_PREVIOUS_EXCEPTOOK = None
+_PREVIOUS_THREAD_EXCEPTOOK = None
+_LOG_FAILURE_OBSERVED = False
+
+
+def _active_file_log_handlers() -> list["NfsSafeFileHandler"]:
+    """Return active file handlers without relying on logger attributes.
+
+    GWAS deliberately owns its lifecycle outside ``setup_logging`` and passes
+    ``manage_lifecycle=False``.  Include handlers attached directly to the
+    root logger so the uncaught-exception hook covers that route as well.
+    """
+    handlers: list["NfsSafeFileHandler"] = []
+    seen: set[int] = set()
+    with _LOG_SESSIONS_LOCK:
+        candidates = list(_LOG_SESSIONS.values())
+    candidates.extend(logging.getLogger().handlers)
+    for handler in candidates:
+        if not isinstance(handler, NfsSafeFileHandler) or handler._finalizing:
+            continue
+        marker = id(handler)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        handlers.append(handler)
+    return handlers
+
+
+def _install_exception_hooks() -> None:
+    """Persist uncaught Python exceptions in the active JanusX log.
+
+    Most module pipelines catch ``Exception`` themselves, but a few utility
+    paths and worker callbacks can still escape to the interpreter.  The
+    standard traceback then goes only to stderr, which is often unavailable
+    after a batch job exits.  Install one process-wide hook after a file log is
+    available so the same traceback is flushed to the local spool and its live
+    published snapshot.
+    """
+    global _EXCEPTION_HOOKS_INSTALLED
+    global _PREVIOUS_EXCEPTOOK, _PREVIOUS_THREAD_EXCEPTOOK
+    if _EXCEPTION_HOOKS_INSTALLED:
+        return
+
+    _PREVIOUS_EXCEPTOOK = sys.excepthook
+
+    def _excepthook(exc_type, exc_value, exc_traceback) -> None:
+        global _LOG_FAILURE_OBSERVED
+        if exc_type is not None and issubclass(exc_type, KeyboardInterrupt):
+            # Normal Ctrl+C is handled by _common.interrupt.  If a caller did
+            # not install that handler, retain the standard traceback path.
+            previous = _PREVIOUS_EXCEPTOOK
+            if previous is not None:
+                previous(exc_type, exc_value, exc_traceback)
+            return
+        handlers = _active_file_log_handlers()
+        if handlers:
+            _LOG_FAILURE_OBSERVED = True
+            logged = False
+            try:
+                logging.getLogger().error(
+                    "Unhandled exception in JanusX pipeline.",
+                    exc_info=(exc_type, exc_value, exc_traceback),
+                )
+                logged = True
+            except Exception:
+                pass
+            try:
+                finalize_logging(success=False)
+            except Exception:
+                pass
+            if logged:
+                # The root logger already emits the traceback to stderr and
+                # the file spool. Calling the default hook as well would
+                # print the same traceback twice.
+                return
+        previous = _PREVIOUS_EXCEPTOOK
+        if previous is not None:
+            try:
+                previous(exc_type, exc_value, exc_traceback)
+            except Exception:
+                pass
+
+    sys.excepthook = _excepthook
+
+    previous_thread = getattr(threading, "excepthook", None)
+    _PREVIOUS_THREAD_EXCEPTOOK = previous_thread
+    if previous_thread is not None:
+
+        def _thread_excepthook(args) -> None:
+            global _LOG_FAILURE_OBSERVED
+            handlers = _active_file_log_handlers()
+            if handlers:
+                _LOG_FAILURE_OBSERVED = True
+                logged = False
+                try:
+                    logging.getLogger().error(
+                        "Unhandled exception in JanusX worker thread %s.",
+                        getattr(args, "thread", None),
+                        exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+                    )
+                    logged = True
+                except Exception:
+                    pass
+                if logged:
+                    return
+            try:
+                previous_thread(args)
+            except Exception:
+                pass
+
+        threading.excepthook = _thread_excepthook
+    _EXCEPTION_HOOKS_INSTALLED = True
 
 
 class NfsSafeFileHandler(logging.FileHandler):
@@ -979,7 +1092,7 @@ def finalize_logging(*, success: bool) -> None:
 
 
 def _finalize_logging_at_exit() -> None:
-    finalize_logging(success=True)
+    finalize_logging(success=not bool(_LOG_FAILURE_OBSERVED))
 
 
 def get_log_spool_path(logger: logging.Logger) -> str:
@@ -1205,7 +1318,11 @@ def setup_logging(
     is treated as already owning the requested destination (the GWAS runner
     uses this for its pre-reserved live path).
     """
-    global _ATEXIT_REGISTERED
+    global _ATEXIT_REGISTERED, _LOG_FAILURE_OBSERVED
+    _install_exception_hooks()
+    with _LOG_SESSIONS_LOCK:
+        if not _LOG_SESSIONS:
+            _LOG_FAILURE_OBSERVED = False
     requested_path = os.path.abspath(os.path.expanduser(os.fspath(log_file_path)))
     chosen_log_path = requested_path
     fallback_note: str | None = None

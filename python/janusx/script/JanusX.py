@@ -42,6 +42,7 @@ Modules:
 import sys
 import subprocess
 import importlib
+import logging
 import os
 import re
 import shutil
@@ -523,16 +524,34 @@ def main():
                 except SystemExit as exc:
                     from janusx.script._common.log import finalize_logging
 
+                    # Preserve a useful terminal status in the active module
+                    # log before finalization.  Several utility modules use
+                    # ``raise SystemExit(1)`` for validation/native-worker
+                    # failures, which bypasses their normal Exception path.
+                    if exc.code not in (None, 0):
+                        try:
+                            logging.getLogger().error(
+                                "JanusX module exited before completion (status=%s).",
+                                exc.code,
+                            )
+                        except Exception:
+                            pass
                     finalize_logging(success=exc.code in (None, 0))
                     raise
                 except KeyboardInterrupt:
-                    from janusx.script._common.log import finalize_logging
-
-                    finalize_logging(success=False)
+                    # force_exit() records the reason before closing the
+                    # active spool; finalizing first would discard that log
+                    # handler and leave only stderr output.
                     force_exit(130, "Interrupted by user (Ctrl+C).")
                 except BaseException:
                     from janusx.script._common.log import finalize_logging
 
+                    try:
+                        logging.getLogger().exception(
+                            "JanusX module exited unexpectedly."
+                        )
+                    except Exception:
+                        pass
                     finalize_logging(success=False)
                     raise
                 else:

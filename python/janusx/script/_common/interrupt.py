@@ -53,7 +53,12 @@ def _terminate_active_children() -> None:
         pass
 
 
-def force_exit(code: int = 130, msg: Optional[str] = None) -> None:
+def force_exit(
+    code: int = 130,
+    msg: Optional[str] = None,
+    *,
+    signum: Optional[int] = None,
+) -> None:
     global _FORCE_EXITING
     if _FORCE_EXITING:
         os._exit(int(code))
@@ -61,6 +66,25 @@ def force_exit(code: int = 130, msg: Optional[str] = None) -> None:
     if msg:
         try:
             print(str(msg), file=sys.stderr, flush=True)
+        except Exception:
+            pass
+        # The stderr message is easy to lose in batch jobs or redirected
+        # terminals.  Mirror it into the active JanusX file log before the
+        # process is force-exited.  This covers every CLI module because the
+        # launcher installs these handlers before dispatching a subcommand.
+        try:
+            signal_label = ""
+            if signum is not None:
+                try:
+                    signal_label = f" signal={signal.Signals(int(signum)).name}"
+                except (ValueError, TypeError):
+                    signal_label = f" signal={int(signum)}"
+            logging.getLogger().error(
+                "JanusX process terminated%s (exit_code=%d): %s",
+                signal_label,
+                int(code),
+                str(msg),
+            )
         except Exception:
             pass
     try:
@@ -88,11 +112,11 @@ def install_interrupt_handlers() -> None:
         sigbreak = int(getattr(signal, "SIGBREAK", -1))
         s = int(signum)
         if s == sigterm:
-            force_exit(143, "Terminated.")
+            force_exit(143, "Terminated.", signum=s)
         elif s == sigbreak:
-            force_exit(131, "Interrupted by user (Ctrl+Break).")
+            force_exit(131, "Interrupted by user (Ctrl+Break).", signum=s)
         else:
-            force_exit(130, "Interrupted by user (Ctrl+C).")
+            force_exit(130, "Interrupted by user (Ctrl+C).", signum=s)
 
     for sig_name in ("SIGINT", "SIGTERM", "SIGBREAK"):
         sig = getattr(signal, sig_name, None)

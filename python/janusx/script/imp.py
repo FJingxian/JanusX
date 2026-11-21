@@ -51,6 +51,8 @@ from ._common.threads import detect_effective_threads
 _REPORT_RULE = "=" * 72
 _TERMINAL_SECTION_WIDTH = 60
 _IMP_PROGRESS_BAR_WIDTH = 12
+_IMP_PREFLIGHT_RSS_NUMERATOR = 5
+_IMP_PREFLIGHT_RSS_DENOMINATOR = 3
 
 
 def _report_banner(logger: logging.Logger, title: str) -> None:
@@ -660,6 +662,14 @@ def _set_preflight_estimate(
             max(inspection.max_window_markers, 1),
         )
     )
+    # The active-window model does not include resident allocator, reader, and
+    # streaming-pipeline retention. Calibrate only that dynamic component
+    # against observed HPC peaks; the process baseline is already included.
+    window_bytes = (
+        window_bytes * _IMP_PREFLIGHT_RSS_NUMERATOR
+        + _IMP_PREFLIGHT_RSS_DENOMINATOR
+        - 1
+    ) // _IMP_PREFLIGHT_RSS_DENOMINATOR
     return _WindowInspection(
         inspection.samples,
         inspection.markers,

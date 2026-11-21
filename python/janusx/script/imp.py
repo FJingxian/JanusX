@@ -652,17 +652,12 @@ def _set_preflight_estimate(
     options: dict[str, object],
     reference_samples: int,
 ) -> _WindowInspection:
-    marker_bound = (
-        int(options["window_markers"])
-        if options["reference"] is not None
-        else inspection.max_window_markers
-    )
     window_bytes = int(
         jxrs.imp_estimate_window_bytes(
             json.dumps(options),
             inspection.samples,
             reference_samples,
-            max(marker_bound, 1),
+            max(inspection.max_window_markers, 1),
         )
     )
     return _WindowInspection(

@@ -8,14 +8,12 @@
 use crate::bitwise::{and_popcount, popcount};
 use crate::stats_common::{check_ctrlc, interrupt_requested, INTERRUPTED_MSG};
 use numpy::ndarray::Array1;
-use numpy::{PyArray1, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
-use pyo3::exceptions::PyRuntimeError;
+use numpy::{PyArray1, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use pyo3::BoundObject;
 use rayon::prelude::*;
 use std::borrow::Cow;
-use std::time::Instant;
 
 const BATCH_PAR_MIN_ROWS: usize = 64;
 const SUM_Y_LOOKUP_SEGMENTS_PER_WORD: usize = 8;
@@ -1501,34 +1499,6 @@ pub fn score_cont_centered_gain_dual_packed(
     )
 }
 
-#[pyfunction(name = "garfield_score_cont_centered_gain_batch_packed_cpu")]
-pub fn garfield_score_cont_centered_gain_batch_packed_cpu_py<'py>(
-    py: Python<'py>,
-    y: PyReadonlyArray1<'py, f64>,
-    bits: PyReadonlyArray2<'py, u64>,
-    n_samples: usize,
-) -> PyResult<Bound<'py, PyDict>> {
-    let yv = y.as_slice()?;
-    let shape = bits.shape();
-    if shape.len() != 2 {
-        return Err(PyRuntimeError::new_err("bits must be a 2D uint64 array"));
-    }
-    let n_rows = shape[0];
-    let row_words = shape[1];
-    let bits_flat_storage = crate::stats_common::array_standard_cow(&bits);
-    let bits_flat = &*bits_flat_storage;
-    let t0 = Instant::now();
-    let parts = py
-        .detach(|| {
-            score_cont_centered_gain_batch_packed_cpu_impl(
-                yv, bits_flat, row_words, n_rows, n_samples,
-            )
-        })
-        .map_err(PyRuntimeError::new_err)?;
-    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    batch_score_parts_to_pydict(py, parts, "cpu", Some(elapsed_ms))
-}
-
 #[inline]
 fn readonly_u8_to_cow<'a>(arr: &'a PyReadonlyArray1<'a, u8>) -> Cow<'a, [u8]> {
     match crate::stats_common::array_standard_slice(&arr) {
@@ -1567,175 +1537,6 @@ fn readonly_u64_2d_to_flat_cow<'a>(arr: &'a PyReadonlyArray2<'a, u64>) -> Cow<'a
             &arr.as_array(),
         )),
     }
-}
-
-#[pyfunction(name = "score_binary_ba")]
-#[pyo3(signature = (y, bits, n_samples=None))]
-pub fn score_binary_ba_py(
-    y: PyReadonlyArray1<'_, u8>,
-    bits: PyReadonlyArray1<'_, u64>,
-    n_samples: Option<usize>,
-) -> PyResult<f64> {
-    let yv = readonly_u8_to_cow(&y);
-    let bv = readonly_u64_to_cow(&bits);
-    let n = n_samples.unwrap_or(yv.len());
-    require_n_valid(n, yv.len(), bv.len(), "score_binary_ba").map_err(PyRuntimeError::new_err)?;
-    validate_binary_y(yv.as_ref(), n, "score_binary_ba").map_err(PyRuntimeError::new_err)?;
-    Ok(score_binary_ba_packed(yv.as_ref(), bv.as_ref(), n))
-}
-
-#[pyfunction(name = "score_binary_mcc")]
-#[pyo3(signature = (y, bits, n_samples=None))]
-pub fn score_binary_mcc_py(
-    y: PyReadonlyArray1<'_, u8>,
-    bits: PyReadonlyArray1<'_, u64>,
-    n_samples: Option<usize>,
-) -> PyResult<f64> {
-    let yv = readonly_u8_to_cow(&y);
-    let bv = readonly_u64_to_cow(&bits);
-    let n = n_samples.unwrap_or(yv.len());
-    require_n_valid(n, yv.len(), bv.len(), "score_binary_mcc").map_err(PyRuntimeError::new_err)?;
-    validate_binary_y(yv.as_ref(), n, "score_binary_mcc").map_err(PyRuntimeError::new_err)?;
-    Ok(score_binary_mcc_packed(yv.as_ref(), bv.as_ref(), n))
-}
-
-#[pyfunction(name = "score_cont_mean_diff")]
-#[pyo3(signature = (y, bits, n_samples=None))]
-pub fn score_cont_mean_diff_py(
-    y: PyReadonlyArray1<'_, f64>,
-    bits: PyReadonlyArray1<'_, u64>,
-    n_samples: Option<usize>,
-) -> PyResult<f64> {
-    let yv = readonly_f64_to_cow(&y);
-    let bv = readonly_u64_to_cow(&bits);
-    let n = n_samples.unwrap_or(yv.len());
-    require_n_valid(n, yv.len(), bv.len(), "score_cont_mean_diff")
-        .map_err(PyRuntimeError::new_err)?;
-    Ok(score_cont_mean_diff_packed(yv.as_ref(), bv.as_ref(), n))
-}
-
-#[pyfunction(name = "score_cont_corr")]
-#[pyo3(signature = (y, bits, n_samples=None))]
-pub fn score_cont_corr_py(
-    y: PyReadonlyArray1<'_, f64>,
-    bits: PyReadonlyArray1<'_, u64>,
-    n_samples: Option<usize>,
-) -> PyResult<f64> {
-    let yv = readonly_f64_to_cow(&y);
-    let bv = readonly_u64_to_cow(&bits);
-    let n = n_samples.unwrap_or(yv.len());
-    require_n_valid(n, yv.len(), bv.len(), "score_cont_corr").map_err(PyRuntimeError::new_err)?;
-    Ok(score_cont_corr_packed(yv.as_ref(), bv.as_ref(), n))
-}
-
-#[pyfunction(name = "score_binary_ba_mcc_batch")]
-#[pyo3(signature = (y, bits, n_samples=None))]
-pub fn score_binary_ba_mcc_batch_py<'py>(
-    py: Python<'py>,
-    y: PyReadonlyArray1<'py, u8>,
-    bits: PyReadonlyArray2<'py, u64>,
-    n_samples: Option<usize>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    let yv = readonly_u8_to_cow(&y);
-    let bits_arr = bits.as_array();
-    if bits_arr.ndim() != 2 {
-        return Err(PyRuntimeError::new_err(
-            "score_binary_ba_mcc_batch: bits must be 2D",
-        ));
-    }
-
-    let n_rows = bits_arr.shape()[0];
-    let row_words = bits_arr.shape()[1];
-    let n = n_samples.unwrap_or(yv.len());
-    let needed_words = words_for_samples(n).max(1);
-
-    require_n_valid(n, yv.len(), needed_words, "score_binary_ba_mcc_batch")
-        .map_err(PyRuntimeError::new_err)?;
-    validate_binary_y(yv.as_ref(), n, "score_binary_ba_mcc_batch")
-        .map_err(PyRuntimeError::new_err)?;
-
-    if row_words < needed_words {
-        return Err(PyRuntimeError::new_err(format!(
-            "score_binary_ba_mcc_batch: bits row_words={} is smaller than required {} for n_samples={}",
-            row_words, needed_words, n
-        )));
-    }
-
-    let bv = readonly_u64_2d_to_flat_cow(&bits);
-    let (ba, mcc) =
-        score_binary_ba_mcc_batch_packed(yv.as_ref(), bv.as_ref(), row_words, n_rows, n);
-
-    let out_ba = PyArray1::<f64>::zeros(py, [n_rows], false);
-    let out_mcc = PyArray1::<f64>::zeros(py, [n_rows], false);
-
-    let out_ba_slice = unsafe {
-        out_ba.as_slice_mut().map_err(|_| {
-            PyRuntimeError::new_err("score_binary_ba_mcc_batch: out_ba not contiguous")
-        })?
-    };
-    let out_mcc_slice = unsafe {
-        out_mcc.as_slice_mut().map_err(|_| {
-            PyRuntimeError::new_err("score_binary_ba_mcc_batch: out_mcc not contiguous")
-        })?
-    };
-    out_ba_slice.copy_from_slice(&ba);
-    out_mcc_slice.copy_from_slice(&mcc);
-
-    Ok((out_ba, out_mcc))
-}
-
-#[pyfunction(name = "score_cont_mean_diff_corr_batch")]
-#[pyo3(signature = (y, bits, n_samples=None))]
-pub fn score_cont_mean_diff_corr_batch_py<'py>(
-    py: Python<'py>,
-    y: PyReadonlyArray1<'py, f64>,
-    bits: PyReadonlyArray2<'py, u64>,
-    n_samples: Option<usize>,
-) -> PyResult<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)> {
-    let yv = readonly_f64_to_cow(&y);
-    let bits_arr = bits.as_array();
-    if bits_arr.ndim() != 2 {
-        return Err(PyRuntimeError::new_err(
-            "score_cont_mean_diff_corr_batch: bits must be 2D",
-        ));
-    }
-
-    let n_rows = bits_arr.shape()[0];
-    let row_words = bits_arr.shape()[1];
-    let n = n_samples.unwrap_or(yv.len());
-    let needed_words = words_for_samples(n).max(1);
-
-    require_n_valid(n, yv.len(), needed_words, "score_cont_mean_diff_corr_batch")
-        .map_err(PyRuntimeError::new_err)?;
-
-    if row_words < needed_words {
-        return Err(PyRuntimeError::new_err(format!(
-            "score_cont_mean_diff_corr_batch: bits row_words={} is smaller than required {} for n_samples={}",
-            row_words, needed_words, n
-        )));
-    }
-
-    let bv = readonly_u64_2d_to_flat_cow(&bits);
-    let (md, corr) =
-        score_cont_mean_diff_corr_batch_packed(yv.as_ref(), bv.as_ref(), row_words, n_rows, n);
-
-    let out_md = PyArray1::<f64>::zeros(py, [n_rows], false);
-    let out_corr = PyArray1::<f64>::zeros(py, [n_rows], false);
-
-    let out_md_slice = unsafe {
-        out_md.as_slice_mut().map_err(|_| {
-            PyRuntimeError::new_err("score_cont_mean_diff_corr_batch: out_md not contiguous")
-        })?
-    };
-    let out_corr_slice = unsafe {
-        out_corr.as_slice_mut().map_err(|_| {
-            PyRuntimeError::new_err("score_cont_mean_diff_corr_batch: out_corr not contiguous")
-        })?
-    };
-    out_md_slice.copy_from_slice(&md);
-    out_corr_slice.copy_from_slice(&corr);
-
-    Ok((out_md, out_corr))
 }
 
 #[cfg(test)]

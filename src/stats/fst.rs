@@ -10,10 +10,7 @@ use crate::stats_common::{
     emit_progress_callback, get_cached_pool, map_err_string_to_py, progress_step,
 };
 use memmap2::Mmap;
-use numpy::PyArray2;
-use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::BoundObject;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
@@ -1575,105 +1572,6 @@ pub fn fst_bed_window_to_tsv(
         )
     })
     .map_err(map_err_string_to_py)
-}
-
-#[pyfunction]
-#[pyo3(signature = (prefix, within, method="wc", threads=0))]
-pub fn fst_bed<'py>(
-    py: Python<'py>,
-    prefix: String,
-    within: String,
-    method: &str,
-    threads: usize,
-) -> PyResult<(
-    Vec<String>,
-    Vec<i64>,
-    Vec<String>,
-    Bound<'py, numpy::PyArray2<f64>>,
-    Bound<'py, numpy::PyArray2<i64>>,
-    Bound<'py, numpy::PyArray2<i64>>,
-    Vec<String>,
-    Vec<String>,
-)> {
-    let method_owned = method.to_string();
-    let output = py
-        .detach(move || compute_fst_core(&prefix, &within, &method_owned, threads))
-        .map_err(map_err_string_to_py)?;
-    let n_sites = output.sites.len();
-    let n_pairs = output.pair_names.len();
-    let chrom = output
-        .sites
-        .iter()
-        .map(|site| site.chrom.clone())
-        .collect::<Vec<_>>();
-    let pos = output
-        .sites
-        .iter()
-        .map(|site| i64::from(site.pos))
-        .collect::<Vec<_>>();
-    let snp = output
-        .sites
-        .iter()
-        .map(|site| site.snp.clone())
-        .collect::<Vec<_>>();
-    let fst = PyArray2::from_owned_array(
-        py,
-        numpy::ndarray::Array2::from_shape_vec((n_sites, n_pairs), output.values)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-    )
-    .into_bound();
-    let nmiss_left = PyArray2::from_owned_array(
-        py,
-        numpy::ndarray::Array2::from_shape_vec(
-            (n_sites, n_pairs),
-            output
-                .nmiss_left
-                .into_iter()
-                .map(|value| value as i64)
-                .collect(),
-        )
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-    )
-    .into_bound();
-    let nmiss_right = PyArray2::from_owned_array(
-        py,
-        numpy::ndarray::Array2::from_shape_vec(
-            (n_sites, n_pairs),
-            output
-                .nmiss_right
-                .into_iter()
-                .map(|value| value as i64)
-                .collect(),
-        )
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-    )
-    .into_bound();
-    let pop1 = output
-        .pair_names
-        .iter()
-        .map(|(lhs, _)| lhs.clone())
-        .collect::<Vec<_>>();
-    let pop2 = output
-        .pair_names
-        .iter()
-        .map(|(_, rhs)| rhs.clone())
-        .collect::<Vec<_>>();
-    Ok((chrom, pos, snp, fst, nmiss_left, nmiss_right, pop1, pop2))
-}
-
-#[pyfunction]
-#[pyo3(signature = (prefix, within, output, method="wc", threads=0))]
-pub fn fst_bed_to_tsv(
-    py: Python<'_>,
-    prefix: String,
-    within: String,
-    output: String,
-    method: &str,
-    threads: usize,
-) -> PyResult<(usize, usize)> {
-    let method_owned = method.to_string();
-    py.detach(move || write_fst_tsv_streaming(&prefix, &within, &output, &method_owned, threads))
-        .map_err(map_err_string_to_py)
 }
 
 #[cfg(test)]

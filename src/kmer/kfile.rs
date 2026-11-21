@@ -2,8 +2,8 @@ use crate::breader::parse_bsite_header;
 use crate::kmer::format::{KmergeMeta, SampleEntry, BSITE_HEADER_SIZE};
 use crate::kmer::writer::read_idv_file;
 use anyhow::{bail, Context, Result};
-use numpy::ndarray::{Array1, Array2};
-use numpy::{PyArray1, PyArray2};
+use numpy::ndarray::Array2;
+use numpy::PyArray2;
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -1504,144 +1504,6 @@ impl KfileGrmSource {
     }
 }
 
-#[pyclass]
-pub struct KfileChunkReader {
-    bsite: File,
-    bsite_path: PathBuf,
-    n_samples_full: usize,
-    n_kmers: u64,
-    bytes_per_col: usize,
-    sample_indices: Vec<usize>,
-    sample_ids: Vec<String>,
-    next_row: u64,
-}
-
-#[pymethods]
-impl KfileChunkReader {
-    #[new]
-    #[pyo3(signature = (prefix, sample_indices=None, mmap_window_mb=None))]
-    fn new(
-        prefix: String,
-        sample_indices: Option<Vec<usize>>,
-        mmap_window_mb: Option<usize>,
-    ) -> PyResult<Self> {
-        let _ = mmap_window_mb;
-        let layout =
-            load_layout(Path::new(&prefix)).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let n_samples_full = usize::try_from(layout.meta.n_samples)
-            .map_err(|_| PyRuntimeError::new_err("n_samples does not fit usize"))?;
-        let (sample_indices, sample_ids) = build_sample_selection(&layout.samples, sample_indices)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        let bsite = File::open(&layout.bsite_path)
-            .map_err(|e| PyRuntimeError::new_err(format!("failed to open bsite file: {e}")))?;
-        Ok(Self {
-            bsite,
-            bsite_path: layout.bsite_path,
-            n_samples_full,
-            n_kmers: layout.meta.n_kmers,
-            bytes_per_col: usize::try_from(layout.meta.bytes_per_col)
-                .map_err(|_| PyRuntimeError::new_err("bytes_per_col does not fit usize"))?,
-            sample_indices,
-            sample_ids,
-            next_row: 0,
-        })
-    }
-
-    #[getter]
-    fn n_samples(&self) -> usize {
-        self.sample_indices.len()
-    }
-
-    #[getter]
-    fn n_samples_full(&self) -> usize {
-        self.n_samples_full
-    }
-
-    #[getter]
-    fn n_kmers(&self) -> u64 {
-        self.n_kmers
-    }
-
-    #[getter]
-    fn bytes_per_col(&self) -> usize {
-        self.bytes_per_col
-    }
-
-    #[getter]
-    fn sample_ids(&self) -> Vec<String> {
-        self.sample_ids.clone()
-    }
-
-    #[getter]
-    fn next_row(&self) -> u64 {
-        self.next_row
-    }
-
-    #[pyo3(signature = (chunk_size))]
-    fn next_chunk<'py>(
-        &mut self,
-        py: Python<'py>,
-        chunk_size: usize,
-    ) -> PyResult<
-        Option<(
-            Bound<'py, PyArray2<f32>>,
-            Bound<'py, PyArray1<f32>>,
-            Bound<'py, PyArray1<i64>>,
-        )>,
-    > {
-        if chunk_size == 0 {
-            return Err(PyValueError::new_err("chunk_size must be > 0"));
-        }
-        if self.next_row >= self.n_kmers {
-            return Ok(None);
-        }
-        let rows_left = self.n_kmers - self.next_row;
-        let n_rows = usize::try_from(rows_left.min(chunk_size as u64))
-            .map_err(|_| PyRuntimeError::new_err("chunk row count does not fit usize"))?;
-        let byte_len = n_rows
-            .checked_mul(self.bytes_per_col)
-            .ok_or_else(|| PyRuntimeError::new_err("chunk payload size overflow"))?;
-        let offset = (BSITE_HEADER_SIZE as u64)
-            .checked_add(
-                self.next_row
-                    .checked_mul(self.bytes_per_col as u64)
-                    .ok_or_else(|| PyRuntimeError::new_err("bsite offset overflow"))?,
-            )
-            .ok_or_else(|| PyRuntimeError::new_err("bsite offset overflow"))?;
-        self.bsite.seek(SeekFrom::Start(offset)).map_err(|e| {
-            PyRuntimeError::new_err(format!("failed to seek {}: {e}", self.bsite_path.display()))
-        })?;
-        let mut bytes = vec![0u8; byte_len];
-        self.bsite.read_exact(&mut bytes).map_err(|e| {
-            PyRuntimeError::new_err(format!("failed to read {}: {e}", self.bsite_path.display()))
-        })?;
-        let (dosage, presence) = decode_bsite_chunk(
-            &bytes,
-            self.n_samples_full,
-            n_rows,
-            self.next_row,
-            &self.sample_indices,
-        )
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let n_selected = self.sample_indices.len();
-        let maf = presence
-            .iter()
-            .map(|&count| maf_from_presence(count, n_selected))
-            .collect::<Vec<_>>();
-        let row_indices = (self.next_row..self.next_row + n_rows as u64)
-            .map(|idx| idx as i64)
-            .collect::<Vec<_>>();
-        self.next_row += n_rows as u64;
-        let geno = Array2::from_shape_vec((n_rows, n_selected), dosage)
-            .map_err(|e| PyRuntimeError::new_err(format!("failed to shape dosage chunk: {e}")))?;
-        Ok(Some((
-            PyArray2::from_owned_array(py, geno).into_bound(),
-            PyArray1::from_owned_array(py, Array1::from_vec(maf)).into_bound(),
-            PyArray1::from_owned_array(py, Array1::from_vec(row_indices)).into_bound(),
-        )))
-    }
-}
-
 /// Decode selected k-file rows to raw 0/2 dosage values.
 ///
 /// This narrow helper is intentionally separate from the sequential chunk
@@ -1725,7 +1587,7 @@ mod tests {
     use super::{
         decode_bsite_chunk, decode_centered_row_full_identity_simd, decode_grm_prepared_block_into,
         decode_grm_prepared_block_into_with_plan, load_layout, maf_from_presence,
-        prepare_grm_bsite_block, KfileAssocSource, KfileBitsetDecodePlan, KfileChunkReader,
+        prepare_grm_bsite_block, KfileAssocSource, KfileBitsetDecodePlan,
         KfileGrmSource,
     };
     use crate::kmer::format::{BsiteHeader, KmergeMeta};
@@ -2194,7 +2056,6 @@ mod tests {
         meta.value_type = "dosage".to_string();
         write_grm_fixture(&dir, &meta, VALID_IDV, &[3, 15, 1]);
         let prefix = dir.join("fixture");
-        assert!(KfileChunkReader::new(prefix.to_string_lossy().into_owned(), None, None).is_ok());
         assert!(KfileGrmSource::open(&prefix, None, 1, 0.0).is_err());
         fs::remove_dir_all(dir).expect("remove fixture directory");
     }

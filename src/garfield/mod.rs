@@ -30,7 +30,6 @@ mod permutation;
 mod proposal;
 mod residual;
 mod sampled_screen;
-mod sampling;
 mod score;
 mod simbench;
 mod types;
@@ -99,18 +98,19 @@ use self::proposal::{
 };
 use crate::bedmath::packed_byte_lut;
 use crate::bincore::{
-    append_suffix, bin01_header_bytes, bin01_id_sidecar_path, bin_prefix, build_windows_from_sites,
-    discover_id_sidecar, discover_site_sidecar, parse_bin01_header, resolve_bin01_path, BinWindow,
+    append_suffix, bin01_id_sidecar_path, bin_prefix, discover_id_sidecar, discover_site_sidecar,
+    resolve_bin01_path, BinWindow,
 };
-use crate::binwriter::{Bin01SiteMode, Bin01SiteRecordRef, Bin01Writer};
+#[cfg(test)]
+use crate::binwriter::Bin01SiteMode;
+use crate::binwriter::{Bin01SiteRecordRef, Bin01Writer};
 use crate::bitwise::{
     and_popcount, and_popcount_bounded_blocks_with_backend, bitand_assign, bitnot_masked,
     resolve_reduce_backend, ReduceBackend,
 };
 use crate::blas::BlasThreadGuard;
 use crate::breader::{
-    gather_rows_by_indices, gather_rows_by_range, load_bin01_as_u64_words,
-    load_bin01_packed_payload_owned, load_bin01_selected_rows_as_u64_words,
+    gather_rows_by_indices, gather_rows_by_range, load_bin01_packed_payload_owned,
 };
 use crate::bstats::{apply_tail_mask, tail_mask, words_for_samples};
 use crate::eigh::load_square_matrix_f64_from_file;
@@ -128,7 +128,6 @@ use crate::gfreader::{
     prepare_bed_logic_meta_owned_for_stats_samples_with_mmap_window, read_compact_max6_bim_rows,
     sample_indices_are_identity, CompactMax6SiteMetadata,
 };
-use crate::gload::load_file_owned;
 use crate::ml::common::{
     parse_importance, parse_permutation_scoring, topk_indices, ImportanceKind, PermutationConfig,
     ResponseKind,
@@ -174,10 +173,6 @@ use std::time::{Instant, UNIX_EPOCH};
 use self::bs::cmp_candidate;
 use self::bs::{take_garfield_frontier_trace, BeamFrontierTraceRecord};
 use self::logic_residual_screen::{OneCellMarginTable, ResidualProposalMode, ResidualScreenKernel};
-pub use all_pair::{
-    garfield_all_pair_scan_bin_py, garfield_all_pair_scan_bin_with_cells_py,
-    garfield_all_pair_scan_bin_xor_py,
-};
 #[allow(unused_imports)]
 pub use bs::{
     beam_search_train_test_continuous, evaluate_rule_continuous, materialize_rule_bits,
@@ -193,15 +188,8 @@ use grm_max6::{
     candidate_rerank_exact_with_py_trusted_scaled, project_phenotype_for_candidate_rerank,
     CandidateRerankResult, CandidateRerankTiming, DosageChannel, GrmIntScoreDiagnostics,
 };
-pub use grm_max6::{
-    garfield_grm_max6_full_window_py, garfield_grm_max6_rerank_candidates_py,
-    garfield_weighted_c_sample_row_sparse_py,
-};
-pub use logic_classifier::garfield_logic_pair_cell_summary_py;
-pub use logic_residual_screen::{
-    garfield_logic_residual_rerank_candidates_bin_py, garfield_logic_residual_screen_bin_py,
-};
-pub use pair_triple::garfield_pair_triple_refine_bin_py;
+pub use grm_max6::garfield_grm_max6_rerank_candidates_py;
+pub use logic_residual_screen::garfield_logic_residual_screen_bin_py;
 use residual::{
     build_design_matrix, build_exact_projection_from_grm_rust, build_no_grm_covariate_projector,
     NoGrmCovariateProjector,
@@ -211,16 +199,11 @@ use residual::{
     garfield_residualize_exact_with_eigenvectors_rust, garfield_residualize_lm_rust,
     GarfieldResidualResult,
 };
-pub use residual::{garfield_residualize_bed_py, garfield_residualize_grm_py};
-#[allow(unused_imports)]
-pub use sampling::stratified_test_mask;
+pub use residual::garfield_residualize_grm_py;
 #[allow(unused_imports)]
 pub use score::{
-    dual_packed_summary, dual_packed_summary_with_lookup,
-    garfield_score_cont_centered_gain_batch_packed_cpu_py, score_binary_ba_mcc_batch_py,
-    score_binary_ba_py, score_binary_mcc_packed, score_binary_mcc_py,
-    score_cont_centered_gain_packed_with_sum, score_cont_corr_packed, score_cont_corr_py,
-    score_cont_mean_diff_corr_batch_py, score_cont_mean_diff_py,
+    dual_packed_summary, dual_packed_summary_with_lookup, score_binary_mcc_packed,
+    score_cont_centered_gain_packed_with_sum, score_cont_corr_packed,
     score_cont_weighted_mean_diff_packed, support_size_packed, ContinuousRuleScore,
     PackedYSumLookup,
 };

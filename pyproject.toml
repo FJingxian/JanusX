@@ -32,9 +32,6 @@ ml = [
 stats = [
     "statsmodels",
 ]
-wgcna = [
-    "dynamicTreeCut",
-]
 treeplot = [
     "toytree",
     "toyplot",
@@ -44,7 +41,6 @@ full = [
     "scikit-learn",
     "xgboost",
     "statsmodels",
-    "dynamicTreeCut",
     "toytree",
     "toyplot",
 ]

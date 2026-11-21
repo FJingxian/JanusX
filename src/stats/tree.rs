@@ -1,6 +1,6 @@
 use crate::gfreader::SiteInfo;
 use numpy::ndarray::Array2;
-use numpy::{PyArray2, PyReadonlyArray1, PyReadonlyArray2};
+use numpy::{PyArray2, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use rand::rngs::StdRng;
@@ -5244,135 +5244,6 @@ fn render_ml_newick(
     }
 }
 
-#[pyfunction]
-#[pyo3(signature = (
-    aln,
-    sample_ids,
-    min_overlap=1usize,
-    max_taxa=2000usize,
-    threads=0usize,
-    ml_mode="exact",
-    bootstrap_niter=0usize,
-    support_mode="bootstrap"
-))]
-pub fn ml_newick_from_alignment_u8(
-    aln: PyReadonlyArray2<u8>,
-    sample_ids: Vec<String>,
-    min_overlap: usize,
-    max_taxa: usize,
-    threads: usize,
-    ml_mode: &str,
-    bootstrap_niter: usize,
-    support_mode: &str,
-) -> PyResult<String> {
-    let a_in = aln.as_array();
-    let shape = a_in.shape();
-    if shape.len() != 2 {
-        return Err(PyValueError::new_err(
-            "alignment must be a 2D uint8 matrix: (n_samples, n_sites)",
-        ));
-    }
-    let n_taxa = shape[0];
-    let n_sites = shape[1];
-    if n_taxa < 2 {
-        return Err(PyValueError::new_err(
-            "need at least 2 samples to build a tree",
-        ));
-    }
-    if n_sites == 0 {
-        return Err(PyValueError::new_err("alignment has zero sites"));
-    }
-    if sample_ids.len() != n_taxa {
-        return Err(PyValueError::new_err(format!(
-            "sample_ids length mismatch: got {}, expected {}",
-            sample_ids.len(),
-            n_taxa
-        )));
-    }
-    if max_taxa == 0 {
-        return Err(PyValueError::new_err("max_taxa must be > 0"));
-    }
-    if n_taxa > max_taxa {
-        return Err(PyValueError::new_err(format!(
-            "n_samples={} exceeds max_taxa={}; ML v1 uses NJ init (O(N^3))",
-            n_taxa, max_taxa
-        )));
-    }
-
-    let mode = ml_mode.to_ascii_lowercase();
-    if mode != "exact" && mode != "approx" && mode != "compat" {
-        return Err(PyValueError::new_err(format!(
-            "invalid ml_mode='{}' (expected 'exact', 'approx', or 'compat')",
-            ml_mode
-        )));
-    }
-    let use_compat_strict_ambig =
-        mode == "compat" && env_bool_or("JANUSX_ML_COMPAT_STRICT_AMBIG", true);
-    let a_compat_owned = if use_compat_strict_ambig {
-        Some(sanitize_alignment_compat_strict(&a_in))
-    } else {
-        None
-    };
-    let a = if let Some(ref owned) = a_compat_owned {
-        owned.view()
-    } else {
-        a_in
-    };
-    let support_mode_l = support_mode.to_ascii_lowercase();
-    if support_mode_l != "bootstrap" && support_mode_l != "shlike" && support_mode_l != "local" {
-        return Err(PyValueError::new_err(format!(
-            "invalid support_mode='{}' (expected 'bootstrap' or 'shlike')",
-            support_mode
-        )));
-    }
-
-    let min_ov = min_overlap.max(1) as u64;
-    let chosen_threads = resolve_threads(threads);
-    let use_parallel = chosen_threads > 1;
-    let pool = if use_parallel {
-        Some(
-            ThreadPoolBuilder::new()
-                .num_threads(chosen_threads)
-                .build()
-                .map_err(|e| PyValueError::new_err(format!("failed to create thread pool: {e}")))?,
-        )
-    } else {
-        None
-    };
-
-    let tree = infer_ml_tree_jc69(&a, &sample_ids, min_ov, pool.as_ref(), mode.as_str())
-        .map_err(PyValueError::new_err)?;
-
-    let support = if bootstrap_niter > 0 {
-        if support_mode_l == "bootstrap" {
-            Some(
-                bootstrap_support_map(
-                    &tree,
-                    &a,
-                    &sample_ids,
-                    min_ov,
-                    pool.as_ref(),
-                    mode.as_str(),
-                    bootstrap_niter,
-                )
-                .map_err(PyValueError::new_err)?,
-            )
-        } else {
-            Some(
-                shlike_support_map(&tree, &a, pool.as_ref(), bootstrap_niter)
-                    .map_err(PyValueError::new_err)?,
-            )
-        }
-    } else {
-        None
-    };
-
-    let mut out =
-        render_ml_newick(&tree, tree.root, support.as_deref()).map_err(PyValueError::new_err)?;
-    out.push(';');
-    Ok(out)
-}
-
 fn ensure_row_state_lt(
     i: usize,
     active: &[usize],
@@ -7167,22 +7038,6 @@ fn nj_newick_from_distance_exact(
 }
 
 #[pyfunction]
-pub fn geno_chunk_to_alignment_u8<'py>(
-    py: Python<'py>,
-    geno: PyReadonlyArray2<'py, f32>,
-    ref_codes: PyReadonlyArray1<'py, u8>,
-    alt_codes: PyReadonlyArray1<'py, u8>,
-) -> PyResult<Bound<'py, PyArray2<u8>>> {
-    let g = geno.as_array();
-    let rc = ref_codes.as_array();
-    let ac = alt_codes.as_array();
-    let rc_vec: Vec<u8> = rc.iter().copied().collect();
-    let ac_vec: Vec<u8> = ac.iter().copied().collect();
-    let arr = convert_geno_to_alignment_u8(&g, &rc_vec, &ac_vec).map_err(PyValueError::new_err)?;
-    Ok(PyArray2::from_owned_array(py, arr))
-}
-
-#[pyfunction]
 #[pyo3(signature = (
     dist,
     sample_ids,
@@ -7232,27 +7087,6 @@ pub fn nj_newick_from_distance_matrix(
     let dist_vec = normalize_distance_matrix_from_ndarray(&d).map_err(PyValueError::new_err)?;
     let nwk = nj_newick_from_distance_exact(dist_vec, sample_ids).map_err(PyValueError::new_err)?;
     Ok(nwk)
-}
-
-#[pyfunction]
-pub fn geno_chunk_to_alignment_u8_sites<'py>(
-    py: Python<'py>,
-    geno: PyReadonlyArray2<'py, f32>,
-    ref_alleles: Vec<String>,
-    alt_alleles: Vec<String>,
-) -> PyResult<Bound<'py, PyArray2<u8>>> {
-    if ref_alleles.len() != alt_alleles.len() {
-        return Err(PyValueError::new_err(format!(
-            "ref_alleles/alt_alleles length mismatch: {}/{}",
-            ref_alleles.len(),
-            alt_alleles.len()
-        )));
-    }
-    let rc: Vec<u8> = ref_alleles.iter().map(|s| first_base_code(s)).collect();
-    let ac: Vec<u8> = alt_alleles.iter().map(|s| first_base_code(s)).collect();
-    let g = geno.as_array();
-    let arr = convert_geno_to_alignment_u8(&g, &rc, &ac).map_err(PyValueError::new_err)?;
-    Ok(PyArray2::from_owned_array(py, arr))
 }
 
 #[pyfunction]

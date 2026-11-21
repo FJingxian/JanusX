@@ -19,7 +19,7 @@ pub mod writer;
 pub use cli::kmerge_run_py;
 pub use count::kmer_count_run_py;
 pub use inputs::kmer_resolve_inputs_py;
-pub use kfile::{kfile_inspect_py, kfile_read_rows_f32_py, KfileChunkReader};
+pub use kfile::{kfile_inspect_py, kfile_read_rows_f32_py};
 #[allow(unused_imports)]
 pub(crate) use kfile::{
     KfileAssocPrefetch, KfileAssocPrefetchBlock, KfileAssocSource, KfileBitsetDecodePlan,

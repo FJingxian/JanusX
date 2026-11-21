@@ -47,18 +47,6 @@ pub fn parse_ml_engine(method: &str) -> Result<MlEngine, String> {
     }
 }
 
-pub fn compute_feature_scores(
-    x_rows: &[Vec<u8>],
-    y: &[f64],
-    response: ResponseKind,
-    engine: MlEngine,
-    cfg: ExtraTreesConfig,
-    importance: ImportanceKind,
-    perm_cfg: PermutationConfig,
-) -> Result<Vec<f64>, String> {
-    compute_feature_scores_grouped(x_rows, y, response, engine, cfg, importance, perm_cfg, None)
-}
-
 pub fn compute_feature_scores_grouped(
     x_rows: &[Vec<u8>],
     y: &[f64],

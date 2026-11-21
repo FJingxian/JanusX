@@ -1,8 +1,4 @@
-use numpy::{PyReadonlyArray1, PyReadwriteArray1};
-use pyo3::exceptions::PyRuntimeError;
-use pyo3::prelude::*;
 use rayon::prelude::*;
-use std::borrow::Cow;
 use std::hint::black_box;
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -1629,98 +1625,6 @@ pub fn bitnot_masked(words: &mut [u64], n_valid_bits: usize) {
             tail.fill(0);
         }
     }
-}
-
-#[inline]
-fn readonly_u64_to_cow<'a>(arr: &'a PyReadonlyArray1<'a, u64>) -> Cow<'a, [u64]> {
-    match crate::stats_common::array_standard_slice(&arr) {
-        Ok(s) => Cow::Borrowed(s),
-        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(
-            &arr.as_array(),
-        )),
-    }
-}
-
-#[pyfunction(name = "popcount")]
-pub fn popcount_py(words: PyReadonlyArray1<'_, u64>) -> PyResult<u64> {
-    let words_cow = readonly_u64_to_cow(&words);
-    Ok(popcount(words_cow.as_ref()))
-}
-
-#[pyfunction(name = "and_popcount")]
-pub fn and_popcount_py(
-    lhs: PyReadonlyArray1<'_, u64>,
-    rhs: PyReadonlyArray1<'_, u64>,
-) -> PyResult<u64> {
-    let lhs_cow = readonly_u64_to_cow(&lhs);
-    let rhs_cow = readonly_u64_to_cow(&rhs);
-    if lhs_cow.len() != rhs_cow.len() {
-        return Err(PyRuntimeError::new_err(format!(
-            "and_popcount: length mismatch (lhs={}, rhs={})",
-            lhs_cow.len(),
-            rhs_cow.len()
-        )));
-    }
-    Ok(and_popcount(lhs_cow.as_ref(), rhs_cow.as_ref()))
-}
-
-#[pyfunction(name = "bitand_assign")]
-pub fn bitand_assign_py(
-    mut dst: PyReadwriteArray1<'_, u64>,
-    rhs: PyReadonlyArray1<'_, u64>,
-) -> PyResult<()> {
-    let dst_slice = dst
-        .as_slice_mut()
-        .map_err(|_| PyRuntimeError::new_err("bitand_assign: dst must be contiguous"))?;
-    let rhs_cow = readonly_u64_to_cow(&rhs);
-    if dst_slice.len() != rhs_cow.len() {
-        return Err(PyRuntimeError::new_err(format!(
-            "bitand_assign: length mismatch (dst={}, rhs={})",
-            dst_slice.len(),
-            rhs_cow.len()
-        )));
-    }
-    bitand_assign(dst_slice, rhs_cow.as_ref());
-    Ok(())
-}
-
-#[pyfunction(name = "bitor_into")]
-pub fn bitor_into_py(
-    mut dst: PyReadwriteArray1<'_, u64>,
-    src: PyReadonlyArray1<'_, u64>,
-) -> PyResult<()> {
-    let dst_slice = dst
-        .as_slice_mut()
-        .map_err(|_| PyRuntimeError::new_err("bitor_into: dst must be contiguous"))?;
-    let src_cow = readonly_u64_to_cow(&src);
-    if dst_slice.len() != src_cow.len() {
-        return Err(PyRuntimeError::new_err(format!(
-            "bitor_into: length mismatch (dst={}, src={})",
-            dst_slice.len(),
-            src_cow.len()
-        )));
-    }
-    bitor_into(dst_slice, src_cow.as_ref());
-    Ok(())
-}
-
-#[pyfunction(name = "bitnot_masked")]
-pub fn bitnot_masked_py(
-    mut words: PyReadwriteArray1<'_, u64>,
-    n_valid_bits: usize,
-) -> PyResult<()> {
-    let words_slice = words
-        .as_slice_mut()
-        .map_err(|_| PyRuntimeError::new_err("bitnot_masked: words must be contiguous"))?;
-    if n_valid_bits > words_slice.len().saturating_mul(64) {
-        return Err(PyRuntimeError::new_err(format!(
-            "bitnot_masked: n_valid_bits={} exceeds capacity {} bits",
-            n_valid_bits,
-            words_slice.len().saturating_mul(64)
-        )));
-    }
-    bitnot_masked(words_slice, n_valid_bits);
-    Ok(())
 }
 
 #[cfg(test)]

@@ -2895,20 +2895,7 @@ pub fn gblup_effect_from_meta_stream<'py>(
     Ok(PyArray1::from_owned_array(py, Array1::from_vec(effect_beta)).into_bound())
 }
 
-#[pyfunction]
-#[pyo3(signature = (
-    packed,
-    n_samples,
-    row_flip,
-    row_maf,
-    sample_indices=None,
-    method=1,
-    block_cols=2048,
-    threads=0,
-    progress_callback=None,
-    progress_every=0
-))]
-pub fn grm_packed_f32<'py>(
+fn grm_packed_f32<'py>(
     py: Python<'py>,
     packed: PyReadonlyArray2<'py, u8>,
     n_samples: usize,

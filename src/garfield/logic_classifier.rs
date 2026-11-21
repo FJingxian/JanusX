@@ -9,7 +9,7 @@
 //! binary states 0/1, while heterozygotes and missing values are excluded by
 //! the strict valid mask rather than imputed.
 
-use numpy::{PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
+use numpy::PyReadonlyArray2;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -611,61 +611,6 @@ pub(crate) fn summaries_to_py_dict<'py>(
     )?;
     set_summary_columns(&out, summaries)?;
     Ok(out)
-}
-
-/// Summarize and classify a bounded list of Top-K marker pairs.
-///
-/// `genotypes` is marker-major `(n_markers, n_samples)`.  With `encoding="02"`
-/// only homozygous 0/2 calls are accepted; heterozygotes (1), NaN and false
-/// entries in `valid_mask` are excluded.  The legacy Logic5 pair scorer is not
-/// called or changed by this post-processing API.
-#[pyfunction(name = "garfield_logic_pair_cell_summary")]
-#[pyo3(signature = (genotypes, y, pairs, valid_mask=None, encoding="auto", min_cell_count=1))]
-pub fn garfield_logic_pair_cell_summary_py<'py>(
-    py: Python<'py>,
-    genotypes: PyReadonlyArray2<'py, f64>,
-    y: PyReadonlyArray1<'py, f64>,
-    pairs: Vec<(usize, usize)>,
-    valid_mask: Option<PyReadonlyArray2<'py, bool>>,
-    encoding: &str,
-    min_cell_count: usize,
-) -> PyResult<Bound<'py, PyDict>> {
-    let genotype_shape = genotypes.shape();
-    if genotype_shape.len() != 2 {
-        return Err(PyValueError::new_err(
-            "genotypes must be a 2D marker-major array",
-        ));
-    }
-    let n_markers = genotype_shape[0];
-    let n_samples = genotype_shape[1];
-    let genotype_vec = array2_to_vec(&genotypes);
-    let y_vec = y.as_array().iter().copied().collect::<Vec<_>>();
-    let mask_vec = valid_mask.as_ref().map(bool_array2_to_vec);
-    if let Some(mask) = mask_vec.as_ref() {
-        if valid_mask.as_ref().map(|array| array.shape()) != Some(&genotype_shape[..]) {
-            return Err(PyValueError::new_err(
-                "valid_mask must have the same shape as genotypes",
-            ));
-        }
-        if mask.len() != genotype_vec.len() {
-            return Err(PyValueError::new_err(
-                "valid_mask size does not match genotypes",
-            ));
-        }
-    }
-    let encoding = BinaryEncoding::parse(encoding).map_err(PyValueError::new_err)?;
-    let summaries = summarize_binary_pairs_marker_major(
-        &genotype_vec,
-        n_markers,
-        n_samples,
-        &y_vec,
-        pairs.as_slice(),
-        mask_vec.as_deref(),
-        encoding,
-        min_cell_count,
-    )
-    .map_err(PyValueError::new_err)?;
-    summaries_to_py_dict(py, pairs.as_slice(), summaries.as_slice())
 }
 
 #[cfg(test)]

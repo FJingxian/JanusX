@@ -13,8 +13,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 // stats
-#[path = "stats/adamixture.rs"]
-mod admixture;
 #[path = "stats/algwas.rs"]
 mod algwas;
 #[path = "stats/bayes.rs"]
@@ -67,8 +65,6 @@ mod logreg;
 mod mixed_ld;
 #[path = "stats/packed.rs"]
 mod packed;
-#[path = "stats/plot.rs"]
-mod plot;
 #[path = "stats/reml.rs"]
 mod reml;
 #[path = "stats/rrblup.rs"]
@@ -163,8 +159,6 @@ mod cholesky;
 mod eigh;
 #[path = "math/FaST.rs"]
 mod fast_math;
-#[path = "math/KING.rs"]
-mod king;
 #[path = "math/lasso.rs"]
 mod lasso;
 #[path = "math/linalg.rs"]
@@ -180,28 +174,14 @@ mod phylo;
 #[path = "sim/g2p.rs"]
 mod sim_g2p;
 
-use admixture::{
-    admx_adam_optimize_bed_f32, admx_adam_optimize_f32, admx_adam_update_p,
-    admx_adam_update_p_inplace, admx_adam_update_p_inplace_f32, admx_adam_update_q,
-    admx_adam_update_q_inplace, admx_adam_update_q_inplace_f32, admx_allele_frequency,
-    admx_bed_training_meta, admx_em_step, admx_em_step_inplace, admx_em_step_inplace_f32,
-    admx_kl_divergence, admx_loglikelihood, admx_loglikelihood_bed_f32, admx_loglikelihood_f32,
-    admx_map_p_f32, admx_map_q_f32, admx_multiply_a_omega, admx_multiply_a_omega_bed,
-    admx_multiply_a_omega_inplace, admx_multiply_at_omega, admx_multiply_at_omega_inplace,
-    admx_rmse_f32, admx_rmse_f64, admx_rsvd_power_step_inplace, admx_rsvd_stream,
-    admx_rsvd_stream_sample, admx_set_threads, AdmxBedBackend, AdmxBedFoldBackend,
-    AdmxBedTrainingSession,
-};
 use algwas::algwas_packed_to_tsv;
 use assoc2tsv::GwasAssocTsvWriter;
 use bayes::{
-    bayesa, bayesa_packed, bayesa_packed_trace, bayesa_stream_bed, bayesb, bayesb_packed,
-    bayesb_packed_trace, bayesb_stream_bed, bayesc, bayesc_packed, bayesc_packed_trace,
-    bayesc_stream_bed,
+    bayesa, bayesa_packed, bayesa_stream_bed, bayesb, bayesb_packed, bayesb_stream_bed, bayesc,
+    bayesc_packed, bayesc_stream_bed,
 };
 use bayesr::{bayesr as bayesr_fn, bayesr_packed, bayesr_stream_bed};
 use binwriter::Bin01StreamWriter;
-use bitwise::{and_popcount_py, bitand_assign_py, bitnot_masked_py, bitor_into_py, popcount_py};
 use blas::{
     rust_blas_get_num_threads, rust_blas_set_num_threads, rust_eigh_lapack_backend,
     rust_sgemm_backend,
@@ -217,10 +197,8 @@ use eigh::{
     rust_eigh_debug_f64, rust_eigh_from_array_f64, rust_eigh_from_array_f64_inplace,
     rust_eigh_from_matrix_file_f64, rust_eigh_from_matrix_file_subset_f64,
 };
-use farmcpu::{
-    farmcpu_packed_to_tsv, farmcpu_rem_packed, farmcpu_super_packed, farmcpu_write_assoc_tsv,
-};
-use fst::{fst_bed, fst_bed_to_tsv, fst_bed_window_to_tsv};
+use farmcpu::farmcpu_packed_to_tsv;
+use fst::fst_bed_window_to_tsv;
 use fvlmm::{
     fvlmm_assoc_bed_to_tsv_f32, fvlmm_assoc_chunk_f32, fvlmm_assoc_chunk_from_snp_f32,
     fvlmm_assoc_chunk_from_snp_to_tsv_f32, fvlmm_assoc_chunk_from_snp_with_cache_f32,
@@ -229,19 +207,10 @@ use fvlmm::{
 };
 use fvlmm2::fvlmm2_assoc_chunk_f32;
 use garfield::{
-    finalize_max6_genotype_universe_py, garfield_all_pair_scan_bin_py,
-    garfield_all_pair_scan_bin_with_cells_py, garfield_all_pair_scan_bin_xor_py,
-    garfield_eval_rule_bin_py, garfield_grm_max6_full_window_py,
-    garfield_grm_max6_rerank_candidates_py, garfield_logic_pair_cell_summary_py,
-    garfield_logic_residual_rerank_candidates_bin_py, garfield_logic_residual_screen_bin_py,
-    garfield_logic_search_bed_py, garfield_pair_triple_refine_bin_py,
-    garfield_prepare_input_bin_py, garfield_residualize_bed_py, garfield_residualize_grm_py,
-    garfield_scan_groups_bin_py, garfield_scan_windows_bin_py,
-    garfield_score_cont_centered_gain_batch_packed_cpu_py, garfield_subset_bin_samples_py,
-    garfield_weighted_c_sample_row_sparse_py, load_bin01_packed_py, prepare_max6_genotype_tags_py,
-    score_binary_ba_mcc_batch_py, score_binary_ba_py, score_binary_mcc_py, score_cont_corr_py,
-    score_cont_mean_diff_corr_batch_py, score_cont_mean_diff_py, PyMax6PreparedGenotypeTags,
-    PyMax6PreparedGenotypeUniverse,
+    finalize_max6_genotype_universe_py, garfield_grm_max6_rerank_candidates_py,
+    garfield_logic_residual_screen_bin_py, garfield_logic_search_bed_py,
+    garfield_residualize_grm_py, load_bin01_packed_py, prepare_max6_genotype_tags_py,
+    PyMax6PreparedGenotypeTags, PyMax6PreparedGenotypeUniverse,
 };
 use gblup::{
     farmcpu_q_packed_grm_pca_f32, gblup_effect_from_meta_stream, gblup_grm_from_meta_to_npy,
@@ -249,13 +218,12 @@ use gblup::{
 };
 use gffanno::GffAnnotationIndex;
 use gfreader::{
-    bed_filter_stream_to_plink_rust, bed_filter_to_plink_rust, bed_mmap_filter_to_plink_rust,
-    count_hmp_snps, count_vcf_snps, load_bed_2bit_packed, load_bed_u8_matrix, load_bim_columns,
-    load_site_info, prepare_bed_2bit_packed, prepare_bed_fused_qc_packed,
+    bed_filter_to_plink_rust, bed_mmap_filter_to_plink_rust, count_hmp_snps, count_vcf_snps,
+    load_bed_2bit_packed, load_bim_columns, prepare_bed_2bit_packed, prepare_bed_fused_qc_packed,
     prepare_bed_logic_keep_mask, prepare_bed_logic_keep_mask_pure_line,
     prepare_bed_logic_meta_selected, scan_bed_2bit_packed_stats, BedChunkReader,
-    BedChunkReaderFromMeta, BedMmapReader, HmpChunkReader, NpyMmapReader, PgenChunkReader,
-    SiteInfo, TxtChunkReader, VcfChunkReader,
+    BedChunkReaderFromMeta, HmpChunkReader, PgenChunkReader, SiteInfo, TxtChunkReader,
+    VcfChunkReader,
 };
 use glm::{
     lm_assoc_kfile_to_tsv_f32, lm_block_assoc_f32, lm_block_assoc_packed,
@@ -264,14 +232,12 @@ use glm::{
 };
 use gmerge::{convert_genotypes, merge_genotypes, PyConvertStats, PyMergeStats};
 use grm::{
-    grm_bed_f64_from_meta, grm_kfile_f32, grm_kfile_f32_to_npy, grm_packed_bed_f32,
-    grm_packed_bed_f64, grm_packed_f32, grm_packed_f32_with_stats, grm_packed_f64,
-    grm_packed_f64_with_stats, grm_sim_bench_f32, grm_stream_bed_f32, grm_stream_bed_f32_to_npy,
-    grm_stream_bed_f64, grm_stream_bed_f64_to_npy,
+    grm_bed_f64_from_meta, grm_kfile_f32, grm_kfile_f32_to_npy, grm_packed_bed_f32, grm_packed_f32,
+    grm_packed_f32_with_stats, grm_packed_f64_with_stats, grm_stream_bed_f32,
+    grm_stream_bed_f32_to_npy,
 };
 use gstats::{
     gstats_bed_individual_stats, gstats_bed_joint_stats, gstats_bed_ldscore, gstats_bed_site_stats,
-    gstats_bed_site_stats_compare,
 };
 use gwas_unified::{
     gwas_packed_unified_to_tsv, gwas_trait_model_dispatch_v2, gwas_trait_model_schedule,
@@ -279,19 +245,15 @@ use gwas_unified::{
 use gwasio::load_gwas_triplet_fast;
 use gwriter::{HmpStreamWriter, PgenStreamWriter, PlinkStreamWriter, VcfStreamWriter};
 use he::he_pcg_bed;
-use heritability::{
-    prepare_heritability_broad_sparse_cache, prepare_heritability_trait_workflow,
-    prepare_sparse_onehot_blup_cache, SparseOneHotBlupCache,
-};
+use heritability::{prepare_sparse_onehot_blup_cache, SparseOneHotBlupCache};
 use kmer::{
     kfile_inspect_py, kfile_read_rows_f32_py, kformat_run_py, kmer_count_run_py,
-    kmer_resolve_inputs_py, kmerge_run_py, kstats_run_py, KfileChunkReader,
+    kmer_resolve_inputs_py, kmerge_run_py, kstats_run_py,
 };
 use ld::{
-    bed_fam_founder_indices, bed_ld_corr_rust, bed_ldblock_r2_rust,
-    bed_packed_ld_prune_maf_priority, bed_prune_mask_to_plink_rust,
-    bed_prune_selected_to_plink_rust, bed_prune_to_plink_rust, packed_prune_kernel_stats,
-    scan_plink_selected_snp_indices_from_bim_rust,
+    bed_fam_founder_indices, bed_ldblock_r2_rust, bed_packed_ld_prune_maf_priority,
+    bed_prune_mask_to_plink_rust, bed_prune_selected_to_plink_rust, bed_prune_to_plink_rust,
+    packed_prune_kernel_stats, scan_plink_selected_snp_indices_from_bim_rust,
 };
 use lm_trait::{lm_trait_assoc_bed_matrix_to_tsv, lm_trait_assoc_bed_to_tsv};
 use lmm::{
@@ -302,54 +264,44 @@ use lmm::{
 };
 use logreg::fit_best_and_not_py;
 use mixed_ld::fvlmm_effective_ld_spectral_f64;
-use ml::{garfield_ml_feature_scores_py, garfield_ml_select_topk_py};
 use packed::{
     bed_decode_rows_f32_from_meta, bed_packed_decode_rows_f32, bed_packed_decode_stats_f64,
     bed_packed_empirical_stats_f64, bed_packed_empirical_stats_subset_f64,
     bed_packed_row_flip_mask, bed_packed_signed_hash_f32, bed_packed_signed_hash_kernels_f64,
     bed_packed_signed_hash_ztz_stats_f64, bed_stream_empirical_stats_f64,
     bed_stream_empirical_stats_subset_f64, cross_grm_times_alpha_packed_f64, packed_malpha_f64,
-    packed_malpha_mode_f64,
 };
-use plot::{qq_band_beta_logp_exact, qq_rank_sample_zero_based};
 use reml::{
     ai_reml_multi_f64, ai_reml_null_f64, lmm_null_fit_f32, lmm_null_pve_se_f64, lmm_reml_null_f32,
     lmm_rotate_x_y_with_ut_f64, lmm_rotate_y_with_ut_f64, ml_loglike_null_f32,
 };
 use rrblup::{
-    rrblup_exact_snp_fit_prepared, rrblup_exact_snp_fit_prepared_bed, rrblup_exact_snp_packed,
-    rrblup_exact_snp_prepare_bed_from_meta, rrblup_pcg_bed, rrblup_standardized_grm_from_source,
-    rrblupc_exact_snp_fit_prepared, rrblupc_exact_snp_fit_prepared_bed, rrblupc_exact_snp_packed,
+    rrblup_exact_snp_fit_prepared_bed, rrblup_exact_snp_prepare_bed_from_meta, rrblup_pcg_bed,
+    rrblup_standardized_grm_from_source, rrblupc_exact_snp_fit_prepared_bed,
     rrblupc_exact_snp_prepare_bed_from_meta, rrblupc_pcg_bed, RrblupCenteredExactSnpCache,
     RrblupExactSnpCache,
 };
-use rsvd::py_rsvd_packed_subset;
-use sim::{sim_trait_accumulate_i8_f32, SimChunkGenerator, SimEngine, SimTraitAccumulator};
+use rsvd::{admx_rsvd_stream_sample, admx_set_threads, py_rsvd_packed_subset};
+use sim::{SimChunkGenerator, SimEngine, SimTraitAccumulator};
 use sim_g2p::g2p_simulate_py;
 use spgrm::{
     grm_bed_f32_row_band_from_meta, grm_bed_f32_row_band_from_meta_to_npy,
     grm_bed_f32_tiled_from_meta_to_npy, spgrm_bed_to_jxgrm, spgrm_bed_to_jxgrm_from_meta,
     spgrm_dense_f32_to_jxgrm, spgrm_dense_npy_to_jxgrm, spgrm_kfile_to_jxgrm,
-    spgrm_packed_to_jxgrm,
 };
 use splmm::{
     splmm_assoc_pcg_bed, splmm_assoc_pcg_bed_to_tsv, splmm_assoc_pcg_bed_to_tsv_fused_approx,
     splmm_assoc_pcg_bed_to_tsv_fused_exact, splmm_assoc_pcg_dense_f32,
     splmm_assoc_pcg_kfile_to_tsv, splmm_load_sparse_grm_subset_dense,
-    splmm_residualized_approx_null_fit_from_jxgrm,
-    splmm_residualized_approx_sample_state_from_jxgrm,
-    splmm_residualized_approx_sample_state_from_jxgrm_lambda, splmm_scan_exact_packed,
-    splmm_scan_grammar_packed, splmm_sparse_grm_diag_stats, splmm_sparse_null_model_debug,
+    splmm_residualized_approx_null_fit_from_jxgrm, splmm_sparse_grm_diag_stats,
 };
 use spreml::{
     spreml_sparse_fastgwa_fixed_vp_brent_from_jxgrm, spreml_sparse_reml_brent_from_jxgrm,
-    spreml_sparse_reml_grid_from_jxgrm,
 };
 use susie::susie_rss_f64;
-use top::{top_fit_model_py, top_rank_to_target_sample_py, top_rank_to_target_values_py};
+use top::{top_fit_model_py, top_rank_to_target_values_py};
 use tree::{
-    geno_chunk_to_alignment_u8, geno_chunk_to_alignment_u8_siteinfo,
-    geno_chunk_to_alignment_u8_sites, ml_newick_from_alignment_u8, nj_newick_from_alignment_u8,
+    geno_chunk_to_alignment_u8_siteinfo, nj_newick_from_alignment_u8,
     nj_newick_from_distance_matrix,
 };
 use xpclr::xpclr_bed_to_tsv;
@@ -367,13 +319,6 @@ pub use he::{
     he_variance_components_packed, he_variance_components_packed_with_covariates, HePcgResult,
     RowStdStats, HE_BOUNDARY_INTERIOR, HE_BOUNDARY_ORIGIN, HE_BOUNDARY_SIGMA_E_ZERO,
     HE_BOUNDARY_SIGMA_G_ZERO,
-};
-pub use king::{
-    king_bitplanes_from_packed, king_pair_stats, king_prune_related_graph,
-    king_related_graph_from_bitplanes, king_related_graph_from_packed,
-    king_related_pairs_from_bitplanes, king_related_pairs_from_packed, king_unrelated_set_from_bed,
-    king_unrelated_set_from_bed_default, king_unrelated_set_from_packed, KingBitplanes,
-    KingPairStats, KingPruneResult, KingRelatedGraph, KingRelatedPairRow,
 };
 pub use lasso::{
     compare_lasso_results, fit_lasso_f32, fit_lasso_f32_reference, fit_lasso_packed_active_f32,
@@ -812,14 +757,9 @@ fn emit_imp_progress_callback(
 
 #[pymodule]
 fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
-    m.add_class::<AdmxBedBackend>()?;
-    m.add_class::<AdmxBedFoldBackend>()?;
-    m.add_class::<AdmxBedTrainingSession>()?;
     m.add_class::<BedChunkReader>()?;
     m.add_class::<BedChunkReaderFromMeta>()?;
     m.add_class::<PgenChunkReader>()?;
-    m.add_class::<BedMmapReader>()?;
-    m.add_class::<NpyMmapReader>()?;
     m.add_class::<VcfChunkReader>()?;
     m.add_class::<HmpChunkReader>()?;
     m.add_class::<TxtChunkReader>()?;
@@ -842,19 +782,9 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<PyMax6PreparedGenotypeTags>()?;
     m.add_class::<PyMax6PreparedGenotypeUniverse>()?;
     m.add_class::<Bin01StreamWriter>()?;
-    m.add_class::<KfileChunkReader>()?;
     m.add_function(wrap_pyfunction!(imp_run, m)?)?;
     m.add_function(wrap_pyfunction!(imp_estimate_window_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(imp_convert_to_pgen, m)?)?;
-    m.add_function(wrap_pyfunction!(popcount_py, m)?)?;
-    m.add_function(wrap_pyfunction!(and_popcount_py, m)?)?;
-    m.add_function(wrap_pyfunction!(bitand_assign_py, m)?)?;
-    m.add_function(wrap_pyfunction!(bitor_into_py, m)?)?;
-    m.add_function(wrap_pyfunction!(bitnot_masked_py, m)?)?;
-    m.add_function(wrap_pyfunction!(score_binary_ba_py, m)?)?;
-    m.add_function(wrap_pyfunction!(score_binary_mcc_py, m)?)?;
-    m.add_function(wrap_pyfunction!(score_binary_ba_mcc_batch_py, m)?)?;
-    m.add_function(wrap_pyfunction!(spgrm_packed_to_jxgrm, m)?)?;
     m.add_function(wrap_pyfunction!(spgrm_bed_to_jxgrm, m)?)?;
     m.add_function(wrap_pyfunction!(spgrm_bed_to_jxgrm_from_meta, m)?)?;
     m.add_function(wrap_pyfunction!(spgrm_kfile_to_jxgrm, m)?)?;
@@ -865,9 +795,6 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(spgrm_dense_npy_to_jxgrm, m)?)?;
     m.add_function(wrap_pyfunction!(grm_kfile_f32, m)?)?;
     m.add_function(wrap_pyfunction!(grm_kfile_f32_to_npy, m)?)?;
-    m.add_function(wrap_pyfunction!(score_cont_mean_diff_py, m)?)?;
-    m.add_function(wrap_pyfunction!(score_cont_corr_py, m)?)?;
-    m.add_function(wrap_pyfunction!(score_cont_mean_diff_corr_batch_py, m)?)?;
     m.add_function(wrap_pyfunction!(kmer_count_run_py, m)?)?;
     m.add_function(wrap_pyfunction!(kmerge_run_py, m)?)?;
     m.add_function(wrap_pyfunction!(kmer_resolve_inputs_py, m)?)?;
@@ -883,20 +810,13 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(count_hmp_snps, m)?)?;
     m.add_function(wrap_pyfunction!(load_bed_2bit_packed, m)?)?;
     m.add_function(wrap_pyfunction!(load_bin01_packed_py, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        garfield_score_cont_centered_gain_batch_packed_cpu_py,
-        m
-    )?)?;
     m.add_function(wrap_pyfunction!(scan_bed_2bit_packed_stats, m)?)?;
     m.add_function(wrap_pyfunction!(prepare_bed_2bit_packed, m)?)?;
     m.add_function(wrap_pyfunction!(prepare_bed_logic_keep_mask, m)?)?;
     m.add_function(wrap_pyfunction!(prepare_bed_logic_keep_mask_pure_line, m)?)?;
     m.add_function(wrap_pyfunction!(prepare_bed_logic_meta_selected, m)?)?;
     m.add_function(wrap_pyfunction!(prepare_bed_fused_qc_packed, m)?)?;
-    m.add_function(wrap_pyfunction!(load_bed_u8_matrix, m)?)?;
-    m.add_function(wrap_pyfunction!(load_site_info, m)?)?;
     m.add_function(wrap_pyfunction!(load_bim_columns, m)?)?;
-    m.add_function(wrap_pyfunction!(sim_trait_accumulate_i8_f32, m)?)?;
     m.add_function(wrap_pyfunction!(g2p_simulate_py, m)?)?;
     m.add_function(wrap_pyfunction!(load_gwas_triplet_fast, m)?)?;
     m.add_function(wrap_pyfunction!(lm_block_assoc_f32, m)?)?;
@@ -909,7 +829,6 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(lm_stream_bed_segments_compact_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(lm_block_assoc_packed, m)?)?;
     m.add_function(wrap_pyfunction!(lm_block_assoc_packed_to_tsv, m)?)?;
-    m.add_function(wrap_pyfunction!(grm_sim_bench_f32, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_row_flip_mask, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_decode_rows_f32, m)?)?;
     m.add_function(wrap_pyfunction!(bed_decode_rows_f32_from_meta, m)?)?;
@@ -921,7 +840,6 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bed_fam_founder_indices, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_ld_prune_maf_priority, m)?)?;
     m.add_function(wrap_pyfunction!(bed_ldblock_r2_rust, m)?)?;
-    m.add_function(wrap_pyfunction!(bed_ld_corr_rust, m)?)?;
     m.add_function(wrap_pyfunction!(
         scan_plink_selected_snp_indices_from_bim_rust,
         m
@@ -933,20 +851,11 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bed_packed_signed_hash_f32, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_signed_hash_ztz_stats_f64, m)?)?;
     m.add_function(wrap_pyfunction!(bed_packed_signed_hash_kernels_f64, m)?)?;
-    m.add_function(wrap_pyfunction!(bed_filter_stream_to_plink_rust, m)?)?;
     m.add_function(wrap_pyfunction!(bed_filter_to_plink_rust, m)?)?;
     m.add_function(wrap_pyfunction!(bed_mmap_filter_to_plink_rust, m)?)?;
-    m.add_function(wrap_pyfunction!(qq_band_beta_logp_exact, m)?)?;
-    m.add_function(wrap_pyfunction!(qq_rank_sample_zero_based, m)?)?;
     m.add_function(wrap_pyfunction!(cross_grm_times_alpha_packed_f64, m)?)?;
     m.add_function(wrap_pyfunction!(packed_malpha_f64, m)?)?;
-    m.add_function(wrap_pyfunction!(packed_malpha_mode_f64, m)?)?;
     m.add_function(wrap_pyfunction!(he_pcg_bed, m)?)?;
-    m.add_function(wrap_pyfunction!(prepare_heritability_trait_workflow, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        prepare_heritability_broad_sparse_cache,
-        m
-    )?)?;
     m.add_function(wrap_pyfunction!(prepare_sparse_onehot_blup_cache, m)?)?;
     m.add_function(wrap_pyfunction!(splmm_assoc_pcg_bed, m)?)?;
     m.add_function(wrap_pyfunction!(splmm_assoc_pcg_bed_to_tsv, m)?)?;
@@ -957,45 +866,28 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(splmm_assoc_pcg_bed_to_tsv_fused_exact, m)?)?;
     m.add_function(wrap_pyfunction!(splmm_assoc_pcg_dense_f32, m)?)?;
     m.add_function(wrap_pyfunction!(splmm_assoc_pcg_kfile_to_tsv, m)?)?;
-    m.add_function(wrap_pyfunction!(splmm_scan_grammar_packed, m)?)?;
-    m.add_function(wrap_pyfunction!(splmm_scan_exact_packed, m)?)?;
     m.add_function(wrap_pyfunction!(splmm_load_sparse_grm_subset_dense, m)?)?;
     m.add_function(wrap_pyfunction!(splmm_sparse_grm_diag_stats, m)?)?;
-    m.add_function(wrap_pyfunction!(splmm_sparse_null_model_debug, m)?)?;
     m.add_function(wrap_pyfunction!(
         splmm_residualized_approx_null_fit_from_jxgrm,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        splmm_residualized_approx_sample_state_from_jxgrm,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        splmm_residualized_approx_sample_state_from_jxgrm_lambda,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
         spreml_sparse_fastgwa_fixed_vp_brent_from_jxgrm,
         m
     )?)?;
-    m.add_function(wrap_pyfunction!(spreml_sparse_reml_grid_from_jxgrm, m)?)?;
     m.add_function(wrap_pyfunction!(spreml_sparse_reml_brent_from_jxgrm, m)?)?;
     m.add_function(wrap_pyfunction!(susie_rss_f64, m)?)?;
-    m.add_function(wrap_pyfunction!(king::king_unrelated_set_from_bed_py, m)?)?;
     m.add_function(wrap_pyfunction!(rrblup_pcg_bed, m)?)?;
     m.add_function(wrap_pyfunction!(rrblup_standardized_grm_from_source, m)?)?;
-    m.add_function(wrap_pyfunction!(rrblup_exact_snp_fit_prepared, m)?)?;
     m.add_function(wrap_pyfunction!(rrblup_exact_snp_prepare_bed_from_meta, m)?)?;
     m.add_function(wrap_pyfunction!(rrblup_exact_snp_fit_prepared_bed, m)?)?;
-    m.add_function(wrap_pyfunction!(rrblup_exact_snp_packed, m)?)?;
     m.add_function(wrap_pyfunction!(rrblupc_pcg_bed, m)?)?;
-    m.add_function(wrap_pyfunction!(rrblupc_exact_snp_fit_prepared, m)?)?;
     m.add_function(wrap_pyfunction!(
         rrblupc_exact_snp_prepare_bed_from_meta,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(rrblupc_exact_snp_fit_prepared_bed, m)?)?;
-    m.add_function(wrap_pyfunction!(rrblupc_exact_snp_packed, m)?)?;
     m.add_function(wrap_pyfunction!(gblup_reml_packed_bed, m)?)?;
     m.add_function(wrap_pyfunction!(gblup_reml_npy_grm, m)?)?;
     m.add_function(wrap_pyfunction!(gblup_effect_from_meta_stream, m)?)?;
@@ -1010,37 +902,26 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rust_eigh_from_matrix_file_subset_f64, m)?)?;
     m.add_function(wrap_pyfunction!(rust_eigh_from_array_f64_inplace, m)?)?;
     m.add_function(wrap_pyfunction!(top_fit_model_py, m)?)?;
-    m.add_function(wrap_pyfunction!(top_rank_to_target_sample_py, m)?)?;
     m.add_function(wrap_pyfunction!(top_rank_to_target_values_py, m)?)?;
     m.add_function(wrap_pyfunction!(grm_packed_bed_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(grm_packed_bed_f64, m)?)?;
     m.add_function(wrap_pyfunction!(grm_bed_f64_from_meta, m)?)?;
     m.add_function(wrap_pyfunction!(grm_stream_bed_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(grm_stream_bed_f64, m)?)?;
     m.add_function(wrap_pyfunction!(grm_stream_bed_f32_to_npy, m)?)?;
-    m.add_function(wrap_pyfunction!(grm_stream_bed_f64_to_npy, m)?)?;
     m.add_function(wrap_pyfunction!(grm_packed_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(grm_packed_f64, m)?)?;
     m.add_function(wrap_pyfunction!(grm_packed_f32_with_stats, m)?)?;
     m.add_function(wrap_pyfunction!(grm_packed_f64_with_stats, m)?)?;
     m.add_function(wrap_pyfunction!(gstats_bed_site_stats, m)?)?;
-    m.add_function(wrap_pyfunction!(gstats_bed_site_stats_compare, m)?)?;
     m.add_function(wrap_pyfunction!(gstats_bed_joint_stats, m)?)?;
     m.add_function(wrap_pyfunction!(gstats_bed_individual_stats, m)?)?;
     m.add_function(wrap_pyfunction!(gstats_bed_ldscore, m)?)?;
-    m.add_function(wrap_pyfunction!(fst_bed, m)?)?;
-    m.add_function(wrap_pyfunction!(fst_bed_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(fst_bed_window_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(xpclr_bed_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(packed_mtm_f64, m)?)?;
     m.add_function(wrap_pyfunction!(farmcpu_q_packed_grm_pca_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(farmcpu_rem_packed, m)?)?;
-    m.add_function(wrap_pyfunction!(farmcpu_super_packed, m)?)?;
     m.add_function(wrap_pyfunction!(farmcpu_packed_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(gwas_packed_unified_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(gwas_trait_model_dispatch_v2, m)?)?;
     m.add_function(wrap_pyfunction!(gwas_trait_model_schedule, m)?)?;
-    m.add_function(wrap_pyfunction!(farmcpu_write_assoc_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_reml_null_f32, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_null_fit_f32, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_null_pve_se_f64, m)?)?;
@@ -1085,79 +966,20 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(bayesr_fn, m)?)?;
     m.add_function(wrap_pyfunction!(bayesr_packed, m)?)?;
     m.add_function(wrap_pyfunction!(bayesr_stream_bed, m)?)?;
-    m.add_function(wrap_pyfunction!(bayesa_packed_trace, m)?)?;
-    m.add_function(wrap_pyfunction!(bayesb_packed_trace, m)?)?;
-    m.add_function(wrap_pyfunction!(bayesc_packed_trace, m)?)?;
-    m.add_function(wrap_pyfunction!(admx_multiply_at_omega, m)?)?;
-    m.add_function(wrap_pyfunction!(admx_multiply_a_omega, m)?)?;
-    m.add_function(wrap_pyfunction!(admx_multiply_a_omega_bed, m)?)?;
-    m.add_function(wrap_pyfunction!(admx_bed_training_meta, m)?)?;
-    m.add_function(wrap_pyfunction!(admx_multiply_at_omega_inplace, m)?)?;
-    m.add_function(wrap_pyfunction!(admx_multiply_a_omega_inplace, m)?)?;
-    m.add_function(wrap_pyfunction!(admx_rsvd_power_step_inplace, m)?)?;
-    m.add_function(wrap_pyfunction!(admx_rsvd_stream, m)?)?;
     m.add_function(wrap_pyfunction!(admx_rsvd_stream_sample, m)?)?;
     m.add_function(wrap_pyfunction!(py_rsvd_packed_subset, m)?)?;
-    m.add_function(wrap_pyfunction!(admx_allele_frequency, m)?)?;
-    m.add_function(wrap_pyfunction!(admx_loglikelihood, m)?)?;
-    m.add_function(wrap_pyfunction!(admx_loglikelihood_bed_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(admx_loglikelihood_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(admx_rmse_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(admx_rmse_f64, m)?)?;
-    m.add_function(wrap_pyfunction!(admx_kl_divergence, m)?)?;
-    m.add_function(wrap_pyfunction!(admx_map_q_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(admx_map_p_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(admx_em_step, m)?)?;
-    m.add_function(wrap_pyfunction!(admx_em_step_inplace, m)?)?;
-    m.add_function(wrap_pyfunction!(admx_em_step_inplace_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(admx_adam_update_p, m)?)?;
-    m.add_function(wrap_pyfunction!(admx_adam_update_q, m)?)?;
-    m.add_function(wrap_pyfunction!(admx_adam_update_p_inplace, m)?)?;
-    m.add_function(wrap_pyfunction!(admx_adam_update_q_inplace, m)?)?;
-    m.add_function(wrap_pyfunction!(admx_adam_update_p_inplace_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(admx_adam_update_q_inplace_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(admx_adam_optimize_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(admx_adam_optimize_bed_f32, m)?)?;
     m.add_function(wrap_pyfunction!(admx_set_threads, m)?)?;
     m.add_function(wrap_pyfunction!(fit_best_and_not_py, m)?)?;
-    m.add_function(wrap_pyfunction!(garfield_ml_feature_scores_py, m)?)?;
-    m.add_function(wrap_pyfunction!(garfield_ml_select_topk_py, m)?)?;
-    m.add_function(wrap_pyfunction!(garfield_subset_bin_samples_py, m)?)?;
-    m.add_function(wrap_pyfunction!(garfield_scan_groups_bin_py, m)?)?;
-    m.add_function(wrap_pyfunction!(garfield_scan_windows_bin_py, m)?)?;
-    m.add_function(wrap_pyfunction!(garfield_all_pair_scan_bin_py, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        garfield_all_pair_scan_bin_with_cells_py,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(garfield_all_pair_scan_bin_xor_py, m)?)?;
-    m.add_function(wrap_pyfunction!(garfield_grm_max6_full_window_py, m)?)?;
     m.add_function(wrap_pyfunction!(garfield_grm_max6_rerank_candidates_py, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        garfield_weighted_c_sample_row_sparse_py,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(garfield_logic_pair_cell_summary_py, m)?)?;
     m.add_function(wrap_pyfunction!(garfield_logic_residual_screen_bin_py, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        garfield_logic_residual_rerank_candidates_bin_py,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(garfield_pair_triple_refine_bin_py, m)?)?;
-    m.add_function(wrap_pyfunction!(garfield_eval_rule_bin_py, m)?)?;
     m.add_function(wrap_pyfunction!(garfield_logic_search_bed_py, m)?)?;
     m.add_function(wrap_pyfunction!(prepare_max6_genotype_tags_py, m)?)?;
     m.add_function(wrap_pyfunction!(finalize_max6_genotype_universe_py, m)?)?;
-    m.add_function(wrap_pyfunction!(garfield_prepare_input_bin_py, m)?)?;
     m.add_function(wrap_pyfunction!(garfield_residualize_grm_py, m)?)?;
-    m.add_function(wrap_pyfunction!(garfield_residualize_bed_py, m)?)?;
     m.add_function(wrap_pyfunction!(preprocess_bsa, m)?)?;
-    m.add_function(wrap_pyfunction!(geno_chunk_to_alignment_u8, m)?)?;
     m.add_function(wrap_pyfunction!(geno_chunk_to_alignment_u8_siteinfo, m)?)?;
-    m.add_function(wrap_pyfunction!(geno_chunk_to_alignment_u8_sites, m)?)?;
     m.add_function(wrap_pyfunction!(nj_newick_from_alignment_u8, m)?)?;
     m.add_function(wrap_pyfunction!(nj_newick_from_distance_matrix, m)?)?;
-    m.add_function(wrap_pyfunction!(ml_newick_from_alignment_u8, m)?)?;
     ct::output::register_py(m)?;
     phylo::register_py(m)?;
     Ok(())

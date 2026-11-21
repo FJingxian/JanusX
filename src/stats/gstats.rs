@@ -14,7 +14,6 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-use std::time::Instant;
 
 use crate::bedmath::{packed_byte_lut, packed_pair_lut};
 use crate::gfcore;
@@ -249,41 +248,6 @@ fn finalize_individual_rates(
     (miss_rate, het_rate)
 }
 
-fn compute_site_stats_core(
-    packed_src: &[u8],
-    n_samples: usize,
-    n_snps: usize,
-    bytes_per_snp: usize,
-    threads: usize,
-) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>), String> {
-    let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
-    let mut maf = vec![0.0_f32; n_snps];
-    let mut miss = vec![0.0_f32; n_snps];
-    let mut het = vec![0.0_f32; n_snps];
-
-    let mut run = || {
-        maf.par_iter_mut()
-            .zip(miss.par_iter_mut())
-            .zip(het.par_iter_mut())
-            .enumerate()
-            .for_each(|(row_idx, ((maf_dst, miss_dst), het_dst))| {
-                let row = &packed_src[row_idx * bytes_per_snp..(row_idx + 1) * bytes_per_snp];
-                let (missing, het_count, hom_alt) = count_packed_row_counts_simd(row, n_samples);
-                let (maf_v, miss_v, het_v) =
-                    packed_site_rates(n_samples, missing, het_count, hom_alt);
-                *maf_dst = maf_v;
-                *miss_dst = miss_v;
-                *het_dst = het_v;
-            });
-    };
-    if let Some(tp) = &pool {
-        tp.install(&mut run);
-    } else {
-        run();
-    }
-    Ok((maf, miss, het))
-}
-
 fn compute_bed_filter_meta_core(
     packed_src: &[u8],
     n_samples_full: usize,
@@ -484,18 +448,6 @@ fn snps_only_for_light_mode(sites_all: Option<&[gfcore::SiteInfo]>) -> bool {
     sites_all.is_some()
 }
 
-fn compute_site_stats_legacy_from_prefix(
-    prefix: &str,
-    threads: usize,
-) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, usize, usize), String> {
-    let bed_prefix = normalize_plink_prefix(prefix);
-    let (mmap, n_samples, n_snps, bytes_per_snp) = open_bed_mmap(&bed_prefix)?;
-    let packed_src = &mmap[3..];
-    let (maf, miss, het) =
-        compute_site_stats_core(packed_src, n_samples, n_snps, bytes_per_snp, threads)?;
-    Ok((maf, miss, het, n_samples, n_snps))
-}
-
 fn compute_site_stats_unified_from_prefix(
     prefix: &str,
     threads: usize,
@@ -545,14 +497,6 @@ fn compute_joint_site_only_via_meta(
         meta.n_samples_full,
         meta.n_markers_total,
     ))
-}
-
-#[inline]
-fn max_abs_diff_f32(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(&x, &y)| (x - y).abs())
-        .fold(0.0_f32, f32::max)
 }
 
 fn compute_individual_stats_core(
@@ -2064,57 +2008,6 @@ pub fn gstats_bed_joint_stats<'py>(
     Ok((
         maf_arr, miss_arr, het_arr, imiss_arr, ihet_arr, n_samples, n_snps,
     ))
-}
-
-#[pyfunction]
-#[pyo3(signature = (prefix, threads=0, repeats=3))]
-pub fn gstats_bed_site_stats_compare<'py>(
-    py: Python<'py>,
-    prefix: String,
-    threads: usize,
-    repeats: usize,
-) -> PyResult<(f64, f64, f32, f32, f32, usize, usize)> {
-    let reps = repeats.max(1);
-    py.detach(move || -> Result<(f64, f64, f32, f32, f32, usize, usize), String> {
-        let (maf_legacy, miss_legacy, het_legacy, n_samples_legacy, n_snps_legacy) =
-            compute_site_stats_legacy_from_prefix(&prefix, threads)?;
-        let (maf_unified, miss_unified, het_unified, n_samples_unified, n_snps_unified) =
-            compute_site_stats_unified_from_prefix(&prefix, threads)?;
-        if n_samples_legacy != n_samples_unified || n_snps_legacy != n_snps_unified {
-            return Err(format!(
-                "site-stats shape mismatch: legacy=({n_samples_legacy},{n_snps_legacy}) unified=({n_samples_unified},{n_snps_unified})"
-            ));
-        }
-        let maf_diff = max_abs_diff_f32(&maf_legacy, &maf_unified);
-        let miss_diff = max_abs_diff_f32(&miss_legacy, &miss_unified);
-        let het_diff = max_abs_diff_f32(&het_legacy, &het_unified);
-
-        let mut legacy_secs = 0.0_f64;
-        let mut unified_secs = 0.0_f64;
-        for _ in 0..reps {
-            let t0 = Instant::now();
-            let (maf, miss, het, _n_samples, _n_snps) =
-                compute_site_stats_legacy_from_prefix(&prefix, threads)?;
-            let _ = (maf.len(), miss.len(), het.len());
-            legacy_secs += t0.elapsed().as_secs_f64();
-
-            let t0 = Instant::now();
-            let (maf, miss, het, _n_samples, _n_snps) =
-                compute_site_stats_unified_from_prefix(&prefix, threads)?;
-            let _ = (maf.len(), miss.len(), het.len());
-            unified_secs += t0.elapsed().as_secs_f64();
-        }
-        Ok((
-            legacy_secs / reps as f64,
-            unified_secs / reps as f64,
-            maf_diff,
-            miss_diff,
-            het_diff,
-            n_samples_legacy,
-            n_snps_legacy,
-        ))
-    })
-    .map_err(map_err_string_to_py)
 }
 
 #[pyfunction]

@@ -857,7 +857,7 @@ fn build_low_frequency_direction_view(
 ) -> Result<(), String> {
     let n_samples = full_view.n_samples();
     let n_haplotypes = n_samples * 2;
-    let mut order = (0..n_haplotypes).collect::<Vec<_>>();
+    let mut order = (0..n_haplotypes as u32).collect::<Vec<u32>>();
     let mut divergence = vec![0i32; n_haplotypes + 1];
     if direction == PbwtDirection::Reverse {
         divergence.fill((stage1_steps.len() - 1) as i32);
@@ -887,7 +887,7 @@ fn build_low_frequency_direction_view(
             }
         }
         for (rank, &haplotype) in order.iter().enumerate() {
-            inverse[haplotype] = rank;
+            inverse[haplotype as usize] = rank;
         }
         let (previous, next) = low_frequency_hap_neighbors_view(
             full_view,
@@ -898,7 +898,8 @@ fn build_low_frequency_direction_view(
             max_carriers,
         )?;
         random.reset(seed.wrapping_add(step as u64));
-        for (target_rank, &target_haplotype) in order.iter().enumerate() {
+        for (target_rank, &target_haplotype_u32) in order.iter().enumerate() {
+            let target_haplotype = target_haplotype_u32 as usize;
             if target_haplotype >= full_view.target_samples() * 2 {
                 continue;
             }
@@ -932,7 +933,7 @@ fn build_low_frequency_direction_view(
                     let first = random.next_int(length);
                     (0..length).find_map(|offset| {
                         let donor_rank = left + (first + offset) % length;
-                        let donor_haplotype = order[donor_rank];
+                        let donor_haplotype = order[donor_rank] as usize;
                         let donor_sample = donor_haplotype / 2;
                         (donor_sample != target_haplotype / 2
                             && super::ibd2::can_contribute_segment(
@@ -960,7 +961,7 @@ fn best_low_frequency_donor_rank(
     step: usize,
     n_steps: usize,
     target_rank: usize,
-    order: &[usize],
+    order: &[u32],
     divergence: &[i32],
     previous: &[Option<usize>],
     next: &[Option<usize>],
@@ -973,7 +974,7 @@ fn best_low_frequency_donor_rank(
         let Some(&donor_haplotype) = order.get(rank) else {
             return false;
         };
-        let source_sample = donor_haplotype / 2;
+        let source_sample = (donor_haplotype as usize) / 2;
         source_sample != target_sample
             && super::ibd2::can_contribute_segment(
                 source_sample,
@@ -1339,7 +1340,6 @@ fn build_phase_donor_batch<T: DonorProposalId>(
             order,
             divergence,
             updater,
-            codes_u32,
         } = batch;
         let mut random = JavaRandom::new(seed);
 
@@ -1347,29 +1347,43 @@ fn build_phase_donor_batch<T: DonorProposalId>(
             PbwtDirection::Forward => {
                 for step in buffer_start..batch_end {
                     let (start, end) = step_ranges[step];
-                    let codes = match step_codes {
+                    let row_start = step * n_haplotypes;
+                    let row_end = row_start + n_haplotypes;
+                    match step_codes {
                         PhaseStepCodes::Compact(rows) => {
-                            codes_u32.clear();
-                            codes_u32.extend(
-                                rows[step * n_haplotypes..(step + 1) * n_haplotypes]
-                                    .iter()
-                                    .map(|&code| u32::from(code)),
+                            updater.forward_update(
+                                &rows[row_start..row_end],
+                                step_code_counts[step],
+                                step,
+                                order,
+                                divergence,
                             );
-                            codes_u32.as_slice()
                         }
                         PhaseStepCodes::Wide(rows) => {
-                            &rows[step * n_haplotypes..(step + 1) * n_haplotypes]
+                            updater.forward_update(
+                                &rows[row_start..row_end],
+                                step_code_counts[step],
+                                step,
+                                order,
+                                divergence,
+                            );
                         }
-                    };
-                    updater.forward_update(codes, step_code_counts[step], step, order, divergence);
+                    }
                     let sentinel = step as i32 + 2;
                     divergence[0] = sentinel;
                     divergence[n_haplotypes] = sentinel;
                     if trace_state_window == Some(view.target_window().index)
                         && trace_state_step == Some(step)
                     {
+                        let codes_dbg: Vec<u32> = match step_codes {
+                            PhaseStepCodes::Compact(rows) => rows[row_start..row_end]
+                                .iter()
+                                .map(|&c| u32::from(c))
+                                .collect(),
+                            PhaseStepCodes::Wide(rows) => rows[row_start..row_end].to_vec(),
+                        };
                         eprintln!(
-                            "JANUSX_PBWT_STATE\tWINDOW={}\tDIRECTION=Forward\tSTEP={step}\tSEED={seed}\tCODES={codes:?}\tORDER={order:?}\tDIVERGENCE={divergence:?}",
+                            "JANUSX_PBWT_STATE\tWINDOW={}\tDIRECTION=Forward\tSTEP={step}\tSEED={seed}\tCODES={codes_dbg:?}\tORDER={order:?}\tDIVERGENCE={divergence:?}",
                             view.target_window().index,
                         );
                     }
@@ -1395,36 +1409,57 @@ fn build_phase_donor_batch<T: DonorProposalId>(
                 divergence.fill((buffer_end - 1) as i32);
                 for step in (buffer_start..buffer_end).rev() {
                     let (start, end) = step_ranges[step];
-                    let codes = match step_codes {
+                    let row_start = step * n_haplotypes;
+                    let row_end = row_start + n_haplotypes;
+                    match step_codes {
                         PhaseStepCodes::Compact(rows) => {
-                            codes_u32.clear();
-                            codes_u32.extend(
-                                rows[step * n_haplotypes..(step + 1) * n_haplotypes]
-                                    .iter()
-                                    .map(|&code| u32::from(code)),
+                            updater.reverse_update(
+                                &rows[row_start..row_end],
+                                step_code_counts[step],
+                                step,
+                                order,
+                                divergence,
                             );
-                            codes_u32.as_slice()
                         }
                         PhaseStepCodes::Wide(rows) => {
-                            &rows[step * n_haplotypes..(step + 1) * n_haplotypes]
+                            updater.reverse_update(
+                                &rows[row_start..row_end],
+                                step_code_counts[step],
+                                step,
+                                order,
+                                divergence,
+                            );
                         }
-                    };
-                    updater.reverse_update(codes, step_code_counts[step], step, order, divergence);
+                    }
                     let sentinel = step as i32 - 2;
                     divergence[0] = sentinel;
                     divergence[n_haplotypes] = sentinel;
                     if trace_state_window == Some(view.target_window().index)
                         && trace_state_step == Some(step)
                     {
+                        let codes_dbg: Vec<u32> = match step_codes {
+                            PhaseStepCodes::Compact(rows) => rows[row_start..row_end]
+                                .iter()
+                                .map(|&c| u32::from(c))
+                                .collect(),
+                            PhaseStepCodes::Wide(rows) => rows[row_start..row_end].to_vec(),
+                        };
                         eprintln!(
-                            "JANUSX_PBWT_STATE\tWINDOW={}\tDIRECTION=Reverse\tSTEP={step}\tSEED={seed}\tCODES={codes:?}\tORDER={order:?}\tDIVERGENCE={divergence:?}",
+                            "JANUSX_PBWT_STATE\tWINDOW={}\tDIRECTION=Reverse\tSTEP={step}\tSEED={seed}\tCODES={codes_dbg:?}\tORDER={order:?}\tDIVERGENCE={divergence:?}",
                             view.target_window().index,
                         );
                     }
                     let in_batch = (batch_start..batch_end).contains(&step);
                     if in_batch && trace_target && trace_seed {
+                        let codes_dbg: Vec<u32> = match step_codes {
+                            PhaseStepCodes::Compact(rows) => rows[row_start..row_end]
+                                .iter()
+                                .map(|&c| u32::from(c))
+                                .collect(),
+                            PhaseStepCodes::Wide(rows) => rows[row_start..row_end].to_vec(),
+                        };
                         eprintln!(
-                            "JANUSX_STEP_CODES\tWINDOW={}\tSTEP={step}\tSTART={start}\tEND={end}\tCODES={codes:?}",
+                            "JANUSX_STEP_CODES\tWINDOW={}\tSTEP={step}\tSTART={start}\tEND={end}\tCODES={codes_dbg:?}",
                             view.target_window().index,
                         );
                     }
@@ -1858,7 +1893,7 @@ fn write_step_donors<T: DonorProposalId, const FORWARD: bool>(
     divergence_boundary: i32,
     max_candidates: usize,
     n_proposal_haplotypes: usize,
-    order: &[usize],
+    order: &[u32],
     divergence: &[i32],
     ibd2_intervals: &[super::types::Ibd2Interval],
     random: &mut JavaRandom,
@@ -1869,7 +1904,7 @@ fn write_step_donors<T: DonorProposalId, const FORWARD: bool>(
     }
     let check_ibs2 = !ibd2_intervals.is_empty();
     for target_rank in 0..order.len() {
-        let target_haplotype = order[target_rank];
+        let target_haplotype = order[target_rank] as usize;
         if target_haplotype >= n_proposal_haplotypes {
             continue;
         }
@@ -1920,7 +1955,7 @@ fn write_step_donors<T: DonorProposalId, const FORWARD: bool>(
             if rank == target_rank {
                 continue;
             }
-            let donor_haplotype = order[rank];
+            let donor_haplotype = order[rank] as usize;
             let donor_sample = donor_haplotype / 2;
             if donor_sample == target_sample
                 || (check_ibs2
@@ -1943,55 +1978,149 @@ fn write_step_donors<T: DonorProposalId, const FORWARD: bool>(
 
 struct PbwtDivUpdater {
     p: Vec<i32>,
+    last_seen: Vec<u32>,
+    mono_stack: Vec<(u32, i32)>,
     counts: Vec<u32>,
     alleles: Vec<u32>,
     updated_divergence: Vec<i32>,
-    next_order: Vec<usize>,
+    next_order: Vec<u32>,
+    alt_order: Vec<u32>,
+    alt_div: Vec<i32>,
 }
 
 impl PbwtDivUpdater {
     fn new(n_haplotypes: usize) -> Self {
         Self {
             p: Vec::new(),
+            last_seen: Vec::new(),
+            mono_stack: Vec::with_capacity(64),
             counts: Vec::new(),
             alleles: vec![0; n_haplotypes],
             updated_divergence: vec![0; n_haplotypes],
             next_order: vec![0; n_haplotypes],
+            alt_order: Vec::with_capacity(n_haplotypes),
+            alt_div: Vec::with_capacity(n_haplotypes),
         }
     }
 
-    fn forward_update(
+    fn forward_update<C: Copy + Into<u32>>(
         &mut self,
-        alleles: &[u32],
+        alleles: &[C],
         n_alleles: usize,
         marker: usize,
-        order: &mut Vec<usize>,
+        order: &mut Vec<u32>,
         divergence: &mut [i32],
     ) {
-        self.prepare(n_alleles, order.len());
-        self.update_regroup_scalar::<true>(alleles, n_alleles, marker, order, divergence);
+        self.update_impl::<true, C>(alleles, n_alleles, marker, order, divergence);
+    }
+
+    fn reverse_update<C: Copy + Into<u32>>(
+        &mut self,
+        alleles: &[C],
+        n_alleles: usize,
+        marker: usize,
+        order: &mut Vec<u32>,
+        divergence: &mut [i32],
+    ) {
+        self.update_impl::<false, C>(alleles, n_alleles, marker, order, divergence);
+    }
+
+    fn update_impl<const FORWARD: bool, C: Copy + Into<u32>>(
+        &mut self,
+        alleles: &[C],
+        n_alleles: usize,
+        marker: usize,
+        order: &mut Vec<u32>,
+        divergence: &mut [i32],
+    ) {
+        let n_haplotypes = order.len();
+        if n_alleles <= 1 || n_haplotypes == 0 {
+            if n_alleles == 1 && n_haplotypes > 0 {
+                let init = if FORWARD { marker as i32 + 1 } else { marker as i32 - 1 };
+                divergence[0] = if FORWARD {
+                    init.max(divergence[0])
+                } else {
+                    init.min(divergence[0])
+                };
+            }
+            return;
+        }
+        if n_alleles == 2 {
+            self.update_biallelic::<FORWARD, C>(alleles, marker, order, divergence);
+            return;
+        }
+        self.prepare(n_alleles, n_haplotypes);
+        if n_alleles <= 16 {
+            self.update_regroup_scalar::<FORWARD, C>(alleles, n_alleles, marker, order, divergence);
+        } else {
+            self.update_regroup_monostack::<FORWARD, C>(
+                alleles,
+                n_alleles,
+                marker,
+                order,
+                divergence,
+            );
+        }
         self.commit(n_alleles, order, divergence);
     }
 
-    fn reverse_update(
+    /// Single-pass biallelic PBWT regrouping: writes allele-0 entries directly
+    /// into `next_order`/`updated_divergence` and allele-1 entries into
+    /// `alt_order`/`alt_div`, then swaps `order` without an extra copy.
+    fn update_biallelic<const FORWARD: bool, C: Copy + Into<u32>>(
         &mut self,
-        alleles: &[u32],
-        n_alleles: usize,
+        alleles: &[C],
         marker: usize,
-        order: &mut Vec<usize>,
+        order: &mut Vec<u32>,
         divergence: &mut [i32],
     ) {
-        self.prepare(n_alleles, order.len());
-        self.update_regroup_scalar::<false>(alleles, n_alleles, marker, order, divergence);
-        self.commit(n_alleles, order, divergence);
+        let n_haplotypes = order.len();
+        if self.next_order.len() != n_haplotypes {
+            self.next_order.resize(n_haplotypes, 0);
+        }
+        if self.updated_divergence.len() != n_haplotypes {
+            self.updated_divergence.resize(n_haplotypes, 0);
+        }
+        self.alt_order.clear();
+        self.alt_div.clear();
+        let init = if FORWARD { marker as i32 + 1 } else { marker as i32 - 1 };
+        let reset = if FORWARD { i32::MIN } else { i32::MAX };
+        let mut p0 = init;
+        let mut p1 = init;
+        let mut w0 = 0usize;
+        for (rank, &haplotype) in order.iter().enumerate() {
+            let div = divergence[rank];
+            if FORWARD {
+                p0 = p0.max(div);
+                p1 = p1.max(div);
+            } else {
+                p0 = p0.min(div);
+                p1 = p1.min(div);
+            }
+            if alleles[haplotype as usize].into() == 0 {
+                self.next_order[w0] = haplotype;
+                self.updated_divergence[w0] = p0;
+                p0 = reset;
+                w0 += 1;
+            } else {
+                self.alt_order.push(haplotype);
+                self.alt_div.push(p1);
+                p1 = reset;
+            }
+        }
+        let n1 = self.alt_order.len();
+        self.next_order[w0..w0 + n1].copy_from_slice(&self.alt_order);
+        divergence[..w0].copy_from_slice(&self.updated_divergence[..w0]);
+        divergence[w0..w0 + n1].copy_from_slice(&self.alt_div);
+        std::mem::swap(order, &mut self.next_order);
     }
 
-    fn update_regroup_scalar<const FORWARD: bool>(
+    fn update_regroup_scalar<const FORWARD: bool, C: Copy + Into<u32>>(
         &mut self,
-        alleles: &[u32],
+        alleles: &[C],
         n_alleles: usize,
         marker: usize,
-        order: &[usize],
+        order: &[u32],
         divergence: &[i32],
     ) {
         self.p[..n_alleles].fill(if FORWARD {
@@ -2009,24 +2138,72 @@ impl PbwtDivUpdater {
                     (*value).min(div)
                 };
             }
-            let allele = alleles[haplotype] as usize;
+            let allele = alleles[haplotype as usize].into() as usize;
             self.alleles[rank] = allele as u32;
             self.updated_divergence[rank] = probabilities[allele];
             probabilities[allele] = if FORWARD { i32::MIN } else { i32::MAX };
         }
     }
 
+    /// Exact O(H log(stack)) multi-allelic divergence update using a monotonic
+    /// stack of `(rank, div)`. Bit-identical to `update_regroup_scalar`, while
+    /// avoiding O(H * n_alleles) inner scans when `n_alleles` is large.
+    fn update_regroup_monostack<const FORWARD: bool, C: Copy + Into<u32>>(
+        &mut self,
+        alleles: &[C],
+        n_alleles: usize,
+        marker: usize,
+        order: &[u32],
+        divergence: &[i32],
+    ) {
+        let init = if FORWARD { marker as i32 + 1 } else { marker as i32 - 1 };
+        self.last_seen[..n_alleles].fill(u32::MAX);
+        self.mono_stack.clear();
+        for (rank, &haplotype) in order.iter().enumerate() {
+            let div = divergence[rank];
+            while let Some(&(_, top_div)) = self.mono_stack.last() {
+                let dominated = if FORWARD { top_div <= div } else { top_div >= div };
+                if dominated {
+                    self.mono_stack.pop();
+                } else {
+                    break;
+                }
+            }
+            let rank_u32 = rank as u32;
+            self.mono_stack.push((rank_u32, div));
+
+            let allele = alleles[haplotype as usize].into() as usize;
+            self.alleles[rank] = allele as u32;
+            let prev = self.last_seen[allele];
+            self.updated_divergence[rank] = if prev == u32::MAX {
+                let first_div = self.mono_stack[0].1;
+                if FORWARD {
+                    init.max(first_div)
+                } else {
+                    init.min(first_div)
+                }
+            } else {
+                let idx = self.mono_stack.partition_point(|&(r, _)| r <= prev);
+                self.mono_stack[idx].1
+            };
+            self.last_seen[allele] = rank_u32;
+        }
+    }
+
     fn prepare(&mut self, n_alleles: usize, n_haplotypes: usize) {
         if self.p.len() < n_alleles {
             self.p.resize(n_alleles, 0);
+            self.last_seen.resize(n_alleles, u32::MAX);
             self.counts.resize(n_alleles + 1, 0);
         }
         self.alleles.resize(n_haplotypes, 0);
         self.updated_divergence.resize(n_haplotypes, 0);
-        self.next_order.resize(n_haplotypes, 0);
+        if self.next_order.len() != n_haplotypes {
+            self.next_order.resize(n_haplotypes, 0);
+        }
     }
 
-    fn commit(&mut self, n_alleles: usize, order: &mut Vec<usize>, divergence: &mut [i32]) {
+    fn commit(&mut self, n_alleles: usize, order: &mut Vec<u32>, divergence: &mut [i32]) {
         self.counts[..=n_alleles].fill(0);
         for &allele in &self.alleles[..order.len()] {
             self.counts[allele as usize + 1] += 1;
@@ -2042,30 +2219,28 @@ impl PbwtDivUpdater {
             self.next_order[destination] = order[rank];
             divergence[destination] = self.updated_divergence[rank];
         }
-        order.copy_from_slice(&self.next_order[..n_haplotypes]);
+        std::mem::swap(order, &mut self.next_order);
     }
 }
 
 struct PbwtBatchScratch {
-    order: Vec<usize>,
+    order: Vec<u32>,
     divergence: Vec<i32>,
     updater: PbwtDivUpdater,
-    codes_u32: Vec<u32>,
 }
 
 impl PbwtBatchScratch {
     fn new(n_haplotypes: usize) -> Self {
         Self {
-            order: (0..n_haplotypes).collect(),
+            order: (0..n_haplotypes as u32).collect(),
             divergence: vec![0; n_haplotypes + 1],
             updater: PbwtDivUpdater::new(n_haplotypes),
-            codes_u32: Vec::with_capacity(n_haplotypes),
         }
     }
 
     fn reset(&mut self, n_haplotypes: usize, initial_divergence: usize) {
         self.order.clear();
-        self.order.extend(0..n_haplotypes);
+        self.order.extend(0..n_haplotypes as u32);
         self.divergence.clear();
         self.divergence
             .resize(n_haplotypes + 1, initial_divergence as i32);
@@ -3655,7 +3830,8 @@ mod tests {
         initial_alignment_het, initialize, initialize_with_reference_pool, initialize_with_threads,
         low_frequency_hap_neighbors, low_frequency_hap_neighbors_view, phase_pbwt_batch_ranges,
         phase_step_ranges, segment_exact_neighbors, segment_neighbors_from_alleles,
-        DonorProposalStorage, PbwtDirection, StepSequenceScratch,
+        write_step_donors, DonorProposalStorage, JavaRandom, PbwtDirection, PbwtDivUpdater,
+        StepSequenceScratch,
     };
     use crate::imp::composite::PhaseHaplotypeView;
     use crate::imp::types::{
@@ -3763,6 +3939,193 @@ mod tests {
             emit_start: 0,
             emit_end: 24,
         }
+    }
+
+    struct TestRng(u64);
+
+    impl TestRng {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            self.0
+        }
+
+        fn below(&mut self, upper: usize) -> usize {
+            (self.next_u64() as usize) % upper
+        }
+    }
+
+    fn shuffle<T>(values: &mut [T], random: &mut TestRng) {
+        for index in (1..values.len()).rev() {
+            values.swap(index, random.below(index + 1));
+        }
+    }
+
+    fn scalar_oracle_step<const FORWARD: bool>(
+        alleles: &[u32],
+        n_alleles: usize,
+        marker: usize,
+        order: &[usize],
+        divergence: &[i32],
+    ) -> (Vec<usize>, Vec<i32>) {
+        let n_haplotypes = order.len();
+        let mut probabilities = vec![
+            if FORWARD {
+                marker as i32 + 1
+            } else {
+                marker as i32 - 1
+            };
+            n_alleles
+        ];
+        let mut grouped_alleles = vec![0usize; n_haplotypes];
+        let mut updated_divergence = vec![0i32; n_haplotypes];
+        for (rank, &haplotype) in order.iter().enumerate() {
+            let div = divergence[rank];
+            for value in &mut probabilities {
+                *value = if FORWARD {
+                    (*value).max(div)
+                } else {
+                    (*value).min(div)
+                };
+            }
+            let allele = alleles[haplotype] as usize;
+            grouped_alleles[rank] = allele;
+            updated_divergence[rank] = probabilities[allele];
+            probabilities[allele] = if FORWARD { i32::MIN } else { i32::MAX };
+        }
+
+        let mut counts = vec![0usize; n_alleles + 1];
+        for &allele in &grouped_alleles {
+            counts[allele + 1] += 1;
+        }
+        for allele in 1..=n_alleles {
+            counts[allele] += counts[allele - 1];
+        }
+        let mut next_order = vec![0usize; n_haplotypes];
+        let mut next_divergence = vec![0i32; n_haplotypes];
+        for rank in 0..n_haplotypes {
+            let allele = grouped_alleles[rank];
+            let destination = counts[allele];
+            counts[allele] += 1;
+            next_order[destination] = order[rank];
+            next_divergence[destination] = updated_divergence[rank];
+        }
+        (next_order, next_divergence)
+    }
+
+    fn run_actual_step<const FORWARD: bool>(
+        updater: &mut PbwtDivUpdater,
+        alleles: &[u32],
+        n_alleles: usize,
+        marker: usize,
+        order: &mut Vec<u32>,
+        divergence: &mut [i32],
+    ) {
+        if FORWARD {
+            updater.forward_update(alleles, n_alleles, marker, order, divergence);
+        } else {
+            updater.reverse_update(alleles, n_alleles, marker, order, divergence);
+        }
+    }
+
+    fn random_codes(n_haplotypes: usize, n_alleles: usize, random: &mut TestRng) -> Vec<u32> {
+        let mut codes = (0..n_haplotypes)
+            .map(|_| random.below(n_alleles) as u32)
+            .collect::<Vec<_>>();
+        for (allele, code) in codes.iter_mut().take(n_alleles).enumerate() {
+            *code = allele as u32;
+        }
+        shuffle(&mut codes, random);
+        codes
+    }
+
+    fn random_divergence(n_haplotypes: usize, random: &mut TestRng) -> Vec<i32> {
+        let candidates = [
+            i32::MIN,
+            i32::MIN + 1,
+            -101,
+            -3,
+            -3,
+            0,
+            0,
+            7,
+            i32::MAX - 1,
+            i32::MAX,
+        ];
+        let mut divergence = (0..n_haplotypes)
+            .map(|_| candidates[random.below(candidates.len())])
+            .collect::<Vec<_>>();
+        divergence.push(0);
+        divergence
+    }
+
+    fn oracle_donor_choices<const FORWARD: bool>(
+        order: &[usize],
+        divergence: &[i32],
+        divergence_boundary: i32,
+        max_candidates: usize,
+        random: &mut JavaRandom,
+    ) -> Vec<Option<(usize, usize)>> {
+        let mut choices = vec![None; order.len()];
+        for target_rank in 0..order.len() {
+            let target_haplotype = order[target_rank];
+            let target_sample = target_haplotype / 2;
+            let (mut left, mut right, mut left_divergence, mut right_divergence) = (
+                target_rank,
+                target_rank + 1,
+                divergence[target_rank],
+                divergence[target_rank + 1],
+            );
+            loop {
+                let interval_len = right - left;
+                let should_expand = interval_len < max_candidates
+                    && if FORWARD {
+                        left_divergence <= divergence_boundary
+                            || right_divergence <= divergence_boundary
+                    } else {
+                        divergence_boundary <= left_divergence
+                            || divergence_boundary <= right_divergence
+                    };
+                if !should_expand {
+                    break;
+                }
+                if FORWARD {
+                    if right_divergence <= left_divergence {
+                        right += 1;
+                        right_divergence = right_divergence.max(divergence[right]);
+                    } else {
+                        left -= 1;
+                        left_divergence = left_divergence.max(divergence[left]);
+                    }
+                } else if left_divergence <= right_divergence {
+                    right += 1;
+                    right_divergence = right_divergence.min(divergence[right]);
+                } else {
+                    left -= 1;
+                    left_divergence = left_divergence.min(divergence[left]);
+                }
+            }
+
+            let interval_len = right - left;
+            if interval_len <= 1 {
+                continue;
+            }
+            let first = random.next_int(interval_len);
+            for offset in 0..interval_len {
+                let rank = left + (first + offset) % interval_len;
+                if rank == target_rank {
+                    continue;
+                }
+                let donor_haplotype = order[rank];
+                if donor_haplotype / 2 != target_sample {
+                    choices[target_haplotype] = Some((rank, donor_haplotype));
+                    break;
+                }
+            }
+        }
+        choices
     }
 
     #[test]
@@ -3913,7 +4276,7 @@ mod tests {
 
     #[test]
     fn low_frequency_donor_choice_uses_directional_divergence_and_carrier_edges() {
-        let order = [0usize, 2, 4, 6, 8, 10];
+        let order = [0u32, 2, 4, 6, 8, 10];
         let mut previous = vec![None; order.len()];
         let mut next = vec![None; order.len()];
         previous[2] = Some(0);
@@ -5068,5 +5431,382 @@ mod tests {
             assert_eq!(storage.raw_pair(0), [3, -1]);
             assert_eq!(storage.raw_pair(1), [-1, 11]);
         }
+    }
+
+    #[test]
+    fn pbwt_div_updater_matches_scalar_oracle_at_boundary_allele_counts() {
+        let cases = [
+            (1usize, 0usize),
+            (1, 1),
+            (2, 1),
+            (2, 2),
+            (3, 2),
+            (3, 17),
+            (16, 8),
+            (16, 17),
+            (17, 17),
+            (17, 64),
+            (255, 17),
+            (255, 255),
+        ];
+        for (case_index, &(n_alleles, n_haplotypes)) in cases.iter().enumerate() {
+            for forward in [false, true] {
+                let mut random = TestRng(
+                    0x6a09_e667_f3bc_c909u64 ^ (case_index as u64) ^ u64::from(forward),
+                );
+                let codes = random_codes(n_haplotypes, n_alleles, &mut random);
+                let mut oracle_order = (0..n_haplotypes).collect::<Vec<_>>();
+                let mut actual_order = oracle_order
+                    .iter()
+                    .map(|&haplotype| haplotype as u32)
+                    .collect::<Vec<_>>();
+                let mut oracle_divergence = random_divergence(n_haplotypes, &mut random);
+                let mut actual_divergence = oracle_divergence.clone();
+                let mut updater = PbwtDivUpdater::new(n_haplotypes);
+
+                for step in 0..6 {
+                    let boundary = if forward {
+                        step as i32 + 2
+                    } else {
+                        step as i32 - 2
+                    };
+                    oracle_divergence[0] = boundary;
+                    oracle_divergence[n_haplotypes] = boundary;
+                    actual_divergence[0] = boundary;
+                    actual_divergence[n_haplotypes] = boundary;
+
+                    let (expected_order, expected_divergence) = if forward {
+                        scalar_oracle_step::<true>(
+                            &codes,
+                            n_alleles,
+                            step,
+                            &oracle_order,
+                            &oracle_divergence,
+                        )
+                    } else {
+                        scalar_oracle_step::<false>(
+                            &codes,
+                            n_alleles,
+                            step,
+                            &oracle_order,
+                            &oracle_divergence,
+                        )
+                    };
+                    if forward {
+                        run_actual_step::<true>(
+                            &mut updater,
+                            &codes,
+                            n_alleles,
+                            step,
+                            &mut actual_order,
+                            &mut actual_divergence,
+                        );
+                    } else {
+                        run_actual_step::<false>(
+                            &mut updater,
+                            &codes,
+                            n_alleles,
+                            step,
+                            &mut actual_order,
+                            &mut actual_divergence,
+                        );
+                    }
+
+                    assert_eq!(
+                        actual_order,
+                        expected_order
+                            .iter()
+                            .map(|&haplotype| haplotype as u32)
+                            .collect::<Vec<_>>(),
+                        "order mismatch for n_alleles={n_alleles}, n_haplotypes={n_haplotypes}, forward={forward}, step={step}"
+                    );
+                    assert_eq!(
+                        &actual_divergence[..n_haplotypes],
+                        expected_divergence,
+                        "divergence mismatch for n_alleles={n_alleles}, n_haplotypes={n_haplotypes}, forward={forward}, step={step}"
+                    );
+                    assert_eq!(actual_divergence[0], boundary);
+                    assert_eq!(actual_divergence[n_haplotypes], boundary);
+
+                    oracle_order = expected_order;
+                    oracle_divergence[..n_haplotypes]
+                        .copy_from_slice(&expected_divergence);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pbwt_div_updater_matches_scalar_oracle_on_random_repeated_inputs() {
+        let allele_counts = [1usize, 2, 3, 16, 17, 255];
+        let mut random = TestRng(0xbb67_ae85_84ca_a73b);
+        for iteration in 0..240 {
+            let n_haplotypes = 1 + random.below(80);
+            let n_alleles = allele_counts[random.below(allele_counts.len())];
+            let codes = random_codes(n_haplotypes, n_alleles, &mut random);
+            let mut oracle_order = (0..n_haplotypes).collect::<Vec<_>>();
+            shuffle(&mut oracle_order, &mut random);
+            let mut actual_order = oracle_order
+                .iter()
+                .map(|&haplotype| haplotype as u32)
+                .collect::<Vec<_>>();
+            let mut oracle_divergence = random_divergence(n_haplotypes, &mut random);
+            let mut actual_divergence = oracle_divergence.clone();
+            let mut updater = PbwtDivUpdater::new(n_haplotypes);
+
+            for step in 0..3 {
+                let forward = random.next_u64() & 1 == 0;
+                let boundary = if forward {
+                    step as i32 + 2
+                } else {
+                    step as i32 - 2
+                };
+                oracle_divergence[0] = boundary;
+                oracle_divergence[n_haplotypes] = boundary;
+                actual_divergence[0] = boundary;
+                actual_divergence[n_haplotypes] = boundary;
+
+                let (expected_order, expected_divergence) = if forward {
+                    scalar_oracle_step::<true>(
+                        &codes,
+                        n_alleles,
+                        step,
+                        &oracle_order,
+                        &oracle_divergence,
+                    )
+                } else {
+                    scalar_oracle_step::<false>(
+                        &codes,
+                        n_alleles,
+                        step,
+                        &oracle_order,
+                        &oracle_divergence,
+                    )
+                };
+                if forward {
+                    run_actual_step::<true>(
+                        &mut updater,
+                        &codes,
+                        n_alleles,
+                        step,
+                        &mut actual_order,
+                        &mut actual_divergence,
+                    );
+                } else {
+                    run_actual_step::<false>(
+                        &mut updater,
+                        &codes,
+                        n_alleles,
+                        step,
+                        &mut actual_order,
+                        &mut actual_divergence,
+                    );
+                }
+
+                assert_eq!(
+                    actual_order,
+                    expected_order
+                        .iter()
+                        .map(|&haplotype| haplotype as u32)
+                        .collect::<Vec<_>>(),
+                    "random order mismatch at iteration={iteration}, n_alleles={n_alleles}, n_haplotypes={n_haplotypes}, forward={forward}, step={step}"
+                );
+                assert_eq!(
+                    &actual_divergence[..n_haplotypes],
+                    expected_divergence,
+                    "random divergence mismatch at iteration={iteration}, n_alleles={n_alleles}, n_haplotypes={n_haplotypes}, forward={forward}, step={step}"
+                );
+                oracle_order = expected_order;
+                oracle_divergence[..n_haplotypes].copy_from_slice(&expected_divergence);
+            }
+        }
+    }
+
+    #[test]
+    fn pbwt_donor_choices_match_scalar_oracle_for_forward_and_reverse() {
+        let seeds = [
+            0u64,
+            1,
+            42,
+            0xdead_beef_cafe_babe,
+            u64::MAX - 17,
+        ];
+        for &n_alleles in &[2usize, 17] {
+            for &(n_haplotypes, max_candidates) in &[(17usize, 9usize), (80, 25)] {
+                for forward in [false, true] {
+                    let mut random = TestRng(
+                        0x3c6e_f372_fe94_f82bu64
+                            ^ ((n_alleles as u64) << 32)
+                            ^ ((n_haplotypes as u64) << 8)
+                            ^ u64::from(forward),
+                    );
+                    let mut oracle_order = (0..n_haplotypes).collect::<Vec<_>>();
+                    shuffle(&mut oracle_order, &mut random);
+                    let mut actual_order = oracle_order
+                        .iter()
+                        .map(|&haplotype| haplotype as u32)
+                        .collect::<Vec<_>>();
+                    let mut oracle_divergence = random_divergence(n_haplotypes, &mut random);
+                    let mut actual_divergence = oracle_divergence.clone();
+                    let mut updater = PbwtDivUpdater::new(n_haplotypes);
+
+                    for step in 0..8 {
+                        let codes = random_codes(n_haplotypes, n_alleles, &mut random);
+                        let boundary = if forward {
+                            step as i32 + 2
+                        } else {
+                            step as i32 - 2
+                        };
+                        oracle_divergence[0] = boundary;
+                        oracle_divergence[n_haplotypes] = boundary;
+                        actual_divergence[0] = boundary;
+                        actual_divergence[n_haplotypes] = boundary;
+                        let (expected_order, expected_divergence) = if forward {
+                            scalar_oracle_step::<true>(
+                                &codes,
+                                n_alleles,
+                                step,
+                                &oracle_order,
+                                &oracle_divergence,
+                            )
+                        } else {
+                            scalar_oracle_step::<false>(
+                                &codes,
+                                n_alleles,
+                                step,
+                                &oracle_order,
+                                &oracle_divergence,
+                            )
+                        };
+                        if forward {
+                            run_actual_step::<true>(
+                                &mut updater,
+                                &codes,
+                                n_alleles,
+                                step,
+                                &mut actual_order,
+                                &mut actual_divergence,
+                            );
+                        } else {
+                            run_actual_step::<false>(
+                                &mut updater,
+                                &codes,
+                                n_alleles,
+                                step,
+                                &mut actual_order,
+                                &mut actual_divergence,
+                            );
+                        }
+                        assert_eq!(
+                            actual_order,
+                            expected_order
+                                .iter()
+                                .map(|&haplotype| haplotype as u32)
+                                .collect::<Vec<_>>()
+                        );
+                        assert_eq!(
+                            &actual_divergence[..n_haplotypes],
+                            expected_divergence
+                        );
+                        oracle_order = expected_order;
+                        oracle_divergence[..n_haplotypes]
+                            .copy_from_slice(&expected_divergence);
+
+                        for &seed in &seeds {
+                            let mut actual_random =
+                                JavaRandom::new(seed.wrapping_add(step as u64));
+                            let mut oracle_random =
+                                JavaRandom::new(seed.wrapping_add(step as u64));
+                            let mut donors = vec![u16::MAX; n_haplotypes];
+                            if forward {
+                                write_step_donors::<u16, true>(
+                                    0,
+                                    step,
+                                    step + 1,
+                                    step as i32,
+                                    max_candidates,
+                                    n_haplotypes,
+                                    &actual_order,
+                                    &actual_divergence,
+                                    &[],
+                                    &mut actual_random,
+                                    &mut donors,
+                                );
+                            } else {
+                                write_step_donors::<u16, false>(
+                                    0,
+                                    step,
+                                    step + 1,
+                                    step as i32,
+                                    max_candidates,
+                                    n_haplotypes,
+                                    &actual_order,
+                                    &actual_divergence,
+                                    &[],
+                                    &mut actual_random,
+                                    &mut donors,
+                                );
+                            }
+                            let choices = if forward {
+                                oracle_donor_choices::<true>(
+                                    &oracle_order,
+                                    &oracle_divergence,
+                                    step as i32,
+                                    max_candidates,
+                                    &mut oracle_random,
+                                )
+                            } else {
+                                oracle_donor_choices::<false>(
+                                    &oracle_order,
+                                    &oracle_divergence,
+                                    step as i32,
+                                    max_candidates,
+                                    &mut oracle_random,
+                                )
+                            };
+                            for (target_haplotype, choice) in
+                                choices.iter().copied().enumerate()
+                            {
+                                match choice {
+                                    Some((expected_rank, expected_haplotype)) => {
+                                        let actual_haplotype = donors[target_haplotype];
+                                        assert_ne!(actual_haplotype, u16::MAX);
+                                        assert_eq!(
+                                            usize::from(actual_haplotype),
+                                            expected_haplotype,
+                                            "donor haplotype mismatch for seed={seed}, n_alleles={n_alleles}, forward={forward}, step={step}, target={target_haplotype}"
+                                        );
+                                        assert_eq!(
+                                            actual_order
+                                                .iter()
+                                                .position(|&value| {
+                                                    usize::from(actual_haplotype) == value as usize
+                                                })
+                                                .unwrap(),
+                                            expected_rank,
+                                            "donor rank mismatch for seed={seed}, n_alleles={n_alleles}, forward={forward}, step={step}, target={target_haplotype}"
+                                        );
+                                    }
+                                    None => assert_eq!(donors[target_haplotype], u16::MAX),
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pbwt_encoder_reports_a_bound_that_covers_every_code() {
+        let (_, phased) = synthetic_window();
+        let mut scratch = StepSequenceScratch::default();
+        let mut codes = Vec::new();
+        let n_codes = encode_step_sequences(&phased, 0, 3, &mut codes, &mut scratch);
+        assert_eq!(codes.len(), 8);
+        assert!(n_codes > 0);
+        assert!(codes
+            .iter()
+            .all(|&code| (code as usize) < n_codes));
     }
 }

@@ -1,5 +1,5 @@
 use numpy::ndarray::Array2;
-use numpy::{PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyReadwriteArray1};
+use numpy::{PyArray2, PyReadonlyArray2, PyReadwriteArray1};
 use pyo3::exceptions::*;
 use pyo3::prelude::*;
 use pyo3::BoundObject;
@@ -591,72 +591,4 @@ impl SimEngine {
         self.chunk.n_done += m;
         Ok(Some((out, sites)))
     }
-}
-
-#[pyfunction]
-pub fn sim_trait_accumulate_i8_f32<'py>(
-    py: Python<'py>,
-    mut y: PyReadwriteArray1<'py, f32>,
-    g: PyReadonlyArray2<'py, i8>,
-    beta: PyReadonlyArray1<'py, f32>,
-) -> PyResult<()> {
-    let y_slice = y
-        .as_slice_mut()
-        .map_err(|_| PyValueError::new_err("y must be contiguous float32 1D"))?;
-    let g_view = g.as_array();
-    if g_view.ndim() != 2 {
-        return Err(PyValueError::new_err("g must be a 2D int8 array"));
-    }
-    let m = g_view.shape()[0];
-    let n = g_view.shape()[1];
-    if y_slice.len() != n {
-        return Err(PyValueError::new_err(format!(
-            "y length mismatch: got {}, expected {}",
-            y_slice.len(),
-            n
-        )));
-    }
-    if m == 0 || n == 0 {
-        return Ok(());
-    }
-
-    let beta_owned;
-    let beta_data: &[f32] = if let Ok(s) = beta.as_slice() {
-        s
-    } else {
-        let (raw, offset) = beta.as_array().to_owned().into_raw_vec_and_offset();
-        let total = m;
-        let start = offset.unwrap_or(0);
-        let end = start.saturating_add(total);
-        if end > raw.len() {
-            return Err(PyValueError::new_err(format!(
-                "beta copy layout error: start={}, total={}, raw_len={}",
-                start,
-                total,
-                raw.len()
-            )));
-        }
-        beta_owned = raw[start..end].to_vec();
-        &beta_owned
-    };
-    if beta_data.len() != m {
-        return Err(PyValueError::new_err(format!(
-            "beta length mismatch: got {}, expected {}",
-            beta_data.len(),
-            m
-        )));
-    }
-
-    let g_owned;
-    let g_data: &[i8] = if g_view.is_standard_layout() {
-        g_view
-            .as_slice()
-            .ok_or_else(|| PyValueError::new_err("g must be C-contiguous or castable"))?
-    } else {
-        g_owned = crate::stats_common::copy_array_standard_layout(&g_view);
-        &g_owned
-    };
-
-    py.detach(|| sim_apply_trait_to_y(y_slice, g_data, beta_data, n));
-    Ok(())
 }

@@ -6,11 +6,7 @@
 //! and keeps a bounded raw-score Top-K.  It does not apply Beam retention,
 //! parent-gain pruning, support gates, or formal maxT thresholds.
 
-use crate::breader::load_bin01_as_u64_words;
 use crate::bstats::{tail_mask, words_for_samples};
-use numpy::PyReadonlyArray1;
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
-use pyo3::prelude::*;
 use std::cmp::Ordering;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -525,117 +521,6 @@ pub(crate) fn scan_pair_seeded_triples_continuous_packed(
         n_rows,
         n_samples,
     })
-}
-
-/// Python diagnostic wrapper for pair-seeded order-3 refinement.
-///
-/// `pair_seeds` is an ordered list of `(first, second)` pairs.  Its order is
-/// retained as `pair_rank` for diagnostics, while pair orientation and
-/// duplicate entries are canonicalized by the Rust scanner.  Optional
-/// `target_triples` are summarized in scan order without retaining all
-/// evaluated triples.
-#[pyfunction(name = "garfield_pair_triple_refine_bin")]
-#[pyo3(signature = (bin_path, y, pair_seeds, top_k=100, target_triples=None))]
-pub fn garfield_pair_triple_refine_bin_py(
-    bin_path: String,
-    y: PyReadonlyArray1<'_, f64>,
-    pair_seeds: Vec<(usize, usize)>,
-    top_k: usize,
-    target_triples: Option<Vec<(usize, usize, usize)>>,
-) -> PyResult<(
-    Vec<(usize, usize, usize, u8, f64, usize, usize, usize, usize)>,
-    Vec<(
-        usize,
-        usize,
-        usize,
-        bool,
-        Option<usize>,
-        Option<u8>,
-        Option<f64>,
-        Option<usize>,
-        Option<usize>,
-        Option<usize>,
-        Option<usize>,
-    )>,
-    usize,
-    usize,
-    usize,
-    usize,
-    usize,
-    usize,
-)> {
-    let (bits, row_words, n_rows, n_samples) =
-        load_bin01_as_u64_words(&bin_path, "garfield_pair_triple_refine_bin")
-            .map_err(PyRuntimeError::new_err)?;
-    let y_vec = y
-        .as_slice()
-        .map_err(|e| PyValueError::new_err(format!("garfield_pair_triple_refine_bin: {e}")))?;
-    let seeds = pair_seeds
-        .into_iter()
-        .enumerate()
-        .map(|(pair_rank, (first, second))| PairTripleSeed {
-            first,
-            second,
-            pair_rank,
-        })
-        .collect::<Vec<_>>();
-    let result = scan_pair_seeded_triples_continuous_packed(
-        &bits,
-        row_words,
-        n_rows,
-        y_vec,
-        n_samples,
-        &seeds,
-        target_triples.as_deref().unwrap_or(&[]),
-        top_k,
-    )
-    .map_err(PyValueError::new_err)?;
-    let candidates = result
-        .candidates
-        .into_iter()
-        .map(|candidate| {
-            (
-                candidate.first,
-                candidate.second,
-                candidate.third,
-                candidate.polarity,
-                candidate.raw_score,
-                candidate.support,
-                candidate.owner_first,
-                candidate.owner_second,
-                candidate.owner_pair_rank,
-            )
-        })
-        .collect();
-    let targets = result
-        .targets
-        .into_iter()
-        .map(|target| {
-            (
-                target.first,
-                target.second,
-                target.third,
-                target.evaluated,
-                target.rank,
-                target.polarity,
-                target.raw_score,
-                target.support,
-                target.owner_first,
-                target.owner_second,
-                target.owner_pair_rank,
-            )
-        })
-        .collect();
-    Ok((
-        candidates,
-        targets,
-        result.pair_seeds_used,
-        result.expansion_attempts,
-        result.triples_evaluated,
-        result.polarity_evaluated,
-        result.n_rows,
-        result.n_samples,
-    ))
 }
 
 #[cfg(test)]

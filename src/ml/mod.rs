@@ -3,8 +3,5 @@ pub mod engine;
 pub mod extra_trees;
 pub mod gbdt;
 pub mod pairwise_and;
-pub mod py;
 pub mod rf;
 pub mod univariate;
-
-pub use py::{garfield_ml_feature_scores_py, garfield_ml_select_topk_py};

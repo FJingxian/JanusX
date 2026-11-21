@@ -1,5 +1,6 @@
 use super::bs::conditional_split_support_passes;
 use super::*;
+use crate::binwriter::Bin01SiteMode;
 
 #[test]
 fn max6_fused_scan_gate_accepts_geneset_multi_span_groups() {

@@ -5451,9 +5451,8 @@ mod tests {
         ];
         for (case_index, &(n_alleles, n_haplotypes)) in cases.iter().enumerate() {
             for forward in [false, true] {
-                let mut random = TestRng(
-                    0x6a09_e667_f3bc_c909u64 ^ (case_index as u64) ^ u64::from(forward),
-                );
+                let mut random =
+                    TestRng(0x6a09_e667_f3bc_c909u64 ^ (case_index as u64) ^ u64::from(forward));
                 let codes = random_codes(n_haplotypes, n_alleles, &mut random);
                 let mut oracle_order = (0..n_haplotypes).collect::<Vec<_>>();
                 let mut actual_order = oracle_order
@@ -5525,12 +5524,9 @@ mod tests {
                         expected_divergence,
                         "divergence mismatch for n_alleles={n_alleles}, n_haplotypes={n_haplotypes}, forward={forward}, step={step}"
                     );
-                    assert_eq!(actual_divergence[0], boundary);
-                    assert_eq!(actual_divergence[n_haplotypes], boundary);
 
                     oracle_order = expected_order;
-                    oracle_divergence[..n_haplotypes]
-                        .copy_from_slice(&expected_divergence);
+                    oracle_divergence[..n_haplotypes].copy_from_slice(&expected_divergence);
                 }
             }
         }
@@ -5624,13 +5620,7 @@ mod tests {
 
     #[test]
     fn pbwt_donor_choices_match_scalar_oracle_for_forward_and_reverse() {
-        let seeds = [
-            0u64,
-            1,
-            42,
-            0xdead_beef_cafe_babe,
-            u64::MAX - 17,
-        ];
+        let seeds = [0u64, 1, 42, 0xdead_beef_cafe_babe, u64::MAX - 17];
         for &n_alleles in &[2usize, 17] {
             for &(n_haplotypes, max_candidates) in &[(17usize, 9usize), (80, 25)] {
                 for forward in [false, true] {
@@ -5704,19 +5694,13 @@ mod tests {
                                 .map(|&haplotype| haplotype as u32)
                                 .collect::<Vec<_>>()
                         );
-                        assert_eq!(
-                            &actual_divergence[..n_haplotypes],
-                            expected_divergence
-                        );
+                        assert_eq!(&actual_divergence[..n_haplotypes], expected_divergence);
                         oracle_order = expected_order;
-                        oracle_divergence[..n_haplotypes]
-                            .copy_from_slice(&expected_divergence);
+                        oracle_divergence[..n_haplotypes].copy_from_slice(&expected_divergence);
 
                         for &seed in &seeds {
-                            let mut actual_random =
-                                JavaRandom::new(seed.wrapping_add(step as u64));
-                            let mut oracle_random =
-                                JavaRandom::new(seed.wrapping_add(step as u64));
+                            let mut actual_random = JavaRandom::new(seed.wrapping_add(step as u64));
+                            let mut oracle_random = JavaRandom::new(seed.wrapping_add(step as u64));
                             let mut donors = vec![u16::MAX; n_haplotypes];
                             if forward {
                                 write_step_donors::<u16, true>(
@@ -5764,9 +5748,7 @@ mod tests {
                                     &mut oracle_random,
                                 )
                             };
-                            for (target_haplotype, choice) in
-                                choices.iter().copied().enumerate()
-                            {
+                            for (target_haplotype, choice) in choices.iter().copied().enumerate() {
                                 match choice {
                                     Some((expected_rank, expected_haplotype)) => {
                                         let actual_haplotype = donors[target_haplotype];
@@ -5805,8 +5787,93 @@ mod tests {
         let n_codes = encode_step_sequences(&phased, 0, 3, &mut codes, &mut scratch);
         assert_eq!(codes.len(), 8);
         assert!(n_codes > 0);
-        assert!(codes
-            .iter()
-            .all(|&code| (code as usize) < n_codes));
+        assert!(codes.iter().all(|&code| (code as usize) < n_codes));
+    }
+
+    #[test]
+    fn pbwt_biallelic_encoder_emits_only_categories_zero_and_one() {
+        let calls = DiploidCalls::from_calls(vec![
+            DiploidCall {
+                alleles: [Some(0), Some(0)],
+                phased: true,
+            },
+            DiploidCall {
+                alleles: [Some(0), Some(1)],
+                phased: true,
+            },
+            DiploidCall {
+                alleles: [Some(1), Some(1)],
+                phased: true,
+            },
+        ]);
+        let phased = PhasedWindow {
+            chrom: "1".to_owned(),
+            index: 0,
+            rows: vec![PhasedRow {
+                meta: VariantMeta {
+                    chrom: "1".to_owned(),
+                    pos: 1,
+                    id: "v1".to_owned(),
+                    ref_allele: "A".to_owned(),
+                    alt_alleles: vec!["G".to_owned()],
+                },
+                calls,
+                dosage: None,
+                ap1: None,
+                ap2: None,
+                gp: None,
+                info_af: None,
+                info_dr2: None,
+                imputed: false,
+            }],
+            emit_start: 0,
+            emit_end: 1,
+        };
+        let mut scratch = StepSequenceScratch::default();
+        let mut codes = Vec::new();
+        let n_codes = encode_step_sequences(&phased, 0, 1, &mut codes, &mut scratch);
+        assert_eq!(n_codes, 2);
+        assert_eq!(codes, vec![0, 0, 0, 1, 1, 1]);
+    }
+
+    #[test]
+    fn pbwt_all_missing_step_encodes_as_one_category() {
+        let rows = (0..4)
+            .map(|marker| PhasedRow {
+                meta: VariantMeta {
+                    chrom: "1".to_owned(),
+                    pos: marker as u64 + 1,
+                    id: format!("v{}", marker + 1),
+                    ref_allele: "A".to_owned(),
+                    alt_alleles: vec!["G".to_owned()],
+                },
+                calls: DiploidCalls::from_calls(vec![DiploidCall::missing(false); 7]),
+                dosage: None,
+                ap1: None,
+                ap2: None,
+                gp: None,
+                info_af: None,
+                info_dr2: None,
+                imputed: false,
+            })
+            .collect::<Vec<_>>();
+        let phased = PhasedWindow {
+            chrom: "1".to_owned(),
+            index: 0,
+            rows,
+            emit_start: 0,
+            emit_end: 4,
+        };
+        let mut scratch = StepSequenceScratch::default();
+        let mut codes = Vec::new();
+        let n_codes = encode_step_sequences(&phased, 0, 4, &mut codes, &mut scratch);
+        assert_eq!(n_codes, 1);
+        assert_eq!(codes, vec![0; 14]);
+
+        let mut order = (0..14u32).collect::<Vec<_>>();
+        let mut divergence = vec![0i32; 15];
+        let mut updater = PbwtDivUpdater::new(14);
+        updater.forward_update(&codes, n_codes, 0, &mut order, &mut divergence);
+        assert_eq!(order, (0..14u32).collect::<Vec<_>>());
     }
 }

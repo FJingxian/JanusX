@@ -652,13 +652,13 @@ def build_parser(argv: Sequence[str] | None = None) -> CliArgumentParser:
         "-window",
         type=float,
         default=40.0,
-        help=help_text("Window length in cM (default: %(default)s).", advanced=True),
+        help="Window length in cM (default: %(default)s).",
     )
     model.add_argument(
         "-overlap",
         type=float,
         default=2.0,
-        help=help_text("Window overlap in cM (default: %(default)s).", advanced=True),
+        help="Window overlap in cM (default: %(default)s).",
     )
     model.add_argument(
         "-window-markers",
@@ -743,14 +743,13 @@ def build_parser(argv: Sequence[str] | None = None) -> CliArgumentParser:
                 "Effective population size used by phasing transitions "
                 "(default: %(default)s)."
             ),
-            advanced=True,
         ),
     )
     model.add_argument(
         "-err",
         type=float,
         default=None,
-        help=help_text("Optional allele error-rate override.", advanced=True),
+        help="Optional allele error-rate override.",
     )
     em = model.add_mutually_exclusive_group()
     em.add_argument(

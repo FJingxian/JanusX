@@ -64,17 +64,6 @@ def _report_kv(logger: logging.Logger, key: str, value: object) -> None:
     logger.info(f"  {str(key):<20} : {value}")
 
 
-def _format_bytes(value: int | None) -> str:
-    if value is None:
-        return "Auto"
-    size = float(max(0, int(value)))
-    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
-        if size < 1024.0 or unit == "TiB":
-            return f"{size:.2f} {unit}"
-        size /= 1024.0
-    return f"{size:.2f} TiB"
-
-
 def _format_mode(mode: str) -> str:
     return {
         "phase": "Phasing",
@@ -357,27 +346,6 @@ def _progress_enabled(value: bool) -> bool:
         return False
     raw = str(os.environ.get("JX_IMP_PROGRESS", "1")).strip().lower()
     return raw in {"1", "true", "yes", "y", "on"}
-
-
-def _memory_bytes(value: str | None) -> int | None:
-    if value is None:
-        return None
-    text = str(value).strip().lower().replace("_", "")
-    multipliers = {"k": 1024, "m": 1024**2, "g": 1024**3, "t": 1024**4}
-    suffix = text[-1:] if text else ""
-    if suffix in multipliers:
-        number = text[:-1]
-        multiplier = multipliers[suffix]
-    else:
-        number = text
-        multiplier = 1
-    try:
-        result = int(float(number) * multiplier)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError("--max-memory expects bytes or a value with K/M/G/T suffix") from exc
-    if result <= 0:
-        raise ValueError("--max-memory must be positive")
-    return result
 
 
 class _SingleUseStoreAction(argparse.Action):
@@ -930,11 +898,6 @@ def build_parser(argv: Sequence[str] | None = None) -> CliArgumentParser:
         default=-99_999,
         help=help_text("Random seed (default: %(default)s).", advanced=True),
     )
-    runtime.add_argument(
-        "--max-memory",
-        default=None,
-        help="Memory cap in bytes or with a K/M/G/T suffix.",
-    )
     progress = runtime.add_mutually_exclusive_group()
     progress.add_argument(
         "--progress",
@@ -989,7 +952,6 @@ def main() -> int:
             if args.bimrange is None
             else parse_cli_range(args.bimrange, allow_chrom_only=True)
         )
-        max_memory = _memory_bytes(args.max_memory)
         diagnostic_site = _diagnostic_site(args.trace_site)
     except ValueError as exc:
         parser.error(str(exc))
@@ -1047,7 +1009,6 @@ def main() -> int:
         ("Region", region_label),
         ("Mode", mode_label),
         ("Output format", str(args.format).upper()),
-        ("Memory", _format_bytes(max_memory)),
         ("Window", f"{float(args.window):g} cM"),
         ("Overlap", f"{float(args.overlap):g} cM"),
         ("Marker cap", f"{int(args.window_markers):,}"),
@@ -1180,7 +1141,6 @@ def main() -> int:
             "imp_step": float(args.imp_step),
             "imp_nsteps": int(args.imp_nsteps),
             "cluster": float(args.cluster),
-            "max_memory": max_memory,
             "ap": bool(args.ap),
             "gp": bool(args.gp),
             "assume_global_phase": bool(args.assume_global_phase),

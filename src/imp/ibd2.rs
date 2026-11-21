@@ -106,7 +106,7 @@ fn detect_intervals_with_marker_flags(
                 .ok_or_else(|| "IBD2 interval count overflow".to_owned())?;
             if max_intervals.is_some_and(|limit| directed_count > limit) {
                 return Err(
-                    "IBD2 interval storage exceeds --max-memory for the active window; reduce the window size or HMM state counts".to_owned(),
+                    "IBD2 interval storage exceeds the active-window allowance; reduce the window size or HMM state counts".to_owned(),
                 );
             }
             segments.push(PairSegment {
@@ -130,7 +130,7 @@ fn detect_intervals_with_marker_flags(
         }
         if max_intervals.is_some_and(|limit| intervals.len().saturating_add(2) > limit) {
             return Err(
-                "IBD2 interval storage exceeds --max-memory for the active window; reduce the window size or HMM state counts".to_owned(),
+                "IBD2 interval storage exceeds the active-window allowance; reduce the window size or HMM state counts".to_owned(),
             );
         }
         intervals.push(Ibd2Interval {
@@ -623,7 +623,7 @@ fn ibs2_pairs_for_step(
                 pairs.insert((cluster.samples[left_index], cluster.samples[right_index]));
                 if max_intervals.is_some_and(|limit| pairs.len().saturating_mul(2) > limit) {
                     return Err(
-                        "IBD2 interval storage exceeds --max-memory for the active window; reduce the window size or HMM state counts".to_owned(),
+                        "IBD2 interval storage exceeds the active-window allowance; reduce the window size or HMM state counts".to_owned(),
                     );
                 }
             }
@@ -653,7 +653,7 @@ fn check_cluster_scratch(
         .ok_or_else(|| "IBD2 scratch-memory estimate overflow".to_owned())?;
     if max_scratch_bytes.is_some_and(|limit| estimated > limit) {
         return Err(
-            "IBD2 candidate search exceeds --max-memory scratch allowance for the active window; reduce the window size or HMM state counts".to_owned(),
+            "IBD2 candidate search exceeds the active-window scratch allowance; reduce the window size or HMM state counts".to_owned(),
         );
     }
     Ok(())

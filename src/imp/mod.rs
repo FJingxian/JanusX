@@ -377,11 +377,6 @@ impl ReferenceWindowStream {
         target: &types::PhaseWindow,
         max_markers: usize,
         config: &ImpConfig,
-        target_storage_excess: usize,
-        target_marginal_excess: usize,
-        target_phase_expansion_bytes: usize,
-        target_bits_per_allele: u8,
-        ibd2_intervals: &Vec<types::Ibd2Interval>,
         terminal_target_window: bool,
     ) -> Result<(types::PhasedWindow, Vec<f64>, Vec<Option<u64>>), String> {
         let profile_stream = std::env::var_os("JANUSX_IMP_HMM_PROFILE").is_some();
@@ -439,11 +434,6 @@ impl ReferenceWindowStream {
                 None => target_end_cm,
             }
         };
-        let phase_pbwt_step_cm = if config.max_memory.is_some() {
-            phase::phase_ibs_step_cm(&target.cm_positions)
-        } else {
-            0.0
-        };
         let previous_emitted_pos = self
             .last_emitted_chromosome
             .as_deref()
@@ -481,14 +471,6 @@ impl ReferenceWindowStream {
                     .ok_or_else(|| "merged marker memory estimate overflow".to_owned())?;
             }
         }
-        let mut reference_storage_excess = rows.iter().try_fold(0usize, |sum, (row, _, _)| {
-            sum.checked_add(memory::row_storage_excess(row, self.samples)?)
-                .ok_or_else(|| "reference-window memory estimate overflow".to_owned())
-        })?;
-        let mut reference_marginal_excess = rows.iter().try_fold(0usize, |sum, (row, _, _)| {
-            sum.checked_add(memory::row_marginal_excess(row))
-                .ok_or_else(|| "reference-window memory estimate overflow".to_owned())
-        })?;
         if rows.len() > max_markers {
             return Err(format!(
                 "reference window exceeds --window-markers={max_markers}; lower --window or use a less dense reference interval"
@@ -498,23 +480,6 @@ impl ReferenceWindowStream {
             return Err(format!(
                 "merged target/reference window exceeds --window-markers={max_markers}; reduce window size or split the reference input"
             ));
-        }
-        if !rows.is_empty() {
-            Self::check_reference_window_admission(
-                config,
-                target,
-                self.samples,
-                rows.len(),
-                merged_marker_count,
-                target_storage_excess,
-                target_marginal_excess,
-                target_phase_expansion_bytes,
-                phase_pbwt_step_cm,
-                reference_storage_excess,
-                reference_marginal_excess,
-                target_bits_per_allele,
-                ibd2_intervals,
-            )?;
         }
         loop {
             let Some((row, cm, group)) = self.read_next()? else {
@@ -544,13 +509,6 @@ impl ReferenceWindowStream {
                             .ok_or_else(|| "merged marker memory estimate overflow".to_owned())?;
                     }
                     rows.push((row, cm, group));
-                    let (row, _, _) = rows.last().unwrap();
-                    reference_storage_excess = reference_storage_excess
-                        .checked_add(memory::row_storage_excess(row, self.samples)?)
-                        .ok_or_else(|| "reference-window memory estimate overflow".to_owned())?;
-                    reference_marginal_excess = reference_marginal_excess
-                        .checked_add(memory::row_marginal_excess(row))
-                        .ok_or_else(|| "reference-window memory estimate overflow".to_owned())?;
                     if rows.len() > max_markers {
                         return Err(format!(
                             "reference window exceeds --window-markers={max_markers}; lower --window or use a less dense reference interval"
@@ -561,21 +519,6 @@ impl ReferenceWindowStream {
                             "merged target/reference window exceeds --window-markers={max_markers}; reduce window size or split the reference input"
                         ));
                     }
-                    Self::check_reference_window_admission(
-                        config,
-                        target,
-                        self.samples,
-                        rows.len(),
-                        merged_marker_count,
-                        target_storage_excess,
-                        target_marginal_excess,
-                        target_phase_expansion_bytes,
-                        phase_pbwt_step_cm,
-                        reference_storage_excess,
-                        reference_marginal_excess,
-                        target_bits_per_allele,
-                        ibd2_intervals,
-                    )?;
                 }
                 continue;
             }
@@ -589,13 +532,6 @@ impl ReferenceWindowStream {
                     .ok_or_else(|| "merged marker memory estimate overflow".to_owned())?;
             }
             rows.push((row, cm, group));
-            let (row, _, _) = rows.last().unwrap();
-            reference_storage_excess = reference_storage_excess
-                .checked_add(memory::row_storage_excess(row, self.samples)?)
-                .ok_or_else(|| "reference-window memory estimate overflow".to_owned())?;
-            reference_marginal_excess = reference_marginal_excess
-                .checked_add(memory::row_marginal_excess(row))
-                .ok_or_else(|| "reference-window memory estimate overflow".to_owned())?;
             if rows.len() > max_markers {
                 return Err(format!(
                     "reference window exceeds --window-markers={max_markers}; lower --window or use a less dense reference interval"
@@ -606,21 +542,6 @@ impl ReferenceWindowStream {
                     "merged target/reference window exceeds --window-markers={max_markers}; reduce window size or split the reference input"
                 ));
             }
-            Self::check_reference_window_admission(
-                config,
-                target,
-                self.samples,
-                rows.len(),
-                merged_marker_count,
-                target_storage_excess,
-                target_marginal_excess,
-                target_phase_expansion_bytes,
-                phase_pbwt_step_cm,
-                reference_storage_excess,
-                reference_marginal_excess,
-                target_bits_per_allele,
-                ibd2_intervals,
-            )?;
         }
         if rows.is_empty() {
             return Err(format!(
@@ -677,98 +598,6 @@ impl ReferenceWindowStream {
         // here would repeat the same genotype checks for each overlapping
         // window.
         Ok((phased, cm_positions, reference_groups))
-    }
-
-    fn check_reference_window_admission(
-        config: &ImpConfig,
-        target: &types::PhaseWindow,
-        reference_samples: usize,
-        reference_markers: usize,
-        merged_marker_count: usize,
-        target_storage_excess: usize,
-        target_marginal_excess: usize,
-        target_phase_expansion_bytes: usize,
-        phase_pbwt_step_cm: f64,
-        reference_storage_excess: usize,
-        reference_marginal_excess: usize,
-        target_bits_per_allele: u8,
-        ibd2_intervals: &Vec<types::Ibd2Interval>,
-    ) -> Result<(), String> {
-        let Some(memory_limit) = config.max_memory else {
-            return Ok(());
-        };
-        let target_samples = target.rows.first().map_or(0, |row| row.calls.len());
-        let phase_samples = target_samples
-            .checked_add(reference_samples)
-            .ok_or_else(|| "reference phase sample count overflow".to_owned())?;
-        let reference_haplotypes = reference_samples
-            .checked_mul(2)
-            .ok_or_else(|| "reference haplotype count overflow".to_owned())?;
-        let imp_states = if config.adaptive_states {
-            impute::adaptive_imp_states(
-                config.imp_states,
-                reference_haplotypes,
-                reference_markers,
-                target.rows.len(),
-            )
-        } else {
-            // This budget also determines IBS donors per step. Capping it
-            // to panel size here changes the model even when the composite
-            // builder ultimately uses fewer distinct states.
-            config.imp_states
-        };
-        let mut estimate = memory::estimate_window(
-            phase_samples,
-            merged_marker_count,
-            config.phase_states,
-            imp_states,
-            target_bits_per_allele,
-            1,
-        )?;
-        memory::include_initial_phase_pbwt_workspace(
-            &mut estimate,
-            phase_samples,
-            pbwt::initial_pbwt_max_chunk_markers(&target.cm_positions, config.threads.max(1))?,
-        )?;
-        memory::include_row_storage_excess(&mut estimate, target_storage_excess, 2)?;
-        memory::include_phase_expansion(&mut estimate, target_phase_expansion_bytes)?;
-        memory::include_row_storage_excess(&mut estimate, reference_storage_excess, 2)?;
-        memory::include_multiallelic_marginal_storage(
-            &mut estimate,
-            target_marginal_excess
-                .checked_add(reference_marginal_excess)
-                .ok_or_else(|| "multiallelic posterior memory estimate overflow".to_owned())?,
-        )?;
-        memory::include_ibd2_intervals(&mut estimate, ibd2_intervals)?;
-        memory::include_reference_window(&mut estimate, reference_samples, reference_markers)?;
-        memory::include_pbwt_segment_index(
-            &mut estimate,
-            reference_samples,
-            merged_marker_count,
-            max_pbwt_segments(config, merged_marker_count),
-        )?;
-        memory::include_phase_pbwt_donors(
-            &mut estimate,
-            phase_samples,
-            phase_pbwt_step_count_with_step_cm(
-                config,
-                &target.cm_positions,
-                phase_pbwt_step_cm,
-                merged_marker_count,
-            ),
-        )?;
-        memory::include_imputation_window(
-            &mut estimate,
-            target_samples,
-            merged_marker_count,
-            config.ap,
-            config.gp,
-        )?;
-        if is_bgzf_vcf_output(config) {
-            memory::include_bgzf_writer_workspace(&mut estimate)?;
-        }
-        memory::resolve_worker_count(1, Some(memory_limit), &estimate)?;
-        Ok(())
     }
 
     fn cache_carry(
@@ -981,7 +810,6 @@ where
         &mut reference,
         reference_samples,
         config.threads,
-        config.max_memory,
         output_path,
         &mut progress,
     );
@@ -1223,7 +1051,6 @@ fn run_to_output<F>(
     reference: &mut Option<ReferenceWindowStream>,
     reference_samples: usize,
     requested_workers: usize,
-    memory_limit: Option<usize>,
     output_path: &std::path::Path,
     progress: &mut F,
 ) -> Result<ImpSummary, String>
@@ -1286,48 +1113,8 @@ where
         let window_started = profile_windows.then(Instant::now);
         let mut staged_reference_data = None;
         let mut scheduled_bounds = None;
-        let mut streamed_target_excess = 0usize;
-        let mut streamed_target_marginal_excess = 0usize;
-        let mut streamed_phase_expansion_bytes = 0usize;
-        let mut streamed_phase_fixed_added = false;
-        let mut streamed_target_bits = 1u8;
         let next_window = {
-            let mut admission = |marker_count: usize, row: &types::VariantRow| {
-                if memory_limit.is_some() {
-                    streamed_target_excess = streamed_target_excess
-                        .checked_add(memory::row_storage_excess(row, samples.len())?)
-                        .ok_or_else(|| "target-window memory estimate overflow".to_owned())?;
-                    streamed_target_marginal_excess = streamed_target_marginal_excess
-                        .checked_add(memory::row_marginal_excess(row))
-                        .ok_or_else(|| "target-window memory estimate overflow".to_owned())?;
-                    if !streamed_phase_fixed_added {
-                        streamed_phase_expansion_bytes = memory::phase_expansion_fixed_bytes(
-                            samples.len().saturating_add(reference_samples),
-                        )?;
-                        streamed_phase_fixed_added = true;
-                    }
-                    streamed_phase_expansion_bytes = streamed_phase_expansion_bytes
-                        .checked_add(memory::phase_expansion_row_bytes_with_extra_samples(
-                            row,
-                            samples.len(),
-                            reference_samples,
-                        )?)
-                        .ok_or_else(|| "phase-call memory estimate overflow".to_owned())?;
-                    streamed_target_bits =
-                        streamed_target_bits.max(allele_bits_for_meta(&row.meta));
-                    check_target_window_admission(
-                        config,
-                        samples.len(),
-                        reference_samples,
-                        marker_count,
-                        streamed_target_bits,
-                        streamed_target_excess,
-                        streamed_target_marginal_excess,
-                        streamed_phase_expansion_bytes,
-                    )?;
-                }
-                Ok(())
-            };
+            let mut admission = |_marker_count: usize, _row: &types::VariantRow| Ok(());
             if config.impute {
                 if let Some(reference_stream) = reference.as_mut() {
                     match reference_schedule.next_window(
@@ -1417,16 +1204,6 @@ where
                 )?)
                 .ok_or_else(|| "reference phase memory estimate overflow".to_owned())?;
         let target_bits = max_allele_bits(&window.rows, &[]);
-        check_target_window_admission(
-            config,
-            samples.len(),
-            reference_samples,
-            window.rows.len(),
-            target_bits,
-            target_storage_excess,
-            target_marginal_excess,
-            target_phase_expansion_bytes,
-        )?;
         let target_base_estimate = target_window_estimate(
             config,
             samples.len(),
@@ -1446,33 +1223,8 @@ where
                 pbwt::initial_pbwt_max_chunk_markers(&window.cm_positions, requested_workers)?,
             )?;
         }
-        let ibd2_budget =
-            memory_limit.map(|limit| limit.saturating_sub(target_base_estimate.total_bytes));
-        let max_ibd2_scratch = ibd2_budget.map(|budget| budget / 2);
-        let max_ibd2_intervals = ibd2_budget.map(|budget| {
-            (budget - budget / 2)
-                / std::mem::size_of::<types::Ibd2Interval>()
-                // Pair hits, merged/extended hits, and directed intervals can
-                // coexist; reserve space for their Vec capacity slack.
-                / 8
-        });
-        // With an explicit memory cap the reference-window admission check
-        // needs the final IBS2 storage size before the reference is loaded.
-        // Otherwise, direct imputation needs no phasing IBS2 and normal
-        // phasing can defer the full-window scan until it knows whether the
-        // Beagle Stage1 projection will be used.
         let mut ibd2_elapsed = Duration::ZERO;
         let mut ibd2_intervals = None;
-        if !phase_bypass_allowed && memory_limit.is_some() {
-            let ibd2_started = profile_windows.then(Instant::now);
-            ibd2_intervals = Some(ibd2::detect_intervals(
-                &window,
-                &window.cm_positions,
-                max_ibd2_intervals,
-                max_ibd2_scratch,
-            )?);
-            ibd2_elapsed += ibd2_started.map_or(Duration::ZERO, |started| started.elapsed());
-        }
         let previous_emitted_pos = scheduled_bounds.map(|bounds| bounds.2).unwrap_or_else(|| {
             reference
                 .as_ref()
@@ -1483,7 +1235,6 @@ where
                 .and_then(|stream| stream.last_emitted_target_pos)
         });
         let reference_started = profile_windows.then(Instant::now);
-        let no_ibd2_intervals = Vec::new();
         let reference_window_data = if staged_reference_data.is_some() {
             staged_reference_data.take()
         } else if let Some(reference_stream) = reference.as_mut() {
@@ -1491,11 +1242,6 @@ where
                 &window,
                 config.window_markers,
                 config,
-                target_storage_excess,
-                target_marginal_excess,
-                target_phase_expansion_bytes,
-                target_bits,
-                ibd2_intervals.as_ref().unwrap_or(&no_ibd2_intervals),
                 terminal_target_window,
             )?)
         } else {
@@ -1704,12 +1450,6 @@ where
             // minimum physical-to-genetic distance independently of the raw
             // map positions used to define sliding windows.
             drop(ibd2_intervals.take());
-            let available =
-                memory_limit.map(|limit| limit.saturating_sub(active_estimate.total_bytes));
-            let max_scratch = available.map(|budget| budget / 2);
-            let max_intervals = available.map(|budget| {
-                (budget - budget / 2) / std::mem::size_of::<types::Ibd2Interval>() / 8
-            });
             let ibd2_started = profile_windows.then(Instant::now);
             let intervals = Some(ibd2::detect_projected_intervals_with_reference_map(
                 &window,
@@ -1718,8 +1458,8 @@ where
                 reference_window_for_phase,
                 reference_marker_alignment.as_ref(),
                 Some(config.master_seed()),
-                max_intervals,
-                max_scratch,
+                None,
+                None,
             )?);
             ibd2_elapsed += ibd2_started.map_or(Duration::ZERO, |started| started.elapsed());
             intervals
@@ -1733,8 +1473,7 @@ where
             .unwrap_or(&no_ibd2_intervals);
         memory::include_ibd2_intervals(&mut active_estimate, phase_ibd2_intervals)?;
         memory::include_multiallelic_marginal_storage(&mut active_estimate, marginal_excess)?;
-        let workers =
-            memory::resolve_worker_count(requested_workers, memory_limit, &active_estimate)?;
+        let workers = requested_workers;
         memory::set_worker_count(&mut active_estimate, workers)?;
         summary.peak_window_bytes = summary
             .peak_window_bytes
@@ -2062,34 +1801,6 @@ fn ensure_thread_pool(
     Ok(())
 }
 
-fn check_target_window_admission(
-    config: &ImpConfig,
-    target_samples: usize,
-    reference_samples: usize,
-    marker_count: usize,
-    bits_per_allele: u8,
-    target_storage_excess: usize,
-    target_marginal_excess: usize,
-    target_phase_expansion_bytes: usize,
-) -> Result<(), String> {
-    let Some(memory_limit) = config.max_memory else {
-        return Ok(());
-    };
-    let estimate = target_window_estimate(
-        config,
-        target_samples,
-        reference_samples,
-        marker_count,
-        bits_per_allele,
-        target_storage_excess,
-        target_marginal_excess,
-        target_phase_expansion_bytes,
-        1,
-    )?;
-    memory::resolve_worker_count(1, Some(memory_limit), &estimate)?;
-    Ok(())
-}
-
 fn target_window_estimate(
     config: &ImpConfig,
     target_samples: usize,
@@ -2145,19 +1856,6 @@ fn is_bgzf_vcf_output(config: &ImpConfig) -> bool {
             .to_string_lossy()
             .to_ascii_lowercase()
             .ends_with(".vcf.gz")
-}
-
-fn max_pbwt_segments(config: &ImpConfig, max_markers: usize) -> usize {
-    if max_markers == 0 {
-        return 0;
-    }
-    let span_bound = config.window + 2.0 * config.overlap;
-    let count = if span_bound.is_finite() && span_bound >= 0.0 {
-        ((span_bound / config.imp_segment).ceil() as usize).saturating_add(1)
-    } else {
-        max_markers
-    };
-    count.min(max_markers).max(1)
 }
 
 fn max_phase_pbwt_steps(config: &ImpConfig, max_markers: usize) -> usize {
@@ -2246,10 +1944,6 @@ fn target_contains_position(target: &types::PhaseWindow, position: u64) -> bool 
         .rows
         .binary_search_by_key(&position, |row| row.meta.pos)
         .is_ok()
-}
-
-fn allele_bits_for_meta(meta: &types::VariantMeta) -> u8 {
-    allele_bits_from_index(meta.allele_count().saturating_sub(1))
 }
 
 fn allele_bits_from_index(max_allele: usize) -> u8 {

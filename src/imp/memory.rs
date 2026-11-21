@@ -859,44 +859,6 @@ pub(crate) fn set_compact_target_mosaic_storage(
     Ok(())
 }
 
-pub(crate) fn resolve_worker_count(
-    requested: usize,
-    memory_limit_bytes: Option<usize>,
-    estimate: &MemoryEstimate,
-) -> Result<usize, String> {
-    if requested == 0 {
-        return Err("threads must be a positive integer".to_owned());
-    }
-    let Some(limit) = memory_limit_bytes else {
-        return Ok(requested);
-    };
-    let fixed_bytes = estimate
-        .input_window_bytes
-        .checked_add(estimate.phase_snapshot_bytes)
-        .and_then(|value| value.checked_add(estimate.composite_panel_bytes))
-        .and_then(|value| value.checked_add(estimate.output_buffer_bytes))
-        .ok_or_else(|| "fixed window memory estimate overflow".to_string())?;
-    let per_worker = estimate
-        .checkpoint_bytes_per_worker
-        .checked_add(estimate.scratch_bytes_per_worker)
-        .ok_or_else(|| "per-worker memory estimate overflow".to_string())?;
-    let one_worker = fixed_bytes
-        .checked_add(per_worker)
-        .ok_or_else(|| "one-worker memory estimate overflow".to_string())?;
-    if one_worker > limit {
-        return Err(format!(
-            "one imp worker needs about {} MiB for the active window, exceeding --max-memory={} MiB; reduce --window, --window-markers, or the HMM state counts",
-            one_worker.div_ceil(1024 * 1024),
-            limit.div_ceil(1024 * 1024)
-        ));
-    }
-    if per_worker == 0 {
-        return Ok(requested);
-    }
-    let available = (limit - fixed_bytes) / per_worker;
-    Ok(requested.min(available.max(1)))
-}
-
 pub(crate) fn set_worker_count(
     estimate: &mut MemoryEstimate,
     workers: usize,

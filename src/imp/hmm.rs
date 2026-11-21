@@ -1860,7 +1860,6 @@ where
     )
 }
 
-const SELECTED_FORWARD_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 const EMISSION_MATCH: u8 = 0;
 const EMISSION_MISMATCH: u8 = 1;
 const EMISSION_OBSERVATION_MISSING: u8 = 2;
@@ -2013,20 +2012,6 @@ where
     {
         return Err("paired mismatch HMM parameters are invalid".to_owned());
     }
-    let cache_bytes0 = selected_markers
-        .len()
-        .checked_mul(states_count0)
-        .and_then(|count| count.checked_mul(std::mem::size_of::<f32>()))
-        .ok_or_else(|| "paired mismatch HMM left forward-cache size overflow".to_owned())?;
-    let cache_bytes1 = selected_markers
-        .len()
-        .checked_mul(states_count1)
-        .and_then(|count| count.checked_mul(std::mem::size_of::<f32>()))
-        .ok_or_else(|| "paired mismatch HMM right forward-cache size overflow".to_owned())?;
-    if cache_bytes0.saturating_add(cache_bytes1) > SELECTED_FORWARD_CACHE_BUDGET_BYTES {
-        return Err("paired mismatch HMM forward cache exceeds its memory budget".to_owned());
-    }
-
     let allele_counts0 = paired_hmm_allele_counts(observations0, states0, n_markers);
     let allele_counts1 = paired_hmm_allele_counts(observations1, states1, n_markers);
     let matrix0 = MismatchEmissionMatrix::build(observations0, states0, &allele_counts0, config)?;
@@ -2232,20 +2217,6 @@ where
     {
         return Err("paired selected HMM parameters are invalid".to_owned());
     }
-    let cache_bytes0 = selected_markers
-        .len()
-        .checked_mul(states_count0)
-        .and_then(|count| count.checked_mul(std::mem::size_of::<f32>()))
-        .ok_or_else(|| "paired selected HMM left forward-cache size overflow".to_owned())?;
-    let cache_bytes1 = selected_markers
-        .len()
-        .checked_mul(states_count1)
-        .and_then(|count| count.checked_mul(std::mem::size_of::<f32>()))
-        .ok_or_else(|| "paired selected HMM right forward-cache size overflow".to_owned())?;
-    if cache_bytes0.saturating_add(cache_bytes1) > SELECTED_FORWARD_CACHE_BUDGET_BYTES {
-        return Err("paired selected HMM forward cache exceeds its memory budget".to_owned());
-    }
-
     let allele_counts0 = paired_hmm_allele_counts(observations0, states0, n_markers);
     let allele_counts1 = paired_hmm_allele_counts(observations1, states1, n_markers);
     scratch0.transition_probabilities.resize(n_markers, 0.0);
@@ -2919,31 +2890,6 @@ where
         return Err("HMM genetic positions must be finite and nondecreasing".to_owned());
     }
 
-    let selected_value_count = selected_markers
-        .len()
-        .checked_mul(n_states)
-        .ok_or_else(|| "selected HMM forward-cache size overflow".to_owned())?;
-    let selected_cache_bytes = selected_value_count
-        .checked_mul(std::mem::size_of::<f32>())
-        .ok_or_else(|| "selected HMM forward-cache byte size overflow".to_owned())?;
-    if selected_cache_bytes > SELECTED_FORWARD_CACHE_BUDGET_BYTES {
-        return forward_backward_impl(
-            observations,
-            states,
-            cm_positions,
-            config,
-            scratch,
-            None,
-            false,
-            true,
-            false,
-            Some(selected_markers),
-            state_callback,
-            None,
-            |_| Ok(()),
-        );
-    }
-
     let allele_counts = (0..n_markers)
         .map(|marker| {
             let panel_marker = states.marker_indices[marker];
@@ -2971,6 +2917,10 @@ where
     scratch.emission_block.resize(n_states, 0.0);
     scratch.state_posterior.resize(n_states, 0.0);
     scratch.selected_forward_values.clear();
+    let selected_value_count = selected_markers
+        .len()
+        .checked_mul(n_states)
+        .ok_or_else(|| "selected HMM forward-cache size overflow".to_owned())?;
     scratch
         .selected_forward_values
         .resize(selected_value_count, 0.0);

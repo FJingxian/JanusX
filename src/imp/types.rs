@@ -1783,8 +1783,6 @@ pub struct ImpConfig {
     #[serde(alias = "imp_nsteps")]
     pub imp_nsteps: usize,
     pub cluster: f64,
-    #[serde(alias = "max_memory_bytes")]
-    pub max_memory: Option<usize>,
     pub ap: bool,
     pub gp: bool,
     pub assume_global_phase: bool,
@@ -1868,7 +1866,6 @@ impl Default for ImpConfig {
             imp_step: 0.1,
             imp_nsteps: 7,
             cluster: 0.005,
-            max_memory: None,
             ap: false,
             gp: false,
             assume_global_phase: false,
@@ -1949,9 +1946,6 @@ impl ImpConfig {
                 "imp-step/imp-nsteps currently only accept their Beagle-compatible defaults (0.1/7); these matching controls are not yet implemented".to_owned(),
             );
         }
-        if self.max_memory == Some(0) {
-            return Err("max-memory must be a positive byte count".to_owned());
-        }
         if self.diagnostic_site.as_ref().is_some_and(|site| {
             site.chrom.is_empty() || site.position == 0 || site.sample.is_empty()
         }) {
@@ -1993,20 +1987,14 @@ impl ImpConfig {
 
     pub fn phase_config(&self, haplotype_count: usize) -> Result<PhaseConfig, String> {
         const DEFAULT_PACKED_CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
-        const PACKED_CACHE_MEMORY_DIVISOR: usize = 8;
         let hmm = self.hmm_config(haplotype_count)?;
-        let packed_cache_budget_bytes = self
-            .max_memory
-            .map_or(DEFAULT_PACKED_CACHE_BUDGET_BYTES, |limit| {
-                (limit / PACKED_CACHE_MEMORY_DIVISOR).min(DEFAULT_PACKED_CACHE_BUDGET_BYTES)
-            });
         Ok(PhaseConfig {
             window_cm: self.window,
             overlap_cm: self.overlap,
             window_markers: self.window_markers,
             seed: self.master_seed(),
             hmm,
-            packed_cache_budget_bytes,
+            packed_cache_budget_bytes: DEFAULT_PACKED_CACHE_BUDGET_BYTES,
         })
     }
 
@@ -2176,8 +2164,8 @@ mod packed_mosaic_tests {
     }
 
     #[test]
-    fn packed_phase_cache_budget_tracks_the_memory_cap() {
-        let mut config = ImpConfig {
+    fn packed_phase_cache_budget_is_fixed() {
+        let config = ImpConfig {
             target: "target.vcf.gz".into(),
             output: "phased.vcf.gz".into(),
             ..ImpConfig::default()
@@ -2188,14 +2176,6 @@ mod packed_mosaic_tests {
                 .unwrap()
                 .packed_cache_budget_bytes,
             256 * 1024 * 1024
-        );
-        config.max_memory = Some(512 * 1024 * 1024);
-        assert_eq!(
-            config
-                .phase_config(1_000)
-                .unwrap()
-                .packed_cache_budget_bytes,
-            64 * 1024 * 1024
         );
     }
 

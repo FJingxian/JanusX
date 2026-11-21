@@ -51,7 +51,6 @@ impl ReferenceWindowSchedule {
             .or(self.target_pending.as_ref())
             .unwrap();
         let chrom = first.0.meta.chrom.clone();
-        let first_target_cm = first.1;
         let first_target_pos = first.0.meta.pos;
         let output_start = config
             .region
@@ -65,56 +64,7 @@ impl ReferenceWindowSchedule {
             .filter(|region| region.contains_chromosome(&chrom))
             .and_then(|region| region.end)
             .unwrap_or(u64::MAX);
-        // Admit reference storage while streaming, before a dense reference
-        // chromosome can be accumulated. The complete combined estimate is
-        // checked again before retaining the next overlap.
-        let provisional_target = types::PhaseWindow {
-            chrom: chrom.clone(),
-            index: self.index,
-            rows: vec![first.0.clone()],
-            cm_positions: vec![first_target_cm],
-            incoming_overlap_len: 0,
-            emit_start: 0,
-            emit_end: 1,
-        };
-        let mut reference_storage_excess = 0usize;
-        let mut reference_marginal_excess = 0usize;
-        let mut reference_count = 0usize;
-        let reference_samples = references.samples;
-        let mut admit_reference = |record: &ReferenceRecord| -> Result<(), String> {
-            reference_count += 1;
-            if config.max_memory.is_some() {
-                reference_storage_excess = reference_storage_excess
-                    .checked_add(super::memory::row_storage_excess(
-                        &record.0,
-                        reference_samples,
-                    )?)
-                    .ok_or_else(|| "reference-window memory estimate overflow".to_owned())?;
-                reference_marginal_excess = reference_marginal_excess
-                    .checked_add(super::memory::row_marginal_excess(&record.0))
-                    .ok_or_else(|| "reference-window memory estimate overflow".to_owned())?;
-                ReferenceWindowStream::check_reference_window_admission(
-                    config,
-                    &provisional_target,
-                    reference_samples,
-                    reference_count,
-                    reference_count.max(1),
-                    0,
-                    0,
-                    0,
-                    0.0,
-                    reference_storage_excess,
-                    reference_marginal_excess,
-                    1,
-                    &Vec::new(),
-                )?;
-            }
-            Ok(())
-        };
         let mut reference_rows = std::mem::take(&mut self.reference_carry);
-        for row in &reference_rows {
-            admit_reference(row)?;
-        }
         let overlap_end = reference_rows.len();
         if overlap_end == 0 {
             self.previous_emitted_pos = None;
@@ -169,7 +119,6 @@ impl ReferenceWindowSchedule {
                 references.pending = Some(record);
                 break;
             }
-            admit_reference(&record)?;
             reference_rows.push(record);
         }
         if reference_rows.is_empty() {
@@ -243,7 +192,6 @@ impl ReferenceWindowSchedule {
                 if reference_rows.len() >= config.window_markers {
                     return Err("terminal reference window exceeds --window-markers".to_owned());
                 }
-                admit_reference(&record)?;
                 reference_rows.push(record);
             }
         }
@@ -284,53 +232,6 @@ impl ReferenceWindowSchedule {
         let emit_end = before_reference(next_splice);
         let target_overlap_start = before_reference(overlap_start);
         let outgoing_phase_carry_len = emit_end.saturating_sub(target_overlap_start);
-        if config.max_memory.is_some() {
-            let target = types::PhaseWindow {
-                chrom: chrom.clone(),
-                index: self.index,
-                rows: target_rows.iter().map(|r| r.0.clone()).collect(),
-                cm_positions: target_rows.iter().map(|r| r.1).collect(),
-                incoming_overlap_len: self.incoming_phase_carry_len,
-                emit_start,
-                emit_end,
-            };
-            let mut storage = 0usize;
-            let mut marginal = 0usize;
-            let mut expansion = super::memory::phase_expansion_fixed_bytes(
-                references.samples + target.rows[0].calls.len(),
-            )?;
-            let mut bits = 1;
-            for row in &target.rows {
-                storage += super::memory::row_storage_excess(row, row.calls.len())?;
-                marginal += super::memory::row_marginal_excess(row);
-                expansion += super::memory::phase_expansion_row_bytes_with_extra_samples(
-                    row,
-                    row.calls.len(),
-                    references.samples,
-                )?;
-                bits = bits.max(super::allele_bits_for_meta(&row.meta));
-            }
-            let merged = target.rows.len()
-                + reference_rows
-                    .iter()
-                    .filter(|r| !super::target_contains_position(&target, r.0.meta.pos))
-                    .count();
-            ReferenceWindowStream::check_reference_window_admission(
-                config,
-                &target,
-                references.samples,
-                reference_rows.len(),
-                merged,
-                storage,
-                marginal,
-                expansion,
-                super::phase::phase_ibs_step_cm(&target.cm_positions),
-                reference_storage_excess,
-                reference_marginal_excess,
-                bits,
-                &Vec::new(),
-            )?;
-        }
         self.target_carry = target_rows[target_overlap_start..].to_vec();
         self.reference_carry = reference_rows[overlap_start..].to_vec();
         let previous_emitted_pos = self.previous_emitted_pos;

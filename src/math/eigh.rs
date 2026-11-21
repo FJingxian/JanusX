@@ -38,14 +38,77 @@ enum NpyFloatDtype {
 }
 
 #[inline]
+fn transpose_square_inplace(buf: &mut [f64], n: usize) {
+    const TILE: usize = 64;
+    if n <= 1 {
+        return;
+    }
+    for bi in (0..n).step_by(TILE) {
+        let i_end = (bi + TILE).min(n);
+        // Diagonal tile
+        for r in bi..i_end {
+            let row_off = r * n;
+            for c in (r + 1)..i_end {
+                buf.swap(row_off + c, c * n + r);
+            }
+        }
+        // Off-diagonal tile pairs
+        for bj in ((bi + TILE)..n).step_by(TILE) {
+            let j_end = (bj + TILE).min(n);
+            for r in bi..i_end {
+                let row_off = r * n;
+                for c in bj..j_end {
+                    buf.swap(row_off + c, c * n + r);
+                }
+            }
+        }
+    }
+}
+
+#[inline]
 fn copy_col_major_to_row_major(src_col_major: &[f64], n: usize) -> Vec<f64> {
+    const TILE: usize = 64;
     let mut out_row_major = vec![0.0_f64; n * n];
-    for col in 0..n {
-        for row in 0..n {
-            out_row_major[row * n + col] = src_col_major[row + col * n];
+    for bj in (0..n).step_by(TILE) {
+        let j_end = (bj + TILE).min(n);
+        for bi in (0..n).step_by(TILE) {
+            let i_end = (bi + TILE).min(n);
+            for col in bj..j_end {
+                let src_col_off = col * n;
+                for row in bi..i_end {
+                    out_row_major[row * n + col] = src_col_major[row + src_col_off];
+                }
+            }
         }
     }
     out_row_major
+}
+
+#[inline]
+fn symmetrize_square_inplace_f64(a: &mut [f64], n: usize, label: &str) -> Result<(), String> {
+    validate_eigh_dims(n, a.len(), label)?;
+    for row in 0..n {
+        let diag_idx = row * n + row;
+        if !a[diag_idx].is_finite() {
+            return Err(format!("{label}: non-finite value at ({row}, {row})"));
+        }
+        for col in (row + 1)..n {
+            let rc = row * n + col;
+            let cr = col * n + row;
+            let a_rc = a[rc];
+            let a_cr = a[cr];
+            if !a_rc.is_finite() {
+                return Err(format!("{label}: non-finite value at ({row}, {col})"));
+            }
+            if !a_cr.is_finite() {
+                return Err(format!("{label}: non-finite value at ({col}, {row})"));
+            }
+            let v = 0.5_f64 * (a_rc + a_cr);
+            a[rc] = v;
+            a[cr] = v;
+        }
+    }
+    Ok(())
 }
 
 #[inline]
@@ -1317,11 +1380,11 @@ fn lapack_dsyevr_col_major_raw(
 
 #[inline]
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-fn lapack_dsyevd_col_major_inplace(
+fn lapack_dsyevd_col_major_raw_inplace(
     a_col_major: &mut [f64],
     n: usize,
     jobz: EighJobz,
-) -> Result<(Vec<f64>, Option<Vec<f64>>, &'static str), String> {
+) -> Result<(Vec<f64>, &'static str), String> {
     let n_i = n as CblasInt;
     let lda = n_i;
     let jobz_flag = [
@@ -1390,11 +1453,9 @@ fn lapack_dsyevd_col_major_inplace(
     }
 
     if need_vec {
-        let u_row = copy_col_major_to_row_major(a_col_major, n);
-        Ok((w, Some(u_row), lapack_dsyevd_backend_label()))
-    } else {
-        Ok((w, None, lapack_dsyevd_backend_label()))
+        transpose_square_inplace(a_col_major, n);
     }
+    Ok((w, lapack_dsyevd_backend_label()))
 }
 
 #[inline]
@@ -1405,14 +1466,20 @@ fn lapack_run_driver_from_col_major_owned(
     jobz: EighJobz,
     driver: EighDriver,
 ) -> Result<(Vec<f64>, Option<Vec<f64>>, &'static str), String> {
+    let need_vec = matches!(jobz, EighJobz::ValuesAndVectors);
     match driver {
-        EighDriver::Dsyevd => lapack_dsyevd_col_major_inplace(&mut a_col_major, n, jobz),
+        EighDriver::Dsyevd => {
+            let (evals, backend) = lapack_dsyevd_col_major_raw_inplace(&mut a_col_major, n, jobz)?;
+            Ok((evals, need_vec.then_some(a_col_major), backend))
+        }
         EighDriver::Dsyevr => {
-            let (evals, z_col_major, backend) =
+            let (evals, mut z_col_major, backend) =
                 lapack_dsyevr_col_major_raw(&mut a_col_major, n, jobz)?;
             drop(a_col_major);
-            let u_row = z_col_major.map(|z| copy_col_major_to_row_major(&z, n));
-            Ok((evals, u_row, backend))
+            if let Some(ref mut z) = z_col_major {
+                transpose_square_inplace(z, n);
+            }
+            Ok((evals, z_col_major, backend))
         }
         EighDriver::Auto => Err("internal error: unresolved auto LAPACK driver".to_string()),
     }
@@ -1911,13 +1978,94 @@ pub fn rust_eigh_from_array_f64_inplace<'py>(
         )));
     }
     let n = nrows;
-    let a_ro = a.readonly();
-
     let driver_sel = parse_eigh_driver_token(driver.unwrap_or_else(|| "auto".to_string()).as_str());
     let jobz_sel = parse_eigh_jobz_token(jobz);
-    let a_row_major = pyreadonly_array2_to_row_major_cow(&a_ro);
-
+    let need_vec = matches!(jobz_sel, EighJobz::ValuesAndVectors);
     let backend = crate::blas::rust_sgemm_backend();
+
+    // True zero-copy in-place path when `a` is writable and C-contiguous:
+    // a real symmetric matrix has identical row-major and column-major layout,
+    // so we symmetrize `a` in place, run LAPACK directly on its buffer, and
+    // transpose the resulting eigenvectors back to row-major in place.
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    if let Ok(mut a_rw) = a.try_readwrite() {
+        if let Ok(a_slice) = a_rw.as_slice_mut() {
+            let primary = resolve_eigh_driver_for_problem(driver_sel, n, jobz_sel);
+            let (threads_before, threads_in_stage, run, threads_after) =
+                crate::blas::with_eigh_thread_stage(threads, || {
+                    let t0 = Instant::now();
+                    let run: Result<(Vec<f64>, Option<Vec<f64>>, bool, &'static str), String> = (|| {
+                        symmetrize_square_inplace_f64(
+                            a_slice,
+                            n,
+                            "rust_eigh_from_array_f64_inplace",
+                        )?;
+                        match primary {
+                            EighDriver::Dsyevd => {
+                                let (evals, evd_backend) =
+                                    lapack_dsyevd_col_major_raw_inplace(a_slice, n, jobz_sel)?;
+                                Ok((evals, None, need_vec, evd_backend))
+                            }
+                            EighDriver::Dsyevr => {
+                                let (evals, mut z_opt, evd_backend) =
+                                    lapack_dsyevr_col_major_raw(a_slice, n, jobz_sel)?;
+                                if let Some(ref mut z) = z_opt {
+                                    transpose_square_inplace(z, n);
+                                }
+                                Ok((evals, z_opt, false, evd_backend))
+                            }
+                            EighDriver::Auto => Err(
+                                "internal error: unresolved auto LAPACK driver".to_string(),
+                            ),
+                        }
+                    })();
+                    let elapsed = t0.elapsed().as_secs_f64();
+                    (run, elapsed)
+                });
+            drop(a_rw);
+            let (run, elapsed) = run;
+            let (evals, evecs_owned_opt, reuse_input_buf, evd_backend) =
+                run.map_err(PyRuntimeError::new_err)?;
+            let lapack_used = is_lapack_backend(evd_backend);
+            if require_lapack && !lapack_used {
+                return Err(PyRuntimeError::new_err(format!(
+                    "rust_eigh_from_array_f64_inplace expected LAPACK backend, got {evd_backend}"
+                )));
+            }
+            let evals_arr = PyArray1::from_owned_array(py, Array1::from_vec(evals)).into_bound();
+            let evecs_arr = if reuse_input_buf {
+                Some(a.clone())
+            } else {
+                match evecs_owned_opt {
+                    Some(v) => Some(
+                        PyArray2::from_owned_array(
+                            py,
+                            Array2::from_shape_vec((n, n), v)
+                                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+                        )
+                        .into_bound(),
+                    ),
+                    None => None,
+                }
+            };
+            return Ok((
+                evals_arr,
+                evecs_arr,
+                backend,
+                evd_backend.to_string(),
+                n,
+                threads_before,
+                threads_in_stage,
+                threads_after,
+                lapack_used,
+                elapsed,
+            ));
+        }
+    }
+
+    // Fallback for read-only or non-contiguous inputs.
+    let a_ro = a.readonly();
+    let a_row_major = pyreadonly_array2_to_row_major_cow(&a_ro);
     let (threads_before, threads_in_stage, run, threads_after) =
         crate::blas::with_eigh_thread_stage(threads, || {
             let t0 = Instant::now();
@@ -2002,5 +2150,47 @@ mod tests {
         let overflow = (CblasInt::MAX as f64) + 1024.0_f64;
         let err = lapack_f64_workspace_len(overflow, "test").unwrap_err();
         assert!(err.contains("exceeds LAPACK integer limit"));
+    }
+
+    #[test]
+    fn test_transpose_square_inplace_matches_copy_across_tile_boundaries() {
+        for &n in &[0usize, 1, 2, 3, 63, 64, 65, 130] {
+            let src: Vec<f64> = (0..(n * n)).map(|i| (i as f64) * 0.25 - 3.5).collect();
+            let expected = copy_col_major_to_row_major(&src, n);
+            let mut inplace = src.clone();
+            transpose_square_inplace(&mut inplace, n);
+            assert_eq!(inplace, expected, "mismatch for n={n}");
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    #[test]
+    fn test_symmetrize_and_dsyevd_inplace_matches_eigen_equation() {
+        let n = 4usize;
+        let raw = vec![
+            4.0, 1.2, -0.4, 0.2,
+            0.8, 3.0, 0.5, -0.3,
+            -0.6, 0.5, 2.5, 0.9,
+            0.4, -0.1, 0.7, 1.5,
+        ];
+        let sym_ref = symmetrize_row_major_f64(&raw, n, "ref").unwrap();
+        let mut buf = raw.clone();
+        symmetrize_square_inplace_f64(&mut buf, n, "inplace").unwrap();
+        assert_eq!(buf, sym_ref);
+
+        let (evals, _backend) =
+            lapack_dsyevd_col_major_raw_inplace(&mut buf, n, EighJobz::ValuesAndVectors).unwrap();
+        assert_eq!(evals.len(), n);
+        // Verify A * V = V * diag(evals) where column j of `buf` (row-major) is eigenvector j.
+        for j in 0..n {
+            for i in 0..n {
+                let av_ij: f64 = (0..n).map(|k| sym_ref[i * n + k] * buf[k * n + j]).sum();
+                let lv_ij = evals[j] * buf[i * n + j];
+                assert!(
+                    (av_ij - lv_ij).abs() < 1e-11,
+                    "A*V != V*L at ({i},{j}): {av_ij} vs {lv_ij}"
+                );
+            }
+        }
     }
 }

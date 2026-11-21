@@ -736,13 +736,11 @@ def run_chunked_gwas_kfile(
             elif (
                 candidate == "lmm"
                 and hasattr(jxrs, "lmm_reml_assoc_kfile_to_tsv_f32")
-                and not bool(getattr(models[0][1], "lowrank", False))
             ):
                 native_model_key = candidate
             elif (
                 candidate == "fvlmm"
                 and hasattr(jxrs, "fvlmm_assoc_kfile_to_tsv_f32")
-                and not bool(getattr(models[0][1], "lowrank", False))
                 and getattr(models[0][1], "Dh", None) is not None
                 and np.isfinite(fvlmm_lbd_native)
                 and fvlmm_lbd_native > 0.0

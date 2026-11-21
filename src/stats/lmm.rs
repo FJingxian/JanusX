@@ -9,7 +9,6 @@
 // LMM2 uses the same REML beta/se for Wald output, then runs an additional ML optimization
 // to emit per-SNP lambda/ml/plrt.
 
-use matrixmultiply::sgemm;
 use numpy::{PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -19,19 +18,15 @@ use rayon::prelude::*;
 use std::borrow::Cow;
 use std::f64::consts::PI;
 use std::fmt::Write as FmtWrite;
+use std::fs::File;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use crate::assoc2tsv::{
     append_assoc_block_from_arrays, resolve_assoc_tsv_metadata, send_text_buf, AssocArraysBlock,
     AssocMissBlock, AssocResultCols, AssocResultLayout,
-};
-use crate::bedmath::packed_row_missing_count_selected;
-use crate::blas::{
-    cblas_sgemm_dispatch, rust_sgemm_backend_tag, BlasThreadGuard, CblasInt, CBLAS_NO_TRANS,
-    CBLAS_ROW_MAJOR, CBLAS_TRANS,
 };
 use crate::brent::brent_minimize_with_init;
 use crate::decode::{
@@ -43,14 +38,18 @@ use crate::gfreader::{evaluate_packed_bed_row_qc, is_simple_snp_allele};
 use crate::gload::WindowedBedMatrix;
 use crate::kmer::KfileAssocSource;
 use crate::linalg::{chi2_sf_df1, cholesky_gram_inplace, cholesky_solve_into, normal_sf};
-use crate::stats_common::{env_truthy, get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
-use memmap2::Mmap;
-use std::fs::File;
-
+use crate::lmm_common::{
+    choose_rotate_tile_rows, dot_loop, elapsed_nanos_to_secs, fill_packed_missing_block,
+    missing_count_from_rate, missing_rate_from_count, record_elapsed_nanos, resolve_snp_name,
+    rotate_snp_block_with_ut_blas, rotate_snp_block_with_ut_parallel, stage_assoc_threads_or,
+    stage_proj_threads_or, AssocScratch, SnpCounts, StreamingChunk,
+};
 use crate::reml::{
     final_beta_se_with_workspace, ml_loglike, ml_loglike_with_workspace,
     reml_brent_minimize_with_workspace, run_rotated_assoc_block_f32, MlWorkspace, RemlWorkspace,
 };
+use crate::stats_common::{env_truthy, get_cached_pool, parse_index_vec_i64, AsyncTsvWriter};
+use memmap2::Mmap;
 
 struct RotatedRemlAssocState {
     snp_vec: Vec<f64>,
@@ -769,437 +768,6 @@ pub fn lmm_reml_chunk_f32<'py>(
     Ok(beta_se_p)
 }
 
-#[inline]
-
-fn rotate_snp_block_with_ut(
-    snp_block: &[f32],
-    rows: usize,
-    n: usize,
-    u_t: &[f32],
-    out_block: &mut [f32],
-) {
-    if rows == 0 || n == 0 {
-        return;
-    }
-    // C(rows, n) = A(rows, n) * U(n, n)
-    // We store U^T in row-major (`u_t`). For matrixmultiply strides, expose U by
-    // setting B row stride = 1 and col stride = n, i.e. B(i,j)=u_t[j*n + i].
-    unsafe {
-        sgemm(
-            rows,
-            n,
-            n,
-            1.0,
-            snp_block.as_ptr(),
-            n as isize,
-            1,
-            u_t.as_ptr(),
-            1,
-            n as isize,
-            0.0,
-            out_block.as_mut_ptr(),
-            n as isize,
-            1,
-        );
-    }
-}
-
-#[inline]
-fn env_positive_usize(name: &str) -> Option<usize> {
-    std::env::var(name)
-        .ok()
-        .and_then(|s| s.trim().parse::<usize>().ok())
-        .filter(|&v| v > 0)
-}
-
-#[inline]
-fn choose_rotate_row_tile_rows_fvlmm(rows: usize, n: usize, thread_hint: usize) -> usize {
-    if let Some(v) = env_positive_usize("JX_GWAS_ROTATE_ROW_TILE") {
-        return v.max(1).min(rows.max(1));
-    }
-    if n < 2048 {
-        return choose_rotate_tile_rows(rows, thread_hint);
-    }
-    let target_mb = env_positive_usize("JX_GWAS_ROTATE_ROW_TILE_MB").unwrap_or_else(|| {
-        if n >= 16384 {
-            8usize
-        } else if n >= 8192 {
-            6usize
-        } else {
-            4usize
-        }
-    });
-    let target_bytes = target_mb.saturating_mul(1024 * 1024);
-    let bytes_per_row = n
-        .saturating_mul(2)
-        .saturating_mul(std::mem::size_of::<f32>())
-        .max(1);
-    let mut tile_rows = (target_bytes / bytes_per_row).max(16).min(rows.max(1));
-    let max_tile = if n >= 16384 {
-        256usize
-    } else if n >= 8192 {
-        192usize
-    } else {
-        128usize
-    };
-    tile_rows = tile_rows.clamp(16, max_tile.min(rows.max(1)));
-    tile_rows.min(rows.max(1))
-}
-
-#[inline]
-fn choose_rotate_col_block_cols_fvlmm(n: usize) -> usize {
-    if let Some(v) = env_positive_usize("JX_GWAS_ROTATE_COL_BLOCK") {
-        return v.max(1).min(n.max(1));
-    }
-    if n < 2048 {
-        return n.max(1);
-    }
-    let target_mb = env_positive_usize("JX_GWAS_ROTATE_COL_BLOCK_MB").unwrap_or_else(|| {
-        if n >= 16384 {
-            12usize
-        } else if n >= 8192 {
-            16usize
-        } else {
-            8usize
-        }
-    });
-    let target_bytes = target_mb.saturating_mul(1024 * 1024);
-    let bytes_per_col = n.saturating_mul(std::mem::size_of::<f32>()).max(1);
-    let cols = (target_bytes / bytes_per_col).max(64);
-    cols.clamp(64, 1024).min(n.max(1))
-}
-
-#[inline]
-fn rotate_snp_block_with_ut_parallel_blocked(
-    snp_block: &[f32],
-    rows: usize,
-    n: usize,
-    u_t: &[f32],
-    out_block: &mut [f32],
-    row_tile_rows: usize,
-    col_block_cols: usize,
-    pool: Option<&Arc<rayon::ThreadPool>>,
-) {
-    if rows == 0 || n == 0 {
-        return;
-    }
-    debug_assert!(snp_block.len() >= rows.saturating_mul(n));
-    debug_assert!(u_t.len() >= n.saturating_mul(n));
-    debug_assert!(out_block.len() >= rows.saturating_mul(n));
-    let tile_rows = row_tile_rows.max(1).min(rows);
-    let col_block = col_block_cols.max(1).min(n);
-
-    let mut run_parallel = || {
-        out_block
-            .par_chunks_mut(tile_rows * n)
-            .enumerate()
-            .for_each_init(
-                || vec![0.0_f32; tile_rows.saturating_mul(col_block)],
-                |scratch, (chunk_idx, out_chunk)| {
-                    let row_start = chunk_idx * tile_rows;
-                    let rows_here = out_chunk.len() / n;
-                    let a_start = row_start * n;
-                    let a_end = a_start + rows_here * n;
-                    let a_block = &snp_block[a_start..a_end];
-                    if col_block >= n {
-                        rotate_snp_block_with_ut(a_block, rows_here, n, u_t, out_chunk);
-                        return;
-                    }
-                    for col_start in (0..n).step_by(col_block) {
-                        let cols_here = (n - col_start).min(col_block);
-                        let scratch_sub = &mut scratch[..rows_here * cols_here];
-                        matmul_rowmajor_rhs_transposed_from_rowmajor_f32(
-                            a_block,
-                            rows_here,
-                            n,
-                            &u_t[col_start * n..(col_start + cols_here) * n],
-                            cols_here,
-                            scratch_sub,
-                        );
-                        for r in 0..rows_here {
-                            let src = &scratch_sub[r * cols_here..(r + 1) * cols_here];
-                            let dst =
-                                &mut out_chunk[r * n + col_start..r * n + col_start + cols_here];
-                            dst.copy_from_slice(src);
-                        }
-                    }
-                },
-            );
-    };
-
-    if tile_rows >= rows {
-        if col_block >= n {
-            rotate_snp_block_with_ut(snp_block, rows, n, u_t, out_block);
-            return;
-        }
-        let mut scratch = vec![0.0_f32; rows.saturating_mul(col_block)];
-        for col_start in (0..n).step_by(col_block) {
-            let cols_here = (n - col_start).min(col_block);
-            let scratch_sub = &mut scratch[..rows * cols_here];
-            matmul_rowmajor_rhs_transposed_from_rowmajor_f32(
-                snp_block,
-                rows,
-                n,
-                &u_t[col_start * n..(col_start + cols_here) * n],
-                cols_here,
-                scratch_sub,
-            );
-            for r in 0..rows {
-                let src = &scratch_sub[r * cols_here..(r + 1) * cols_here];
-                let dst = &mut out_block[r * n + col_start..r * n + col_start + cols_here];
-                dst.copy_from_slice(src);
-            }
-        }
-        return;
-    }
-
-    if let Some(tp) = pool {
-        tp.install(run_parallel);
-    } else {
-        run_parallel();
-    }
-}
-
-#[inline]
-fn assoc_rotate_prefers_rayon_rowmajor_f32_kernel() -> bool {
-    for env_name in ["JX_LMM_ROTATE_F32_KERNEL", "JX_ROWMAJOR_F32_KERNEL"] {
-        if let Ok(raw) = std::env::var(env_name) {
-            let norm = raw.trim().to_ascii_lowercase();
-            match norm.as_str() {
-                "rayon" | "parallel" | "custom" => return true,
-                "blas" | "gemm" | "serial" => return false,
-                _ => {}
-            }
-        }
-    }
-    // For LMM/FvLMM association rotate-proj, default to BLAS-backed GEMM
-    // across platforms. This path is large dense projection, unlike some
-    // HE/PCG row-major kernels that still prefer custom Rayon tiling.
-    false
-}
-
-#[inline]
-fn rotate_snp_block_with_ut_blas(
-    snp_block: &[f32],
-    rows: usize,
-    n: usize,
-    u_t: &[f32],
-    out_block: &mut [f32],
-    threads: usize,
-    proj_pool: Option<&Arc<rayon::ThreadPool>>,
-) {
-    if rows == 0 || n == 0 {
-        return;
-    }
-    debug_assert!(snp_block.len() >= rows.saturating_mul(n));
-    debug_assert!(u_t.len() >= n.saturating_mul(n));
-    debug_assert!(out_block.len() >= rows.saturating_mul(n));
-
-    if assoc_rotate_prefers_rayon_rowmajor_f32_kernel() {
-        let thread_hint = if threads > 0 {
-            threads
-        } else {
-            rayon::current_num_threads()
-        };
-        let row_tile = choose_rotate_row_tile_rows_fvlmm(rows, n, thread_hint);
-        let col_block = choose_rotate_col_block_cols_fvlmm(n);
-        rotate_snp_block_with_ut_parallel_blocked(
-            snp_block, rows, n, u_t, out_block, row_tile, col_block, proj_pool,
-        );
-        return;
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-    unsafe {
-        let _blas_guard = BlasThreadGuard::enter(threads.max(1));
-        cblas_sgemm_dispatch(
-            CBLAS_ROW_MAJOR,
-            CBLAS_NO_TRANS,
-            CBLAS_TRANS,
-            rows as CblasInt,
-            n as CblasInt,
-            n as CblasInt,
-            1.0_f32,
-            snp_block.as_ptr(),
-            n as CblasInt,
-            u_t.as_ptr(),
-            n as CblasInt,
-            0.0_f32,
-            out_block.as_mut_ptr(),
-            n as CblasInt,
-        );
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    {
-        rotate_snp_block_with_ut(snp_block, rows, n, u_t, out_block);
-    }
-}
-
-#[inline]
-fn matmul_rowmajor_rhs_transposed_from_rowmajor_f32(
-    a: &[f32],
-    m: usize,
-    k: usize,
-    b_rowmajor_nk: &[f32],
-    n: usize,
-    out: &mut [f32],
-) {
-    if m == 0 || k == 0 || n == 0 {
-        return;
-    }
-    debug_assert!(a.len() >= m.saturating_mul(k));
-    debug_assert!(b_rowmajor_nk.len() >= n.saturating_mul(k));
-    debug_assert!(out.len() >= m.saturating_mul(n));
-    // C(m, n) = A(m, k) * B^T(k, n)
-    // `b_rowmajor_nk` stores B(n, k) row-major. Expose B^T by setting
-    // B strides to: row_stride=1, col_stride=k.
-    unsafe {
-        sgemm(
-            m,
-            k,
-            n,
-            1.0,
-            a.as_ptr(),
-            k as isize,
-            1,
-            b_rowmajor_nk.as_ptr(),
-            1,
-            k as isize,
-            0.0,
-            out.as_mut_ptr(),
-            n as isize,
-            1,
-        );
-    }
-}
-
-#[inline]
-fn choose_rotate_tile_rows(rows: usize, thread_hint: usize) -> usize {
-    if rows <= 1 {
-        return 1;
-    }
-    let threads = thread_hint.max(1);
-    // Avoid splitting when there is no real parallelism (or chunk is tiny):
-    // one large SGEMM is much faster than many tiny calls in this case.
-    if threads <= 1 || rows <= 32 {
-        return rows;
-    }
-    // Keep enough independent tiles to feed the rayon pool, but avoid tiles
-    // so small that SGEMM launch overhead dominates.
-    let target_tasks = threads.saturating_mul(2).max(1);
-    let mut tile_rows = (rows + target_tasks - 1) / target_tasks;
-    tile_rows = tile_rows.clamp(16, 128);
-    tile_rows.min(rows)
-}
-
-#[inline]
-fn rotate_snp_block_with_ut_parallel(
-    snp_block: &[f32],
-    rows: usize,
-    n: usize,
-    u_t: &[f32],
-    out_block: &mut [f32],
-    tile_rows: usize,
-) {
-    if rows == 0 || n == 0 {
-        return;
-    }
-
-    let tile_rows = tile_rows.max(1).min(rows);
-    if tile_rows >= rows {
-        rotate_snp_block_with_ut(snp_block, rows, n, u_t, out_block);
-        return;
-    }
-
-    out_block
-        .par_chunks_mut(tile_rows * n)
-        .enumerate()
-        .for_each(|(chunk_idx, out_chunk)| {
-            let row_start = chunk_idx * tile_rows;
-            let rows_here = out_chunk.len() / n;
-            let a_start = row_start * n;
-            let a_end = a_start + rows_here * n;
-            rotate_snp_block_with_ut(&snp_block[a_start..a_end], rows_here, n, u_t, out_chunk);
-        });
-}
-
-#[inline]
-fn record_elapsed_nanos(acc: &AtomicU64, t0: Instant) {
-    let nanos = t0.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
-    acc.fetch_add(nanos, Ordering::Relaxed);
-}
-
-#[inline]
-fn elapsed_nanos_to_secs(acc: &AtomicU64) -> f64 {
-    (acc.load(Ordering::Relaxed) as f64) * 1e-9
-}
-
-/// Per-SNP filter results from parallel counting (Copy-friendly, no heap strings).
-struct SnpCounts {
-    flip: bool,
-    maf: f32,
-    miss_rate: f32,
-    missing_count: usize,
-}
-
-/// Double-buffer for the streaming BED → TSV pipeline.
-struct StreamingChunk {
-    // Stage 1 output: count + decode
-    g_block: Vec<f32>,
-    miss_block: Vec<usize>,
-    indices: Vec<usize>,
-    flip: Vec<bool>,
-    maf: Vec<f32>,
-    miss_rate: Vec<f32>,
-    chrom: Vec<String>,
-    pos: Vec<i64>,
-    snp: Vec<String>,
-    a0: Vec<String>,
-    a1: Vec<String>,
-    // Stage 2 output
-    rot_block: Vec<f32>,
-    out_block: Vec<f64>,
-    // Bookkeeping
-    rows: usize,
-    scanned_to: usize,
-}
-
-impl StreamingChunk {
-    fn new(capacity: usize, n: usize, out_cols: usize) -> Self {
-        Self {
-            g_block: vec![0.0_f32; capacity.saturating_mul(n)],
-            miss_block: vec![0usize; capacity],
-            indices: Vec::with_capacity(capacity),
-            flip: Vec::with_capacity(capacity),
-            maf: Vec::with_capacity(capacity),
-            miss_rate: Vec::with_capacity(capacity),
-            chrom: Vec::with_capacity(capacity),
-            pos: Vec::with_capacity(capacity),
-            snp: Vec::with_capacity(capacity),
-            a0: Vec::with_capacity(capacity),
-            a1: Vec::with_capacity(capacity),
-            rot_block: vec![0.0_f32; capacity.saturating_mul(n)],
-            out_block: vec![0.0_f64; capacity.saturating_mul(out_cols)],
-            rows: 0,
-            scanned_to: 0,
-        }
-    }
-
-    fn clear(&mut self) {
-        self.indices.clear();
-        self.flip.clear();
-        self.maf.clear();
-        self.miss_rate.clear();
-        self.chrom.clear();
-        self.pos.clear();
-        self.snp.clear();
-        self.a0.clear();
-        self.a1.clear();
-        self.rows = 0;
-        self.scanned_to = 0;
-    }
-}
 
 struct UnifiedBedScanSummary {
     total_rows: usize,
@@ -1743,7 +1311,7 @@ where
     let pipeline_t0 = Instant::now();
     crate::pipeline::run_double_buffer(
         2,
-        || StreamingChunk::new(scan_chunk_snps, n, out_cols),
+        || StreamingChunk::new_decoded(scan_chunk_snps, n, out_cols),
         producer,
         consumer,
     )?;
@@ -1785,9 +1353,7 @@ where
     })
 }
 
-#[pyfunction]
-#[pyo3(signature = (s, xcov, y_rot, low, high, snp_chunk, u_t, max_iter=50, tol=1e-2, threads=0, nullml=None, rotate_block_rows=256))]
-pub fn lmm_reml_chunk_from_snp_f32<'py>(
+fn lmm_reml_chunk_from_snp_common<'py, F>(
     py: Python<'py>,
     s: PyReadonlyArray1<'py, f64>,
     xcov: PyReadonlyArray2<'py, f64>,
@@ -1796,12 +1362,15 @@ pub fn lmm_reml_chunk_from_snp_f32<'py>(
     high: f64,
     snp_chunk: PyReadonlyArray2<'py, f32>,
     u_t: PyReadonlyArray2<'py, f32>,
-    max_iter: usize,
-    tol: f64,
+    out_cols: usize,
+    out_err_msg: &'static str,
     threads: usize,
-    nullml: Option<f64>,
     rotate_block_rows: usize,
-) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    run_rows: F,
+) -> PyResult<Bound<'py, PyArray2<f64>>>
+where
+    F: Fn(&[f32], usize, usize, &[f64], &[f64], &[f64], usize, &mut [f64]) + Sync,
+{
     let s = s.as_slice()?;
     let xcov_arr = xcov.as_array();
     let y = y_rot.as_slice()?;
@@ -1830,27 +1399,22 @@ pub fn lmm_reml_chunk_from_snp_f32<'py>(
 
     let m_chunk = snp_arr.shape()[0];
     let xcov_flat: Cow<[f64]> = match crate::stats_common::array_standard_slice(&xcov) {
-        Ok(s) => Cow::Borrowed(s),
+        Ok(s0) => Cow::Borrowed(s0),
         Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&xcov_arr)),
     };
     let snp_flat: Cow<[f32]> = match crate::stats_common::array_standard_slice(&snp_chunk) {
-        Ok(s) => Cow::Borrowed(s),
+        Ok(s0) => Cow::Borrowed(s0),
         Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&snp_arr)),
     };
     let ut_flat: Cow<[f32]> = match crate::stats_common::array_standard_slice(&u_t) {
-        Ok(s) => Cow::Borrowed(s),
+        Ok(s0) => Cow::Borrowed(s0),
         Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&ut_arr)),
     };
 
-    let with_plrt = nullml.is_some();
-    let nullml_val = nullml.unwrap_or(0.0);
-    let out_cols = if with_plrt { 4 } else { 3 };
-
-    let beta_se_p = PyArray2::<f64>::zeros(py, [m_chunk, out_cols], false).into_bound();
-    let beta_se_p_slice: &mut [f64] = unsafe {
-        beta_se_p
-            .as_slice_mut()
-            .map_err(|_| PyRuntimeError::new_err("beta_se_p not contiguous"))?
+    let out = PyArray2::<f64>::zeros(py, [m_chunk, out_cols], false).into_bound();
+    let out_slice: &mut [f64] = unsafe {
+        out.as_slice_mut()
+            .map_err(|_| PyRuntimeError::new_err(out_err_msg))?
     };
 
     // Keep same behavior as lmm_reml_chunk_f32: dedicated pool can be faster here.
@@ -1869,180 +1433,6 @@ pub fn lmm_reml_chunk_from_snp_f32<'py>(
 
     py.detach(|| {
         let mut rot_buf = vec![0.0_f32; block_rows * n];
-
-        let run_rows = |g_block: &[f32], out_block: &mut [f64]| {
-            run_rotated_reml_assoc_block_f32(
-                g_block,
-                out_block.len() / out_cols,
-                n,
-                s,
-                &xcov_flat,
-                y,
-                p_cov,
-                low,
-                high,
-                tol,
-                max_iter,
-                None,
-                false,
-                false,
-                if with_plrt { Some(nullml_val) } else { None },
-                out_block,
-                out_cols,
-                None,
-            );
-        };
-
-        let mut start = 0usize;
-        while start < m_chunk {
-            let rows = (m_chunk - start).min(block_rows);
-            let snp_block = &snp_flat[start * n..(start + rows) * n];
-            let rot_block = &mut rot_buf[..rows * n];
-            let rotate_tile_rows = choose_rotate_tile_rows(
-                rows,
-                if threads > 0 {
-                    threads
-                } else {
-                    rayon::current_num_threads()
-                },
-            );
-
-            let out_block = &mut beta_se_p_slice[start * out_cols..(start + rows) * out_cols];
-            if let Some(tp) = &pool {
-                tp.install(|| {
-                    rotate_snp_block_with_ut_parallel(
-                        snp_block,
-                        rows,
-                        n,
-                        &ut_flat,
-                        rot_block,
-                        rotate_tile_rows,
-                    );
-                    run_rows(rot_block, out_block);
-                });
-            } else {
-                rotate_snp_block_with_ut_parallel(
-                    snp_block,
-                    rows,
-                    n,
-                    &ut_flat,
-                    rot_block,
-                    rotate_tile_rows,
-                );
-                run_rows(rot_block, out_block);
-            }
-            start += rows;
-        }
-    });
-
-    Ok(beta_se_p)
-}
-
-#[pyfunction]
-#[pyo3(signature = (s, xcov, y_rot, low, high, snp_chunk, u_t, nullml, max_iter=50, tol=1e-2, threads=0, rotate_block_rows=256))]
-pub fn lmm_reml_lmm2_chunk_from_snp_f32<'py>(
-    py: Python<'py>,
-    s: PyReadonlyArray1<'py, f64>,
-    xcov: PyReadonlyArray2<'py, f64>,
-    y_rot: PyReadonlyArray1<'py, f64>,
-    low: f64,
-    high: f64,
-    snp_chunk: PyReadonlyArray2<'py, f32>,
-    u_t: PyReadonlyArray2<'py, f32>,
-    nullml: f64,
-    max_iter: usize,
-    tol: f64,
-    threads: usize,
-    rotate_block_rows: usize,
-) -> PyResult<Bound<'py, PyArray2<f64>>> {
-    let s = s.as_slice()?;
-    let xcov_arr = xcov.as_array();
-    let y = y_rot.as_slice()?;
-    let snp_arr = snp_chunk.as_array();
-    let ut_arr = u_t.as_array();
-
-    let n = y.len();
-    let (xc_n, p_cov) = (xcov_arr.shape()[0], xcov_arr.shape()[1]);
-    if xc_n != n {
-        return Err(PyRuntimeError::new_err("Xcov.n_rows must equal len(y_rot)"));
-    }
-    if s.len() != n {
-        return Err(PyRuntimeError::new_err("len(S) must equal len(y_rot)"));
-    }
-    if snp_arr.shape()[1] != n {
-        return Err(PyRuntimeError::new_err("snp_chunk must be (m_chunk, n)"));
-    }
-    if ut_arr.shape()[0] != n || ut_arr.shape()[1] != n {
-        return Err(PyRuntimeError::new_err(
-            "u_t must be (n, n) and row-major U^T",
-        ));
-    }
-    if low >= high {
-        return Err(PyRuntimeError::new_err("low must be < high"));
-    }
-    if !nullml.is_finite() {
-        return Err(PyRuntimeError::new_err("nullml must be finite"));
-    }
-
-    let m_chunk = snp_arr.shape()[0];
-    let xcov_flat: Cow<[f64]> = match crate::stats_common::array_standard_slice(&xcov) {
-        Ok(s0) => Cow::Borrowed(s0),
-        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&xcov_arr)),
-    };
-    let snp_flat: Cow<[f32]> = match crate::stats_common::array_standard_slice(&snp_chunk) {
-        Ok(s0) => Cow::Borrowed(s0),
-        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&snp_arr)),
-    };
-    let ut_flat: Cow<[f32]> = match crate::stats_common::array_standard_slice(&u_t) {
-        Ok(s0) => Cow::Borrowed(s0),
-        Err(_) => Cow::Owned(crate::stats_common::copy_array_standard_layout(&ut_arr)),
-    };
-
-    let out_cols = 6usize;
-    let out = PyArray2::<f64>::zeros(py, [m_chunk, out_cols], false).into_bound();
-    let out_slice: &mut [f64] = unsafe {
-        out.as_slice_mut()
-            .map_err(|_| PyRuntimeError::new_err("lmm2 output not contiguous"))?
-    };
-
-    let pool = if threads > 0 {
-        Some(
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .build()
-                .map_err(|e| PyRuntimeError::new_err(format!("rayon pool: {e}")))?,
-        )
-    } else {
-        None
-    };
-
-    let block_rows = rotate_block_rows.max(1);
-
-    py.detach(|| {
-        let mut rot_buf = vec![0.0_f32; block_rows * n];
-
-        let run_rows = |g_block: &[f32], out_block: &mut [f64]| {
-            run_rotated_lmm2_assoc_block_f32(
-                g_block,
-                out_block.len() / out_cols,
-                n,
-                s,
-                &xcov_flat,
-                y,
-                p_cov,
-                low,
-                high,
-                tol,
-                max_iter,
-                None,
-                None,
-                nullml,
-                out_block,
-                out_cols,
-                None,
-            );
-        };
-
         let mut start = 0usize;
         while start < m_chunk {
             let rows = (m_chunk - start).min(block_rows);
@@ -2067,7 +1457,7 @@ pub fn lmm_reml_lmm2_chunk_from_snp_f32<'py>(
                         rot_block,
                         rotate_tile_rows,
                     );
-                    run_rows(rot_block, out_block);
+                    run_rows(rot_block, rows, n, s, &xcov_flat, y, p_cov, out_block);
                 });
             } else {
                 rotate_snp_block_with_ut_parallel(
@@ -2078,7 +1468,7 @@ pub fn lmm_reml_lmm2_chunk_from_snp_f32<'py>(
                     rot_block,
                     rotate_tile_rows,
                 );
-                run_rows(rot_block, out_block);
+                run_rows(rot_block, rows, n, s, &xcov_flat, y, p_cov, out_block);
             }
             start += rows;
         }
@@ -2087,233 +1477,89 @@ pub fn lmm_reml_lmm2_chunk_from_snp_f32<'py>(
     Ok(out)
 }
 
-// ------------------------------------------------------------
-// Helpers: dot loops
-// ------------------------------------------------------------
-
-#[inline]
-fn dot_loop(a: &[f64], b: &[f64]) -> f64 {
-    dot_loop_simd(a, b)
-}
-
-#[inline]
-fn dot_loop_unrolled(a: &[f64], b: &[f64]) -> f64 {
-    debug_assert_eq!(a.len(), b.len());
-    let n = a.len();
-    let mut s0 = 0.0_f64;
-    let mut s1 = 0.0_f64;
-    let mut s2 = 0.0_f64;
-    let mut s3 = 0.0_f64;
-    let mut i = 0usize;
-    while i + 3 < n {
-        s0 += a[i] * b[i];
-        s1 += a[i + 1] * b[i + 1];
-        s2 += a[i + 2] * b[i + 2];
-        s3 += a[i + 3] * b[i + 3];
-        i += 4;
-    }
-    let mut s = s0 + s1 + s2 + s3;
-    while i < n {
-        s += a[i] * b[i];
-        i += 1;
-    }
-    s
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn dot_loop_avx2(a: &[f64], b: &[f64]) -> f64 {
-    use std::arch::x86_64::{
-        __m256d, _mm256_add_pd, _mm256_loadu_pd, _mm256_mul_pd, _mm256_setzero_pd, _mm256_storeu_pd,
-    };
-
-    debug_assert_eq!(a.len(), b.len());
-    let n = a.len();
-    let mut i = 0usize;
-    let mut acc: __m256d = _mm256_setzero_pd();
-    while i + 4 <= n {
-        let va = unsafe { _mm256_loadu_pd(a.as_ptr().add(i)) };
-        let vb = unsafe { _mm256_loadu_pd(b.as_ptr().add(i)) };
-        acc = _mm256_add_pd(acc, _mm256_mul_pd(va, vb));
-        i += 4;
-    }
-    let mut lanes = [0.0_f64; 4];
-    unsafe { _mm256_storeu_pd(lanes.as_mut_ptr(), acc) };
-    let mut s = lanes[0] + lanes[1] + lanes[2] + lanes[3];
-    while i < n {
-        s += a[i] * b[i];
-        i += 1;
-    }
-    s
-}
-
-#[cfg(target_arch = "aarch64")]
-unsafe fn dot_loop_neon(a: &[f64], b: &[f64]) -> f64 {
-    use std::arch::aarch64::{vaddq_f64, vdupq_n_f64, vld1q_f64, vmulq_f64, vst1q_f64};
-
-    debug_assert_eq!(a.len(), b.len());
-    let n = a.len();
-    let mut i = 0usize;
-    let mut acc = vdupq_n_f64(0.0);
-    while i + 2 <= n {
-        let va = unsafe { vld1q_f64(a.as_ptr().add(i)) };
-        let vb = unsafe { vld1q_f64(b.as_ptr().add(i)) };
-        acc = vaddq_f64(acc, vmulq_f64(va, vb));
-        i += 2;
-    }
-    let mut lanes = [0.0_f64; 2];
-    unsafe { vst1q_f64(lanes.as_mut_ptr(), acc) };
-    let mut s = lanes[0] + lanes[1];
-    while i < n {
-        s += a[i] * b[i];
-        i += 1;
-    }
-    s
-}
-
-#[inline]
-fn dot_loop_simd(a: &[f64], b: &[f64]) -> f64 {
-    #[cfg(target_arch = "x86_64")]
-    {
-        if std::is_x86_feature_detected!("avx2") {
-            return unsafe { dot_loop_avx2(a, b) };
-        }
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        return unsafe { dot_loop_neon(a, b) };
-    }
-    #[allow(unreachable_code)]
-    dot_loop_unrolled(a, b)
-}
-
-struct AssocScratch {
-    c: Vec<f64>,       // len p
-    a_inv_c: Vec<f64>, // len p
-}
-impl AssocScratch {
-    fn new(p: usize) -> Self {
-        Self {
-            c: vec![0.0; p],
-            a_inv_c: vec![0.0; p],
-        }
-    }
-    #[inline]
-    fn reset(&mut self) {
-        self.c.fill(0.0);
-    }
-}
-
-fn stage_proj_threads_or(requested_threads: usize) -> usize {
-    env_positive_usize("JX_FVLMM_PROJ_THREADS")
-        .or_else(|| env_positive_usize("JX_MLM_RUST_THREADS"))
-        .unwrap_or(requested_threads)
-}
-
-#[inline]
-fn normalize_default_assoc_threads_for_backend(
-    backend_tag: &str,
-    proj_threads: usize,
-    assoc_threads: usize,
-) -> usize {
-    let proj = proj_threads.max(1);
-    let assoc = assoc_threads.max(1);
-    if backend_tag == "openblas" {
-        assoc.min(proj)
-    } else {
-        assoc
-    }
-}
-
-#[inline]
-fn stage_assoc_threads_or(requested_threads: usize, proj_threads: usize) -> usize {
-    if let Some(explicit) = env_positive_usize("JX_FVLMM_ASSOC_THREADS") {
-        return explicit;
-    }
-    let default_threads = env_positive_usize("JX_MLM_RUST_THREADS").unwrap_or(requested_threads);
-    normalize_default_assoc_threads_for_backend(
-        rust_sgemm_backend_tag(),
-        proj_threads,
-        default_threads,
+#[pyfunction]
+#[pyo3(signature = (s, xcov, y_rot, low, high, snp_chunk, u_t, max_iter=50, tol=1e-2, threads=0, nullml=None, rotate_block_rows=256))]
+pub fn lmm_reml_chunk_from_snp_f32<'py>(
+    py: Python<'py>,
+    s: PyReadonlyArray1<'py, f64>,
+    xcov: PyReadonlyArray2<'py, f64>,
+    y_rot: PyReadonlyArray1<'py, f64>,
+    low: f64,
+    high: f64,
+    snp_chunk: PyReadonlyArray2<'py, f32>,
+    u_t: PyReadonlyArray2<'py, f32>,
+    max_iter: usize,
+    tol: f64,
+    threads: usize,
+    nullml: Option<f64>,
+    rotate_block_rows: usize,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let out_cols = if nullml.is_some() { 4 } else { 3 };
+    lmm_reml_chunk_from_snp_common(
+        py,
+        s,
+        xcov,
+        y_rot,
+        low,
+        high,
+        snp_chunk,
+        u_t,
+        out_cols,
+        "beta_se_p not contiguous",
+        threads,
+        rotate_block_rows,
+        |g_block, rows, n, s, xcov_flat, y, p_cov, out_block| {
+            run_rotated_reml_assoc_block_f32(
+                g_block, rows, n, s, xcov_flat, y, p_cov, low, high, tol, max_iter, None, false,
+                false, nullml, out_block, out_cols, None,
+            );
+        },
     )
 }
 
-#[inline]
-fn missing_count_from_rate(v: f32, n_samples: usize) -> usize {
-    if !v.is_finite() || v <= 0.0 {
-        0usize
-    } else {
-        ((v as f64) * (n_samples as f64)).round().max(0.0) as usize
+#[pyfunction]
+#[pyo3(signature = (s, xcov, y_rot, low, high, snp_chunk, u_t, nullml, max_iter=50, tol=1e-2, threads=0, rotate_block_rows=256))]
+pub fn lmm_reml_lmm2_chunk_from_snp_f32<'py>(
+    py: Python<'py>,
+    s: PyReadonlyArray1<'py, f64>,
+    xcov: PyReadonlyArray2<'py, f64>,
+    y_rot: PyReadonlyArray1<'py, f64>,
+    low: f64,
+    high: f64,
+    snp_chunk: PyReadonlyArray2<'py, f32>,
+    u_t: PyReadonlyArray2<'py, f32>,
+    nullml: f64,
+    max_iter: usize,
+    tol: f64,
+    threads: usize,
+    rotate_block_rows: usize,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    if !nullml.is_finite() {
+        return Err(PyRuntimeError::new_err("nullml must be finite"));
     }
+    let out_cols = 6usize;
+    lmm_reml_chunk_from_snp_common(
+        py,
+        s,
+        xcov,
+        y_rot,
+        low,
+        high,
+        snp_chunk,
+        u_t,
+        out_cols,
+        "lmm2 output not contiguous",
+        threads,
+        rotate_block_rows,
+        |g_block, rows, n, s, xcov_flat, y, p_cov, out_block| {
+            run_rotated_lmm2_assoc_block_f32(
+                g_block, rows, n, s, xcov_flat, y, p_cov, low, high, tol, max_iter, None, None,
+                nullml, out_block, out_cols, None,
+            );
+        },
+    )
 }
 
-#[inline]
-fn missing_rate_from_count(v: usize, n_samples: usize) -> f32 {
-    if n_samples == 0 {
-        0.0_f32
-    } else {
-        (v as f32) / (n_samples as f32)
-    }
-}
-
-#[inline]
-fn resolve_snp_name(snp: &str, chrom: &str, pos: i32) -> String {
-    if !snp.is_empty() && snp != "." {
-        snp.to_string()
-    } else {
-        format!("{chrom}_{pos}")
-    }
-}
-
-fn fill_packed_missing_block(
-    miss_sub: &mut [usize],
-    sample_identity: bool,
-    row_missing: &[f32],
-    row_idx: Option<&[usize]>,
-    start: usize,
-    packed_flat: &[u8],
-    bytes_per_snp: usize,
-    n_samples: usize,
-    sample_idx: &[usize],
-    pool: Option<&Arc<rayon::ThreadPool>>,
-) {
-    if sample_identity {
-        if let Some(tp) = pool {
-            tp.install(|| {
-                miss_sub.par_iter_mut().enumerate().for_each(|(off, dst)| {
-                    let idx = start + off;
-                    // row_missing is aligned to the active/output row order; only packed
-                    // row fetches should use row_idx indirection.
-                    *dst = missing_count_from_rate(row_missing[idx], n_samples);
-                });
-            });
-        } else {
-            miss_sub.iter_mut().enumerate().for_each(|(off, dst)| {
-                let idx = start + off;
-                *dst = missing_count_from_rate(row_missing[idx], n_samples);
-            });
-        }
-        return;
-    }
-
-    if let Some(tp) = pool {
-        tp.install(|| {
-            miss_sub.par_iter_mut().enumerate().for_each(|(off, dst)| {
-                let idx = start + off;
-                let src_row = row_idx.map(|v| v[idx]).unwrap_or(idx);
-                let row = &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
-                *dst = packed_row_missing_count_selected(row, n_samples, sample_idx);
-            });
-        });
-    } else {
-        miss_sub.iter_mut().enumerate().for_each(|(off, dst)| {
-            let idx = start + off;
-            let src_row = row_idx.map(|v| v[idx]).unwrap_or(idx);
-            let row = &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
-            *dst = packed_row_missing_count_selected(row, n_samples, sample_idx);
-        });
-    }
-}
 
 #[pyfunction]
 #[pyo3(signature = (s, xcov, y_rot, log10_lbd, g_rot_chunk, threads=0, nullml=None))]

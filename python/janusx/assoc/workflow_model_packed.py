@@ -2846,108 +2846,6 @@ def run_qtn_segmented_lm_stage2(
     return int(kept_rows), int(scan_rows), int(qtn_cov.shape[1])
 
 
-def _packed_lowrank_scan_to_tsv(
-    *,
-    mod: object,
-    packed: np.ndarray,
-    packed_n: int,
-    packed_row_idx: np.ndarray,
-    row_flip: np.ndarray,
-    maf: np.ndarray,
-    miss: np.ndarray,
-    sites_all: _BimSiteColumns,
-    sample_idx_trait: np.ndarray,
-    out_tsv: str,
-    chunk_size: int,
-    threads: int,
-    genetic_model: str,
-    progress_callback=None,
-) -> int:
-    if not hasattr(jxrs, "bed_packed_decode_rows_f32"):
-        raise RuntimeError(
-            "Rust extension missing bed_packed_decode_rows_f32 required by packed low-rank GWAS scan."
-        )
-    if not hasattr(jxrs, "GwasAssocTsvWriter") or not hasattr(jxrs, "SiteInfo"):
-        raise RuntimeError(
-            "Rust extension missing GwasAssocTsvWriter/SiteInfo required by packed low-rank GWAS scan."
-        )
-
-    total = int(len(sites_all))
-    if total != int(packed_row_idx.shape[0]):
-        raise ValueError(
-            f"packed low-rank scan metadata mismatch: sites={total}, active_rows={packed_row_idx.shape[0]}"
-        )
-    sample_idx_arr = np.ascontiguousarray(
-        np.asarray(sample_idx_trait, dtype=np.int64).reshape(-1),
-        dtype=np.int64,
-    )
-    writer = jxrs.GwasAssocTsvWriter(str(out_tsv), genetic_model=str(genetic_model))
-    step = int(max(1, chunk_size))
-    done = 0
-    try:
-        for start in range(0, total, step):
-            end = min(start + step, total)
-            src_rows = np.ascontiguousarray(
-                np.asarray(packed_row_idx[start:end], dtype=np.int64).reshape(-1),
-                dtype=np.int64,
-            )
-            packed_subset = np.ascontiguousarray(
-                np.asarray(packed[src_rows, :], dtype=np.uint8),
-                dtype=np.uint8,
-            )
-            maf_blk = np.ascontiguousarray(
-                np.asarray(maf[start:end], dtype=np.float32).reshape(-1),
-                dtype=np.float32,
-            )
-            miss_blk = np.ascontiguousarray(
-                np.asarray(miss[start:end], dtype=np.float32).reshape(-1),
-                dtype=np.float32,
-            )
-            flip_blk = np.ascontiguousarray(
-                np.asarray(row_flip[start:end], dtype=np.bool_).reshape(-1),
-                dtype=np.bool_,
-            )
-            local_rows = np.ascontiguousarray(
-                np.arange(int(end - start), dtype=np.int64),
-                dtype=np.int64,
-            )
-            geno_blk = np.ascontiguousarray(
-                np.asarray(
-                    jxrs.bed_packed_decode_rows_f32(
-                        packed_subset,
-                        int(packed_n),
-                        local_rows,
-                        flip_blk,
-                        maf_blk,
-                        sample_indices=sample_idx_arr,
-                    ),
-                    dtype=np.float32,
-                ),
-                dtype=np.float32,
-            )
-            res_blk = np.ascontiguousarray(
-                np.asarray(mod.gwas(geno_blk, threads=max(1, int(threads))), dtype=np.float64),
-                dtype=np.float64,
-            )
-            site_objs: list[object] = []
-            snp_blk: list[str] = []
-            for site in sites_all[start:end]:
-                c, p, a0, a1, sid = _site_tuple_parts(site)
-                site_objs.append(jxrs.SiteInfo(str(c), int(p), str(sid), str(a0), str(a1)))
-                snp_blk.append(str(sid))
-            writer.write_chunk(site_objs, snp_blk, maf_blk, miss_blk, res_blk)
-            done = int(end)
-            if progress_callback is not None:
-                progress_callback(done, total)
-        writer.flush()
-        return int(done)
-    finally:
-        try:
-            writer.close()
-        except Exception:
-            pass
-
-
 def _packed_preload_ready_state(
     *,
     prefix: str,
@@ -4235,11 +4133,6 @@ def run_fvlmm_packed_fullrank(
                 fixed_lbd = float(lbd0_tmp)
         except Exception:
             fixed_lbd = None
-        if bool(getattr(null_fv_mod, "lowrank", False)):
-            eigvals = None
-            eigvecs = None
-            grm_fit = None
-            gc.collect()
 
         # Packed fixed-lambda routes currently expose only scan-stage progress. Keep a
         # placeholder stage-1 handle so shared cleanup code remains safe.
@@ -4299,158 +4192,130 @@ def run_fvlmm_packed_fullrank(
                 else _gwas_scan_stage_ctx
             )
             with scan_stage_ctx(max(1, int(threads))):
-                if bool(getattr(null_fv_mod, "lowrank", False)):
-                    sites_lowrank = _resolve_packed_sites_all(prefix, packed_row_idx, sites_all)
-                    _written_rows = _packed_lowrank_scan_to_tsv(
-                        mod=null_fv_mod,
-                        packed=packed,
-                        packed_n=int(packed_n),
-                        packed_row_idx=packed_row_idx,
-                        row_flip=row_flip,
-                        maf=maf,
-                        miss=miss,
-                        sites_all=sites_lowrank,
-                        sample_idx_trait=sample_idx_trait,
-                        out_tsv=str(tmp_tsv),
-                        chunk_size=int(max(1, int(chunk_size))),
-                        threads=int(max(1, int(threads))),
-                        genetic_model=str(genetic_model),
-                        progress_callback=_scan_progress if gwas_pbar is not None else None,
-                        )
-                    if int(_written_rows) != int(n_sites_active):
-                        _emit_warning_line(
-                            logger,
-                            f"{_route_model_label} low-rank writer row mismatch: expected={n_sites_active} wrote={int(_written_rows)}",
-                            use_spinner=bool(use_spinner),
-                        )
-                    lbd = float(getattr(null_fv_mod, "lbd_null", np.nan))
-                    ml0 = float(getattr(null_fv_mod, "ML0", np.nan))
-                    reml0 = float(getattr(null_fv_mod, "LL0", np.nan))
+                u_sub = np.ascontiguousarray(np.asarray(eigvecs, dtype=np.float32), dtype=np.float32)
+                s_trait = np.ascontiguousarray(np.maximum(eigvals, 0.0), dtype=np.float32)
+                sample_idx_scan_arg: Optional[np.ndarray]
+                if _is_full_identity_index(sample_idx_trait, int(packed_n)):
+                    u_trait = u_sub
+                    sample_idx_scan_arg = None
                 else:
-                    u_sub = np.ascontiguousarray(np.asarray(eigvecs, dtype=np.float32), dtype=np.float32)
-                    s_trait = np.ascontiguousarray(np.maximum(eigvals, 0.0), dtype=np.float32)
-                    sample_idx_scan_arg: Optional[np.ndarray]
-                    if _is_full_identity_index(sample_idx_trait, int(packed_n)):
-                        u_trait = u_sub
-                        sample_idx_scan_arg = None
-                    else:
-                        u_trait = np.zeros((int(packed_n), int(n_idv)), dtype=np.float32)
-                        u_trait[sample_idx_trait, :] = u_sub
-                        sample_idx_scan_arg = sample_idx_trait
-                    progress_kwargs: dict[str, object] = {
-                        "progress_callback": None,
-                        "progress_every": 0,
+                    u_trait = np.zeros((int(packed_n), int(n_idv)), dtype=np.float32)
+                    u_trait[sample_idx_trait, :] = u_sub
+                    sample_idx_scan_arg = sample_idx_trait
+                progress_kwargs: dict[str, object] = {
+                    "progress_callback": None,
+                    "progress_every": 0,
+                }
+                if gwas_pbar is not None:
+                    progress_kwargs = {
+                        "progress_callback": _scan_progress,
+                        "progress_every": int(
+                            max(
+                                1,
+                                min(
+                                    int(max(1, min(gwas_total, int(max(1, chunk_size))))),
+                                    _progress_callback_step(int(max(1, gwas_total))),
+                                ),
+                            )
+                        ),
                     }
-                    if gwas_pbar is not None:
-                        progress_kwargs = {
-                            "progress_callback": _scan_progress,
-                            "progress_every": int(
-                                max(
-                                    1,
-                                    min(
-                                        int(max(1, min(gwas_total, int(max(1, chunk_size))))),
-                                        _progress_callback_step(int(max(1, gwas_total))),
-                                    ),
-                                )
-                            ),
-                        }
-                    unified_done = False
-                    if _gwas_use_rust_unified_v1():
-                        try:
-                            jobs = [
-                                {
-                                    "model": _route_model_key,
-                                    "trait": str(pname),
-                                    "out_tsv": str(tmp_tsv),
-                                    "y": y_vec,
-                                    "x": x_arg,
-                                    "u": u_trait,
-                                    "s": s_trait,
-                                    "sample_indices": sample_idx_scan_arg,
-                                    "low": -5.0,
-                                    "high": 5.0,
-                                    "max_iter": 50,
-                                    "tol": 1e-2,
-                                    "tau": 0.0,
-                                    "genetic_model": str(genetic_model),
-                                    "fixed_lbd": (float(fixed_lbd) if fixed_lbd is not None else None),
-                                    "fixed_ml0": None,
-                                    "rotate_block_rows": int(max(1, int(chunk_size))),
-                                    "scan_progress_callback": _scan_progress,
-                                    "progress_every": int(
-                                        max(
-                                            1,
-                                            min(
-                                                int(max(1, int(chunk_size))),
-                                                _progress_callback_step(int(max(1, gwas_total))),
-                                            ),
-                                        )
-                                    ),
-                                }
-                            ]
-                            _res = jxrs.gwas_packed_unified_to_tsv(
-                                jobs,
-                                packed,
-                                int(packed_n),
-                                row_flip,
-                                maf,
-                                miss,
-                                [],
-                                [],
-                                [],
-                                [],
-                                [],
-                                int(max(1, int(chunk_size))),
-                                int(threads),
-                                None,
-                                int(max(1, int(chunk_size))),
-                                row_indices=packed_row_idx,
-                                bed_prefix=str(prefix),
-                            )
-                            r0 = _res[0]
-                            lbd = float(r0.get("lbd", np.nan))
-                            ml0 = float(r0.get("ml0", np.nan))
-                            reml0 = float(r0.get("reml0", np.nan))
-                            unified_done = True
-                        except Exception as ex:
-                            _emit_warning_line(
-                                logger,
-                                f"{_route_model_label} unified Rust dispatcher unavailable; fallback to legacy packed scan. reason={ex}",
-                                use_spinner=bool(use_spinner),
-                            )
-                            unified_done = False
-                    if not unified_done:
-                        lbd, ml0, reml0 = jxrs.fvlmm_assoc_packed_f32_to_tsv(
+                unified_done = False
+                if _gwas_use_rust_unified_v1():
+                    try:
+                        jobs = [
+                            {
+                                "model": _route_model_key,
+                                "trait": str(pname),
+                                "out_tsv": str(tmp_tsv),
+                                "y": y_vec,
+                                "x": x_arg,
+                                "u": u_trait,
+                                "s": s_trait,
+                                "sample_indices": sample_idx_scan_arg,
+                                "low": -5.0,
+                                "high": 5.0,
+                                "max_iter": 50,
+                                "tol": 1e-2,
+                                "tau": 0.0,
+                                "genetic_model": str(genetic_model),
+                                "fixed_lbd": (float(fixed_lbd) if fixed_lbd is not None else None),
+                                "fixed_ml0": None,
+                                "rotate_block_rows": int(max(1, int(chunk_size))),
+                                "scan_progress_callback": _scan_progress,
+                                "progress_every": int(
+                                    max(
+                                        1,
+                                        min(
+                                            int(max(1, int(chunk_size))),
+                                            _progress_callback_step(int(max(1, gwas_total))),
+                                        ),
+                                    )
+                                ),
+                            }
+                        ]
+                        _res = jxrs.gwas_packed_unified_to_tsv(
+                            jobs,
                             packed,
                             int(packed_n),
                             row_flip,
                             maf,
                             miss,
-                            u_trait,
-                            s_trait,
-                            y_vec,
-                            x_arg,
-                            sample_idx_scan_arg,
-                            -5.0,
-                            5.0,
-                            50,
-                            1e-2,
-                            0.0,
+                            [],
+                            [],
+                            [],
+                            [],
+                            [],
+                            int(max(1, int(chunk_size))),
                             int(threads),
-                            str(genetic_model),
-                            [],
-                            [],
-                            [],
-                            [],
-                            [],
-                            tmp_tsv,
+                            None,
+                            int(max(1, int(chunk_size))),
                             row_indices=packed_row_idx,
-                            fixed_lbd=(float(fixed_lbd) if fixed_lbd is not None else None),
-                            fixed_ml0=None,
-                            rotate_block_rows=int(max(1, int(chunk_size))),
                             bed_prefix=str(prefix),
-                            **progress_kwargs,
                         )
+                        r0 = _res[0]
+                        lbd = float(r0.get("lbd", np.nan))
+                        ml0 = float(r0.get("ml0", np.nan))
+                        reml0 = float(r0.get("reml0", np.nan))
+                        unified_done = True
+                    except Exception as ex:
+                        _emit_warning_line(
+                            logger,
+                            f"{_route_model_label} unified Rust dispatcher unavailable; fallback to legacy packed scan. reason={ex}",
+                            use_spinner=bool(use_spinner),
+                        )
+                        unified_done = False
+                if not unified_done:
+                    lbd, ml0, reml0 = jxrs.fvlmm_assoc_packed_f32_to_tsv(
+                        packed,
+                        int(packed_n),
+                        row_flip,
+                        maf,
+                        miss,
+                        u_trait,
+                        s_trait,
+                        y_vec,
+                        x_arg,
+                        sample_idx_scan_arg,
+                        -5.0,
+                        5.0,
+                        50,
+                        1e-2,
+                        0.0,
+                        int(threads),
+                        str(genetic_model),
+                        [],
+                        [],
+                        [],
+                        [],
+                        [],
+                        tmp_tsv,
+                        row_indices=packed_row_idx,
+                        fixed_lbd=(float(fixed_lbd) if fixed_lbd is not None else None),
+                        fixed_ml0=None,
+                        rotate_block_rows=int(max(1, int(chunk_size))),
+                        bed_prefix=str(prefix),
+                        **progress_kwargs,
+                    )
             scan_secs = max(time.monotonic() - scan_t0, 0.0)
             gwas_ok = True
         finally:
@@ -7110,95 +6975,76 @@ def run_lmm_packed_fullrank(
         tmp_tsv = _gwas_result_tmp_path(out_tsv)
         try:
             with _gwas_scan_stage_ctx(max(1, int(threads))):
-                if bool(getattr(mod, "lowrank", False)):
-                    sites_lowrank = _resolve_packed_sites_all(prefix, packed_row_idx, sites_all)
-                    _written_rows = _packed_lowrank_scan_to_tsv(
-                        mod=mod,
-                        packed=packed,
-                        packed_n=int(packed_n),
-                        packed_row_idx=packed_row_idx,
-                        row_flip=row_flip,
-                        maf=maf,
-                        miss=miss,
-                        sites_all=sites_lowrank,
-                        sample_idx_trait=sample_idx_trait,
-                        out_tsv=str(tmp_tsv),
-                        chunk_size=int(max(1, int(chunk_size))),
-                        threads=int(max(1, int(threads))),
-                        genetic_model=str(genetic_model),
-                        progress_callback=_lmm_progress if gwas_pbar is not None else None,
+                progress_kwargs: dict[str, object] = {}
+                if gwas_pbar is not None:
+                    progress_kwargs = {
+                        "progress_callback": _lmm_progress,
+                        "progress_every": int(
+                            max(
+                                1,
+                                min(
+                                    int(max(1, int(chunk_size))),
+                                    _progress_callback_step(int(max(1, gwas_total))),
+                                ),
+                            )
+                        ),
+                    }
+                null_ml0: Optional[float] = None
+                init_log10_lbd: Optional[float] = None
+                try:
+                    ml0_tmp = float(getattr(mod, "ML0"))
+                    if np.isfinite(ml0_tmp):
+                        null_ml0 = ml0_tmp
+                except Exception:
+                    null_ml0 = None
+                try:
+                    lbd0_tmp = float(getattr(mod, "lbd_null"))
+                    if np.isfinite(lbd0_tmp) and lbd0_tmp > 0.0:
+                        init_log10_lbd = float(np.log10(lbd0_tmp))
+                except Exception:
+                    init_log10_lbd = None
+                s_trait = np.ascontiguousarray(
+                    np.maximum(np.asarray(mod.S, dtype=np.float64).reshape(-1), 0.0),
+                    dtype=np.float64,
+                )
+                u_t = np.ascontiguousarray(np.asarray(mod.Dh, dtype=np.float32), dtype=np.float32)
+                if u_t.shape != (n_idv, n_idv):
+                    raise ValueError(
+                        f"Trait eigenvector shape mismatch: got {u_t.shape}, expected ({n_idv}, {n_idv})."
                     )
-                else:
-                    progress_kwargs: dict[str, object] = {}
-                    if gwas_pbar is not None:
-                        progress_kwargs = {
-                            "progress_callback": _lmm_progress,
-                            "progress_every": int(
-                                max(
-                                    1,
-                                    min(
-                                        int(max(1, int(chunk_size))),
-                                        _progress_callback_step(int(max(1, gwas_total))),
-                                    ),
-                                )
-                            ),
-                        }
-                    null_ml0: Optional[float] = None
-                    init_log10_lbd: Optional[float] = None
-                    try:
-                        ml0_tmp = float(getattr(mod, "ML0"))
-                        if np.isfinite(ml0_tmp):
-                            null_ml0 = ml0_tmp
-                    except Exception:
-                        null_ml0 = None
-                    try:
-                        lbd0_tmp = float(getattr(mod, "lbd_null"))
-                        if np.isfinite(lbd0_tmp) and lbd0_tmp > 0.0:
-                            init_log10_lbd = float(np.log10(lbd0_tmp))
-                    except Exception:
-                        init_log10_lbd = None
-                    s_trait = np.ascontiguousarray(
-                        np.maximum(np.asarray(mod.S, dtype=np.float64).reshape(-1), 0.0),
-                        dtype=np.float64,
-                    )
-                    u_t = np.ascontiguousarray(np.asarray(mod.Dh, dtype=np.float32), dtype=np.float32)
-                    if u_t.shape != (n_idv, n_idv):
-                        raise ValueError(
-                            f"Trait eigenvector shape mismatch: got {u_t.shape}, expected ({n_idv}, {n_idv})."
-                        )
-                    x_rot = np.ascontiguousarray(np.asarray(mod.Xcov, dtype=np.float64), dtype=np.float64)
-                    y_rot = np.ascontiguousarray(np.asarray(mod.y, dtype=np.float64).reshape(-1), dtype=np.float64)
+                x_rot = np.ascontiguousarray(np.asarray(mod.Xcov, dtype=np.float64), dtype=np.float64)
+                y_rot = np.ascontiguousarray(np.asarray(mod.y, dtype=np.float64).reshape(-1), dtype=np.float64)
 
-                    _written_rows = jxrs.lmm_reml_assoc_packed_f32_to_tsv(
-                        packed,
-                        int(packed_n),
-                        row_flip,
-                        maf,
-                        miss,
-                        s_trait,
-                        x_rot,
-                        y_rot,
-                        u_t,
-                        [],
-                        [],
-                        [],
-                        [],
-                        [],
-                        tmp_tsv,
-                        sample_idx_trait,
-                        row_indices=packed_row_idx,
-                        low=-5.0,
-                        high=5.0,
-                        max_iter=50,
-                        tol=1e-2,
-                        threads=int(threads),
-                        model="add",
-                        nullml=None,
-                        init_log10_lbd=init_log10_lbd,
-                        rotate_block_rows=int(max(1, int(chunk_size))),
-                        bed_prefix=str(prefix),
-                        **progress_kwargs,
-                    )
+                _written_rows = jxrs.lmm_reml_assoc_packed_f32_to_tsv(
+                    packed,
+                    int(packed_n),
+                    row_flip,
+                    maf,
+                    miss,
+                    s_trait,
+                    x_rot,
+                    y_rot,
+                    u_t,
+                    [],
+                    [],
+                    [],
+                    [],
+                    [],
+                    tmp_tsv,
+                    sample_idx_trait,
+                    row_indices=packed_row_idx,
+                    low=-5.0,
+                    high=5.0,
+                    max_iter=50,
+                    tol=1e-2,
+                    threads=int(threads),
+                    model="add",
+                    nullml=None,
+                    init_log10_lbd=init_log10_lbd,
+                    rotate_block_rows=int(max(1, int(chunk_size))),
+                    bed_prefix=str(prefix),
+                    **progress_kwargs,
+                )
                 if int(_written_rows) != int(n_sites_active):
                     _emit_warning_line(
                         logger,

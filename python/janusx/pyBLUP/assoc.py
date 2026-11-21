@@ -5,7 +5,6 @@ High-level Python APIs wrapping Rust-accelerated association tests.
 This module provides:
   - FEM(): fast fixed-effect model (LM / GLM-like) GWAS scan in chunks
   - lmm_reml(): REML-based LMM GWAS scan on rotated genotype chunks
-  - fastlmm_*(): FaST-LMM (rank-k + residual) wrappers
   - LMM / LM: convenient OO wrappers for repeated scans
   - SUPER(): correlation-based de-redundancy helper reused by GARFIELD
 
@@ -343,8 +342,6 @@ def _resolve_matrix_file_hint(matrix: object) -> Optional[str]:
 
 # Rust core kernels (PyO3 extension)
 from janusx.janusx import (
-    fastlmm_prepare_lowrank_f64,
-    fastlmm_assoc_from_snp_f32,
     lm_block_assoc_f32,
     lmm_reml_chunk_f32,
     lmm_reml_null_f32,
@@ -352,10 +349,6 @@ from janusx.janusx import (
     lmm_null_pve_se_f64,
     ml_loglike_null_f32,
     lmm_assoc_chunk_f32,
-    fastlmm_reml_chunk_f32,
-    fastlmm_reml_null_f32,
-    fastlmm_null_fit_f32,
-    fastlmm_assoc_chunk_f32,
 )
 import janusx.janusx as _jxrs
 from janusx._optional_deps import load_optional_native_symbols
@@ -1149,300 +1142,31 @@ def lmm_ml_null(
     return float(10.0 ** best_log10), ml0
 
 
-def fastlmm_reml_null(
-    S: np.ndarray,
-    u1tx: np.ndarray,
-    u2tx: np.ndarray,
-    u1ty: np.ndarray,
-    u2ty: np.ndarray,
-    bounds: tuple,
-    max_iter: int = 50,
-    tol: float = 1e-2,
-    model: str = "add",
-) -> Tuple[float, float, float]:
-    """
-    FaST-LMM null-model REML optimization (rank-k + residual space).
-
-    This is a thin wrapper over Rust `fastlmm_reml_null_f32`.
-
-    Parameters
-    ----------
-    S : np.ndarray, shape (k,)
-        Eigenvalues (or s^2) corresponding to the low-rank space U (k components).
-
-    u1tx : np.ndarray, shape (k, p)
-        Projected covariates in U space (U^T @ X).
-
-    u2tx : np.ndarray, shape (n, p)
-        Residual covariates (X - U @ (U^T @ X)).
-
-    u1ty : np.ndarray, shape (k,)
-        Projected phenotype (U^T @ y).
-
-    u2ty : np.ndarray, shape (n,)
-        Residual phenotype (y - U @ (U^T @ y)).
-
-    bounds : tuple (low, high)
-        Search bounds in log10(lambda).
-
-    max_iter : int
-        Max iterations in Brent optimizer.
-
-    tol : float
-        Convergence tolerance in log10(lambda).
-
-    model : {"add"}
-        The only supported genetic effect coding mode.
-
-    Returns
-    -------
-    lbd : float
-        Estimated lambda (ve/vg).
-
-    ml : float
-        Null ML evaluated at the returned REML lambda (higher is better).
-        This legacy value is not the maximized ML used for model selection.
-
-    reml : float
-        REML log-likelihood (higher is better).
-    """
-    if str(model).strip().lower() != "add":
-        raise ValueError("FastLMM currently supports only additive coding (model='add').")
-    low, high = bounds
-    S = np.ascontiguousarray(S, dtype=np.float64).ravel()
-    u1tx = np.ascontiguousarray(u1tx, dtype=np.float64)
-    u2tx = np.ascontiguousarray(u2tx, dtype=np.float64)
-    u1ty = np.ascontiguousarray(u1ty, dtype=np.float64).ravel()
-    u2ty = np.ascontiguousarray(u2ty, dtype=np.float64).ravel()
-
-    lbd, ml, reml = fastlmm_reml_null_f32(
-        S,
-        u1tx,
-        u2tx,
-        u1ty,
-        u2ty,
-        float(low),
-        float(high),
-        int(max_iter),
-        float(tol),
-        str(model),
+def _raise_fastlmm_removed(api_name: str, replacement: str) -> None:
+    raise RuntimeError(
+        f"`{api_name}` was removed along with the low-rank FaST-LMM backend. "
+        f"Use full-rank `{replacement}` instead."
     )
-    return lbd, ml, reml
 
 
-def fastlmm_reml(
-    S: np.ndarray,
-    u1tx: np.ndarray,
-    u2tx: np.ndarray,
-    u1ty: np.ndarray,
-    u2ty: np.ndarray,
-    snp_chunk: np.ndarray,
-    u1t: np.ndarray,
-    bounds: tuple,
-    max_iter: int = 50,
-    tol: float = 1e-2,
-    threads: int = 4,
-    nullml: Optional[float] = None,
-    model: str = "add",
-) -> np.ndarray:
-    """
-    FaST-LMM REML scan on a SNP chunk (rank-k + residual space).
-
-    This is a thin wrapper over Rust `fastlmm_reml_chunk_f32`.
-
-    Parameters
-    ----------
-    S : np.ndarray, shape (k,)
-        Eigenvalues (or s^2) for the low-rank space.
-
-    u1tx : np.ndarray, shape (k, p)
-        Projected covariates in U space (U^T @ X).
-
-    u2tx : np.ndarray, shape (n, p)
-        Residual covariates (X - U @ (U^T @ X)).
-
-    u1ty : np.ndarray, shape (k,)
-        Projected phenotype (U^T @ y).
-
-    u2ty : np.ndarray, shape (n,)
-        Residual phenotype (y - U @ (U^T @ y)).
-
-    snp_chunk : np.ndarray, shape (m, n)
-        Raw SNP chunk (SNP-major), before projection.
-
-    u1t : np.ndarray, shape (k, n)
-        Projection matrix U^T used by Rust to project SNPs internally.
-
-    bounds : tuple (low, high)
-        Search bounds in log10(lambda).
-
-    max_iter : int
-        Max iterations in Brent optimizer.
-
-    tol : float
-        Convergence tolerance in log10(lambda).
-
-    threads : int
-        Rust worker threads.
-
-    nullml : float, optional
-        Null-model ML log-likelihood. If provided, plrt is appended.
-
-    model : {"add"}
-        The only supported genetic effect coding mode.
-
-    Returns
-    -------
-    beta_se_p : np.ndarray, shape (m, 3) or (m, 4)
-        Per-SNP beta, standard error, pwald.
-        If nullml is provided, an extra column plrt is appended.
-    """
-    if str(model).strip().lower() != "add":
-        raise ValueError("FastLMM currently supports only additive coding (model='add').")
-    low, high = bounds
-    S = np.ascontiguousarray(S, dtype=np.float64).ravel()
-    u1tx = np.ascontiguousarray(u1tx, dtype=np.float64)
-    u2tx = np.ascontiguousarray(u2tx, dtype=np.float64)
-    u1ty = np.ascontiguousarray(u1ty, dtype=np.float64).ravel()
-    u2ty = np.ascontiguousarray(u2ty, dtype=np.float64).ravel()
-
-    snp_chunk = np.ascontiguousarray(snp_chunk, dtype=np.float32)
-    u1t = np.ascontiguousarray(u1t, dtype=np.float32)
-
-    beta_se_p = fastlmm_reml_chunk_f32(
-        S,
-        u1tx,
-        u2tx,
-        u1ty,
-        u2ty,
-        snp_chunk,
-        u1t,
-        float(low),
-        float(high),
-        int(max_iter),
-        float(tol),
-        int(threads),
-        None if nullml is None else float(nullml),
-        str(model),
-    )
-    return beta_se_p
+def fastlmm_reml_null(*args, **kwargs):
+    """Removed low-rank FaST-LMM null REML API (use `lmm_reml_null`)."""
+    _raise_fastlmm_removed("fastlmm_reml_null", "lmm_reml_null")
 
 
-def fastlmm_assoc_chunk(
-    S: np.ndarray,
-    u1tx: np.ndarray,
-    u2tx: np.ndarray,
-    u1ty: np.ndarray,
-    u2ty: np.ndarray,
-    log10_lbd: float,
-    u1tsnp_chunk: np.ndarray,
-    u2tsnp_chunk: np.ndarray,
-    threads: int = 4,
-    nullml: Optional[float] = None,
-) -> np.ndarray:
-    """
-    FaST-LMM fixed-lambda association on a SNP chunk.
-
-    This is a thin wrapper over Rust `fastlmm_assoc_chunk_f32`.
-
-    Parameters
-    ----------
-    S : np.ndarray, shape (k,)
-        Eigenvalues (or s^2) for the low-rank space.
-
-    u1tx : np.ndarray, shape (k, p)
-        Projected covariates in U space (U^T @ X).
-
-    u2tx : np.ndarray, shape (n, p)
-        Residual covariates (X - U @ (U^T @ X)).
-
-    u1ty : np.ndarray, shape (k,)
-        Projected phenotype (U^T @ y).
-
-    u2ty : np.ndarray, shape (n,)
-        Residual phenotype (y - U @ (U^T @ y)).
-
-    log10_lbd : float
-        Fixed log10(lambda) for all SNPs.
-
-    u1tsnp_chunk : np.ndarray, shape (m, k)
-        Projected SNP chunk in U space (SNP-major).
-
-    u2tsnp_chunk : np.ndarray, shape (m, n)
-        Residual SNP chunk (SNP-major).
-
-    threads : int
-        Rust worker threads.
-
-    nullml : float, optional
-        Null-model ML log-likelihood. If provided, plrt is appended.
-
-    Returns
-    -------
-    beta_se_p : np.ndarray, shape (m, 3) or (m, 4)
-        Per-SNP beta, standard error, pwald.
-        If nullml is provided, an extra column plrt is appended.
-    """
-    S = np.ascontiguousarray(S, dtype=np.float64).ravel()
-    u1tx = np.ascontiguousarray(u1tx, dtype=np.float64)
-    u2tx = np.ascontiguousarray(u2tx, dtype=np.float64)
-    u1ty = np.ascontiguousarray(u1ty, dtype=np.float64).ravel()
-    u2ty = np.ascontiguousarray(u2ty, dtype=np.float64).ravel()
-
-    u1tsnp_chunk = np.ascontiguousarray(u1tsnp_chunk, dtype=np.float32)
-    u2tsnp_chunk = np.ascontiguousarray(u2tsnp_chunk, dtype=np.float32)
-
-    beta_se_p = fastlmm_assoc_chunk_f32(
-        S,
-        u1tx,
-        u2tx,
-        u1ty,
-        u2ty,
-        float(log10_lbd),
-        u1tsnp_chunk,
-        u2tsnp_chunk,
-        int(threads),
-        None if nullml is None else float(nullml),
-    )
-    return beta_se_p
+def fastlmm_reml(*args, **kwargs):
+    """Removed low-rank FaST-LMM REML scan API (use `lmm_reml`)."""
+    _raise_fastlmm_removed("fastlmm_reml", "lmm_reml")
 
 
-def fastlmm_assoc_from_snp(
-    S: np.ndarray,
-    u1tx: np.ndarray,
-    u2tx: np.ndarray,
-    u1ty: np.ndarray,
-    u2ty: np.ndarray,
-    log10_lbd: float,
-    snp_chunk: np.ndarray,
-    u1t: np.ndarray,
-    threads: int = 4,
-    nullml: Optional[float] = None,
-) -> np.ndarray:
-    """
-    Fixed-lambda FaST-LMM scan on SNP-major chunk with internal low-rank projection.
-    """
-    S = np.ascontiguousarray(S, dtype=np.float64).ravel()
-    u1tx = np.ascontiguousarray(u1tx, dtype=np.float64)
-    u2tx = np.ascontiguousarray(u2tx, dtype=np.float64)
-    u1ty = np.ascontiguousarray(u1ty, dtype=np.float64).ravel()
-    u2ty = np.ascontiguousarray(u2ty, dtype=np.float64).ravel()
-    snp_chunk = np.ascontiguousarray(snp_chunk, dtype=np.float32)
-    u1t = np.ascontiguousarray(u1t, dtype=np.float32)
+def fastlmm_assoc_chunk(*args, **kwargs):
+    """Removed low-rank FaST-LMM fixed-lambda API (use `fvlmm_assoc_fixed`)."""
+    _raise_fastlmm_removed("fastlmm_assoc_chunk", "fvlmm_assoc_fixed")
 
-    beta_se_p = fastlmm_assoc_from_snp_f32(
-        S,
-        u1tx,
-        u2tx,
-        u1ty,
-        u2ty,
-        float(log10_lbd),
-        snp_chunk,
-        u1t,
-        int(threads),
-        None if nullml is None else float(nullml),
-    )
-    return beta_se_p
+
+def fastlmm_assoc_from_snp(*args, **kwargs):
+    """Removed low-rank FaST-LMM raw-SNP API (use `fvlmm_assoc_fixed_from_snp`)."""
+    _raise_fastlmm_removed("fastlmm_assoc_from_snp", "fvlmm_assoc_fixed_from_snp")
 
 
 def ml_loglike_null(
@@ -1751,9 +1475,7 @@ class LMM:
     LMM GWAS with ridge-stabilized full-rank spectral GRM.
     """
 
-    _LOWRANK_REL_TOL = 1e-8
     _GRM_EIGH_RIDGE = 1e-6
-    _ENABLE_LOWRANK_FAST = False
     _NULL_REML_TOL = 1e-6
 
     def __init__(self, y: np.ndarray, X: Optional[np.ndarray], kinship: np.ndarray):
@@ -1918,26 +1640,13 @@ class LMM:
             dtype=np.int64,
         )
 
-        lam_max = float(np.max(s_full)) if s_full.size > 0 else 0.0
-        rank_thr = float(self._LOWRANK_REL_TOL) * max(lam_max, 0.0)
-        keep_mask = np.isfinite(s_full) & (s_full > rank_thr)
-        rank = int(np.sum(keep_mask))
-        allow_lowrank = bool(self._ENABLE_LOWRANK_FAST)
-
         self.n = int(n)
         self.rank = int(n)
-        self.lowrank = bool(allow_lowrank and (0 < rank < n))
         self.full_rank = True
-        self.rank_threshold = float(rank_thr)
         self.evd_secs = float(evd_secs)
         self.trace_mean = float(np.sum(np.clip(s_full, 0.0, None), dtype=np.float64) / float(max(1, n)))
         self.Xcov = None
         self.Dh = None
-        self.u1t = None
-        self.u1tx = None
-        self.u2tx = None
-        self.u1ty = None
-        self.u2ty = None
         self._fvlmm_assoc_cache = None
         self._fvlmm_assoc_cache_log10_lbd = None
         self.sigma_g2_null = float("nan")
@@ -1946,79 +1655,37 @@ class LMM:
         self.pve_vc_ratio_raw = float("nan")
         self.pve_component_ratio_raw = float("nan")
 
-        if self.lowrank:
-            (
-                rank_out,
-                trace_mean,
-                s_keep,
-                u1t,
-                u1tx,
-                u2tx,
-                u1ty,
-                u2ty,
-            ) = fastlmm_prepare_lowrank_f64(
-                s_full,
-                u_full,
-                X_design,
-                y_vec,
-                rel_tol=float(self._LOWRANK_REL_TOL),
+        self.S = s_full
+        self.Dh = np.ascontiguousarray(u_full.T.astype(np.float32), dtype=np.float32)
+        if _lmm_rotate_x_y_with_ut_f64 is None:
+            raise RuntimeError(
+                "Rust extension missing lmm_rotate_x_y_with_ut_f64. "
+                "Rebuild janusx extension for Rust-only GWAS mode."
             )
-            self.rank = int(rank_out)
-            self.trace_mean = float(trace_mean)
-            self.S = np.ascontiguousarray(np.asarray(s_keep, dtype=np.float64).reshape(-1), dtype=np.float64)
-            self.u1t = np.ascontiguousarray(np.asarray(u1t, dtype=np.float32), dtype=np.float32)
-            self.u1tx = np.ascontiguousarray(np.asarray(u1tx, dtype=np.float64), dtype=np.float64)
-            self.u2tx = np.ascontiguousarray(np.asarray(u2tx, dtype=np.float64), dtype=np.float64)
-            self.u1ty = np.ascontiguousarray(np.asarray(u1ty, dtype=np.float64).reshape(-1), dtype=np.float64)
-            self.u2ty = np.ascontiguousarray(np.asarray(u2ty, dtype=np.float64).reshape(-1), dtype=np.float64)
-            self.y = y_vec.reshape(-1, 1)
-            lbd_null, ml0, reml, ml0_model_selection = fastlmm_null_fit_f32(
-                self.S,
-                self.u1tx,
-                self.u2tx,
-                self.u1ty,
-                self.u2ty,
-                -5.0,
-                5.0,
-                max_iter=50,
-                tol=self._NULL_REML_TOL,
-                model="add",
-            )
-            vg_null = float(self.trace_mean)
-            sigma_g2_null = float("nan")
-            sigma_e2_null = float("nan")
-        else:
-            self.S = s_full
-            self.Dh = np.ascontiguousarray(u_full.T.astype(np.float32), dtype=np.float32)
-            if _lmm_rotate_x_y_with_ut_f64 is None:
-                raise RuntimeError(
-                    "Rust extension missing lmm_rotate_x_y_with_ut_f64. "
-                    "Rebuild janusx extension for Rust-only GWAS mode."
-                )
-            xcov_rot, y_rot = _lmm_rotate_x_y_with_ut_f64(
-                self.Dh,
-                X_design,
-                y_vec,
-                int(_infer_blas_threads_from_env() or 0),
-            )
-            self.Xcov = np.ascontiguousarray(np.asarray(xcov_rot, dtype=np.float64), dtype=np.float64)
-            self.y = np.ascontiguousarray(np.asarray(y_rot, dtype=np.float64), dtype=np.float64)
-            lbd_null, ml0, reml, ml0_model_selection = lmm_null_fit_f32(
-                self.S,
-                self.Xcov,
-                self.y.reshape(-1),
-                -5.0,
-                5.0,
-                max_iter=50,
-                tol=self._NULL_REML_TOL,
-            )
-            sigma_g2_null, sigma_e2_null = _lmm_profile_exact_vc(
-                self.S,
-                self.Xcov,
-                self.y,
-                lbd_null,
-            )
-            vg_null = float(np.mean(np.clip(self.S, 0.0, None)))
+        xcov_rot, y_rot = _lmm_rotate_x_y_with_ut_f64(
+            self.Dh,
+            X_design,
+            y_vec,
+            int(_infer_blas_threads_from_env() or 0),
+        )
+        self.Xcov = np.ascontiguousarray(np.asarray(xcov_rot, dtype=np.float64), dtype=np.float64)
+        self.y = np.ascontiguousarray(np.asarray(y_rot, dtype=np.float64), dtype=np.float64)
+        lbd_null, ml0, reml, ml0_model_selection = lmm_null_fit_f32(
+            self.S,
+            self.Xcov,
+            self.y.reshape(-1),
+            -5.0,
+            5.0,
+            max_iter=50,
+            tol=self._NULL_REML_TOL,
+        )
+        sigma_g2_null, sigma_e2_null = _lmm_profile_exact_vc(
+            self.S,
+            self.Xcov,
+            self.y,
+            lbd_null,
+        )
+        vg_null = float(np.mean(np.clip(self.S, 0.0, None)))
 
         self.lbd_null = float(lbd_null)
         self.sigma_g2_null = float(sigma_g2_null)
@@ -2044,7 +1711,7 @@ class LMM:
             self.pve_component_ratio_raw = float("nan")
         self.pve_pheno_scale = float(self.pve)
         self.pve_se = float("nan")
-        if not self.lowrank and np.isfinite(self.lbd_null) and self.lbd_null > 0.0:
+        if np.isfinite(self.lbd_null) and self.lbd_null > 0.0:
             self.pve_se = float(
                 lmm_null_pve_se_f64(
                     self.S,
@@ -2094,15 +1761,8 @@ class LMM:
             "evd_secs",
             "n",
             "rank",
-            "lowrank",
             "full_rank",
-            "rank_threshold",
             "trace_mean",
-            "u1t",
-            "u1tx",
-            "u2tx",
-            "u1ty",
-            "u2ty",
             "_fvlmm_assoc_cache",
             "_fvlmm_assoc_cache_log10_lbd",
         ):
@@ -2158,22 +1818,6 @@ class LMM:
         """
         Run LMM GWAS on a SNP-major genotype matrix/chunk.
         """
-        if bool(getattr(self, "lowrank", False)):
-            return fastlmm_reml(
-                self.S,
-                self.u1tx,
-                self.u2tx,
-                self.u1ty,
-                self.u2ty,
-                np.ascontiguousarray(np.asarray(snp, dtype=np.float32), dtype=np.float32),
-                self.u1t,
-                self.bounds,
-                max_iter=30,
-                tol=1e-2,
-                threads=threads,
-                nullml=None,
-                model="add",
-            )
         beta_se_p = lmm_reml_from_snp(
             self.S,
             self.Xcov,
@@ -2198,10 +1842,6 @@ class LMM2(LMM):
     """
 
     def gwas(self, snp: np.ndarray, threads: int = 1) -> np.ndarray:
-        if bool(getattr(self, "lowrank", False)):
-            raise RuntimeError(
-                "LMM2 currently requires the full-rank spectral LMM path."
-            )
         ml0_exact = getattr(self, "_lmm2_ml0_exact", None)
         if ml0_exact is None or (not np.isfinite(float(ml0_exact))):
             lbd_ml, ml0_exact = lmm_ml_null(
@@ -2238,19 +1878,6 @@ class FastLMM(LMM):
             return super().gwas(snp, threads=threads)
 
         log10_lbd = float(np.log10(self.lbd_null))
-        if bool(getattr(self, "lowrank", False)):
-            return fastlmm_assoc_from_snp(
-                self.S,
-                self.u1tx,
-                self.u2tx,
-                self.u1ty,
-                self.u2ty,
-                log10_lbd,
-                np.ascontiguousarray(np.asarray(snp, dtype=np.float32), dtype=np.float32),
-                self.u1t,
-                threads=threads,
-                nullml=None,
-            )
         beta_se_p = lmm_assoc_fixed_from_snp(
             self.S,
             self.Xcov,
@@ -2274,8 +1901,6 @@ class FvLMM(LMM):
     """
 
     def _ensure_assoc_cache(self, log10_lbd: float) -> Optional[object]:
-        if bool(getattr(self, "lowrank", False)):
-            return None
         if (
             _fvlmm_assoc_prepare_cache_f32 is None
             or (
@@ -2314,11 +1939,6 @@ class FvLMM(LMM):
             raise RuntimeError("FvLMM.gwas_rotated requires a finite positive null lambda.")
 
         log10_lbd = float(np.log10(lbd_null))
-        if bool(getattr(self, "lowrank", False)):
-            raise RuntimeError(
-                "FvLMM.gwas_rotated is only available for full-rank spectral path."
-            )
-
         cache = self._ensure_assoc_cache(log10_lbd)
         if cache is not None and _fvlmm_assoc_chunk_with_cache_f32 is not None:
             return fvlmm_assoc_fixed_with_cache(
@@ -2343,19 +1963,6 @@ class FvLMM(LMM):
             return super().gwas(snp, threads=threads)
 
         log10_lbd = float(np.log10(lbd_null))
-        if bool(getattr(self, "lowrank", False)):
-            return fastlmm_assoc_from_snp(
-                self.S,
-                self.u1tx,
-                self.u2tx,
-                self.u1ty,
-                self.u2ty,
-                log10_lbd,
-                np.ascontiguousarray(np.asarray(snp, dtype=np.float32), dtype=np.float32),
-                self.u1t,
-                threads=threads,
-                nullml=None,
-            )
         cache = self._ensure_assoc_cache(log10_lbd)
         if cache is not None and _fvlmm_assoc_chunk_from_snp_with_cache_f32 is not None:
             return fvlmm_assoc_fixed_from_snp_with_cache(

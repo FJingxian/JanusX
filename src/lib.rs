@@ -31,8 +31,6 @@ mod ct;
 mod decode;
 #[path = "stats/farmcpu.rs"]
 mod farmcpu;
-#[path = "stats/fastlmm_lowrank.rs"]
-mod fastlmm_lowrank;
 #[path = "stats/fst.rs"]
 mod fst;
 #[path = "stats/fvlmm.rs"]
@@ -222,15 +220,12 @@ use eigh::{
 use farmcpu::{
     farmcpu_packed_to_tsv, farmcpu_rem_packed, farmcpu_super_packed, farmcpu_write_assoc_tsv,
 };
-use fast_math::fastlmm_prepare_lowrank_f64;
 use fst::{fst_bed, fst_bed_to_tsv, fst_bed_window_to_tsv};
 use fvlmm::{
-    fastlmm_assoc_chunk_f32, fastlmm_assoc_from_snp_f32, fastlmm_null_fit_f32,
-    fastlmm_reml_chunk_f32, fastlmm_reml_null_f32, fvlmm_assoc_bed_to_tsv_f32,
-    fvlmm_assoc_chunk_f32, fvlmm_assoc_chunk_from_snp_f32, fvlmm_assoc_chunk_from_snp_to_tsv_f32,
-    fvlmm_assoc_chunk_from_snp_with_cache_f32, fvlmm_assoc_chunk_with_cache_f32,
-    fvlmm_assoc_kfile_to_tsv_f32, fvlmm_assoc_packed_f32_to_tsv, fvlmm_assoc_prepare_cache_f32,
-    FvLmmAssocCache,
+    fvlmm_assoc_bed_to_tsv_f32, fvlmm_assoc_chunk_f32, fvlmm_assoc_chunk_from_snp_f32,
+    fvlmm_assoc_chunk_from_snp_to_tsv_f32, fvlmm_assoc_chunk_from_snp_with_cache_f32,
+    fvlmm_assoc_chunk_with_cache_f32, fvlmm_assoc_kfile_to_tsv_f32,
+    fvlmm_assoc_packed_f32_to_tsv, fvlmm_assoc_prepare_cache_f32, FvLmmAssocCache,
 };
 use fvlmm2::fvlmm2_assoc_chunk_f32;
 use garfield::{
@@ -324,11 +319,9 @@ use reml::{
 use rrblup::{
     rrblup_exact_snp_fit_prepared, rrblup_exact_snp_fit_prepared_bed, rrblup_exact_snp_packed,
     rrblup_exact_snp_prepare_bed_from_meta, rrblup_pcg_bed, rrblup_standardized_grm_from_source,
-    RrblupExactSnpCache,
-};
-use rrblupc::{
     rrblupc_exact_snp_fit_prepared, rrblupc_exact_snp_fit_prepared_bed, rrblupc_exact_snp_packed,
     rrblupc_exact_snp_prepare_bed_from_meta, rrblupc_pcg_bed, RrblupCenteredExactSnpCache,
+    RrblupExactSnpCache,
 };
 use rsvd::py_rsvd_packed_subset;
 use sim::{sim_trait_accumulate_i8_f32, SimChunkGenerator, SimEngine, SimTraitAccumulator};
@@ -1076,12 +1069,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(lmm_reml_lmm2_assoc_bed_to_tsv_f32, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_reml_assoc_packed_f32, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_reml_assoc_packed_f32_to_tsv, m)?)?;
-    m.add_function(wrap_pyfunction!(fastlmm_assoc_chunk_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(fastlmm_assoc_from_snp_f32, m)?)?;
     m.add_function(wrap_pyfunction!(fvlmm_assoc_packed_f32_to_tsv, m)?)?;
-    m.add_function(wrap_pyfunction!(fastlmm_reml_null_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(fastlmm_null_fit_f32, m)?)?;
-    m.add_function(wrap_pyfunction!(fastlmm_reml_chunk_f32, m)?)?;
     m.add_function(wrap_pyfunction!(bayesa, m)?)?;
     m.add_function(wrap_pyfunction!(bayesb, m)?)?;
     m.add_function(wrap_pyfunction!(bayesc, m)?)?;

@@ -688,17 +688,34 @@ def _inspect_target_dimensions(
     raise ValueError(f"unsupported target kind for progress inspection: {target_kind}")
 
 
-def _inspect_reference_samples(reference: Path | None) -> int:
+def _inspect_reference_dimensions(
+    reference: Path | None,
+    region,
+    *,
+    map_path: Path | None,
+    window_cm: float,
+    overlap_cm: float,
+    window_markers: int,
+    threads: int,
+) -> _WindowInspection | None:
     if reference is None:
-        return 0
+        return None
     lower = str(reference).lower()
-    if lower.endswith(".vcf") or lower.endswith(".vcf.gz"):
-        with _open_text_input(reference) as handle:
-            for raw in handle:
-                if raw.startswith("#CHROM"):
-                    return max(0, len(raw.rstrip("\n").split("\t")) - 9)
-        return 0
-    return _count_sample_rows(Path(f"{reference}.psam"))
+    reference_kind = (
+        "vcf"
+        if lower.endswith(".vcf") or lower.endswith(".vcf.gz")
+        else "pfile"
+    )
+    return _inspect_target_dimensions(
+        reference_kind,
+        reference,
+        region,
+        map_path=map_path,
+        window_cm=window_cm,
+        overlap_cm=overlap_cm,
+        window_markers=window_markers,
+        threads=threads,
+    )
 
 
 def _process_rss_bytes() -> int:
@@ -736,16 +753,34 @@ def _set_preflight_estimate(
     inspection: _WindowInspection,
     *,
     options: dict[str, object],
-    reference_samples: int,
+    reference_inspection: _WindowInspection | None,
 ) -> _WindowInspection:
+    reference_samples = (
+        0 if reference_inspection is None else reference_inspection.samples
+    )
+    reference_markers = (
+        0 if reference_inspection is None else reference_inspection.max_window_markers
+    )
+    union_markers = min(
+        int(options["window_markers"]),
+        max(inspection.max_window_markers, reference_markers),
+    )
+    window_cm_span = max(
+        inspection.max_window_cm_span,
+        0.0
+        if reference_inspection is None
+        else reference_inspection.max_window_cm_span,
+    )
     window_bytes = int(
         jxrs.imp_estimate_window_bytes(
             json.dumps(options),
             inspection.samples,
             reference_samples,
             max(inspection.max_window_markers, 1),
+            max(reference_markers, 0),
+            max(union_markers, 1),
             max(inspection.max_initial_pbwt_chunk_markers, 1),
-            max(float(inspection.max_window_cm_span), 0.0),
+            max(float(window_cm_span), 0.0),
         )
     )
     # The active-window model does not include resident allocator, reader, and
@@ -1631,10 +1666,21 @@ def main() -> int:
                 raise ValueError(
                     "no markers remain inside the requested -bimrange"
                 )
+            reference_inspection = _inspect_reference_dimensions(
+                reference,
+                region,
+                map_path=None
+                if args.map is None
+                else Path(args.map).expanduser(),
+                window_cm=float(args.window),
+                overlap_cm=float(args.overlap),
+                window_markers=int(args.window_markers),
+                threads=int(args.threads),
+            )
             inspection = _set_preflight_estimate(
                 inspection,
                 options=options,
-                reference_samples=_inspect_reference_samples(reference),
+                reference_inspection=reference_inspection,
             )
         except Exception as exc:
             message = f"Peak-memory preflight unavailable: {exc}"

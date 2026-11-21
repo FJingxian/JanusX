@@ -688,7 +688,9 @@ fn imp_estimate_window_bytes(
     options_json: String,
     target_samples: usize,
     reference_samples: usize,
-    max_window_markers: usize,
+    max_target_window_markers: usize,
+    max_reference_window_markers: usize,
+    max_union_window_markers: usize,
     max_initial_pbwt_chunk_markers: usize,
     max_window_cm_span: f64,
 ) -> PyResult<u64> {
@@ -698,7 +700,9 @@ fn imp_estimate_window_bytes(
         &config,
         target_samples,
         reference_samples,
-        max_window_markers,
+        max_target_window_markers,
+        max_reference_window_markers,
+        max_union_window_markers,
         max_initial_pbwt_chunk_markers,
         max_window_cm_span,
     )

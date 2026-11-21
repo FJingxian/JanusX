@@ -845,7 +845,9 @@ pub fn estimate_imp_window_bytes(
     config: &ImpConfig,
     target_samples: usize,
     reference_samples: usize,
-    max_window_markers: usize,
+    max_target_window_markers: usize,
+    max_reference_window_markers: usize,
+    max_union_window_markers: usize,
     max_initial_pbwt_chunk_markers: usize,
     max_window_cm_span: f64,
 ) -> Result<u64, String> {
@@ -855,15 +857,19 @@ pub fn estimate_imp_window_bytes(
     if config.threads == 0 {
         return Err("memory estimate requires at least one worker".to_owned());
     }
-    let marker_count = max_window_markers.min(config.window_markers);
-    if marker_count == 0 {
+    let target_marker_count = max_target_window_markers.min(config.window_markers);
+    let reference_marker_count = max_reference_window_markers.min(config.window_markers);
+    let union_marker_count = max_union_window_markers
+        .min(config.window_markers)
+        .max(target_marker_count);
+    if target_marker_count == 0 || union_marker_count == 0 {
         return Err("memory estimate requires at least one marker".to_owned());
     }
 
-    // Metadata-only planning cannot observe multiallelic records. Use the
-    // common biallelic width as the baseline and keep the estimate labeled as
-    // an estimate rather than presenting it as a hard allocation guarantee.
-    let bits_per_allele = 2;
+    // Metadata-only planning cannot observe multiallelic records. Most inputs
+    // are biallelic, whose allele index needs one bit; PhaseTrack additionally
+    // stores a second missingness bit.
+    let bits_per_allele = 1;
     let phase_samples = target_samples
         .checked_add(reference_samples)
         .ok_or_else(|| "memory estimate phase sample count overflow".to_owned())?;
@@ -875,7 +881,8 @@ pub fn estimate_imp_window_bytes(
     let mut estimate = memory::estimate_window(
         target_samples,
         reference_samples,
-        marker_count,
+        target_marker_count,
+        union_marker_count,
         config.phase_states,
         imp_states,
         bits_per_allele,
@@ -884,30 +891,48 @@ pub fn estimate_imp_window_bytes(
     memory::include_phase_pbwt_donors(
         &mut estimate,
         phase_samples,
-        max_phase_pbwt_steps(config, marker_count),
+        max_phase_pbwt_steps(config, target_marker_count),
     )?;
-    memory::include_initial_phase_pbwt_workspace(
+    memory::include_initial_phase_pbwt_workspace_exact(
         &mut estimate,
-        phase_samples,
-        max_initial_pbwt_chunk_markers.clamp(1, marker_count),
+        target_samples,
+        reference_samples,
+        target_marker_count,
+        max_initial_pbwt_chunk_markers.clamp(1, target_marker_count),
+        bits_per_allele,
+        config.threads,
     )?;
     if config.reference.is_some() {
-        memory::include_reference_window(&mut estimate, reference_samples, marker_count)?;
+        memory::include_reference_window(&mut estimate, reference_samples, reference_marker_count)?;
         if config.impute {
-            let step_count = estimated_imp_step_count(config, max_window_cm_span, marker_count);
+            let step_count =
+                estimated_imp_step_count(config, max_window_cm_span, union_marker_count);
+            memory::set_compact_target_mosaic_storage(
+                &mut estimate,
+                union_marker_count,
+                target_marker_count,
+                imp_states,
+                reference_samples
+                    .checked_mul(2)
+                    .ok_or_else(|| "reference haplotype count overflow".to_owned())?,
+                step_count,
+            )?;
             memory::include_imp_ibs_reference_index(
                 &mut estimate,
                 reference_samples
                     .checked_mul(2)
                     .ok_or_else(|| "reference haplotype count overflow".to_owned())?,
-                marker_count,
+                union_marker_count,
                 step_count,
                 config.threads,
             )?;
             memory::include_streamed_imputation_window(
                 &mut estimate,
                 target_samples,
-                marker_count,
+                union_marker_count,
+                reference_samples
+                    .checked_mul(2)
+                    .ok_or_else(|| "reference haplotype count overflow".to_owned())?,
                 config.threads,
             )?;
         }
@@ -1313,10 +1338,14 @@ where
         )?;
         let mut target_base_estimate = target_base_estimate;
         if !phase_bypass_allowed {
-            memory::include_initial_phase_pbwt_workspace(
+            memory::include_initial_phase_pbwt_workspace_exact(
                 &mut target_base_estimate,
-                samples.len().saturating_add(reference_samples),
+                samples.len(),
+                reference_samples,
+                window.rows.len(),
                 pbwt::initial_pbwt_max_chunk_markers(&window.cm_positions, requested_workers)?,
+                target_bits,
+                requested_workers,
             )?;
         }
         let mut ibd2_elapsed = Duration::ZERO;
@@ -1435,6 +1464,7 @@ where
         let mut active_estimate = memory::estimate_window(
             samples.len(),
             reference_samples,
+            window.rows.len(),
             merged_markers,
             phase_config.hmm.phase_states,
             imp_states,
@@ -1442,10 +1472,14 @@ where
             requested_workers,
         )?;
         if !phase_bypass_allowed {
-            memory::include_initial_phase_pbwt_workspace(
+            memory::include_initial_phase_pbwt_workspace_exact(
                 &mut active_estimate,
-                samples.len().saturating_add(reference_samples),
+                samples.len(),
+                reference_samples,
+                window.rows.len(),
                 pbwt::initial_pbwt_max_chunk_markers(&phase_cm_positions, requested_workers)?,
+                bits_per_allele,
+                requested_workers,
             )?;
         }
         if is_bgzf_vcf_output(config) {
@@ -1530,6 +1564,9 @@ where
                 &mut active_estimate,
                 samples.len(),
                 merged_markers,
+                reference_samples
+                    .checked_mul(2)
+                    .ok_or_else(|| "reference haplotype count overflow".to_owned())?,
                 requested_workers,
             )?;
         } else if let Some((reference_window, _, _)) = reference_window_data.as_ref() {
@@ -1927,6 +1964,7 @@ fn target_window_estimate(
         target_samples,
         reference_samples,
         marker_count,
+        marker_count,
         config.phase_states,
         imp_states,
         bits_per_allele,
@@ -1945,6 +1983,9 @@ fn target_window_estimate(
             &mut estimate,
             target_samples,
             marker_count,
+            reference_samples
+                .checked_mul(2)
+                .ok_or_else(|| "reference haplotype count overflow".to_owned())?,
             workers,
         )?;
     }

@@ -69,14 +69,16 @@ pub(crate) fn include_bgzf_writer_workspace(estimate: &mut MemoryEstimate) -> Re
 pub(crate) fn estimate_window(
     target_samples: usize,
     reference_samples: usize,
-    n_markers: usize,
+    target_markers: usize,
+    union_markers: usize,
     phase_states: usize,
     imp_states: usize,
     bits_per_allele: u8,
     workers: usize,
 ) -> Result<MemoryEstimate, String> {
     if target_samples == 0
-        || n_markers == 0
+        || target_markers == 0
+        || union_markers < target_markers
         || phase_states == 0
         || imp_states == 0
         || bits_per_allele == 0
@@ -104,11 +106,11 @@ pub(crate) fn estimate_window(
     // the next cursor state; reserve two target-window row sets. Reference
     // rows are accounted separately by `include_reference_window`.
     let input_window_bytes = checked_mul(
-        checked_mul(n_markers, input_row_bytes, "input window")?,
+        checked_mul(target_markers, input_row_bytes, "input window")?,
         2,
         "input window and overlap",
     )?;
-    let haplotype_bytes_per_state = n_markers
+    let haplotype_bytes_per_state = union_markers
         .checked_mul(usize::from(bits_per_allele) + 1)
         .ok_or_else(|| "haplotype memory estimate overflow".to_owned())?
         .div_ceil(8);
@@ -140,7 +142,7 @@ pub(crate) fn estimate_window(
     )?;
     let progressive_phase_bytes = checked_mul(
         phase_samples,
-        n_markers
+        union_markers
             .div_ceil(64)
             .checked_mul(std::mem::size_of::<u64>())
             .ok_or_else(|| "progressive phase-state memory estimate overflow".to_owned())?,
@@ -155,7 +157,7 @@ pub(crate) fn estimate_window(
     // and two haplotype tracks inside each worker.
     let composite_panel_bytes = 0usize;
     let checkpoint_stride = 256usize;
-    let checkpoints = n_markers.div_ceil(checkpoint_stride).saturating_add(1);
+    let checkpoints = union_markers.div_ceil(checkpoint_stride).saturating_add(1);
     let hmm_states = phase_states.max(imp_states);
     let checkpoint_bytes_per_worker = checked_mul(
         checked_mul(
@@ -168,11 +170,11 @@ pub(crate) fn estimate_window(
     )?;
     // Three forward tracks and their matching emission caches are bounded by
     // one checkpoint block per worker.
-    let segment_markers = checkpoint_stride.min(n_markers);
+    let segment_markers = checkpoint_stride.min(union_markers);
     let per_marker_scratch =
         checked_mul(hmm_states, 6 * std::mem::size_of::<f32>(), "HMM scratch")?;
     let marker_marginal_scratch = checked_mul(
-        n_markers,
+        union_markers,
         100,
         "HMM transitions, marker marginals, and phase ranking",
     )?;
@@ -189,7 +191,7 @@ pub(crate) fn estimate_window(
         "phase reference panel",
     )?
     .checked_add(
-        n_markers
+        union_markers
             .checked_mul(2 * std::mem::size_of::<usize>())
             .ok_or_else(|| "phase panel marker-index estimate overflow".to_owned())?,
     )
@@ -203,7 +205,7 @@ pub(crate) fn estimate_window(
     let mosaic_panel_bytes =
         checked_mul(imp_states, haplotype_bytes_per_state, "target mosaic panel")?
             .checked_add(
-                n_markers
+                union_markers
                     .checked_mul(2 * std::mem::size_of::<usize>())
                     .ok_or_else(|| "target mosaic marker-index estimate overflow".to_owned())?,
             )
@@ -271,32 +273,78 @@ pub(crate) fn estimate_window(
 /// reverse/forward PBWT passes plus both live per-haplotype phasers. The
 /// marker bound is computed from the same fixed logical chunks used at run
 /// time, so this remains independent of the Rayon worker count.
-pub(crate) fn include_initial_phase_pbwt_workspace(
+pub(crate) fn include_initial_phase_pbwt_workspace_exact(
     estimate: &mut MemoryEstimate,
     target_samples: usize,
+    reference_samples: usize,
+    n_markers: usize,
     max_chunk_markers: usize,
+    bits_per_allele: u8,
+    workers: usize,
 ) -> Result<(), String> {
-    let haplotypes = target_samples
+    if target_samples == 0
+        || n_markers == 0
+        || max_chunk_markers == 0
+        || bits_per_allele == 0
+        || workers == 0
+    {
+        return Err("initial PBWT memory dimensions must be positive".to_owned());
+    }
+    let target_haplotypes = target_samples
         .checked_mul(2)
         .ok_or_else(|| "initial PBWT haplotype count overflow".to_owned())?;
-    let track_bytes = haplotypes
-        .checked_mul(max_chunk_markers)
-        .and_then(|cells| cells.checked_mul(2 * std::mem::size_of::<u16>()))
-        .ok_or_else(|| "initial PBWT track memory estimate overflow".to_owned())?;
+    let phase_samples = target_samples
+        .checked_add(reference_samples)
+        .ok_or_else(|| "initial PBWT phase sample count overflow".to_owned())?;
+    let phase_haplotypes = phase_samples
+        .checked_mul(2)
+        .ok_or_else(|| "initial PBWT phase haplotype count overflow".to_owned())?;
+    let (retained_forward_bytes, live_pair_bytes) = if bits_per_allele == 1 {
+        // Biallelic PhaseTrack::Packed stores an allele bit and a missing bit
+        // for each target haplotype. Completed chunks retain one forward
+        // track; each active worker can additionally hold reverse+forward
+        // tracks for one logical chunk.
+        let retained_bits = target_haplotypes
+            .checked_mul(n_markers)
+            .and_then(|cells| cells.checked_mul(2))
+            .ok_or_else(|| "initial PBWT retained track overflow".to_owned())?;
+        let live_bits = target_haplotypes
+            .checked_mul(max_chunk_markers)
+            .and_then(|cells| cells.checked_mul(2 * 2 * workers))
+            .ok_or_else(|| "initial PBWT live tracks overflow".to_owned())?;
+        (retained_bits.div_ceil(8), live_bits.div_ceil(8))
+    } else {
+        let retained = target_haplotypes
+            .checked_mul(n_markers)
+            .and_then(|cells| cells.checked_mul(std::mem::size_of::<u16>()))
+            .ok_or_else(|| "initial scalar PBWT retained track overflow".to_owned())?;
+        let live = target_haplotypes
+            .checked_mul(max_chunk_markers)
+            .and_then(|cells| cells.checked_mul(2 * std::mem::size_of::<u16>()))
+            .and_then(|bytes| bytes.checked_mul(workers))
+            .ok_or_else(|| "initial scalar PBWT live tracks overflow".to_owned())?;
+        (retained, live)
+    };
+    let marker_words_bytes = target_haplotypes
+        .div_ceil(64)
+        .checked_mul(std::mem::size_of::<u64>())
+        .ok_or_else(|| "initial PBWT marker words overflow".to_owned())?;
     // Each live PbwtRecPhaser owns order/inverse/reorder arrays, allele values,
     // and per-allele buckets. Include headroom for their Vec capacities, the
     // per-sample het/alignment vectors, and small allocator metadata.
-    let phaser_bytes = haplotypes
+    let phaser_bytes = phase_haplotypes
         .checked_mul(100)
         .and_then(|bytes| {
-            target_samples
+            phase_samples
                 .checked_mul(64)
                 .and_then(|sample_bytes| bytes.checked_add(sample_bytes))
         })
         .and_then(|bytes| bytes.checked_add(16 * 1024))
         .ok_or_else(|| "initial PBWT phaser memory estimate overflow".to_owned())?;
-    let bytes = track_bytes
-        .checked_add(phaser_bytes)
+    let bytes = retained_forward_bytes
+        .checked_add(live_pair_bytes)
+        .and_then(|value| value.checked_add(marker_words_bytes))
+        .and_then(|value| value.checked_add(phaser_bytes))
         .ok_or_else(|| "initial PBWT workspace memory estimate overflow".to_owned())?;
     estimate.phase_snapshot_bytes = estimate
         .phase_snapshot_bytes
@@ -307,6 +355,23 @@ pub(crate) fn include_initial_phase_pbwt_workspace(
         .checked_add(bytes)
         .ok_or_else(|| "total initial PBWT memory estimate overflow".to_owned())?;
     Ok(())
+}
+
+#[cfg(test)]
+fn include_initial_phase_pbwt_workspace(
+    estimate: &mut MemoryEstimate,
+    target_samples: usize,
+    max_chunk_markers: usize,
+) -> Result<(), String> {
+    include_initial_phase_pbwt_workspace_exact(
+        estimate,
+        target_samples,
+        target_samples,
+        max_chunk_markers,
+        max_chunk_markers,
+        2,
+        2,
+    )
 }
 
 pub(crate) fn include_reference_window(
@@ -733,9 +798,10 @@ pub(crate) fn include_streamed_imputation_window(
     estimate: &mut MemoryEstimate,
     target_samples: usize,
     n_markers: usize,
+    reference_haplotypes: usize,
     workers: usize,
 ) -> Result<(), String> {
-    if target_samples == 0 || n_markers == 0 || workers == 0 {
+    if target_samples == 0 || n_markers == 0 || reference_haplotypes == 0 || workers == 0 {
         return Err("streamed imputation memory dimensions must be positive".to_owned());
     }
     const POSTERIOR_TILE_BYTES: usize = 32 * 1024 * 1024;
@@ -752,8 +818,19 @@ pub(crate) fn include_streamed_imputation_window(
     let tile_bytes = POSTERIOR_TILE_BYTES
         .checked_mul(3)
         .ok_or_else(|| "streamed imputation tile estimate overflow".to_owned())?;
-    // HaplotypeScratch can retain one full marker vector of f32 per active
-    // worker when projection markers are not dense.
+    // The packed reference retains one allele bit per reference haplotype and
+    // marker, plus one target-only/missing flag per marker.
+    let packed_reference_bytes = reference_haplotypes
+        .checked_mul(n_markers)
+        .and_then(|bits| bits.div_ceil(8).checked_add(n_markers))
+        .ok_or_else(|| "packed reference memory estimate overflow".to_owned())?;
+    // HaplotypeScratch retains Option<u16> query values, and may retain one
+    // full marker vector of f32 per active worker when projection markers are
+    // not dense.
+    let query_scratch = n_markers
+        .checked_mul(std::mem::size_of::<Option<u16>>())
+        .and_then(|bytes| bytes.checked_mul(workers))
+        .ok_or_else(|| "streamed imputation query scratch overflow".to_owned())?;
     let full_projection_scratch = n_markers
         .checked_mul(std::mem::size_of::<f32>())
         .and_then(|bytes| bytes.checked_mul(workers))
@@ -766,6 +843,8 @@ pub(crate) fn include_streamed_imputation_window(
         .ok_or_else(|| "streamed imputation metadata estimate overflow".to_owned())?;
     let bytes = posterior_batch_bytes
         .checked_add(tile_bytes)
+        .and_then(|value| value.checked_add(packed_reference_bytes))
+        .and_then(|value| value.checked_add(query_scratch))
         .and_then(|value| value.checked_add(full_projection_scratch))
         .and_then(|value| value.checked_add(statistics_bytes))
         .and_then(|value| value.checked_add(metadata_bytes))

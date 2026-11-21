@@ -571,6 +571,125 @@ pub(crate) fn with_reference_haplotypes_aligned(
     Ok((packed, target_samples, reference_present))
 }
 
+/// Pre-packed state-major 1-bit reference haplotypes and rare-carrier flags
+/// extracted directly from a `CompactReferenceWindow` before spilling it to
+/// disk for phasing.
+pub(crate) struct PrepackedPhaseReference {
+    pub(crate) packed: PackedHaplotypes,
+    pub(crate) target_samples: usize,
+    pub(crate) reference_present: Vec<bool>,
+    pub(crate) low_frequency_data: (Vec<bool>, Vec<Vec<bool>>),
+}
+
+/// Pack aligned reference haplotypes directly from a 1-bit
+/// `CompactReferenceWindow` (either resident in RAM or already spilled to disk)
+/// into state-major `PackedHaplotypes` without decoding 4-bit `DiploidCalls` or
+/// cloning `VariantMeta`.
+pub(crate) fn pack_compact_reference_haplotypes_aligned(
+    target: &PhaseWindow,
+    reference: &mut super::reference_store::CompactReferenceWindow,
+    alignment: &super::impute::ReferenceMarkerAlignment,
+) -> Result<(PackedHaplotypes, usize, Vec<bool>), String> {
+    let target_samples = target.rows.first().map_or(0, |row| row.calls.len());
+    let reference_samples = reference.n_samples;
+    if target_samples == 0 || reference_samples == 0 {
+        return Err(
+            "reference-assisted phasing requires positive target and reference sample counts"
+                .to_owned(),
+        );
+    }
+    if target.chrom != reference.chrom {
+        return Err(format!(
+            "target and reference chromosomes differ for reference-assisted phasing: {} versus {}",
+            target.chrom, reference.chrom
+        ));
+    }
+    if target
+        .rows
+        .iter()
+        .any(|row| row.calls.len() != target_samples)
+    {
+        return Err("reference-assisted phasing input has inconsistent sample counts".to_owned());
+    }
+    if alignment.len() != target.rows.len() {
+        return Err("reference marker alignment does not match the phase window".to_owned());
+    }
+
+    let reference_haplotypes = reference_samples
+        .checked_mul(2)
+        .ok_or_else(|| "reference-assisted phasing haplotype count overflow".to_owned())?;
+    let words_per_marker = reference.words_per_marker;
+    let reference_present = alignment.reference_present().collect::<Vec<_>>();
+    let all_present = reference_present.iter().all(|&present| present);
+    let mut packed = if all_present {
+        PackedHaplotypes::empty_complete_biallelic_state_major(
+            reference_haplotypes,
+            target.rows.len(),
+        )?
+    } else {
+        PackedHaplotypes::empty_state_major(reference_haplotypes, target.rows.len(), 1)?
+    };
+    match reference.alleles {
+        super::reference_store::ReferenceWindowAlleles::Resident(ref words) => {
+            for marker in 0..target.rows.len() {
+                if let Some(reference_index) = alignment.reference_row(marker) {
+                    let start = reference_index
+                        .checked_mul(words_per_marker)
+                        .ok_or_else(|| "compact reference marker offset overflow".to_owned())?;
+                    let end = start
+                        .checked_add(words_per_marker)
+                        .ok_or_else(|| "compact reference marker offset overflow".to_owned())?;
+                    let row_words = words.get(start..end).ok_or_else(|| {
+                        format!("compact reference marker index {reference_index} is out of bounds")
+                    })?;
+                    packed.write_fresh_state_major_biallelic_marker_from_words(
+                        marker,
+                        row_words,
+                        alignment.reference_swap(marker),
+                    )?;
+                }
+            }
+        }
+        super::reference_store::ReferenceWindowAlleles::Spilled(ref mut spill) => {
+            let spill_markers = spill.n_markers();
+            if spill.words_per_marker() != words_per_marker {
+                return Err("spilled reference cache word stride differs from window".to_owned());
+            }
+            let label = spill.path_display().to_string();
+            let mut reader = spill.open_reader()?;
+            let mut row_buf = vec![0u64; words_per_marker];
+            let mut cursor = 0usize;
+            for marker in 0..target.rows.len() {
+                if let Some(reference_index) = alignment.reference_row(marker) {
+                    if reference_index >= spill_markers || reference_index < cursor {
+                        return Err(format!(
+                            "spilled reference alignment index {reference_index} is out of order (cursor {cursor})"
+                        ));
+                    }
+                    while cursor <= reference_index {
+                        super::reference_store::read_exact_u64_words(
+                            &mut reader,
+                            &mut row_buf,
+                            &label,
+                        )?;
+                        cursor += 1;
+                    }
+                    packed.write_fresh_state_major_biallelic_marker_from_words(
+                        marker,
+                        &row_buf,
+                        alignment.reference_swap(marker),
+                    )?;
+                }
+            }
+        }
+    }
+    if all_present {
+        packed.mark_complete();
+    }
+
+    Ok((packed, target_samples, reference_present))
+}
+
 fn swap_biallelic_phase_allele(allele: u16) -> u16 {
     if allele == 0 {
         1
@@ -678,6 +797,78 @@ pub(crate) fn phase_window_prepared(
     ),
     String,
 > {
+    phase_window_prepared_impl(
+        window,
+        carrier_window,
+        config,
+        seed,
+        ibd2_intervals,
+        pool,
+        reference_window,
+        reference_alignment,
+        None,
+        low_frequency_mask,
+        diagnostic_site,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn phase_window_prepared_with_prepacked(
+    window: &PhaseWindow,
+    carrier_window: &PhaseWindow,
+    config: &PhaseConfig,
+    seed: u64,
+    ibd2_intervals: &[super::types::Ibd2Interval],
+    pool: &ThreadPool,
+    prepacked_reference: Option<PrepackedPhaseReference>,
+    low_frequency_mask: Option<&[bool]>,
+    diagnostic_site: Option<&ResolvedDiagnosticSite>,
+) -> Result<
+    (
+        PhasedWindow,
+        HMMConfig,
+        Vec<HMMParameterTrace>,
+        Vec<ImpHmmTrace>,
+    ),
+    String,
+> {
+    phase_window_prepared_impl(
+        window,
+        carrier_window,
+        config,
+        seed,
+        ibd2_intervals,
+        pool,
+        None,
+        None,
+        prepacked_reference,
+        low_frequency_mask,
+        diagnostic_site,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn phase_window_prepared_impl(
+    window: &PhaseWindow,
+    carrier_window: &PhaseWindow,
+    config: &PhaseConfig,
+    seed: u64,
+    ibd2_intervals: &[super::types::Ibd2Interval],
+    pool: &ThreadPool,
+    reference_window: Option<&PhasedWindow>,
+    reference_alignment: Option<&super::impute::ReferenceMarkerAlignment>,
+    prepacked_reference: Option<PrepackedPhaseReference>,
+    low_frequency_mask: Option<&[bool]>,
+    diagnostic_site: Option<&ResolvedDiagnosticSite>,
+) -> Result<
+    (
+        PhasedWindow,
+        HMMConfig,
+        Vec<HMMParameterTrace>,
+        Vec<ImpHmmTrace>,
+    ),
+    String,
+> {
     let target_window = window;
     if reference_window.is_some() != reference_alignment.is_some() {
         return Err("prepared reference phasing requires its marker alignment".to_owned());
@@ -696,12 +887,23 @@ pub(crate) fn phase_window_prepared(
     {
         return Err("carrier-count window does not match the phase window".to_owned());
     }
-    let reference_phase_storage = reference_window
-        .zip(reference_alignment)
-        .map(|(reference, alignment)| {
-            with_reference_haplotypes_aligned(target_window, reference, alignment)
-        })
-        .transpose()?;
+    let (reference_phase_storage, precomputed_low_frequency) = if let Some(pre) = prepacked_reference
+    {
+        (
+            Some((pre.packed, pre.target_samples, pre.reference_present)),
+            Some(pre.low_frequency_data),
+        )
+    } else {
+        (
+            reference_window
+                .zip(reference_alignment)
+                .map(|(reference, alignment)| {
+                    with_reference_haplotypes_aligned(target_window, reference, alignment)
+                })
+                .transpose()?,
+            None,
+        )
+    };
     let target_only_samples = target_window.rows[0].calls.len();
     let (reference_packed, target_samples, reference_present) = if reference_phase_storage
         .as_ref()
@@ -768,11 +970,14 @@ pub(crate) fn phase_window_prepared(
         return Ok((current, config.hmm, Vec::new(), Vec::new()));
     }
     let low_frequency_started = profile.then(Instant::now);
-    let input_low_frequency_data = super::impute::low_frequency_marker_data_with_alignment(
-        carrier_window,
-        reference_window,
-        reference_alignment,
-    )?;
+    let input_low_frequency_data = match precomputed_low_frequency {
+        Some(data) => data,
+        None => super::impute::low_frequency_marker_data_with_alignment(
+            carrier_window,
+            reference_window,
+            reference_alignment,
+        )?,
+    };
     if low_frequency_mask.is_some_and(|mask| mask != input_low_frequency_data.0.as_slice()) {
         return Err(
             "prepared low-frequency mask does not match the original carrier window".to_owned(),

@@ -4,13 +4,13 @@
 //! projects those bounds onto the typed target markers. Target density must
 //! not move the reference window or discard its incoming HMM context.
 
-use super::{types, window, ReferenceWindowStream};
+use super::{reference_store, types, window, ReferenceWindowStream};
 
-type ReferenceRecord = (types::VariantRow, f64, Option<u64>);
+type ReferenceRecord = (reference_store::CompactReferenceRow, f64, Option<u64>);
 
 pub(super) struct ScheduledWindow {
     pub target: types::PhaseWindow,
-    pub reference: (types::PhasedWindow, Vec<f64>, Vec<Option<u64>>),
+    pub reference: reference_store::CompactReferenceWindow,
     pub terminal: bool,
     pub outgoing_phase_carry_len: usize,
     pub previous_emitted_pos: Option<u64>,
@@ -248,35 +248,17 @@ impl ReferenceWindowSchedule {
             emit_end,
         };
         self.incoming_phase_carry_len = outgoing_phase_carry_len;
-        let mut rows = Vec::with_capacity(reference_rows.len());
-        let mut positions = Vec::with_capacity(reference_rows.len());
-        let mut groups = Vec::with_capacity(reference_rows.len());
-        for (row, cm, group) in reference_rows {
-            rows.push(types::PhasedRow {
-                meta: row.meta,
-                calls: row.calls,
-                dosage: None,
-                ap1: None,
-                ap2: None,
-                gp: None,
-                info_af: None,
-                info_dr2: None,
-                imputed: false,
-            });
-            positions.push(cm);
-            groups.push(group);
-        }
-        let reference = types::PhasedWindow {
+        let reference = reference_store::CompactReferenceWindow::from_compact_rows(
             chrom,
-            index: self.index,
-            emit_start: previous_splice,
-            emit_end: next_splice,
-            rows,
-        };
+            self.index,
+            previous_splice,
+            next_splice,
+            reference_rows,
+        )?;
         self.index += 1;
         Ok(Some(ScheduledWindow {
             target,
-            reference: (reference, positions, groups),
+            reference,
             terminal,
             outgoing_phase_carry_len,
             previous_emitted_pos,

@@ -1230,6 +1230,66 @@ impl PackedHaplotypes {
         }
     }
 
+    /// Populate one marker column of a freshly allocated (zero-initialized
+    /// allele plane) state-major biallelic `PackedHaplotypes` directly from
+    /// 64-bit marker-major haplotype words.
+    ///
+    /// Iterating only set bits via `trailing_zeros` skips all reference-allele
+    /// haplotypes and avoids per-haplotype bounds checks.
+    pub(crate) fn write_fresh_state_major_biallelic_marker_from_words(
+        &mut self,
+        marker: usize,
+        allele_words: &[u64],
+        swap: bool,
+    ) -> Result<(), String> {
+        let required_words = self.n_haplotypes.div_ceil(64);
+        if marker >= self.n_markers
+            || self.layout != PackedLayout::StateMajor
+            || self.bits_per_allele != 1
+            || allele_words.len() < required_words
+        {
+            return Err("state-major biallelic marker word write dimensions are invalid".to_owned());
+        }
+        let n_markers = self.n_markers;
+        let n_haplotypes = self.n_haplotypes;
+        if !self.missing_bits.is_empty() {
+            let mut index = marker;
+            for _ in 0..n_haplotypes {
+                // SAFETY: `index = state * n_markers + marker < n_haplotypes * n_markers`,
+                // and `missing_bits` has `(n_haplotypes * n_markers).div_ceil(64)` words.
+                unsafe {
+                    *self.missing_bits.get_unchecked_mut(index >> 6) &= !(1u64 << (index & 63));
+                }
+                index += n_markers;
+            }
+        }
+        let swap_word = if swap { u64::MAX } else { 0 };
+        let full_words = n_haplotypes / 64;
+        let rem_bits = n_haplotypes & 63;
+        let tail_mask = if rem_bits == 0 {
+            u64::MAX
+        } else {
+            (1u64 << rem_bits) - 1
+        };
+        for (word_idx, &raw_word) in allele_words[..required_words].iter().enumerate() {
+            let mut bits = raw_word ^ swap_word;
+            if word_idx == full_words && rem_bits != 0 {
+                bits &= tail_mask;
+            }
+            let base_hap = word_idx * 64;
+            while bits != 0 {
+                let tz = bits.trailing_zeros() as usize;
+                let index = (base_hap + tz) * n_markers + marker;
+                // SAFETY: `base_hap + tz < n_haplotypes` and `marker < n_markers`.
+                unsafe {
+                    *self.allele_bits.get_unchecked_mut(index >> 6) |= 1u64 << (index & 63);
+                }
+                bits &= bits - 1;
+            }
+        }
+        Ok(())
+    }
+
     /// Write a biallelic marker row in packed 64-state words.
     ///
     /// When the state count is not word aligned, this uses the scalar writer

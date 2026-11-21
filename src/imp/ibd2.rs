@@ -230,6 +230,29 @@ pub(crate) fn detect_projected_intervals_with_reference_map(
     max_intervals: Option<usize>,
     max_scratch_bytes: Option<usize>,
 ) -> Result<Vec<Ibd2Interval>, String> {
+    detect_projected_intervals_with_phase_reference(
+        window,
+        marker_indices,
+        cm_positions,
+        reference.map(super::reference_store::PhaseReference::Phased),
+        reference_alignment,
+        sample_seed,
+        max_intervals,
+        max_scratch_bytes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn detect_projected_intervals_with_phase_reference(
+    window: &PhaseWindow,
+    marker_indices: &[usize],
+    cm_positions: &[f64],
+    reference: Option<super::reference_store::PhaseReference<'_>>,
+    reference_alignment: Option<&ReferenceMarkerAlignment>,
+    sample_seed: Option<u64>,
+    max_intervals: Option<usize>,
+    max_scratch_bytes: Option<usize>,
+) -> Result<Vec<Ibd2Interval>, String> {
     if marker_indices.is_empty()
         || marker_indices
             .iter()
@@ -337,7 +360,7 @@ pub(crate) fn can_contribute_segment(
 /// are missing.
 fn ibs2_markers_with_reference(
     window: &PhaseWindow,
-    reference: Option<&PhasedWindow>,
+    reference: Option<super::reference_store::PhaseReference<'_>>,
     reference_alignment: Option<&ReferenceMarkerAlignment>,
     marker_indices: Option<&[usize]>,
     sample_seed: Option<u64>,
@@ -362,9 +385,7 @@ fn ibs2_markers_with_reference(
         .map(|seed| {
             sampled_ibs2_haplotypes(
                 n_haps,
-                reference.map_or(0, |reference| {
-                    reference.rows.first().map_or(0, |row| row.calls.len()) * 2
-                }),
+                reference.map_or(0, |reference| reference.n_samples() * 2),
                 seed,
             )
         })
@@ -409,39 +430,88 @@ fn ibs2_markers_with_reference(
             }
         }
         if let (Some(reference), Some(alignment)) = (reference, reference_alignment) {
-            if let Some(reference_row) = alignment
-                .reference_row(marker)
-                .map(|index| &reference.rows[index])
-            {
+            if let Some(reference_index) = alignment.reference_row(marker) {
                 let swap = alignment.reference_swap(marker);
-                if let Some(sampled) = sampled_haplotypes.as_ref() {
-                    for &haplotype in &sampled.reference {
-                        let call = reference_row
-                            .calls
-                            .get(haplotype / 2)
-                            .expect("validated reference hap");
-                        if let Some(allele) = call.alleles[haplotype & 1] {
-                            let allele = if swap { u16::from(allele == 0) } else { allele };
-                            let Some(count) = counts.get_mut(usize::from(allele)) else {
-                                return Err(format!(
-                                    "IBD2 reference allele {allele} exceeds the target allele count at {}:{}",
-                                    row.meta.chrom, row.meta.pos
-                                ));
-                            };
-                            *count += 1;
+                match reference {
+                    super::reference_store::PhaseReference::Phased(phased_ref) => {
+                        let reference_row = &phased_ref.rows[reference_index];
+                        if let Some(sampled) = sampled_haplotypes.as_ref() {
+                            for &haplotype in &sampled.reference {
+                                let call = reference_row
+                                    .calls
+                                    .get(haplotype / 2)
+                                    .expect("validated reference hap");
+                                if let Some(allele) = call.alleles[haplotype & 1] {
+                                    let allele = if swap { u16::from(allele == 0) } else { allele };
+                                    let Some(count) = counts.get_mut(usize::from(allele)) else {
+                                        return Err(format!(
+                                            "IBD2 reference allele {allele} exceeds the target allele count at {}:{}",
+                                            row.meta.chrom, row.meta.pos
+                                        ));
+                                    };
+                                    *count += 1;
+                                }
+                            }
+                        } else {
+                            for call in reference_row.calls.iter() {
+                                for allele in call.alleles.into_iter().flatten() {
+                                    let allele = if swap { u16::from(allele == 0) } else { allele };
+                                    let Some(count) = counts.get_mut(usize::from(allele)) else {
+                                        return Err(format!(
+                                            "IBD2 reference allele {allele} exceeds the target allele count at {}:{}",
+                                            row.meta.chrom, row.meta.pos
+                                        ));
+                                    };
+                                    *count += 1;
+                                }
+                            }
                         }
                     }
-                } else {
-                    for call in reference_row.calls.iter() {
-                        for allele in call.alleles.into_iter().flatten() {
-                            let allele = if swap { u16::from(allele == 0) } else { allele };
-                            let Some(count) = counts.get_mut(usize::from(allele)) else {
-                                return Err(format!(
-                                    "IBD2 reference allele {allele} exceeds the target allele count at {}:{}",
-                                    row.meta.chrom, row.meta.pos
-                                ));
+                    super::reference_store::PhaseReference::Compact(compact_ref) => {
+                        let words = compact_ref.resident_marker_words(reference_index)?;
+                        if let Some(sampled) = sampled_haplotypes.as_ref() {
+                            let swap_mask = u16::from(swap);
+                            for &haplotype in &sampled.reference {
+                                let allele = (((words[haplotype >> 6] >> (haplotype & 63)) & 1) as u16)
+                                    ^ swap_mask;
+                                let Some(count) = counts.get_mut(usize::from(allele)) else {
+                                    return Err(format!(
+                                        "IBD2 reference allele {allele} exceeds the target allele count at {}:{}",
+                                        row.meta.chrom, row.meta.pos
+                                    ));
+                                };
+                                *count += 1;
+                            }
+                        } else {
+                            let total_haps = compact_ref.n_samples.saturating_mul(2);
+                            let alt_count = words
+                                .iter()
+                                .map(|word| word.count_ones() as usize)
+                                .sum::<usize>();
+                            let ref_count = total_haps.saturating_sub(alt_count);
+                            let (c0, c1) = if swap {
+                                (alt_count, ref_count)
+                            } else {
+                                (ref_count, alt_count)
                             };
-                            *count += 1;
+                            if c0 > 0 {
+                                let Some(count) = counts.get_mut(0) else {
+                                    return Err(format!(
+                                        "IBD2 reference allele 0 exceeds the target allele count at {}:{}",
+                                        row.meta.chrom, row.meta.pos
+                                    ));
+                                };
+                                *count += c0;
+                            }
+                            if c1 > 0 {
+                                let Some(count) = counts.get_mut(1) else {
+                                    return Err(format!(
+                                        "IBD2 reference allele 1 exceeds the target allele count at {}:{}",
+                                        row.meta.chrom, row.meta.pos
+                                    ));
+                                };
+                                *count += c1;
+                            }
                         }
                     }
                 }
@@ -871,7 +941,9 @@ mod tests {
         assert_eq!(
             ibs2_markers_with_reference(
                 &window,
-                Some(&reference),
+                Some(crate::imp::reference_store::PhaseReference::Phased(
+                    &reference,
+                )),
                 Some(&alignment),
                 Some(&marker_indices),
                 None,

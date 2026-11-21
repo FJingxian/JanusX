@@ -400,6 +400,43 @@ pub(crate) fn include_reference_window(
     Ok(())
 }
 
+/// Account for a compact 1-bit reference window (`CompactReferenceWindow`).
+/// When spilled to disk during phasing (P1-1b), only per-marker metadata stays
+/// resident; when kept in RAM (P1-1a), one 1-bit haplotype bitplane is
+/// retained alongside metadata.
+pub(crate) fn include_compact_reference_window(
+    estimate: &mut MemoryEstimate,
+    reference_samples: usize,
+    n_markers: usize,
+    spilled: bool,
+) -> Result<(), String> {
+    let allele_per_row = if spilled {
+        0
+    } else {
+        reference_samples
+            .checked_mul(2)
+            .ok_or_else(|| "compact reference haplotype count overflow".to_owned())?
+            .div_ceil(64)
+            .checked_mul(std::mem::size_of::<u64>())
+            .ok_or_else(|| "compact reference row memory estimate overflow".to_owned())?
+    };
+    let per_row = allele_per_row
+        .checked_add(256)
+        .ok_or_else(|| "compact reference row memory estimate overflow".to_owned())?;
+    let bytes = n_markers
+        .checked_mul(per_row)
+        .ok_or_else(|| "compact reference window memory estimate overflow".to_owned())?;
+    estimate.input_window_bytes = estimate
+        .input_window_bytes
+        .checked_add(bytes)
+        .ok_or_else(|| "compact reference window memory estimate overflow".to_owned())?;
+    estimate.total_bytes = estimate
+        .total_bytes
+        .checked_add(bytes)
+        .ok_or_else(|| "total compact reference memory estimate overflow".to_owned())?;
+    Ok(())
+}
+
 pub(crate) fn include_imp_ibs_reference_index(
     estimate: &mut MemoryEstimate,
     reference_haplotypes: usize,

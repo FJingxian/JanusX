@@ -33,23 +33,40 @@ impl ReferenceMarkerAlignment {
     pub(crate) fn new(target: &[VariantRow], reference: &[PhasedRow]) -> Result<Self, String> {
         validate_sorted_unique(target.iter().map(|row| &row.meta), "target")?;
         validate_sorted_unique(reference.iter().map(|row| &row.meta), "reference")?;
+        Self::build_impl(target, reference.len(), |index| &reference[index].meta)
+    }
+
+    pub(crate) fn new_from_metas(
+        target: &[VariantRow],
+        reference: &[VariantMeta],
+    ) -> Result<Self, String> {
+        validate_sorted_unique(target.iter().map(|row| &row.meta), "target")?;
+        validate_sorted_unique(reference.iter(), "reference")?;
+        Self::build_impl(target, reference.len(), |index| &reference[index])
+    }
+
+    fn build_impl<'a>(
+        target: &[VariantRow],
+        reference_len: usize,
+        reference_meta: impl Fn(usize) -> &'a VariantMeta,
+    ) -> Result<Self, String> {
         let mut reference_index = 0usize;
         let mut reference_rows = Vec::with_capacity(target.len());
         let mut reference_swaps = Vec::with_capacity(target.len());
         for target_row in target {
-            while reference_index < reference.len()
-                && compare_position(&reference[reference_index].meta, &target_row.meta)
+            while reference_index < reference_len
+                && compare_position(reference_meta(reference_index), &target_row.meta)
                     == Ordering::Less
             {
                 reference_index += 1;
             }
-            let reference_row = reference.get(reference_index).filter(|reference_row| {
-                compare_position(&reference_row.meta, &target_row.meta) == Ordering::Equal
-            });
-            reference_rows.push(reference_row.map(|_| reference_index));
+            let matched_meta = (reference_index < reference_len)
+                .then(|| reference_meta(reference_index))
+                .filter(|ref_meta| compare_position(ref_meta, &target_row.meta) == Ordering::Equal);
+            reference_rows.push(matched_meta.map(|_| reference_index));
             reference_swaps.push(
-                reference_row
-                    .map(|reference_row| harmonization(&target_row.meta, &reference_row.meta))
+                matched_meta
+                    .map(|ref_meta| harmonization(&target_row.meta, ref_meta))
                     .transpose()?
                     .unwrap_or(false),
             );
@@ -117,6 +134,18 @@ pub(crate) fn low_frequency_marker_data_with_alignment(
     reference: Option<&PhasedWindow>,
     alignment: Option<&ReferenceMarkerAlignment>,
 ) -> Result<(Vec<bool>, Vec<Vec<bool>>), String> {
+    low_frequency_marker_data_with_alignment_ref(
+        window,
+        reference.map(super::reference_store::PhaseReference::Phased),
+        alignment,
+    )
+}
+
+pub(crate) fn low_frequency_marker_data_with_alignment_ref(
+    window: &PhaseWindow,
+    reference: Option<super::reference_store::PhaseReference<'_>>,
+    alignment: Option<&ReferenceMarkerAlignment>,
+) -> Result<(Vec<bool>, Vec<Vec<bool>>), String> {
     if reference.is_some() != alignment.is_some() {
         return Err("reference marker alignment must accompany the reference window".to_owned());
     }
@@ -126,9 +155,7 @@ pub(crate) fn low_frequency_marker_data_with_alignment(
         }
     }
     let target_sample_count = window.rows.first().map_or(0, |row| row.calls.len());
-    let reference_sample_count = reference
-        .and_then(|reference| reference.rows.first())
-        .map_or(0, |row| row.calls.len());
+    let reference_sample_count = reference.map_or(0, |reference| reference.n_samples());
     let max_carriers =
         beagle_rare_carrier_limit(target_sample_count.saturating_add(reference_sample_count));
     let mut low_frequency = Vec::with_capacity(window.rows.len());
@@ -139,18 +166,35 @@ pub(crate) fn low_frequency_marker_data_with_alignment(
             add_sample_carriers(&mut carrier_counts, call.alleles, max_carriers);
         }
         if let (Some(reference), Some(alignment)) = (reference, alignment) {
-            if let Some(reference_row) = alignment
-                .reference_row(marker)
-                .map(|index| &reference.rows[index])
-            {
+            if let Some(reference_index) = alignment.reference_row(marker) {
                 let swap = alignment.reference_swap(marker);
-                for call in reference_row.calls.iter() {
-                    let alleles = if swap {
-                        call.alleles.map(|allele| allele.map(swap_biallelic))
-                    } else {
-                        call.alleles
-                    };
-                    add_sample_carriers(&mut carrier_counts, alleles, max_carriers);
+                match reference {
+                    super::reference_store::PhaseReference::Phased(phased_ref) => {
+                        let reference_row = &phased_ref.rows[reference_index];
+                        for call in reference_row.calls.iter() {
+                            let alleles = if swap {
+                                call.alleles.map(|allele| allele.map(swap_biallelic))
+                            } else {
+                                call.alleles
+                            };
+                            add_sample_carriers(&mut carrier_counts, alleles, max_carriers);
+                        }
+                    }
+                    super::reference_store::PhaseReference::Compact(compact_ref) => {
+                        let words = compact_ref.resident_marker_words(reference_index)?;
+                        let swap_mask = u16::from(swap);
+                        for sample in 0..compact_ref.n_samples {
+                            let hap0 = sample * 2;
+                            let pair = (words[hap0 >> 6] >> (hap0 & 63)) & 0x3;
+                            let a0 = ((pair & 1) as u16) ^ swap_mask;
+                            let a1 = (((pair >> 1) & 1) as u16) ^ swap_mask;
+                            add_sample_carriers(
+                                &mut carrier_counts,
+                                [Some(a0), Some(a1)],
+                                max_carriers,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -254,16 +298,43 @@ pub(crate) fn merged_marker_count(
 ) -> Result<usize, String> {
     validate_sorted_unique(target.iter().map(|row| &row.meta), "target")?;
     validate_sorted_unique(reference.iter().map(|row| &row.meta), "reference")?;
+    merged_marker_count_impl(
+        target,
+        reference.len(),
+        |index| &reference[index].meta,
+        max_rows,
+    )
+}
+
+pub(crate) fn merged_marker_count_from_metas(
+    target: &[super::types::VariantRow],
+    reference: &[VariantMeta],
+    max_rows: Option<usize>,
+) -> Result<usize, String> {
+    validate_sorted_unique(target.iter().map(|row| &row.meta), "target")?;
+    validate_sorted_unique(reference.iter(), "reference")?;
+    merged_marker_count_impl(target, reference.len(), |index| &reference[index], max_rows)
+}
+
+fn merged_marker_count_impl<'a>(
+    target: &[super::types::VariantRow],
+    reference_len: usize,
+    reference_meta: impl Fn(usize) -> &'a VariantMeta,
+    max_rows: Option<usize>,
+) -> Result<usize, String> {
     let (mut target_index, mut reference_index) = (0usize, 0usize);
     let mut count = 0usize;
-    while target_index < target.len() || reference_index < reference.len() {
-        match (target.get(target_index), reference.get(reference_index)) {
-            (Some(target_row), Some(reference_row)) => {
-                match compare_position(&target_row.meta, &reference_row.meta) {
+    while target_index < target.len() || reference_index < reference_len {
+        match (
+            target.get(target_index),
+            (reference_index < reference_len).then(|| reference_meta(reference_index)),
+        ) {
+            (Some(target_row), Some(ref_meta)) => {
+                match compare_position(&target_row.meta, ref_meta) {
                     Ordering::Less => target_index += 1,
                     Ordering::Greater => reference_index += 1,
                     Ordering::Equal => {
-                        harmonization(&target_row.meta, &reference_row.meta)?;
+                        harmonization(&target_row.meta, ref_meta)?;
                         target_index += 1;
                         reference_index += 1;
                     }
@@ -1450,7 +1521,7 @@ pub(crate) fn impute_window_prevalidated(
     impute_window_with_output(
         target,
         phased_target,
-        reference,
+        ReferenceInput::Phased(reference),
         reference_cm_positions,
         &reference_groups,
         config,
@@ -1464,6 +1535,7 @@ pub(crate) fn impute_window_prevalidated(
     )
 }
 
+#[allow(dead_code)]
 pub(crate) fn impute_window_stream(
     target: &PhaseWindow,
     phased_target: &PhasedWindow,
@@ -1482,7 +1554,7 @@ pub(crate) fn impute_window_stream(
     impute_window_with_output(
         target,
         phased_target,
-        reference,
+        ReferenceInput::Phased(reference),
         reference_cm_positions,
         reference_groups,
         config,
@@ -1497,10 +1569,79 @@ pub(crate) fn impute_window_stream(
     .map(|_| ())
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn impute_window_stream_compact(
+    target: &PhaseWindow,
+    phased_target: &PhasedWindow,
+    mut reference: super::reference_store::CompactReferenceWindow,
+    config: &ImputeConfig,
+    hmm_config: &HMMConfig,
+    seed: u64,
+    previous_emitted_pos: Option<u64>,
+    reference_emit_end_pos: Option<u64>,
+    orientation_flips: &[bool],
+    pool: &ThreadPool,
+    emit: &mut dyn FnMut(&[PhasedRow], &[usize]) -> Result<(), String>,
+) -> Result<(), String> {
+    let reference_cm_positions = std::mem::take(&mut reference.cm_positions);
+    let reference_groups = std::mem::take(&mut reference.groups);
+    impute_window_with_output(
+        target,
+        phased_target,
+        ReferenceInput::Compact(reference),
+        &reference_cm_positions,
+        &reference_groups,
+        config,
+        hmm_config,
+        seed,
+        previous_emitted_pos,
+        reference_emit_end_pos,
+        orientation_flips,
+        pool,
+        Some(emit),
+    )
+    .map(|_| ())
+}
+
+enum ReferenceInput {
+    Phased(PhasedWindow),
+    Compact(super::reference_store::CompactReferenceWindow),
+}
+
+impl ReferenceInput {
+    fn chrom(&self) -> &str {
+        match self {
+            Self::Phased(window) => &window.chrom,
+            Self::Compact(window) => &window.chrom,
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Phased(window) => window.rows.len(),
+            Self::Compact(window) => window.metas.len(),
+        }
+    }
+
+    fn n_samples(&self) -> usize {
+        match self {
+            Self::Phased(window) => window.rows.first().map_or(0, |row| row.calls.len()),
+            Self::Compact(window) => window.n_samples,
+        }
+    }
+
+    fn meta(&self, index: usize) -> &VariantMeta {
+        match self {
+            Self::Phased(window) => &window.rows[index].meta,
+            Self::Compact(window) => &window.metas[index],
+        }
+    }
+}
+
 fn impute_window_with_output(
     target: &PhaseWindow,
     phased_target: &PhasedWindow,
-    reference: PhasedWindow,
+    reference: ReferenceInput,
     reference_cm_positions: &[f64],
     reference_groups: &[Option<u64>],
     config: &ImputeConfig,
@@ -1516,21 +1657,24 @@ fn impute_window_with_output(
         || std::env::var_os("JANUSX_IMP_DETAIL_PROFILE").is_some();
     let profile_started = profile_impute.then(Instant::now);
     let reference_index_started = profile_started;
-    if target.rows.is_empty() || reference.rows.is_empty() {
+    if target.rows.is_empty() || reference.len() == 0 {
         return Err(
             "reference imputation requires nonempty target and reference windows".to_owned(),
         );
     }
-    for row in &reference.rows {
-        validate_phased_reference_calls(row)?;
+    if let ReferenceInput::Phased(ref phased_ref) = reference {
+        for row in &phased_ref.rows {
+            validate_phased_reference_calls(row)?;
+        }
     }
     if target.rows.len() != target.cm_positions.len() {
         return Err("target window rows and map positions have different lengths".to_owned());
     }
-    if target.chrom != reference.chrom {
+    if target.chrom != reference.chrom() {
         return Err(format!(
             "target and reference windows must be on the same chromosome ({} versus {})",
-            target.chrom, reference.chrom
+            target.chrom,
+            reference.chrom()
         ));
     }
     if target.rows.len() != phased_target.rows.len()
@@ -1544,10 +1688,10 @@ fn impute_window_with_output(
     {
         return Err("phased target window does not match its input window".to_owned());
     }
-    if reference.rows.len() != reference_cm_positions.len() {
+    if reference.len() != reference_cm_positions.len() {
         return Err("reference window rows and map positions have different lengths".to_owned());
     }
-    if reference.rows.len() != reference_groups.len() {
+    if reference.len() != reference_groups.len() {
         return Err("reference window rows and sequence groups have different lengths".to_owned());
     }
     for row in &target.rows {
@@ -1562,7 +1706,7 @@ fn impute_window_with_output(
     }
     let target_samples = target.rows[0].calls.len();
     let target_accounting = target_marker_accounting(target);
-    let reference_samples = reference.rows[0].calls.len();
+    let reference_samples = reference.n_samples();
     if target_samples == 0 || reference_samples == 0 {
         return Err("target or reference window has zero samples".to_owned());
     }
@@ -1576,15 +1720,21 @@ fn impute_window_with_output(
             orientation_flips.len()
         ));
     }
-    let merged_indices =
-        merge_sorted_indices(&target.rows, &reference.rows, Some(config.window_markers))?;
+    let merged_indices = match &reference {
+        ReferenceInput::Phased(window) => {
+            merge_sorted_indices(&target.rows, &window.rows, Some(config.window_markers))?
+        }
+        ReferenceInput::Compact(window) => {
+            merge_sorted_indices_from_metas(&target.rows, &window.metas, Some(config.window_markers))?
+        }
+    };
     let mut target_row_indices = Vec::with_capacity(merged_indices.len());
     let mut reference_row_indices = Vec::with_capacity(merged_indices.len());
     let mut reference_swaps = Vec::with_capacity(merged_indices.len());
     let mut merged_cm = Vec::with_capacity(merged_indices.len());
     for (target_index, reference_index) in merged_indices {
         let target_meta = target_index.map(|index| &target.rows[index].meta);
-        let reference_meta = reference_index.map(|index| &reference.rows[index].meta);
+        let reference_meta = reference_index.map(|index| reference.meta(index));
         let swap = match (target_meta, reference_meta) {
             (Some(target_meta), Some(reference_meta)) => {
                 harmonization(target_meta, reference_meta)?
@@ -1771,20 +1921,30 @@ fn impute_window_with_output(
         });
     }
 
-    let packed_reference = composite::PackedBiallelicReference::from_reference_rows(
-        &reference.rows,
-        &reference_row_indices,
-        &reference_swaps,
-        reference_samples,
-    )?;
-    // Consume `reference` immediately after packing its 1-bit allele plane:
-    // this frees all 4-bit reference DiploidCalls before building IBS/sequence
-    // indexes and moves reference-only VariantMeta without cloning.
-    let mut reference_metas: Vec<Option<VariantMeta>> = reference
-        .rows
-        .into_iter()
-        .map(|row| Some(row.meta))
-        .collect();
+    let (packed_reference, mut reference_metas): (
+        composite::PackedBiallelicReference,
+        Vec<Option<VariantMeta>>,
+    ) = match reference {
+        ReferenceInput::Phased(window) => {
+            let packed = composite::PackedBiallelicReference::from_reference_rows(
+                &window.rows,
+                &reference_row_indices,
+                &reference_swaps,
+                reference_samples,
+            )?;
+            let metas = window.rows.into_iter().map(|row| Some(row.meta)).collect();
+            (packed, metas)
+        }
+        ReferenceInput::Compact(mut window) => {
+            let packed = composite::PackedBiallelicReference::from_compact_reference(
+                &mut window,
+                &reference_row_indices,
+                &reference_swaps,
+            )?;
+            let metas = window.metas.into_iter().map(Some).collect();
+            (packed, metas)
+        }
+    };
     let mut metadata = Vec::with_capacity(target_row_indices.len());
     for (&target_index, &reference_index) in target_row_indices.iter().zip(&reference_row_indices) {
         let meta = if let Some(index) = target_index {
@@ -4304,17 +4464,38 @@ fn merge_sorted_indices(
 ) -> Result<Vec<(Option<usize>, Option<usize>)>, String> {
     validate_sorted_unique(target.iter().map(|row| &row.meta), "target")?;
     validate_sorted_unique(reference.iter().map(|row| &row.meta), "reference")?;
+    merge_sorted_indices_impl(target, reference.len(), |index| &reference[index].meta, max_rows)
+}
 
-    let total = target.len().saturating_add(reference.len());
+fn merge_sorted_indices_from_metas(
+    target: &[super::types::VariantRow],
+    reference: &[VariantMeta],
+    max_rows: Option<usize>,
+) -> Result<Vec<(Option<usize>, Option<usize>)>, String> {
+    validate_sorted_unique(target.iter().map(|row| &row.meta), "target")?;
+    validate_sorted_unique(reference.iter(), "reference")?;
+    merge_sorted_indices_impl(target, reference.len(), |index| &reference[index], max_rows)
+}
+
+fn merge_sorted_indices_impl<'a>(
+    target: &[super::types::VariantRow],
+    reference_len: usize,
+    reference_meta: impl Fn(usize) -> &'a VariantMeta,
+    max_rows: Option<usize>,
+) -> Result<Vec<(Option<usize>, Option<usize>)>, String> {
+    let total = target.len().saturating_add(reference_len);
     let capacity = max_rows
         .map(|limit| limit.saturating_add(1).min(total))
         .unwrap_or(total);
     let mut merged = Vec::with_capacity(capacity);
     let (mut target_index, mut reference_index) = (0, 0);
-    while target_index < target.len() || reference_index < reference.len() {
-        let entry = match (target.get(target_index), reference.get(reference_index)) {
-            (Some(target_row), Some(reference_row)) => {
-                match compare_position(&target_row.meta, &reference_row.meta) {
+    while target_index < target.len() || reference_index < reference_len {
+        let entry = match (
+            target.get(target_index),
+            (reference_index < reference_len).then(|| reference_meta(reference_index)),
+        ) {
+            (Some(target_row), Some(ref_meta)) => {
+                match compare_position(&target_row.meta, ref_meta) {
                     Ordering::Less => {
                         target_index += 1;
                         (Some(target_index - 1), None)

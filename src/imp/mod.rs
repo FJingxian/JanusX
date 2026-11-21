@@ -18,6 +18,7 @@ pub(crate) mod phase_baum;
 mod posterior_store;
 mod projection;
 mod reference_groups;
+mod reference_store;
 mod reference_window;
 pub(crate) mod types;
 pub(crate) mod window;
@@ -35,7 +36,7 @@ struct ReferenceWindowStream {
     reader: crate::imp_reader::ImpReader,
     map: window::GeneticMap,
     samples: usize,
-    pending: Option<(types::VariantRow, f64, Option<u64>)>,
+    pending: Option<(reference_store::CompactReferenceRow, f64, Option<u64>)>,
     carry: Vec<(types::PhasedRow, f64, Option<u64>)>,
     sequence_groups: reference_groups::ReferenceSequenceGroups,
     last_chromosome: Option<String>,
@@ -106,9 +107,7 @@ enum PostPhaseJob {
     Impute {
         window: types::PhaseWindow,
         phased: types::PhasedWindow,
-        reference_window: types::PhasedWindow,
-        reference_cm: Vec<f64>,
-        reference_groups: Vec<Option<u64>>,
+        reference_window: reference_store::CompactReferenceWindow,
         impute_config: types::ImputeConfig,
         fitted_hmm_config: types::HMMConfig,
         imputation_error: f64,
@@ -261,8 +260,6 @@ fn process_post_phase_job(
             window,
             phased,
             reference_window,
-            reference_cm,
-            reference_groups,
             impute_config,
             fitted_hmm_config,
             imputation_error,
@@ -282,12 +279,10 @@ fn process_post_phase_job(
             let mut selection_elapsed = Duration::ZERO;
             let mut write_elapsed = Duration::ZERO;
             let mut emitted_rows = 0usize;
-            impute::impute_window_stream(
+            impute::impute_window_stream_compact(
                 &window,
                 &phased,
                 reference_window,
-                &reference_cm,
-                &reference_groups,
                 &impute_config,
                 &imputation_hmm_config,
                 seed,
@@ -485,19 +480,11 @@ impl ReferenceWindowStream {
             row.meta.chrom == target.chrom
                 && previous_emitted_pos.map_or(true, |previous| row.meta.pos > previous)
         });
-        let mut rows = std::mem::take(&mut self.carry)
-            .into_iter()
-            .map(|(row, cm, group)| {
-                (
-                    types::VariantRow {
-                        meta: row.meta,
-                        calls: row.calls,
-                    },
-                    cm,
-                    group,
-                )
-            })
-            .collect::<Vec<_>>();
+        let filter_to_target = !config.impute;
+        let mut rows = std::mem::take(&mut self.carry);
+        let mut saw_reference_in_window = !rows.is_empty();
+        let mut fallback_row: Option<(reference_store::CompactReferenceRow, f64, Option<u64>)> =
+            None;
         let mut merged_marker_count = target.rows.len();
         for (row, _, _) in &rows {
             if !target_contains_position(target, row.meta.pos) {
@@ -521,7 +508,7 @@ impl ReferenceWindowStream {
                 break;
             };
             if row.meta.chrom != target.chrom {
-                if rows.is_empty() {
+                if !saw_reference_in_window {
                     // Reference-only contigs and contigs absent from the
                     // current target are consumed until the current contig is found.
                     continue;
@@ -538,12 +525,20 @@ impl ReferenceWindowStream {
             }
             if cm < start_cm {
                 if previous_emitted_pos.is_some_and(|previous| row.meta.pos > previous) {
-                    if !target_contains_position(target, row.meta.pos) {
+                    saw_reference_in_window = true;
+                    let matches_target = target_contains_position(target, row.meta.pos);
+                    if filter_to_target && !matches_target {
+                        if fallback_row.is_none() && rows.is_empty() {
+                            fallback_row = Some((row, cm, group));
+                        }
+                        continue;
+                    }
+                    if !matches_target {
                         merged_marker_count = merged_marker_count
                             .checked_add(1)
                             .ok_or_else(|| "merged marker memory estimate overflow".to_owned())?;
                     }
-                    rows.push((row, cm, group));
+                    rows.push((row.to_phased_row(), cm, group));
                     if rows.len() > max_markers {
                         return Err(format!(
                             "reference window exceeds --window-markers={max_markers}; lower --window or use a less dense reference interval"
@@ -561,12 +556,20 @@ impl ReferenceWindowStream {
                 self.pending = Some((row, cm, group));
                 break;
             }
-            if !target_contains_position(target, row.meta.pos) {
+            saw_reference_in_window = true;
+            let matches_target = target_contains_position(target, row.meta.pos);
+            if filter_to_target && !matches_target {
+                if fallback_row.is_none() && rows.is_empty() {
+                    fallback_row = Some((row, cm, group));
+                }
+                continue;
+            }
+            if !matches_target {
                 merged_marker_count = merged_marker_count
                     .checked_add(1)
                     .ok_or_else(|| "merged marker memory estimate overflow".to_owned())?;
             }
-            rows.push((row, cm, group));
+            rows.push((row.to_phased_row(), cm, group));
             if rows.len() > max_markers {
                 return Err(format!(
                     "reference window exceeds --window-markers={max_markers}; lower --window or use a less dense reference interval"
@@ -578,7 +581,7 @@ impl ReferenceWindowStream {
                 ));
             }
         }
-        if rows.is_empty() {
+        if !saw_reference_in_window {
             return Err(format!(
                 "reference input has no variants in target window {}:{}-{}; verify chromosome names and genetic map",
                 target.chrom,
@@ -586,30 +589,21 @@ impl ReferenceWindowStream {
                 target.rows.last().map_or(0, |row| row.meta.pos)
             ));
         }
+        if rows.is_empty() {
+            if let Some((row, cm, group)) = fallback_row {
+                rows.push((row.to_phased_row(), cm, group));
+            }
+        }
         let finalize_started = profile_stream.then(Instant::now);
-        let mut reference_rows = Vec::with_capacity(rows.len());
+        let mut phased_rows = Vec::with_capacity(rows.len());
         let mut cm_positions = Vec::with_capacity(rows.len());
         let mut reference_groups = Vec::with_capacity(rows.len());
         for (row, cm, group) in rows {
-            reference_rows.push(row);
+            phased_rows.push(row);
             cm_positions.push(cm);
             reference_groups.push(group);
         }
         self.pending_carry_start_cm = target.cm_positions.get(target.emit_end).copied();
-        let phased_rows = reference_rows
-            .into_iter()
-            .map(|row| types::PhasedRow {
-                meta: row.meta,
-                calls: row.calls,
-                dosage: None,
-                ap1: None,
-                ap2: None,
-                gp: None,
-                info_af: None,
-                info_dr2: None,
-                imputed: false,
-            })
-            .collect::<Vec<_>>();
         let phased = types::PhasedWindow {
             chrom: target.chrom.clone(),
             index: target.index,
@@ -660,7 +654,9 @@ impl ReferenceWindowStream {
         Ok(())
     }
 
-    fn read_next(&mut self) -> Result<Option<(types::VariantRow, f64, Option<u64>)>, String> {
+    fn read_next(
+        &mut self,
+    ) -> Result<Option<(reference_store::CompactReferenceRow, f64, Option<u64>)>, String> {
         if let Some(pending) = self.pending.take() {
             return Ok(Some(pending));
         }
@@ -717,10 +713,11 @@ impl ReferenceWindowStream {
             ));
         }
         let group = self.sequence_groups.push(&chrom, &row.calls)?;
+        let compact = reference_store::CompactReferenceRow::from_validated_variant_row(row)?;
         self.last_chromosome = Some(chrom);
-        self.last_pos = row.meta.pos;
+        self.last_pos = compact.meta.pos;
         self.last_cm = cm;
-        Ok(Some((row, cm, group)))
+        Ok(Some((compact, cm, group)))
     }
 }
 
@@ -938,7 +935,27 @@ pub fn estimate_imp_window_bytes(
         config.threads,
     )?;
     if config.reference.is_some() {
-        memory::include_reference_window(&mut estimate, reference_samples, reference_marker_count)?;
+        if config.impute {
+            let ref_allele_bytes = reference_samples
+                .saturating_mul(2)
+                .div_ceil(64)
+                .saturating_mul(std::mem::size_of::<u64>())
+                .saturating_mul(reference_marker_count);
+            let will_spill =
+                reference_store::ReferenceSpillPolicy::from_env().should_spill(ref_allele_bytes);
+            memory::include_compact_reference_window(
+                &mut estimate,
+                reference_samples,
+                reference_marker_count,
+                will_spill,
+            )?;
+        } else {
+            memory::include_reference_window(
+                &mut estimate,
+                reference_samples,
+                target_marker_count.min(reference_marker_count),
+            )?;
+        }
         if config.impute {
             let step_count =
                 estimated_imp_step_count(config, max_window_cm_span, union_marker_count);
@@ -1393,19 +1410,25 @@ where
                 })
                 .and_then(|stream| stream.last_emitted_target_pos)
         });
+        enum ActiveReferenceWindow {
+            Compact(reference_store::CompactReferenceWindow),
+            Phased(types::PhasedWindow, Vec<f64>, Vec<Option<u64>>),
+        }
         let reference_started = profile_windows.then(Instant::now);
-        let reference_window_data = if staged_reference_data.is_some() {
-            staged_reference_data.take()
+        let mut reference_window_data = if let Some(compact) = staged_reference_data.take() {
+            Some(ActiveReferenceWindow::Compact(compact))
         } else if let Some(reference_stream) = reference.as_mut() {
-            Some(reference_stream.window_for(
+            let (phased, cm, groups) = reference_stream.window_for(
                 &window,
                 config.window_markers,
                 config,
                 terminal_target_window,
-            )?)
+            )?;
+            Some(ActiveReferenceWindow::Phased(phased, cm, groups))
         } else {
             None
         };
+
         let reference_elapsed =
             reference_started.map_or(Duration::ZERO, |started| started.elapsed());
         report_progress(
@@ -1417,21 +1440,30 @@ where
             summary.variants_written,
             samples.len(),
         )?;
-        let merged_markers = if let Some((reference_window, _, _)) = reference_window_data.as_ref()
-        {
-            impute::merged_marker_count(
-                &window.rows,
-                &reference_window.rows,
-                Some(config.window_markers),
-            )?
-        } else {
-            window.rows.len()
+        let merged_markers = match reference_window_data.as_ref() {
+            Some(ActiveReferenceWindow::Compact(compact_ref)) => {
+                impute::merged_marker_count_from_metas(
+                    &window.rows,
+                    &compact_ref.metas,
+                    Some(config.window_markers),
+                )?
+            }
+            Some(ActiveReferenceWindow::Phased(reference_window, _, _)) => {
+                impute::merged_marker_count(
+                    &window.rows,
+                    &reference_window.rows,
+                    Some(config.window_markers),
+                )?
+            }
+            None => window.rows.len(),
         };
-        let reference_marker_count = reference_window_data
-            .as_ref()
-            .map_or(window.rows.len(), |(reference_window, _, _)| {
+        let reference_marker_count = match reference_window_data.as_ref() {
+            Some(ActiveReferenceWindow::Compact(compact_ref)) => compact_ref.n_markers(),
+            Some(ActiveReferenceWindow::Phased(reference_window, _, _)) => {
                 reference_window.rows.len()
-            });
+            }
+            None => window.rows.len(),
+        };
         let perform_imputation = config.impute && reference_window_data.is_some();
         if perform_imputation {
             summary.imputation_windows = summary.imputation_windows.saturating_add(1);
@@ -1452,35 +1484,49 @@ where
         } else {
             phase_config.hmm.phase_states
         };
-        let bits_per_allele = max_allele_bits(
-            &window.rows,
-            reference_window_data
-                .as_ref()
-                .map(|(reference_window, _, _)| reference_window.rows.as_slice())
-                .unwrap_or(&[]),
-        );
-        let reference_window_for_phase = reference_window_data
+        let bits_per_allele = match reference_window_data.as_ref() {
+            Some(ActiveReferenceWindow::Phased(reference_window, _, _)) => {
+                max_allele_bits(&window.rows, reference_window.rows.as_slice())
+            }
+            _ => max_allele_bits(&window.rows, &[]),
+        };
+        let reference_marker_alignment = match reference_window_data.as_ref() {
+            Some(ActiveReferenceWindow::Compact(compact_ref)) => Some(
+                impute::ReferenceMarkerAlignment::new_from_metas(&window.rows, &compact_ref.metas)?,
+            ),
+            Some(ActiveReferenceWindow::Phased(reference_window, _, _)) => Some(
+                impute::ReferenceMarkerAlignment::new(&window.rows, &reference_window.rows)?,
+            ),
+            None => None,
+        };
+        let mut low_frequency_data = if phase_bypass_allowed {
+            None
+        } else {
+            let phase_ref = match reference_window_data.as_ref() {
+                Some(ActiveReferenceWindow::Compact(compact_ref)) => {
+                    Some(reference_store::PhaseReference::Compact(compact_ref))
+                }
+                Some(ActiveReferenceWindow::Phased(reference_window, _, _)) => {
+                    Some(reference_store::PhaseReference::Phased(reference_window))
+                }
+                None => None,
+            };
+            Some(impute::low_frequency_marker_data_with_alignment_ref(
+                carrier_window_storage.as_ref().unwrap_or(&window),
+                phase_ref,
+                reference_marker_alignment.as_ref(),
+            )?)
+        };
+        let use_two_stage_phase = low_frequency_data
             .as_ref()
-            .map(|(reference_window, _, _)| reference_window);
-        let reference_marker_alignment = reference_window_for_phase
-            .map(|reference| impute::ReferenceMarkerAlignment::new(&window.rows, &reference.rows))
-            .transpose()?;
-        let low_frequency_candidate = low_frequency_phase_candidate(
-            phase_bypass_allowed,
-            carrier_window_storage.as_ref().unwrap_or(&window),
-            reference_window_for_phase,
-            reference_marker_alignment.as_ref(),
-        )?;
-        let use_two_stage_phase = low_frequency_candidate
-            .as_deref()
-            .is_some_and(impute::use_two_stage_phase_from_mask);
+            .is_some_and(|(mask, _)| impute::use_two_stage_phase_from_mask(mask));
         let mut phase_cm_positions = if phase_bypass_allowed {
             window.cm_positions.clone()
         } else {
             phase::beagle_phase_marker_map(&window)?
         };
         let stage1_low_frequency_mask =
-            use_two_stage_phase.then(|| low_frequency_candidate.as_deref().unwrap());
+            use_two_stage_phase.then(|| low_frequency_data.as_ref().unwrap().0.as_slice());
         let stage1_marker_indices = stage1_low_frequency_mask
             .as_deref()
             .map(|mask| {
@@ -1550,9 +1596,19 @@ where
             }
         }
         if perform_imputation {
-            let (reference_window, reference_cm, _) = reference_window_data
+            let (ref_markers, reference_cm) = match reference_window_data
                 .as_ref()
-                .expect("imputation requires a reference window");
+                .expect("imputation requires a reference window")
+            {
+                ActiveReferenceWindow::Compact(compact_ref) => (
+                    compact_ref.n_markers(),
+                    compact_ref.cm_positions.as_slice(),
+                ),
+                ActiveReferenceWindow::Phased(reference_window, reference_cm, _) => (
+                    reference_window.rows.len(),
+                    reference_cm.as_slice(),
+                ),
+            };
             memory::set_compact_target_mosaic_storage(
                 &mut active_estimate,
                 merged_markers,
@@ -1567,11 +1623,26 @@ where
                     merged_markers,
                 ),
             )?;
-            memory::include_reference_window(
-                &mut active_estimate,
-                reference_samples,
-                reference_window.rows.len(),
-            )?;
+            match reference_window_data.as_ref() {
+                Some(ActiveReferenceWindow::Compact(compact_ref)) => {
+                    let will_spill = !phase_bypass_allowed
+                        && reference_store::ReferenceSpillPolicy::from_env()
+                            .should_spill(compact_ref.allele_bytes());
+                    memory::include_compact_reference_window(
+                        &mut active_estimate,
+                        reference_samples,
+                        ref_markers,
+                        will_spill,
+                    )?;
+                }
+                _ => {
+                    memory::include_reference_window(
+                        &mut active_estimate,
+                        reference_samples,
+                        ref_markers,
+                    )?;
+                }
+            }
             memory::include_imp_ibs_reference_index(
                 &mut active_estimate,
                 reference_samples
@@ -1585,15 +1656,19 @@ where
                 ),
                 requested_workers,
             )?;
-            memory::include_variant_storage(
-                &mut active_estimate,
-                &reference_window.rows,
-                reference_samples,
-                2,
-            )?;
-            marginal_excess = marginal_excess
-                .checked_add(memory::variant_marginal_excess_sum(&reference_window.rows)?)
-                .ok_or_else(|| "multiallelic posterior memory estimate overflow".to_owned())?;
+            if let Some(ActiveReferenceWindow::Phased(reference_window, _, _)) =
+                reference_window_data.as_ref()
+            {
+                memory::include_variant_storage(
+                    &mut active_estimate,
+                    &reference_window.rows,
+                    reference_samples,
+                    2,
+                )?;
+                marginal_excess = marginal_excess
+                    .checked_add(memory::variant_marginal_excess_sum(&reference_window.rows)?)
+                    .ok_or_else(|| "multiallelic posterior memory estimate overflow".to_owned())?;
+            }
             memory::include_streamed_imputation_window(
                 &mut active_estimate,
                 samples.len(),
@@ -1603,7 +1678,9 @@ where
                     .ok_or_else(|| "reference haplotype count overflow".to_owned())?,
                 requested_workers,
             )?;
-        } else if let Some((reference_window, _, _)) = reference_window_data.as_ref() {
+        } else if let Some(ActiveReferenceWindow::Phased(reference_window, _, _)) =
+            reference_window_data.as_ref()
+        {
             memory::include_reference_window(
                 &mut active_estimate,
                 reference_samples,
@@ -1623,11 +1700,20 @@ where
             // map positions used to define sliding windows.
             drop(ibd2_intervals.take());
             let ibd2_started = profile_windows.then(Instant::now);
-            let intervals = Some(ibd2::detect_projected_intervals_with_reference_map(
+            let phase_ref = match reference_window_data.as_ref() {
+                Some(ActiveReferenceWindow::Compact(compact_ref)) => {
+                    Some(reference_store::PhaseReference::Compact(compact_ref))
+                }
+                Some(ActiveReferenceWindow::Phased(reference_window, _, _)) => {
+                    Some(reference_store::PhaseReference::Phased(reference_window))
+                }
+                None => None,
+            };
+            let intervals = Some(ibd2::detect_projected_intervals_with_phase_reference(
                 &window,
                 &stage1_marker_indices,
                 &phase_cm_positions,
-                reference_window_for_phase,
+                phase_ref,
                 reference_marker_alignment.as_ref(),
                 Some(config.master_seed()),
                 None,
@@ -1635,6 +1721,37 @@ where
             )?);
             ibd2_elapsed += ibd2_started.map_or(Duration::ZERO, |started| started.elapsed());
             intervals
+        } else {
+            None
+        };
+        let prepacked_compact_reference = if !phase_bypass_allowed {
+            match (
+                reference_window_data.as_mut(),
+                reference_marker_alignment.as_ref(),
+            ) {
+                (Some(ActiveReferenceWindow::Compact(compact_ref)), Some(alignment)) => {
+                    // Spill before allocating state-major `packed` so the
+                    // marker-major 1-bit reference buffer and `packed` never
+                    // coexist in RAM when P1-1b is active.
+                    let _spilled = compact_ref.maybe_spill_to_disk()?;
+                    let (packed, target_samples, reference_present) =
+                        phase::pack_compact_reference_haplotypes_aligned(
+                            &window,
+                            compact_ref,
+                            alignment,
+                        )?;
+                    let lf_data = low_frequency_data
+                        .take()
+                        .expect("low-frequency data is computed whenever phasing runs");
+                    Some(phase::PrepackedPhaseReference {
+                        packed,
+                        target_samples,
+                        reference_present,
+                        low_frequency_data: lf_data,
+                    })
+                }
+                _ => None,
+            }
         } else {
             None
         };
@@ -1684,23 +1801,45 @@ where
             std::mem::swap(&mut window.cm_positions, &mut phase_cm_positions);
             let phase_result = {
                 let carrier_window = carrier_window_storage.as_ref().unwrap_or(&window);
-                phase::phase_window_prepared(
-                    &window,
-                    carrier_window,
-                    phase_config,
-                    pbwt::beagle_window_seed(config.master_seed(), window.index),
-                    phase_ibd2_intervals,
-                    worker_pool.as_ref(),
-                    reference_window_for_phase,
-                    reference_marker_alignment.as_ref(),
-                    low_frequency_candidate.as_deref(),
-                    diagnostic_site,
-                )
+                if let Some(prepacked) = prepacked_compact_reference {
+                    phase::phase_window_prepared_with_prepacked(
+                        &window,
+                        carrier_window,
+                        phase_config,
+                        pbwt::beagle_window_seed(config.master_seed(), window.index),
+                        phase_ibd2_intervals,
+                        worker_pool.as_ref(),
+                        Some(prepacked),
+                        None,
+                        diagnostic_site,
+                    )
+                } else {
+                    let phased_ref = match reference_window_data.as_ref() {
+                        Some(ActiveReferenceWindow::Phased(reference_window, _, _)) => {
+                            Some(reference_window)
+                        }
+                        _ => None,
+                    };
+                    phase::phase_window_prepared(
+                        &window,
+                        carrier_window,
+                        phase_config,
+                        pbwt::beagle_window_seed(config.master_seed(), window.index),
+                        phase_ibd2_intervals,
+                        worker_pool.as_ref(),
+                        phased_ref,
+                        reference_marker_alignment.as_ref(),
+                        low_frequency_data.as_ref().map(|(mask, _)| mask.as_slice()),
+                        diagnostic_site,
+                    )
+                }
             };
             std::mem::swap(&mut window.cm_positions, &mut phase_cm_positions);
             phase_result?
         };
         drop(carrier_window_storage);
+        drop(reference_marker_alignment);
+        drop(low_frequency_data);
         let expected_reference_haplotypes = samples
             .len()
             .checked_add(reference_samples)
@@ -1742,8 +1881,8 @@ where
             summary.variants_written,
             samples.len(),
         )?;
-        if let Some((reference_window, reference_cm, reference_groups)) = reference_window_data {
-            if config.impute {
+        match reference_window_data {
+            Some(ActiveReferenceWindow::Compact(reference_window)) => {
                 let mut impute_config = config.impute_config();
                 impute_config.states = imp_states;
                 // ImpIbs samples donor candidates from the command-line seed,
@@ -1760,13 +1899,6 @@ where
                     samples.len(),
                 )?;
                 if let Some(reference_stream) = reference.as_mut() {
-                    if scheduled_bounds.is_none() {
-                        reference_stream.cache_carry(
-                            &reference_window,
-                            &reference_cm,
-                            &reference_groups,
-                        )?;
-                    }
                     if let Some(last) = phased.rows[phased.emit_start..phased.emit_end]
                         .iter()
                         .rev()
@@ -1784,16 +1916,13 @@ where
                 }
                 let sync_impute = merged_markers >= 50_000
                     || reference_window
-                        .rows
-                        .len()
+                        .n_markers()
                         .saturating_mul(reference_samples)
                         >= 8_000_000;
                 let impute_job = PostPhaseJob::Impute {
                     window,
                     phased,
                     reference_window,
-                    reference_cm,
-                    reference_groups,
                     impute_config,
                     fitted_hmm_config,
                     imputation_error,
@@ -1828,7 +1957,12 @@ where
                     started.elapsed().as_secs_f64(),
                 );
                 }
-            } else {
+            }
+            Some(ActiveReferenceWindow::Phased(
+                reference_window,
+                reference_cm,
+                reference_groups,
+            )) => {
                 let impute_elapsed =
                     impute_started.map_or(Duration::ZERO, |started| started.elapsed());
                 let write_started = profile_windows.then(Instant::now);
@@ -1887,7 +2021,7 @@ where
                     );
                 }
             }
-        } else {
+            None => {
             let impute_elapsed = impute_started.map_or(Duration::ZERO, |started| started.elapsed());
             let write_started = profile_windows.then(Instant::now);
             report_progress(
@@ -1921,6 +2055,7 @@ where
                     write_elapsed.as_secs_f64(),
                     started.elapsed().as_secs_f64(),
                 );
+                }
             }
         }
         report_progress(
@@ -1952,6 +2087,7 @@ fn region_marker_is_emittable(region: Option<&types::RegionSpec>, chrom: &str, p
     region.is_none_or(|region| region.contains(chrom, pos))
 }
 
+#[cfg(test)]
 fn low_frequency_phase_candidate(
     phase_bypass_allowed: bool,
     carrier_window: &types::PhaseWindow,

@@ -2270,6 +2270,165 @@ impl PackedBiallelicReference {
         })
     }
 
+    /// Build a merged `PackedBiallelicReference` directly from a 1-bit
+    /// `CompactReferenceWindow` (either resident in RAM or spilled to disk).
+    ///
+    /// When the window is resident and every merged marker maps 1:1 to a
+    /// reference marker (no target-only markers), the 1-bit `Vec<u64>` is
+    /// moved in O(1) with zero allocation and swapped markers are inverted
+    /// in place.
+    pub(crate) fn from_compact_reference(
+        reference: &mut super::reference_store::CompactReferenceWindow,
+        reference_row_indices: &[Option<usize>],
+        reference_swaps: &[bool],
+    ) -> Result<Self, String> {
+        let ref_markers = reference.n_markers();
+        if ref_markers == 0
+            || reference_row_indices.is_empty()
+            || reference_row_indices.len() != reference_swaps.len()
+            || reference.n_samples == 0
+        {
+            return Err("packed reference dimensions are invalid".to_owned());
+        }
+        let n_haplotypes = reference
+            .n_samples
+            .checked_mul(2)
+            .ok_or_else(|| "packed reference haplotype count overflow".to_owned())?;
+        let words_per_marker = n_haplotypes.div_ceil(64);
+        if words_per_marker != reference.words_per_marker {
+            return Err("compact reference word stride does not match sample count".to_owned());
+        }
+        let valid_last_word_mask = if n_haplotypes % 64 == 0 {
+            u64::MAX
+        } else {
+            (1u64 << (n_haplotypes & 63)) - 1
+        };
+        let invert_row = |words: &mut [u64]| {
+            if let Some((last, prefix)) = words.split_last_mut() {
+                for word in prefix {
+                    *word = !*word;
+                }
+                *last = (!*last) & valid_last_word_mask;
+            }
+        };
+
+        let storage = std::mem::replace(
+            &mut reference.alleles,
+            super::reference_store::ReferenceWindowAlleles::Resident(Vec::new()),
+        );
+        match storage {
+            super::reference_store::ReferenceWindowAlleles::Resident(mut src_words) => {
+                let expected_src_words = ref_markers
+                    .checked_mul(words_per_marker)
+                    .ok_or_else(|| "packed reference dimensions overflow".to_owned())?;
+                if src_words.len() != expected_src_words {
+                    return Err("compact reference resident buffer length is invalid".to_owned());
+                }
+                let is_identity = reference_row_indices.len() == ref_markers
+                    && reference_row_indices
+                        .iter()
+                        .enumerate()
+                        .all(|(marker, idx)| *idx == Some(marker));
+                if is_identity {
+                    for (marker, &swap) in reference_swaps.iter().enumerate() {
+                        if swap {
+                            let start = marker * words_per_marker;
+                            invert_row(&mut src_words[start..start + words_per_marker]);
+                        }
+                    }
+                    return Ok(Self {
+                        n_haplotypes,
+                        n_markers: reference_row_indices.len(),
+                        words_per_marker,
+                        allele_words: src_words,
+                        missing_markers: vec![false; reference_row_indices.len()],
+                    });
+                }
+                let word_count = words_per_marker
+                    .checked_mul(reference_row_indices.len())
+                    .ok_or_else(|| "packed reference dimensions overflow".to_owned())?;
+                let mut allele_words = vec![0u64; word_count];
+                let mut missing_markers = vec![false; reference_row_indices.len()];
+                for (marker, reference_index) in reference_row_indices.iter().copied().enumerate() {
+                    let Some(reference_index) = reference_index else {
+                        missing_markers[marker] = true;
+                        continue;
+                    };
+                    if reference_index >= ref_markers {
+                        return Err(format!(
+                            "reference marker index {reference_index} exceeds the reference window"
+                        ));
+                    }
+                    let src_start = reference_index * words_per_marker;
+                    let dst_start = marker * words_per_marker;
+                    let dst = &mut allele_words[dst_start..dst_start + words_per_marker];
+                    dst.copy_from_slice(&src_words[src_start..src_start + words_per_marker]);
+                    if reference_swaps[marker] {
+                        invert_row(dst);
+                    }
+                }
+                Ok(Self {
+                    n_haplotypes,
+                    n_markers: reference_row_indices.len(),
+                    words_per_marker,
+                    allele_words,
+                    missing_markers,
+                })
+            }
+            super::reference_store::ReferenceWindowAlleles::Spilled(mut spill) => {
+                if spill.n_markers() != ref_markers || spill.words_per_marker() != words_per_marker
+                {
+                    return Err("spilled reference cache dimensions do not match window".to_owned());
+                }
+                let word_count = words_per_marker
+                    .checked_mul(reference_row_indices.len())
+                    .ok_or_else(|| "packed reference dimensions overflow".to_owned())?;
+                let mut allele_words = vec![0u64; word_count];
+                let mut missing_markers = vec![false; reference_row_indices.len()];
+                let label = spill.path_display().to_string();
+                let mut reader = spill.open_reader()?;
+                let mut skip_buf = Vec::new();
+                let mut cursor = 0usize;
+                for (marker, reference_index) in reference_row_indices.iter().copied().enumerate() {
+                    let Some(reference_index) = reference_index else {
+                        missing_markers[marker] = true;
+                        continue;
+                    };
+                    if reference_index >= ref_markers || reference_index < cursor {
+                        return Err(format!(
+                            "spilled reference marker index {reference_index} is out of order (cursor {cursor})"
+                        ));
+                    }
+                    if cursor < reference_index {
+                        skip_buf.resize(words_per_marker, 0);
+                        while cursor < reference_index {
+                            super::reference_store::read_exact_u64_words(
+                                &mut reader,
+                                &mut skip_buf,
+                                &label,
+                            )?;
+                            cursor += 1;
+                        }
+                    }
+                    let dst_start = marker * words_per_marker;
+                    let dst = &mut allele_words[dst_start..dst_start + words_per_marker];
+                    super::reference_store::read_exact_u64_words(&mut reader, dst, &label)?;
+                    cursor += 1;
+                    if reference_swaps[marker] {
+                        invert_row(dst);
+                    }
+                }
+                Ok(Self {
+                    n_haplotypes,
+                    n_markers: reference_row_indices.len(),
+                    words_per_marker,
+                    allele_words,
+                    missing_markers,
+                })
+            }
+        }
+    }
+
     #[inline]
     pub(crate) fn n_haplotypes(&self) -> usize {
         self.n_haplotypes
@@ -5519,6 +5678,125 @@ mod tests {
         assert_eq!(donors, expected);
         assert!(donors.contains(&0));
         assert_ne!(donors, ibs_fallback_donor_haplotypes(64, 64, 0, 43));
+    }
+
+    #[test]
+    fn compact_reference_resident_and_spilled_match_from_reference_rows() {
+        let sample_count = 35usize; // 70 haplotypes (non-multiple of 64)
+        let make_calls = |marker: usize| {
+            (0..sample_count)
+                .map(|sample| {
+                    [
+                        Some(u16::from((sample + marker * 3) % 5 < 2)),
+                        Some(u16::from((sample * 7 + marker) % 11 < 5)),
+                    ]
+                })
+                .collect::<Vec<_>>()
+        };
+        let make_meta = |pos: u64| VariantMeta {
+            chrom: "1".to_owned(),
+            pos,
+            id: format!("v{pos}"),
+            ref_allele: "A".to_owned(),
+            alt_alleles: vec!["G".to_owned()],
+        };
+        let phased_rows = (0..3)
+            .map(|marker| PhasedRow {
+                meta: make_meta([10, 30, 40][marker]),
+                calls: row_calls(&make_calls(marker)),
+                dosage: None,
+                ap1: None,
+                ap2: None,
+                gp: None,
+                info_af: None,
+                info_dr2: None,
+                imputed: false,
+            })
+            .collect::<Vec<_>>();
+        let build_compact = || {
+            let rows = phased_rows
+                .iter()
+                .enumerate()
+                .map(|(idx, row)| {
+                    let compact =
+                        crate::imp::reference_store::CompactReferenceRow::from_validated_variant_row(
+                            VariantRow {
+                                meta: row.meta.clone(),
+                                calls: row.calls.clone(),
+                            },
+                        )
+                        .unwrap();
+                    (compact, (idx + 1) as f64 * 0.1, Some(1))
+                })
+                .collect::<Vec<_>>();
+            crate::imp::reference_store::CompactReferenceWindow::from_compact_rows(
+                "1".to_owned(),
+                0,
+                0,
+                3,
+                rows,
+            )
+            .unwrap()
+        };
+
+        // Case 1: Identity 1:1 (zero-copy move + in-place swap)
+        let id_indices = [Some(0), Some(1), Some(2)];
+        let id_swaps = [false, true, false];
+        let expected_id = PackedBiallelicReference::from_reference_rows(
+            &phased_rows,
+            &id_indices,
+            &id_swaps,
+            sample_count,
+        )
+        .unwrap();
+        let mut compact_id = build_compact();
+        let observed_id = PackedBiallelicReference::from_compact_reference(
+            &mut compact_id,
+            &id_indices,
+            &id_swaps,
+        )
+        .unwrap();
+        assert_eq!(observed_id.allele_words, expected_id.allele_words);
+        assert_eq!(observed_id.missing_markers, expected_id.missing_markers);
+
+        // Case 2: With target-only markers (None) & swaps, both Resident and Spilled
+        let merged_indices = [Some(0), None, Some(1), Some(2)];
+        let merged_swaps = [false, false, true, true];
+        let expected_merged = PackedBiallelicReference::from_reference_rows(
+            &phased_rows,
+            &merged_indices,
+            &merged_swaps,
+            sample_count,
+        )
+        .unwrap();
+
+        let mut compact_res = build_compact();
+        let observed_res = PackedBiallelicReference::from_compact_reference(
+            &mut compact_res,
+            &merged_indices,
+            &merged_swaps,
+        )
+        .unwrap();
+        assert_eq!(observed_res.allele_words, expected_merged.allele_words);
+        assert_eq!(
+            observed_res.missing_markers,
+            expected_merged.missing_markers
+        );
+
+        let mut compact_spilled = build_compact();
+        compact_spilled.spill_to_disk().unwrap();
+        assert!(compact_spilled.is_spilled());
+        let observed_spilled = PackedBiallelicReference::from_compact_reference(
+            &mut compact_spilled,
+            &merged_indices,
+            &merged_swaps,
+        )
+        .unwrap();
+        assert_eq!(observed_spilled.allele_words, expected_merged.allele_words);
+        assert_eq!(
+            observed_spilled.missing_markers,
+            expected_merged.missing_markers
+        );
     }
 }
 

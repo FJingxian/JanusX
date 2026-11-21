@@ -15,7 +15,7 @@ import socket
 import sys
 import time
 from array import array
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
@@ -215,6 +215,29 @@ class _GeneticMap:
         return math.floor(rounded + 0.5)
 
 
+def _initial_pbwt_max_chunk_markers(
+    cm_positions: array,
+    threads: int,
+) -> int:
+    marker_count = len(cm_positions)
+    if marker_count == 0:
+        return 0
+    logical_chunks = max(int(threads), 1)
+    total_cm = float(cm_positions[-1] - cm_positions[0])
+    advance_cm = max(total_cm / logical_chunks, 2.0)
+    maximum = 0
+    start = 0
+    end = bisect_right(cm_positions, cm_positions[0] + advance_cm)
+    while end < marker_count:
+        maximum = max(maximum, end - start)
+        start = bisect_left(cm_positions, cm_positions[end] - 0.5)
+        next_end = bisect_right(cm_positions, cm_positions[end] + advance_cm)
+        if next_end <= end:
+            raise ValueError("initial PBWT window partition did not advance")
+        end = next_end
+    return max(maximum, marker_count - start)
+
+
 class _MetadataWindowCursor:
     def __init__(
         self,
@@ -223,12 +246,14 @@ class _MetadataWindowCursor:
         window_cm: float,
         overlap_cm: float,
         window_markers: int,
+        threads: int,
     ) -> None:
         self.records = records
         self.map = map_data
         self.window_cm = window_cm
         self.overlap_cm = overlap_cm
         self.window_markers = window_markers
+        self.threads = threads
         self.pending: tuple[str, int, float] | None = None
         self.carry_positions = array("Q")
         self.carry_cm = array("d")
@@ -238,7 +263,7 @@ class _MetadataWindowCursor:
         self.exhausted = False
         self.seen_chromosomes: set[str] = set()
 
-    def next_window(self) -> int | None:
+    def next_window(self) -> tuple[int, int, float] | None:
         if self.exhausted and not self.carry_positions and self.pending is None:
             return None
         window_positions = self.carry_positions
@@ -348,7 +373,11 @@ class _MetadataWindowCursor:
             )
         self.carry_positions = retained_positions
         self.carry_cm = retained_cm
-        return len(window_positions)
+        return (
+            len(window_positions),
+            _initial_pbwt_max_chunk_markers(window_cm, self.threads),
+            float(window_cm[-1] - window_cm[0]),
+        )
 
     def _read_next(self) -> tuple[str, int, float] | None:
         if self.pending is not None:
@@ -391,6 +420,8 @@ class _WindowInspection:
     markers: int
     windows: int
     max_window_markers: int
+    max_initial_pbwt_chunk_markers: int = 0
+    max_window_cm_span: float = 0.0
     estimated_peak_rss_bytes: int = 0
 
 
@@ -448,7 +479,8 @@ def _window_layout(
     window_cm: float,
     overlap_cm: float,
     window_markers: int,
-) -> tuple[int, int, int]:
+    threads: int,
+) -> tuple[int, int, int, int, float]:
     marker_count = 0
 
     def counted_records() -> Iterator[tuple[str, int]]:
@@ -463,16 +495,31 @@ def _window_layout(
         window_cm,
         overlap_cm,
         window_markers,
+        threads,
     )
     windows = 0
     max_window_markers = 0
+    max_initial_pbwt_chunk_markers = 0
+    max_window_cm_span = 0.0
     while True:
-        observed = cursor.next_window()
-        if observed is None:
+        layout = cursor.next_window()
+        if layout is None:
             break
+        observed, initial_pbwt_markers, window_cm_span = layout
         windows += 1
         max_window_markers = max(max_window_markers, observed)
-    return marker_count, windows, max_window_markers
+        max_initial_pbwt_chunk_markers = max(
+            max_initial_pbwt_chunk_markers,
+            initial_pbwt_markers,
+        )
+        max_window_cm_span = max(max_window_cm_span, window_cm_span)
+    return (
+        marker_count,
+        windows,
+        max_window_markers,
+        max_initial_pbwt_chunk_markers,
+        max_window_cm_span,
+    )
 
 
 def _inspect_target_dimensions(
@@ -484,6 +531,7 @@ def _inspect_target_dimensions(
     window_cm: float,
     overlap_cm: float,
     window_markers: int,
+    threads: int,
 ) -> _WindowInspection:
     map_data = (
         _GeneticMap.fallback()
@@ -492,7 +540,13 @@ def _inspect_target_dimensions(
     )
     if target_kind == "bfile":
         samples = _count_sample_rows(Path(f"{target}.fam"))
-        markers, windows, max_window_markers = _window_layout(
+        (
+            markers,
+            windows,
+            max_window_markers,
+            max_initial_pbwt_chunk_markers,
+            max_window_cm_span,
+        ) = _window_layout(
             _plain_marker_records(
                 Path(f"{target}.bim"),
                 chrom_index=0,
@@ -503,16 +557,25 @@ def _inspect_target_dimensions(
             window_cm=window_cm,
             overlap_cm=overlap_cm,
             window_markers=window_markers,
+            threads=threads,
         )
         return _WindowInspection(
             samples,
             markers,
             windows,
             max_window_markers,
+            max_initial_pbwt_chunk_markers,
+            max_window_cm_span,
         )
     if target_kind == "pfile":
         samples = _count_sample_rows(Path(f"{target}.psam"))
-        markers, windows, max_window_markers = _window_layout(
+        (
+            markers,
+            windows,
+            max_window_markers,
+            max_initial_pbwt_chunk_markers,
+            max_window_cm_span,
+        ) = _window_layout(
             _plain_marker_records(
                 Path(pvar_path_for_prefix(str(target))),
                 chrom_index=0,
@@ -523,12 +586,15 @@ def _inspect_target_dimensions(
             window_cm=window_cm,
             overlap_cm=overlap_cm,
             window_markers=window_markers,
+            threads=threads,
         )
         return _WindowInspection(
             samples,
             markers,
             windows,
             max_window_markers,
+            max_initial_pbwt_chunk_markers,
+            max_window_cm_span,
         )
     if target_kind == "vcf":
         samples = 0
@@ -552,18 +618,27 @@ def _inspect_target_dimensions(
                     if _marker_in_region(chrom, position, region):
                         yield chrom, position
 
-        markers, windows, max_window_markers = _window_layout(
+        (
+            markers,
+            windows,
+            max_window_markers,
+            max_initial_pbwt_chunk_markers,
+            max_window_cm_span,
+        ) = _window_layout(
             records(),
             map_data=map_data,
             window_cm=window_cm,
             overlap_cm=overlap_cm,
             window_markers=window_markers,
+            threads=threads,
         )
         return _WindowInspection(
             samples,
             markers,
             windows,
             max_window_markers,
+            max_initial_pbwt_chunk_markers,
+            max_window_cm_span,
         )
     if target_kind == "hmp":
         samples = 0
@@ -588,18 +663,27 @@ def _inspect_target_dimensions(
                     if _marker_in_region(chrom, position, region):
                         yield chrom, position
 
-        markers, windows, max_window_markers = _window_layout(
+        (
+            markers,
+            windows,
+            max_window_markers,
+            max_initial_pbwt_chunk_markers,
+            max_window_cm_span,
+        ) = _window_layout(
             records(),
             map_data=map_data,
             window_cm=window_cm,
             overlap_cm=overlap_cm,
             window_markers=window_markers,
+            threads=threads,
         )
         return _WindowInspection(
             samples,
             markers,
             windows,
             max_window_markers,
+            max_initial_pbwt_chunk_markers,
+            max_window_cm_span,
         )
     raise ValueError(f"unsupported target kind for progress inspection: {target_kind}")
 
@@ -660,6 +744,8 @@ def _set_preflight_estimate(
             inspection.samples,
             reference_samples,
             max(inspection.max_window_markers, 1),
+            max(inspection.max_initial_pbwt_chunk_markers, 1),
+            max(float(inspection.max_window_cm_span), 0.0),
         )
     )
     # The active-window model does not include resident allocator, reader, and
@@ -671,11 +757,15 @@ def _set_preflight_estimate(
         - 1
     ) // _IMP_PREFLIGHT_RSS_DENOMINATOR
     return _WindowInspection(
-        inspection.samples,
-        inspection.markers,
-        inspection.windows,
-        inspection.max_window_markers,
-        max(_process_rss_bytes(), 0) + window_bytes,
+        samples=inspection.samples,
+        markers=inspection.markers,
+        windows=inspection.windows,
+        max_window_markers=inspection.max_window_markers,
+        max_initial_pbwt_chunk_markers=(
+            inspection.max_initial_pbwt_chunk_markers
+        ),
+        max_window_cm_span=inspection.max_window_cm_span,
+        estimated_peak_rss_bytes=max(_process_rss_bytes(), 0) + window_bytes,
     )
 
 def _janusx_version() -> str:
@@ -1529,6 +1619,7 @@ def main() -> int:
             window_cm=float(args.window),
             overlap_cm=float(args.overlap),
             window_markers=int(args.window_markers),
+            threads=int(args.threads),
         )
         progress_total = int(inspection.markers) if inspection.markers > 0 else None
         if progress_total is not None:

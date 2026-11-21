@@ -846,6 +846,8 @@ pub fn estimate_imp_window_bytes(
     target_samples: usize,
     reference_samples: usize,
     max_window_markers: usize,
+    max_initial_pbwt_chunk_markers: usize,
+    max_window_cm_span: f64,
 ) -> Result<u64, String> {
     if target_samples == 0 {
         return Err("memory estimate requires at least one target sample".to_owned());
@@ -871,7 +873,8 @@ pub fn estimate_imp_window_bytes(
         config.phase_states
     };
     let mut estimate = memory::estimate_window(
-        phase_samples,
+        target_samples,
+        reference_samples,
         marker_count,
         config.phase_states,
         imp_states,
@@ -883,22 +886,29 @@ pub fn estimate_imp_window_bytes(
         phase_samples,
         max_phase_pbwt_steps(config, marker_count),
     )?;
-    memory::include_initial_phase_pbwt_workspace(&mut estimate, phase_samples, marker_count)?;
+    memory::include_initial_phase_pbwt_workspace(
+        &mut estimate,
+        phase_samples,
+        max_initial_pbwt_chunk_markers.clamp(1, marker_count),
+    )?;
     if config.reference.is_some() {
         memory::include_reference_window(&mut estimate, reference_samples, marker_count)?;
         if config.impute {
-            memory::include_imputation_window(
+            let step_count = estimated_imp_step_count(config, max_window_cm_span, marker_count);
+            memory::include_imp_ibs_reference_index(
+                &mut estimate,
+                reference_samples
+                    .checked_mul(2)
+                    .ok_or_else(|| "reference haplotype count overflow".to_owned())?,
+                marker_count,
+                step_count,
+                config.threads,
+            )?;
+            memory::include_streamed_imputation_window(
                 &mut estimate,
                 target_samples,
                 marker_count,
-                config.ap,
-                config.gp,
-            )?;
-            memory::include_pbwt_segment_index(
-                &mut estimate,
-                reference_samples,
-                marker_count,
-                marker_count,
+                config.threads,
             )?;
         }
     }
@@ -1423,7 +1433,8 @@ where
             .collect::<Vec<_>>();
         let stage1_marker_count = stage1_cm_positions.len();
         let mut active_estimate = memory::estimate_window(
-            samples.len().saturating_add(reference_samples),
+            samples.len(),
+            reference_samples,
             merged_markers,
             phase_config.hmm.phase_states,
             imp_states,
@@ -1474,12 +1485,6 @@ where
             let (reference_window, reference_cm, _) = reference_window_data
                 .as_ref()
                 .expect("imputation requires a reference window");
-            let imp_pbwt_segments = pbwt_segment_count(
-                &window.cm_positions,
-                reference_cm,
-                config.imp_segment,
-                merged_markers,
-            )?;
             memory::set_compact_target_mosaic_storage(
                 &mut active_estimate,
                 merged_markers,
@@ -1488,18 +1493,29 @@ where
                 reference_samples
                     .checked_mul(2)
                     .ok_or_else(|| "reference haplotype count overflow".to_owned())?,
-                imp_pbwt_segments,
+                estimated_imp_step_count(
+                    config,
+                    merged_cm_span(&window.cm_positions, reference_cm)?,
+                    merged_markers,
+                ),
             )?;
             memory::include_reference_window(
                 &mut active_estimate,
                 reference_samples,
                 reference_window.rows.len(),
             )?;
-            memory::include_pbwt_segment_index(
+            memory::include_imp_ibs_reference_index(
                 &mut active_estimate,
-                reference_samples,
+                reference_samples
+                    .checked_mul(2)
+                    .ok_or_else(|| "reference haplotype count overflow".to_owned())?,
                 merged_markers,
-                imp_pbwt_segments,
+                estimated_imp_step_count(
+                    config,
+                    merged_cm_span(&window.cm_positions, reference_cm)?,
+                    merged_markers,
+                ),
+                requested_workers,
             )?;
             memory::include_variant_storage(
                 &mut active_estimate,
@@ -1510,12 +1526,11 @@ where
             marginal_excess = marginal_excess
                 .checked_add(memory::variant_marginal_excess_sum(&reference_window.rows)?)
                 .ok_or_else(|| "multiallelic posterior memory estimate overflow".to_owned())?;
-            memory::include_imputation_window(
+            memory::include_streamed_imputation_window(
                 &mut active_estimate,
                 samples.len(),
                 merged_markers,
-                config.ap,
-                config.gp,
+                requested_workers,
             )?;
         } else if let Some((reference_window, _, _)) = reference_window_data.as_ref() {
             memory::include_reference_window(
@@ -1909,7 +1924,8 @@ fn target_window_estimate(
         .checked_add(reference_samples)
         .ok_or_else(|| "phase sample count overflow in memory estimate".to_owned())?;
     let mut estimate = memory::estimate_window(
-        phase_samples,
+        target_samples,
+        reference_samples,
         marker_count,
         config.phase_states,
         imp_states,
@@ -1919,14 +1935,17 @@ fn target_window_estimate(
     memory::include_row_storage_excess(&mut estimate, target_storage_excess, 2)?;
     memory::include_phase_expansion(&mut estimate, target_phase_expansion_bytes)?;
     memory::include_multiallelic_marginal_storage(&mut estimate, target_marginal_excess)?;
-    memory::include_phase_pbwt_donors(&mut estimate, phase_samples, marker_count)?;
+    memory::include_phase_pbwt_donors(
+        &mut estimate,
+        phase_samples,
+        max_phase_pbwt_steps(config, marker_count),
+    )?;
     if has_imputation {
-        memory::include_imputation_window(
+        memory::include_streamed_imputation_window(
             &mut estimate,
             target_samples,
             marker_count,
-            config.ap,
-            config.gp,
+            workers,
         )?;
     }
     if is_bgzf_vcf_output(config) {
@@ -1957,6 +1976,18 @@ fn max_phase_pbwt_steps(config: &ImpConfig, max_markers: usize) -> usize {
     count.min(max_markers).max(1)
 }
 
+fn estimated_imp_step_count(config: &ImpConfig, genetic_span_cm: f64, max_markers: usize) -> usize {
+    let step_cm = f64::from(config.imp_step as f32);
+    if max_markers == 0 || !step_cm.is_finite() || step_cm <= 0.0 {
+        return 0;
+    }
+    let span = genetic_span_cm.max(0.0);
+    ((span / step_cm).ceil() as usize)
+        .saturating_add(1)
+        .min(max_markers)
+        .max(1)
+}
+
 fn phase_pbwt_step_count(config: &ImpConfig, cm_positions: &[f64], max_markers: usize) -> usize {
     if max_markers == 0 || cm_positions.is_empty() {
         return 0;
@@ -1984,14 +2015,12 @@ fn phase_pbwt_step_count_with_step_cm(
     estimate.min(max_markers).max(1)
 }
 
-fn pbwt_segment_count(
+fn merged_cm_span(
     target_cm_positions: &[f64],
     reference_cm_positions: &[f64],
-    segment_cm: f64,
-    max_markers: usize,
-) -> Result<usize, String> {
+) -> Result<f64, String> {
     let Some(target_start) = target_cm_positions.first().copied() else {
-        return Err("cannot estimate PBWT segments for an empty target map".to_owned());
+        return Err("cannot estimate genetic span for an empty target map".to_owned());
     };
     let target_end = *target_cm_positions.last().unwrap();
     let start_cm = reference_cm_positions
@@ -2004,11 +2033,10 @@ fn pbwt_segment_count(
         .last()
         .copied()
         .map_or(target_end, |reference_end| target_end.max(reference_end));
-    if !segment_cm.is_finite() || segment_cm <= 0.0 || end_cm < start_cm {
-        return Err("cannot estimate PBWT segments from invalid genetic positions".to_owned());
+    if !start_cm.is_finite() || !end_cm.is_finite() || end_cm < start_cm {
+        return Err("cannot estimate genetic span from invalid positions".to_owned());
     }
-    let count = (((end_cm - start_cm) / segment_cm).floor() as usize).saturating_add(1);
-    Ok(count.min(max_markers).max(1))
+    Ok(end_cm - start_cm)
 }
 
 fn max_allele_bits(target: &[types::VariantRow], reference: &[types::PhasedRow]) -> u8 {

@@ -744,6 +744,8 @@ fn imp_estimate_window_bytes(
     target_samples: usize,
     reference_samples: usize,
     max_window_markers: usize,
+    max_initial_pbwt_chunk_markers: usize,
+    max_window_cm_span: f64,
 ) -> PyResult<u64> {
     let config = serde_json::from_str::<imp::ImpConfig>(&options_json)
         .map_err(|error| PyRuntimeError::new_err(format!("invalid imp options: {error}")))?;
@@ -752,6 +754,8 @@ fn imp_estimate_window_bytes(
         target_samples,
         reference_samples,
         max_window_markers,
+        max_initial_pbwt_chunk_markers,
+        max_window_cm_span,
     )
     .map_err(PyRuntimeError::new_err)
 }

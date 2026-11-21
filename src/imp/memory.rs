@@ -67,14 +67,15 @@ pub(crate) fn include_bgzf_writer_workspace(estimate: &mut MemoryEstimate) -> Re
 }
 
 pub(crate) fn estimate_window(
-    n_samples: usize,
+    target_samples: usize,
+    reference_samples: usize,
     n_markers: usize,
     phase_states: usize,
     imp_states: usize,
     bits_per_allele: u8,
     workers: usize,
 ) -> Result<MemoryEstimate, String> {
-    if n_samples == 0
+    if target_samples == 0
         || n_markers == 0
         || phase_states == 0
         || imp_states == 0
@@ -83,6 +84,9 @@ pub(crate) fn estimate_window(
     {
         return Err("memory estimate dimensions and worker count must be positive".to_owned());
     }
+    let phase_samples = target_samples
+        .checked_add(reference_samples)
+        .ok_or_else(|| "phase sample count overflow".to_owned())?;
     let checked_mul = |a: usize, b: usize, label: &str| {
         a.checked_mul(b)
             .ok_or_else(|| format!("{label} memory estimate overflow"))
@@ -91,13 +95,14 @@ pub(crate) fn estimate_window(
         a.checked_add(b)
             .ok_or_else(|| format!("{label} memory estimate overflow"))
     };
-    let haplotypes = checked_mul(n_samples, 2, "haplotype count")?;
+    let haplotypes = checked_mul(phase_samples, 2, "haplotype count")?;
     // DiploidCalls stores common biallelic hard calls in half a byte/sample.
     // Extra storage for complex partial-missing or multiallelic calls is added
     // from the actual active rows once they have been read.
-    let input_row_bytes = checked_add(n_samples.div_ceil(2), 256, "input row")?;
+    let input_row_bytes = checked_add(target_samples.div_ceil(2), 256, "input row")?;
     // The input cursor holds the active window while cloning its overlap into
-    // the next cursor state; reserve two window-sized row sets.
+    // the next cursor state; reserve two target-window row sets. Reference
+    // rows are accounted separately by `include_reference_window`.
     let input_window_bytes = checked_mul(
         checked_mul(n_markers, input_row_bytes, "input window")?,
         2,
@@ -134,7 +139,7 @@ pub(crate) fn estimate_window(
         "PBWT workspace",
     )?;
     let progressive_phase_bytes = checked_mul(
-        n_samples,
+        phase_samples,
         n_markers
             .div_ceil(64)
             .checked_mul(std::mem::size_of::<u64>())
@@ -234,7 +239,7 @@ pub(crate) fn estimate_window(
         mosaic_rank_scratch,
         "per-worker panels, HMM, and mosaic scratch",
     )?;
-    let output_buffer_bytes = checked_mul(n_samples, 256, "output buffer")?;
+    let output_buffer_bytes = checked_mul(target_samples, 256, "output buffer")?;
     let per_worker = checked_add(
         checkpoint_bytes_per_worker,
         scratch_bytes_per_worker,
@@ -330,52 +335,51 @@ pub(crate) fn include_reference_window(
     Ok(())
 }
 
-pub(crate) fn include_pbwt_segment_index(
+pub(crate) fn include_imp_ibs_reference_index(
     estimate: &mut MemoryEstimate,
-    reference_samples: usize,
+    reference_haplotypes: usize,
     n_markers: usize,
-    segment_count: usize,
+    step_count: usize,
+    workers: usize,
 ) -> Result<(), String> {
-    let reference_haplotypes = reference_samples
-        .checked_mul(2)
-        .ok_or_else(|| "reference PBWT haplotype count overflow".to_owned())?;
-    // Retained segment orders plus the current order/reorder buffers used
-    // while building the next segment. The marker-sized major-allele vector
-    // supplies a deterministic value at target-missing sites during each
-    // target query. Shared target/reference marker indexes are retained per
-    // segment; a temporary searchable-marker mask is used during construction.
-    let order_bytes = reference_haplotypes
-        .checked_mul(segment_count.saturating_add(1))
-        .and_then(|count| count.checked_mul(std::mem::size_of::<usize>()))
-        .ok_or_else(|| "reference PBWT order memory estimate overflow".to_owned())?;
-    let marker_bytes = n_markers
-        .checked_mul(std::mem::size_of::<Option<u16>>())
-        .ok_or_else(|| "reference PBWT query memory estimate overflow".to_owned())?;
+    if reference_haplotypes == 0 || n_markers == 0 || step_count == 0 || workers == 0 {
+        return Err("imputation IBS index memory dimensions must be positive".to_owned());
+    }
+    // ImpIbsReferenceIndex retains three marker/step range vectors, one
+    // partitioning marker-index vector, and one sorted hash/donor vector per
+    // genetic step. The segment count is the number of imp-step intervals,
+    // not the number of markers.
+    let range_bytes = step_count
+        .checked_mul(3 * 2 * std::mem::size_of::<usize>())
+        .ok_or_else(|| "imputation IBS step range memory estimate overflow".to_owned())?;
     let marker_index_bytes = n_markers
         .checked_mul(std::mem::size_of::<usize>())
-        .ok_or_else(|| "reference PBWT marker-index memory estimate overflow".to_owned())?;
-    let searchable_mask_bytes = n_markers
-        .checked_mul(std::mem::size_of::<bool>())
-        .ok_or_else(|| "reference PBWT marker-mask memory estimate overflow".to_owned())?;
-    let segment_struct_bytes =
-        2 * std::mem::size_of::<usize>() + 2 * std::mem::size_of::<Vec<usize>>();
-    let segment_bytes = segment_count
-        .checked_mul(segment_struct_bytes)
-        .ok_or_else(|| "reference PBWT segment memory estimate overflow".to_owned())?;
-    let bytes = order_bytes
-        .checked_add(marker_bytes)
-        .and_then(|value| value.checked_add(marker_index_bytes))
-        .and_then(|value| value.checked_add(searchable_mask_bytes))
-        .and_then(|value| value.checked_add(segment_bytes))
-        .ok_or_else(|| "reference PBWT index memory estimate overflow".to_owned())?;
+        .ok_or_else(|| "imputation IBS marker index memory estimate overflow".to_owned())?;
+    let per_haplotype_step_bytes = std::mem::size_of::<u64>() + std::mem::size_of::<u32>();
+    let retained_step_bytes = reference_haplotypes
+        .checked_mul(step_count)
+        .and_then(|count| count.checked_mul(per_haplotype_step_bytes))
+        .ok_or_else(|| "imputation IBS hash index memory estimate overflow".to_owned())?;
+    // Each Rayon worker sorts a temporary (u64, u32) donor entry for the
+    // current step. These entries coexist before the compact vectors are
+    // filled.
+    let construction_entry_bytes = reference_haplotypes
+        .checked_mul(workers)
+        .and_then(|count| count.checked_mul(std::mem::size_of::<(u64, u32)>()))
+        .ok_or_else(|| "imputation IBS construction scratch estimate overflow".to_owned())?;
+    let bytes = range_bytes
+        .checked_add(marker_index_bytes)
+        .and_then(|value| value.checked_add(retained_step_bytes))
+        .and_then(|value| value.checked_add(construction_entry_bytes))
+        .ok_or_else(|| "imputation IBS index memory estimate overflow".to_owned())?;
     estimate.phase_snapshot_bytes = estimate
         .phase_snapshot_bytes
         .checked_add(bytes)
-        .ok_or_else(|| "reference PBWT index memory estimate overflow".to_owned())?;
+        .ok_or_else(|| "imputation IBS index memory estimate overflow".to_owned())?;
     estimate.total_bytes = estimate
         .total_bytes
         .checked_add(bytes)
-        .ok_or_else(|| "total reference PBWT index memory estimate overflow".to_owned())?;
+        .ok_or_else(|| "total imputation IBS index memory estimate overflow".to_owned())?;
     Ok(())
 }
 
@@ -721,74 +725,79 @@ pub(crate) fn include_multiallelic_marginal_storage(
     Ok(())
 }
 
-pub(crate) fn include_imputation_window(
+/// Account for the production streaming path used by `impute_window_stream`.
+/// Sample posterior batches are bounded independently, and output rows and
+/// posterior tiles are assembled from fixed-size chunks rather than retaining
+/// a marker × sample matrix for the full window.
+pub(crate) fn include_streamed_imputation_window(
     estimate: &mut MemoryEstimate,
     target_samples: usize,
     n_markers: usize,
-    allele_probabilities: bool,
-    genotype_probabilities: bool,
+    workers: usize,
 ) -> Result<(), String> {
-    let mut bytes_per_sample_marker = std::mem::size_of::<f32>() + 1; // DS and compact phased hard calls
-    if allele_probabilities {
-        bytes_per_sample_marker += 2 * std::mem::size_of::<f32>();
+    if target_samples == 0 || n_markers == 0 || workers == 0 {
+        return Err("streamed imputation memory dimensions must be positive".to_owned());
     }
-    if genotype_probabilities {
-        bytes_per_sample_marker += 3 * std::mem::size_of::<f32>();
-    }
+    const POSTERIOR_TILE_BYTES: usize = 32 * 1024 * 1024;
+    const DEFAULT_POSTERIOR_BATCH_BYTES: usize = 256 * 1024 * 1024;
+    let posterior_batch_bytes = std::env::var("JX_IMP_POSTERIOR_BATCH_MB")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_POSTERIOR_BATCH_BYTES / (1024 * 1024))
+        .clamp(16, 512)
+        .saturating_mul(1024 * 1024);
+
+    // A store tile is copied into posterior values and assembled rows. Reserve
+    // two posterior tile copies plus one output-row tile.
+    let tile_bytes = POSTERIOR_TILE_BYTES
+        .checked_mul(3)
+        .ok_or_else(|| "streamed imputation tile estimate overflow".to_owned())?;
+    // HaplotypeScratch can retain one full marker vector of f32 per active
+    // worker when projection markers are not dense.
+    let full_projection_scratch = n_markers
+        .checked_mul(std::mem::size_of::<f32>())
+        .and_then(|bytes| bytes.checked_mul(workers))
+        .ok_or_else(|| "streamed imputation projection scratch overflow".to_owned())?;
+    let statistics_bytes = n_markers
+        .checked_mul(2 * std::mem::size_of::<f64>())
+        .ok_or_else(|| "streamed imputation statistics estimate overflow".to_owned())?;
     let metadata_bytes = n_markers
         .checked_mul(256)
-        .ok_or_else(|| "imputation metadata memory estimate overflow".to_owned())?;
-    let bytes = n_markers
-        .checked_mul(target_samples)
-        .and_then(|value| value.checked_mul(bytes_per_sample_marker))
+        .ok_or_else(|| "streamed imputation metadata estimate overflow".to_owned())?;
+    let bytes = posterior_batch_bytes
+        .checked_add(tile_bytes)
+        .and_then(|value| value.checked_add(full_projection_scratch))
+        .and_then(|value| value.checked_add(statistics_bytes))
         .and_then(|value| value.checked_add(metadata_bytes))
-        .ok_or_else(|| "imputation output memory estimate overflow".to_owned())?;
+        .ok_or_else(|| "streamed imputation memory estimate overflow".to_owned())?;
     estimate.output_buffer_bytes = estimate
         .output_buffer_bytes
         .checked_add(bytes)
-        .ok_or_else(|| "imputation output memory estimate overflow".to_owned())?;
+        .ok_or_else(|| "streamed imputation output estimate overflow".to_owned())?;
     estimate.total_bytes = estimate
         .total_bytes
         .checked_add(bytes)
-        .ok_or_else(|| "total imputation memory estimate overflow".to_owned())?;
-
-    // Posterior vectors are emitted sample batches no larger than the worker
-    // pool, instead of retaining two full marker vectors for every sample.
-    let posterior_bytes_per_worker = n_markers
-        .checked_mul(2 * std::mem::size_of::<f32>())
-        .ok_or_else(|| "imputation posterior memory estimate overflow".to_owned())?;
-    estimate.scratch_bytes_per_worker = estimate
-        .scratch_bytes_per_worker
-        .checked_add(posterior_bytes_per_worker)
-        .ok_or_else(|| "imputation posterior memory estimate overflow".to_owned())?;
-    estimate.total_bytes = estimate
-        .total_bytes
-        .checked_add(
-            posterior_bytes_per_worker
-                .checked_mul(estimate.worker_count)
-                .ok_or_else(|| "imputation posterior memory estimate overflow".to_owned())?,
-        )
-        .ok_or_else(|| "total imputation posterior estimate overflow".to_owned())?;
+        .ok_or_else(|| "total streamed imputation estimate overflow".to_owned())?;
     Ok(())
 }
 
-/// Replace the full dense donor mosaic allowance with the compact layout used
-/// by reference imputation: state haplotypes at target HMM markers plus one
-/// donor-index vector per PBWT segment.
+/// Replace the full dense donor mosaic allowance with the compact IBS layout
+/// used by reference imputation: state haplotypes at target HMM markers plus
+/// donor runs bounded by the imp-step count.
 pub(crate) fn set_compact_target_mosaic_storage(
     estimate: &mut MemoryEstimate,
     union_markers: usize,
     hmm_markers: usize,
     requested_states: usize,
     reference_haplotypes: usize,
-    segment_count: usize,
+    step_count: usize,
 ) -> Result<(), String> {
     if union_markers == 0
         || hmm_markers == 0
         || hmm_markers > union_markers
         || requested_states == 0
         || reference_haplotypes == 0
-        || segment_count == 0
+        || step_count == 0
     {
         return Err("compact imputation mosaic memory dimensions are invalid".to_owned());
     }
@@ -830,7 +839,7 @@ pub(crate) fn set_compact_target_mosaic_storage(
                 .and_then(|metadata| value.checked_add(metadata))
         })
         .and_then(|value| {
-            segment_count
+            step_count
                 .checked_mul(
                     new_states
                         .checked_mul(std::mem::size_of::<usize>())?

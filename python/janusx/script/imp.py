@@ -649,13 +649,15 @@ def build_parser(argv: Sequence[str] | None = None) -> CliArgumentParser:
 
     model = parser.add_argument_group("Phasing / Imputation Arguments")
     model.add_argument(
-        "-window",
+        "-w",
+        "--window",
         type=float,
         default=40.0,
         help="Window length in cM (default: %(default)s).",
     )
     model.add_argument(
         "-overlap",
+        "--overlap",
         type=float,
         default=2.0,
         help="Window overlap in cM (default: %(default)s).",
@@ -664,10 +666,7 @@ def build_parser(argv: Sequence[str] | None = None) -> CliArgumentParser:
         "-window-markers",
         type=int,
         default=4_000_000,
-        help=help_text(
-            "Maximum target markers per window (default: %(default)s).",
-            advanced=True,
-        ),
+        help="Maximum target markers per window (default: %(default)s).",
     )
     model.add_argument(
         "-phase-states",
@@ -690,23 +689,13 @@ def build_parser(argv: Sequence[str] | None = None) -> CliArgumentParser:
             advanced=True,
         ),
     )
-    adaptive = model.add_mutually_exclusive_group()
-    adaptive.add_argument(
-        "--adaptive-states",
-        dest="adaptive_states",
-        action="store_true",
-        help=help_text(
-            "Scale imputation states to the available reference panel.",
-            advanced=True,
-        ),
-    )
-    adaptive.add_argument(
+    model.add_argument(
         "--no-adaptive-states",
         dest="adaptive_states",
         action="store_false",
+        default=True,
         help=help_text("Use the fixed -imp-states value.", advanced=True),
     )
-    parser.set_defaults(adaptive_states=True)
     model.add_argument(
         "-burnin",
         type=int,
@@ -749,25 +738,19 @@ def build_parser(argv: Sequence[str] | None = None) -> CliArgumentParser:
         "-err",
         type=float,
         default=None,
-        help="Optional allele error-rate override.",
-    )
-    em = model.add_mutually_exclusive_group()
-    em.add_argument(
-        "--em",
-        dest="em",
-        action="store_true",
-        help=help_text(
-            "Enable Beagle-style EM initialization and burn-in updates (default).",
-            advanced=True,
+        help=(
+            "Allele error-rate override (default: auto, "
+            "1/[2+2H(0.5+ln H)], where H is the total target+reference "
+            "haplotype count)."
         ),
     )
-    em.add_argument(
+    model.add_argument(
         "--no-em",
         dest="em",
         action="store_false",
+        default=True,
         help=help_text("Disable EM parameter updates.", advanced=True),
     )
-    parser.set_defaults(em=True)
     model.add_argument(
         "-only-phase",
         "--only-phase",
@@ -874,7 +857,6 @@ def build_parser(argv: Sequence[str] | None = None) -> CliArgumentParser:
     runtime.add_argument(
         "-t",
         "--thread",
-        "--threads",
         dest="threads",
         type=int,
         default=None,
@@ -909,7 +891,7 @@ def main() -> int:
     if args.threads is None:
         args.threads = max(1, int(detect_effective_threads()))
     if args.threads <= 0:
-        parser.error("-t/--threads must be positive")
+        parser.error("-t/--thread must be positive")
     try:
         target_kind, target = _selected_target(args)
         reference = _resolve_reference_arg(args.reference)

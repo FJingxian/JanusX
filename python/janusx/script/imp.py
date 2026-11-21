@@ -8,14 +8,18 @@ import gzip
 import hashlib
 import json
 import logging
+import math
 import os
 import shlex
 import socket
 import sys
 import time
-from collections.abc import Sequence
-from pathlib import Path
+from array import array
+from bisect import bisect_left
+from collections.abc import Iterable, Iterator, Sequence
+from dataclasses import dataclass
 from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
 
 from janusx import janusx as jxrs
 from janusx._plink import open_text_auto, pvar_path_for_prefix
@@ -80,6 +84,314 @@ def _open_text_input(path: Path):
     return path.open(mode="rt", encoding="utf-8", newline="")
 
 
+class _GeneticMap:
+    def __init__(
+        self,
+        by_chromosome: dict[str, list[tuple[int, float]]] | None = None,
+        *,
+        use_fallback: bool = False,
+    ) -> None:
+        self.by_chromosome = by_chromosome or {}
+        self.use_fallback = use_fallback
+
+    @classmethod
+    def from_plink(cls, path: Path) -> "_GeneticMap":
+        by_chromosome: dict[str, list[tuple[int, float]]] = {}
+        with path.open(mode="rt", encoding="utf-8") as handle:
+            for line_idx, raw in enumerate(handle):
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                fields = line.split()
+                if len(fields) < 4:
+                    if line_idx == 0 and any(field.lower() == "chr" for field in fields):
+                        continue
+                    raise ValueError(
+                        f"{path}:{line_idx + 1}: expected PLINK map columns CHR SNP CM BP"
+                    )
+                try:
+                    cm = float(fields[2])
+                    position = int(fields[3])
+                except ValueError as exc:
+                    raise ValueError(
+                        f"{path}:{line_idx + 1}: invalid genetic-map row"
+                    ) from exc
+                if position <= 0 or not math.isfinite(cm) or cm < 0.0:
+                    raise ValueError(
+                        f"{path}:{line_idx + 1}: map positions must be positive "
+                        "bp and finite nonnegative cM"
+                    )
+                points = by_chromosome.setdefault(str(fields[0]), [])
+                if points and (position < points[-1][0] or cm < points[-1][1]):
+                    raise ValueError(
+                        f"{path}:{line_idx + 1}: map positions must be "
+                        "nondecreasing within each chromosome"
+                    )
+                points.append((position, cm))
+        if not by_chromosome:
+            raise ValueError(f"{path}: genetic map contains no data rows")
+        return cls(by_chromosome)
+
+    @classmethod
+    def fallback(cls) -> "_GeneticMap":
+        return cls(use_fallback=True)
+
+    def cm_at(self, chrom: str, position: int) -> float:
+        points = self.by_chromosome.get(chrom)
+        if points is None:
+            if self.use_fallback:
+                return float(position) / 1_000_000.0
+            raise ValueError(f"genetic map has no chromosome {chrom}")
+        if len(points) == 1:
+            return points[0][1] + (position - points[0][0]) / 1_000_000.0
+        upper = bisect_left(points, position, key=lambda point: point[0])
+        if upper == 0:
+            min_cm = points[0][1] + 5.0
+            right = bisect_left(points, min_cm, key=lambda point: point[1])
+            left, right = points[0], points[min(right, len(points) - 1)]
+        elif upper >= len(points):
+            last = len(points) - 1
+            min_cm = points[last][1] - 5.0
+            lower = bisect_left(points, min_cm, key=lambda point: point[1])
+            left_index = (
+                lower
+                if lower < len(points) and points[lower][1] == min_cm
+                else lower - 1
+            )
+            left, right = points[min(left_index, last - 1)], points[last]
+        elif points[upper][0] == position:
+            return points[upper][1]
+        else:
+            left, right = points[upper - 1], points[upper]
+        if left[0] == right[0]:
+            return left[1]
+        fraction = (position - left[0]) / (right[0] - left[0])
+        return left[1] + fraction * (right[1] - left[1])
+
+    def base_pos_at(self, chrom: str, cm: float) -> int:
+        if not math.isfinite(cm):
+            raise ValueError("genetic map boundary must be finite")
+        if self.use_fallback:
+            rounded = cm * 1_000_000.0
+        else:
+            points = self.by_chromosome.get(chrom)
+            if not points:
+                raise ValueError(f"genetic map has no positions for chromosome {chrom}")
+            if len(points) == 1:
+                rounded = points[0][0] + (cm - points[0][1]) * 1_000_000.0
+            else:
+                last = len(points) - 1
+                upper = bisect_left(points, cm, key=lambda point: point[1])
+                if upper < len(points) and points[upper][1] == cm:
+                    return points[upper][0]
+                if cm < points[0][1]:
+                    threshold = points[0][1] + 5.0
+                    upper_boundary = bisect_left(
+                        points, threshold, key=lambda point: point[1]
+                    )
+                    left, right = 0, min(upper_boundary, last)
+                elif cm > points[last][1]:
+                    threshold = points[last][1] - 5.0
+                    upper_boundary = bisect_left(
+                        points, threshold, key=lambda point: point[1]
+                    )
+                    left = min(max(upper_boundary - 1, 0), last - 1)
+                    right = last
+                else:
+                    left = min(max(upper - 1, 0), last - 1)
+                    right = min(upper, last)
+                left_bp, left_cm = points[left]
+                right_bp, right_cm = points[right]
+                if left_cm == right_cm:
+                    rounded = float(left_bp)
+                else:
+                    rounded = left_bp + (
+                        (cm - left_cm) / (right_cm - left_cm)
+                    ) * (right_bp - left_bp)
+        if not math.isfinite(rounded) or rounded < 0.0 or rounded > 2**64 - 1:
+            raise ValueError(f"genetic position {cm} cM has no valid base position")
+        return math.floor(rounded + 0.5)
+
+
+class _MetadataWindowCursor:
+    def __init__(
+        self,
+        records: Iterator[tuple[str, int]],
+        map_data: _GeneticMap,
+        window_cm: float,
+        overlap_cm: float,
+        window_markers: int,
+    ) -> None:
+        self.records = records
+        self.map = map_data
+        self.window_cm = window_cm
+        self.overlap_cm = overlap_cm
+        self.window_markers = window_markers
+        self.pending: tuple[str, int, float] | None = None
+        self.carry_positions = array("Q")
+        self.carry_cm = array("d")
+        self.last_chromosome: str | None = None
+        self.last_position = 0
+        self.last_cm = -math.inf
+        self.exhausted = False
+        self.seen_chromosomes: set[str] = set()
+
+    def next_window(self) -> int | None:
+        if self.exhausted and not self.carry_positions and self.pending is None:
+            return None
+        window_positions = self.carry_positions
+        window_cm = self.carry_cm
+        self.carry_positions = array("Q")
+        self.carry_cm = array("d")
+        retained_overlap_rows = len(window_positions)
+        if retained_overlap_rows and self.pending is None and not self.exhausted:
+            self.pending = self._read_next()
+            self.exhausted = self.pending is None
+
+        if self.pending is not None:
+            chrom, position, cm = self.pending
+            self.pending = None
+            if not window_positions:
+                window_positions.append(position)
+                window_cm.append(cm)
+            else:
+                chrom = self.last_chromosome or ""
+                self.pending = (chrom, position, cm)
+        elif window_positions:
+            chrom = self.last_chromosome or ""
+        else:
+            first = self._read_next()
+            if first is None:
+                self.exhausted = True
+                return None
+            chrom, position, cm = first
+            window_positions.append(position)
+            window_cm.append(cm)
+        if not window_positions:
+            return None
+
+        start_cm = window_cm[0]
+        if retained_overlap_rows:
+            end_cm = (
+                self.pending[2] + self.window_cm - self.overlap_cm
+                if self.pending is not None and self.pending[0] == chrom
+                else start_cm + self.window_cm
+            )
+        else:
+            end_cm = start_cm + self.window_cm
+        end_position = self.map.base_pos_at(chrom, end_cm)
+        hit_chromosome_boundary = False
+        hit_cm_boundary = False
+        while len(window_positions) < self.window_markers and not self.exhausted:
+            record = self._read_next()
+            if record is None:
+                self.exhausted = True
+                break
+            next_chrom, next_position, next_cm = record
+            if next_chrom != chrom:
+                self.pending = record
+                hit_chromosome_boundary = True
+                break
+            if next_position >= end_position:
+                self.pending = record
+                hit_cm_boundary = True
+                break
+            window_positions.append(next_position)
+            window_cm.append(next_cm)
+
+        marker_cap_reached = len(window_positions) >= self.window_markers
+        no_new_rows_after_overlap = len(window_positions) == retained_overlap_rows
+        terminal = self.exhausted or hit_chromosome_boundary or (
+            hit_cm_boundary and no_new_rows_after_overlap
+        )
+        if terminal:
+            carry_start = len(window_positions)
+            outgoing_phase_carry_len = 0
+        else:
+            overlap_start_cm = max(
+                window_cm[-1] - self.overlap_cm,
+                window_cm[0],
+            )
+            overlap_start_position = self.map.base_pos_at(chrom, overlap_start_cm)
+            low = max(
+                len(window_positions) - max(self.window_markers >> 2, 1),
+                0,
+            )
+            insertion = bisect_left(
+                window_positions,
+                overlap_start_position,
+                lo=low,
+            )
+            candidate = (
+                insertion
+                if insertion < len(window_positions)
+                and window_positions[insertion] == overlap_start_position
+                else max(insertion - 1, 0)
+            )
+            candidate_position = window_positions[candidate]
+            overlap_start = bisect_left(window_positions, candidate_position)
+            splice = (len(window_positions) + overlap_start) >> 1
+            carry_start = overlap_start
+            outgoing_phase_carry_len = splice - overlap_start
+
+        retained_positions = window_positions[carry_start:]
+        retained_cm = window_cm[carry_start:]
+        if marker_cap_reached and len(retained_positions) >= self.window_markers:
+            removed = len(retained_positions) - (self.window_markers - 1)
+            retained_positions = retained_positions[removed:]
+            retained_cm = retained_cm[removed:]
+            outgoing_phase_carry_len = max(
+                outgoing_phase_carry_len - removed,
+                0,
+            )
+        self.carry_positions = retained_positions
+        self.carry_cm = retained_cm
+        return len(window_positions)
+
+    def _read_next(self) -> tuple[str, int, float] | None:
+        if self.pending is not None:
+            record = self.pending
+            self.pending = None
+            return record
+        try:
+            chrom, position = next(self.records)
+        except StopIteration:
+            return None
+        if self.last_chromosome is not None:
+            if chrom == self.last_chromosome:
+                if position < self.last_position:
+                    raise ValueError(
+                        f"input positions are not sorted: {chrom}:{position} "
+                        f"follows {self.last_chromosome}:{self.last_position}"
+                    )
+            else:
+                self.seen_chromosomes.add(self.last_chromosome)
+                if chrom in self.seen_chromosomes:
+                    raise ValueError(
+                        f"input chromosome {chrom} reappears after another chromosome"
+                    )
+                self.last_cm = -math.inf
+        cm = self.map.cm_at(chrom, position)
+        if cm + sys.float_info.epsilon < self.last_cm:
+            raise ValueError(
+                f"genetic positions decrease at {chrom}:{position} "
+                f"({cm} cM after {self.last_cm} cM)"
+            )
+        self.last_chromosome = chrom
+        self.last_position = position
+        self.last_cm = cm
+        return chrom, position, cm
+
+
+@dataclass(frozen=True)
+class _WindowInspection:
+    samples: int
+    markers: int
+    windows: int
+    max_window_markers: int
+    estimated_peak_rss_bytes: int = 0
+
+
 def _marker_in_region(
     chrom: object,
     position: object,
@@ -96,39 +408,25 @@ def _marker_in_region(
     )
 
 
-def _count_marker_rows(
+def _plain_marker_records(
     path: Path,
     *,
     chrom_index: int,
     position_index: int,
-    delimiter: str | None,
     region,
-    skip_first_data_row: bool = False,
-) -> int:
-    count = 0
-    data_row_seen = False
+) -> Iterator[tuple[str, int]]:
     with _open_text_input(path) as handle:
         for raw in handle:
             line = raw.strip()
             if not line or line.startswith("#"):
                 continue
-            if skip_first_data_row and not data_row_seen:
-                data_row_seen = True
-                continue
-            data_row_seen = True
-            if region is None:
-                count += 1
-                continue
-            fields = line.split(delimiter) if delimiter is not None else line.split()
+            fields = line.split()
             if len(fields) <= max(chrom_index, position_index):
                 raise ValueError(f"{path}: malformed marker row")
-            if _marker_in_region(
-                fields[chrom_index],
-                fields[position_index],
-                region,
-            ):
-                count += 1
-    return count
+            chrom = str(fields[chrom_index])
+            position = int(fields[position_index])
+            if _marker_in_region(chrom, position, region):
+                yield chrom, position
 
 
 def _count_sample_rows(path: Path) -> int:
@@ -141,72 +439,239 @@ def _count_sample_rows(path: Path) -> int:
     return count
 
 
+def _window_layout(
+    records: Iterable[tuple[str, int]],
+    *,
+    map_data: _GeneticMap,
+    window_cm: float,
+    overlap_cm: float,
+    window_markers: int,
+) -> tuple[int, int, int]:
+    marker_count = 0
+
+    def counted_records() -> Iterator[tuple[str, int]]:
+        nonlocal marker_count
+        for record in records:
+            marker_count += 1
+            yield record
+
+    cursor = _MetadataWindowCursor(
+        counted_records(),
+        map_data,
+        window_cm,
+        overlap_cm,
+        window_markers,
+    )
+    windows = 0
+    max_window_markers = 0
+    while True:
+        observed = cursor.next_window()
+        if observed is None:
+            break
+        windows += 1
+        max_window_markers = max(max_window_markers, observed)
+    return marker_count, windows, max_window_markers
+
+
 def _inspect_target_dimensions(
     target_kind: str,
     target: Path,
     region,
-) -> tuple[int, int]:
+    *,
+    map_path: Path | None,
+    window_cm: float,
+    overlap_cm: float,
+    window_markers: int,
+) -> _WindowInspection:
+    map_data = (
+        _GeneticMap.fallback()
+        if map_path is None
+        else _GeneticMap.from_plink(map_path)
+    )
     if target_kind == "bfile":
         samples = _count_sample_rows(Path(f"{target}.fam"))
-        markers = _count_marker_rows(
-            Path(f"{target}.bim"),
-            chrom_index=0,
-            position_index=3,
-            delimiter=None,
-            region=region,
+        markers, windows, max_window_markers = _window_layout(
+            _plain_marker_records(
+                Path(f"{target}.bim"),
+                chrom_index=0,
+                position_index=3,
+                region=region,
+            ),
+            map_data=map_data,
+            window_cm=window_cm,
+            overlap_cm=overlap_cm,
+            window_markers=window_markers,
         )
-        return samples, markers
+        return _WindowInspection(
+            samples,
+            markers,
+            windows,
+            max_window_markers,
+        )
     if target_kind == "pfile":
         samples = _count_sample_rows(Path(f"{target}.psam"))
-        markers = _count_marker_rows(
-            Path(pvar_path_for_prefix(str(target))),
-            chrom_index=0,
-            position_index=1,
-            delimiter=None,
-            region=region,
+        markers, windows, max_window_markers = _window_layout(
+            _plain_marker_records(
+                Path(pvar_path_for_prefix(str(target))),
+                chrom_index=0,
+                position_index=1,
+                region=region,
+            ),
+            map_data=map_data,
+            window_cm=window_cm,
+            overlap_cm=overlap_cm,
+            window_markers=window_markers,
         )
-        return samples, markers
+        return _WindowInspection(
+            samples,
+            markers,
+            windows,
+            max_window_markers,
+        )
     if target_kind == "vcf":
         samples = 0
-        markers = 0
-        with _open_text_input(target) as handle:
-            for raw in handle:
-                line = raw.strip()
-                if not line:
-                    continue
-                if line.startswith("#"):
-                    if line.startswith("#CHROM"):
-                        samples = max(0, len(line.split("\t")) - 9)
-                    continue
-                if region is not None:
+
+        def records() -> Iterator[tuple[str, int]]:
+            nonlocal samples
+            with _open_text_input(target) as handle:
+                for raw in handle:
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    if line.startswith("#"):
+                        if line.startswith("#CHROM"):
+                            samples = max(0, len(line.split("\t")) - 9)
+                        continue
                     fields = line.split("\t")
                     if len(fields) < 2:
                         raise ValueError(f"{target}: malformed VCF marker row")
-                    if not _marker_in_region(fields[0], fields[1], region):
-                        continue
-                markers += 1
-        return samples, markers
+                    chrom = str(fields[0])
+                    position = int(fields[1])
+                    if _marker_in_region(chrom, position, region):
+                        yield chrom, position
+
+        markers, windows, max_window_markers = _window_layout(
+            records(),
+            map_data=map_data,
+            window_cm=window_cm,
+            overlap_cm=overlap_cm,
+            window_markers=window_markers,
+        )
+        return _WindowInspection(
+            samples,
+            markers,
+            windows,
+            max_window_markers,
+        )
     if target_kind == "hmp":
         samples = 0
-        markers = 0
         header_seen = False
-        with _open_text_input(target) as handle:
-            for raw in handle:
-                line = raw.strip()
-                if not line or line.startswith("#"):
-                    continue
-                fields = line.split()
-                if not header_seen:
-                    samples = max(0, len(fields) - 11)
-                    header_seen = True
-                    continue
-                if len(fields) < 4:
-                    raise ValueError(f"{target}: malformed HapMap marker row")
-                if _marker_in_region(fields[2], fields[3], region):
-                    markers += 1
-        return samples, markers
+
+        def records() -> Iterator[tuple[str, int]]:
+            nonlocal samples, header_seen
+            with _open_text_input(target) as handle:
+                for raw in handle:
+                    line = raw.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    fields = line.split()
+                    if not header_seen:
+                        samples = max(0, len(fields) - 11)
+                        header_seen = True
+                        continue
+                    if len(fields) < 4:
+                        raise ValueError(f"{target}: malformed HapMap marker row")
+                    chrom = str(fields[2])
+                    position = int(fields[3])
+                    if _marker_in_region(chrom, position, region):
+                        yield chrom, position
+
+        markers, windows, max_window_markers = _window_layout(
+            records(),
+            map_data=map_data,
+            window_cm=window_cm,
+            overlap_cm=overlap_cm,
+            window_markers=window_markers,
+        )
+        return _WindowInspection(
+            samples,
+            markers,
+            windows,
+            max_window_markers,
+        )
     raise ValueError(f"unsupported target kind for progress inspection: {target_kind}")
 
+
+def _inspect_reference_samples(reference: Path | None) -> int:
+    if reference is None:
+        return 0
+    lower = str(reference).lower()
+    if lower.endswith(".vcf") or lower.endswith(".vcf.gz"):
+        with _open_text_input(reference) as handle:
+            for raw in handle:
+                if raw.startswith("#CHROM"):
+                    return max(0, len(raw.rstrip("\n").split("\t")) - 9)
+        return 0
+    return _count_sample_rows(Path(f"{reference}.psam"))
+
+
+def _process_rss_bytes() -> int:
+    current_rss = 0
+    statm = Path("/proc/self/statm")
+    if statm.is_file():
+        try:
+            resident_pages = int(statm.read_text().split()[1])
+            current_rss = resident_pages * int(os.sysconf("SC_PAGE_SIZE"))
+        except (OSError, ValueError, IndexError):
+            current_rss = 0
+    try:
+        import resource
+
+        maximum_rss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        if sys.platform.startswith("linux"):
+            maximum_rss *= 1024
+    except (ImportError, OSError, ValueError):
+        maximum_rss = 0
+    return max(current_rss, maximum_rss)
+
+
+def _emit_memory_preflight(
+    logger: logging.Logger,
+    inspection: _WindowInspection,
+) -> None:
+    logger.info(f"windows                       {inspection.windows:,}")
+    logger.info(
+        "estimated peak RSS            "
+        f"{inspection.estimated_peak_rss_bytes / (1024.0**3):.1f} GiB"
+    )
+
+
+def _set_preflight_estimate(
+    inspection: _WindowInspection,
+    *,
+    options: dict[str, object],
+    reference_samples: int,
+) -> _WindowInspection:
+    marker_bound = (
+        int(options["window_markers"])
+        if options["reference"] is not None
+        else inspection.max_window_markers
+    )
+    window_bytes = int(
+        jxrs.imp_estimate_window_bytes(
+            json.dumps(options),
+            inspection.samples,
+            reference_samples,
+            max(marker_bound, 1),
+        )
+    )
+    return _WindowInspection(
+        inspection.samples,
+        inspection.markers,
+        inspection.windows,
+        inspection.max_window_markers,
+        max(_process_rss_bytes(), 0) + window_bytes,
+    )
 
 def _janusx_version() -> str:
     try:
@@ -999,7 +1464,48 @@ def main() -> int:
     report_logger.info(f"  {_invocation_command()}")
     report_logger.info("")
     _report_block(report_logger, "Stage Progress")
+    options = {
+        "target": str(target),
+        "reference": None if reference is None else str(reference),
+        "map": None if args.map is None else str(Path(args.map).expanduser()),
+        "region": (
+            None
+            if region is None
+            else {
+                "chrom": region.chrom_key,
+                "start": region.start,
+                "end": region.end,
+            }
+        ),
+        "output": str(output),
+        "format": "pgen" if args.format == "pfile" else "vcf",
+        "threads": int(args.threads),
+        "seed": int(args.seed),
+        "window": float(args.window),
+        "overlap": float(args.overlap),
+        "window_markers": int(args.window_markers),
+        "phase_states": int(args.phase_states),
+        "imp_states": int(args.imp_states),
+        "adaptive_states": bool(args.adaptive_states),
+        "burnin": int(args.burnin),
+        "iterations": int(args.iterations),
+        "initial_lr": float(args.initial_lr),
+        "ne": int(args.ne),
+        "err": args.err,
+        "em": bool(args.em),
+        "impute": not bool(args.only_phase),
+        "imp_segment": float(args.imp_segment),
+        "imp_step": float(args.imp_step),
+        "imp_nsteps": int(args.imp_nsteps),
+        "cluster": float(args.cluster),
+        "ap": bool(args.ap),
+        "gp": bool(args.gp),
+        "assume_global_phase": bool(args.assume_global_phase),
+        "diagnostic_site": diagnostic_site,
+    }
     progress_total = None
+    inspection: _WindowInspection | None = None
+    count_task = None
     if terminal_rich:
         count_task = CliStatus(
             f"Loading genotype from {progress_target_label}...",
@@ -1007,30 +1513,56 @@ def main() -> int:
             use_process=True,
         )
         count_task.__enter__()
-        try:
-            samples_hint, counted = _inspect_target_dimensions(
-                target_kind,
-                target,
-                region,
+    try:
+        inspection = _inspect_target_dimensions(
+            target_kind,
+            target,
+            region,
+            map_path=None
+            if args.map is None
+            else Path(args.map).expanduser(),
+            window_cm=float(args.window),
+            overlap_cm=float(args.overlap),
+            window_markers=int(args.window_markers),
+        )
+        progress_total = int(inspection.markers) if inspection.markers > 0 else None
+        if progress_total is not None:
+            report_logger.info(
+                f"  Progress denominator : {progress_total:,} target markers"
             )
-            progress_total = int(counted) if int(counted) > 0 else None
-            if progress_total is not None:
-                report_logger.info(
-                    f"  Progress denominator : {progress_total:,} target markers"
+        try:
+            if inspection.markers == 0:
+                raise ValueError(
+                    "no markers remain inside the requested -bimrange"
                 )
-            count_task.complete(
-                f"Loading genotype from {progress_target_label} "
-                f"(n={int(samples_hint):,}, nSNP={int(counted):,})"
+            inspection = _set_preflight_estimate(
+                inspection,
+                options=options,
+                reference_samples=_inspect_reference_samples(reference),
             )
         except Exception as exc:
-            message = (
-                "Genotype dimensions unavailable for the loading status. "
-                f"{exc}"
-            )
+            message = f"Peak-memory preflight unavailable: {exc}"
             report_logger.warning(message)
             terminal_logger.warning(message)
-        finally:
+        if count_task is not None:
+            count_task.complete(
+                f"Loading genotype from {progress_target_label} "
+                f"(n={inspection.samples:,}, nSNP={inspection.markers:,})"
+            )
+    except Exception as exc:
+        message = (
+            "Genotype dimensions unavailable for startup planning. "
+            f"{exc}"
+        )
+        report_logger.warning(message)
+        terminal_logger.warning(message)
+    finally:
+        if count_task is not None:
             count_task.close(show_done=False)
+    if inspection is not None and inspection.estimated_peak_rss_bytes:
+        _emit_memory_preflight(report_logger, inspection)
+        if terminal_logger is not report_logger:
+            _emit_memory_preflight(terminal_logger, inspection)
     reporter = _ImpProgressReporter(
         report_logger if terminal_rich else logger,
         total=progress_total,
@@ -1055,47 +1587,9 @@ def main() -> int:
                 logger.error(str(exc))
                 return 1
         target = cache_prefix
+        options["target"] = str(target)
 
     try:
-        options = {
-            "target": str(target),
-            "reference": None if reference is None else str(reference),
-            "map": None if args.map is None else str(Path(args.map).expanduser()),
-            "region": (
-                None
-                if region is None
-                else {
-                    "chrom": region.chrom_key,
-                    "start": region.start,
-                    "end": region.end,
-                }
-            ),
-            "output": str(output),
-            "format": "pgen" if args.format == "pfile" else "vcf",
-            "threads": int(args.threads),
-            "seed": int(args.seed),
-            "window": float(args.window),
-            "overlap": float(args.overlap),
-            "window_markers": int(args.window_markers),
-            "phase_states": int(args.phase_states),
-            "imp_states": int(args.imp_states),
-            "adaptive_states": bool(args.adaptive_states),
-            "burnin": int(args.burnin),
-            "iterations": int(args.iterations),
-            "initial_lr": float(args.initial_lr),
-            "ne": int(args.ne),
-            "err": args.err,
-            "em": bool(args.em),
-            "impute": not bool(args.only_phase),
-            "imp_segment": float(args.imp_segment),
-            "imp_step": float(args.imp_step),
-            "imp_nsteps": int(args.imp_nsteps),
-            "cluster": float(args.cluster),
-            "ap": bool(args.ap),
-            "gp": bool(args.gp),
-            "assume_global_phase": bool(args.assume_global_phase),
-            "diagnostic_site": diagnostic_site,
-        }
         summary = json.loads(jxrs.imp_run(json.dumps(options), reporter))
     except Exception as exc:
         reporter.close()

@@ -746,6 +746,24 @@ fn imp_run(
 }
 
 #[pyfunction]
+fn imp_estimate_window_bytes(
+    options_json: String,
+    target_samples: usize,
+    reference_samples: usize,
+    max_window_markers: usize,
+) -> PyResult<u64> {
+    let config = serde_json::from_str::<imp::ImpConfig>(&options_json)
+        .map_err(|error| PyRuntimeError::new_err(format!("invalid imp options: {error}")))?;
+    imp::estimate_imp_window_bytes(
+        &config,
+        target_samples,
+        reference_samples,
+        max_window_markers,
+    )
+    .map_err(PyRuntimeError::new_err)
+}
+
+#[pyfunction]
 #[pyo3(signature = (input, output_prefix, progress_callback=None))]
 fn imp_convert_to_pgen(
     py: Python<'_>,
@@ -829,6 +847,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<Bin01StreamWriter>()?;
     m.add_class::<KfileChunkReader>()?;
     m.add_function(wrap_pyfunction!(imp_run, m)?)?;
+    m.add_function(wrap_pyfunction!(imp_estimate_window_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(imp_convert_to_pgen, m)?)?;
     m.add_function(wrap_pyfunction!(popcount_py, m)?)?;
     m.add_function(wrap_pyfunction!(and_popcount_py, m)?)?;

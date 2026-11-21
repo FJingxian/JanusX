@@ -835,6 +835,92 @@ where
     }
 }
 
+/// Estimate the peak resident working set for one active genotype window.
+///
+/// Windows are processed serially, so the process estimate is the startup
+/// baseline plus the largest single-window allocation rather than a sum over
+/// worker threads. The marker bound is supplied by the metadata scanner and is
+/// capped by `window_markers` inside the estimator.
+pub fn estimate_imp_window_bytes(
+    config: &ImpConfig,
+    target_samples: usize,
+    reference_samples: usize,
+    max_window_markers: usize,
+) -> Result<u64, String> {
+    if target_samples == 0 {
+        return Err("memory estimate requires at least one target sample".to_owned());
+    }
+    if config.threads == 0 {
+        return Err("memory estimate requires at least one worker".to_owned());
+    }
+    let marker_count = max_window_markers.min(config.window_markers);
+    if marker_count == 0 {
+        return Err("memory estimate requires at least one marker".to_owned());
+    }
+
+    // Metadata-only planning cannot observe multiallelic records. Use the
+    // common biallelic width as the baseline and keep the estimate labeled as
+    // an estimate rather than presenting it as a hard allocation guarantee.
+    let bits_per_allele = 2;
+    let phase_samples = target_samples
+        .checked_add(reference_samples)
+        .ok_or_else(|| "memory estimate phase sample count overflow".to_owned())?;
+    let imp_states = if config.reference.is_some() && config.impute {
+        config.imp_states
+    } else {
+        config.phase_states
+    };
+    let mut estimate = memory::estimate_window(
+        phase_samples,
+        marker_count,
+        config.phase_states,
+        imp_states,
+        bits_per_allele,
+        config.threads,
+    )?;
+    memory::include_phase_pbwt_donors(
+        &mut estimate,
+        phase_samples,
+        max_phase_pbwt_steps(config, marker_count),
+    )?;
+    memory::include_initial_phase_pbwt_workspace(&mut estimate, phase_samples, marker_count)?;
+    if config.reference.is_some() {
+        memory::include_reference_window(&mut estimate, reference_samples, marker_count)?;
+        if config.impute {
+            memory::include_imputation_window(
+                &mut estimate,
+                target_samples,
+                marker_count,
+                config.ap,
+                config.gp,
+            )?;
+            memory::include_pbwt_segment_index(
+                &mut estimate,
+                reference_samples,
+                marker_count,
+                marker_count,
+            )?;
+        }
+    }
+    if is_bgzf_vcf_output(config) {
+        memory::include_bgzf_writer_workspace(&mut estimate)?;
+    }
+
+    // Rayon worker stacks and small reader/writer structures are outside the
+    // active-window accounting. Two MiB per worker plus 16 MiB of headroom is
+    // a conservative allowance for those allocations.
+    let fixed_headroom = config
+        .threads
+        .checked_mul(2 * 1024 * 1024)
+        .and_then(|bytes| bytes.checked_add(16 * 1024 * 1024))
+        .ok_or_else(|| "memory estimate headroom overflow".to_owned())?;
+    let total_bytes = estimate
+        .total_bytes
+        .checked_add(fixed_headroom)
+        .ok_or_else(|| "total memory estimate overflow".to_owned())?;
+    u64::try_from(total_bytes).map_err(|_| "memory estimate exceeds u64".to_owned())
+}
+
 fn validate_output_paths(config: &ImpConfig) -> Result<(), String> {
     let mut inputs = genotype_input_paths(&config.target);
     if config.impute {

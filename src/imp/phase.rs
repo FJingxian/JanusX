@@ -529,9 +529,16 @@ pub(crate) fn with_reference_haplotypes_aligned(
     let reference_haplotypes = reference_samples
         .checked_mul(2)
         .ok_or_else(|| "reference-assisted phasing haplotype count overflow".to_owned())?;
-    let mut packed =
-        PackedHaplotypes::empty_state_major(reference_haplotypes, target.rows.len(), 1)?;
     let reference_present = alignment.reference_present().collect::<Vec<_>>();
+    let all_present = reference_present.iter().all(|&present| present);
+    let mut packed = if all_present {
+        PackedHaplotypes::empty_complete_biallelic_state_major(
+            reference_haplotypes,
+            target.rows.len(),
+        )?
+    } else {
+        PackedHaplotypes::empty_state_major(reference_haplotypes, target.rows.len(), 1)?
+    };
     for marker in 0..target.rows.len() {
         if let Some(reference_index) = alignment.reference_row(marker) {
             let swap = alignment.reference_swap(marker);
@@ -557,7 +564,7 @@ pub(crate) fn with_reference_haplotypes_aligned(
             }
         }
     }
-    if reference_present.iter().all(|&present| present) {
+    if all_present {
         packed.mark_complete();
     }
 

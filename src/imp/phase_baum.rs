@@ -5286,6 +5286,37 @@ fn hap_allele_posteriors(
             .filter(|&count| count != 0)
         {
             let required_words = bit_count.div_ceil(64);
+            if allele_words.len() >= required_words && panel.haplotypes.is_complete() {
+                for state in 0..panel.haplotypes.n_haplotypes {
+                    let mass0 = forward0[state] * backward0[state];
+                    let mass1 = forward1[state] * backward1[state];
+                    let valid0 = mass0 > 0.0 && mass0.is_finite();
+                    let valid1 = mass1 > 0.0 && mass1.is_finite();
+                    if !valid0 && !valid1 {
+                        continue;
+                    }
+                    let index = state * marker_count + marker;
+                    let word = index >> 6;
+                    let shift = index & 63;
+                    // `bit_count` covers every `(state, marker)` pair, `allele_words`
+                    // has at least `required_words`, and `is_complete()` guarantees no
+                    // missing alleles even when `missing_words` is omitted.
+                    let allele =
+                        unsafe { ((*allele_words.get_unchecked(word) >> shift) & 1) as u16 };
+                    let allele = usize::from(allele);
+                    if valid0 {
+                        if let Some(probability) = probabilities0.get_mut(allele) {
+                            *probability += mass0;
+                        }
+                    }
+                    if valid1 {
+                        if let Some(probability) = probabilities1.get_mut(allele) {
+                            *probability += mass1;
+                        }
+                    }
+                }
+                return (probabilities0, probabilities1);
+            }
             if allele_words.len() >= required_words && missing_words.len() >= required_words {
                 for state in 0..panel.haplotypes.n_haplotypes {
                     let mass0 = forward0[state] * backward0[state];

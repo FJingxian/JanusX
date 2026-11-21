@@ -869,6 +869,31 @@ impl PackedHaplotypes {
         Ok(packed)
     }
 
+    /// Allocate a complete state-major biallelic bitplane without a redundant
+    /// zero-filled `missing_bits` vector, halving memory for large target and
+    /// reference snapshots.
+    pub(crate) fn empty_complete_biallelic_state_major(
+        n_haplotypes: usize,
+        n_markers: usize,
+    ) -> Result<Self, String> {
+        if n_haplotypes == 0 || n_markers == 0 {
+            return Err("packed haplotypes require positive dimensions".to_owned());
+        }
+        let values = n_haplotypes
+            .checked_mul(n_markers)
+            .ok_or_else(|| "packed haplotype dimensions overflow".to_owned())?;
+        Ok(Self {
+            n_haplotypes,
+            n_haplotypes_capacity: n_haplotypes,
+            n_markers,
+            bits_per_allele: 1,
+            layout: PackedLayout::StateMajor,
+            allele_bits: vec![0; values.div_ceil(64)],
+            missing_bits: Vec::new(),
+            complete: true,
+        })
+    }
+
     pub(crate) fn complete_biallelic_state_major(
         window: &PhasedWindow,
     ) -> Result<Option<Self>, String> {
@@ -888,8 +913,7 @@ impl PackedHaplotypes {
         let n_haplotypes = n_samples
             .checked_mul(2)
             .ok_or_else(|| "phase snapshot haplotype count overflow".to_owned())?;
-        let mut packed = Self::empty_state_major(n_haplotypes, n_markers, 1)?;
-        packed.missing_bits.fill(0);
+        let mut packed = Self::empty_complete_biallelic_state_major(n_haplotypes, n_markers)?;
         for (marker, row) in window.rows.iter().enumerate() {
             for (sample, call) in row.calls.iter().enumerate() {
                 let [Some(first), Some(second)] = call.alleles else {
@@ -908,7 +932,6 @@ impl PackedHaplotypes {
                 }
             }
         }
-        packed.complete = true;
         Ok(Some(packed))
     }
 
@@ -1154,12 +1177,19 @@ impl PackedHaplotypes {
             self.allele_bits[word + 1] &= !high_mask;
             self.allele_bits[word + 1] |= value >> (64 - shift);
         }
-        let missing_word = index >> 6;
-        let missing_mask = 1u64 << (index & 63);
-        if allele.is_some() {
-            self.missing_bits[missing_word] &= !missing_mask;
-        } else {
-            self.missing_bits[missing_word] |= missing_mask;
+        if !self.missing_bits.is_empty() {
+            let missing_word = index >> 6;
+            let missing_mask = 1u64 << (index & 63);
+            if allele.is_some() {
+                self.missing_bits[missing_word] &= !missing_mask;
+            } else {
+                self.missing_bits[missing_word] |= missing_mask;
+            }
+        } else if allele.is_none() {
+            let values = self.n_haplotypes * self.n_markers;
+            self.missing_bits.resize(values.div_ceil(64), 0);
+            self.missing_bits[index >> 6] |= 1u64 << (index & 63);
+            self.complete = false;
         }
         Ok(())
     }
@@ -1187,12 +1217,16 @@ impl PackedHaplotypes {
         } else {
             *self.allele_bits.get_unchecked_mut(word) &= !mask;
         }
-        let missing_word = index >> 6;
-        let missing_mask = 1u64 << (index & 63);
-        if allele.is_some() {
-            *self.missing_bits.get_unchecked_mut(missing_word) &= !missing_mask;
+        if !self.missing_bits.is_empty() {
+            let missing_word = index >> 6;
+            let missing_mask = 1u64 << (index & 63);
+            if allele.is_some() {
+                *self.missing_bits.get_unchecked_mut(missing_word) &= !missing_mask;
+            } else {
+                *self.missing_bits.get_unchecked_mut(missing_word) |= missing_mask;
+            }
         } else {
-            *self.missing_bits.get_unchecked_mut(missing_word) |= missing_mask;
+            debug_assert!(allele.is_some());
         }
     }
 
@@ -1374,14 +1408,15 @@ impl PackedHaplotypes {
         {
             return Err("packed haplotype projection requires ordered unique markers and state-major biallelic data".to_owned());
         }
-        let mut projected = Self::empty_state_major(self.n_haplotypes, marker_indices.len(), 1)?;
+        let mut projected = if self.complete {
+            Self::empty_complete_biallelic_state_major(self.n_haplotypes, marker_indices.len())?
+        } else {
+            Self::empty_state_major(self.n_haplotypes, marker_indices.len(), 1)?
+        };
         for (target_marker, &source_marker) in marker_indices.iter().enumerate() {
             for state in 0..self.n_haplotypes {
                 projected.set_allele(target_marker, state, self.allele(source_marker, state))?;
             }
-        }
-        if self.complete {
-            projected.mark_complete();
         }
         Ok(projected)
     }
@@ -1465,8 +1500,10 @@ impl PackedHaplotypes {
         unsafe {
             overwrite_bit(&mut self.allele_bits, first_index, first == 1);
             overwrite_bit(&mut self.allele_bits, second_index, second == 1);
-            clear_bit(&mut self.missing_bits, first_index);
-            clear_bit(&mut self.missing_bits, second_index);
+            if !self.missing_bits.is_empty() {
+                clear_bit(&mut self.missing_bits, first_index);
+                clear_bit(&mut self.missing_bits, second_index);
+            }
         }
         true
     }

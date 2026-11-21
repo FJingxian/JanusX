@@ -127,9 +127,14 @@ enum PostPhaseJob {
     },
 }
 
+struct PostPhaseRequest {
+    job: PostPhaseJob,
+    done: Option<mpsc::SyncSender<()>>,
+}
+
 struct PostPhasePipeline {
     path: PathBuf,
-    sender: Option<mpsc::SyncSender<PostPhaseJob>>,
+    sender: Option<mpsc::SyncSender<PostPhaseRequest>>,
     handle: Option<JoinHandle<Result<(), String>>>,
 }
 
@@ -140,7 +145,7 @@ impl PostPhasePipeline {
         completed_rows: Arc<AtomicU64>,
     ) -> Result<Self, String> {
         let path = path.to_path_buf();
-        let (sender, receiver) = mpsc::sync_channel::<PostPhaseJob>(1);
+        let (sender, receiver) = mpsc::sync_channel::<PostPhaseRequest>(1);
         let handle = std::thread::Builder::new()
             .name("imp-postphase".to_owned())
             .spawn(move || {
@@ -149,7 +154,8 @@ impl PostPhasePipeline {
                 let profile = std::env::var_os("JANUSX_IMP_HMM_PROFILE").is_some()
                     || std::env::var_os("JANUSX_IMP_POSTPHASE_PROFILE").is_some()
                     || std::env::var_os("JANUSX_IMP_VCF_PROFILE").is_some();
-                for job in receiver {
+                for request in receiver {
+                    let PostPhaseRequest { job, done } = request;
                     let job_kind = match &job {
                         PostPhaseJob::Impute { .. } => "impute",
                         PostPhaseJob::Write { .. } => "write",
@@ -161,6 +167,9 @@ impl PostPhasePipeline {
                     }
                     let started = profile.then(Instant::now);
                     process_post_phase_job(&mut writer, job, &completed_rows)?;
+                    if let Some(done) = done {
+                        let _ = done.send(());
+                    }
                     if let Some(started) = started {
                         eprintln!(
                             "JANUSX_IMP_POSTPHASE_PROFILE job={job_kind} elapsed_s={:.6}",
@@ -182,13 +191,39 @@ impl PostPhasePipeline {
         self.sender
             .as_ref()
             .ok_or_else(|| format!("IMP post-phase pipeline closed for {}", self.path.display()))?
-            .send(job)
+            .send(PostPhaseRequest { job, done: None })
             .map_err(|_| {
                 format!(
                     "IMP post-phase pipeline stopped for {}",
                     self.path.display()
                 )
             })
+    }
+
+    /// Submit a job and wait until the post-phase worker finishes and drops
+    /// its owned window buffers, preventing two dense windows from coexisting
+    /// in resident memory.
+    fn submit_sync(&self, job: PostPhaseJob) -> Result<(), String> {
+        let (done_tx, done_rx) = mpsc::sync_channel::<()>(0);
+        self.sender
+            .as_ref()
+            .ok_or_else(|| format!("IMP post-phase pipeline closed for {}", self.path.display()))?
+            .send(PostPhaseRequest {
+                job,
+                done: Some(done_tx),
+            })
+            .map_err(|_| {
+                format!(
+                    "IMP post-phase pipeline stopped for {}",
+                    self.path.display()
+                )
+            })?;
+        done_rx.recv().map_err(|_| {
+            format!(
+                "IMP post-phase pipeline stopped for {}",
+                self.path.display()
+            )
+        })
     }
 
     fn finish(mut self) -> Result<(), String> {
@@ -250,7 +285,7 @@ fn process_post_phase_job(
             impute::impute_window_stream(
                 &window,
                 &phased,
-                &reference_window,
+                reference_window,
                 &reference_cm,
                 &reference_groups,
                 &impute_config,
@@ -1294,9 +1329,8 @@ where
             samples.len(),
         )?;
         // Beagle's rare-carrier classification reads the unspliced Window GT.
-        // Keep that immutable view while the overlap prefix is replaced with
-        // the previous window's phased alleles for phasing.
-        let carrier_window = window.clone();
+        // Only clone when an incoming overlap prefix will be overwritten.
+        let carrier_window_storage = (window.incoming_overlap_len > 0).then(|| window.clone());
         phase::splice_phase_overlap(&mut window, &previous_phase_carry)?;
         summary.total_target_windows = summary.total_target_windows.saturating_add(1);
         let direct_eligibility = if force_normal_phasing {
@@ -1433,14 +1467,14 @@ where
             .transpose()?;
         let low_frequency_candidate = low_frequency_phase_candidate(
             phase_bypass_allowed,
-            &carrier_window,
+            carrier_window_storage.as_ref().unwrap_or(&window),
             reference_window_for_phase,
             reference_marker_alignment.as_ref(),
         )?;
         let use_two_stage_phase = low_frequency_candidate
             .as_deref()
             .is_some_and(impute::use_two_stage_phase_from_mask);
-        let phase_cm_positions = if phase_bypass_allowed {
+        let mut phase_cm_positions = if phase_bypass_allowed {
             window.cm_positions.clone()
         } else {
             phase::beagle_phase_marker_map(&window)?
@@ -1647,23 +1681,26 @@ where
                 samples.len(),
             )?;
             summary.normal_phasing_windows = summary.normal_phasing_windows.saturating_add(1);
-            let phase_target_window = types::PhaseWindow {
-                cm_positions: phase_cm_positions.clone(),
-                ..window.clone()
+            std::mem::swap(&mut window.cm_positions, &mut phase_cm_positions);
+            let phase_result = {
+                let carrier_window = carrier_window_storage.as_ref().unwrap_or(&window);
+                phase::phase_window_prepared(
+                    &window,
+                    carrier_window,
+                    phase_config,
+                    pbwt::beagle_window_seed(config.master_seed(), window.index),
+                    phase_ibd2_intervals,
+                    worker_pool.as_ref(),
+                    reference_window_for_phase,
+                    reference_marker_alignment.as_ref(),
+                    low_frequency_candidate.as_deref(),
+                    diagnostic_site,
+                )
             };
-            phase::phase_window_prepared(
-                &phase_target_window,
-                &carrier_window,
-                phase_config,
-                pbwt::beagle_window_seed(config.master_seed(), window.index),
-                phase_ibd2_intervals,
-                worker_pool.as_ref(),
-                reference_window_for_phase,
-                reference_marker_alignment.as_ref(),
-                low_frequency_candidate.as_deref(),
-                diagnostic_site,
-            )?
+            std::mem::swap(&mut window.cm_positions, &mut phase_cm_positions);
+            phase_result?
         };
+        drop(carrier_window_storage);
         let expected_reference_haplotypes = samples
             .len()
             .checked_add(reference_samples)
@@ -1745,7 +1782,13 @@ where
                         reference_stream.last_emitted_chromosome = Some(last.meta.chrom.clone());
                     }
                 }
-                writer.submit(PostPhaseJob::Impute {
+                let sync_impute = merged_markers >= 50_000
+                    || reference_window
+                        .rows
+                        .len()
+                        .saturating_mul(reference_samples)
+                        >= 8_000_000;
+                let impute_job = PostPhaseJob::Impute {
                     window,
                     phased,
                     reference_window,
@@ -1760,7 +1803,12 @@ where
                     orientation_flips,
                     region: config.region.clone(),
                     worker_pool: Arc::clone(&worker_pool),
-                })?;
+                };
+                if sync_impute {
+                    writer.submit_sync(impute_job)?;
+                } else {
+                    writer.submit(impute_job)?;
+                }
                 summary.variants_written = completed_rows.load(Ordering::Relaxed);
                 let write_elapsed =
                     write_started.map_or(Duration::ZERO, |started| started.elapsed());

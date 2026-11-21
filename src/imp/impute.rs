@@ -1426,7 +1426,7 @@ fn owned_output_indices(
 pub(crate) fn impute_window_prevalidated(
     target: &PhaseWindow,
     phased_target: &PhasedWindow,
-    reference: &PhasedWindow,
+    reference: PhasedWindow,
     reference_cm_positions: &[f64],
     config: &ImputeConfig,
     hmm_config: &HMMConfig,
@@ -1467,7 +1467,7 @@ pub(crate) fn impute_window_prevalidated(
 pub(crate) fn impute_window_stream(
     target: &PhaseWindow,
     phased_target: &PhasedWindow,
-    reference: &PhasedWindow,
+    reference: PhasedWindow,
     reference_cm_positions: &[f64],
     reference_groups: &[Option<u64>],
     config: &ImputeConfig,
@@ -1500,7 +1500,7 @@ pub(crate) fn impute_window_stream(
 fn impute_window_with_output(
     target: &PhaseWindow,
     phased_target: &PhasedWindow,
-    reference: &PhasedWindow,
+    reference: PhasedWindow,
     reference_cm_positions: &[f64],
     reference_groups: &[Option<u64>],
     config: &ImputeConfig,
@@ -1578,7 +1578,6 @@ fn impute_window_with_output(
     }
     let merged_indices =
         merge_sorted_indices(&target.rows, &reference.rows, Some(config.window_markers))?;
-    let mut metadata = Vec::with_capacity(merged_indices.len());
     let mut target_row_indices = Vec::with_capacity(merged_indices.len());
     let mut reference_row_indices = Vec::with_capacity(merged_indices.len());
     let mut reference_swaps = Vec::with_capacity(merged_indices.len());
@@ -1593,8 +1592,7 @@ fn impute_window_with_output(
             _ => false,
         };
         let meta = target_meta
-            .cloned()
-            .or_else(|| reference_meta.cloned())
+            .or(reference_meta)
             .ok_or_else(|| "target/reference position has no variant metadata".to_owned())?;
         let cm = target_index
             .map(|index| target.cm_positions[index])
@@ -1606,7 +1604,6 @@ fn impute_window_with_output(
                 meta.chrom, meta.pos
             ));
         }
-        metadata.push(meta);
         target_row_indices.push(target_index);
         reference_row_indices.push(reference_index);
         reference_swaps.push(swap);
@@ -1619,6 +1616,15 @@ fn impute_window_with_output(
         .count();
     let direct_target_markers = target_row_indices.len() - posterior_projection_markers;
     if posterior_projection_markers == 0 {
+        drop(reference);
+        let metadata = target_row_indices
+            .iter()
+            .map(|target_index| {
+                target_index
+                    .map(|index| target.rows[index].meta.clone())
+                    .ok_or_else(|| "direct target fast path missing target metadata".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         // Every output marker is present in the target VCF. Phasing has
         // already recovered its genotype, so reference imputation and
         // posterior projection cannot change any value.
@@ -1765,6 +1771,35 @@ fn impute_window_with_output(
         });
     }
 
+    let packed_reference = composite::PackedBiallelicReference::from_reference_rows(
+        &reference.rows,
+        &reference_row_indices,
+        &reference_swaps,
+        reference_samples,
+    )?;
+    // Consume `reference` immediately after packing its 1-bit allele plane:
+    // this frees all 4-bit reference DiploidCalls before building IBS/sequence
+    // indexes and moves reference-only VariantMeta without cloning.
+    let mut reference_metas: Vec<Option<VariantMeta>> = reference
+        .rows
+        .into_iter()
+        .map(|row| Some(row.meta))
+        .collect();
+    let mut metadata = Vec::with_capacity(target_row_indices.len());
+    for (&target_index, &reference_index) in target_row_indices.iter().zip(&reference_row_indices) {
+        let meta = if let Some(index) = target_index {
+            target.rows[index].meta.clone()
+        } else if let Some(index) = reference_index {
+            reference_metas[index]
+                .take()
+                .ok_or_else(|| "duplicate reference metadata index".to_owned())?
+        } else {
+            return Err("target/reference position has no variant metadata".to_owned());
+        };
+        metadata.push(meta);
+    }
+    drop(reference_metas);
+
     let dense_posterior_layout = std::env::var_os("JANUSX_IMP_DENSE_POSTERIOR_LAYOUT").is_some();
     let mut next_posterior_marker = 0usize;
     let posterior_marker_by_output = if dense_posterior_layout {
@@ -1794,13 +1829,6 @@ fn impute_window_with_output(
         posterior_projection_markers
     };
     debug_assert_eq!(posterior_marker_indices.len(), posterior_layout_markers);
-
-    let packed_reference = composite::PackedBiallelicReference::from_reference_rows(
-        &reference.rows,
-        &reference_row_indices,
-        &reference_swaps,
-        reference_samples,
-    )?;
     let target_hmm_cm_positions = beagle_cumulative_positions(&target.cm_positions)?;
     let reference_projection_cm_positions = beagle_cumulative_positions(reference_cm_positions)?;
     let mut merged_projection_cm_positions = Vec::with_capacity(merged_cm.len());
@@ -5250,7 +5278,7 @@ mod imputation_alignment_tests {
         let output = impute_window_prevalidated(
             &target,
             &phased_target,
-            &reference,
+            reference,
             &[0.1],
             &config,
             &hmm,
@@ -5373,7 +5401,7 @@ mod imputation_alignment_tests {
         let error = impute_window_prevalidated(
             &target,
             &phased_target,
-            &reference,
+            reference,
             &[0.1],
             &config,
             &hmm,

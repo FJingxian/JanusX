@@ -247,8 +247,11 @@ def _collect_windows_runtime_dlls() -> list[Path]:
     if not sys.platform.startswith("win"):
         return []
 
-    # Keep this list tight to avoid wheel bloat while still covering common
-    # OpenBLAS + MinGW runtime dependencies in conda environments.
+    # Keep this list tight to avoid wheel bloat while covering pthreads
+    # OpenBLAS + MinGW runtime dependencies. Deliberately exclude OpenMP DLLs
+    # (libomp/libgomp/libiomp/vcomp) from the Python package root so we never
+    # collide with XGBoost/scikit-learn OpenMP runtimes (FastTree keeps its own
+    # isolated runtime inside janusx/bin/).
     patterns = [
         "libopenblas*.dll",
         "openblas*.dll",
@@ -261,10 +264,6 @@ def _collect_windows_runtime_dlls() -> list[Path]:
         "libgcc_s*.dll",
         "libwinpthread*.dll",
         "libstdc++*.dll",
-        "libgomp*.dll",
-        "libomp*.dll",
-        "libiomp*.dll",
-        "vcomp*.dll",
     ]
     picked: dict[str, Path] = {}
     for d in _windows_runtime_dirs():
@@ -317,15 +316,13 @@ def _macos_runtime_dirs() -> list[Path]:
         cp = conda_prefix
         dirs.extend([cp / "lib", cp / "Library" / "lib"])
 
-    # Common Homebrew prefixes.
+    # Common Homebrew prefixes (excluding libomp; macOS wheels bundle pthreads OpenBLAS).
     dirs.extend(
         [
             Path("/opt/homebrew/opt/openblas/lib"),
             Path("/usr/local/opt/openblas/lib"),
             Path("/opt/homebrew/opt/gcc/lib/gcc/current"),
             Path("/usr/local/opt/gcc/lib/gcc/current"),
-            Path("/opt/homebrew/opt/libomp/lib"),
-            Path("/usr/local/opt/libomp/lib"),
         ]
     )
     return _iter_unique_existing_dirs(dirs)
@@ -434,81 +431,98 @@ def _collect_macos_openblas_dylibs() -> list[Path]:
     if str(os.environ.get("JANUSX_BUNDLE_OPENBLAS_DYLIB", "1")).strip().lower() in {"0", "false", "no", "off"}:
         return []
 
-    strict = str(os.environ.get("JANUSX_STRICT_OPENBLAS_BUNDLE", "")).strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    strict = _env_flag("JANUSX_STRICT_OPENBLAS_BUNDLE")
+    allow_openmp = _env_flag("JANUSX_ALLOW_OPENMP_OPENBLAS_BUNDLE")
     prefer = [
         "libopenblas.dylib",
         "libopenblas.0.dylib",
     ]
-    primary: Path | None = None
-    source_dir: Path | None = None
-    for d in _macos_runtime_dirs():
-        picked: list[Path] = []
+    runtime_dirs = _macos_runtime_dirs()
+    skipped_openmp: list[tuple[Path, list[str]]] = []
+
+    for d in runtime_dirs:
+        cands: list[Path] = []
         for name in prefer:
             p = d / name
             if p.is_file():
-                picked.append(p)
-        if len(picked) == 0:
-            picked.extend(sorted(p for p in d.glob("libopenblas*.dylib") if p.is_file()))
-        if len(picked) > 0:
-            primary = picked[0]
-            source_dir = d
-            break
+                cands.append(p)
+        if len(cands) == 0:
+            cands.extend(sorted(p for p in d.glob("libopenblas*.dylib") if p.is_file()))
+        if len(cands) == 0:
+            continue
 
-    if primary is None or source_dir is None:
-        if strict:
+        # Keep all OpenBLAS aliases from the selected source directory so loader
+        # can resolve both libopenblas.dylib and libopenblas.0.dylib references.
+        seed: list[Path] = []
+        seen_seed: set[str] = set()
+        for p in sorted(d.glob("libopenblas*.dylib")):
+            if not p.is_file():
+                continue
+            key = p.name.lower()
+            if key in seen_seed:
+                continue
+            seen_seed.add(key)
+            seed.append(p.resolve())
+        if len(seed) == 0:
+            seed.append(cands[0].resolve())
+
+        # Recursive dependency closure for non-system absolute dylibs.
+        search_dirs: list[Path] = [d, *runtime_dirs]
+        picked: dict[str, Path] = {}
+        queue: list[Path] = list(seed)
+        openmp_deps: list[str] = []
+        unresolved_non_sys: list[tuple[str, str]] = []
+        while len(queue) > 0:
+            cur = queue.pop(0)
+            key = cur.name.lower()
+            if key in picked:
+                continue
+            picked[key] = cur
+            for dep in _otool_libraries(cur):
+                dep_name = Path(dep).name.lower()
+                if dep_name.startswith(("libomp", "libgomp", "libiomp")):
+                    openmp_deps.append(dep)
+                dep_path = _resolve_macos_otool_dep(
+                    dep,
+                    origin_dir=cur.parent,
+                    extra_dirs=search_dirs,
+                )
+                if dep_path is None:
+                    if not _is_macos_system_lib(dep):
+                        unresolved_non_sys.append((cur.name, dep))
+                    continue
+                if dep_path.name.lower() not in picked:
+                    queue.append(dep_path)
+
+        if openmp_deps and not allow_openmp:
+            skipped_openmp.append((d, sorted(set(openmp_deps))))
+            continue
+        if unresolved_non_sys and strict:
+            cur_name, dep = unresolved_non_sys[0]
             raise RuntimeError(
-                "JANUSX_STRICT_OPENBLAS_BUNDLE=1 but no macOS OpenBLAS dylib was found. "
-                "Set OPENBLAS_LIB_DIR to a directory containing libopenblas*.dylib."
+                "JANUSX_STRICT_OPENBLAS_BUNDLE=1 but failed to resolve "
+                f"macOS dylib dependency {dep!r} for {cur_name}."
             )
+        return sorted(picked.values(), key=lambda p: p.name.lower())
+
+    if skipped_openmp:
+        details = ", ".join(f"{d} -> {deps}" for d, deps in skipped_openmp)
+        msg = (
+            f"Skipped OpenMP-linked macOS OpenBLAS candidate(s) ({details}) to avoid "
+            "multi-libomp segfaults with XGBoost/scikit-learn. Install/build a pthreads "
+            "OpenBLAS (e.g. `scripts/ci/build_macos_openblas.sh`) and point OPENBLAS_LIB_DIR to it."
+        )
+        if strict:
+            raise RuntimeError(msg)
+        print(f"[janusx build_backend] WARNING: {msg}", file=sys.stderr)
         return []
 
-    # Keep all OpenBLAS aliases from the selected source directory so loader
-    # can resolve both libopenblas.dylib and libopenblas.0.dylib references.
-    seed: list[Path] = []
-    seen_seed: set[str] = set()
-    for p in sorted(source_dir.glob("libopenblas*.dylib")):
-        if not p.is_file():
-            continue
-        key = p.name.lower()
-        if key in seen_seed:
-            continue
-        seen_seed.add(key)
-        seed.append(p.resolve())
-    if len(seed) == 0:
-        seed.append(primary.resolve())
-
-    # Recursive dependency closure for non-system absolute dylibs.
-    runtime_dirs = _macos_runtime_dirs()
-    search_dirs: list[Path] = [source_dir, *runtime_dirs]
-    picked: dict[str, Path] = {}
-    queue: list[Path] = list(seed)
-    while len(queue) > 0:
-        cur = queue.pop(0)
-        key = cur.name.lower()
-        if key in picked:
-            continue
-        picked[key] = cur
-        for dep in _otool_libraries(cur):
-            dep_path = _resolve_macos_otool_dep(
-                dep,
-                origin_dir=cur.parent,
-                extra_dirs=search_dirs,
-            )
-            if dep_path is None:
-                if strict and (not _is_macos_system_lib(dep)):
-                    raise RuntimeError(
-                        "JANUSX_STRICT_OPENBLAS_BUNDLE=1 but failed to resolve "
-                        f"macOS dylib dependency {dep!r} for {cur.name}."
-                    )
-                continue
-            if dep_path.name.lower() not in picked:
-                queue.append(dep_path)
-    return sorted(picked.values(), key=lambda p: p.name.lower())
+    if strict:
+        raise RuntimeError(
+            "JANUSX_STRICT_OPENBLAS_BUNDLE=1 but no macOS OpenBLAS dylib was found. "
+            "Set OPENBLAS_LIB_DIR to a directory containing libopenblas*.dylib."
+        )
+    return []
 
 
 def _collect_fasttree_artifacts() -> list[Path]:

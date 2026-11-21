@@ -307,17 +307,32 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install maturin==1.9.4 build "numpy>=1.23" "pybind11>=2.13" zstandard
 
-      - name: Install OpenBLAS (macOS)
+      - name: Restore macOS OpenBLAS build cache
+        if: ${{ matrix.platform == 'macos' }}
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/janusx-openblas-macos-cache
+          key: openblas-${{ matrix.label }}-0.3.33-pthreads-${{ hashFiles('scripts/ci/build_macos_openblas.sh') }}
+
+      - name: Install OpenBLAS (macOS, pthreads)
         if: ${{ matrix.platform == 'macos' }}
         shell: bash
         run: |
-          brew list --versions openblas >/dev/null 2>&1 || brew install openblas
+          command -v gfortran >/dev/null 2>&1 || brew install gcc
           command -v pkg-config >/dev/null 2>&1 || brew install pkgconf
-          OPENBLAS_PREFIX="$(brew --prefix openblas)"
+          OPENBLAS_CACHE_PREFIX="${RUNNER_TEMP}/janusx-openblas-macos-cache/prefix"
+          if [[ -s "${OPENBLAS_CACHE_PREFIX}/lib/libopenblas.dylib" ]]; then
+            echo "[wheel-macos] reusing cached pthreads OpenBLAS from ${OPENBLAS_CACHE_PREFIX}"
+          else
+            OPENBLAS_BUILD_ROOT="${RUNNER_TEMP}/janusx-openblas-macos-cache/build" \
+            OPENBLAS_PREFIX="${OPENBLAS_CACHE_PREFIX}" \
+              bash scripts/ci/build_macos_openblas.sh
+            rm -rf "${RUNNER_TEMP}/janusx-openblas-macos-cache/build"
+          fi
           {
-            echo "OPENBLAS_LIB_DIR=${OPENBLAS_PREFIX}/lib"
-            echo "OPENBLAS_INCLUDE_DIR=${OPENBLAS_PREFIX}/include"
-            echo "PKG_CONFIG_PATH=${OPENBLAS_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+            echo "OPENBLAS_LIB_DIR=${OPENBLAS_CACHE_PREFIX}/lib"
+            echo "OPENBLAS_INCLUDE_DIR=${OPENBLAS_CACHE_PREFIX}/include"
+            echo "PKG_CONFIG_PATH=${OPENBLAS_CACHE_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
           } >> "$GITHUB_ENV"
 
       - name: Install OpenBLAS (Windows x86_64, conda-forge threaded)
@@ -452,7 +467,7 @@ jobs:
               ${INTERP} -m pip install --force-reinstall --no-deps dist/*.whl
               CXX=/bin/false ${INTERP} /io/scripts/ci/check_installed_runtime.py \
                 --require-openblas \
-                --require-threaded-openblas \
+                --require-pthreads-openblas \
                 --check-kmc-load
             "
 
@@ -531,13 +546,13 @@ jobs:
           print("[janusx] rust_eigh_debug_f64(require_lapack=True) passed")
           PY
 
-      - name: Verify bundled OpenBLAS is threaded (windows-x86_64)
+      - name: Verify bundled OpenBLAS is pthreads (windows-x86_64)
         if: ${{ matrix.label == 'windows-x86_64' }}
         shell: bash
         run: |
           PY=python
           command -v python >/dev/null 2>&1 || PY=python3
-          "$PY" scripts/ci/check_installed_runtime.py --require-openblas --require-threaded-openblas
+          "$PY" scripts/ci/check_installed_runtime.py --require-openblas --require-pthreads-openblas
 
       - name: Verify OpenBLAS threading (windows-x86_64)
         if: ${{ matrix.label == 'windows-x86_64' }}

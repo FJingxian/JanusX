@@ -46,6 +46,34 @@ def _load_openblas_cdll(libpath: str) -> ctypes.CDLL:
     return ctypes.CDLL(libpath)
 
 
+def _check_no_bundled_openmp_runtime() -> None:
+    """Fail if the wheel bundled any OpenMP runtime alongside OpenBLAS."""
+    pkg_dir = Path(_janusx_pkg_dir())
+    libs_dir = pkg_dir.parent / "janusx.libs"
+    bad: list[str] = []
+    omp_prefixes = ("libomp", "libgomp", "libiomp", "vcomp")
+    if libs_dir.is_dir():
+        for p in sorted(libs_dir.iterdir()):
+            if p.is_file() and p.name.lower().startswith(omp_prefixes):
+                bad.append(f"janusx.libs/{p.name}")
+    # On Windows, runtime DLLs sit directly under janusx/ (FastTree keeps its
+    # own isolated subprocess runtime under janusx/bin/, so scan non-recursively).
+    if pkg_dir.is_dir():
+        for p in sorted(pkg_dir.iterdir()):
+            if (
+                p.is_file()
+                and p.suffix.lower() in {".dll", ".dylib", ".so"}
+                and p.name.lower().startswith(omp_prefixes)
+            ):
+                bad.append(f"janusx/{p.name}")
+    if bad:
+        raise SystemExit(
+            "Strict mode failed: wheel must bundle pthreads OpenBLAS without OpenMP "
+            "runtime libraries in the Python package/libs directory; found: "
+            + ", ".join(bad)
+        )
+
+
 def _validate_macos_extension_bundle_links(
     extension: str,
     deps: list[str],
@@ -289,6 +317,8 @@ def main() -> int:
             raise SystemExit(f"Strict mode failed: expected openblas backend, got {backend!r}")
 
     if args.require_threaded_openblas or args.require_pthreads_openblas:
+        if args.require_pthreads_openblas:
+            _check_no_bundled_openmp_runtime()
         libpath = _find_bundled_openblas()
         lib = _load_openblas_cdll(libpath)
         print(f"[check_installed_runtime] bundled_openblas={libpath}")

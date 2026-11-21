@@ -609,15 +609,23 @@ def _init_macos_openblas_path() -> None:
             os.environ["JX_OPENBLAS_LIB_PATH"] = str(Path(explicit).expanduser().resolve())
             return
 
-    # On macOS + conda, prefer the environment's own OpenBLAS runtime so JanusX
-    # reuses the same BLAS/OpenMP stack as SciPy/scikit-learn instead of
-    # forcing a wheel-local copy into the process.
+    # Prefer wheel-local janusx.libs pthreads OpenBLAS over environment-level
+    # OpenBLAS so a user's conda OpenMP OpenBLAS cannot pull a conflicting
+    # libomp.dylib into the process ahead of XGBoost/scikit-learn.
     candidate_groups: list[list[Path]] = []
-    # A console script can invoke a conda Python without activating its
-    # environment. CONDA_PREFIX can then be absent (or refer to another
-    # environment). Use the running interpreter first: prewarming a foreign
-    # OpenBLAS here can load a second libomp before SciPy loads its own,
-    # causing an OpenMP abort or a native crash during threaded BLAS calls.
+    for site_root in site_roots:
+        candidate_groups.append(
+            sorted((site_root / "janusx.libs").glob("libopenblas*.dylib"))
+        )
+    wheel_local_cands: list[Path] = []
+    for pkg_dir in pkg_dirs:
+        wheel_local_cands.extend(sorted((pkg_dir / ".dylibs").glob("libopenblas*.dylib")))
+        wheel_local_cands.extend(sorted((pkg_dir.parent / "janusx.libs").glob("libopenblas*.dylib")))
+        wheel_local_cands.extend(sorted((pkg_dir / ".libs").glob("libopenblas*.dylib")))
+    candidate_groups.append(wheel_local_cands)
+
+    # Fallback to the active interpreter's own prefix (never an unrelated
+    # shell CONDA_PREFIX) when no wheel-bundled OpenBLAS is present.
     runtime_prefixes = [sys.prefix, sys.base_prefix]
     conda_prefix = _matching_conda_prefix()
     if conda_prefix is not None:
@@ -629,16 +637,6 @@ def _init_macos_openblas_path() -> None:
             continue
         seen_prefixes.add(lib_dir)
         candidate_groups.append(sorted(lib_dir.glob("libopenblas*.dylib")))
-    for site_root in site_roots:
-        candidate_groups.append(
-            sorted((site_root / "janusx.libs").glob("libopenblas*.dylib"))
-        )
-    wheel_local_cands: list[Path] = []
-    for pkg_dir in pkg_dirs:
-        wheel_local_cands.extend(sorted((pkg_dir / ".dylibs").glob("libopenblas*.dylib")))
-        wheel_local_cands.extend(sorted((pkg_dir.parent / "janusx.libs").glob("libopenblas*.dylib")))
-        wheel_local_cands.extend(sorted((pkg_dir / ".libs").glob("libopenblas*.dylib")))
-    candidate_groups.append(wheel_local_cands)
 
     picked: Path | None = None
     for group in candidate_groups:

@@ -22,6 +22,7 @@ make_args=(
   "BINARY=64"
   "INTERFACE64=0"
   "USE_THREAD=1"
+  "USE_OPENMP=0"
   "NO_AFFINITY=1"
   "NO_STATIC=1"
   "NUM_THREADS=128"
@@ -105,8 +106,10 @@ cfg = cfg_raw.decode("utf-8", "ignore") if cfg_raw else ""
 parallel = int(lib.openblas_get_parallel())
 print(f"[build_linux_openblas] config={cfg}")
 print(f"[build_linux_openblas] parallel={parallel}")
-if parallel == 0:
-    raise SystemExit("OpenBLAS source build reports no threading support")
+if parallel != 1:
+    raise SystemExit(
+        f"OpenBLAS source build must use pthreads (parallel=1), got parallel={parallel} (config={cfg!r})"
+    )
 PY
 
 echo "OPENBLAS_LIB_DIR=${OPENBLAS_LIB_DIR}"

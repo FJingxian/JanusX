@@ -688,11 +688,13 @@ fn exchange_fvlmm_output_buffers(chunk: &mut StreamingChunk, block: &mut FvLmmOu
 #[cfg(test)]
 mod tests {
     use super::{
-        choose_fvlmm_bed_pread, choose_fvlmm_blas_tile_rows, fvlmm_bed_other_nanos,
-        fvlmm_prepared_scan_chunk_end, fvlmm_read_packed_source_block,
-        normalize_default_assoc_threads_for_backend, rotate_finalize_pipeline_default_for_backend,
+        choose_fvlmm_bed_pread, fvlmm_bed_other_nanos, fvlmm_prepared_scan_chunk_end,
+        fvlmm_read_packed_source_block, rotate_finalize_pipeline_default_for_backend,
     };
     use crate::gload::PackedBedSourceReader;
+    use crate::lmm_common::{
+        choose_fvlmm_blas_tile_rows, normalize_default_assoc_threads_for_backend,
+    };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 

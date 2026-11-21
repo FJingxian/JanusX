@@ -60,6 +60,9 @@ debug = 1
 opt-level = 3
 
 [profile.release]
+# Enable ThinLTO for cross-CGU inlining across src/imp and other large modules
+# without excessive compile-time overhead.
+lto = "thin"
 # Cargo may implicitly strip dependency debuginfo for release builds. rustc's
 # macOS strip=debuginfo path can produce cdylibs rejected by newer dyld loaders.
 # Keep the Mach-O symbol/string tables intact so Git and wheel builds stay loadable.

@@ -341,13 +341,6 @@ def _pfile_cache_complete(prefix: Path) -> bool:
     )
 
 
-def _progress_enabled(value: bool) -> bool:
-    if not value:
-        return False
-    raw = str(os.environ.get("JX_IMP_PROGRESS", "1")).strip().lower()
-    return raw in {"1", "true", "yes", "y", "on"}
-
-
 class _SingleUseStoreAction(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None):
         if getattr(namespace, "_bimrange_seen", False):
@@ -400,13 +393,11 @@ class _ImpProgressReporter:
         self,
         logger: logging.Logger,
         *,
-        enabled: bool = True,
         total: int | None = None,
         task_label: str = "IMP",
         imputation_mode: bool = False,
     ) -> None:
         self.logger = logger
-        self.enabled = bool(enabled)
         self._total = None if total is None else int(max(0, total))
         self._task_label = str(task_label).strip() or "IMP"
         self._imputation_mode = bool(imputation_mode)
@@ -415,7 +406,7 @@ class _ImpProgressReporter:
         self._task_id = None
         self._observed_phasing = False
         self._last_progress_signature = None
-        if self.enabled and stdout_is_tty() and rich_progress_available():
+        if stdout_is_tty() and rich_progress_available():
             self._progress = build_rich_progress(
                 description_template="[green]{task.description:<16}",
                 show_spinner=True,
@@ -510,8 +501,6 @@ class _ImpProgressReporter:
         variants_written: int,
         samples: int,
     ) -> None:
-        if not self.enabled:
-            return
         stage = str(stage)
         chrom = str(chrom)
         window_index = int(max(0, window_index))
@@ -898,21 +887,6 @@ def build_parser(argv: Sequence[str] | None = None) -> CliArgumentParser:
         default=-99_999,
         help=help_text("Random seed (default: %(default)s).", advanced=True),
     )
-    progress = runtime.add_mutually_exclusive_group()
-    progress.add_argument(
-        "--progress",
-        dest="progress",
-        action="store_true",
-        help="Show progress in the terminal and log (default).",
-    )
-    progress.add_argument(
-        "--no-progress",
-        dest="progress",
-        action="store_false",
-        help="Disable progress reporting.",
-    )
-    parser.set_defaults(progress=True)
-
     diagnostics = parser.add_argument_group("Diagnostics")
     diagnostics.add_argument(
         "--trace-site",
@@ -962,10 +936,7 @@ def main() -> int:
     log_path = str(output_prefix) + ".log"
     logger: logging.Logger = setup_logging(log_path)
     log_path = get_log_path(logger) or log_path
-    progress_enabled = _progress_enabled(bool(args.progress))
-    terminal_rich = bool(
-        progress_enabled and stdout_is_tty() and rich_progress_available()
-    )
+    terminal_rich = bool(stdout_is_tty() and rich_progress_available())
     if terminal_rich:
         report_logger = _logger_handlers(
             logger,
@@ -1045,9 +1016,8 @@ def main() -> int:
     report_logger.info("")
     _report_block(report_logger, "Command")
     report_logger.info(f"  {_invocation_command()}")
-    if progress_enabled:
-        report_logger.info("")
-        _report_block(report_logger, "Stage Progress")
+    report_logger.info("")
+    _report_block(report_logger, "Stage Progress")
     progress_total = None
     if terminal_rich:
         count_task = CliStatus(
@@ -1082,7 +1052,6 @@ def main() -> int:
             count_task.close(show_done=False)
     reporter = _ImpProgressReporter(
         report_logger if terminal_rich else logger,
-        enabled=progress_enabled,
         total=progress_total,
         task_label=progress_label,
         imputation_mode=(not bool(args.only_phase)),

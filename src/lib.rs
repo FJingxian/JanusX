@@ -73,8 +73,6 @@ mod plot;
 mod reml;
 #[path = "stats/rrblup.rs"]
 mod rrblup;
-#[path = "stats/rrblupc.rs"]
-mod rrblupc;
 #[path = "stats/rsvd.rs"]
 mod rsvd;
 #[path = "stats/spgrm.rs"]

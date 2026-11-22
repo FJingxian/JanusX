@@ -30,8 +30,10 @@ from ._common.cli_core import (
 )
 from ._common.cli_ranges import (
     format_normalized_range,
+    format_normalized_ranges,
     normalize_chromosome_key,
     parse_cli_range,
+    parse_cli_ranges,
 )
 from ._common.config_render import emit_cli_configuration
 from ._common.grmio import genotype_cache_prefix
@@ -238,6 +240,59 @@ def _initial_pbwt_max_chunk_markers(
     return max(maximum, marker_count - start)
 
 
+def _build_region_intervals(
+    region,
+) -> dict[str, list[tuple[int | None, int | None]]] | None:
+    if not region:
+        return None
+    regions = region if isinstance(region, (list, tuple)) else (region,)
+    grouped: dict[str, list[tuple[int | None, int | None]]] = {}
+    for item in regions:
+        grouped.setdefault(item.chrom_key, []).append(
+            (
+                None if item.start is None else int(item.start),
+                None if item.end is None else int(item.end),
+            )
+        )
+    merged_by_chrom: dict[str, list[tuple[int | None, int | None]]] = {}
+    for chrom_key, intervals in grouped.items():
+        if any(start is None and end is None for start, end in intervals):
+            merged_by_chrom[chrom_key] = [(None, None)]
+            continue
+        concrete = sorted(
+            (
+                0 if start is None else start,
+                sys.maxsize if end is None else end,
+            )
+            for start, end in intervals
+        )
+        merged: list[tuple[int | None, int | None]] = []
+        for start, end in concrete:
+            if merged and merged[-1][1] is not None and start <= merged[-1][1] + 1:
+                prev_start, prev_end = merged[-1]
+                merged[-1] = (prev_start, max(prev_end, end))
+            else:
+                merged.append((start, end))
+        merged_by_chrom[chrom_key] = merged
+    return merged_by_chrom
+
+
+def _region_interval_index(
+    intervals_by_chrom: dict[str, list[tuple[int | None, int | None]]] | None,
+    chrom: str,
+    position: int,
+) -> int | None:
+    if intervals_by_chrom is None:
+        return None
+    intervals = intervals_by_chrom.get(normalize_chromosome_key(chrom))
+    if not intervals:
+        return None
+    for idx, (start, end) in enumerate(intervals):
+        if (start is None or position >= start) and (end is None or position <= end):
+            return idx
+    return None
+
+
 class _MetadataWindowCursor:
     def __init__(
         self,
@@ -247,6 +302,7 @@ class _MetadataWindowCursor:
         overlap_cm: float,
         window_markers: int,
         threads: int,
+        region=None,
     ) -> None:
         self.records = records
         self.map = map_data
@@ -254,9 +310,11 @@ class _MetadataWindowCursor:
         self.overlap_cm = overlap_cm
         self.window_markers = window_markers
         self.threads = threads
+        self.region_intervals = _build_region_intervals(region)
         self.pending: tuple[str, int, float] | None = None
         self.carry_positions = array("Q")
         self.carry_cm = array("d")
+        self.carry_chromosome: str | None = None
         self.last_chromosome: str | None = None
         self.last_position = 0
         self.last_cm = -math.inf
@@ -268,24 +326,27 @@ class _MetadataWindowCursor:
             return None
         window_positions = self.carry_positions
         window_cm = self.carry_cm
+        carry_chromosome = self.carry_chromosome
         self.carry_positions = array("Q")
         self.carry_cm = array("d")
+        self.carry_chromosome = None
         retained_overlap_rows = len(window_positions)
         if retained_overlap_rows and self.pending is None and not self.exhausted:
             self.pending = self._read_next()
             self.exhausted = self.pending is None
 
         if self.pending is not None:
-            chrom, position, cm = self.pending
+            pending_chrom, position, cm = self.pending
             self.pending = None
             if not window_positions:
+                chrom = pending_chrom
                 window_positions.append(position)
                 window_cm.append(cm)
             else:
-                chrom = self.last_chromosome or ""
-                self.pending = (chrom, position, cm)
+                chrom = carry_chromosome or ""
+                self.pending = (pending_chrom, position, cm)
         elif window_positions:
-            chrom = self.last_chromosome or ""
+            chrom = carry_chromosome or ""
         else:
             first = self._read_next()
             if first is None:
@@ -297,11 +358,22 @@ class _MetadataWindowCursor:
         if not window_positions:
             return None
 
+        active_interval = _region_interval_index(
+            self.region_intervals, chrom, int(window_positions[0])
+        )
         start_cm = window_cm[0]
         if retained_overlap_rows:
+            pending_same_interval = (
+                self.pending is not None
+                and self.pending[0] == chrom
+                and _region_interval_index(
+                    self.region_intervals, self.pending[0], int(self.pending[1])
+                )
+                == active_interval
+            )
             end_cm = (
                 self.pending[2] + self.window_cm - self.overlap_cm
-                if self.pending is not None and self.pending[0] == chrom
+                if pending_same_interval
                 else start_cm + self.window_cm
             )
         else:
@@ -315,7 +387,13 @@ class _MetadataWindowCursor:
                 self.exhausted = True
                 break
             next_chrom, next_position, next_cm = record
-            if next_chrom != chrom:
+            if next_chrom != chrom or (
+                self.region_intervals is not None
+                and _region_interval_index(
+                    self.region_intervals, next_chrom, int(next_position)
+                )
+                != active_interval
+            ):
                 self.pending = record
                 hit_chromosome_boundary = True
                 break
@@ -373,6 +451,7 @@ class _MetadataWindowCursor:
             )
         self.carry_positions = retained_positions
         self.carry_cm = retained_cm
+        self.carry_chromosome = chrom if retained_positions else None
         return (
             len(window_positions),
             _initial_pbwt_max_chunk_markers(window_cm, self.threads),
@@ -430,15 +509,19 @@ def _marker_in_region(
     position: object,
     region,
 ) -> bool:
-    if region is None:
+    if not region:
         return True
-    if normalize_chromosome_key(chrom) != region.chrom_key:
-        return False
+    regions = region if isinstance(region, (list, tuple)) else (region,)
+    chrom_key = normalize_chromosome_key(chrom)
     parsed_position = int(position)
-    return (
-        (region.start is None or parsed_position >= int(region.start))
-        and (region.end is None or parsed_position <= int(region.end))
-    )
+    for item in regions:
+        if chrom_key != item.chrom_key:
+            continue
+        if (item.start is None or parsed_position >= int(item.start)) and (
+            item.end is None or parsed_position <= int(item.end)
+        ):
+            return True
+    return False
 
 
 def _plain_marker_records(
@@ -480,6 +563,7 @@ def _window_layout(
     overlap_cm: float,
     window_markers: int,
     threads: int,
+    region=None,
 ) -> tuple[int, int, int, int, float]:
     marker_count = 0
 
@@ -496,6 +580,7 @@ def _window_layout(
         overlap_cm,
         window_markers,
         threads,
+        region=region,
     )
     windows = 0
     max_window_markers = 0
@@ -558,6 +643,7 @@ def _inspect_target_dimensions(
             overlap_cm=overlap_cm,
             window_markers=window_markers,
             threads=threads,
+            region=region,
         )
         return _WindowInspection(
             samples,
@@ -587,6 +673,7 @@ def _inspect_target_dimensions(
             overlap_cm=overlap_cm,
             window_markers=window_markers,
             threads=threads,
+            region=region,
         )
         return _WindowInspection(
             samples,
@@ -631,6 +718,7 @@ def _inspect_target_dimensions(
             overlap_cm=overlap_cm,
             window_markers=window_markers,
             threads=threads,
+            region=region,
         )
         return _WindowInspection(
             samples,
@@ -676,6 +764,7 @@ def _inspect_target_dimensions(
             overlap_cm=overlap_cm,
             window_markers=window_markers,
             threads=threads,
+            region=region,
         )
         return _WindowInspection(
             samples,
@@ -936,15 +1025,6 @@ def _pfile_cache_complete(prefix: Path) -> bool:
     )
 
 
-class _SingleUseStoreAction(argparse.Action):
-    def __call__(self, parser, namespace, values, option_string=None):
-        if getattr(namespace, "_bimrange_seen", False):
-            raise argparse.ArgumentError(
-                self,
-                "-bimrange/--bimrange may only be specified once",
-            )
-        setattr(namespace, self.dest, values)
-        setattr(namespace, "_bimrange_seen", True)
 
 
 def _diagnostic_site(value: str | None) -> dict[str, object] | None:
@@ -1234,11 +1314,16 @@ def build_parser(argv: Sequence[str] | None = None) -> CliArgumentParser:
     reference.add_argument(
         "-bimrange",
         "--bimrange",
-        action=_SingleUseStoreAction,
+        type=str,
+        action="append",
+        default=None,
         metavar="CHR[:START:END]",
         help=(
-            "Restrict output to one chromosome or inclusive physical interval. "
-            "Use bp or Mb suffixes when units would be ambiguous."
+            "Restrict output to one or more chromosomes or inclusive physical "
+            "intervals. Repeat the flag for multiple entries (e.g. "
+            "-bimrange 1 -bimrange 2 -bimrange 3:0:100); comma-separated items "
+            "are also accepted. Use bp or Mb suffixes when units would be "
+            "ambiguous."
         ),
     )
 
@@ -1497,10 +1582,10 @@ def main() -> int:
             gp=bool(args.gp),
             output_format=args.format,
         )
-        region = (
+        regions = (
             None
-            if args.bimrange is None
-            else parse_cli_range(args.bimrange, allow_chrom_only=True)
+            if not args.bimrange
+            else parse_cli_ranges(args.bimrange, allow_chrom_only=True)
         )
         diagnostic_site = _diagnostic_site(args.trace_site)
     except ValueError as exc:
@@ -1541,7 +1626,7 @@ def main() -> int:
     }.get(target_kind, target_kind.upper())
     reference_label = "None" if reference is None else str(reference)
     region_label = (
-        "Whole input" if region is None else format_normalized_range(region)
+        "Whole input" if not regions else format_normalized_ranges(regions)
     )
     mode_label = _format_mode(mode)
     progress_label = (
@@ -1599,13 +1684,25 @@ def main() -> int:
         "reference": None if reference is None else str(reference),
         "map": None if args.map is None else str(Path(args.map).expanduser()),
         "region": (
-            None
-            if region is None
-            else {
-                "chrom": region.chrom_key,
-                "start": region.start,
-                "end": region.end,
+            {
+                "chrom": regions[0].chrom_key,
+                "start": regions[0].start,
+                "end": regions[0].end,
             }
+            if regions and len(regions) == 1
+            else None
+        ),
+        "regions": (
+            [
+                {
+                    "chrom": item.chrom_key,
+                    "start": item.start,
+                    "end": item.end,
+                }
+                for item in regions
+            ]
+            if regions
+            else []
         ),
         "output": str(output),
         "format": "pgen" if args.format == "pfile" else "vcf",
@@ -1647,7 +1744,7 @@ def main() -> int:
         inspection = _inspect_target_dimensions(
             target_kind,
             target,
-            region,
+            regions,
             map_path=None
             if args.map is None
             else Path(args.map).expanduser(),
@@ -1668,7 +1765,7 @@ def main() -> int:
                 )
             reference_inspection = _inspect_reference_dimensions(
                 reference,
-                region,
+                regions,
                 map_path=None
                 if args.map is None
                 else Path(args.map).expanduser(),

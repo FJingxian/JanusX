@@ -59,20 +59,36 @@ pub(super) fn normalize_interval_bounds(start: i32, end: i32) -> (i32, i32) {
 }
 
 pub(super) fn parse_scan_bimrange_item(text: &str) -> Result<GarfieldScanBimRange, String> {
-    let raw = text.trim();
+    let normalized_raw = text.trim().replace('：', ":");
+    let raw = normalized_raw.trim();
     if raw.is_empty() {
         return Err("empty --bimrange item".to_string());
     }
+    if !raw.contains(':') && !raw.contains('-') {
+        let chrom = normalize_chrom(raw);
+        if chrom_base_view(chrom.as_str()).is_empty() {
+            return Err(format!("Invalid --bimrange chromosome: '{raw}'."));
+        }
+        return Ok(GarfieldScanBimRange {
+            chrom,
+            bp_start: 0,
+            bp_end: i32::MAX,
+        });
+    }
     let (chrom_txt, coords_txt) = raw.split_once(':').ok_or_else(|| {
-        format!("Invalid --bimrange format: {raw}. Use chr:start-end (or chr:start:end) in bp.")
+        format!("Invalid --bimrange format: {raw}. Use chr, chr:start-end, or chr:start:end in bp.")
     })?;
+    let chrom = normalize_chrom(chrom_txt);
+    if chrom_base_view(chrom.as_str()).is_empty() {
+        return Err(format!("Invalid --bimrange chromosome: '{raw}'."));
+    }
     let (start_txt, end_txt) = if let Some((a, b)) = coords_txt.split_once('-') {
         (a.trim(), b.trim())
     } else if let Some((a, b)) = coords_txt.split_once(':') {
         (a.trim(), b.trim())
     } else {
         return Err(format!(
-            "Invalid --bimrange format: {raw}. Use chr:start-end (or chr:start:end) in bp."
+            "Invalid --bimrange format: {raw}. Use chr, chr:start-end, or chr:start:end in bp."
         ));
     };
     let parse_bp = |label: &str, value: &str| -> Result<i32, String> {
@@ -91,7 +107,7 @@ pub(super) fn parse_scan_bimrange_item(text: &str) -> Result<GarfieldScanBimRang
     let end = parse_bp("end", end_txt)?;
     let (bp_start, bp_end) = normalize_interval_bounds(start, end);
     Ok(GarfieldScanBimRange {
-        chrom: normalize_chrom(chrom_txt),
+        chrom,
         bp_start,
         bp_end,
     })

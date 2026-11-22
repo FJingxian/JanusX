@@ -5314,6 +5314,27 @@ fn test_parse_scan_bimrange_item_accepts_bp_interval() {
     assert_eq!(parsed.chrom, "chr10");
     assert_eq!(parsed.bp_start, 111_000_000);
     assert_eq!(parsed.bp_end, 111_200_000);
+
+    let chrom_only = parse_scan_bimrange_item("10").unwrap();
+    assert_eq!(chrom_only.chrom, "10");
+    assert_eq!(chrom_only.bp_start, 0);
+    assert_eq!(chrom_only.bp_end, i32::MAX);
+
+    let multi = parse_scan_bimranges(&[
+        "10,chr11:100-200".to_string(),
+        "chrX".to_string(),
+    ])
+    .unwrap();
+    assert_eq!(multi.len(), 3);
+    assert_eq!(multi[0].chrom, "10");
+    assert_eq!(multi[0].bp_start, 0);
+    assert_eq!(multi[0].bp_end, i32::MAX);
+    assert_eq!(multi[1].chrom, "chr11");
+    assert_eq!(multi[1].bp_start, 100);
+    assert_eq!(multi[1].bp_end, 200);
+    assert_eq!(multi[2].chrom, "chrX");
+    assert_eq!(multi[2].bp_start, 0);
+    assert_eq!(multi[2].bp_end, i32::MAX);
 }
 
 #[test]

@@ -52,17 +52,15 @@ impl ReferenceWindowSchedule {
             .unwrap();
         let chrom = first.0.meta.chrom.clone();
         let first_target_pos = first.0.meta.pos;
-        let output_start = config
-            .region
+        let region_filter = config.region_filter();
+        let active_interval = region_filter
             .as_ref()
-            .filter(|region| region.contains_chromosome(&chrom))
-            .and_then(|region| region.start)
+            .and_then(|filter| filter.interval_for(&chrom, first_target_pos));
+        let output_start = active_interval
+            .and_then(|(_, start, _)| start)
             .unwrap_or(0);
-        let output_end = config
-            .region
-            .as_ref()
-            .filter(|region| region.contains_chromosome(&chrom))
-            .and_then(|region| region.end)
+        let output_end = active_interval
+            .and_then(|(_, _, end)| end)
             .unwrap_or(u64::MAX);
         let mut reference_rows = std::mem::take(&mut self.reference_carry);
         let overlap_end = reference_rows.len();
@@ -149,7 +147,16 @@ impl ReferenceWindowSchedule {
                 None => targets.next_row_for_reference()?,
             };
             let Some(record) = next else { break };
+            let outside_active_interval = region_filter.as_ref().is_some_and(|filter| {
+                !filter.same_interval(
+                    &chrom,
+                    first_target_pos,
+                    &record.0.meta.chrom,
+                    record.0.meta.pos,
+                )
+            });
             if record.0.meta.chrom != chrom
+                || outside_active_interval
                 || (!terminal_reference && record.0.meta.pos >= target_end_pos)
             {
                 self.target_pending = Some(record);
@@ -166,18 +173,22 @@ impl ReferenceWindowSchedule {
                 "target and reference have no target records in the window on chromosome {chrom}"
             ));
         }
-        let terminal_target = self
-            .target_pending
-            .as_ref()
-            .map_or(true, |row| row.0.meta.chrom != chrom);
+        let terminal_target = self.target_pending.as_ref().map_or(true, |row| {
+            row.0.meta.chrom != chrom
+                || region_filter.as_ref().is_some_and(|filter| {
+                    !filter.same_interval(
+                        &chrom,
+                        first_target_pos,
+                        &row.0.meta.chrom,
+                        row.0.meta.pos,
+                    )
+                })
+        });
         let terminal = terminal_target || terminal_reference;
         // Preserve JanusX's complete reference endpoint output contract.
         if terminal_target && !terminal_reference {
-            let context_end = config
-                .region
-                .as_ref()
-                .filter(|region| region.contains_chromosome(&chrom))
-                .and_then(|region| region.end)
+            let context_end = active_interval
+                .and_then(|(_, _, end)| end)
                 .map_or(u64::MAX, |end| {
                     end.max(target_rows.last().unwrap().0.meta.pos)
                 });
@@ -264,5 +275,110 @@ impl ReferenceWindowSchedule {
             previous_emitted_pos,
             reference_emit_end_pos,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn terminal_reference_does_not_pull_next_interval_target_rows_into_window() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "janusx-imp-refwin-interval-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let reference_path = root.join("reference.vcf");
+        let header = concat!(
+            "##fileformat=VCFv4.3\n",
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\ts2\n"
+        );
+        // Reference ends on chromosome 1 inside the first interval [100, 200].
+        std::fs::write(
+            &reference_path,
+            format!(
+                "{header}\
+                 1\t100\tr1\tA\tG\t.\tPASS\t.\tGT\t0|1\t1|0\n\
+                 1\t150\tr2\tA\tG\t.\tPASS\t.\tGT\t1|0\t0|1\n"
+            ),
+        )
+        .unwrap();
+        let config = types::ImpConfig {
+            target: root.join("target.vcf"),
+            reference: Some(reference_path.clone()),
+            output: root.join("out.vcf"),
+            threads: 1,
+            window: 40.0,
+            overlap: 2.0,
+            window_markers: 20,
+            regions: vec![
+                types::RegionSpec {
+                    chrom: "1".to_owned(),
+                    start: Some(100),
+                    end: Some(200),
+                },
+                types::RegionSpec {
+                    chrom: "1".to_owned(),
+                    start: Some(500),
+                    end: Some(600),
+                },
+            ],
+            ..types::ImpConfig::default()
+        };
+        let map = window::map_from_config(&config).unwrap();
+        let mut references = ReferenceWindowStream::open(&reference_path, map.clone(), 1).unwrap();
+        let make_target = |pos: u64| {
+            Ok(types::VariantRow {
+                meta: types::VariantMeta {
+                    chrom: "1".to_owned(),
+                    pos,
+                    id: format!("t{pos}"),
+                    ref_allele: "A".to_owned(),
+                    alt_alleles: vec!["G".to_owned()],
+                },
+                calls: types::DiploidCalls::from_calls(vec![
+                    types::DiploidCall {
+                        alleles: [Some(0), Some(1)],
+                        phased: false,
+                    },
+                    types::DiploidCall {
+                        alleles: [Some(1), Some(0)],
+                        phased: false,
+                    },
+                ]),
+            })
+        };
+        let mut targets = window::WindowCursor::new(
+            vec![make_target(100), make_target(180), make_target(520), make_target(580)]
+                .into_iter(),
+            map,
+            &config,
+        );
+        let mut schedule = ReferenceWindowSchedule::default();
+        let mut admission = |_count: usize, _row: &types::VariantRow| Ok(());
+        let first = schedule
+            .next_window(&mut targets, &mut references, &config, &mut admission)
+            .unwrap()
+            .expect("first interval should produce a scheduled window");
+        let _ = std::fs::remove_dir_all(&root);
+
+        let target_positions = first
+            .target
+            .rows
+            .iter()
+            .map(|row| row.meta.pos)
+            .collect::<Vec<_>>();
+        assert!(first.terminal);
+        assert_eq!(target_positions, vec![100, 180]);
+        assert_eq!(
+            schedule.target_pending.as_ref().map(|(row, _)| row.meta.pos),
+            Some(520)
+        );
     }
 }

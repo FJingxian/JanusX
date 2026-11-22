@@ -133,13 +133,13 @@ enum PostPhaseJob {
         previous_emitted_pos: Option<u64>,
         reference_emit_end_pos: Option<u64>,
         orientation_flips: Vec<bool>,
-        region: Option<types::RegionSpec>,
+        region_filter: Option<Arc<types::RegionFilter>>,
         worker_pool: Arc<rayon::ThreadPool>,
     },
     Write {
         rows: Vec<types::PhasedRow>,
         indices: Vec<usize>,
-        region: Option<types::RegionSpec>,
+        region_filter: Option<Arc<types::RegionFilter>>,
         worker_pool: Arc<rayon::ThreadPool>,
     },
 }
@@ -287,7 +287,7 @@ fn process_post_phase_job(
             previous_emitted_pos,
             reference_emit_end_pos,
             orientation_flips,
-            region,
+            region_filter,
             worker_pool,
         } => {
             let mut imputation_hmm_config = fitted_hmm_config;
@@ -317,7 +317,7 @@ fn process_post_phase_job(
                         .iter()
                         .filter(|&&index| {
                             region_marker_is_emittable(
-                                region.as_ref(),
+                                region_filter.as_deref(),
                                 &rows[index].meta.chrom,
                                 rows[index].meta.pos,
                             )
@@ -354,7 +354,7 @@ fn process_post_phase_job(
         PostPhaseJob::Write {
             rows,
             indices,
-            region,
+            region_filter,
             worker_pool,
         } => {
             let profile = std::env::var_os("JANUSX_IMP_VCF_PROFILE").is_some();
@@ -364,7 +364,11 @@ fn process_post_phase_job(
                 let row = rows.get(index).ok_or_else(|| {
                     format!("output row index {index} exceeds {} rows", rows.len())
                 })?;
-                if region_marker_is_emittable(region.as_ref(), &row.meta.chrom, row.meta.pos) {
+                if region_marker_is_emittable(
+                    region_filter.as_deref(),
+                    &row.meta.chrom,
+                    row.meta.pos,
+                ) {
                     emitted.push(row);
                 }
             }
@@ -445,28 +449,24 @@ impl ReferenceWindowStream {
         let target_end_cm = *target.cm_positions.last().unwrap();
         let first_target_pos = target.rows.first().unwrap().meta.pos;
         let last_target_pos = target.rows.last().unwrap().meta.pos;
-        let region = config
-            .region
+        let region_filter = config.region_filter();
+        let active_interval = region_filter
             .as_ref()
-            .filter(|region| region.contains_chromosome(&target.chrom));
+            .and_then(|filter| filter.interval_for(&target.chrom, first_target_pos));
+        let region_start = active_interval.and_then(|(_, start, _)| start);
+        let region_end = active_interval.and_then(|(_, _, end)| end);
         let first_target_window = self.last_emitted_target_pos.is_none();
-        let include_chromosome_start = config.impute
-            && first_target_window
-            && region.map_or(true, |region| region.start.is_none());
-        let include_chromosome_end = config.impute
-            && terminal_target_window
-            && region.map_or(true, |region| region.end.is_none());
+        let include_chromosome_start =
+            config.impute && first_target_window && region_start.is_none();
+        let include_chromosome_end =
+            config.impute && terminal_target_window && region_end.is_none();
         let output_region_start = if config.impute && first_target_window {
-            region
-                .and_then(|region| region.start)
-                .filter(|&start| start < first_target_pos)
+            region_start.filter(|&start| start < first_target_pos)
         } else {
             None
         };
         let output_region_end = if config.impute && terminal_target_window {
-            region
-                .and_then(|region| region.end)
-                .filter(|&end| end > last_target_pos)
+            region_end.filter(|&end| end > last_target_pos)
         } else {
             None
         };
@@ -1288,11 +1288,13 @@ where
         Arc::clone(&completed_rows),
         run_started,
     )?;
+    let region_filter = config.region_filter().map(Arc::new);
     let mut summary = ImpSummary {
         variants_written: 0,
         samples_written: samples.len(),
         peak_window_bytes: 0,
         region: config.region.clone(),
+        regions: config.effective_regions(),
         total_target_windows: 0,
         direct_imputation_windows: 0,
         normal_phasing_windows: 0,
@@ -1350,11 +1352,12 @@ where
             Some(bounds.3)
         } else if config.impute && terminal_target_window {
             Some(
-                config
-                    .region
-                    .as_ref()
-                    .filter(|region| region.contains_chromosome(&window.chrom))
-                    .and_then(|region| region.end)
+                region_filter
+                    .as_deref()
+                    .and_then(|filter| {
+                        filter.interval_for(&window.chrom, window.rows[0].meta.pos)
+                    })
+                    .and_then(|(_, _, end)| end)
                     .unwrap_or(u64::MAX),
             )
         } else {
@@ -1930,7 +1933,7 @@ where
                         .rev()
                         .find(|row| {
                             region_marker_is_emittable(
-                                config.region.as_ref(),
+                                region_filter.as_deref(),
                                 &row.meta.chrom,
                                 row.meta.pos,
                             )
@@ -1956,7 +1959,7 @@ where
                     previous_emitted_pos,
                     reference_emit_end_pos,
                     orientation_flips,
-                    region: config.region.clone(),
+                    region_filter: region_filter.clone(),
                     worker_pool: Arc::clone(&worker_pool),
                 };
                 if sync_impute {
@@ -2012,7 +2015,7 @@ where
                         .rev()
                         .find(|row| {
                             region_marker_is_emittable(
-                                config.region.as_ref(),
+                                region_filter.as_deref(),
                                 &row.meta.chrom,
                                 row.meta.pos,
                             )
@@ -2025,7 +2028,7 @@ where
                 writer.submit(PostPhaseJob::Write {
                     indices: (phased.emit_start..phased.emit_end).collect(),
                     rows: phased.rows,
-                    region: config.region.clone(),
+                    region_filter: region_filter.clone(),
                     worker_pool: Arc::clone(&worker_pool),
                 })?;
                 summary.variants_written = completed_rows.load(Ordering::Relaxed);
@@ -2062,7 +2065,7 @@ where
             writer.submit(PostPhaseJob::Write {
                 indices: (phased.emit_start..phased.emit_end).collect(),
                 rows: phased.rows,
-                region: config.region.clone(),
+                region_filter: region_filter.clone(),
                 worker_pool: Arc::clone(&worker_pool),
             })?;
             summary.variants_written = completed_rows.load(Ordering::Relaxed);
@@ -2109,8 +2112,12 @@ where
     Ok(summary)
 }
 
-fn region_marker_is_emittable(region: Option<&types::RegionSpec>, chrom: &str, pos: u64) -> bool {
-    region.is_none_or(|region| region.contains(chrom, pos))
+fn region_marker_is_emittable(
+    region_filter: Option<&types::RegionFilter>,
+    chrom: &str,
+    pos: u64,
+) -> bool {
+    region_filter.is_none_or(|filter| filter.contains(chrom, pos))
 }
 
 #[cfg(test)]
@@ -2534,15 +2541,25 @@ mod tests {
 
     #[test]
     fn region_with_no_target_or_reference_output_is_an_error() {
-        let region = types::RegionSpec {
-            chrom: "1".to_owned(),
-            start: Some(100),
-            end: Some(200),
-        };
-        assert!(!region_marker_is_emittable(Some(&region), "1", 99));
-        assert!(region_marker_is_emittable(Some(&region), "1", 100));
-        assert!(region_marker_is_emittable(Some(&region), "chr1", 200));
-        assert!(!region_marker_is_emittable(Some(&region), "1", 201));
+        let filter = types::RegionFilter::from_specs(&[
+            types::RegionSpec {
+                chrom: "1".to_owned(),
+                start: Some(100),
+                end: Some(200),
+            },
+            types::RegionSpec {
+                chrom: "2".to_owned(),
+                start: None,
+                end: None,
+            },
+        ])
+        .unwrap();
+        assert!(!region_marker_is_emittable(Some(&filter), "1", 99));
+        assert!(region_marker_is_emittable(Some(&filter), "1", 100));
+        assert!(region_marker_is_emittable(Some(&filter), "chr1", 200));
+        assert!(!region_marker_is_emittable(Some(&filter), "1", 201));
+        assert!(region_marker_is_emittable(Some(&filter), "chr2", 500));
+        assert!(!region_marker_is_emittable(Some(&filter), "3", 100));
         assert!(region_marker_is_emittable(None, "1", 1));
     }
 
@@ -2604,7 +2621,7 @@ mod tests {
             .submit(PostPhaseJob::Write {
                 rows: vec![row(1), row(2)],
                 indices: vec![1],
-                region: None,
+                region_filter: None,
                 worker_pool: Arc::clone(&pool),
             })
             .unwrap();
@@ -2612,7 +2629,7 @@ mod tests {
             .submit(PostPhaseJob::Write {
                 rows: vec![row(3)],
                 indices: vec![0],
-                region: None,
+                region_filter: None,
                 worker_pool: Arc::clone(&pool),
             })
             .unwrap();

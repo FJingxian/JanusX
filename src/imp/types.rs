@@ -1846,6 +1846,8 @@ pub struct ImpConfig {
     pub reference: Option<PathBuf>,
     pub map: Option<PathBuf>,
     pub region: Option<RegionSpec>,
+    #[serde(default)]
+    pub regions: Vec<RegionSpec>,
     #[serde(alias = "out")]
     pub output: PathBuf,
     #[serde(alias = "fmt")]
@@ -1905,7 +1907,89 @@ impl RegionSpec {
     }
 }
 
-fn normalize_region_chromosome(value: &str) -> String {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegionFilter {
+    by_chrom: std::collections::HashMap<String, Vec<(Option<u64>, Option<u64>)>>,
+}
+
+impl RegionFilter {
+    pub fn from_specs(specs: &[RegionSpec]) -> Option<Self> {
+        if specs.is_empty() {
+            return None;
+        }
+        let mut grouped: std::collections::HashMap<String, Vec<(Option<u64>, Option<u64>)>> =
+            std::collections::HashMap::new();
+        for spec in specs {
+            let key = normalize_region_chromosome(&spec.chrom);
+            grouped.entry(key).or_default().push((spec.start, spec.end));
+        }
+        let mut by_chrom = std::collections::HashMap::with_capacity(grouped.len());
+        for (chrom, intervals) in grouped {
+            if intervals
+                .iter()
+                .any(|(start, end)| start.is_none() && end.is_none())
+            {
+                by_chrom.insert(chrom, vec![(None, None)]);
+                continue;
+            }
+            let mut concrete = intervals
+                .into_iter()
+                .map(|(start, end)| (start.unwrap_or(0), end.unwrap_or(u64::MAX)))
+                .collect::<Vec<_>>();
+            concrete.sort_unstable();
+            let mut merged: Vec<(Option<u64>, Option<u64>)> = Vec::with_capacity(concrete.len());
+            for (start, end) in concrete {
+                if let Some((_, Some(last_end))) = merged.last_mut() {
+                    if start <= last_end.saturating_add(1) {
+                        *last_end = (*last_end).max(end);
+                        continue;
+                    }
+                }
+                merged.push((Some(start), Some(end)));
+            }
+            by_chrom.insert(chrom, merged);
+        }
+        Some(Self { by_chrom })
+    }
+
+    pub fn chrom_count(&self) -> usize {
+        self.by_chrom.len()
+    }
+
+    pub fn contains_chromosome(&self, chrom: &str) -> bool {
+        self.by_chrom
+            .contains_key(&normalize_region_chromosome(chrom))
+    }
+
+    pub fn interval_for(&self, chrom: &str, pos: u64) -> Option<(usize, Option<u64>, Option<u64>)> {
+        let intervals = self.by_chrom.get(&normalize_region_chromosome(chrom))?;
+        for (index, &(start, end)) in intervals.iter().enumerate() {
+            if start.is_none_or(|s| pos >= s) && end.is_none_or(|e| pos <= e) {
+                return Some((index, start, end));
+            }
+        }
+        None
+    }
+
+    pub fn contains(&self, chrom: &str, pos: u64) -> bool {
+        self.interval_for(chrom, pos).is_some()
+    }
+
+    pub fn is_past_chrom_bounds(&self, chrom: &str, pos: u64) -> bool {
+        self.by_chrom
+            .get(&normalize_region_chromosome(chrom))
+            .and_then(|intervals| intervals.last())
+            .is_some_and(|(_, end)| end.is_some_and(|e| pos > e))
+    }
+
+    pub fn same_interval(&self, chrom_a: &str, pos_a: u64, chrom_b: &str, pos_b: u64) -> bool {
+        normalize_region_chromosome(chrom_a) == normalize_region_chromosome(chrom_b)
+            && self.interval_for(chrom_a, pos_a).map(|(idx, _, _)| idx)
+                == self.interval_for(chrom_b, pos_b).map(|(idx, _, _)| idx)
+    }
+}
+
+pub(crate) fn normalize_region_chromosome(value: &str) -> String {
     let trimmed = value.trim();
     let without_prefix = if trimmed
         .get(..3)
@@ -1940,6 +2024,7 @@ impl Default for ImpConfig {
             reference: None,
             map: None,
             region: None,
+            regions: Vec::new(),
             output: PathBuf::new(),
             format: OutputFormat::Vcf,
             threads: std::thread::available_parallelism()
@@ -1972,6 +2057,20 @@ impl Default for ImpConfig {
 }
 
 impl ImpConfig {
+    pub fn effective_regions(&self) -> Vec<RegionSpec> {
+        let mut out = self.regions.clone();
+        if let Some(region) = self.region.as_ref() {
+            if !out.contains(region) {
+                out.push(region.clone());
+            }
+        }
+        out
+    }
+
+    pub fn region_filter(&self) -> Option<RegionFilter> {
+        RegionFilter::from_specs(&self.effective_regions())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if self.target.as_os_str().is_empty() {
             return Err("missing required target genotype path (-gt/--target)".to_owned());
@@ -1979,7 +2078,7 @@ impl ImpConfig {
         if self.output.as_os_str().is_empty() {
             return Err("missing required output path (-out/--out)".to_owned());
         }
-        if let Some(region) = self.region.as_ref() {
+        for region in self.effective_regions() {
             if normalize_region_chromosome(&region.chrom).is_empty() {
                 return Err("region chromosome must not be empty".to_owned());
             }
@@ -2165,6 +2264,8 @@ pub struct ImpSummary {
     pub samples_written: usize,
     pub peak_window_bytes: u64,
     pub region: Option<RegionSpec>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub regions: Vec<RegionSpec>,
     pub total_target_windows: u64,
     pub direct_imputation_windows: u64,
     pub normal_phasing_windows: u64,
@@ -2209,6 +2310,7 @@ impl Default for ImpSummary {
             samples_written: 0,
             peak_window_bytes: 0,
             region: None,
+            regions: Vec::new(),
             total_target_windows: 0,
             direct_imputation_windows: 0,
             normal_phasing_windows: 0,

@@ -1,6 +1,9 @@
 //! Genetic-map interpolation and bounded overlapping-window iteration.
 
-use super::types::{ImpConfig, PhaseWindow, PhasedRow, PhasedWindow, RegionSpec, VariantRow};
+use super::types::{
+    normalize_region_chromosome, ImpConfig, PhaseWindow, PhasedRow, PhasedWindow, RegionFilter,
+    VariantRow,
+};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -209,9 +212,10 @@ where
     last_cm: f64,
     exhausted: bool,
     seen_chromosomes: HashMap<String, ()>,
-    region: Option<RegionSpec>,
-    region_seen: bool,
-    region_cm_bounds: Option<(f64, f64)>,
+    region_filter: Option<RegionFilter>,
+    seen_region_chroms: HashMap<String, ()>,
+    last_region_chrom: Option<String>,
+    last_window_region_interval: Option<(String, usize)>,
 }
 
 impl<I> WindowCursor<I>
@@ -234,9 +238,10 @@ where
             last_cm: f64::NEG_INFINITY,
             exhausted: false,
             seen_chromosomes: HashMap::new(),
-            region: config.region.clone(),
-            region_seen: false,
-            region_cm_bounds: None,
+            region_filter: config.region_filter(),
+            seen_region_chroms: HashMap::new(),
+            last_region_chrom: None,
+            last_window_region_interval: None,
         }
     }
 
@@ -259,10 +264,17 @@ where
     pub(crate) fn is_terminal_window(&self, chrom: &str) -> bool {
         self.carry.is_empty()
             && (self.exhausted
-                || self
-                    .pending
-                    .as_ref()
-                    .is_some_and(|(row, _)| row.meta.chrom != chrom))
+                || self.pending.as_ref().is_some_and(|(row, _)| {
+                    row.meta.chrom != chrom
+                        || self.region_filter.as_ref().is_some_and(|filter| {
+                            let pending_key = filter
+                                .interval_for(&row.meta.chrom, row.meta.pos)
+                                .map(|(idx, _, _)| {
+                                    (normalize_region_chromosome(&row.meta.chrom), idx)
+                                });
+                            pending_key != self.last_window_region_interval
+                        })
+                }))
     }
 
     pub(crate) fn next_window_with_admission<F>(
@@ -308,6 +320,12 @@ where
         for (row, _) in &window_rows {
             admission(window_rows.len(), row)?;
         }
+        let window_region_interval = self.region_filter.as_ref().and_then(|filter| {
+            let first = &window_rows[0].0.meta;
+            filter
+                .interval_for(&first.chrom, first.pos)
+                .map(|(idx, _, _)| (normalize_region_chromosome(&first.chrom), idx))
+        });
         let start_cm = window_rows[0].1;
         let end_cm = if retained_overlap_rows > 0 {
             self.pending
@@ -330,7 +348,16 @@ where
                 self.exhausted = true;
                 break;
             };
-            if row.meta.chrom != chrom {
+            let same_region_interval = match (self.region_filter.as_ref(), &window_region_interval) {
+                (Some(filter), Some(expected)) => filter
+                    .interval_for(&row.meta.chrom, row.meta.pos)
+                    .is_some_and(|(idx, _, _)| {
+                        expected.0 == normalize_region_chromosome(&row.meta.chrom)
+                            && expected.1 == idx
+                    }),
+                _ => true,
+            };
+            if row.meta.chrom != chrom || !same_region_interval {
                 self.pending = Some((row, cm));
                 hit_chromosome_boundary = true;
                 break;
@@ -389,6 +416,7 @@ where
         }
         self.carry = retained;
         self.outgoing_phase_carry_len = outgoing_phase_carry_len;
+        self.last_window_region_interval = window_region_interval;
         let index = self.window_index;
         self.window_index = self.window_index.saturating_add(1);
         Ok(Some(PhaseWindow {
@@ -449,43 +477,54 @@ where
             self.last_pos = row.meta.pos;
             self.last_cm = cm;
 
-            let Some(region) = self.region.as_ref() else {
+            let Some(region_filter) = self.region_filter.as_ref() else {
                 return Ok(Some((row, cm)));
             };
-            if !region.contains_chromosome(&chrom) {
-                if self.region_seen {
+            let chrom_key = normalize_region_chromosome(&chrom);
+            if !region_filter.contains_chromosome(&chrom) {
+                if let Some(prev_region_chrom) = self.last_region_chrom.take() {
+                    self.seen_region_chroms.insert(prev_region_chrom, ());
+                }
+                if self.seen_region_chroms.len() >= region_filter.chrom_count() {
                     return Ok(None);
                 }
                 continue;
             }
-            self.region_seen = true;
-            if region.start.is_some_and(|start| row.meta.pos < start) {
-                continue;
+            if self
+                .last_region_chrom
+                .as_deref()
+                .is_some_and(|prev| prev != chrom_key)
+            {
+                if let Some(prev_region_chrom) = self.last_region_chrom.take() {
+                    self.seen_region_chroms.insert(prev_region_chrom, ());
+                }
             }
-            if region.end.is_some_and(|end| row.meta.pos > end) {
-                return Ok(None);
-            }
-            if self.region_cm_bounds.is_none() {
-                self.region_cm_bounds = Some(match (region.start, region.end) {
-                    // An explicit -bimrange is a hard analysis boundary, as
-                    // Beagle's chrom=CHROM:START-END argument is. Expanding
-                    // the boundary by the window length can join distant
-                    // disjoint benchmark windows into one chromosome-wide HMM.
-                    (Some(start), Some(end)) => {
-                        (self.map.cm_at(&chrom, start)?, self.map.cm_at(&chrom, end)?)
+            self.last_region_chrom = Some(chrom_key.clone());
+            let Some((_, start, end)) = region_filter.interval_for(&chrom, row.meta.pos) else {
+                if region_filter.is_past_chrom_bounds(&chrom, row.meta.pos) {
+                    self.seen_region_chroms.insert(chrom_key, ());
+                    self.last_region_chrom = None;
+                    if self.seen_region_chroms.len() >= region_filter.chrom_count() {
+                        return Ok(None);
                     }
-                    (Some(start), None) => (self.map.cm_at(&chrom, start)?, f64::INFINITY),
-                    (None, Some(end)) => (f64::NEG_INFINITY, self.map.cm_at(&chrom, end)?),
-                    (None, None) => (f64::NEG_INFINITY, f64::INFINITY),
-                });
-            }
-            let (context_start_cm, context_end_cm) =
-                self.region_cm_bounds.expect("region bounds initialized");
-            if cm + f64::EPSILON < context_start_cm {
+                }
                 continue;
+            };
+            // An explicit -bimrange is a hard analysis boundary, as Beagle's
+            // chrom=CHROM:START-END argument is. Expanding the boundary by the
+            // window length can join distant disjoint benchmark windows into
+            // one chromosome-wide HMM.
+            if let Some(start_bp) = start {
+                let context_start_cm = self.map.cm_at(&chrom, start_bp)?;
+                if cm + f64::EPSILON < context_start_cm {
+                    continue;
+                }
             }
-            if cm - f64::EPSILON > context_end_cm {
-                return Ok(None);
+            if let Some(end_bp) = end {
+                let context_end_cm = self.map.cm_at(&chrom, end_bp)?;
+                if cm - f64::EPSILON > context_end_cm {
+                    continue;
+                }
             }
             return Ok(Some((row, cm)));
         }
@@ -791,5 +830,76 @@ mod tests {
         assert!(region.contains("Chr1", 20));
         assert!(!region.contains("1", 21));
         assert!(!region.contains("2", 15));
+    }
+
+    #[test]
+    fn multi_region_cursor_separates_disjoint_intervals_and_multiple_chroms() {
+        let make_row = |chrom: &str, pos: u64| VariantRow {
+            meta: VariantMeta {
+                chrom: chrom.to_owned(),
+                pos,
+                id: format!("{chrom}_{pos}"),
+                ref_allele: "A".to_owned(),
+                alt_alleles: vec!["C".to_owned()],
+            },
+            calls: DiploidCalls::from_calls(vec![DiploidCall {
+                alleles: [Some(0), Some(0)],
+                phased: false,
+            }]),
+        };
+        let rows = [
+            make_row("1", 1_000_000),
+            make_row("1", 2_000_000),
+            make_row("1", 5_000_000),
+            make_row("1", 10_000_000),
+            make_row("1", 11_000_000),
+            make_row("2", 3_000_000),
+            make_row("3", 4_000_000),
+            make_row("3", 5_000_000),
+        ]
+        .into_iter()
+        .map(Ok);
+        let config = ImpConfig {
+            window: 1_000.0,
+            overlap: 1.0,
+            window_markers: 100,
+            regions: vec![
+                RegionSpec {
+                    chrom: "1".to_owned(),
+                    start: Some(1_000_000),
+                    end: Some(2_000_000),
+                },
+                RegionSpec {
+                    chrom: "1".to_owned(),
+                    start: Some(10_000_000),
+                    end: Some(11_000_000),
+                },
+                RegionSpec {
+                    chrom: "chr3".to_owned(),
+                    start: None,
+                    end: None,
+                },
+            ],
+            ..ImpConfig::default()
+        };
+        let mut cursor = WindowCursor::new(rows, GeneticMap::default_1cm_per_mb(), &config);
+        let mut windows = Vec::new();
+        while let Some(window) = cursor.next_window().unwrap() {
+            windows.push(
+                window
+                    .rows
+                    .iter()
+                    .map(|r| (r.meta.chrom.clone(), r.meta.pos))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(
+            windows,
+            vec![
+                vec![("1".to_owned(), 1_000_000), ("1".to_owned(), 2_000_000)],
+                vec![("1".to_owned(), 10_000_000), ("1".to_owned(), 11_000_000)],
+                vec![("3".to_owned(), 4_000_000), ("3".to_owned(), 5_000_000)],
+            ]
+        );
     }
 }

@@ -59,6 +59,8 @@ def _resolve_unit(
     end_token: str,
     start_unit: str | None,
     end_unit: str | None,
+    *,
+    implicit_unit: str = "auto",
 ) -> str:
     if (start_unit is None) != (end_unit is None):
         raise ValueError(
@@ -71,6 +73,16 @@ def _resolve_unit(
                 "Invalid -bimrange/--bimrange: both bounds must use the same unit."
             )
         return start_unit
+
+    if implicit_unit == "bp":
+        if "." in start_token or "." in end_token:
+            raise ValueError(
+                "Invalid -bimrange/--bimrange: fractional coordinates require "
+                "an explicit Mb suffix."
+            )
+        return "bp"
+    if implicit_unit != "auto":
+        raise ValueError(f"Unsupported implicit_unit: {implicit_unit!r}")
 
     start_bp = _looks_like_implicit_bp(start_token)
     end_bp = _looks_like_implicit_bp(end_token)
@@ -87,7 +99,12 @@ def _coordinate_to_bp(value: float, unit: str) -> int:
     return int(round(value * multiplier))
 
 
-def parse_cli_range(value: object, *, allow_chrom_only: bool) -> NormalizedRange:
+def parse_cli_range(
+    value: object,
+    *,
+    allow_chrom_only: bool,
+    implicit_unit: str = "auto",
+) -> NormalizedRange:
     text = str(value).strip().replace("：", ":")
     if not text:
         raise ValueError("Invalid -bimrange/--bimrange: value must not be empty.")
@@ -140,6 +157,7 @@ def parse_cli_range(value: object, *, allow_chrom_only: bool) -> NormalizedRange
         end_token.strip(),
         start_unit,
         end_unit,
+        implicit_unit=implicit_unit,
     )
     start_bp = _coordinate_to_bp(start_num, unit)
     end_bp = _coordinate_to_bp(end_num, unit)
@@ -155,7 +173,60 @@ def parse_cli_range(value: object, *, allow_chrom_only: bool) -> NormalizedRange
     )
 
 
+def _flatten_cli_range_tokens(values: object) -> list[str]:
+    if values is None:
+        return []
+    raw_items: list[object]
+    if isinstance(values, (str, bytes)):
+        raw_items = [values]
+    elif isinstance(values, (list, tuple)):
+        raw_items = []
+        for item in values:
+            if isinstance(item, (list, tuple)):
+                raw_items.extend(item)
+            else:
+                raw_items.append(item)
+    else:
+        raw_items = [values]
+
+    tokens: list[str] = []
+    for item in raw_items:
+        text = str(item).strip()
+        if not text:
+            continue
+        for part in text.split(","):
+            piece = part.strip()
+            if piece:
+                tokens.append(piece)
+    return tokens
+
+
+def parse_cli_ranges(
+    values: object,
+    *,
+    allow_chrom_only: bool,
+    implicit_unit: str = "auto",
+) -> list[NormalizedRange]:
+    tokens = _flatten_cli_range_tokens(values)
+    if not tokens:
+        raise ValueError("Invalid -bimrange/--bimrange: value must not be empty.")
+    return [
+        parse_cli_range(
+            token,
+            allow_chrom_only=allow_chrom_only,
+            implicit_unit=implicit_unit,
+        )
+        for token in tokens
+    ]
+
+
 def format_normalized_range(value: NormalizedRange) -> str:
     if value.start is None or value.end is None:
         return value.chrom_original
     return f"{value.chrom_original}:{int(value.start)}-{int(value.end)}"
+
+
+def format_normalized_ranges(
+    values: list[NormalizedRange] | tuple[NormalizedRange, ...],
+) -> str:
+    return ",".join(format_normalized_range(item) for item in values)

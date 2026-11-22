@@ -60,6 +60,10 @@ from janusx.script._common.grmio import (
     format_grm_cache_num, load_and_align_grm, read_id_file, resolve_grm_id_path,
 )
 from janusx.script._common.cli_core import CliArgumentParser, cli_help_formatter
+from janusx.script._common.cli_ranges import (
+    format_normalized_range,
+    parse_cli_ranges,
+)
 from janusx.script._common.log import setup_logging
 from janusx.script._common.memory import (
     resolve_decode_mmap_window_mb as _common_resolve_decode_mmap_window_mb,
@@ -2455,10 +2459,13 @@ def main() -> None:
         type=str,
         action="append",
         default=None,
+        metavar="CHR[:START:END]",
         help=(
-            "Restrict scan units to one or more genomic bp intervals. "
-            "Repeat the flag or use comma-separated items, e.g. "
-            "--bimrange 10:110800000-111200000,10:112000000-112200000. "
+            "Restrict scan units to one or more chromosomes or inclusive physical "
+            "intervals. Repeat the flag for multiple entries (e.g. "
+            "-bimrange 1 -bimrange 2 -bimrange 3:0:100); comma-separated items "
+            "are also accepted. Unitless integers are interpreted in bp; "
+            "explicit bp or Mb suffixes are also supported. "
             "The analytical Max6 Bonferroni pair count uses this selected unique-pair "
             "universe; other backend calibration scopes are backend-specific."
         ),
@@ -2804,6 +2811,17 @@ def main() -> None:
         args.ncol = parse_trait_selector_specs(args.ncol, label="-n/--ncol")
     except ValueError as e:
         parser.error(str(e))
+
+    if args.bimrange is not None:
+        try:
+            parsed_bimranges = parse_cli_ranges(
+                args.bimrange,
+                allow_chrom_only=True,
+                implicit_unit="bp",
+            )
+        except ValueError as e:
+            parser.error(str(e))
+        args.bimrange = [format_normalized_range(item) for item in parsed_bimranges]
 
     detected_threads = detect_effective_threads()
     requested_threads = int(args.thread)

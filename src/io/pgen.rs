@@ -2560,11 +2560,11 @@ pub(crate) fn open_text_reader(path: &Path) -> Result<Box<dyn BufRead + Send>, S
         .to_ascii_lowercase()
         .ends_with(".zst")
     {
-        let decoder = zstd::stream::read::Decoder::new(BufReader::with_capacity(4 << 20, file))
+        let decoder = zstd::stream::read::Decoder::new(BufReader::with_capacity(8 << 20, file))
             .map_err(|e| format!("open zstd reader {}: {e}", path.display()))?;
-        Ok(Box::new(BufReader::with_capacity(4 << 20, decoder)))
+        Ok(Box::new(BufReader::with_capacity(8 << 20, decoder)))
     } else {
-        Ok(Box::new(BufReader::with_capacity(4 << 20, file)))
+        Ok(Box::new(BufReader::with_capacity(8 << 20, file)))
     }
 }
 

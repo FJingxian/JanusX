@@ -2901,7 +2901,26 @@ pub(crate) fn decode_rhat_markers_col_major(
     } else {
         None
     };
-    let mut pgen_row = vec![0u8; scan_prepared.bytes_per_snp];
+    let pgen_sampled_rows = if let Some(reader) = pgen_reader.as_mut() {
+        let rhat_source_rows: Vec<usize> = rhat_rows
+            .iter()
+            .map(|&row_idx| {
+                scan_prepared
+                    .row_source_indices
+                    .as_ref()
+                    .map_or(row_idx, |indices| indices[row_idx])
+            })
+            .collect();
+        let total_bytes = rhat_source_rows
+            .len()
+            .checked_mul(scan_prepared.bytes_per_snp)
+            .ok_or_else(|| "SparseLMM PGEN gamma sample buffer overflow".to_string())?;
+        let mut buf = vec![0u8; total_bytes];
+        reader.read_source_rows_sparse(&rhat_source_rows, &mut buf)?;
+        Some(buf)
+    } else {
+        None
+    };
     let mut row_source = if let Some(payload) = scan_prepared.payload.as_ref() {
         Some(PackedRowDecodeSource::Resident {
             packed_flat: payload.as_bytes(),
@@ -2924,18 +2943,11 @@ pub(crate) fn decode_rhat_markers_col_major(
     let mut sampled_markers = vec![0.0_f64; n * n_rhat];
     let mut tmp_snp = vec![0.0_f64; n];
     for (col, &row_idx) in rhat_rows.iter().enumerate() {
-        if let Some(reader) = pgen_reader.as_mut() {
-            let source_row = scan_prepared
-                .row_source_indices
-                .as_ref()
-                .map_or(row_idx, |indices| indices[row_idx]);
-            if reader.read_source_block(source_row, 1, &mut pgen_row)? != 1 {
-                return Err(format!(
-                    "PGEN ended while reading SparseLMM gamma row {source_row}"
-                ));
-            }
+        if let Some(sampled_buf) = pgen_sampled_rows.as_deref() {
+            let row_start = col * scan_prepared.bytes_per_snp;
+            let pgen_row = &sampled_buf[row_start..row_start + scan_prepared.bytes_per_snp];
             decode_packed_row_model_enum_into_f64(
-                &pgen_row,
+                pgen_row,
                 scan_prepared.row_flip[row_idx],
                 scan_prepared.row_maf[row_idx],
                 n,
@@ -7938,6 +7950,7 @@ fn unified_input_from_splmm_prepared(
             )?),
             source_rows: Vec::new(),
             packed_rows: Vec::new(),
+            span_scratch: Vec::new(),
             local_rows: Vec::new(),
             n_samples_full: prepared.n_samples_full,
             bytes_per_snp: prepared.bytes_per_snp,
@@ -7977,6 +7990,7 @@ enum SplmmPreparedMatrixAdapter<'a> {
         reader: Mutex<PackedBedSourceReader>,
         source_rows: Vec<usize>,
         packed_rows: Vec<u8>,
+        span_scratch: Vec<u8>,
         local_rows: Vec<usize>,
         n_samples_full: usize,
         bytes_per_snp: usize,
@@ -8042,6 +8056,7 @@ impl GenotypeMatrix for SplmmPreparedMatrixAdapter<'_> {
             reader,
             source_rows,
             packed_rows,
+            span_scratch,
             local_rows,
             bytes_per_snp,
             ..
@@ -8067,8 +8082,9 @@ impl GenotypeMatrix for SplmmPreparedMatrixAdapter<'_> {
                 "SparseLMM PGEN prepared source rows must be strictly increasing".to_string(),
             );
         }
+        let row_bytes = *bytes_per_snp;
         let packed_len = rows_here
-            .checked_mul(*bytes_per_snp)
+            .checked_mul(row_bytes)
             .ok_or_else(|| "SparseLMM PGEN packed block size overflow".to_string())?;
         packed_rows.resize(packed_len, 0);
         source_rows.clear();
@@ -8078,14 +8094,40 @@ impl GenotypeMatrix for SplmmPreparedMatrixAdapter<'_> {
         let mut source = reader
             .lock()
             .map_err(|_| "SparseLMM PGEN reader lock is poisoned".to_string())?;
-        for (local_idx, &source_idx) in selected_source_rows.iter().enumerate() {
-            let start = local_idx * *bytes_per_snp;
-            let end = start + *bytes_per_snp;
-            if source.read_source_block(source_idx, 1, &mut packed_rows[start..end])? != 1 {
+        let first_src = selected_source_rows[0];
+        let last_src = selected_source_rows[rows_here - 1];
+        let span_rows = last_src - first_src + 1;
+        const MAX_SPAN_SCRATCH_BYTES: usize = 64 * 1024 * 1024;
+        let span_bytes = span_rows.checked_mul(row_bytes);
+        if span_rows == rows_here {
+            if source.read_source_block(first_src, rows_here, &mut packed_rows[..packed_len])?
+                != rows_here
+            {
                 return Err(format!(
-                    "PGEN ended while reading SparseLMM scan row {source_idx}"
+                    "PGEN ended while reading SparseLMM scan rows [{first_src}..{})",
+                    first_src + rows_here
                 ));
             }
+        } else if let Some(sb) = span_bytes.filter(|&sb| {
+            span_rows <= rows_here.saturating_mul(4) && sb <= MAX_SPAN_SCRATCH_BYTES
+        }) {
+            span_scratch.resize(sb, 0);
+            if source.read_source_block(first_src, span_rows, &mut span_scratch[..sb])?
+                != span_rows
+            {
+                return Err(format!(
+                    "PGEN ended while reading SparseLMM scan span [{first_src}..{})",
+                    first_src + span_rows
+                ));
+            }
+            for (local_idx, &source_idx) in selected_source_rows.iter().enumerate() {
+                let src_off = (source_idx - first_src) * row_bytes;
+                let dst_off = local_idx * row_bytes;
+                packed_rows[dst_off..dst_off + row_bytes]
+                    .copy_from_slice(&span_scratch[src_off..src_off + row_bytes]);
+            }
+        } else {
+            source.read_source_rows_sparse(selected_source_rows, &mut packed_rows[..packed_len])?;
         }
         Ok(())
     }

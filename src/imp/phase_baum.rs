@@ -135,12 +135,17 @@ fn parse_beta_cache_budget_mb(raw: &str) -> Result<Option<usize>, ()> {
     }
 }
 
-fn phase_beta_cache_budget_bytes() -> Option<usize> {
-    match std::env::var("JX_IMP_PHASE_BETA_BUDGET_MB") {
-        Ok(value) => parse_beta_cache_budget_mb(&value)
+fn resolve_beta_cache_budget_bytes(raw: Option<&str>) -> Option<usize> {
+    match raw {
+        Some(value) => parse_beta_cache_budget_mb(value)
             .unwrap_or(Some(DEFAULT_PHASE_BETA_CACHE_BUDGET_BYTES)),
-        Err(_) => Some(DEFAULT_PHASE_BETA_CACHE_BUDGET_BYTES),
+        None => Some(DEFAULT_PHASE_BETA_CACHE_BUDGET_BYTES),
     }
+}
+
+fn phase_beta_cache_budget_bytes() -> Option<usize> {
+    let raw = std::env::var("JX_IMP_PHASE_BETA_BUDGET_MB").ok();
+    resolve_beta_cache_budget_bytes(raw.as_deref())
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -8149,6 +8154,15 @@ mod tests {
             super::parse_beta_cache_budget_mb("32"),
             Ok(Some(32 * 1024 * 1024))
         );
+        assert_eq!(
+            super::resolve_beta_cache_budget_bytes(None),
+            Some(super::DEFAULT_PHASE_BETA_CACHE_BUDGET_BYTES)
+        );
+        assert_eq!(
+            super::resolve_beta_cache_budget_bytes(Some("invalid")),
+            Some(super::DEFAULT_PHASE_BETA_CACHE_BUDGET_BYTES)
+        );
+        assert_eq!(super::resolve_beta_cache_budget_bytes(Some("0")), None);
     }
 
     #[test]

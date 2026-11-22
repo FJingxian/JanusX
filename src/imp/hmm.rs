@@ -2205,12 +2205,17 @@ fn parse_stage2_forward_budget_mb(raw: &str) -> Result<Option<usize>, ()> {
     }
 }
 
-fn stage2_forward_budget_bytes() -> Option<usize> {
-    match std::env::var("JX_IMP_STAGE2_FORWARD_BUDGET_MB") {
-        Ok(value) => parse_stage2_forward_budget_mb(&value)
+fn resolve_stage2_forward_budget_bytes(raw: Option<&str>) -> Option<usize> {
+    match raw {
+        Some(value) => parse_stage2_forward_budget_mb(value)
             .unwrap_or(Some(DEFAULT_STAGE2_FORWARD_BUDGET_BYTES)),
-        Err(_) => Some(DEFAULT_STAGE2_FORWARD_BUDGET_BYTES),
+        None => Some(DEFAULT_STAGE2_FORWARD_BUDGET_BYTES),
     }
+}
+
+fn stage2_forward_budget_bytes() -> Option<usize> {
+    let raw = std::env::var("JX_IMP_STAGE2_FORWARD_BUDGET_MB").ok();
+    resolve_stage2_forward_budget_bytes(raw.as_deref())
 }
 
 fn forward_backward_selected_states_pair_impl<F>(
@@ -4960,6 +4965,27 @@ mod tests {
     use crate::imp::types::{
         CompositePanel, HMMConfig, HMMParameterStats, HMMWorkspace, PackedHaplotypes,
     };
+
+    #[test]
+    fn stage2_forward_budget_defaults_and_overrides() {
+        assert_eq!(super::parse_stage2_forward_budget_mb("0"), Ok(None));
+        assert_eq!(super::parse_stage2_forward_budget_mb(" 0 "), Ok(None));
+        assert_eq!(super::parse_stage2_forward_budget_mb(""), Err(()));
+        assert_eq!(super::parse_stage2_forward_budget_mb("invalid"), Err(()));
+        assert_eq!(
+            super::parse_stage2_forward_budget_mb("16"),
+            Ok(Some(16 * 1024 * 1024))
+        );
+        assert_eq!(
+            super::resolve_stage2_forward_budget_bytes(None),
+            Some(super::DEFAULT_STAGE2_FORWARD_BUDGET_BYTES)
+        );
+        assert_eq!(
+            super::resolve_stage2_forward_budget_bytes(Some("invalid")),
+            Some(super::DEFAULT_STAGE2_FORWARD_BUDGET_BYTES)
+        );
+        assert_eq!(super::resolve_stage2_forward_budget_bytes(Some("0")), None);
+    }
 
     #[test]
     fn adaptive_checkpoint_stride_balances_recomputation_and_memory() {

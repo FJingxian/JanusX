@@ -269,6 +269,8 @@ struct BedMarkerDesign {
     row_mean: Vec<f32>,
     row_inv_sd: Vec<f32>,
     block_rows: usize,
+    block_buf: Vec<f32>,
+    relative_rows_buf: Vec<usize>,
     pool: Option<Arc<rayon::ThreadPool>>,
 }
 
@@ -349,6 +351,11 @@ impl BedMarkerDesign {
         }
         let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
         let full_sample_fast = is_identity_indices(sample_idx.as_slice(), n_samples_full);
+        let m_effective = active_source.len();
+        let block_rows = block_rows.max(1);
+        let row_step = block_rows.min(m_effective.max(1));
+        let block_buf = vec![0.0_f32; row_step.saturating_mul(sample_idx.len())];
+        let relative_rows_buf = Vec::with_capacity(row_step);
         let design = Self {
             matrix,
             n_samples_full,
@@ -358,28 +365,26 @@ impl BedMarkerDesign {
             row_flip: active_flip,
             row_mean: active_mean,
             row_inv_sd: active_inv_sd,
-            block_rows: block_rows.max(1),
+            block_rows,
+            block_buf,
+            relative_rows_buf,
             pool,
         };
-        let m_effective = design.row_source_indices.len();
         Ok((design, m_effective))
     }
 
-    fn decode_block(
-        &mut self,
-        row_start: usize,
-        row_end: usize,
-        out: &mut [f32],
-    ) -> Result<(), String> {
+    fn decode_block_into_buf(&mut self, row_start: usize, row_end: usize) -> Result<usize, String> {
         let cur_rows = row_end.saturating_sub(row_start);
+        let n = self.sample_idx.len();
+        let len = cur_rows.saturating_mul(n);
         if cur_rows == 0 {
-            return Ok(());
+            return Ok(0);
         }
         let source_rows = &self.row_source_indices[row_start..row_end];
-        let mut relative_rows = Vec::with_capacity(cur_rows);
+        self.relative_rows_buf.clear();
         let packed = self
             .matrix
-            .prepare_source_rows(source_rows, &mut relative_rows)?;
+            .prepare_source_rows(source_rows, &mut self.relative_rows_buf)?;
         decode_prepared_additive_block_packed_f32(
             packed,
             self.n_samples_full.div_ceil(4),
@@ -390,26 +395,24 @@ impl BedMarkerDesign {
             self.sample_idx.as_slice(),
             self.full_sample_fast,
             None,
-            Some(relative_rows.as_slice()),
+            Some(self.relative_rows_buf.as_slice()),
             0,
             cur_rows,
-            out,
+            &mut self.block_buf[..len],
             self.pool.as_ref(),
-        )
+        )?;
+        Ok(len)
     }
 
     fn for_each_block<F>(&mut self, mut worker: F) -> Result<(), String>
     where
         F: FnMut(usize, usize, &[f32]) -> Result<(), String>,
     {
-        let n = self.sample_idx.len();
         let row_step = self.block_rows.min(self.n_markers().max(1));
-        let mut block = vec![0.0_f32; row_step.saturating_mul(n)];
         for row_start in (0..self.n_markers()).step_by(row_step) {
             let row_end = (row_start + row_step).min(self.n_markers());
-            let cur_rows = row_end - row_start;
-            self.decode_block(row_start, row_end, &mut block[..cur_rows * n])?;
-            worker(row_start, row_end, &block[..cur_rows * n])?;
+            let len = self.decode_block_into_buf(row_start, row_end)?;
+            worker(row_start, row_end, &self.block_buf[..len])?;
         }
         Ok(())
     }
@@ -431,17 +434,25 @@ impl MarkerDesign for BedMarkerDesign {
         out.fill(0.0_f32);
         let pool = self.pool.clone();
         let n_samples = self.n_samples();
+        const SAMPLE_TILE: usize = 256;
         self.for_each_block(|row_start, row_end, block| {
             let rows = row_end - row_start;
             let weights = &marker_beta[row_start..row_end];
             let mut run = || {
-                out.par_iter_mut().enumerate().for_each(|(i, dst)| {
-                    let mut acc = 0.0_f32;
-                    for r in 0..rows {
-                        acc += block[r * n_samples + i] * weights[r];
-                    }
-                    *dst += acc;
-                });
+                out.par_chunks_mut(SAMPLE_TILE)
+                    .enumerate()
+                    .for_each(|(tile_idx, out_chunk)| {
+                        let sample_start = tile_idx * SAMPLE_TILE;
+                        let tile_len = out_chunk.len();
+                        for r in 0..rows {
+                            let w = weights[r];
+                            let src = &block[r * n_samples + sample_start
+                                ..r * n_samples + sample_start + tile_len];
+                            for (dst_val, &x_val) in out_chunk.iter_mut().zip(src.iter()) {
+                                *dst_val += x_val * w;
+                            }
+                        }
+                    });
             };
             if let Some(tp) = pool.as_ref() {
                 tp.install(&mut run);

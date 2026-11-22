@@ -449,14 +449,17 @@ fn pair_indices(n_markers: usize) -> (Vec<usize>, Vec<usize>) {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-pub(super) fn dgemm_row_major(
+#[allow(clippy::too_many_arguments)]
+pub(super) fn dgemm_row_major_scaled(
     trans_left: bool,
     trans_right: bool,
     m: usize,
     n: usize,
     k: usize,
+    alpha: f64,
     left: &[f64],
     right: &[f64],
+    beta: f64,
     out: &mut [f64],
 ) -> Result<(), String> {
     let left_rows = if trans_left { k } else { m };
@@ -497,12 +500,12 @@ pub(super) fn dgemm_row_major(
             m_i,
             n_i,
             k_i,
-            1.0,
+            alpha,
             left.as_ptr(),
             lda,
             right.as_ptr(),
             ldb,
-            0.0,
+            beta,
             out.as_mut_ptr(),
             ldc,
         );
@@ -511,14 +514,17 @@ pub(super) fn dgemm_row_major(
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-pub(super) fn dgemm_row_major(
+#[allow(clippy::too_many_arguments)]
+pub(super) fn dgemm_row_major_scaled(
     trans_left: bool,
     trans_right: bool,
     m: usize,
     n: usize,
     k: usize,
+    alpha: f64,
     left: &[f64],
     right: &[f64],
+    beta: f64,
     out: &mut [f64],
 ) -> Result<(), String> {
     let left_len = checked_matrix_len(
@@ -551,10 +557,29 @@ pub(super) fn dgemm_row_major(
                 };
                 value += a * b;
             }
-            out[row * n + col] = value;
+            let idx = row * n + col;
+            out[idx] = if beta == 0.0 {
+                alpha * value
+            } else {
+                alpha * value + beta * out[idx]
+            };
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn dgemm_row_major(
+    trans_left: bool,
+    trans_right: bool,
+    m: usize,
+    n: usize,
+    k: usize,
+    left: &[f64],
+    right: &[f64],
+    out: &mut [f64],
+) -> Result<(), String> {
+    dgemm_row_major_scaled(trans_left, trans_right, m, n, k, 1.0, left, right, 0.0, out)
 }
 
 fn matvec_row_major(matrix: &[f64], n: usize, vector: &[f64]) -> Vec<f64> {
@@ -772,8 +797,15 @@ pub(crate) fn grm_int_interaction_scores_packed(
         .max(1);
     let budget_batch = (GRM_INT_MAX_BATCH_WORKSPACE_BYTES / bytes_per_candidate).max(1);
     let batch_size = budget_batch.min(GRM_INT_MAX_BATCH_CANDIDATES);
-    let no_grm_projected_diagonal =
-        no_grm_projector.map(NoGrmCovariateProjector::projected_diagonal);
+    let metric_diag = if let Some(matrix) = p_c {
+        (0..n_samples)
+            .map(|sample| matrix[sample * n_samples + sample].abs())
+            .collect::<Vec<_>>()
+    } else {
+        no_grm_projector
+            .expect("validated no-GRM projector")
+            .projected_diagonal()
+    };
 
     let mut batch_start = 0usize;
     while batch_start < candidate_pairs.len() {
@@ -802,139 +834,263 @@ pub(crate) fn grm_int_interaction_scores_packed(
             .collect::<Result<Vec<_>, String>>()?;
         let n_endpoints = endpoint_rows.len();
         let n_pairs = pairs.len();
-        let endpoint_len = checked_matrix_len(n_samples, n_endpoints, "GRM-INT endpoint matrix")?;
-        let interaction_len = checked_matrix_len(n_samples, n_pairs, "GRM-INT interaction matrix")?;
-        let mut x_endpoints = vec![0.0; endpoint_len];
-        let mut endpoint_means = vec![0.0; n_endpoints];
-        for (local_endpoint, &global_endpoint) in endpoint_rows.iter().enumerate() {
-            let row_offset = global_endpoint * row_words;
-            let mut sum = 0.0;
-            for sample in 0..n_samples {
-                let value = ((bits[row_offset + sample / 64] >> (sample % 64)) & 1) as f64;
-                x_endpoints[sample * n_endpoints + local_endpoint] = value;
-                sum += value;
-            }
-            endpoint_means[local_endpoint] = sum / n_samples as f64;
-        }
-        let mut h = vec![0.0; interaction_len];
-        for (pair_column, &(left, right)) in local_pairs.iter().enumerate() {
-            let mean_left = endpoint_means[left];
-            let mean_right = endpoint_means[right];
-            for sample in 0..n_samples {
-                h[sample * n_pairs + pair_column] = (x_endpoints[sample * n_endpoints + left]
-                    - mean_left)
-                    * (x_endpoints[sample * n_endpoints + right] - mean_right);
-            }
-        }
-        let mut z_endpoints = vec![0.0; endpoint_len];
-        let mut z_h = vec![0.0; interaction_len];
-        if let Some(matrix) = p_c {
-            dgemm_row_major(
-                false,
-                false,
-                n_samples,
-                n_endpoints,
-                n_samples,
-                matrix,
-                &x_endpoints,
-                &mut z_endpoints,
-            )?;
-            dgemm_row_major(
-                false, false, n_samples, n_pairs, n_samples, matrix, &h, &mut z_h,
-            )?;
-        } else {
-            let projector = no_grm_projector.expect("validated no-GRM projector");
-            projector.project_row_major_columns_into(
-                x_endpoints.as_slice(),
-                n_endpoints,
-                z_endpoints.as_mut_slice(),
-            )?;
-            projector.project_row_major_columns_into(h.as_slice(), n_pairs, z_h.as_mut_slice())?;
-        }
-        let workspace_bytes = endpoint_len
-            .saturating_add(interaction_len)
-            .saturating_add(endpoint_len)
-            .saturating_add(interaction_len)
+        let n_cols = n_endpoints
+            .checked_add(n_pairs)
+            .ok_or_else(|| "GRM-INT combined column count overflow".to_string())?;
+        let total_len = checked_matrix_len(n_samples, n_cols, "GRM-INT design block")?;
+        let workspace_bytes = total_len
+            .saturating_mul(2)
             .saturating_mul(std::mem::size_of::<f64>());
         result.diagnostics.max_workspace_bytes =
             result.diagnostics.max_workspace_bytes.max(workspace_bytes);
         result.diagnostics.batches = result.diagnostics.batches.saturating_add(1);
 
-        for (pair_column, &(left, right)) in local_pairs.iter().enumerate() {
-            let mut a00 = 0.0;
-            let mut a11 = 0.0;
-            let mut a01_lr = 0.0;
-            let mut a01_rl = 0.0;
-            let mut b0 = 0.0;
-            let mut b1 = 0.0;
-            let mut t0 = 0.0;
-            let mut t1 = 0.0;
-            let mut q = 0.0;
-            let mut c = 0.0;
-            let mut interaction_reference = 0.0;
-            for sample in 0..n_samples {
-                let x0 = x_endpoints[sample * n_endpoints + left];
-                let x1 = x_endpoints[sample * n_endpoints + right];
-                let z0 = z_endpoints[sample * n_endpoints + left];
-                let z1 = z_endpoints[sample * n_endpoints + right];
-                let interaction = h[sample * n_pairs + pair_column];
-                let p_interaction = z_h[sample * n_pairs + pair_column];
-                a00 += x0 * z0;
-                a11 += x1 * z1;
-                a01_lr += x0 * z1;
-                a01_rl += x1 * z0;
-                b0 += x0 * projected_y[sample];
-                b1 += x1 * projected_y[sample];
-                t0 += x0 * p_interaction;
-                t1 += x1 * p_interaction;
-                q += interaction * p_interaction;
-                c += interaction * projected_y[sample];
-                let metric_diagonal = if let Some(matrix) = p_c {
-                    matrix[sample * n_samples + sample].abs()
-                } else {
-                    no_grm_projected_diagonal
-                        .as_ref()
-                        .expect("validated no-GRM projector")[sample]
-                };
-                interaction_reference += interaction * interaction * metric_diagonal;
+        if let Some(matrix) = p_c {
+            // Store design_t in contiguous (n_cols, n_samples) row-major layout.
+            // Because P_C is symmetric, (P_C * D)^T = D^T * P_C, so every
+            // unpacking, interaction construction, and dot product runs at unit
+            // stride for SIMD vectorization.
+            let mut design_t = vec![0.0; total_len];
+            let mut endpoint_means = vec![0.0; n_endpoints];
+            {
+                let (x_part, h_part) = design_t.split_at_mut(n_endpoints * n_samples);
+                for (local_endpoint, &global_endpoint) in endpoint_rows.iter().enumerate() {
+                    let row_offset = global_endpoint * row_words;
+                    let dst =
+                        &mut x_part[local_endpoint * n_samples..(local_endpoint + 1) * n_samples];
+                    let mut sum = 0.0;
+                    for sample in 0..n_samples {
+                        let value = ((bits[row_offset + sample / 64] >> (sample % 64)) & 1) as f64;
+                        dst[sample] = value;
+                        sum += value;
+                    }
+                    endpoint_means[local_endpoint] = sum / n_samples as f64;
+                }
+                for (pair_column, &(left, right)) in local_pairs.iter().enumerate() {
+                    let x0 = &x_part[left * n_samples..(left + 1) * n_samples];
+                    let x1 = &x_part[right * n_samples..(right + 1) * n_samples];
+                    let m0 = endpoint_means[left];
+                    let m1 = endpoint_means[right];
+                    let dst = &mut h_part[pair_column * n_samples..(pair_column + 1) * n_samples];
+                    for sample in 0..n_samples {
+                        dst[sample] = (x0[sample] - m0) * (x1[sample] - m1);
+                    }
+                }
             }
-            let a01 = 0.5 * (a01_lr + a01_rl);
-            let score = grm_int_fwl_score_from_geometry(
-                a00,
-                a11,
-                a01,
-                b0,
-                b1,
-                t0,
-                t1,
-                q,
-                c,
-                interaction_reference,
-                score_scale,
-            );
-            let output_index = batch_start + pair_column;
-            match score {
-                Ok(chisq) => result.chisq[output_index] = chisq,
-                Err(GrmIntInvalidScore::SingularEndpointDesign) => {
-                    result.invalid[output_index] = Some(GrmIntInvalidScore::SingularEndpointDesign);
-                    result.diagnostics.singular_endpoint_design = result
-                        .diagnostics
-                        .singular_endpoint_design
-                        .saturating_add(1);
+            let mut z_t = vec![0.0; total_len];
+            dgemm_row_major(
+                false,
+                false,
+                n_cols,
+                n_samples,
+                n_samples,
+                &design_t,
+                matrix,
+                &mut z_t,
+            )?;
+
+            let mut endpoint_a_diag = vec![0.0; n_endpoints];
+            let mut endpoint_b = vec![0.0; n_endpoints];
+            for e in 0..n_endpoints {
+                let xe = &design_t[e * n_samples..(e + 1) * n_samples];
+                let ze = &z_t[e * n_samples..(e + 1) * n_samples];
+                let mut a_val = 0.0;
+                let mut b_val = 0.0;
+                for sample in 0..n_samples {
+                    let x_s = xe[sample];
+                    a_val += x_s * ze[sample];
+                    b_val += x_s * projected_y[sample];
                 }
-                Err(GrmIntInvalidScore::NegligibleInteractionInformation) => {
-                    result.invalid[output_index] =
-                        Some(GrmIntInvalidScore::NegligibleInteractionInformation);
-                    result
-                        .diagnostics
-                        .negligible_residual_interaction_information = result
-                        .diagnostics
-                        .negligible_residual_interaction_information
-                        .saturating_add(1);
+                endpoint_a_diag[e] = a_val;
+                endpoint_b[e] = b_val;
+            }
+
+            for (pair_column, &(left, right)) in local_pairs.iter().enumerate() {
+                let a00 = endpoint_a_diag[left];
+                let a11 = endpoint_a_diag[right];
+                let b0 = endpoint_b[left];
+                let b1 = endpoint_b[right];
+                let h_col = n_endpoints + pair_column;
+                let x0 = &design_t[left * n_samples..(left + 1) * n_samples];
+                let x1 = &design_t[right * n_samples..(right + 1) * n_samples];
+                let z0 = &z_t[left * n_samples..(left + 1) * n_samples];
+                let z1 = &z_t[right * n_samples..(right + 1) * n_samples];
+                let h = &design_t[h_col * n_samples..(h_col + 1) * n_samples];
+                let ph = &z_t[h_col * n_samples..(h_col + 1) * n_samples];
+                let mut a01_lr = 0.0;
+                let mut a01_rl = 0.0;
+                let mut t0 = 0.0;
+                let mut t1 = 0.0;
+                let mut q = 0.0;
+                let mut c = 0.0;
+                let mut interaction_reference = 0.0;
+                for sample in 0..n_samples {
+                    let x0_s = x0[sample];
+                    let x1_s = x1[sample];
+                    let h_s = h[sample];
+                    let ph_s = ph[sample];
+                    a01_lr += x0_s * z1[sample];
+                    a01_rl += x1_s * z0[sample];
+                    t0 += x0_s * ph_s;
+                    t1 += x1_s * ph_s;
+                    q += h_s * ph_s;
+                    c += h_s * projected_y[sample];
+                    interaction_reference += h_s * h_s * metric_diag[sample];
                 }
-                Err(GrmIntInvalidScore::Nonfinite) => {
-                    result.invalid[output_index] = Some(GrmIntInvalidScore::Nonfinite);
-                    result.diagnostics.nonfinite = result.diagnostics.nonfinite.saturating_add(1);
+                let a01 = 0.5 * (a01_lr + a01_rl);
+                let score = grm_int_fwl_score_from_geometry(
+                    a00,
+                    a11,
+                    a01,
+                    b0,
+                    b1,
+                    t0,
+                    t1,
+                    q,
+                    c,
+                    interaction_reference,
+                    score_scale,
+                );
+                let output_index = batch_start + pair_column;
+                match score {
+                    Ok(chisq) => result.chisq[output_index] = chisq,
+                    Err(GrmIntInvalidScore::SingularEndpointDesign) => {
+                        result.invalid[output_index] =
+                            Some(GrmIntInvalidScore::SingularEndpointDesign);
+                        result.diagnostics.singular_endpoint_design = result
+                            .diagnostics
+                            .singular_endpoint_design
+                            .saturating_add(1);
+                    }
+                    Err(GrmIntInvalidScore::NegligibleInteractionInformation) => {
+                        result.invalid[output_index] =
+                            Some(GrmIntInvalidScore::NegligibleInteractionInformation);
+                        result
+                            .diagnostics
+                            .negligible_residual_interaction_information = result
+                            .diagnostics
+                            .negligible_residual_interaction_information
+                            .saturating_add(1);
+                    }
+                    Err(GrmIntInvalidScore::Nonfinite) => {
+                        result.invalid[output_index] = Some(GrmIntInvalidScore::Nonfinite);
+                        result.diagnostics.nonfinite =
+                            result.diagnostics.nonfinite.saturating_add(1);
+                    }
+                }
+            }
+        } else {
+            let mut design_block = vec![0.0; total_len];
+            let mut endpoint_means = vec![0.0; n_endpoints];
+            for (local_endpoint, &global_endpoint) in endpoint_rows.iter().enumerate() {
+                let row_offset = global_endpoint * row_words;
+                let mut sum = 0.0;
+                for sample in 0..n_samples {
+                    let value = ((bits[row_offset + sample / 64] >> (sample % 64)) & 1) as f64;
+                    design_block[sample * n_cols + local_endpoint] = value;
+                    sum += value;
+                }
+                endpoint_means[local_endpoint] = sum / n_samples as f64;
+            }
+            for sample in 0..n_samples {
+                let row = &mut design_block[sample * n_cols..(sample + 1) * n_cols];
+                let (x_row, h_row) = row.split_at_mut(n_endpoints);
+                for (pair_column, &(left, right)) in local_pairs.iter().enumerate() {
+                    h_row[pair_column] = (x_row[left] - endpoint_means[left])
+                        * (x_row[right] - endpoint_means[right]);
+                }
+            }
+            let mut z_block = vec![0.0; total_len];
+            let projector = no_grm_projector.expect("validated no-GRM projector");
+            projector.project_row_major_columns_into(
+                design_block.as_slice(),
+                n_cols,
+                z_block.as_mut_slice(),
+            )?;
+
+            let mut endpoint_a_diag = vec![0.0; n_endpoints];
+            let mut endpoint_b = vec![0.0; n_endpoints];
+            for sample in 0..n_samples {
+                let base = sample * n_cols;
+                let py_s = projected_y[sample];
+                let x_row = &design_block[base..base + n_endpoints];
+                let z_row = &z_block[base..base + n_endpoints];
+                for e in 0..n_endpoints {
+                    let xe = x_row[e];
+                    endpoint_a_diag[e] += xe * z_row[e];
+                    endpoint_b[e] += xe * py_s;
+                }
+            }
+
+            for (pair_column, &(left, right)) in local_pairs.iter().enumerate() {
+                let a00 = endpoint_a_diag[left];
+                let a11 = endpoint_a_diag[right];
+                let b0 = endpoint_b[left];
+                let b1 = endpoint_b[right];
+                let mut a01_lr = 0.0;
+                let mut a01_rl = 0.0;
+                let mut t0 = 0.0;
+                let mut t1 = 0.0;
+                let mut q = 0.0;
+                let mut c = 0.0;
+                let mut interaction_reference = 0.0;
+                let h_col = n_endpoints + pair_column;
+                for sample in 0..n_samples {
+                    let base = sample * n_cols;
+                    let x0 = design_block[base + left];
+                    let x1 = design_block[base + right];
+                    let z0 = z_block[base + left];
+                    let z1 = z_block[base + right];
+                    let interaction = design_block[base + h_col];
+                    let p_interaction = z_block[base + h_col];
+                    a01_lr += x0 * z1;
+                    a01_rl += x1 * z0;
+                    t0 += x0 * p_interaction;
+                    t1 += x1 * p_interaction;
+                    q += interaction * p_interaction;
+                    c += interaction * projected_y[sample];
+                    interaction_reference += interaction * interaction * metric_diag[sample];
+                }
+                let a01 = 0.5 * (a01_lr + a01_rl);
+                let score = grm_int_fwl_score_from_geometry(
+                    a00,
+                    a11,
+                    a01,
+                    b0,
+                    b1,
+                    t0,
+                    t1,
+                    q,
+                    c,
+                    interaction_reference,
+                    score_scale,
+                );
+                let output_index = batch_start + pair_column;
+                match score {
+                    Ok(chisq) => result.chisq[output_index] = chisq,
+                    Err(GrmIntInvalidScore::SingularEndpointDesign) => {
+                        result.invalid[output_index] =
+                            Some(GrmIntInvalidScore::SingularEndpointDesign);
+                        result.diagnostics.singular_endpoint_design = result
+                            .diagnostics
+                            .singular_endpoint_design
+                            .saturating_add(1);
+                    }
+                    Err(GrmIntInvalidScore::NegligibleInteractionInformation) => {
+                        result.invalid[output_index] =
+                            Some(GrmIntInvalidScore::NegligibleInteractionInformation);
+                        result
+                            .diagnostics
+                            .negligible_residual_interaction_information = result
+                            .diagnostics
+                            .negligible_residual_interaction_information
+                            .saturating_add(1);
+                    }
+                    Err(GrmIntInvalidScore::Nonfinite) => {
+                        result.invalid[output_index] = Some(GrmIntInvalidScore::Nonfinite);
+                        result.diagnostics.nonfinite =
+                            result.diagnostics.nonfinite.saturating_add(1);
+                    }
                 }
             }
         }

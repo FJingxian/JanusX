@@ -199,8 +199,8 @@ impl NoGrmCovariateProjector {
         Ok(projected)
     }
 
-    /// Project all columns of a row-major matrix without allocating a
-    /// temporary input and output vector for each column.
+    /// Project all columns of a row-major matrix in two contiguous row-major
+    /// streaming passes (`M - Q (Q' M)`), avoiding strided per-column traversal.
     pub(crate) fn project_row_major_columns_into(
         &self,
         values: &[f64],
@@ -222,21 +222,47 @@ impl NoGrmCovariateProjector {
             return Ok(());
         }
 
-        let mut coordinates = vec![0.0; self.rank];
-        for column in 0..n_columns {
-            self.project_strided_into(
-                &values[column..],
-                n_columns,
-                &mut projected[column..],
-                n_columns,
-                &mut coordinates,
-            )?;
+        let coords_len = self
+            .rank
+            .checked_mul(n_columns)
+            .ok_or_else(|| "no-GRM projector coordinate workspace overflow".to_string())?;
+        let mut coords = vec![0.0_f64; coords_len];
+        for row in 0..self.n_samples {
+            let q_row = &self.q[row * self.rank..(row + 1) * self.rank];
+            let v_row = &values[row * n_columns..(row + 1) * n_columns];
+            if v_row.iter().any(|v| !v.is_finite()) {
+                return Err("no-GRM projector input contains a non-finite value".to_string());
+            }
+            for r in 0..self.rank {
+                let qr = q_row[r];
+                let c_row = &mut coords[r * n_columns..(r + 1) * n_columns];
+                for col in 0..n_columns {
+                    c_row[col] += qr * v_row[col];
+                }
+            }
+        }
+        for row in 0..self.n_samples {
+            let q_row = &self.q[row * self.rank..(row + 1) * self.rank];
+            let v_row = &values[row * n_columns..(row + 1) * n_columns];
+            let out_row = &mut projected[row * n_columns..(row + 1) * n_columns];
+            out_row.copy_from_slice(v_row);
+            for r in 0..self.rank {
+                let qr = q_row[r];
+                let c_row = &coords[r * n_columns..(r + 1) * n_columns];
+                for col in 0..n_columns {
+                    out_row[col] -= qr * c_row[col];
+                }
+            }
+            if out_row.iter().any(|v| !v.is_finite()) {
+                return Err("no-GRM projector produced a non-finite value".to_string());
+            }
         }
         Ok(())
     }
 
     /// Project a strided vector into a strided output column without making
     /// per-column input, coordinate, and result allocations.
+    #[allow(dead_code)]
     pub(crate) fn project_strided_into(
         &self,
         values: &[f64],
@@ -687,30 +713,16 @@ fn rotate_design_and_response(
     p: usize,
     threads: usize,
 ) -> Result<(Vec<f64>, Vec<f64>), String> {
-    let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
     let dim = p + 1;
-    let mut utxy = vec![0.0_f64; n * dim];
-    let mut run = || {
-        utxy.par_chunks_mut(dim).enumerate().for_each(|(k, row)| {
-            for c in 0..p {
-                let mut acc = 0.0_f64;
-                for i in 0..n {
-                    acc += u[i * n + k] * x[i * p + c];
-                }
-                row[c] = acc;
-            }
-            let mut accy = 0.0_f64;
-            for i in 0..n {
-                accy += u[i * n + k] * y[i];
-            }
-            row[p] = accy;
-        });
-    };
-    if let Some(p0) = &pool {
-        p0.install(run);
-    } else {
-        run();
+    let mut xy = vec![0.0_f64; n * dim];
+    for i in 0..n {
+        let dst = &mut xy[i * dim..(i + 1) * dim];
+        dst[..p].copy_from_slice(&x[i * p..(i + 1) * p]);
+        dst[p] = y[i];
     }
+    let mut utxy = vec![0.0_f64; n * dim];
+    let _blas_guard = crate::blas::BlasThreadGuard::enter(threads);
+    super::grm_max6::dgemm_row_major(true, false, n, dim, n, u, &xy, &mut utxy)?;
 
     let mut x_rot = vec![0.0_f64; n * p];
     let mut y_rot = vec![0.0_f64; n];
@@ -1716,47 +1728,59 @@ pub(crate) fn build_exact_projection_from_eigensystem_rust(
         .ok_or_else(|| "fixed-effect metric is singular/indefinite while building P_C".to_string())?
         .inverse;
 
-    // A = U D X_rot = V^-1 X.  Keeping A explicit makes the final symmetric
-    // rank-p correction simple and avoids a second sample-space projection.
-    let mut a = vec![0.0; n * p];
-    for row in 0..n {
+    // A = U D X_rot = V^-1 X, computed via BLAS GEMM instead of a scalar loop.
+    crate::blas::ensure_garfield_blas_backend()?;
+    let mut dx_rot = vec![0.0; n * p];
+    for k in 0..n {
+        let dk = d[k];
         for column in 0..p {
-            let mut value = 0.0;
-            for k in 0..n {
-                value += u_vec[row * n + k] * d[k] * x_rot[k * p + column];
-            }
-            a[row * p + column] = value;
+            dx_rot[k * p + column] = dk * x_rot[k * p + column];
         }
     }
+    let _blas_guard = crate::blas::BlasThreadGuard::enter(threads);
+    let mut a = vec![0.0; n * p];
+    super::grm_max6::dgemm_row_major(false, false, n, p, n, u_vec, &dx_rot, &mut a)?;
+    drop(dx_rot);
 
     // U D U' is a dense matrix product, not n^2 independent scalar dots.
-    // Use the same GARFIELD BLAS dispatcher as the exact candidate kernel.
-    // Weight U by D (rather than sqrt(D)) to preserve the reference product
-    // definition; only BLAS reduction order changes. Keep explicit symmetry
-    // and the existing fixed-effect correction below.
-    crate::blas::ensure_garfield_blas_backend()?;
+    // Weight U by D in parallel and subtract the rank-p fixed-effect term
+    // A (X'DX)^-1 A' in-place via BLAS GEMM.
+    let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
     let mut weighted_u = u_vec.to_vec();
-    for row in weighted_u.chunks_exact_mut(n) {
-        for (value, &weight) in row.iter_mut().zip(d.iter()) {
-            *value *= weight;
-        }
+    let mut scale_u = || {
+        weighted_u.par_chunks_exact_mut(n).for_each(|row| {
+            for (value, &weight) in row.iter_mut().zip(d.iter()) {
+                *value *= weight;
+            }
+        });
+    };
+    if let Some(p0) = &pool {
+        p0.install(scale_u);
+    } else {
+        scale_u();
     }
     let mut p_c = vec![0.0; n * n];
-    super::grm_max6::dgemm_row_major(false, true, n, n, n, &weighted_u, &u_vec, &mut p_c)?;
+    super::grm_max6::dgemm_row_major(false, true, n, n, n, &weighted_u, u_vec, &mut p_c)?;
     drop(weighted_u);
+
+    let mut b = vec![0.0; n * p];
     for row in 0..n {
-        for col in 0..=row {
-            let p0 = p_c[row * n + col];
-            let mut correction = 0.0;
-            for left in 0..p {
-                let a_left = a[row * p + left];
-                for right in 0..p {
-                    correction += a_left * xtdx_inv[left * p + right] * a[col * p + right];
-                }
+        let a_row = &a[row * p..(row + 1) * p];
+        let b_row = &mut b[row * p..(row + 1) * p];
+        for col in 0..p {
+            let mut acc = 0.0;
+            for k in 0..p {
+                acc += a_row[k] * xtdx_inv[k * p + col];
             }
-            let value = p0 - correction;
-            p_c[row * n + col] = value;
-            p_c[col * n + row] = value;
+            b_row[col] = acc;
+        }
+    }
+    super::grm_max6::dgemm_row_major_scaled(false, true, n, n, p, -1.0, &a, &b, 1.0, &mut p_c)?;
+    for row in 0..n {
+        for col in 0..row {
+            let avg = 0.5 * (p_c[row * n + col] + p_c[col * n + row]);
+            p_c[row * n + col] = avg;
+            p_c[col * n + row] = avg;
         }
     }
     if p_c.iter().any(|value| !value.is_finite()) {

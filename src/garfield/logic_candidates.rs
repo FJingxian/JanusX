@@ -481,7 +481,54 @@ pub(super) fn select_max6_identical_tag_rows(
     candidates.dedup();
     let full_identity = sample_indices_are_full_identity(samples, logic_bits.n_samples);
     let words = words_for_samples(samples.len());
-    let mut representatives = HashMap::<Vec<u64>, usize>::new();
+    let mask = tail_mask(samples.len());
+    let tail_clean = full_identity
+        && (mask.is_none()
+            || candidates.iter().all(|&row_index| {
+                row_index < logic_bits.sites.len()
+                    && (logic_bits.bits()[row_index * logic_bits.row_words + words - 1]
+                        & !mask.unwrap())
+                        == 0
+            }));
+    if tail_clean {
+        let bits = logic_bits.bits();
+        let row_words = logic_bits.row_words;
+        let mut representatives = HashMap::<&[u64], usize>::with_capacity(candidates.len());
+        let mut selected_global_rows = Vec::with_capacity(candidates.len());
+        let mut compressed = Vec::new();
+        let interrupt_interval = garfield_ld_interrupt_check_interval();
+        for (offset, row_index) in candidates.into_iter().enumerate() {
+            check_garfield_ld_interrupt(offset, interrupt_interval)?;
+            if row_index >= logic_bits.sites.len() {
+                return Err(format!("Max6 tag row {row_index} is out of range"));
+            }
+            let encoded = &bits[row_index * row_words..row_index * row_words + words];
+            let support = encoded
+                .iter()
+                .map(|w| w.count_ones() as usize)
+                .sum::<usize>();
+            if support == 0 || support == samples.len() {
+                continue;
+            }
+            if let Some(&kept) = representatives.get(encoded) {
+                if record_compression {
+                    compressed.push(GarfieldLdCompressionRecord {
+                        kept_global_row: kept,
+                        dropped_global_row: row_index,
+                        r2: 1.0,
+                    });
+                }
+            } else {
+                representatives.insert(encoded, row_index);
+                selected_global_rows.push(row_index);
+            }
+        }
+        return Ok(GarfieldLdSelection {
+            selected_global_rows,
+            compressed,
+        });
+    }
+    let mut representatives = HashMap::<Vec<u64>, usize>::with_capacity(candidates.len());
     let mut selected_global_rows = Vec::new();
     let mut compressed = Vec::new();
     let interrupt_interval = garfield_ld_interrupt_check_interval();

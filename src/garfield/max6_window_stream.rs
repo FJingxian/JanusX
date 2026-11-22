@@ -1657,6 +1657,48 @@ pub(super) fn run_max6_fused_grm_int_scan(
             observed_scan_timing.screen_memberships_sum = observed_scan_timing
                 .screen_memberships_sum
                 .saturating_add(batch_timing.memberships);
+            observed_scan_timing
+                .screen_batch_profiles
+                .push(Max6BatchScanProfile {
+                    scan_merge_wall_seconds: batch_timing.scan_merge_wall_seconds,
+                    fold_task_count: batch_timing.fold_task_count,
+                    fold_task_wall_sum_seconds: batch_timing.fold_task_wall_sum_seconds,
+                    fold_task_wall_max_seconds: batch_timing.fold_task_wall_max_seconds,
+                    fold_anchor_count_min: batch_timing.fold_anchor_count_min,
+                    fold_anchor_count_max: batch_timing.fold_anchor_count_max,
+                    fold_active_workers: batch_timing.fold_active_workers,
+                    worker_task_wall_min_seconds: batch_timing.worker_task_wall_min_seconds,
+                    worker_task_wall_median_seconds: batch_timing.worker_task_wall_median_seconds,
+                    worker_task_wall_max_seconds: batch_timing.worker_task_wall_max_seconds,
+                    worker_finish_skew_seconds: batch_timing.worker_finish_skew_seconds,
+                    post_last_fold_tail_seconds: batch_timing.post_last_fold_tail_seconds,
+                    topk_merge_task_seconds: batch_timing.topk_merge_task_seconds,
+                    topk_merge_max_task_seconds: batch_timing.topk_merge_max_task_seconds,
+                    topk_merge_task_count: batch_timing.topk_merge_task_count,
+                    topk_merge_critical_path_seconds: batch_timing.topk_merge_critical_path_seconds,
+                    scan_reduce_critical_path_seconds: batch_timing
+                        .scan_reduce_critical_path_seconds,
+                    pair_profile_sampled_anchors: batch_timing.pair_scan_profile.sampled_anchors,
+                    pair_profile_sampled_pairs: batch_timing.pair_scan_profile.sampled_pairs,
+                    pair_profile_sampled_scored_pairs: batch_timing
+                        .pair_scan_profile
+                        .sampled_scored_pairs,
+                    pair_profile_sampled_score_offers: batch_timing
+                        .pair_scan_profile
+                        .sampled_score_offers,
+                    pair_profile_cursor_merge_seconds: batch_timing
+                        .pair_scan_profile
+                        .cursor_merge_seconds,
+                    pair_profile_min_cell_gate_seconds: batch_timing
+                        .pair_scan_profile
+                        .min_cell_gate_seconds,
+                    pair_profile_sufficient_stats_seconds: batch_timing
+                        .pair_scan_profile
+                        .sufficient_stats_seconds,
+                    pair_profile_topk_offer_seconds: batch_timing
+                        .pair_scan_profile
+                        .topk_offer_seconds,
+                });
             if batch_screen.used_direct_fallback {
                 observed_scan_timing.screen_batch_direct_fallbacks = observed_scan_timing
                     .screen_batch_direct_fallbacks
@@ -1811,17 +1853,9 @@ pub(super) fn run_max6_fused_grm_int_scan(
             observed_scan_timing.grm_int_batch_wall_seconds +=
                 grm_int_started.elapsed().as_secs_f64();
 
+            let result_drain_started = Instant::now();
             for (batch_index, &selection_index) in scan_unit_indices.iter().enumerate() {
                 let selection = &selections[selection_index];
-                let selected = selection.prepared_local.selected_global_rows.as_slice();
-                let margins = OneCellMarginTable::build_for_rows(
-                    selection.bits.bits(),
-                    selection.bits.row_words,
-                    selected,
-                    train_fit.residualized_y.as_slice(),
-                    n_samples,
-                    &shared_y_lookup,
-                )?;
                 let precomputed = Max6PrecomputedScreen {
                     screen: batch_screen.units[batch_index].clone(),
                     kernel_seconds: screen_kernel_seconds / scan_unit_indices.len().max(1) as f64,
@@ -1845,7 +1879,7 @@ pub(super) fn run_max6_fused_grm_int_scan(
                     test_idx_local,
                     train_fit.residualized_y.as_slice(),
                     &shared_y_lookup,
-                    &margins,
+                    None,
                     p_c,
                     no_grm_projector,
                     projected_y.as_slice(),
@@ -1869,6 +1903,8 @@ pub(super) fn run_max6_fused_grm_int_scan(
                 )?;
                 scans[selection_index] = Some(unit_result);
             }
+            observed_scan_timing.scan_result_drain_wall_seconds +=
+                result_drain_started.elapsed().as_secs_f64();
         }
         let scans = scans
             .into_iter()
@@ -1878,6 +1914,7 @@ pub(super) fn run_max6_fused_grm_int_scan(
             return Err("fused Max6 window batch result count mismatch".to_string());
         }
         let _batch_elapsed = batch_scan_started.elapsed().as_secs_f64();
+        let format_drain_started = Instant::now();
         let mut pair_text = String::with_capacity(1024 * 1024);
         let mut provenance_text = String::with_capacity(256 * 1024);
         for (selection, unit_result) in selections.iter().zip(scans.into_iter()) {
@@ -2020,6 +2057,8 @@ pub(super) fn run_max6_fused_grm_int_scan(
                 writer.send_text(&mut provenance_text)?;
             }
         }
+        observed_scan_timing.scan_result_drain_wall_seconds +=
+            format_drain_started.elapsed().as_secs_f64();
         Ok(())
     };
 

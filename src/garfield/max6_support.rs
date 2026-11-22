@@ -534,7 +534,7 @@ pub(super) fn scan_max6_grmmax6_unit(
     test_idx_local: &[usize],
     residualized_y: &[f64],
     stage1_y_lookup: &PackedYSumLookup,
-    one_cell_margin_table: &OneCellMarginTable,
+    one_cell_margin_table: Option<&OneCellMarginTable>,
     p_c: Option<&[f64]>,
     no_grm_projector: Option<&NoGrmCovariateProjector>,
     projected_y: &[f64],
@@ -630,14 +630,35 @@ pub(super) fn scan_max6_grmmax6_unit(
     let screen_top_k = max6_grmmax6_screen_top_k(grm_int_only, final_top_k);
     let effective_screen_score_threshold =
         max6_grmmax6_screen_threshold(grm_int_only, screen_score_threshold);
-    let packed = gather_rows_by_indices(
-        logic_bits.bits(),
-        logic_bits.row_words,
-        selected.as_slice(),
-        "max6_grmmax6 selected rows",
-    )?;
-    let selected_margins = one_cell_margin_table.select(selected.as_slice())?;
-    let selected_margins_for_profile = screen_profile_pairs.map(|_| selected_margins.clone());
+    let has_precomputed_screen = precomputed_screen.is_some();
+    let has_precomputed_grm_int = precomputed_screen
+        .as_ref()
+        .is_some_and(|precomputed| precomputed.shared_grm_int.is_some());
+    let needs_packed = !has_precomputed_screen
+        || screen_profile_pairs.is_some()
+        || (grm_int_only && !has_precomputed_grm_int)
+        || (!grm_int_only && !defer_exact_rerank);
+    let needs_margins = !has_precomputed_screen || screen_profile_pairs.is_some();
+    let packed = if needs_packed {
+        gather_rows_by_indices(
+            logic_bits.bits(),
+            logic_bits.row_words,
+            selected.as_slice(),
+            "max6_grmmax6 selected rows",
+        )?
+    } else {
+        Vec::new()
+    };
+    let selected_margins = if needs_margins {
+        let margin_table = one_cell_margin_table.ok_or_else(|| {
+            "one-cell margin table is required when screen or profiling runs locally".to_string()
+        })?;
+        Some(margin_table.select(selected.as_slice())?)
+    } else {
+        None
+    };
+    let selected_margins_for_profile = screen_profile_pairs
+        .and_then(|_| selected_margins.clone());
     let screen_input_prepare_seconds = screen_input_prepare_started.elapsed().as_secs_f64();
     let (screen, screen_kernel_seconds, precomputed_grm_int) = if let Some(precomputed) =
         precomputed_screen
@@ -674,7 +695,7 @@ pub(super) fn scan_max6_grmmax6_unit(
             ResidualProposalMode::Max6,
             ResidualScreenKernel::OneCell,
             stage1_y_lookup,
-            Some(selected_margins),
+            selected_margins,
             pair_groups.as_deref(),
             min_cell,
             effective_screen_score_threshold,
@@ -694,7 +715,7 @@ pub(super) fn scan_max6_grmmax6_unit(
             ResidualProposalMode::Max6,
             ResidualScreenKernel::OneCell,
             stage1_y_lookup,
-            Some(selected_margins),
+            selected_margins,
             pair_groups.as_deref(),
             min_cell,
             effective_screen_score_threshold,
@@ -878,14 +899,10 @@ pub(super) fn scan_max6_grmmax6_unit(
             grm_int.chisq.as_slice(),
         )?;
         let screen_local_pairs = candidate_pairs;
-        let output_order = grm_int_chisq_order(
-            grm_int.chisq.as_slice(),
-            &(0..screen_candidate_count).collect::<Vec<_>>(),
-        );
-        let final_local_pairs = output_order
+        let final_local_pairs = outputs
             .iter()
-            .map(|&candidate_index| {
-                let candidate = &screen.candidates[candidate_index];
+            .map(|record| {
+                let candidate = &screen.candidates[record.candidate_rank - 1];
                 (candidate.first, candidate.second)
             })
             .collect::<Vec<_>>();

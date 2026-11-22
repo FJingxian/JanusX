@@ -971,6 +971,75 @@ fn packed_n11_min_cell_pass_count_unrolled4_no_scratch(
     (lower..=upper).contains(&n11).then_some(n11)
 }
 
+/// Single-pass MinCell gate + one-cell sufficient statistics for n <= 1024.
+///
+/// Computes `first[w] & second[w]` and its popcount once per word, caching up
+/// to 16 words on the stack. On MinCell failure it exits before touching `y`
+/// or `lookup`; on success it reuses both the masked intersections and their
+/// popcounts for `sum_word_adaptive_with_popcount`.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn one_cell_min_cell_and_stats_small(
+    first: &[u64],
+    second: &[u64],
+    needed_words: usize,
+    tail: Option<u64>,
+    n_samples: usize,
+    lower: usize,
+    upper: usize,
+    y: &[f64],
+    first_marker: usize,
+    second_marker: usize,
+    margins: &OneCellMargins,
+    lookup: &PackedYSumLookup,
+) -> Option<FourCellSufficientStats> {
+    debug_assert!(needed_words <= 16);
+    debug_assert!(first.len() >= needed_words);
+    debug_assert!(second.len() >= needed_words);
+    let mut inter_words = [0u64; 16];
+    let mut popcounts = [0u8; 16];
+    let mut n11 = 0usize;
+    let mut processed = 0usize;
+    for word_idx in 0..needed_words {
+        let mut w = first[word_idx] & second[word_idx];
+        let valid_bits = if word_idx + 1 == needed_words {
+            if let Some(mask) = tail {
+                w &= mask;
+                mask.count_ones() as usize
+            } else {
+                64
+            }
+        } else {
+            64
+        };
+        let c = w.count_ones();
+        inter_words[word_idx] = w;
+        popcounts[word_idx] = c as u8;
+        n11 += c as usize;
+        processed += valid_bits;
+        if n11 > upper || n11 + n_samples.saturating_sub(processed) < lower {
+            return None;
+        }
+    }
+    if n11 < lower || n11 > upper {
+        return None;
+    }
+    let mut s11 = 0.0f64;
+    for word_idx in 0..needed_words {
+        let pop = popcounts[word_idx] as u32;
+        if pop != 0 {
+            s11 += lookup.sum_word_adaptive_with_popcount(y, word_idx, inter_words[word_idx], pop);
+        }
+    }
+    Some(one_cell_sufficient_stats_from_n11_s11(
+        margins,
+        first_marker,
+        second_marker,
+        n11,
+        s11,
+    ))
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ResidualScreenCandidate {
     pub(crate) first: usize,
@@ -1178,14 +1247,13 @@ fn derive_proposal_scores(
 /// directly and avoid constructing the intermediate five-element score
 /// array/struct on every pair.
 #[inline(always)]
-fn fused_logic_gate_score(
-    gate: FourCellGate,
+fn fused_logic_gate_raw(
     n_hit: usize,
     sum_hit: f64,
     total: f64,
     n_total: f64,
     n_valid: usize,
-) -> Option<ResidualGateScore> {
+) -> Option<(f64, f64, f64)> {
     if n_valid == 0 || n_hit == 0 || n_hit >= n_valid {
         return None;
     }
@@ -1197,19 +1265,18 @@ fn fused_logic_gate_score(
         return None;
     }
     let centered_sum = sum_hit - (n_hit as f64 / n_total) * total;
-    let signed_score = centered_sum / denominator.sqrt();
     let score = n_total * centered_sum * centered_sum / (hit_f * miss_f);
-    Some(ResidualGateScore {
-        gate,
-        score,
-        signed_score,
-        n_hit,
-    })
+    Some((score, centered_sum, denominator))
 }
 
 #[inline(always)]
-fn fused_standardized_dosage_score(stats: FourCellSufficientStats) -> Option<(f64, f64)> {
-    if stats.n_valid == 0 || stats.counts.iter().any(|&count| count == 0) {
+fn fused_standardized_dosage_raw(stats: FourCellSufficientStats) -> Option<(f64, f64)> {
+    if stats.n_valid == 0
+        || stats.counts[0] == 0
+        || stats.counts[1] == 0
+        || stats.counts[2] == 0
+        || stats.counts[3] == 0
+    {
         return None;
     }
     let means = [
@@ -1227,38 +1294,41 @@ fn fused_standardized_dosage_score(stats: FourCellSufficientStats) -> Option<(f6
         return None;
     }
     let score = contrast * contrast / inverse_count_sum;
-    score
-        .is_finite()
-        .then_some((score, contrast.signum() * score.sqrt()))
+    score.is_finite().then_some((score, contrast))
 }
 
 #[inline(always)]
-fn best_max6_gate_fused(
+fn best_max6_gate_fused_impl(
     stats: FourCellSufficientStats,
     include_xor: bool,
+    compute_signed_score: bool,
 ) -> Option<ResidualGateScore> {
+    if stats.n_valid == 0 {
+        return None;
+    }
     let total = stats.sums.iter().sum::<f64>();
     let n_total = stats.n_valid as f64;
-    let mut best = None;
+    let mut best_logic: Option<(FourCellGate, f64, usize, f64, f64)> = None;
 
     macro_rules! consider_gate {
         ($gate:expr, $n_hit:expr, $sum_hit:expr) => {
-            if let Some(candidate) =
-                fused_logic_gate_score($gate, $n_hit, $sum_hit, total, n_total, stats.n_valid)
+            if let Some((score, centered_sum, denominator)) =
+                fused_logic_gate_raw($n_hit, $sum_hit, total, n_total, stats.n_valid)
             {
-                if best
-                    .map(|current: ResidualGateScore| candidate.score > current.score)
+                if best_logic
+                    .map(|current| score > current.1)
                     .unwrap_or(true)
                 {
-                    best = Some(candidate);
+                    best_logic = Some(($gate, score, $n_hit, centered_sum, denominator));
                 }
             }
         };
     }
 
     // Preserve the historical tie priority: AND11, AND01, AND10, AND00,
-    // then XOR.  The macro expansion keeps the hot Max6 path branch-light
-    // while retaining the exact score arithmetic of the reference loop.
+    // then XOR.  Defer the sqrt/signed_score calculation so it runs once for
+    // the single winning gate (or is skipped entirely during Top-K screening
+    // where finalists are rebuilt from sufficient statistics).
     consider_gate!(FourCellGate::And11, stats.counts[3], stats.sums[3]);
     consider_gate!(FourCellGate::And01, stats.counts[1], stats.sums[1]);
     consider_gate!(FourCellGate::And10, stats.counts[2], stats.sums[2]);
@@ -1271,18 +1341,47 @@ fn best_max6_gate_fused(
         );
     }
 
-    let mut best = best?;
-    if let Some((dosage_score, dosage_signed_score)) = fused_standardized_dosage_score(stats) {
-        if dosage_score > best.score {
-            best = ResidualGateScore {
+    let (gate, score, n_hit, centered_sum, denominator) = best_logic?;
+    if let Some((dosage_score, contrast)) = fused_standardized_dosage_raw(stats) {
+        if dosage_score > score {
+            return Some(ResidualGateScore {
                 gate: FourCellGate::DosageInteraction,
                 score: dosage_score,
-                signed_score: dosage_signed_score,
+                signed_score: if compute_signed_score {
+                    contrast.signum() * dosage_score.sqrt()
+                } else {
+                    0.0
+                },
                 n_hit: 0,
-            };
+            });
         }
     }
-    Some(best)
+    Some(ResidualGateScore {
+        gate,
+        score,
+        signed_score: if compute_signed_score {
+            centered_sum / denominator.sqrt()
+        } else {
+            0.0
+        },
+        n_hit,
+    })
+}
+
+#[inline(always)]
+fn best_max6_gate_fused(
+    stats: FourCellSufficientStats,
+    include_xor: bool,
+) -> Option<ResidualGateScore> {
+    best_max6_gate_fused_impl(stats, include_xor, true)
+}
+
+#[inline(always)]
+fn best_max6_gate_fused_score_only(
+    stats: FourCellSufficientStats,
+    include_xor: bool,
+) -> Option<ResidualGateScore> {
+    best_max6_gate_fused_impl(stats, include_xor, false)
 }
 
 #[inline]
@@ -2636,6 +2735,7 @@ struct ResidualBatchPartnerCursor {
     anchor_group: Option<usize>,
     next_local_index: usize,
     current_local_index: usize,
+    current_partner: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2830,10 +2930,12 @@ fn residual_batch_scan_anchor(
         state.pair_scan_profile.sampled_anchors =
             state.pair_scan_profile.sampled_anchors.saturating_add(1);
     }
+    let needed_words = words_for_samples(n_samples);
+    let sample_tail = tail_mask(n_samples);
     let first_margin_slot = anchor.margin_slot;
     let first_count = margins.counts[first_margin_slot];
     let anchor_row_start = anchor.global_row * row_words;
-    let anchor_row = &bits_flat[anchor_row_start..anchor_row_start + words_for_samples(n_samples)];
+    let anchor_row = &bits_flat[anchor_row_start..anchor_row_start + needed_words];
     let cursor_init_started = profile_anchor.then(Instant::now);
     state.cursors.clear();
     state.cursor_heap.clear();
@@ -2845,113 +2947,173 @@ fn residual_batch_scan_anchor(
             anchor_group: member.group,
             next_local_index: member.local_index + 1,
             current_local_index: member.local_index,
+            current_partner: usize::MAX,
         };
         if let Some(partner_global_row) =
             residual_batch_advance_partner(units, anchor.global_row, &mut cursor)
         {
-            let cursor_index = state.cursors.len();
+            cursor.current_partner = partner_global_row;
             state.cursors.push(cursor);
+        }
+    }
+    let use_linear_cursors = state.cursors.len() <= 16;
+    if !use_linear_cursors {
+        for (cursor_index, cursor) in state.cursors.iter().enumerate() {
             state
                 .cursor_heap
-                .push(Reverse((partner_global_row, cursor_index)));
+                .push(Reverse((cursor.current_partner, cursor_index)));
         }
     }
     if let Some(started) = cursor_init_started {
         state.pair_scan_profile.cursor_merge_seconds += started.elapsed().as_secs_f64();
     }
 
-    while let Some(Reverse((partner_global_row, first_cursor_index))) =
-        state.cursor_heap.peek().copied()
-    {
+    loop {
+        let (partner_global_row, first_cursor_index) = if use_linear_cursors {
+            let mut min_partner = usize::MAX;
+            let mut min_idx = 0usize;
+            for (idx, cursor) in state.cursors.iter().enumerate() {
+                if cursor.current_partner < min_partner {
+                    min_partner = cursor.current_partner;
+                    min_idx = idx;
+                }
+            }
+            if min_partner == usize::MAX {
+                break;
+            }
+            (min_partner, min_idx)
+        } else {
+            match state.cursor_heap.peek().copied() {
+                Some(Reverse(pair)) => pair,
+                None => break,
+            }
+        };
         let first_cursor = &state.cursors[first_cursor_index];
         let second_margin_slot =
             margin_slots_by_unit[first_cursor.unit_index][first_cursor.current_local_index];
         let second_count = margins.counts[second_margin_slot];
         let partner_row_start = partner_global_row * row_words;
-        let partner_row =
-            &bits_flat[partner_row_start..partner_row_start + words_for_samples(n_samples)];
+        let partner_row = &bits_flat[partner_row_start..partner_row_start + needed_words];
         if profile_anchor {
             state.pair_scan_profile.sampled_pairs =
                 state.pair_scan_profile.sampled_pairs.saturating_add(1);
         }
 
-        let min_cell_n11 = if min_cell > 0 {
-            let min_cell_started = profile_anchor.then(Instant::now);
-            let n11 = one_cell_min_cell_n11_bounds(n_samples, first_count, second_count, min_cell)
+        let best_gate = if min_cell > 0 && !profile_anchor && needed_words <= 16 {
+            one_cell_min_cell_n11_bounds(n_samples, first_count, second_count, min_cell)
                 .and_then(|(lower, upper)| {
-                    packed_n11_min_cell_pass_count_unrolled4_no_scratch(
+                    one_cell_min_cell_and_stats_small(
                         anchor_row,
                         partner_row,
+                        needed_words,
+                        sample_tail,
                         n_samples,
                         lower,
                         upper,
+                        residual,
+                        first_margin_slot,
+                        second_margin_slot,
+                        margins,
+                        lookup,
                     )
-                });
-            if let Some(started) = min_cell_started {
-                state.pair_scan_profile.min_cell_gate_seconds += started.elapsed().as_secs_f64();
-            }
-            n11
+                })
+                .and_then(|stats| best_max6_gate_fused_score_only(stats, include_xor))
         } else {
-            None
-        };
-        let min_cell_passes = min_cell == 0 || min_cell_n11.is_some();
-        let best_gate = if min_cell_passes {
-            let sufficient_stats_started = profile_anchor.then(Instant::now);
-            let stats = if let Some(n11) = min_cell_n11 {
-                one_cell_sufficient_stats_packed_no_valid_with_n11(
-                    anchor_row,
-                    partner_row,
-                    words_for_samples(n_samples),
-                    tail_mask(n_samples),
-                    residual,
-                    first_margin_slot,
-                    second_margin_slot,
-                    margins,
-                    lookup,
-                    n11,
-                    false,
-                )
+            let min_cell_n11 = if min_cell > 0 {
+                let min_cell_started = profile_anchor.then(Instant::now);
+                let n11 =
+                    one_cell_min_cell_n11_bounds(n_samples, first_count, second_count, min_cell)
+                        .and_then(|(lower, upper)| {
+                            packed_n11_min_cell_pass_count_unrolled4_no_scratch(
+                                anchor_row,
+                                partner_row,
+                                n_samples,
+                                lower,
+                                upper,
+                            )
+                        });
+                if let Some(started) = min_cell_started {
+                    state.pair_scan_profile.min_cell_gate_seconds +=
+                        started.elapsed().as_secs_f64();
+                }
+                n11
             } else {
-                one_cell_sufficient_stats_packed_no_valid(
-                    anchor_row,
-                    partner_row,
-                    words_for_samples(n_samples),
-                    tail_mask(n_samples),
-                    residual,
-                    first_margin_slot,
-                    second_margin_slot,
-                    margins,
-                    lookup,
-                )
+                None
             };
-            let best_gate =
-                best_proposal_gate_fused(stats, ResidualProposalMode::Max6, include_xor);
-            if let Some(started) = sufficient_stats_started {
-                state.pair_scan_profile.sufficient_stats_seconds += started.elapsed().as_secs_f64();
+            let min_cell_passes = min_cell == 0 || min_cell_n11.is_some();
+            if min_cell_passes {
+                let sufficient_stats_started = profile_anchor.then(Instant::now);
+                let stats = if let Some(n11) = min_cell_n11 {
+                    one_cell_sufficient_stats_packed_no_valid_with_n11(
+                        anchor_row,
+                        partner_row,
+                        needed_words,
+                        sample_tail,
+                        residual,
+                        first_margin_slot,
+                        second_margin_slot,
+                        margins,
+                        lookup,
+                        n11,
+                        true,
+                    )
+                } else {
+                    one_cell_sufficient_stats_packed_no_valid_skip_zero(
+                        anchor_row,
+                        partner_row,
+                        needed_words,
+                        sample_tail,
+                        residual,
+                        first_margin_slot,
+                        second_margin_slot,
+                        margins,
+                        lookup,
+                    )
+                };
+                let best_gate = best_max6_gate_fused_score_only(stats, include_xor);
+                if let Some(started) = sufficient_stats_started {
+                    state.pair_scan_profile.sufficient_stats_seconds +=
+                        started.elapsed().as_secs_f64();
+                }
+                best_gate
+            } else {
+                None
             }
-            best_gate
-        } else {
-            None
         };
 
         state.recipients.clear();
         let cursor_merge_started = profile_anchor.then(Instant::now);
-        while let Some(Reverse((current_partner, cursor_index))) = state.cursor_heap.peek().copied()
-        {
-            if current_partner != partner_global_row {
-                break;
+        if use_linear_cursors {
+            for cursor in state.cursors.iter_mut() {
+                if cursor.current_partner == partner_global_row {
+                    if best_gate.is_some() {
+                        state.recipients.push(cursor.unit_index);
+                    }
+                    cursor.current_partner =
+                        residual_batch_advance_partner(units, anchor.global_row, cursor)
+                            .unwrap_or(usize::MAX);
+                }
             }
-            state.cursor_heap.pop();
-            let cursor = &mut state.cursors[cursor_index];
-            if best_gate.is_some() {
-                state.recipients.push(cursor.unit_index);
-            }
-            if let Some(next_global_row) =
-                residual_batch_advance_partner(units, anchor.global_row, cursor)
+        } else {
+            while let Some(Reverse((current_partner, cursor_index))) =
+                state.cursor_heap.peek().copied()
             {
-                state
-                    .cursor_heap
-                    .push(Reverse((next_global_row, cursor_index)));
+                if current_partner != partner_global_row {
+                    break;
+                }
+                state.cursor_heap.pop();
+                let cursor = &mut state.cursors[cursor_index];
+                if best_gate.is_some() {
+                    state.recipients.push(cursor.unit_index);
+                }
+                if let Some(next_global_row) =
+                    residual_batch_advance_partner(units, anchor.global_row, cursor)
+                {
+                    cursor.current_partner = next_global_row;
+                    state
+                        .cursor_heap
+                        .push(Reverse((next_global_row, cursor_index)));
+                }
             }
         }
         if let Some(started) = cursor_merge_started {
@@ -3517,14 +3679,17 @@ fn scan_residual_pairs_packed_max6_batch_with_min_anchor_len_and_profile(
                 &margins,
                 lookup,
             );
+            let derived = derive_proposal_scores(stats, ResidualProposalMode::Max6);
+            let best_gate = best_gate_for_proposal(&derived, ResidualProposalMode::Max6, true)
+                .unwrap_or(entry.best_gate);
             candidates.push(ResidualScreenCandidate {
                 first: first_local,
                 second: second_local,
-                best_gate: entry.best_gate,
-                proposal_score: entry.proposal_score,
+                best_gate,
+                proposal_score: best_gate.score,
                 proposal_source: entry.proposal_source,
                 stats,
-                derived: derive_proposal_scores(stats, ResidualProposalMode::Max6),
+                derived,
             });
         }
         candidates.sort_unstable_by(|left, right| candidate_cmp(right, left));

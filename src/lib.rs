@@ -59,8 +59,6 @@ mod lm_trait;
 mod lmm;
 #[path = "stats/lmm_common.rs"]
 mod lmm_common;
-#[path = "stats/logreg.rs"]
-mod logreg;
 #[path = "stats/mixed_ld.rs"]
 mod mixed_ld;
 #[path = "stats/packed.rs"]
@@ -194,8 +192,8 @@ pub use blas::{
 };
 use bsa::preprocess_bsa;
 use eigh::{
-    rust_eigh_debug_f64, rust_eigh_from_array_f64, rust_eigh_from_array_f64_inplace,
-    rust_eigh_from_matrix_file_f64, rust_eigh_from_matrix_file_subset_f64,
+    rust_eigh_from_array_f64, rust_eigh_from_array_f64_inplace, rust_eigh_from_matrix_file_f64,
+    rust_eigh_from_matrix_file_subset_f64,
 };
 use farmcpu::farmcpu_packed_to_tsv;
 use fst::fst_bed_window_to_tsv;
@@ -262,7 +260,6 @@ use lmm::{
     lmm_reml_chunk_f32, lmm_reml_chunk_from_snp_f32, lmm_reml_lmm2_assoc_bed_to_tsv_f32,
     lmm_reml_lmm2_chunk_from_snp_f32,
 };
-use logreg::fit_best_and_not_py;
 use mixed_ld::fvlmm_effective_ld_spectral_f64;
 use packed::{
     bed_decode_rows_f32_from_meta, bed_packed_decode_rows_f32, bed_packed_decode_stats_f64,
@@ -900,7 +897,6 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rust_eigh_lapack_backend, m)?)?;
     m.add_function(wrap_pyfunction!(rust_blas_set_num_threads, m)?)?;
     m.add_function(wrap_pyfunction!(rust_blas_get_num_threads, m)?)?;
-    m.add_function(wrap_pyfunction!(rust_eigh_debug_f64, m)?)?;
     m.add_function(wrap_pyfunction!(rust_eigh_from_array_f64, m)?)?;
     m.add_function(wrap_pyfunction!(rust_eigh_from_matrix_file_f64, m)?)?;
     m.add_function(wrap_pyfunction!(rust_eigh_from_matrix_file_subset_f64, m)?)?;
@@ -973,7 +969,6 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(admx_rsvd_stream_sample, m)?)?;
     m.add_function(wrap_pyfunction!(py_rsvd_packed_subset, m)?)?;
     m.add_function(wrap_pyfunction!(admx_set_threads, m)?)?;
-    m.add_function(wrap_pyfunction!(fit_best_and_not_py, m)?)?;
     m.add_function(wrap_pyfunction!(garfield_grm_max6_rerank_candidates_py, m)?)?;
     m.add_function(wrap_pyfunction!(garfield_logic_residual_screen_bin_py, m)?)?;
     m.add_function(wrap_pyfunction!(garfield_logic_search_bed_py, m)?)?;

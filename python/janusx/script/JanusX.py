@@ -19,25 +19,30 @@ Modules:
     gs            Genomic prediction and model-based selection
     postgs        Summarize and visualize GS results
 
-    Epistasis Association (GARFIELD):
+    Epistasis Association:
     garfield      Random-forest based marker-trait association
     postgarfield  Post-process GARFIELD results and downstream plots
+    ct            Test cis/trans effects for nearby phased variant pairs
 
     K-mer:
     kmer          K-mer counting workflow via KMC
     kmerge        Merge multi-sample KMC databases into genotype matrix
     kstats        Compute pairwise KMC k-mer statistics
+    kformat       Filter and convert JanusX kfile bitmatrices
+
+    Population Analysis:
+    adamixture    Population structure inference via ADAMIXTURE
+    fst           Compute windowed population FST
+    xpclr         Compute windowed XP-CLR selection scan
 
     Utility:
     grm           Build genomic relationship matrix
     pca           Principal component analysis for population structure
     gstats        Genotype basic statistics and LD score
     reml          Estimate broad/narrow heritability and BLUE by REML
-    adamixture    Population structure inference via ADAMIXTURE
-    fst           Windowed population FST
-    xpclr         Windowed XP-CLR selection scan
     gformat       Convert genotype files across plink/vcf/txt/npy
     gmerge        Merge genotype/variant tables
+    imp           Windowed genotype phasing and reference imputation
 '''
 import sys
 import subprocess
@@ -118,7 +123,6 @@ _CLI_MODULE_SECTIONS = [
         "Genome-wide Association Studies (GWAS)",
         [
             ("gwas", "Run genome-wide association analysis"),
-            ("ct", "Test cis/trans effects for nearby phased variant pairs"),
             ("postgwas", "Post-process GWAS results and downstream plots"),
         ],
     ),
@@ -130,10 +134,11 @@ _CLI_MODULE_SECTIONS = [
         ],
     ),
     (
-        "Epistasis Association (GARFIELD)",
+        "Epistasis Association",
         [
             ("garfield", "Random-forest based marker-trait association"),
             ("postgarfield", "Post-process GARFIELD results and downstream plots"),
+            ("ct", "Test cis/trans effects for nearby phased variant pairs"),
         ],
     ),
     (

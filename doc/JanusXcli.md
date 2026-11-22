@@ -75,7 +75,7 @@ Most scientific modules accept one of these input families:
 Input support varies by command. Check `jx <module> -h` before assuming every
 module accepts every source format.
 
-For large repeated analyses, `-bfile` is usually the best default because packed BED paths can be reused across `grm`, `pca`, `gwas`, `gs`, `fastpop`, `gformat`, and related workflows.
+For large repeated analyses, `-bfile` is usually the best default because packed BED paths can be reused across `grm`, `pca`, `gwas`, `gs`, `adamixture`, `gformat`, and related workflows.
 
 ### 2.2 `-file` sidecars
 
@@ -228,17 +228,15 @@ Line×environment terms from `-gxe`, and continuous reaction-norm slopes from
 without either, REML reports BLUE/BLUP and logs raw variance components without
 narrow-sense h².
 
-### 3.4 Run FastPop
+### 3.4 Population structure and selection scans
 
 ```bash
-jx fastpop -vcf example/mouse_hs1940.vcf.gz -k 1..6 -cv -o demo -prefix mouse_hs1940
-jx fastpop -vcf example/mouse_hs1940.vcf.gz -k 4 -tag x,1 -o demo -prefix mouse_hs1940
+jx adamixture -vcf example/mouse_hs1940.vcf.gz -k 1..6 -cv -o demo -prefix mouse_hs1940
+jx adamixture -vcf example/mouse_hs1940.vcf.gz -k 4 -tag x,1 -o demo -prefix mouse_hs1940
 ```
 
-Compatibility note: `jx adamixture` is still accepted as an alias.
-
-The structure/CV workflow is the default. Windowed population scans are
-subcommands: `jx fastpop fst ...` and `jx fastpop xpclr ...`.
+Windowed population genetics scans are exposed as standalone commands:
+`jx fst ...` and `jx xpclr ...`.
 
 Accepted `-k` forms:
 
@@ -322,10 +320,11 @@ Use launcher `jx` when you want the full external workflow to run.
 - `reml`: mixed-model REML/BLUP for phenotype and effect tables
 - `postgs`: summarize GS outputs and effect plots
 
-### 4.3 GARFIELD and BSA
+### 4.3 Epistasis (GARFIELD / CT) and BSA
 
 - `garfield`: logic-gate or interval-based marker-trait association workflow
 - `postgarfield`: pseudo-genotype GWAS and post-processing
+- `ct`: test cis/trans effects for nearby phased variant pairs
 - `postbsa`: BSA table processing and figures
 
 ### 4.4 Utility and format tools
@@ -334,7 +333,9 @@ Use launcher `jx` when you want the full external workflow to run.
 - `gmerge`: merge multiple genotype panels
 - `view`: print `.bin` and `.bin.site` style files as plain text
 - `hybrid`: generate pairwise hybrid genotype matrices from parent lists
-- `fastpop`: ancestry inference and CVerror scan (`jx adamixture` remains a compatibility alias)
+- `adamixture`: population structure inference via ADAMIXTURE
+- `fst`: compute windowed population FST
+- `xpclr`: compute windowed XP-CLR selection scan
 - `tree`: tree workflow entry
 - `treeplot`: visualize Newick or GRM-derived trees
 - `webui`: start the JanusX web interface
@@ -346,17 +347,14 @@ Use launcher `jx` when you want the full external workflow to run.
 - `fastq2vcf`: FASTQ-to-VCF compatibility check in Python mode; full pipeline in launcher mode
 - `fastq2count`: FASTQ-to-count compatibility check in Python mode; full pipeline in launcher mode
 
-### 4.6 Simulation and standalone benchmark tools
+### 4.6 Simulation
 
 - `sim`: quick simulation workflow
 - `simulation`: extended simulation and benchmarking workflow
-- `gblupbench`: GBLUP benchmark workflow
-- `garfieldbench`: GARFIELD local-interval benchmark workflow
 
-Other current command entrypoints include `ct` (cis/trans pair testing),
-`fvlmm2`, `hybrid`, `tree`, `treeplot`, `refcheck`, `view`, and the `kformat`
-K-mer utility. Their exact availability and arguments are defined by their
-module help.
+Other current command entrypoints include `fvlmm2`, `hybrid`, `tree`,
+`treeplot`, `refcheck`, `view`, and the `kformat` K-mer utility. Their exact
+availability and arguments are defined by their module help.
 
 ## 5. Practical notes
 

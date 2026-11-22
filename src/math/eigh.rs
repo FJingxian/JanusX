@@ -7,8 +7,6 @@ use numpy::{
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::BoundObject;
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
 use std::borrow::Cow;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -1610,79 +1608,6 @@ pub fn symmetric_eigh_f64_row_major(
     )?;
     let vecs = evecs.ok_or_else(|| "eigh internal error: missing eigenvectors".to_string())?;
     Ok((evals, vecs, backend))
-}
-
-#[pyfunction]
-#[pyo3(signature = (n=2048, threads=0, seed=20260501, driver=None, jobz="V", require_lapack=false))]
-pub fn rust_eigh_debug_f64(
-    n: usize,
-    threads: usize,
-    seed: u64,
-    driver: Option<String>,
-    jobz: &str,
-    require_lapack: bool,
-) -> PyResult<(
-    String,
-    String,
-    String,
-    usize,
-    isize,
-    isize,
-    isize,
-    bool,
-    f64,
-    f64,
-    f64,
-)> {
-    if n == 0 {
-        return Err(PyRuntimeError::new_err("n must be > 0"));
-    }
-    let driver_sel = parse_eigh_driver_token(driver.unwrap_or_else(|| "auto".to_string()).as_str());
-    let jobz_sel = parse_eigh_jobz_token(jobz);
-
-    let mut rng = StdRng::seed_from_u64(seed);
-    let mut a = vec![0.0_f64; n * n];
-    for i in 0..n {
-        for j in 0..=i {
-            let v = rng.random::<f64>() - 0.5_f64;
-            a[i * n + j] = v;
-            a[j * n + i] = v;
-        }
-    }
-
-    let backend = crate::blas::rust_sgemm_backend();
-    let (threads_before, threads_in_stage, run, threads_after) =
-        crate::blas::with_eigh_thread_stage(threads, || {
-            let t0 = Instant::now();
-            let run = symmetric_eigh_f64_row_major_with_driver(&a, n, driver_sel, jobz_sel);
-            let elapsed = t0.elapsed().as_secs_f64();
-            (run, elapsed)
-        });
-    let (run, elapsed) = run;
-
-    let (evals, _evecs, evd_backend) = run.map_err(PyRuntimeError::new_err)?;
-    let lapack_used = is_lapack_backend(evd_backend);
-    if require_lapack && !lapack_used {
-        return Err(PyRuntimeError::new_err(format!(
-            "rust_eigh_debug_f64 expected LAPACK backend, got {evd_backend}"
-        )));
-    }
-    let min_eval = evals.first().copied().unwrap_or(f64::NAN);
-    let max_eval = evals.last().copied().unwrap_or(f64::NAN);
-
-    Ok((
-        backend,
-        evd_backend.to_string(),
-        eigh_jobz_label(jobz_sel).to_string(),
-        n,
-        threads_before,
-        threads_in_stage,
-        threads_after,
-        lapack_used,
-        elapsed,
-        min_eval,
-        max_eval,
-    ))
 }
 
 #[pyfunction]

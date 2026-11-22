@@ -24,8 +24,9 @@ JanusX (Joint Association and Novel Utility for Selection) is a GWAS and genomic
 
 **Main capabilities**:
 
-- Genome-Wide Association Study (GWAS): `lm`, `lmm`, `lmm2`, `fvlmm`, SparseLMM (`splmm` / `splmm-exact`), `farmcpu`, and cis/trans pair scans (`ct`)
+- Genome-Wide Association Study (GWAS): `lm`, `lmm`, `lmm2`, `fvlmm`, SparseLMM (`splmm` / `splmm-exact`), and `farmcpu`
 - Genomic Selection (GS): `BLUP`, `BayesA/B/C/R`, PLS/KRR, and ML models (`RF/ET/GBDT/XGB/SVM/ENET`)
+- Epistasis Association: `garfield`, `postgarfield`, and cis/trans pair scans (`ct`)
 - Streaming genotype IO for VCF/HMP/PLINK BED and PLINK 2 PGEN
 - Post-analysis workflows: `postgwas`, `postgs`
 - Population analysis: `adamixture`, `fst`, and `xpclr`
@@ -158,7 +159,6 @@ The command groups below mirror the sections printed by `jx -h`.
 **Genome-wide Association Studies (GWAS)**:
 
 - `gwas` — Run genome-wide association analysis (`lm`, `lmm`, `lmm2`, `fvlmm`, `splmm`, `splmm-exact`, and `farmcpu`)
-- `ct` — Test cis/trans effects for nearby phased variant pairs
 - `postgwas` — Post-process GWAS results and create Manhattan, QQ, LD-block, and gene-structure plots
 
 **Genomic Selection (GS)**:
@@ -166,10 +166,11 @@ The command groups below mirror the sections printed by `jx -h`.
 - `gs` — Genomic prediction and model-based selection, including BLUP, Bayesian, and machine-learning models
 - `postgs` — Summarize and visualize GS results
 
-**Epistasis Association (GARFIELD)**:
+**Epistasis Association**:
 
 - `garfield` — Run GARFIELD marker-trait and interaction scans
 - `postgarfield` — Post-process GARFIELD results and downstream plots
+- `ct` — Test cis/trans effects for nearby phased variant pairs
 
 **K-mer**:
 

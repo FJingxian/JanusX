@@ -1123,6 +1123,28 @@ pub fn garfield_logic_search_bed_py<'py>(
         "max6_batch_memberships_sum",
         batch_timing.screen_memberships_sum,
     )?;
+    let upstream_timing = batch_timing.upstream_timing;
+    out.set_item(
+        "timing_max6_stream_metadata_io_wall_s",
+        upstream_timing.metadata_io_wall_seconds,
+    )?;
+    out.set_item(
+        "timing_max6_stream_genotype_io_wall_s",
+        upstream_timing.genotype_io_wall_seconds,
+    )?;
+    out.set_item(
+        "timing_max6_stream_qc_pack_wall_s",
+        upstream_timing.qc_pack_wall_seconds,
+    )?;
+    out.set_item(
+        "timing_max6_stream_window_emit_wall_s",
+        upstream_timing.window_emit_wall_seconds,
+    )?;
+    out.set_item(
+        "timing_max6_stream_ld_select_wall_s",
+        upstream_timing.ld_select_wall_seconds,
+    )?;
+    out.set_item("max6_stream_chunks_read", upstream_timing.chunks_read)?;
     let batch_scan_profiles = batch_timing
         .screen_batch_profiles
         .iter()

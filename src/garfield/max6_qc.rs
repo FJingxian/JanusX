@@ -371,10 +371,10 @@ impl Drop for Max6BitsTempFileOwner {
     }
 }
 
-pub(super) const MAX6_WINDOW_STREAM_CHUNK_ROWS: usize = 4096;
-pub(super) const MAX6_WINDOW_STREAM_METADATA_ROWS: usize = 4096;
-pub(super) const MAX6_WINDOW_STREAM_PGEN_CHUNK_ROWS: usize = 16_384;
-pub(super) const MAX6_WINDOW_STREAM_PGEN_METADATA_ROWS: usize = 16_384;
+pub(super) const MAX6_WINDOW_STREAM_CHUNK_ROWS: usize = 16_384;
+pub(super) const MAX6_WINDOW_STREAM_METADATA_ROWS: usize = 16_384;
+pub(super) const MAX6_WINDOW_STREAM_PGEN_CHUNK_ROWS: usize = 32_768;
+pub(super) const MAX6_WINDOW_STREAM_PGEN_METADATA_ROWS: usize = 32_768;
 
 pub(super) struct Max6WindowStreamChunk {
     pub(super) sites: Vec<SiteInfo>,
@@ -599,8 +599,10 @@ impl Max6WindowRangeSource {
     }
 
     pub(super) fn set_max_chunk_rows(&mut self, rows: usize) {
-        self.metadata.max_run_rows = rows.max(1);
-        self.max_chunk_rows = rows.max(1);
+        let rows = rows.max(1);
+        self.metadata.max_run_rows = rows;
+        self.metadata.metadata_chunk_rows = self.metadata.metadata_chunk_rows.min(rows);
+        self.max_chunk_rows = rows;
     }
 
     pub(super) fn selected_rows_seen(&self) -> Arc<AtomicBool> {

@@ -166,7 +166,7 @@ impl BimChunkReader {
             crate::pgen::open_text_reader(&path)?
         } else {
             let file = File::open(&path).map_err(|e| e.to_string())?;
-            Box::new(BufReader::new(file))
+            Box::new(BufReader::with_capacity(4 * 1024 * 1024, file))
         };
         let pvar_columns = if pgen_source {
             Some({

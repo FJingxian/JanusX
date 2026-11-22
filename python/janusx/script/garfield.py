@@ -3750,6 +3750,20 @@ def main() -> None:
                         + "grm_int wall includes unit setup/finalization; "
                         + "result_drain includes four-cell recount, TSV writes and progress callbacks",
                     )
+                stream_chunks_read = int(result.get("max6_stream_chunks_read", 0))
+                if stream_chunks_read > 0:
+                    _emit_garfield_file_only_line(
+                        logger,
+                        "Max6 stream upstream timing: "
+                        + f"metadata_io={float(result.get('timing_max6_stream_metadata_io_wall_s', 0.0)):.3f}s, "
+                        + f"genotype_io={float(result.get('timing_max6_stream_genotype_io_wall_s', 0.0)):.3f}s "
+                        + "(stage 1/2 threads overlap stage 3); "
+                        + f"qc_pack={float(result.get('timing_max6_stream_qc_pack_wall_s', 0.0)):.3f}s, "
+                        + f"window_emit={float(result.get('timing_max6_stream_window_emit_wall_s', 0.0)):.3f}s, "
+                        + f"ld_select={float(result.get('timing_max6_stream_ld_select_wall_s', 0.0)):.3f}s "
+                        + "(stage 3 before batch scan); "
+                        + f"chunks={stream_chunks_read}",
+                    )
                 batch_profiles = result.get("max6_batch_scan_profiles") or []
                 if batch_profiles:
                     def _batch_quantile(values, probability):

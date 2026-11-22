@@ -292,7 +292,7 @@ const GARFIELD_SCAN_TASK_COALESCE_MAX_UNITS_DEFAULT: usize = 512;
 const GARFIELD_PERM_SLOT_TASK_MAX_SLOTS_DEFAULT: usize = 1;
 const GARFIELD_PERM_TASK_COALESCE_MAX_TASKS_DEFAULT: usize = 64;
 const GARFIELD_PERM_BITS_CACHE_MAX_MB_DEFAULT: usize = 256;
-const GARFIELD_LOGIC_MMAP_WINDOW_MB_DEFAULT: usize = 128;
+const GARFIELD_LOGIC_MMAP_WINDOW_MB_DEFAULT: usize = 256;
 const GARFIELD_DENSE_DECODE_PAR_MIN_ROWS: usize = 64;
 const GARFIELD_DENSE_DECODE_PAR_MIN_SAMPLES: usize = 256;
 
@@ -3903,9 +3903,20 @@ struct Max6BatchScanProfile {
     pair_profile_topk_offer_seconds: f64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Max6StreamUpstreamTiming {
+    pub(super) metadata_io_wall_seconds: f64,
+    pub(super) genotype_io_wall_seconds: f64,
+    pub(super) qc_pack_wall_seconds: f64,
+    pub(super) window_emit_wall_seconds: f64,
+    pub(super) ld_select_wall_seconds: f64,
+    pub(super) chunks_read: usize,
+}
+
 #[derive(Clone, Debug, Default)]
 struct Max6ObservedScanTiming {
     units_timed: usize,
+    upstream_timing: Max6StreamUpstreamTiming,
     screen_input_prepare_task_seconds: f64,
     screen_kernel_task_seconds: f64,
     screen_batch_count: usize,

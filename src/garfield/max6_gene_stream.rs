@@ -409,13 +409,7 @@ fn max6_interval_unit_task(
         unit_kind: unit_kind.to_string(),
         ld_tags_preselected,
         unit,
-        source_rows: Vec::new(),
-        sites: Vec::new(),
-        row_flip: Vec::new(),
-        logic_words: Vec::new(),
-        support: Vec::new(),
-        block_support: Vec::new(),
-        shared_gene_rows: Some(rows),
+        shared_rows: rows,
     }
 }
 
@@ -524,8 +518,8 @@ fn prune_max6_geneset_span_rows(
     rows.retain(|row| {
         nearest_unit_span_index(
             &span_unit,
-            row.site.garfield_chrom(),
-            row.site.garfield_pos(),
+            row.logic_site.garfield_chrom(),
+            row.logic_site.garfield_pos(),
         ) == Some(span_index)
     });
     if rows.len() < 2 {
@@ -533,8 +527,6 @@ fn prune_max6_geneset_span_rows(
     }
 
     let mut bits = Vec::with_capacity(rows.len().saturating_mul(row_words));
-    let mut sites = Vec::with_capacity(rows.len());
-    let mut row_flip = Vec::with_capacity(rows.len());
     let support_cache_required = ld_tag_r2 < 1.0;
     let block_words = garfield_ld_block_words();
     let block_count = row_words.div_ceil(block_words);
@@ -561,8 +553,6 @@ fn prune_max6_geneset_span_rows(
             );
         }
         bits.extend_from_slice(words);
-        sites.push(row.site.clone());
-        row_flip.push(row.row_flip);
         if support_cache_required {
             support.push(row.support.ok_or_else(|| {
                 "streamed Max6 geneset span is missing its LD support cache".to_string()
@@ -582,11 +572,7 @@ fn prune_max6_geneset_span_rows(
         bits_hi_flat: None,
         row_words,
         sample_ids: Vec::new(),
-        sites: build_logic_sites_from_metadata_owned_direct(
-            sites,
-            row_flip.as_slice(),
-            GarfieldBinMode::Bin,
-        ),
+        sites: resolve_stream_window_logic_sites(rows.as_slice()),
         group_ids: build_logic_mode_group_ids(n_rows, GarfieldBinMode::Bin),
         n_samples,
     };
@@ -635,11 +621,14 @@ fn flush_max6_gene_stream_tasks(
     any_eligible_unit: &mut bool,
     max_task_batch_bytes: &mut usize,
     task_batch_bytes: &mut usize,
+    ld_select_wall_seconds: &mut f64,
+    flush_wall_seconds: &mut f64,
     on_batch: &mut Option<&mut Max6WindowFusedBatchCallback<'_>>,
 ) -> Result<(), String> {
     if tasks.is_empty() {
         return Ok(());
     }
+    let flush_started = Instant::now();
     let batch_bytes = tasks.iter().fold(0usize, |total, task| {
         total.saturating_add(max6_stream_window_task_materialized_bytes(task, row_words))
     });
@@ -648,6 +637,7 @@ fn flush_max6_gene_stream_tasks(
     let mut unused_screen_units = Vec::new();
     let mut unused_original_unit_indices = Vec::new();
     let mut unused_active_source_rows = Vec::new();
+    let ld_started = Instant::now();
     let selections = process_max6_stream_window_batch(
         tasks,
         sample_indices,
@@ -663,10 +653,12 @@ fn flush_max6_gene_stream_tasks(
         any_eligible_unit,
         false,
     )?;
+    *ld_select_wall_seconds += ld_started.elapsed().as_secs_f64();
     if let Some(callback) = on_batch.as_deref_mut() {
         callback(&selections, pool)?;
     }
     *task_batch_bytes = 0;
+    *flush_wall_seconds += flush_started.elapsed().as_secs_f64();
     Ok(())
 }
 
@@ -838,6 +830,17 @@ pub(super) fn prepare_max6_interval_streamed_ld_with_callback(
     let mut raw_missing_sites = 0usize;
     let mut next_qc_index = 0usize;
     let mut unsupported_order = false;
+    let mut raw_chrom_pool = HashSet::<Arc<str>>::new();
+    let mut allele_pool = HashSet::<Arc<str>>::new();
+    let metadata_io_ns = AtomicU64::new(0);
+    let genotype_io_ns = AtomicU64::new(0);
+    let chunks_read = AtomicUsize::new(0);
+    let mut qc_pack_wall_seconds = 0.0_f64;
+    let mut window_emit_wall_seconds = 0.0_f64;
+    let mut ld_select_wall_seconds = 0.0_f64;
+    let mut geneset_span_ld_wall_seconds = 0.0_f64;
+    let mut flush_wall_seconds = 0.0_f64;
+    let pipeline_depth = if logic_mem_budget_bytes == 0 { 4 } else { 2 };
     let mut geneset_accumulator = if unit_kind == "geneset" {
         Some(Max6GeneSetRowAccumulator::new(groups, group_names)?)
     } else {
@@ -860,6 +863,7 @@ pub(super) fn prepare_max6_interval_streamed_ld_with_callback(
                             )
                         })?
                         .clone();
+                    let span_ld_started = Instant::now();
                     let rows = prune_max6_geneset_span_rows(
                         completion.rows,
                         spans.as_slice(),
@@ -868,6 +872,9 @@ pub(super) fn prepare_max6_interval_streamed_ld_with_callback(
                         n_samples,
                         ld_tag_r2,
                     )?;
+                    let span_ld_elapsed = span_ld_started.elapsed().as_secs_f64();
+                    geneset_span_ld_wall_seconds += span_ld_elapsed;
+                    ld_select_wall_seconds += span_ld_elapsed;
                     accumulator.push(completion.unit_index, completion.span_index, rows)?
                 } else {
                     let span = GarfieldUnitSpan {
@@ -887,7 +894,7 @@ pub(super) fn prepare_max6_interval_streamed_ld_with_callback(
                 let Some(task) = task else {
                     continue;
                 };
-                if task.shared_gene_rows.as_ref().is_some_and(Vec::is_empty) {
+                if task.shared_rows.is_empty() {
                     continue;
                 }
                 distinct_gene_count = distinct_gene_count.saturating_add(1);
@@ -906,6 +913,8 @@ pub(super) fn prepare_max6_interval_streamed_ld_with_callback(
                         &mut any_eligible_unit,
                         &mut max_task_batch_bytes,
                         &mut task_batch_bytes,
+                        &mut ld_select_wall_seconds,
+                        &mut flush_wall_seconds,
                         &mut on_batch,
                     )?;
                 }
@@ -915,10 +924,29 @@ pub(super) fn prepare_max6_interval_streamed_ld_with_callback(
 
     let (mut metadata_source, mut genotype_source) = source.into_sources();
     crate::pipeline::run_three_stage(
-        2,
+        pipeline_depth,
         || Max6WindowStreamChunk::new(chunk_rows, bytes_per_variant, row_words),
-        || metadata_source.next_run(),
-        |run, chunk| genotype_source.fill_chunk(run, chunk),
+        || {
+            let started = Instant::now();
+            let run = metadata_source.next_run();
+            metadata_io_ns.fetch_add(
+                started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                Ordering::Relaxed,
+            );
+            run
+        },
+        |run, chunk| {
+            let started = Instant::now();
+            let filled = genotype_source.fill_chunk(run, chunk);
+            genotype_io_ns.fetch_add(
+                started.elapsed().as_nanos().min(u64::MAX as u128) as u64,
+                Ordering::Relaxed,
+            );
+            if matches!(filled, Ok(true)) {
+                chunks_read.fetch_add(1, Ordering::Relaxed);
+            }
+            filled
+        },
         |chunk| {
             if let Some(error) = chunk.error.take() {
                 return Err(error);
@@ -927,6 +955,7 @@ pub(super) fn prepare_max6_interval_streamed_ld_with_callback(
             if rows == 0 {
                 return Ok(());
             }
+            let qc_started = Instant::now();
             let required_words = rows
                 .checked_mul(row_words)
                 .ok_or_else(|| "Max6 gene logic chunk size overflow".to_string())?;
@@ -971,8 +1000,10 @@ pub(super) fn prepare_max6_interval_streamed_ld_with_callback(
             } else {
                 process_rows();
             }
+            qc_pack_wall_seconds += qc_started.elapsed().as_secs_f64();
             check_ctrlc()?;
 
+            let emit_started = Instant::now();
             for offset in 0..rows {
                 let qc = chunk.qc[offset];
                 let source_row = chunk.source_rows[offset];
@@ -1005,11 +1036,17 @@ pub(super) fn prepare_max6_interval_streamed_ld_with_callback(
                         } else {
                             (None, None)
                         };
+                        let (logic_site, snp_name_missing) = build_stream_window_logic_site(
+                            site,
+                            qc.row_flip,
+                            &mut raw_chrom_pool,
+                            &mut allele_pool,
+                        );
                         sweep.push_current_row(Arc::new(Max6StreamWindowRow {
                             qc_index: next_qc_index,
                             source_row,
-                            site: site.clone(),
-                            row_flip: qc.row_flip,
+                            logic_site,
+                            snp_name_missing,
                             pos: site.pos,
                             logic_words: Some(words),
                             support,
@@ -1034,6 +1071,7 @@ pub(super) fn prepare_max6_interval_streamed_ld_with_callback(
                     raw_missing_sites += 1;
                 }
             }
+            window_emit_wall_seconds += emit_started.elapsed().as_secs_f64();
             if let Some(tracker) = mem_tracker {
                 tracker.sample_now();
             }
@@ -1056,8 +1094,12 @@ pub(super) fn prepare_max6_interval_streamed_ld_with_callback(
         }
     })?;
 
+    let finish_emit_started = Instant::now();
     queue_completions(sweep.finish()?)?;
+    window_emit_wall_seconds += finish_emit_started.elapsed().as_secs_f64();
     drop(queue_completions);
+    let emit_only_wall_seconds =
+        (window_emit_wall_seconds - flush_wall_seconds - geneset_span_ld_wall_seconds).max(0.0);
     flush_max6_gene_stream_tasks(
         &mut tasks,
         train_indices.as_slice(),
@@ -1069,6 +1111,8 @@ pub(super) fn prepare_max6_interval_streamed_ld_with_callback(
         &mut any_eligible_unit,
         &mut max_task_batch_bytes,
         &mut task_batch_bytes,
+        &mut ld_select_wall_seconds,
+        &mut flush_wall_seconds,
         &mut on_batch,
     )?;
     if qc_row_count == 0 {
@@ -1100,6 +1144,14 @@ pub(super) fn prepare_max6_interval_streamed_ld_with_callback(
             "Max6 scan found no eligible LD-tag {unit_kind} with at least two markers"
         ));
     }
+    let upstream_timing = Max6StreamUpstreamTiming {
+        metadata_io_wall_seconds: metadata_io_ns.load(Ordering::Relaxed) as f64 * 1e-9,
+        genotype_io_wall_seconds: genotype_io_ns.load(Ordering::Relaxed) as f64 * 1e-9,
+        qc_pack_wall_seconds,
+        window_emit_wall_seconds: emit_only_wall_seconds,
+        ld_select_wall_seconds,
+        chunks_read: chunks_read.load(Ordering::Relaxed),
+    };
     Ok(Max6WindowStreamLdPrep {
         global_site_keep: Vec::new(),
         units: Vec::new(),
@@ -1113,5 +1165,6 @@ pub(super) fn prepare_max6_interval_streamed_ld_with_callback(
         selected_window_count: distinct_gene_count,
         max_active_rows: 0,
         max_task_batch_bytes,
+        upstream_timing,
     })
 }

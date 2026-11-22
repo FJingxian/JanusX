@@ -29,6 +29,115 @@ static COUNT_EMISSION_ROWS: DetailAtomicU64 = DetailAtomicU64::new(0);
 static COUNT_BETA_CACHE_BYTES: DetailAtomicU64 = DetailAtomicU64::new(0);
 static PEAK_BETA_CACHE_BYTES: DetailAtomicU64 = DetailAtomicU64::new(0);
 static COUNT_SINGLE_TRACK_SAMPLES: DetailAtomicU64 = DetailAtomicU64::new(0);
+static LIVE_BETA_CACHE_BYTES: DetailAtomicU64 = DetailAtomicU64::new(0);
+static WINDOW_PEAK_LIVE_BETA_CACHE_BYTES: DetailAtomicU64 = DetailAtomicU64::new(0);
+static PEAK_LIVE_BETA_CACHE_BYTES: DetailAtomicU64 = DetailAtomicU64::new(0);
+static LIVE_EVENT_WORKSPACE_BYTES: DetailAtomicU64 = DetailAtomicU64::new(0);
+static WINDOW_PEAK_LIVE_EVENT_WORKSPACE_BYTES: DetailAtomicU64 = DetailAtomicU64::new(0);
+static PEAK_LIVE_EVENT_WORKSPACE_BYTES: DetailAtomicU64 = DetailAtomicU64::new(0);
+static COUNT_CHECKPOINTED_PREPARATIONS: DetailAtomicU64 = DetailAtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct PhaseBaumMemoryProfile {
+    pub(crate) live_beta_cache_bytes: u64,
+    pub(crate) window_peak_live_beta_cache_bytes: u64,
+    pub(crate) process_peak_live_beta_cache_bytes: u64,
+    pub(crate) live_event_workspace_bytes: u64,
+    pub(crate) window_peak_live_event_workspace_bytes: u64,
+    pub(crate) process_peak_live_event_workspace_bytes: u64,
+    pub(crate) checkpointed_preparations: u64,
+}
+
+pub(crate) fn reset_window_memory_peaks() {
+    WINDOW_PEAK_LIVE_BETA_CACHE_BYTES.store(
+        LIVE_BETA_CACHE_BYTES.load(DetailOrdering::Relaxed),
+        DetailOrdering::Relaxed,
+    );
+    WINDOW_PEAK_LIVE_EVENT_WORKSPACE_BYTES.store(
+        LIVE_EVENT_WORKSPACE_BYTES.load(DetailOrdering::Relaxed),
+        DetailOrdering::Relaxed,
+    );
+}
+
+pub(crate) fn memory_profile_totals() -> PhaseBaumMemoryProfile {
+    PhaseBaumMemoryProfile {
+        live_beta_cache_bytes: LIVE_BETA_CACHE_BYTES.load(DetailOrdering::Relaxed),
+        window_peak_live_beta_cache_bytes: WINDOW_PEAK_LIVE_BETA_CACHE_BYTES
+            .load(DetailOrdering::Relaxed),
+        process_peak_live_beta_cache_bytes: PEAK_LIVE_BETA_CACHE_BYTES
+            .load(DetailOrdering::Relaxed),
+        live_event_workspace_bytes: LIVE_EVENT_WORKSPACE_BYTES.load(DetailOrdering::Relaxed),
+        window_peak_live_event_workspace_bytes: WINDOW_PEAK_LIVE_EVENT_WORKSPACE_BYTES
+            .load(DetailOrdering::Relaxed),
+        process_peak_live_event_workspace_bytes: PEAK_LIVE_EVENT_WORKSPACE_BYTES
+            .load(DetailOrdering::Relaxed),
+        checkpointed_preparations: COUNT_CHECKPOINTED_PREPARATIONS.load(DetailOrdering::Relaxed),
+    }
+}
+
+#[inline]
+fn update_live_bytes(
+    tracked: &mut usize,
+    new_bytes: usize,
+    live: &DetailAtomicU64,
+    window_peak: &DetailAtomicU64,
+    process_peak: &DetailAtomicU64,
+) {
+    let old = *tracked;
+    if new_bytes == old {
+        return;
+    }
+    *tracked = new_bytes;
+    if new_bytes > old {
+        let delta = (new_bytes - old) as u64;
+        let current = live.fetch_add(delta, DetailOrdering::Relaxed) + delta;
+        window_peak.fetch_max(current, DetailOrdering::Relaxed);
+        process_peak.fetch_max(current, DetailOrdering::Relaxed);
+    } else {
+        let delta = (old - new_bytes) as u64;
+        live.fetch_sub(delta, DetailOrdering::Relaxed);
+    }
+}
+
+#[inline]
+fn vec_cap_bytes<T>(vec: &Vec<T>) -> usize {
+    vec.capacity().saturating_mul(std::mem::size_of::<T>())
+}
+
+fn packed_emission_scratch_bytes(scratch: &PackedPhaseEmissionScratch) -> usize {
+    vec_cap_bytes(&scratch.observed)
+        .saturating_add(vec_cap_bytes(&scratch.mismatched))
+        .saturating_add(
+            scratch
+                .target_observed
+                .iter()
+                .map(vec_cap_bytes)
+                .fold(0usize, usize::saturating_add),
+        )
+        .saturating_add(
+            scratch
+                .target_one
+                .iter()
+                .map(vec_cap_bytes)
+                .fold(0usize, usize::saturating_add),
+        )
+        .saturating_add(vec_cap_bytes(&scratch.donor_column))
+}
+
+fn parse_beta_cache_budget_mb(raw: &str) -> Option<usize> {
+    let mb = raw.trim().parse::<usize>().ok()?;
+    if mb == 0 {
+        None
+    } else {
+        mb.checked_mul(1024 * 1024)
+    }
+}
+
+fn phase_beta_cache_budget_bytes() -> Option<usize> {
+    std::env::var("JX_IMP_PHASE_BETA_BUDGET_MB")
+        .ok()
+        .and_then(|value| parse_beta_cache_budget_mb(&value))
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 struct PairedHmmTraceConfig {
@@ -226,11 +335,41 @@ pub(crate) struct PhaseBaumWorkspace {
     packed_emission_scratch: PackedPhaseEmissionScratch,
     slots: Vec<usize>,
     beta_cache: Vec<MaybeUninit<f32>>,
+    beta_checkpoints: Vec<MaybeUninit<f32>>,
     beta_local: Vec<f32>,
     beta_event_input: Vec<f32>,
     beta_event: Vec<f32>,
     alpha: Vec<f32>,
+    tracked_beta_bytes: usize,
+    tracked_event_workspace_bytes: usize,
+    tracked_scratch_bytes: usize,
     pub(crate) low_frequency_hmm: [HMMWorkspace; 2],
+}
+
+impl Drop for PhaseBaumWorkspace {
+    fn drop(&mut self) {
+        update_live_bytes(
+            &mut self.tracked_beta_bytes,
+            0,
+            &LIVE_BETA_CACHE_BYTES,
+            &WINDOW_PEAK_LIVE_BETA_CACHE_BYTES,
+            &PEAK_LIVE_BETA_CACHE_BYTES,
+        );
+        update_live_bytes(
+            &mut self.tracked_event_workspace_bytes,
+            0,
+            &LIVE_EVENT_WORKSPACE_BYTES,
+            &WINDOW_PEAK_LIVE_EVENT_WORKSPACE_BYTES,
+            &PEAK_LIVE_EVENT_WORKSPACE_BYTES,
+        );
+        update_live_bytes(
+            &mut self.tracked_scratch_bytes,
+            0,
+            &LIVE_EVENT_WORKSPACE_BYTES,
+            &WINDOW_PEAK_LIVE_EVENT_WORKSPACE_BYTES,
+            &PEAK_LIVE_EVENT_WORKSPACE_BYTES,
+        );
+    }
 }
 
 /// Compact per-sample PhaseBaum workspace. Beagle stores mismatch rows and
@@ -241,6 +380,7 @@ struct PreparedEventSample {
     trace_config: PairedHmmTraceConfig,
     avx2: bool,
     single_track: bool,
+    checkpointed: bool,
     complete_emissions: bool,
     clusters: Vec<PhaseCluster>,
     transitions: Vec<f32>,
@@ -249,6 +389,7 @@ struct PreparedEventSample {
     emission_probabilities: Vec<[f32; 2]>,
     slots: Vec<usize>,
     beta_cache: Vec<MaybeUninit<f32>>,
+    beta_checkpoints: Vec<MaybeUninit<f32>>,
     beta_local: Vec<f32>,
     beta_event_input: Vec<f32>,
     beta_event: Vec<f32>,
@@ -263,6 +404,27 @@ struct PreparedEventSample {
     unphased_heterozygote_count: usize,
     forward_cursor: usize,
     forward_active: bool,
+    tracked_beta_bytes: usize,
+    tracked_event_workspace_bytes: usize,
+}
+
+impl Drop for PreparedEventSample {
+    fn drop(&mut self) {
+        update_live_bytes(
+            &mut self.tracked_beta_bytes,
+            0,
+            &LIVE_BETA_CACHE_BYTES,
+            &WINDOW_PEAK_LIVE_BETA_CACHE_BYTES,
+            &PEAK_LIVE_BETA_CACHE_BYTES,
+        );
+        update_live_bytes(
+            &mut self.tracked_event_workspace_bytes,
+            0,
+            &LIVE_EVENT_WORKSPACE_BYTES,
+            &WINDOW_PEAK_LIVE_EVENT_WORKSPACE_BYTES,
+            &PEAK_LIVE_EVENT_WORKSPACE_BYTES,
+        );
+    }
 }
 
 /// A slash-separated heterozygote in the new part of a window activates
@@ -1085,10 +1247,14 @@ fn recycle_event_workspace(workspace: &mut PhaseBaumWorkspace, run: &mut Prepare
     workspace.emission_probabilities = std::mem::take(&mut run.emission_probabilities);
     workspace.slots = std::mem::take(&mut run.slots);
     workspace.beta_cache = std::mem::take(&mut run.beta_cache);
+    workspace.beta_checkpoints = std::mem::take(&mut run.beta_checkpoints);
     workspace.beta_local = std::mem::take(&mut run.beta_local);
     workspace.beta_event_input = std::mem::take(&mut run.beta_event_input);
     workspace.beta_event = std::mem::take(&mut run.beta_event);
     workspace.alpha = std::mem::take(&mut run.alpha);
+    workspace.tracked_beta_bytes = std::mem::replace(&mut run.tracked_beta_bytes, 0);
+    workspace.tracked_event_workspace_bytes =
+        std::mem::replace(&mut run.tracked_event_workspace_bytes, 0);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1156,6 +1322,53 @@ fn update_sample_pair_impl(
     workspace0: &mut PhaseBaumWorkspace,
     workspace1: &mut PhaseBaumWorkspace,
     collapse_equivalent_tracks: bool,
+) -> Result<(JointPhaseUpdate, JointPhaseUpdate), String> {
+    update_sample_pair_impl_with_budget(
+        input,
+        snapshot,
+        sample0,
+        sample1,
+        cluster_template0,
+        cluster_template1,
+        finished0,
+        finished1,
+        any_unphased_heterozygote,
+        masked_heterozygotes0,
+        masked_heterozygotes1,
+        panel0,
+        panel1,
+        packed_target,
+        transition_factors,
+        config,
+        workspace0,
+        workspace1,
+        collapse_equivalent_tracks,
+        phase_beta_cache_budget_bytes(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_sample_pair_impl_with_budget(
+    input: &PhaseWindow,
+    snapshot: &PhasedWindow,
+    sample0: usize,
+    sample1: usize,
+    cluster_template0: &PhaseClusterTemplate,
+    cluster_template1: &PhaseClusterTemplate,
+    finished0: &[u64],
+    finished1: &[u64],
+    any_unphased_heterozygote: bool,
+    masked_heterozygotes0: &[u64],
+    masked_heterozygotes1: &[u64],
+    panel0: &CompositePanel,
+    panel1: &CompositePanel,
+    packed_target: Option<&PackedHaplotypes>,
+    transition_factors: &[f32],
+    config: &HMMConfig,
+    workspace0: &mut PhaseBaumWorkspace,
+    workspace1: &mut PhaseBaumWorkspace,
+    collapse_equivalent_tracks: bool,
+    beta_cache_budget_bytes: Option<usize>,
 ) -> Result<(JointPhaseUpdate, JointPhaseUpdate), String> {
     let print_pair_detail =
         sample0 == 0 || std::env::var_os("JANUSX_IMP_PHASE_PAIR_PROFILE_ALL").is_some();
@@ -1293,7 +1506,7 @@ fn update_sample_pair_impl(
         PREPARE_TRANSITIONS_NANOS
             .fetch_add(started.elapsed().as_nanos() as u64, DetailOrdering::Relaxed);
     }
-    let mut run0 = prepare_event_sample_from_clusters(
+    let mut run0 = prepare_event_sample_from_clusters_with_budget(
         input,
         snapshot,
         sample0,
@@ -1304,8 +1517,9 @@ fn update_sample_pair_impl(
         packed_target,
         workspace0,
         collapse_equivalent_tracks,
+        beta_cache_budget_bytes,
     )?;
-    let mut run1 = prepare_event_sample_from_clusters(
+    let mut run1 = prepare_event_sample_from_clusters_with_budget(
         input,
         snapshot,
         sample1,
@@ -1316,6 +1530,7 @@ fn update_sample_pair_impl(
         packed_target,
         workspace1,
         collapse_equivalent_tracks,
+        beta_cache_budget_bytes,
     )?;
     let detail_prepared = detail_profile.then(Instant::now);
     let prepare_elapsed =
@@ -1409,6 +1624,7 @@ fn phase_transitions_into(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_event_sample_from_clusters(
     input: &PhaseWindow,
     snapshot: &PhasedWindow,
@@ -1420,6 +1636,35 @@ fn prepare_event_sample_from_clusters(
     packed_target: Option<&PackedHaplotypes>,
     workspace: &mut PhaseBaumWorkspace,
     collapse_equivalent_tracks: bool,
+) -> Result<PreparedEventSample, String> {
+    prepare_event_sample_from_clusters_with_budget(
+        input,
+        snapshot,
+        sample,
+        clusters,
+        transitions,
+        panel,
+        config,
+        packed_target,
+        workspace,
+        collapse_equivalent_tracks,
+        phase_beta_cache_budget_bytes(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_event_sample_from_clusters_with_budget(
+    input: &PhaseWindow,
+    snapshot: &PhasedWindow,
+    sample: usize,
+    clusters: Vec<PhaseCluster>,
+    transitions: Vec<f32>,
+    panel: &CompositePanel,
+    config: &HMMConfig,
+    packed_target: Option<&PackedHaplotypes>,
+    workspace: &mut PhaseBaumWorkspace,
+    collapse_equivalent_tracks: bool,
+    beta_cache_budget_bytes: Option<usize>,
 ) -> Result<PreparedEventSample, String> {
     let profile_started = (sample == 0
         && std::env::var_os("JANUSX_IMP_PHASE_DETAIL_PROFILE").is_some())
@@ -1537,20 +1782,57 @@ fn prepare_event_sample_from_clusters(
             needed_count += 1;
         }
     }
-    let mut beta_cache = std::mem::take(&mut workspace.beta_cache);
     let beta_cache_tracks_per_slot = if single_track { 1 } else { 2 };
     let beta_cache_values_per_slot = state_count
         .checked_mul(beta_cache_tracks_per_slot)
         .ok_or_else(|| "event HMM haplotype backward size overflow".to_owned())?;
-    let beta_cache_len = needed_count
+    let full_beta_cache_len = needed_count
         .checked_mul(beta_cache_values_per_slot)
         .ok_or_else(|| "event HMM backward size overflow".to_owned())?;
-    beta_cache.clear();
-    beta_cache.resize_with(beta_cache_len, MaybeUninit::uninit);
+    let full_beta_cache_bytes = full_beta_cache_len.saturating_mul(std::mem::size_of::<f32>());
+    let checkpointed = beta_cache_budget_bytes
+        .is_some_and(|budget| needed_count > 0 && full_beta_cache_bytes > budget);
+    let mut beta_cache = std::mem::take(&mut workspace.beta_cache);
+    let mut beta_checkpoints = std::mem::take(&mut workspace.beta_checkpoints);
+    if checkpointed {
+        let block_count = clusters.len().div_ceil(CHECKPOINT_STRIDE);
+        let mut max_block_slots = 0usize;
+        for block in 0..block_count {
+            let block_start = block * CHECKPOINT_STRIDE;
+            let block_end = ((block + 1) * CHECKPOINT_STRIDE).min(clusters.len());
+            let mut block_slot = 0usize;
+            for cluster_index in block_start..block_end {
+                if slots[cluster_index] != NO_EVENT_SLOT {
+                    slots[cluster_index] = block_slot;
+                    block_slot += 1;
+                }
+            }
+            max_block_slots = max_block_slots.max(block_slot);
+        }
+        let block_beta_cache_len = max_block_slots
+            .checked_mul(beta_cache_values_per_slot)
+            .ok_or_else(|| "event HMM block backward cache size overflow".to_owned())?;
+        let checkpoint_values_per_block = if single_track { state_count } else { track_values };
+        let checkpoint_len = block_count
+            .checked_mul(checkpoint_values_per_block)
+            .ok_or_else(|| "event HMM backward checkpoint size overflow".to_owned())?;
+        beta_cache.clear();
+        beta_cache.resize_with(block_beta_cache_len, MaybeUninit::uninit);
+        if beta_cache_budget_bytes.is_some_and(|budget| vec_cap_bytes(&beta_cache) > budget) {
+            beta_cache.shrink_to(block_beta_cache_len);
+        }
+        beta_checkpoints.clear();
+        beta_checkpoints.resize_with(checkpoint_len, MaybeUninit::uninit);
+        COUNT_CHECKPOINTED_PREPARATIONS.fetch_add(1, DetailOrdering::Relaxed);
+    } else {
+        beta_cache.clear();
+        beta_cache.resize_with(full_beta_cache_len, MaybeUninit::uninit);
+        beta_checkpoints.clear();
+        beta_checkpoints.shrink_to(0);
+    }
     if count_profiling_enabled() {
-        let bytes = beta_cache
-            .capacity()
-            .saturating_mul(std::mem::size_of::<f32>()) as u64;
+        let bytes = vec_cap_bytes(&beta_cache).saturating_add(vec_cap_bytes(&beta_checkpoints))
+            as u64;
         COUNT_BETA_CACHE_BYTES.fetch_add(bytes, DetailOrdering::Relaxed);
         PEAK_BETA_CACHE_BYTES.fetch_max(bytes, DetailOrdering::Relaxed);
         if single_track {
@@ -1573,6 +1855,42 @@ fn prepare_event_sample_from_clusters(
         .iter()
         .filter(|&&cluster| is_unphased_event(cluster))
         .count();
+    let scratch_bytes = packed_emission_scratch_bytes(&workspace.packed_emission_scratch);
+    update_live_bytes(
+        &mut workspace.tracked_scratch_bytes,
+        scratch_bytes,
+        &LIVE_EVENT_WORKSPACE_BYTES,
+        &WINDOW_PEAK_LIVE_EVENT_WORKSPACE_BYTES,
+        &PEAK_LIVE_EVENT_WORKSPACE_BYTES,
+    );
+    let mut tracked_beta_bytes = std::mem::replace(&mut workspace.tracked_beta_bytes, 0);
+    let mut tracked_event_workspace_bytes =
+        std::mem::replace(&mut workspace.tracked_event_workspace_bytes, 0);
+    let beta_bytes = vec_cap_bytes(&beta_cache).saturating_add(vec_cap_bytes(&beta_checkpoints));
+    let event_workspace_bytes = vec_cap_bytes(&clusters)
+        .saturating_add(vec_cap_bytes(&transitions))
+        .saturating_add(vec_cap_bytes(&emission_codes))
+        .saturating_add(vec_cap_bytes(&emission_code_offsets))
+        .saturating_add(vec_cap_bytes(&emission_probabilities))
+        .saturating_add(vec_cap_bytes(&slots))
+        .saturating_add(vec_cap_bytes(&beta_local))
+        .saturating_add(vec_cap_bytes(&beta_event_input))
+        .saturating_add(vec_cap_bytes(&beta_event))
+        .saturating_add(vec_cap_bytes(&alpha));
+    update_live_bytes(
+        &mut tracked_beta_bytes,
+        beta_bytes,
+        &LIVE_BETA_CACHE_BYTES,
+        &WINDOW_PEAK_LIVE_BETA_CACHE_BYTES,
+        &PEAK_LIVE_BETA_CACHE_BYTES,
+    );
+    update_live_bytes(
+        &mut tracked_event_workspace_bytes,
+        event_workspace_bytes,
+        &LIVE_EVENT_WORKSPACE_BYTES,
+        &WINDOW_PEAK_LIVE_EVENT_WORKSPACE_BYTES,
+        &PEAK_LIVE_EVENT_WORKSPACE_BYTES,
+    );
     if let Some(started) = workspace_started {
         PREPARE_WORKSPACE_NANOS
             .fetch_add(started.elapsed().as_nanos() as u64, DetailOrdering::Relaxed);
@@ -1596,6 +1914,7 @@ fn prepare_event_sample_from_clusters(
         trace_config: *paired_hmm_trace_config(),
         avx2: phase_avx2_available(),
         single_track,
+        checkpointed,
         complete_emissions: panel.haplotypes.is_complete(),
         backward_cursor: clusters.len() - 1,
         clusters,
@@ -1605,6 +1924,7 @@ fn prepare_event_sample_from_clusters(
         emission_probabilities,
         slots,
         beta_cache,
+        beta_checkpoints,
         beta_local,
         beta_event_input,
         beta_event,
@@ -1618,6 +1938,8 @@ fn prepare_event_sample_from_clusters(
         unphased_heterozygote_count,
         forward_cursor: 0,
         forward_active: true,
+        tracked_beta_bytes,
+        tracked_event_workspace_bytes,
     })
 }
 
@@ -1628,9 +1950,52 @@ fn backward_store_needed(run: &mut PreparedEventSample) {
         return;
     }
     let cluster_index = run.backward_cursor;
+    let cluster_count = run.clusters.len();
     let state_count = run.beta_local.len() / 3;
-    let cache_values = state_count * 2;
     let cluster = run.clusters[cluster_index];
+    if run.checkpointed {
+        let block = cluster_index / CHECKPOINT_STRIDE;
+        let block_end = ((block + 1) * CHECKPOINT_STRIDE).min(cluster_count) - 1;
+        if cluster_index == block_end {
+            let track_values = state_count * 3;
+            let checkpoint_offset = block * track_values;
+            // SAFETY: `beta_checkpoints` was sized to `block_count * 3 * state_count`
+            // and each block's right edge is visited once during the backward pass.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    run.beta_local.as_ptr(),
+                    run.beta_checkpoints
+                        .as_mut_ptr()
+                        .add(checkpoint_offset)
+                        .cast::<f32>(),
+                    track_values,
+                );
+            }
+        }
+        if is_unphased_event(cluster) {
+            run.beta_event_input.copy_from_slice(&run.beta_local);
+            if cluster_index + 1 < cluster_count
+                && is_unphased_event(run.clusters[cluster_index + 1])
+            {
+                copy_track(&mut run.beta_event_input, 0, 1, state_count);
+                copy_track(&mut run.beta_event_input, 0, 2, state_count);
+            }
+            let emission_offset = run.emission_code_offsets[cluster_index];
+            backward_project_event_from_codes_three(
+                &run.beta_event_input,
+                &mut run.beta_event,
+                &run.emission_codes,
+                emission_offset,
+                cluster.kind,
+                run.transitions[cluster_index],
+                run.emission_probabilities[cluster_index],
+                run.complete_emissions,
+                run.avx2,
+            );
+        }
+        return;
+    }
+    let cache_values = state_count * 2;
     let slot = run.slots[cluster_index];
     if slot == NO_EVENT_SLOT {
         return;
@@ -1650,8 +2015,7 @@ fn backward_store_needed(run: &mut PreparedEventSample) {
         return;
     }
     run.beta_event_input.copy_from_slice(&run.beta_local);
-    if cluster_index + 1 < run.clusters.len() && is_unphased_event(run.clusters[cluster_index + 1])
-    {
+    if cluster_index + 1 < cluster_count && is_unphased_event(run.clusters[cluster_index + 1]) {
         copy_track(&mut run.beta_event_input, 0, 1, state_count);
         copy_track(&mut run.beta_event_input, 0, 2, state_count);
     }
@@ -1680,7 +2044,28 @@ fn backward_store_needed(run: &mut PreparedEventSample) {
 #[inline]
 fn backward_store_single_track(run: &mut PreparedEventSample) {
     let cluster_index = run.backward_cursor;
+    let cluster_count = run.clusters.len();
     let state_count = run.beta_local.len() / 3;
+    if run.checkpointed {
+        let block = cluster_index / CHECKPOINT_STRIDE;
+        let block_end = ((block + 1) * CHECKPOINT_STRIDE).min(cluster_count) - 1;
+        if cluster_index == block_end {
+            let checkpoint_offset = block * state_count;
+            // SAFETY: `beta_checkpoints` was sized to `block_count * state_count`
+            // for single-track runs and each block edge is written once.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    run.beta_local.as_ptr(),
+                    run.beta_checkpoints
+                        .as_mut_ptr()
+                        .add(checkpoint_offset)
+                        .cast::<f32>(),
+                    state_count,
+                );
+            }
+        }
+        return;
+    }
     let slot = run.slots[cluster_index];
     if slot == NO_EVENT_SLOT {
         return;
@@ -1695,6 +2080,156 @@ fn backward_store_single_track(run: &mut PreparedEventSample) {
     unsafe {
         let destination = run.beta_cache.as_mut_ptr().add(offset).cast::<f32>();
         std::ptr::copy_nonoverlapping(run.beta_local.as_ptr(), destination, state_count);
+    }
+}
+
+#[inline]
+fn ensure_forward_block_ready(run: &mut PreparedEventSample) {
+    if run.checkpointed && run.forward_cursor % CHECKPOINT_STRIDE == 0 {
+        reconstruct_backward_block(run, run.forward_cursor / CHECKPOINT_STRIDE);
+    }
+}
+
+fn reconstruct_backward_block(run: &mut PreparedEventSample, block: usize) {
+    let cluster_count = run.clusters.len();
+    let block_start = block * CHECKPOINT_STRIDE;
+    let block_end_excl = ((block + 1) * CHECKPOINT_STRIDE).min(cluster_count);
+    if !run.slots[block_start..block_end_excl]
+        .iter()
+        .any(|&slot| slot != NO_EVENT_SLOT)
+    {
+        return;
+    }
+    let state_count = run.beta_local.len() / 3;
+    if run.single_track {
+        let checkpoint_offset = block * state_count;
+        // SAFETY: the full backward pass initialized every block checkpoint
+        // before the forward pass began.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                run.beta_checkpoints
+                    .as_ptr()
+                    .add(checkpoint_offset)
+                    .cast::<f32>(),
+                run.beta_local.as_mut_ptr(),
+                state_count,
+            );
+        }
+        duplicate_first_track(&mut run.beta_local, state_count);
+        for cluster_index in (block_start..block_end_excl).rev() {
+            let slot = run.slots[cluster_index];
+            if slot != NO_EVENT_SLOT {
+                let offset = slot * state_count;
+                // SAFETY: `beta_cache` holds `max_block_slots * state_count` values.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        run.beta_local.as_ptr(),
+                        run.beta_cache.as_mut_ptr().add(offset).cast::<f32>(),
+                        state_count,
+                    );
+                }
+            }
+            if cluster_index > block_start {
+                let cluster = run.clusters[cluster_index];
+                let emission_offset = run.emission_code_offsets[cluster_index];
+                backward_project_single_from_codes(
+                    &mut run.beta_local[..state_count],
+                    &run.emission_codes,
+                    emission_offset,
+                    cluster.kind,
+                    run.transitions[cluster_index],
+                    run.emission_probabilities[cluster_index],
+                    run.complete_emissions,
+                    run.avx2,
+                );
+                duplicate_first_track(&mut run.beta_local, state_count);
+            }
+        }
+        return;
+    }
+
+    let track_values = state_count * 3;
+    let cache_values = state_count * 2;
+    let checkpoint_offset = block * track_values;
+    // SAFETY: the full backward pass initialized every block checkpoint
+    // before the forward pass began.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            run.beta_checkpoints
+                .as_ptr()
+                .add(checkpoint_offset)
+                .cast::<f32>(),
+            run.beta_local.as_mut_ptr(),
+            track_values,
+        );
+    }
+    for cluster_index in (block_start..block_end_excl).rev() {
+        let cluster = run.clusters[cluster_index];
+        let slot = run.slots[cluster_index];
+        if slot != NO_EVENT_SLOT {
+            let offset = slot * cache_values;
+            if !is_unphased_event(cluster) {
+                // SAFETY: `beta_cache` holds `max_block_slots * 2 * state_count` values.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        run.beta_local.as_ptr().add(state_count),
+                        run.beta_cache.as_mut_ptr().add(offset).cast::<f32>(),
+                        cache_values,
+                    );
+                }
+            } else {
+                run.beta_event_input.copy_from_slice(&run.beta_local);
+                if cluster_index + 1 < cluster_count
+                    && is_unphased_event(run.clusters[cluster_index + 1])
+                {
+                    copy_track(&mut run.beta_event_input, 0, 1, state_count);
+                    copy_track(&mut run.beta_event_input, 0, 2, state_count);
+                }
+                let emission_offset = run.emission_code_offsets[cluster_index];
+                backward_project_event_from_codes_three(
+                    &run.beta_event_input,
+                    &mut run.beta_event,
+                    &run.emission_codes,
+                    emission_offset,
+                    cluster.kind,
+                    run.transitions[cluster_index],
+                    run.emission_probabilities[cluster_index],
+                    run.complete_emissions,
+                    run.avx2,
+                );
+                // SAFETY: see the non-event branch above.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        run.beta_event.as_ptr().add(state_count),
+                        run.beta_cache.as_mut_ptr().add(offset).cast::<f32>(),
+                        cache_values,
+                    );
+                }
+            }
+        }
+        if cluster_index + 1 < cluster_count
+            && is_unphased_event(run.clusters[cluster_index + 1])
+        {
+            copy_track(&mut run.beta_local, 0, 1, state_count);
+            copy_track(&mut run.beta_local, 0, 2, state_count);
+        }
+        if cluster_index > block_start {
+            if is_unphased_event(cluster) {
+                backward_apply_stored_event(run);
+            } else {
+                let emission_offset = run.emission_code_offsets[cluster_index];
+                backward_project_from_codes_three(
+                    &mut run.beta_local,
+                    &run.emission_codes,
+                    emission_offset,
+                    cluster.kind,
+                    run.transitions[cluster_index],
+                    run.emission_probabilities[cluster_index],
+                    run.complete_emissions,
+                    run.avx2,
+                );
+            }
+        }
     }
 }
 
@@ -2216,6 +2751,7 @@ fn run_forward_single(
     panel: &CompositePanel,
 ) -> Result<(), String> {
     while run.forward_active {
+        ensure_forward_block_ready(run);
         let confidence = forward_begin_cluster(run)?;
         let state_count = run.alpha.len() / 3;
         let cluster_kind = run.clusters[run.forward_cursor].kind;
@@ -2258,6 +2794,7 @@ fn run_forward_single_track(
 ) -> Result<(), String> {
     debug_assert!(run.single_track);
     while run.forward_active {
+        ensure_forward_block_ready(run);
         let state_count = run.alpha.len() / 3;
         let cluster = run.clusters[run.forward_cursor];
         let cluster_offset = run.emission_code_offsets[run.forward_cursor];
@@ -2293,6 +2830,8 @@ fn run_forward_pair_single_track(
 ) -> Result<(), String> {
     debug_assert!(run0.single_track && run1.single_track);
     while run0.forward_active && run1.forward_active {
+        ensure_forward_block_ready(run0);
+        ensure_forward_block_ready(run1);
         let states0 = run0.alpha.len() / 3;
         let states1 = run1.alpha.len() / 3;
         let cluster0 = run0.clusters[run0.forward_cursor];
@@ -2361,6 +2900,8 @@ fn run_forward_pair(
     panel1: &CompositePanel,
 ) -> Result<(), String> {
     while run0.forward_active && run1.forward_active {
+        ensure_forward_block_ready(run0);
+        ensure_forward_block_ready(run1);
         let confidence0 = forward_begin_cluster(run0)?;
         let confidence1 = forward_begin_cluster(run1)?;
         debug_assert_eq!(run0.alpha.len(), 3 * panel0.haplotypes.n_haplotypes);
@@ -5828,6 +6369,7 @@ mod tests {
                 trace_config: Default::default(),
                 avx2: false,
                 single_track: false,
+                checkpointed: false,
                 complete_emissions: false,
                 clusters,
                 transitions: vec![0.0, 0.2, 0.15, 0.05],
@@ -5845,6 +6387,7 @@ mod tests {
                 emission_probabilities: vec![[0.99, 0.01]; 4],
                 slots: vec![NO_EVENT_SLOT, 0, 1, NO_EVENT_SLOT],
                 beta_cache: vec![MaybeUninit::uninit(); 2 * 2 * STATES],
+                beta_checkpoints: Vec::new(),
                 beta_local: vec![1.0f32 / STATES as f32; 3 * STATES],
                 beta_event_input: vec![0.0; 3 * STATES],
                 beta_event: vec![0.0; 3 * STATES],
@@ -5859,6 +6402,8 @@ mod tests {
                 unphased_heterozygote_count: 1,
                 forward_cursor: 0,
                 forward_active: true,
+                tracked_beta_bytes: 0,
+                tracked_event_workspace_bytes: 0,
             }
         };
         let cache = |run: &PreparedEventSample| {
@@ -7588,5 +8133,346 @@ mod tests {
         assert!(update.phase_confidences[0].1.is_finite());
         assert_eq!(trace[0].emission_probabilities, vec![vec![0.99, 0.99]; 3]);
         assert_eq!(trace[0].phase_swap, Some(true));
+    }
+
+    #[test]
+    fn beta_cache_budget_env_parser_handles_disabled_and_positive_mb() {
+        assert_eq!(super::parse_beta_cache_budget_mb("0"), None);
+        assert_eq!(super::parse_beta_cache_budget_mb(" 0 "), None);
+        assert_eq!(super::parse_beta_cache_budget_mb(""), None);
+        assert_eq!(super::parse_beta_cache_budget_mb("invalid"), None);
+        assert_eq!(
+            super::parse_beta_cache_budget_mb("32"),
+            Some(32 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn checkpointed_beta_cache_matches_full_cache_bitwise_single_and_three_track() {
+        const MARKERS: usize = 600;
+        const STATES: usize = 8;
+
+        let make_panel = |seed: usize| {
+            let mut haplotypes = PackedHaplotypes::empty_state_major(STATES, MARKERS, 1).unwrap();
+            for marker in 0..MARKERS {
+                for state in 0..STATES {
+                    let allele = (((marker * 7 + state * 13 + seed * 3) / 5) % 2) as u16;
+                    haplotypes.set_allele(marker, state, Some(allele)).unwrap();
+                }
+            }
+            haplotypes.mark_complete();
+            CompositePanel {
+                haplotypes,
+                source_samples: vec![2; STATES],
+                marker_indices: (0..MARKERS).collect(),
+                allele_counts: vec![2; MARKERS],
+            }
+        };
+
+        // Case 1: single-track (homozygous + missing across CHECKPOINT_STRIDE=256 boundaries)
+        // Case 2: three-track (unphased het, consecutive unphased het across 255/256, masked het, missing)
+        for three_track in [false, true] {
+            let mut masked0 = vec![0u64; MARKERS.div_ceil(64)];
+            let mut masked1 = vec![0u64; MARKERS.div_ceil(64)];
+            let rows = (0..MARKERS)
+                .map(|marker| {
+                    let call0 = if !three_track {
+                        if marker % 5 == 0 {
+                            let a = ((marker / 5) % 2) as u16;
+                            DiploidCall {
+                                alleles: [Some(a), Some(a)],
+                                phased: false,
+                            }
+                        } else {
+                            DiploidCall::missing(false)
+                        }
+                    } else if matches!(marker, 2 | 120 | 255 | 256 | 257 | 511 | 512) {
+                        DiploidCall {
+                            alleles: [Some(0), Some(1)],
+                            phased: false,
+                        }
+                    } else if marker == 258 {
+                        masked0[marker / 64] |= 1u64 << (marker % 64);
+                        DiploidCall {
+                            alleles: [Some(0), Some(1)],
+                            phased: false,
+                        }
+                    } else if marker % 4 == 0 {
+                        let a = ((marker / 4) % 2) as u16;
+                        DiploidCall {
+                            alleles: [Some(a), Some(a)],
+                            phased: false,
+                        }
+                    } else {
+                        DiploidCall::missing(false)
+                    };
+                    let call1 = if !three_track {
+                        if marker % 7 == 0 {
+                            let a = ((marker / 7) % 2) as u16;
+                            DiploidCall {
+                                alleles: [Some(a), Some(a)],
+                                phased: false,
+                            }
+                        } else {
+                            DiploidCall::missing(false)
+                        }
+                    } else if matches!(marker, 3 | 254 | 255 | 256 | 400 | 512) {
+                        DiploidCall {
+                            alleles: [Some(0), Some(1)],
+                            phased: false,
+                        }
+                    } else if marker == 257 {
+                        masked1[marker / 64] |= 1u64 << (marker % 64);
+                        DiploidCall {
+                            alleles: [Some(0), Some(1)],
+                            phased: false,
+                        }
+                    } else if marker % 6 == 0 {
+                        let a = ((marker / 6) % 2) as u16;
+                        DiploidCall {
+                            alleles: [Some(a), Some(a)],
+                            phased: false,
+                        }
+                    } else {
+                        DiploidCall::missing(false)
+                    };
+                    VariantRow {
+                        meta: VariantMeta {
+                            chrom: "1".to_owned(),
+                            pos: marker as u64 + 1,
+                            id: format!("v{marker}"),
+                            ref_allele: "A".to_owned(),
+                            alt_alleles: vec!["G".to_owned()],
+                        },
+                        calls: DiploidCalls::from_calls(vec![call0, call1]),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let input = PhaseWindow {
+                chrom: "1".to_owned(),
+                index: 0,
+                rows,
+                cm_positions: (0..MARKERS).map(|m| m as f64 * 0.01).collect(),
+                incoming_overlap_len: 0,
+                emit_start: 0,
+                emit_end: MARKERS,
+            };
+            let snapshot = PhasedWindow {
+                chrom: input.chrom.clone(),
+                index: input.index,
+                rows: input
+                    .rows
+                    .iter()
+                    .map(|row| PhasedRow {
+                        meta: row.meta.clone(),
+                        calls: DiploidCalls::from_calls(
+                            row.calls
+                                .iter()
+                                .map(|call| DiploidCall {
+                                    alleles: call.alleles.map(|a| a.or(Some(0))),
+                                    phased: true,
+                                })
+                                .collect(),
+                        ),
+                        dosage: None,
+                        ap1: None,
+                        ap2: None,
+                        gp: None,
+                        info_af: None,
+                        info_dr2: None,
+                        imputed: false,
+                    })
+                    .collect(),
+                emit_start: 0,
+                emit_end: MARKERS,
+            };
+            let packed_target = PackedHaplotypes::complete_biallelic_state_major(&snapshot)
+                .unwrap()
+                .unwrap();
+            let panel0 = make_panel(0);
+            let panel1 = make_panel(1);
+            let template0 = build_cluster_template(&input, 0).unwrap();
+            let template1 = build_cluster_template(&input, 1).unwrap();
+            let finished = vec![0u64; MARKERS.div_ceil(64)];
+            let config = HMMConfig {
+                ne: 1_000,
+                recombination_intensity: 5.0,
+                err: 0.01,
+                em: false,
+                burnin: 1,
+                iterations: 1,
+                initial_lr: 100_000.0,
+                phase_states: STATES,
+                haplotype_count: 16,
+            };
+            let transition_factors = marker_no_recombination_probabilities(
+                &input.cm_positions,
+                config.recombination_intensity,
+            )
+            .unwrap();
+
+            let mut full_ws0 = PhaseBaumWorkspace::default();
+            let mut full_ws1 = PhaseBaumWorkspace::default();
+            let (full0, full1) = super::update_sample_pair_impl_with_budget(
+                &input,
+                &snapshot,
+                0,
+                1,
+                &template0,
+                &template1,
+                &finished,
+                &finished,
+                three_track,
+                &masked0,
+                &masked1,
+                &panel0,
+                &panel1,
+                Some(&packed_target),
+                &transition_factors,
+                &config,
+                &mut full_ws0,
+                &mut full_ws1,
+                true,
+                None,
+            )
+            .unwrap();
+
+            let mut ckpt_ws0 = PhaseBaumWorkspace::default();
+            let mut ckpt_ws1 = PhaseBaumWorkspace::default();
+            let (ckpt0, ckpt1) = super::update_sample_pair_impl_with_budget(
+                &input,
+                &snapshot,
+                0,
+                1,
+                &template0,
+                &template1,
+                &finished,
+                &finished,
+                three_track,
+                &masked0,
+                &masked1,
+                &panel0,
+                &panel1,
+                Some(&packed_target),
+                &transition_factors,
+                &config,
+                &mut ckpt_ws0,
+                &mut ckpt_ws1,
+                true,
+                Some(1),
+            )
+            .unwrap();
+
+            for (full, ckpt) in [(&full0, &ckpt0), (&full1, &ckpt1)] {
+                assert_eq!(ckpt.changes, full.changes);
+                assert_eq!(ckpt.phase_swap_count, full.phase_swap_count);
+                assert_eq!(
+                    ckpt.unphased_heterozygote_count,
+                    full.unphased_heterozygote_count
+                );
+                assert_eq!(ckpt.phase_confidences.len(), full.phase_confidences.len());
+                for ((m_c, c_c), (m_f, c_f)) in
+                    ckpt.phase_confidences.iter().zip(&full.phase_confidences)
+                {
+                    assert_eq!(m_c, m_f);
+                    assert_eq!(c_c.to_bits(), c_f.to_bits());
+                }
+            }
+
+            let full_beta_bytes = full_ws0.tracked_beta_bytes;
+            let ckpt_beta_bytes = ckpt_ws0.tracked_beta_bytes;
+            assert!(
+                ckpt_beta_bytes < full_beta_bytes,
+                "checkpointed beta storage ({ckpt_beta_bytes} B) should be smaller than full ({full_beta_bytes} B) for three_track={three_track}"
+            );
+            assert!(full_ws0.tracked_event_workspace_bytes > 0);
+            assert!(ckpt_ws0.tracked_event_workspace_bytes > 0);
+            let mem_while_alive = super::memory_profile_totals();
+            assert!(mem_while_alive.process_peak_live_beta_cache_bytes >= full_beta_bytes as u64);
+            assert!(mem_while_alive.window_peak_live_beta_cache_bytes >= full_beta_bytes as u64);
+            assert!(mem_while_alive.process_peak_live_event_workspace_bytes > 0);
+            assert!(mem_while_alive.window_peak_live_event_workspace_bytes > 0);
+
+            // Reusing a workspace previously grown for full cache must shrink below full size
+            // when a tight budget is enabled dynamically.
+            let _ = super::update_sample_pair_impl_with_budget(
+                &input,
+                &snapshot,
+                0,
+                1,
+                &template0,
+                &template1,
+                &finished,
+                &finished,
+                three_track,
+                &masked0,
+                &masked1,
+                &panel0,
+                &panel1,
+                Some(&packed_target),
+                &transition_factors,
+                &config,
+                &mut full_ws0,
+                &mut full_ws1,
+                true,
+                Some(1),
+            )
+            .unwrap();
+            assert!(
+                full_ws0.tracked_beta_bytes < full_beta_bytes,
+                "recycled workspace beta storage ({} B) should shrink below previous full cache ({full_beta_bytes} B) when checkpoint budget is enabled",
+                full_ws0.tracked_beta_bytes
+            );
+
+            // Reusing a checkpointed workspace after disabling the budget must release
+            // beta_checkpoints capacity and drop it from tracked_beta_bytes.
+            assert!(ckpt_ws0.beta_checkpoints.capacity() > 0);
+            let (reverted0, reverted1) = super::update_sample_pair_impl_with_budget(
+                &input,
+                &snapshot,
+                0,
+                1,
+                &template0,
+                &template1,
+                &finished,
+                &finished,
+                three_track,
+                &masked0,
+                &masked1,
+                &panel0,
+                &panel1,
+                Some(&packed_target),
+                &transition_factors,
+                &config,
+                &mut ckpt_ws0,
+                &mut ckpt_ws1,
+                true,
+                None,
+            )
+            .unwrap();
+            assert_eq!(ckpt_ws0.beta_checkpoints.capacity(), 0);
+            assert_eq!(ckpt_ws1.beta_checkpoints.capacity(), 0);
+            assert_eq!(
+                ckpt_ws0.tracked_beta_bytes,
+                super::vec_cap_bytes(&ckpt_ws0.beta_cache)
+            );
+            assert_eq!(reverted0.changes, full0.changes);
+            assert_eq!(reverted1.changes, full1.changes);
+
+            super::reset_window_memory_peaks();
+            let after_reset = super::memory_profile_totals();
+            assert!(
+                after_reset.window_peak_live_beta_cache_bytes >= after_reset.live_beta_cache_bytes
+            );
+            assert!(
+                after_reset.process_peak_live_beta_cache_bytes
+                    >= after_reset.window_peak_live_beta_cache_bytes
+            );
+
+            drop(full_ws0);
+            drop(full_ws1);
+            drop(ckpt_ws0);
+            drop(ckpt_ws1);
+        }
     }
 }

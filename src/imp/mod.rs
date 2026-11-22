@@ -32,6 +32,24 @@ use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+fn stage_timestamp_enabled() -> bool {
+    std::env::var_os("JANUSX_IMP_HMM_PROFILE").is_some()
+        || std::env::var_os("JANUSX_IMP_STAGE_PROFILE").is_some()
+}
+
+fn emit_stage_timestamp(stage: &str, chrom: &str, window_index: u64, run_started: Instant) {
+    if !stage_timestamp_enabled() {
+        return;
+    }
+    let unix_s = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |duration| duration.as_secs_f64());
+    eprintln!(
+        "JANUSX_IMP_STAGE_TIMESTAMP stage={stage} window={chrom}:{window_index} unix_s={unix_s:.6} run_elapsed_s={:.6}",
+        run_started.elapsed().as_secs_f64()
+    );
+}
+
 struct ReferenceWindowStream {
     reader: crate::imp_reader::ImpReader,
     map: window::GeneticMap,
@@ -142,6 +160,7 @@ impl PostPhasePipeline {
         writer: ImpOutputWriter,
         path: &Path,
         completed_rows: Arc<AtomicU64>,
+        run_started: Instant,
     ) -> Result<Self, String> {
         let path = path.to_path_buf();
         let (sender, receiver) = mpsc::sync_channel::<PostPhaseRequest>(1);
@@ -165,7 +184,7 @@ impl PostPhasePipeline {
                         last_pool = Some(Arc::clone(worker_pool));
                     }
                     let started = profile.then(Instant::now);
-                    process_post_phase_job(&mut writer, job, &completed_rows)?;
+                    process_post_phase_job(&mut writer, job, &completed_rows, run_started)?;
                     if let Some(done) = done {
                         let _ = done.send(());
                     }
@@ -254,6 +273,7 @@ fn process_post_phase_job(
     writer: &mut ImpOutputWriter,
     job: PostPhaseJob,
     completed_rows: &AtomicU64,
+    run_started: Instant,
 ) -> Result<(), String> {
     match job {
         PostPhaseJob::Impute {
@@ -274,6 +294,7 @@ fn process_post_phase_job(
             imputation_hmm_config.err = imputation_error;
             let profile = std::env::var_os("JANUSX_IMP_VCF_PROFILE").is_some();
             let profile_window = format!("{}:{}", window.chrom, window.index);
+            emit_stage_timestamp("impute_start", &window.chrom, window.index, run_started);
             let job_started = profile.then(Instant::now);
             let impute_started = profile.then(Instant::now);
             let mut selection_elapsed = Duration::ZERO;
@@ -312,6 +333,7 @@ fn process_post_phase_job(
                     Ok(())
                 },
             )?;
+            emit_stage_timestamp("impute_end", &window.chrom, window.index, run_started);
             let impute_elapsed = impute_started
                 .map_or(Duration::ZERO, |started| started.elapsed())
                 .saturating_sub(selection_elapsed)
@@ -1230,6 +1252,7 @@ fn run_to_output<F>(
 where
     F: FnMut(&ImpProgress) -> Result<(), String>,
 {
+    let run_started = Instant::now();
     let imputation_error = f64::from(phase_config.hmm.err as f32);
     let profile_windows = std::env::var_os("JANUSX_IMP_HMM_PROFILE").is_some();
     let force_normal_phasing = std::env::var("JX_IMP_DISABLE_DIRECT_IMPUTE")
@@ -1263,6 +1286,7 @@ where
         )?,
         output_path,
         Arc::clone(&completed_rows),
+        run_started,
     )?;
     let mut summary = ImpSummary {
         variants_written: 0,
@@ -1797,6 +1821,7 @@ where
                 summary.variants_written,
                 samples.len(),
             )?;
+            emit_stage_timestamp("phase_start", &window.chrom, window.index, run_started);
             summary.normal_phasing_windows = summary.normal_phasing_windows.saturating_add(1);
             std::mem::swap(&mut window.cm_positions, &mut phase_cm_positions);
             let phase_result = {
@@ -1835,6 +1860,7 @@ where
                 }
             };
             std::mem::swap(&mut window.cm_positions, &mut phase_cm_positions);
+            emit_stage_timestamp("phase_end", &window.chrom, window.index, run_started);
             phase_result?
         };
         drop(carrier_window_storage);
@@ -2545,7 +2571,8 @@ mod tests {
         .unwrap();
         let completed_rows = Arc::new(AtomicU64::new(0));
         let writer =
-            PostPhasePipeline::start(writer, &output, Arc::clone(&completed_rows)).unwrap();
+            PostPhasePipeline::start(writer, &output, Arc::clone(&completed_rows), Instant::now())
+                .unwrap();
         let pool = Arc::new(
             rayon::ThreadPoolBuilder::new()
                 .num_threads(2)

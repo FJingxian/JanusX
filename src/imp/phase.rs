@@ -937,6 +937,8 @@ fn phase_window_prepared_impl(
     let prepare_detail_start = phase_baum::prepare_detail_profile_nanos();
     let mosaic_detail_start = composite::mosaic_detail_profile_nanos();
     let phase_count_profile_start = phase_baum::count_profile_totals();
+    phase_baum::reset_window_memory_peaks();
+    let phase_memory_profile_start = phase_baum::memory_profile_totals();
     let mut initialize_elapsed = Duration::ZERO;
     let mut low_frequency_elapsed = Duration::ZERO;
     let mut em_initialize_elapsed = Duration::ZERO;
@@ -2058,8 +2060,12 @@ fn phase_window_prepared_impl(
         let phase_haplotype_state_updates = count_deltas[3];
         let phase_forward_track_state_updates = phase_haplotype_state_updates.saturating_mul(3);
         let phase_backward_track_state_updates = phase_haplotype_state_updates.saturating_mul(3);
+        let memory_profile = phase_baum::memory_profile_totals();
+        let checkpointed_preparations = memory_profile
+            .checkpointed_preparations
+            .saturating_sub(phase_memory_profile_start.checkpointed_preparations);
         eprintln!(
-            "JANUSX_IMP_PHASE_COUNTS_PROFILE window={}:{} sample_updates={} clusters={} states={} state_cluster_updates={phase_haplotype_state_updates} phase_haplotype_state_updates={phase_haplotype_state_updates} phase_forward_track_state_updates={phase_forward_track_state_updates} phase_backward_track_state_updates={phase_backward_track_state_updates} unphased_events={} missing_or_masked={} missing_events={} masked_heterozygote_events={} emission_rows={} beta_cache_allocated_bytes={} process_peak_beta_cache_bytes={} single_track_preparations={}",
+            "JANUSX_IMP_PHASE_COUNTS_PROFILE window={}:{} sample_updates={} clusters={} states={} state_cluster_updates={phase_haplotype_state_updates} phase_haplotype_state_updates={phase_haplotype_state_updates} phase_forward_track_state_updates={phase_forward_track_state_updates} phase_backward_track_state_updates={phase_backward_track_state_updates} unphased_events={} missing_or_masked={} missing_events={} masked_heterozygote_events={} emission_rows={} beta_cache_allocated_bytes={} process_peak_beta_cache_bytes={} single_track_preparations={} window_aggregate_peak_beta_cache_bytes={} process_aggregate_peak_beta_cache_bytes={} aggregate_live_beta_cache_bytes={} window_aggregate_peak_event_workspace_bytes={} process_aggregate_peak_event_workspace_bytes={} aggregate_live_event_workspace_bytes={} checkpointed_preparations={}",
             target_window.chrom,
             target_window.index,
             count_deltas[0],
@@ -2073,6 +2079,13 @@ fn phase_window_prepared_impl(
             count_deltas[9],
             count_totals[10],
             count_deltas[11],
+            memory_profile.window_peak_live_beta_cache_bytes,
+            memory_profile.process_peak_live_beta_cache_bytes,
+            memory_profile.live_beta_cache_bytes,
+            memory_profile.window_peak_live_event_workspace_bytes,
+            memory_profile.process_peak_live_event_workspace_bytes,
+            memory_profile.live_event_workspace_bytes,
+            checkpointed_preparations,
         );
     }
     Ok((current, hmm_config, parameter_trace, hmm_trace))

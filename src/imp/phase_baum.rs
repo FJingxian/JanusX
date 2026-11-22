@@ -124,19 +124,23 @@ fn packed_emission_scratch_bytes(scratch: &PackedPhaseEmissionScratch) -> usize 
         .saturating_add(vec_cap_bytes(&scratch.donor_column))
 }
 
-fn parse_beta_cache_budget_mb(raw: &str) -> Option<usize> {
-    let mb = raw.trim().parse::<usize>().ok()?;
+const DEFAULT_PHASE_BETA_CACHE_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+
+fn parse_beta_cache_budget_mb(raw: &str) -> Result<Option<usize>, ()> {
+    let mb = raw.trim().parse::<usize>().map_err(|_| ())?;
     if mb == 0 {
-        None
+        Ok(None)
     } else {
-        mb.checked_mul(1024 * 1024)
+        mb.checked_mul(1024 * 1024).map(Some).ok_or(())
     }
 }
 
 fn phase_beta_cache_budget_bytes() -> Option<usize> {
-    std::env::var("JX_IMP_PHASE_BETA_BUDGET_MB")
-        .ok()
-        .and_then(|value| parse_beta_cache_budget_mb(&value))
+    match std::env::var("JX_IMP_PHASE_BETA_BUDGET_MB") {
+        Ok(value) => parse_beta_cache_budget_mb(&value)
+            .unwrap_or(Some(DEFAULT_PHASE_BETA_CACHE_BUDGET_BYTES)),
+        Err(_) => Some(DEFAULT_PHASE_BETA_CACHE_BUDGET_BYTES),
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -8137,13 +8141,13 @@ mod tests {
 
     #[test]
     fn beta_cache_budget_env_parser_handles_disabled_and_positive_mb() {
-        assert_eq!(super::parse_beta_cache_budget_mb("0"), None);
-        assert_eq!(super::parse_beta_cache_budget_mb(" 0 "), None);
-        assert_eq!(super::parse_beta_cache_budget_mb(""), None);
-        assert_eq!(super::parse_beta_cache_budget_mb("invalid"), None);
+        assert_eq!(super::parse_beta_cache_budget_mb("0"), Ok(None));
+        assert_eq!(super::parse_beta_cache_budget_mb(" 0 "), Ok(None));
+        assert_eq!(super::parse_beta_cache_budget_mb(""), Err(()));
+        assert_eq!(super::parse_beta_cache_budget_mb("invalid"), Err(()));
         assert_eq!(
             super::parse_beta_cache_budget_mb("32"),
-            Some(32 * 1024 * 1024)
+            Ok(Some(32 * 1024 * 1024))
         );
     }
 

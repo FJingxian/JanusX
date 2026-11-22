@@ -4,6 +4,7 @@ use super::types::{
     read_bit_chunk, CompositePanel, HMMConfig, HMMParameterStats, HMMWorkspace, PackedHaplotypes,
     PosteriorWindow,
 };
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -2155,6 +2156,63 @@ fn paired_mismatch_fill_emissions(
 }
 
 #[allow(clippy::too_many_arguments)]
+const STAGE2_FORWARD_CHECKPOINT_STRIDE: usize = 256;
+const DEFAULT_STAGE2_FORWARD_BUDGET_BYTES: usize = 16 * 1024 * 1024;
+
+static STAGE2_FORWARD_CALLS: AtomicU64 = AtomicU64::new(0);
+static STAGE2_FORWARD_CHECKPOINTED_CALLS: AtomicU64 = AtomicU64::new(0);
+static STAGE2_FORWARD_MAX_SELECTED_MARKERS: AtomicU64 = AtomicU64::new(0);
+static STAGE2_FORWARD_MAX_STATES: AtomicU64 = AtomicU64::new(0);
+static STAGE2_FORWARD_MAX_FULL_BYTES: AtomicU64 = AtomicU64::new(0);
+static STAGE2_FORWARD_MAX_ACTIVE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Stage2ForwardProfile {
+    pub(crate) calls: u64,
+    pub(crate) checkpointed_calls: u64,
+    pub(crate) max_selected_markers: u64,
+    pub(crate) max_states: u64,
+    pub(crate) max_full_forward_bytes: u64,
+    pub(crate) max_active_forward_bytes: u64,
+    pub(crate) budget_bytes: Option<usize>,
+}
+
+pub(crate) fn reset_stage2_forward_profile_peaks() {
+    STAGE2_FORWARD_MAX_SELECTED_MARKERS.store(0, AtomicOrdering::Relaxed);
+    STAGE2_FORWARD_MAX_STATES.store(0, AtomicOrdering::Relaxed);
+    STAGE2_FORWARD_MAX_FULL_BYTES.store(0, AtomicOrdering::Relaxed);
+    STAGE2_FORWARD_MAX_ACTIVE_BYTES.store(0, AtomicOrdering::Relaxed);
+}
+
+pub(crate) fn stage2_forward_profile_totals() -> Stage2ForwardProfile {
+    Stage2ForwardProfile {
+        calls: STAGE2_FORWARD_CALLS.load(AtomicOrdering::Relaxed),
+        checkpointed_calls: STAGE2_FORWARD_CHECKPOINTED_CALLS.load(AtomicOrdering::Relaxed),
+        max_selected_markers: STAGE2_FORWARD_MAX_SELECTED_MARKERS.load(AtomicOrdering::Relaxed),
+        max_states: STAGE2_FORWARD_MAX_STATES.load(AtomicOrdering::Relaxed),
+        max_full_forward_bytes: STAGE2_FORWARD_MAX_FULL_BYTES.load(AtomicOrdering::Relaxed),
+        max_active_forward_bytes: STAGE2_FORWARD_MAX_ACTIVE_BYTES.load(AtomicOrdering::Relaxed),
+        budget_bytes: stage2_forward_budget_bytes(),
+    }
+}
+
+fn parse_stage2_forward_budget_mb(raw: &str) -> Result<Option<usize>, ()> {
+    let mb = raw.trim().parse::<usize>().map_err(|_| ())?;
+    if mb == 0 {
+        Ok(None)
+    } else {
+        mb.checked_mul(1024 * 1024).map(Some).ok_or(())
+    }
+}
+
+fn stage2_forward_budget_bytes() -> Option<usize> {
+    match std::env::var("JX_IMP_STAGE2_FORWARD_BUDGET_MB") {
+        Ok(value) => parse_stage2_forward_budget_mb(&value)
+            .unwrap_or(Some(DEFAULT_STAGE2_FORWARD_BUDGET_BYTES)),
+        Err(_) => Some(DEFAULT_STAGE2_FORWARD_BUDGET_BYTES),
+    }
+}
+
 fn forward_backward_selected_states_pair_impl<F>(
     observations0: &PackedHaplotypes,
     states0: &CompositePanel,
@@ -2166,6 +2224,38 @@ fn forward_backward_selected_states_pair_impl<F>(
     scratch1: &mut HMMWorkspace,
     selected_markers: &[usize],
     state_callback: &mut F,
+) -> Result<PosteriorWindow, String>
+where
+    F: FnMut(usize, &[f32], &[f32]) -> Result<(), String>,
+{
+    forward_backward_selected_states_pair_impl_with_budget(
+        observations0,
+        states0,
+        observations1,
+        states1,
+        cm_positions,
+        config,
+        scratch0,
+        scratch1,
+        selected_markers,
+        state_callback,
+        stage2_forward_budget_bytes(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_backward_selected_states_pair_impl_with_budget<F>(
+    observations0: &PackedHaplotypes,
+    states0: &CompositePanel,
+    observations1: &PackedHaplotypes,
+    states1: &CompositePanel,
+    cm_positions: &[f64],
+    config: &HMMConfig,
+    scratch0: &mut HMMWorkspace,
+    scratch1: &mut HMMWorkspace,
+    selected_markers: &[usize],
+    state_callback: &mut F,
+    forward_budget_bytes: Option<usize>,
 ) -> Result<PosteriorWindow, String>
 where
     F: FnMut(usize, &[f32], &[f32]) -> Result<(), String>,
@@ -2238,19 +2328,128 @@ where
     }
     paired_initialize_forward(observations0, states0, &allele_counts0, config, scratch0);
     paired_initialize_forward(observations1, states1, &allele_counts1, config, scratch1);
-    scratch0
+    let full_forward_bytes0 = selected_markers
+        .len()
+        .saturating_mul(states_count0)
+        .saturating_mul(std::mem::size_of::<f32>());
+    let full_forward_bytes1 = selected_markers
+        .len()
+        .saturating_mul(states_count1)
+        .saturating_mul(std::mem::size_of::<f32>());
+    let checkpointed = forward_budget_bytes.is_some_and(|budget| {
+        n_markers > STAGE2_FORWARD_CHECKPOINT_STRIDE
+            && !selected_markers.is_empty()
+            && full_forward_bytes0.max(full_forward_bytes1) > budget
+    });
+    let mut checkpoint_sums = Vec::new();
+    if checkpointed {
+        let block_count = n_markers.div_ceil(STAGE2_FORWARD_CHECKPOINT_STRIDE);
+        let checkpoint_len0 = block_count
+            .checked_mul(states_count0)
+            .ok_or_else(|| "paired selected HMM checkpoint size overflow".to_owned())?;
+        let checkpoint_len1 = block_count
+            .checked_mul(states_count1)
+            .ok_or_else(|| "paired selected HMM checkpoint size overflow".to_owned())?;
+        scratch0.checkpoint_values.resize(checkpoint_len0, 0.0);
+        scratch1.checkpoint_values.resize(checkpoint_len1, 0.0);
+        checkpoint_sums.resize(block_count, (0.0f32, 0.0f32));
+        let mut max_block_selected = 0usize;
+        let mut sel_idx = 0usize;
+        while sel_idx < selected_markers.len() {
+            let block = selected_markers[sel_idx] / STAGE2_FORWARD_CHECKPOINT_STRIDE;
+            let block_end = (block + 1).saturating_mul(STAGE2_FORWARD_CHECKPOINT_STRIDE);
+            let mut count = 0usize;
+            while sel_idx < selected_markers.len() && selected_markers[sel_idx] < block_end {
+                count += 1;
+                sel_idx += 1;
+            }
+            max_block_selected = max_block_selected.max(count);
+        }
+        let block_forward_len0 = max_block_selected
+            .checked_mul(states_count0)
+            .ok_or_else(|| "paired selected HMM block forward-cache size overflow".to_owned())?;
+        let block_forward_len1 = max_block_selected
+            .checked_mul(states_count1)
+            .ok_or_else(|| "paired selected HMM block forward-cache size overflow".to_owned())?;
+        scratch0
+            .selected_forward_values
+            .resize(block_forward_len0, 0.0);
+        scratch1
+            .selected_forward_values
+            .resize(block_forward_len1, 0.0);
+        if forward_budget_bytes.is_some_and(|budget| {
+            scratch0
+                .selected_forward_values
+                .capacity()
+                .saturating_mul(std::mem::size_of::<f32>())
+                > budget
+        }) {
+            scratch0
+                .selected_forward_values
+                .shrink_to(block_forward_len0);
+        }
+        if forward_budget_bytes.is_some_and(|budget| {
+            scratch1
+                .selected_forward_values
+                .capacity()
+                .saturating_mul(std::mem::size_of::<f32>())
+                > budget
+        }) {
+            scratch1
+                .selected_forward_values
+                .shrink_to(block_forward_len1);
+        }
+    } else {
+        scratch0.checkpoint_values.clear();
+        scratch0.checkpoint_values.shrink_to(0);
+        scratch1.checkpoint_values.clear();
+        scratch1.checkpoint_values.shrink_to(0);
+        scratch0
+            .selected_forward_values
+            .resize(selected_markers.len() * states_count0, 0.0);
+        scratch1
+            .selected_forward_values
+            .resize(selected_markers.len() * states_count1, 0.0);
+    }
+    STAGE2_FORWARD_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+    if checkpointed {
+        STAGE2_FORWARD_CHECKPOINTED_CALLS.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+    STAGE2_FORWARD_MAX_SELECTED_MARKERS
+        .fetch_max(selected_markers.len() as u64, AtomicOrdering::Relaxed);
+    STAGE2_FORWARD_MAX_STATES.fetch_max(
+        states_count0.max(states_count1) as u64,
+        AtomicOrdering::Relaxed,
+    );
+    STAGE2_FORWARD_MAX_FULL_BYTES.fetch_max(
+        full_forward_bytes0.max(full_forward_bytes1) as u64,
+        AtomicOrdering::Relaxed,
+    );
+    let active_bytes0 = scratch0
         .selected_forward_values
-        .resize(selected_markers.len() * states_count0, 0.0);
-    scratch1
+        .capacity()
+        .saturating_add(scratch0.checkpoint_values.capacity())
+        .saturating_mul(std::mem::size_of::<f32>());
+    let active_bytes1 = scratch1
         .selected_forward_values
-        .resize(selected_markers.len() * states_count1, 0.0);
+        .capacity()
+        .saturating_add(scratch1.checkpoint_values.capacity())
+        .saturating_mul(std::mem::size_of::<f32>());
+    STAGE2_FORWARD_MAX_ACTIVE_BYTES.fetch_max(
+        active_bytes0.max(active_bytes1) as u64,
+        AtomicOrdering::Relaxed,
+    );
     let forward_started = Instant::now();
     let mut sums0 = (
         scratch0.forward.iter().sum::<f32>(),
         scratch1.forward.iter().sum::<f32>(),
     );
     let mut selected_forward_index = 0usize;
-    if selected_markers.first() == Some(&0) {
+    if checkpointed {
+        scratch0.checkpoint_values[0..states_count0].copy_from_slice(&scratch0.forward);
+        scratch1.checkpoint_values[0..states_count1].copy_from_slice(&scratch1.forward);
+        checkpoint_sums[0] = sums0;
+    } else if selected_markers.first() == Some(&0) {
         paired_store_selected_forward(scratch0, selected_forward_index, states_count0)?;
         paired_store_selected_forward(scratch1, selected_forward_index, states_count1)?;
         selected_forward_index += 1;
@@ -2289,49 +2488,124 @@ where
             &mut missing_row_words1,
         )?;
         sums0 = paired_sum_lanes(&scratch0.forward, &scratch1.forward);
-        if selected_markers.get(selected_forward_index) == Some(&marker) {
+        if checkpointed {
+            if marker % STAGE2_FORWARD_CHECKPOINT_STRIDE == 0 {
+                let block = marker / STAGE2_FORWARD_CHECKPOINT_STRIDE;
+                let start0 = block * states_count0;
+                let start1 = block * states_count1;
+                scratch0.checkpoint_values[start0..start0 + states_count0]
+                    .copy_from_slice(&scratch0.forward);
+                scratch1.checkpoint_values[start1..start1 + states_count1]
+                    .copy_from_slice(&scratch1.forward);
+                checkpoint_sums[block] = sums0;
+            }
+        } else if selected_markers.get(selected_forward_index) == Some(&marker) {
             paired_store_selected_forward(scratch0, selected_forward_index, states_count0)?;
             paired_store_selected_forward(scratch1, selected_forward_index, states_count1)?;
             selected_forward_index += 1;
         }
     }
-    debug_assert_eq!(selected_forward_index, selected_markers.len());
+    if !checkpointed {
+        debug_assert_eq!(selected_forward_index, selected_markers.len());
+    }
     let forward_elapsed = forward_started.elapsed();
 
     let backward_started = Instant::now();
     scratch0.backward.fill(1.0);
     scratch1.backward.fill(1.0);
     let mut selected_backward_index = selected_markers.len().checked_sub(1);
+    let mut loaded_block: Option<usize> = None;
+    let mut loaded_block_selected_start = 0usize;
     let mut callback_elapsed = Duration::ZERO;
     for marker in (0..n_markers).rev() {
-        paired_fill_emissions(
-            observations0,
-            states0,
-            &allele_counts0,
-            config,
-            &mut scratch0.emission_block,
-            marker,
-            complete_state_major0,
-            &mut allele_row_words0,
-            &mut missing_row_words0,
-        )?;
-        paired_fill_emissions(
-            observations1,
-            states1,
-            &allele_counts1,
-            config,
-            &mut scratch1.emission_block,
-            marker,
-            complete_state_major1,
-            &mut allele_row_words1,
-            &mut missing_row_words1,
-        )?;
         let emit_this_state =
             selected_backward_index.is_some_and(|index| selected_markers[index] == marker);
         if emit_this_state {
             let index = selected_backward_index.unwrap();
-            paired_selected_posterior(scratch0, states_count0, index, marker)?;
-            paired_selected_posterior(scratch1, states_count1, index, marker)?;
+            let forward_slot = if checkpointed {
+                let block = marker / STAGE2_FORWARD_CHECKPOINT_STRIDE;
+                if loaded_block != Some(block) {
+                    let block_start = block * STAGE2_FORWARD_CHECKPOINT_STRIDE;
+                    let block_end = (block_start + STAGE2_FORWARD_CHECKPOINT_STRIDE).min(n_markers);
+                    let sel_start = selected_markers.partition_point(|&m| m < block_start);
+                    let sel_end = selected_markers.partition_point(|&m| m < block_end);
+                    debug_assert!(sel_start < sel_end);
+                    let start0 = block * states_count0;
+                    let start1 = block * states_count1;
+                    scratch0.forward.copy_from_slice(
+                        &scratch0.checkpoint_values[start0..start0 + states_count0],
+                    );
+                    scratch1.forward.copy_from_slice(
+                        &scratch1.checkpoint_values[start1..start1 + states_count1],
+                    );
+                    let mut block_sums = checkpoint_sums[block];
+                    let mut sel_cursor = sel_start;
+                    if selected_markers[sel_cursor] == block_start {
+                        paired_store_selected_forward(
+                            scratch0,
+                            sel_cursor - sel_start,
+                            states_count0,
+                        )?;
+                        paired_store_selected_forward(
+                            scratch1,
+                            sel_cursor - sel_start,
+                            states_count1,
+                        )?;
+                        sel_cursor += 1;
+                    }
+                    let replay_end = selected_markers[sel_end - 1] + 1;
+                    for replay_marker in (block_start + 1)..replay_end {
+                        paired_transition_forward(
+                            observations0,
+                            states0,
+                            &allele_counts0,
+                            config,
+                            scratch0,
+                            replay_marker,
+                            scratch0.transition_probabilities[replay_marker],
+                            block_sums.0,
+                            complete_state_major0,
+                            &mut allele_row_words0,
+                            &mut missing_row_words0,
+                        )?;
+                        paired_transition_forward(
+                            observations1,
+                            states1,
+                            &allele_counts1,
+                            config,
+                            scratch1,
+                            replay_marker,
+                            scratch1.transition_probabilities[replay_marker],
+                            block_sums.1,
+                            complete_state_major1,
+                            &mut allele_row_words1,
+                            &mut missing_row_words1,
+                        )?;
+                        block_sums = paired_sum_lanes(&scratch0.forward, &scratch1.forward);
+                        if sel_cursor < sel_end && selected_markers[sel_cursor] == replay_marker {
+                            paired_store_selected_forward(
+                                scratch0,
+                                sel_cursor - sel_start,
+                                states_count0,
+                            )?;
+                            paired_store_selected_forward(
+                                scratch1,
+                                sel_cursor - sel_start,
+                                states_count1,
+                            )?;
+                            sel_cursor += 1;
+                        }
+                    }
+                    debug_assert_eq!(sel_cursor, sel_end);
+                    loaded_block = Some(block);
+                    loaded_block_selected_start = sel_start;
+                }
+                index - loaded_block_selected_start
+            } else {
+                index
+            };
+            paired_selected_posterior(scratch0, states_count0, forward_slot, marker)?;
+            paired_selected_posterior(scratch1, states_count1, forward_slot, marker)?;
             if profile_hmm {
                 let callback_started = Instant::now();
                 state_callback(marker, &scratch0.state_posterior, &scratch1.state_posterior)?;
@@ -2343,6 +2617,28 @@ where
                 selected_backward_index.and_then(|index| index.checked_sub(1));
         }
         if marker > 0 {
+            paired_fill_emissions(
+                observations0,
+                states0,
+                &allele_counts0,
+                config,
+                &mut scratch0.emission_block,
+                marker,
+                complete_state_major0,
+                &mut allele_row_words0,
+                &mut missing_row_words0,
+            )?;
+            paired_fill_emissions(
+                observations1,
+                states1,
+                &allele_counts1,
+                config,
+                &mut scratch1.emission_block,
+                marker,
+                complete_state_major1,
+                &mut allele_row_words1,
+                &mut missing_row_words1,
+            )?;
             let switch0 = scratch0.transition_probabilities[marker];
             let switch1 = scratch1.transition_probabilities[marker];
             paired_backward_update(
@@ -6446,5 +6742,153 @@ mod tests {
                 "states={state_count}"
             );
         }
+    }
+
+    #[test]
+    fn stage2_checkpointed_selected_forward_matches_full_bitwise_and_manages_capacity() {
+        const MARKERS: usize = 600;
+        const STATES: usize = 8;
+
+        let make_panel = |seed: usize| {
+            let mut haplotypes = PackedHaplotypes::empty_state_major(STATES, MARKERS, 1).unwrap();
+            for marker in 0..MARKERS {
+                for state in 0..STATES {
+                    let allele = (((marker * 7 + state * 11 + seed * 5) / 3) % 2) as u16;
+                    haplotypes.set_allele(marker, state, Some(allele)).unwrap();
+                }
+            }
+            haplotypes.mark_complete();
+            CompositePanel {
+                haplotypes,
+                source_samples: vec![0; STATES],
+                marker_indices: (0..MARKERS).collect(),
+                allele_counts: vec![2; MARKERS],
+            }
+        };
+        let make_obs = |seed: usize| {
+            let mut obs = PackedHaplotypes::empty_state_major(1, MARKERS, 1).unwrap();
+            for marker in 0..MARKERS {
+                let allele = if marker % 9 == 0 {
+                    None
+                } else {
+                    Some((((marker * 5 + seed * 3) / 4) % 2) as u16)
+                };
+                obs.set_allele(marker, 0, allele).unwrap();
+            }
+            obs
+        };
+
+        let panel0 = make_panel(1);
+        let panel1 = make_panel(2);
+        let obs0 = make_obs(3);
+        let obs1 = make_obs(4);
+        let cm_positions = (0..MARKERS).map(|m| m as f64 * 0.01).collect::<Vec<_>>();
+        let config = HMMConfig {
+            ne: 1000,
+            recombination_intensity: 0.04,
+            err: 0.001,
+            em: false,
+            burnin: 1,
+            iterations: 1,
+            initial_lr: 100_000.0,
+            phase_states: STATES,
+            haplotype_count: 100,
+        };
+        // Cover block 0 start (0), interior, block boundaries (255/256, 511/512), and tail (599).
+        let selected_markers = vec![0, 1, 17, 128, 255, 256, 257, 400, 511, 512, 599];
+
+        let mut full_ws0 = HMMWorkspace::default();
+        let mut full_ws1 = HMMWorkspace::default();
+        let mut full_out = Vec::new();
+        super::forward_backward_selected_states_pair_impl_with_budget(
+            &obs0,
+            &panel0,
+            &obs1,
+            &panel1,
+            &cm_positions,
+            &config,
+            &mut full_ws0,
+            &mut full_ws1,
+            &selected_markers,
+            &mut |marker, p0, p1| {
+                full_out.push((marker, p0.to_vec(), p1.to_vec()));
+                Ok(())
+            },
+            None,
+        )
+        .unwrap();
+        let full_cap = full_ws0.selected_forward_values.capacity();
+        assert!(full_cap >= selected_markers.len() * STATES);
+        assert_eq!(full_ws0.checkpoint_values.capacity(), 0);
+
+        let mut ckpt_ws0 = HMMWorkspace::default();
+        let mut ckpt_ws1 = HMMWorkspace::default();
+        let mut ckpt_out = Vec::new();
+        super::forward_backward_selected_states_pair_impl_with_budget(
+            &obs0,
+            &panel0,
+            &obs1,
+            &panel1,
+            &cm_positions,
+            &config,
+            &mut ckpt_ws0,
+            &mut ckpt_ws1,
+            &selected_markers,
+            &mut |marker, p0, p1| {
+                ckpt_out.push((marker, p0.to_vec(), p1.to_vec()));
+                Ok(())
+            },
+            Some(1),
+        )
+        .unwrap();
+        assert_eq!(ckpt_out.len(), full_out.len());
+        for ((m_c, p0_c, p1_c), (m_f, p0_f, p1_f)) in ckpt_out.iter().zip(&full_out) {
+            assert_eq!(m_c, m_f);
+            assert_eq!(
+                p0_c.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                p0_f.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                p1_c.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                p1_f.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+        }
+        assert!(ckpt_ws0.selected_forward_values.capacity() < full_cap);
+        assert!(ckpt_ws0.checkpoint_values.capacity() > 0);
+
+        // Full -> checkpointed must shrink selected_forward_values below full capacity.
+        super::forward_backward_selected_states_pair_impl_with_budget(
+            &obs0,
+            &panel0,
+            &obs1,
+            &panel1,
+            &cm_positions,
+            &config,
+            &mut full_ws0,
+            &mut full_ws1,
+            &selected_markers,
+            &mut |_, _, _| Ok(()),
+            Some(1),
+        )
+        .unwrap();
+        assert!(full_ws0.selected_forward_values.capacity() < full_cap);
+
+        // Checkpointed -> full must release checkpoint_values capacity.
+        super::forward_backward_selected_states_pair_impl_with_budget(
+            &obs0,
+            &panel0,
+            &obs1,
+            &panel1,
+            &cm_positions,
+            &config,
+            &mut ckpt_ws0,
+            &mut ckpt_ws1,
+            &selected_markers,
+            &mut |_, _, _| Ok(()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(ckpt_ws0.checkpoint_values.capacity(), 0);
+        assert_eq!(ckpt_ws1.checkpoint_values.capacity(), 0);
     }
 }

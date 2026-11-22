@@ -887,23 +887,23 @@ fn phase_window_prepared_impl(
     {
         return Err("carrier-count window does not match the phase window".to_owned());
     }
-    let (reference_phase_storage, precomputed_low_frequency) = if let Some(pre) = prepacked_reference
-    {
-        (
-            Some((pre.packed, pre.target_samples, pre.reference_present)),
-            Some(pre.low_frequency_data),
-        )
-    } else {
-        (
-            reference_window
-                .zip(reference_alignment)
-                .map(|(reference, alignment)| {
-                    with_reference_haplotypes_aligned(target_window, reference, alignment)
-                })
-                .transpose()?,
-            None,
-        )
-    };
+    let (reference_phase_storage, precomputed_low_frequency) =
+        if let Some(pre) = prepacked_reference {
+            (
+                Some((pre.packed, pre.target_samples, pre.reference_present)),
+                Some(pre.low_frequency_data),
+            )
+        } else {
+            (
+                reference_window
+                    .zip(reference_alignment)
+                    .map(|(reference, alignment)| {
+                        with_reference_haplotypes_aligned(target_window, reference, alignment)
+                    })
+                    .transpose()?,
+                None,
+            )
+        };
     let target_only_samples = target_window.rows[0].calls.len();
     let (reference_packed, target_samples, reference_present) = if reference_phase_storage
         .as_ref()
@@ -1719,7 +1719,20 @@ fn phase_window_prepared_impl(
             .iter()
             .filter(|plan| plan.anchor_markers.is_empty())
             .count();
+        let stage2_stage_profile = std::env::var_os("JANUSX_IMP_HMM_PROFILE").is_some()
+            || std::env::var_os("JANUSX_IMP_STAGE_PROFILE").is_some();
+        hmm::reset_stage2_forward_profile_peaks();
+        let stage2_forward_start = hmm::stage2_forward_profile_totals();
         if stage2_unresolved_samples > 0 {
+            if stage2_stage_profile {
+                let unix_s = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0.0, |duration| duration.as_secs_f64());
+                eprintln!(
+                    "JANUSX_IMP_STAGE_TIMESTAMP stage=stage2_start window={}:{} unix_s={unix_s:.6}",
+                    target_window.chrom, target_window.index
+                );
+            }
             let snapshot = PhasedWindow {
                 chrom: current.chrom.clone(),
                 index: current.index,
@@ -1844,6 +1857,32 @@ fn phase_window_prepared_impl(
                 emit_end,
             };
             stage2_apply_elapsed += apply_started.map_or(Duration::ZERO, |start| start.elapsed());
+            if stage2_stage_profile {
+                let unix_s = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0.0, |duration| duration.as_secs_f64());
+                eprintln!(
+                    "JANUSX_IMP_STAGE_TIMESTAMP stage=stage2_end window={}:{} unix_s={unix_s:.6}",
+                    target_window.chrom, target_window.index
+                );
+                let stage2_forward = hmm::stage2_forward_profile_totals();
+                eprintln!(
+                    "JANUSX_IMP_STAGE2_FORWARD_PROFILE window={}:{} calls={} checkpointed_calls={} budget_bytes={} max_selected_markers={} max_states={} max_full_forward_bytes={} max_active_forward_bytes={}",
+                    target_window.chrom,
+                    target_window.index,
+                    stage2_forward
+                        .calls
+                        .saturating_sub(stage2_forward_start.calls),
+                    stage2_forward
+                        .checkpointed_calls
+                        .saturating_sub(stage2_forward_start.checkpointed_calls),
+                    stage2_forward.budget_bytes.unwrap_or(0),
+                    stage2_forward.max_selected_markers,
+                    stage2_forward.max_states,
+                    stage2_forward.max_full_forward_bytes,
+                    stage2_forward.max_active_forward_bytes,
+                );
+            }
         }
         stage2_elapsed += stage2_started.map_or(Duration::ZERO, |start| start.elapsed());
         if profile {
@@ -3154,8 +3193,7 @@ fn low_frequency_haplotype_marginals(
                 .expect("validated Stage2 anchors belong to the Stage1 marker set")
         })
         .collect::<Vec<_>>();
-    let donor_haplotypes =
-        donor_haplotypes_at_anchors(donor_segments, &sparse_plan.anchor_markers, state_count);
+    let mut donor_cursor = Stage2DonorCursor::new(donor_segments, state_count);
     // The HMM emits posterior vectors from right to left while unwinding its
     // backward recursion. Keep the right anchor and wait for the next (left)
     // anchor so each Stage2 target uses its adjacent Stage1 markers.
@@ -3170,24 +3208,8 @@ fn low_frequency_haplotype_marginals(
         |hmm_marker, state_probabilities| {
             let anchor_index = stage2_anchor_index(&selected_hmm_markers, hmm_marker)
                 .expect("HMM callback marker belongs to the selected Stage2 anchors");
-            let donor_start = anchor_index
-                .checked_mul(state_count)
-                .ok_or_else(|| "Stage2 donor-table offset overflow".to_owned())?;
-            let donor_end = donor_start
-                .checked_add(state_count)
-                .ok_or_else(|| "Stage2 donor-table end overflow".to_owned())?;
-            let donor_haplotypes =
-                donor_haplotypes
-                    .get(donor_start..donor_end)
-                    .ok_or_else(|| {
-                        format!(
-                            "Stage2 donor-table slice {}..{} is outside length {}",
-                            donor_start,
-                            donor_end,
-                            donor_haplotypes.len()
-                        )
-                    })?;
             let left_marker = stage1_marker_indices[hmm_marker];
+            let donor_haplotypes = donor_cursor.row_for_anchor(left_marker);
             if let Some((_, right_marker, right_probabilities)) = right_anchor.as_ref() {
                 // The interval is left-closed/right-open: a Stage1 marker is
                 // evaluated with its own state vector, and becomes the left
@@ -3253,8 +3275,9 @@ fn low_frequency_haplotype_marginals(
             Ok(())
         },
     )?;
-    if let Some((first_anchor_index, first_marker, first_probabilities)) = right_anchor {
+    if let Some((_first_anchor_index, first_marker, first_probabilities)) = right_anchor {
         // Markers preceding the first Stage1 marker use the first posterior.
+        let first_donor_row = donor_cursor.row_for_anchor(first_marker);
         let end = sparse_plan
             .unresolved_markers
             .partition_point(|&marker| marker < first_marker);
@@ -3268,8 +3291,7 @@ fn low_frequency_haplotype_marginals(
                 &first_probabilities,
                 1.0,
                 0.0,
-                &donor_haplotypes
-                    [first_anchor_index * state_count..(first_anchor_index + 1) * state_count],
+                first_donor_row,
                 low_frequency_mask,
                 low_frequency_allele_flags,
                 false,
@@ -3285,26 +3307,6 @@ fn low_frequency_haplotype_marginals(
     Ok(LowFrequencyAlleleMarginals {
         values: marginals,
         offsets,
-    })
-}
-
-#[inline]
-fn stage2_donor_row(
-    donor_haplotypes: &[usize],
-    anchor_index: usize,
-    state_count: usize,
-) -> Result<&[usize], String> {
-    let start = anchor_index
-        .checked_mul(state_count)
-        .ok_or_else(|| "Stage2 donor-table offset overflow".to_owned())?;
-    let end = start
-        .checked_add(state_count)
-        .ok_or_else(|| "Stage2 donor-table end overflow".to_owned())?;
-    donor_haplotypes.get(start..end).ok_or_else(|| {
-        format!(
-            "Stage2 donor-table slice {start}..{end} is outside length {}",
-            donor_haplotypes.len()
-        )
     })
 }
 
@@ -3387,10 +3389,8 @@ fn low_frequency_haplotype_marginals_pair(
                 .expect("validated Stage2 anchors belong to the Stage1 marker set")
         })
         .collect::<Vec<_>>();
-    let donor_haplotypes0 =
-        donor_haplotypes_at_anchors(donor_segments0, &sparse_plan.anchor_markers, state_count0);
-    let donor_haplotypes1 =
-        donor_haplotypes_at_anchors(donor_segments1, &sparse_plan.anchor_markers, state_count1);
+    let mut donor_cursor0 = Stage2DonorCursor::new(donor_segments0, state_count0);
+    let mut donor_cursor1 = Stage2DonorCursor::new(donor_segments1, state_count1);
     // Callbacks arrive in decreasing marker order. One buffer per haplotype
     // holds the current right anchor and is overwritten bit-for-bit after the
     // interpolation interval has been accumulated.
@@ -3416,9 +3416,9 @@ fn low_frequency_haplotype_marginals_pair(
         let anchor_profile_started = callback_profile.then(Instant::now);
         let anchor_index = stage2_anchor_index(&selected_hmm_markers, hmm_marker)
             .expect("HMM callback marker belongs to the selected Stage2 anchors");
-        let donor_row0 = stage2_donor_row(&donor_haplotypes0, anchor_index, state_count0)?;
-        let donor_row1 = stage2_donor_row(&donor_haplotypes1, anchor_index, state_count1)?;
         let left_marker = stage1_marker_indices[hmm_marker];
+        let donor_row0 = donor_cursor0.row_for_anchor(left_marker);
+        let donor_row1 = donor_cursor1.row_for_anchor(left_marker);
         if let Some(started) = anchor_profile_started {
             STAGE2_CALLBACK_ANCHOR_NANOS
                 .fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -3612,21 +3612,15 @@ fn low_frequency_haplotype_marginals_pair(
         }
     };
     if let (
-        Some((first_anchor_index0, first_marker0)),
-        Some((first_anchor_index1, first_marker1)),
+        Some((_first_anchor_index0, first_marker0)),
+        Some((_first_anchor_index1, first_marker1)),
     ) = (right_anchor0, right_anchor1)
     {
         if first_marker0 != first_marker1 {
             return Err("paired Stage2 first-anchor markers differ".to_owned());
         }
-        let offset0 = first_anchor_index0 * state_count0;
-        let offset1 = first_anchor_index1 * state_count1;
-        let donor_row0 = donor_haplotypes0
-            .get(offset0..offset0 + state_count0)
-            .ok_or_else(|| "paired Stage2 left donor row is out of range".to_owned())?;
-        let donor_row1 = donor_haplotypes1
-            .get(offset1..offset1 + state_count1)
-            .ok_or_else(|| "paired Stage2 right donor row is out of range".to_owned())?;
+        let donor_row0 = donor_cursor0.row_for_anchor(first_marker0);
+        let donor_row1 = donor_cursor1.row_for_anchor(first_marker1);
         let interval_profile_started = callback_profile.then(Instant::now);
         let end = sparse_plan
             .unresolved_markers
@@ -4000,6 +3994,59 @@ fn accumulate_low_frequency_alleles(
         offsets,
         marginal_values,
     );
+}
+
+struct Stage2DonorCursor<'a> {
+    donor_segments: &'a [Vec<composite::DonorHapSegment>],
+    segment_cursors: Vec<usize>,
+    row: Vec<usize>,
+    last_anchor: Option<usize>,
+}
+
+impl<'a> Stage2DonorCursor<'a> {
+    fn new(donor_segments: &'a [Vec<composite::DonorHapSegment>], state_count: usize) -> Self {
+        debug_assert_eq!(donor_segments.len(), state_count);
+        let segment_cursors = donor_segments.iter().map(Vec::len).collect();
+        Self {
+            donor_segments,
+            segment_cursors,
+            row: vec![usize::MAX; state_count],
+            last_anchor: None,
+        }
+    }
+
+    fn row_for_anchor(&mut self, anchor: usize) -> &[usize] {
+        if self.last_anchor == Some(anchor) {
+            return &self.row;
+        }
+        if self.last_anchor.is_some_and(|prev| anchor > prev) {
+            for (cursor, segments) in self.segment_cursors.iter_mut().zip(self.donor_segments) {
+                *cursor = segments.len();
+            }
+        }
+        for ((cursor, segments), slot) in self
+            .segment_cursors
+            .iter_mut()
+            .zip(self.donor_segments)
+            .zip(self.row.iter_mut())
+        {
+            while *cursor > 0 && segments[*cursor - 1].start_marker > anchor {
+                *cursor -= 1;
+            }
+            *slot = if *cursor > 0 {
+                let segment = &segments[*cursor - 1];
+                if anchor < segment.end_marker {
+                    segment.donor_haplotype
+                } else {
+                    usize::MAX
+                }
+            } else {
+                usize::MAX
+            };
+        }
+        self.last_anchor = Some(anchor);
+        &self.row
+    }
 }
 
 fn donor_haplotypes_at_anchors(
@@ -6118,6 +6165,16 @@ mod tests {
         ];
         let anchors = [0, 3, 4, 8, 9];
         let table = donor_haplotypes_at_anchors(&segments, &anchors, segments.len());
+        let mut cursor = super::Stage2DonorCursor::new(&segments, segments.len());
+        for (anchor_index, &anchor) in anchors.iter().enumerate().rev() {
+            let row = cursor.row_for_anchor(anchor);
+            assert_eq!(
+                row,
+                &table[anchor_index * segments.len()..(anchor_index + 1) * segments.len()]
+            );
+        }
+        // Repeated query for the leftmost anchor (used for prefix unresolved markers) is idempotent.
+        assert_eq!(cursor.row_for_anchor(anchors[0]), &table[0..segments.len()]);
         for (anchor_index, &anchor) in anchors.iter().enumerate() {
             for (state, state_segments) in segments.iter().enumerate() {
                 assert_eq!(

@@ -53,8 +53,6 @@ Use these modules as the main public surface:
 | `janusx.pyBLUP.bayes` | `BayesA`, `BayesB`, `BayesC`, `BayesR`, `BAYES` | Bayesian GS imports live here, not at `janusx.pyBLUP` top level |
 | `janusx.gtools` | GFF/BED readers and region queries | annotation-centric helpers |
 | `janusx.bioplotkit` | GWAS, PCA, GS, and structure plots | some helpers live in submodules rather than the top-level export list |
-| `janusx.pipeline` | `fastq2vcf` / `fastq2count` compatibility checks | preflight only |
-| `janusx.ui` | parser/server entrypoints for the web UI | integration-oriented |
 | `janusx.janusx` | native Rust extension | backend diagnostics and advanced calls; lower-level than the wrapper API |
 
 Avoid importing `janusx.assoc.workflow` and `janusx.gs.workflow` directly for ordinary use. The wrapper packages above are the safer API layer.
@@ -347,19 +345,7 @@ from janusx.bioplotkit.gsplot import plot_accuracy_runtime_scatter
 
 Top-level `janusx.bioplotkit` exports the most common entrypoints, but some plotting helpers still live in submodules.
 
-## 7. Pipeline checks and web entrypoints
-
-```python
-from janusx.pipeline import run_fastq2vcf_checks, run_fastq2count_checks, format_report
-from janusx.ui import build_parser, main
-
-print(format_report(run_fastq2vcf_checks()))
-print(format_report(run_fastq2count_checks()))
-```
-
-Use `janusx.pipeline` for environment compatibility checks. Use `janusx.ui` when embedding or extending the web interface entrypoint.
-
-## 8. CLI-to-Python mapping
+## 7. CLI-to-Python mapping
 
 | CLI module | Recommended Python entry |
 | --- | --- |
@@ -369,9 +355,8 @@ Use `janusx.pipeline` for environment compatibility checks. Use `janusx.ui` when
 | `jx gmerge` | `janusx.gfreader.gmerge.merge` |
 | `jx grm` | CLI recommended for file-backed runs; `janusx.pyBLUP.GRM` or `QK` for in-memory matrices |
 | `jx pca` | `janusx.pyBLUP.QK.PCA()`, or plotting helpers, depending on the workflow |
-| `jx fastq2vcf` / `jx fastq2count` | `janusx.pipeline.run_fastq2vcf_checks`, `run_fastq2count_checks` |
 
-## 9. Practical notes
+## 8. Practical notes
 
 - Keep sample alignment explicit. The safest order is the sample order returned by `inspect_genotype_file()`.
 - Remember the orientation split: file-backed streams are SNP-major; `LinearModel` matrix-mode is easiest with sample-major input.

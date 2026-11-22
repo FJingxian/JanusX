@@ -1,4 +1,5 @@
 import argparse
+from dataclasses import dataclass
 import gzip
 import json
 import logging
@@ -93,25 +94,128 @@ from janusx.script._common.threads import (
 from janusx.assoc.workflow_ui import _emit_plain_info_line, _rich_success
 from janusx.assoc.workflow_ui import _run_fastplot_from_tsv_with_status
 from janusx.pyBLUP.assoc import FvLMM
-from janusx.script.fvlmm2 import (
-    _decode_rows as _fvlmm2_decode_rows,
-    _load_active_sites as _fvlmm2_load_active_sites,
-)
 
 
 try:
     from janusx.janusx import (
+        bed_packed_decode_rows_f32,
         finalize_max6_genotype_universe,
         garfield_logic_search_bed,
+        load_bim_columns,
         prepare_max6_genotype_tags,
     )
 except Exception as _exc:  # pragma: no cover
+    bed_packed_decode_rows_f32 = None  # type: ignore[assignment]
     garfield_logic_search_bed = None  # type: ignore[assignment]
     finalize_max6_genotype_universe = None  # type: ignore[assignment]
+    load_bim_columns = None  # type: ignore[assignment]
     prepare_max6_genotype_tags = None  # type: ignore[assignment]
     _RUST_IMPORT_ERROR = _exc
 else:
     _RUST_IMPORT_ERROR = None
+
+
+@dataclass(frozen=True)
+class _GarfieldActiveSite:
+    local_row: int
+    source_row: int
+    chrom: str
+    pos: int
+    snp: str
+    allele0: str
+    allele1: str
+
+
+def _normalize_active_snp_name(raw_name: object, chrom: object, pos: object) -> str:
+    name = str(raw_name).strip()
+    if name == "" or name == "." or name.lower() == "nan":
+        return f"{str(chrom).strip()}_{int(pos)}"
+    return name
+
+
+def _fvlmm2_load_active_sites(
+    prefix: str,
+    packed_ctx: dict[str, object],
+) -> tuple[list[_GarfieldActiveSite], dict[str, list[int]]]:
+    active_row_idx = np.ascontiguousarray(
+        np.asarray(
+            packed_ctx.get("active_row_idx", packed_ctx.get("row_indices")),
+            dtype=np.int64,
+        ).reshape(-1),
+        dtype=np.int64,
+    )
+    row_flip = np.ascontiguousarray(
+        np.asarray(packed_ctx["row_flip"], dtype=np.bool_).reshape(-1),
+        dtype=np.bool_,
+    )
+    chrom, pos, snp, allele0, allele1 = load_bim_columns(str(prefix), active_row_idx)
+    chrom_col = [str(v) for v in list(chrom)]
+    pos_col = [int(v) for v in list(pos)]
+    snp_col = list(snp)
+    allele0_col = [str(v) for v in list(allele0)]
+    allele1_col = [str(v) for v in list(allele1)]
+    if not (
+        len(chrom_col)
+        == len(pos_col)
+        == len(snp_col)
+        == len(allele0_col)
+        == len(allele1_col)
+        == int(active_row_idx.shape[0])
+        == int(row_flip.shape[0])
+    ):
+        raise ValueError("Active site metadata length mismatch in GARFIELD pseudo loader.")
+
+    sites: list[_GarfieldActiveSite] = []
+    name_map: dict[str, list[int]] = {}
+    for local_row in range(int(active_row_idx.shape[0])):
+        snp_name = _normalize_active_snp_name(
+            snp_col[local_row], chrom_col[local_row], pos_col[local_row]
+        )
+        a0 = allele0_col[local_row]
+        a1 = allele1_col[local_row]
+        if bool(row_flip[local_row]):
+            a0, a1 = a1, a0
+        site = _GarfieldActiveSite(
+            local_row=int(local_row),
+            source_row=int(active_row_idx[local_row]),
+            chrom=str(chrom_col[local_row]),
+            pos=int(pos_col[local_row]),
+            snp=str(snp_name),
+            allele0=str(a0),
+            allele1=str(a1),
+        )
+        sites.append(site)
+        for key in {site.snp, f"{site.chrom}_{site.pos}"}:
+            if key == "":
+                continue
+            name_map.setdefault(key, []).append(site.local_row)
+    return sites, name_map
+
+
+def _fvlmm2_decode_rows(
+    packed_ctx: dict[str, object],
+    row_indices_local: list[int] | np.ndarray,
+    sample_indices_full: np.ndarray,
+) -> np.ndarray:
+    rows = np.ascontiguousarray(
+        np.asarray(row_indices_local, dtype=np.int64).reshape(-1),
+        dtype=np.int64,
+    )
+    sidx = np.ascontiguousarray(
+        np.asarray(sample_indices_full, dtype=np.int64).reshape(-1),
+        dtype=np.int64,
+    )
+    if int(rows.shape[0]) == 0:
+        return np.empty((0, int(sidx.shape[0])), dtype=np.float32)
+    decoded = bed_packed_decode_rows_f32(
+        packed_ctx["packed"],
+        int(packed_ctx["n_samples"]),
+        rows,
+        packed_ctx["row_flip"],
+        packed_ctx["maf"],
+        sidx,
+    )
+    return np.ascontiguousarray(np.asarray(decoded, dtype=np.float32), dtype=np.float32)
 
 # Python 仅负责 CLI 调度；训练/测试划分、null-model 残差化、LD-tag
 # exhaustive Max6/GRM-Max6 扫描与最终导出都由 Rust 端统一完成。

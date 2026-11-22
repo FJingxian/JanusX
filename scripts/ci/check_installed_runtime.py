@@ -56,8 +56,7 @@ def _check_no_bundled_openmp_runtime() -> None:
         for p in sorted(libs_dir.iterdir()):
             if p.is_file() and p.name.lower().startswith(omp_prefixes):
                 bad.append(f"janusx.libs/{p.name}")
-    # On Windows, runtime DLLs sit directly under janusx/ (FastTree keeps its
-    # own isolated subprocess runtime under janusx/bin/, so scan non-recursively).
+    # On Windows, runtime DLLs sit directly under janusx/ (scan non-recursively).
     if pkg_dir.is_dir():
         for p in sorted(pkg_dir.iterdir()):
             if (

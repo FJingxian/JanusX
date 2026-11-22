@@ -50,7 +50,6 @@ def _wheel_members(wheel: Path) -> list[tuple[str, bytes]]:
             info
             for info in archive.infolist()
             if info.filename.endswith((".so", ".dylib", ".bundle"))
-            or "/bin/FastTree" in info.filename
         ]
         return [(info.filename, archive.read(info)) for info in members]
 

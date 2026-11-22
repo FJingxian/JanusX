@@ -18,8 +18,6 @@ _OPTIONAL_DEPENDENCIES: dict[str, OptionalDependencySpec] = {
     "sklearn": OptionalDependencySpec(packages=("scikit-learn",), extra="ml"),
     "xgboost": OptionalDependencySpec(packages=("xgboost",), extra="ml"),
     "statsmodels": OptionalDependencySpec(packages=("statsmodels",), extra="stats"),
-    "toytree": OptionalDependencySpec(packages=("toytree", "toyplot"), extra="treeplot"),
-    "toyplot": OptionalDependencySpec(packages=("toyplot", "toytree"), extra="treeplot"),
 }
 
 

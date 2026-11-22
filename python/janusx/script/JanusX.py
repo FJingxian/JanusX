@@ -173,10 +173,10 @@ _CLI_MODULE_SECTIONS = [
 ]
 
 _MODULE_NAMES = [
-    "gwas", "ct", "fvlmm2", "postgwas", "postgarfield", "postbsa",
+    "gwas", "ct", "postgwas", "postgarfield", "postbsa",
     "garfield", "grm", "pca", "gstats", "gs", "reml", "postgs",
-    "sim", "simulation", "adamixture", "fst", "xpclr", "tree", "gformat", "gmerge", "imp", "hybrid", "webui",
-    "fastq2vcf", "fastq2count", "kmer", "kmerge", "kstats", "kformat", "view", "treeplot", "refcheck",
+    "sim", "simulation", "adamixture", "fst", "xpclr", "gformat", "gmerge", "imp", "hybrid",
+    "kmer", "kmerge", "kstats", "kformat", "view", "refcheck",
 ]
 _SCRIPT_MODULE_ALIASES = {
     # Keep CLI surface stable (`jx gwas` / `jx gs`) while routing heavy

@@ -1,16 +1,7 @@
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::Bound;
-use std::env;
-use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
-use std::process::{Command, ExitStatus, Output, Stdio};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
-use std::thread;
-use std::time::{Duration, Instant};
 
 // stats
 #[path = "stats/algwas.rs"]
@@ -33,8 +24,7 @@ mod farmcpu;
 mod fst;
 #[path = "stats/fvlmm.rs"]
 mod fvlmm;
-#[path = "stats/fvlmm2.rs"]
-mod fvlmm2;
+
 #[path = "garfield/mod.rs"]
 pub mod garfield;
 #[path = "stats/gblup.rs"]
@@ -85,8 +75,7 @@ mod susie;
 #[allow(dead_code)]
 #[path = "stats/top.rs"]
 mod top;
-#[path = "stats/tree.rs"]
-mod tree;
+
 #[path = "stats/xpclr.rs"]
 mod xpclr;
 
@@ -111,8 +100,7 @@ mod gfreader;
 mod gload;
 #[path = "io/gmerge.rs"]
 mod gmerge;
-#[path = "io/gwasio.rs"]
-mod gwasio;
+
 #[path = "io/gwriter.rs"]
 mod gwriter;
 #[path = "imp/mod.rs"]
@@ -134,9 +122,7 @@ mod sim;
 #[path = "io/vcfout.rs"]
 mod vcfout;
 
-// workflow
-#[path = "workflow/mod.rs"]
-mod workflow;
+
 
 // math
 #[path = "math/active_path.rs"]
@@ -167,8 +153,7 @@ mod math_ld;
 mod ml;
 #[path = "math/pcg.rs"]
 mod pcg;
-#[path = "phylo/mod.rs"]
-mod phylo;
+
 #[path = "sim/g2p.rs"]
 mod sim_g2p;
 
@@ -203,7 +188,7 @@ use fvlmm::{
     fvlmm_assoc_chunk_with_cache_f32, fvlmm_assoc_kfile_to_tsv_f32,
     fvlmm_assoc_packed_f32_to_tsv, fvlmm_assoc_prepare_cache_f32, FvLmmAssocCache,
 };
-use fvlmm2::fvlmm2_assoc_chunk_f32;
+
 use garfield::{
     finalize_max6_genotype_universe_py, garfield_grm_max6_rerank_candidates_py,
     garfield_logic_residual_screen_bin_py, garfield_logic_search_bed_py,
@@ -240,7 +225,7 @@ use gstats::{
 use gwas_unified::{
     gwas_packed_unified_to_tsv, gwas_trait_model_dispatch_v2, gwas_trait_model_schedule,
 };
-use gwasio::load_gwas_triplet_fast;
+
 use gwriter::{HmpStreamWriter, PgenStreamWriter, PlinkStreamWriter, VcfStreamWriter};
 use he::he_pcg_bed;
 use heritability::{prepare_sparse_onehot_blup_cache, SparseOneHotBlupCache};
@@ -297,10 +282,7 @@ use spreml::{
 };
 use susie::susie_rss_f64;
 use top::{top_fit_model_py, top_rank_to_target_values_py};
-use tree::{
-    geno_chunk_to_alignment_u8_siteinfo, nj_newick_from_alignment_u8,
-    nj_newick_from_distance_matrix,
-};
+
 use xpclr::xpclr_bed_to_tsv;
 
 pub use aireml::{ai_reml_null_from_spectral, AiRemlNullResult};
@@ -324,337 +306,6 @@ pub use lasso::{
     PackedBedLassoConfig, PackedBedLassoDesign,
 };
 
-const SPINNER_FRAMES: [&str; 4] = ["/", "-", "\\", "|"];
-
-pub(crate) fn supports_color() -> bool {
-    io::stdout().is_terminal()
-}
-
-pub(crate) fn style_green(text: &str) -> String {
-    if supports_color() {
-        format!("\x1b[32m{text}\x1b[0m")
-    } else {
-        text.to_string()
-    }
-}
-
-pub(crate) fn style_yellow(text: &str) -> String {
-    if supports_color() {
-        format!("\x1b[33m{text}\x1b[0m")
-    } else {
-        text.to_string()
-    }
-}
-
-pub(crate) fn style_blue(text: &str) -> String {
-    if supports_color() {
-        format!("\x1b[34m{text}\x1b[0m")
-    } else {
-        text.to_string()
-    }
-}
-
-pub(crate) fn style_orange(text: &str) -> String {
-    if supports_color() {
-        format!("\x1b[38;5;208m{text}\x1b[0m")
-    } else {
-        text.to_string()
-    }
-}
-
-pub(crate) fn style_white(text: &str) -> String {
-    if supports_color() {
-        format!("\x1b[37m{text}\x1b[0m")
-    } else {
-        text.to_string()
-    }
-}
-
-pub(crate) fn print_success_line(msg: &str) {
-    let tty = io::stdout().is_terminal();
-    if tty && supports_color() {
-        println!("\r\x1b[2K\x1b[32m✔︎ {}\x1b[0m", msg);
-    } else if tty {
-        println!("\r\x1b[2K✔︎ {}", msg);
-    } else {
-        println!("✔︎ {}", msg);
-    }
-}
-
-pub(crate) fn format_elapsed(d: Duration) -> String {
-    let secs = d.as_secs_f64();
-    if secs < 60.0 {
-        return format!("{secs:.1}s");
-    }
-    let total = secs.round() as u64;
-    if total < 3600 {
-        let m = total / 60;
-        let s = total % 60;
-        return format!("{m}m{s:02}s");
-    }
-    let h = total / 3600;
-    let m = (total % 3600) / 60;
-    format!("{h}h{m:02}m")
-}
-
-pub(crate) fn spinner_refresh_interval(elapsed: Duration) -> Duration {
-    if elapsed < Duration::from_secs(60) {
-        Duration::from_millis(100)
-    } else {
-        Duration::from_secs(1)
-    }
-}
-
-pub(crate) fn format_elapsed_live(elapsed: Duration) -> String {
-    let secs = elapsed.as_secs_f64();
-    if secs < 60.0 {
-        let tenths = (secs * 10.0).floor() / 10.0;
-        return format!("{tenths:.1}s");
-    }
-    if secs < 3600.0 {
-        let total = secs.floor() as u64;
-        let m = total / 60;
-        let s = total % 60;
-        return format!("{m}m{s:02}s");
-    }
-    let total_min = (secs / 60.0).floor() as u64;
-    let h = total_min / 60;
-    let m = total_min % 60;
-    format!("{h}h{m:02}m")
-}
-
-pub(crate) fn spinner_frame_for_elapsed(elapsed: Duration) -> &'static str {
-    let step_ms = spinner_refresh_interval(elapsed).as_millis().max(1);
-    let idx = ((elapsed.as_millis() / step_ms) as usize) % SPINNER_FRAMES.len();
-    SPINNER_FRAMES[idx]
-}
-
-fn detect_help_terminal_columns() -> Option<usize> {
-    if let Ok(v) = env::var("COLUMNS") {
-        if let Ok(cols) = v.parse::<usize>() {
-            if cols > 0 {
-                return Some(cols);
-            }
-        }
-    }
-
-    if io::stdout().is_terminal() {
-        if let Some(cols) = query_stty_columns() {
-            return Some(cols);
-        }
-        if let Some(cols) = query_tput_columns() {
-            return Some(cols);
-        }
-    }
-    None
-}
-
-fn query_stty_columns() -> Option<usize> {
-    if !io::stdin().is_terminal() {
-        return None;
-    }
-    let out = Command::new("stty")
-        .arg("size")
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let cols = text
-        .split_whitespace()
-        .nth(1)
-        .and_then(|x| x.parse::<usize>().ok())?;
-    (cols > 0).then_some(cols)
-}
-
-fn query_tput_columns() -> Option<usize> {
-    let out = Command::new("tput")
-        .arg("cols")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let cols = text.trim().parse::<usize>().ok()?;
-    (cols > 0).then_some(cols)
-}
-
-pub(crate) fn help_line_width() -> usize {
-    let cols = detect_help_terminal_columns().unwrap_or(100);
-    cols.saturating_sub(2).clamp(48, 160)
-}
-
-fn split_long_word(word: &str, width: usize) -> Vec<String> {
-    let w = width.max(1);
-    let mut out: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut n = 0usize;
-    for ch in word.chars() {
-        cur.push(ch);
-        n += 1;
-        if n >= w {
-            out.push(std::mem::take(&mut cur));
-            n = 0;
-        }
-    }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out
-}
-
-pub(crate) fn wrap_help_text(text: &str, width: usize) -> Vec<String> {
-    let w = width.max(8);
-    let mut out: Vec<String> = Vec::new();
-    let mut line = String::new();
-
-    for word in text.split_whitespace() {
-        let len_word = word.chars().count();
-        if line.is_empty() {
-            if len_word <= w {
-                line.push_str(word);
-            } else {
-                let chunks = split_long_word(word, w);
-                if chunks.is_empty() {
-                    continue;
-                }
-                for ch in chunks.iter().take(chunks.len().saturating_sub(1)) {
-                    out.push(ch.to_string());
-                }
-                line = chunks.last().cloned().unwrap_or_default();
-            }
-            continue;
-        }
-
-        let len_line = line.chars().count();
-        if len_line + 1 + len_word <= w {
-            line.push(' ');
-            line.push_str(word);
-            continue;
-        }
-
-        out.push(std::mem::take(&mut line));
-        if len_word <= w {
-            line.push_str(word);
-        } else {
-            let chunks = split_long_word(word, w);
-            for ch in chunks.iter().take(chunks.len().saturating_sub(1)) {
-                out.push(ch.to_string());
-            }
-            line = chunks.last().cloned().unwrap_or_default();
-        }
-    }
-    if !line.is_empty() {
-        out.push(line);
-    }
-    out
-}
-
-pub(crate) fn run_with_spinner(
-    cmd: &mut Command,
-    desc: &str,
-) -> Result<(Output, Duration), String> {
-    let start = Instant::now();
-    let is_tty = io::stdout().is_terminal();
-    let done = Arc::new(AtomicBool::new(false));
-    let done_c = Arc::clone(&done);
-    let desc_s = desc.to_string();
-
-    let spinner = if is_tty {
-        Some(thread::spawn(move || {
-            while !done_c.load(Ordering::Relaxed) {
-                let elapsed = start.elapsed();
-                let line = format!(
-                    "\r{} {} [{}]",
-                    spinner_frame_for_elapsed(elapsed),
-                    desc_s,
-                    format_elapsed_live(elapsed)
-                );
-                if supports_color() {
-                    print!("{}", style_green(&line));
-                } else {
-                    print!("{line}");
-                }
-                let _ = io::stdout().flush();
-                thread::sleep(spinner_refresh_interval(elapsed));
-            }
-            print!("\r\x1b[2K");
-            let _ = io::stdout().flush();
-        }))
-    } else {
-        None
-    };
-
-    let out = cmd
-        .output()
-        .map_err(|e| format!("Failed to run command: {e}"))?;
-    done.store(true, Ordering::Relaxed);
-    if let Some(h) = spinner {
-        let _ = h.join();
-    }
-    Ok((out, start.elapsed()))
-}
-
-pub(crate) fn exit_code(status: ExitStatus) -> i32 {
-    status.code().unwrap_or(1)
-}
-
-pub(crate) fn resolve_jx_executable() -> Result<PathBuf, String> {
-    if let Some(raw) = env::var_os("JANUSX_LAUNCHER_BIN") {
-        let path = PathBuf::from(raw);
-        if path.exists() {
-            return Ok(path);
-        }
-    }
-
-    if let Ok(exe) = env::current_exe() {
-        if let Some(name) = exe.file_name().and_then(|x| x.to_str()) {
-            let lower = name.to_ascii_lowercase();
-            if lower == "jx" || lower == "jx.exe" {
-                return Ok(exe);
-            }
-        }
-    }
-
-    if let Some(paths) = env::var_os("PATH") {
-        for dir in env::split_paths(&paths) {
-            let cand = dir.join("jx");
-            if cand.is_file() {
-                return Ok(cand);
-            }
-            #[cfg(windows)]
-            {
-                let cand_exe = dir.join("jx.exe");
-                if cand_exe.is_file() {
-                    return Ok(cand_exe);
-                }
-            }
-        }
-    }
-
-    Err(
-        "Failed to locate `jx` executable. Add `jx` to PATH or set `JANUSX_LAUNCHER_BIN`."
-            .to_string(),
-    )
-}
-
-#[pyfunction(name = "fastq2count_run")]
-fn fastq2count_run_py(args: Vec<String>) -> PyResult<i32> {
-    workflow::fastq2count::run_fastq2count_module(&args).map_err(PyRuntimeError::new_err)
-}
-
-#[pyfunction(name = "fastq2vcf_run")]
-fn fastq2vcf_run_py(args: Vec<String>) -> PyResult<i32> {
-    workflow::fastq2vcf::run_fastq2vcf_module(&args).map_err(PyRuntimeError::new_err)
-}
 // ============================================================
 // PyO3 module exports
 // ============================================================
@@ -803,8 +454,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(kfile_inspect_py, m)?)?;
     m.add_function(wrap_pyfunction!(kfile_read_rows_f32_py, m)?)?;
     m.add_function(wrap_pyfunction!(kformat_run_py, m)?)?;
-    m.add_function(wrap_pyfunction!(fastq2count_run_py, m)?)?;
-    m.add_function(wrap_pyfunction!(fastq2vcf_run_py, m)?)?;
+
     m.add_function(wrap_pyfunction!(merge_genotypes, m)?)?;
     m.add_function(wrap_pyfunction!(convert_genotypes, m)?)?;
     m.add_function(wrap_pyfunction!(count_vcf_snps, m)?)?;
@@ -819,7 +469,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(prepare_bed_fused_qc_packed, m)?)?;
     m.add_function(wrap_pyfunction!(load_bim_columns, m)?)?;
     m.add_function(wrap_pyfunction!(g2p_simulate_py, m)?)?;
-    m.add_function(wrap_pyfunction!(load_gwas_triplet_fast, m)?)?;
+
     m.add_function(wrap_pyfunction!(lm_block_assoc_f32, m)?)?;
     m.add_function(wrap_pyfunction!(algwas_packed_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(lm_stream_bed_to_tsv, m)?)?;
@@ -945,7 +595,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
         fvlmm_assoc_chunk_from_snp_with_cache_f32,
         m
     )?)?;
-    m.add_function(wrap_pyfunction!(fvlmm2_assoc_chunk_f32, m)?)?;
+
     m.add_function(wrap_pyfunction!(lmm_rotate_x_y_with_ut_f64, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_rotate_y_with_ut_f64, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_reml_assoc_bed_to_tsv_f32, m)?)?;
@@ -976,10 +626,6 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(finalize_max6_genotype_universe_py, m)?)?;
     m.add_function(wrap_pyfunction!(garfield_residualize_grm_py, m)?)?;
     m.add_function(wrap_pyfunction!(preprocess_bsa, m)?)?;
-    m.add_function(wrap_pyfunction!(geno_chunk_to_alignment_u8_siteinfo, m)?)?;
-    m.add_function(wrap_pyfunction!(nj_newick_from_alignment_u8, m)?)?;
-    m.add_function(wrap_pyfunction!(nj_newick_from_distance_matrix, m)?)?;
     ct::output::register_py(m)?;
-    phylo::register_py(m)?;
     Ok(())
 }

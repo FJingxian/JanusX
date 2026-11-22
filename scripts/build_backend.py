@@ -250,8 +250,7 @@ def _collect_windows_runtime_dlls() -> list[Path]:
     # Keep this list tight to avoid wheel bloat while covering pthreads
     # OpenBLAS + MinGW runtime dependencies. Deliberately exclude OpenMP DLLs
     # (libomp/libgomp/libiomp/vcomp) from the Python package root so we never
-    # collide with XGBoost/scikit-learn OpenMP runtimes (FastTree keeps its own
-    # isolated runtime inside janusx/bin/).
+    # collide with XGBoost/scikit-learn OpenMP runtimes.
     patterns = [
         "libopenblas*.dll",
         "openblas*.dll",
@@ -525,36 +524,6 @@ def _collect_macos_openblas_dylibs() -> list[Path]:
     return []
 
 
-def _collect_fasttree_artifacts() -> list[Path]:
-    raw = str(os.environ.get("JANUSX_FASTTREE_BIN", "")).strip()
-    if raw:
-        p = Path(raw)
-        if p.is_file():
-            root = p.resolve().parent
-            return sorted([x.resolve() for x in root.iterdir() if x.is_file()], key=lambda x: x.name.lower())
-        raise RuntimeError(f"JANUSX_FASTTREE_BIN does not exist: {raw}")
-
-    root = _project_root() / "target" / "janusx-artifacts"
-    if not root.is_dir():
-        return []
-
-    exe_names = ["FastTreeMP.exe", "FastTree.exe"] if sys.platform.startswith("win") else ["FastTree"]
-    candidates: list[tuple[float, int, Path]] = []
-    for priority, exe_name in enumerate(exe_names):
-        for p in root.rglob(exe_name):
-            if not (p.is_file() and any(part.lower() == "fasttree" for part in p.parts)):
-                continue
-            try:
-                mtime = p.stat().st_mtime
-            except Exception:
-                mtime = 0.0
-            candidates.append((mtime, len(exe_names) - priority, p))
-    if len(candidates) == 0:
-        return []
-    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    picked = candidates[0][2].resolve()
-    return sorted([x.resolve() for x in picked.parent.iterdir() if x.is_file()], key=lambda x: x.name.lower())
-
 
 def _rewrite_macos_dylib_install_names(extract_root: Path, rel_paths: list[Path]) -> None:
     if sys.platform != "darwin" or len(rel_paths) == 0:
@@ -703,16 +672,7 @@ def _inject_runtime_artifacts(
     *,
     require_bundled_extension: bool,
 ) -> None:
-    fasttree_files = _collect_fasttree_artifacts()
-    if len(fasttree_files) == 0:
-        raise RuntimeError(
-            "FastTree executable was not produced under target/janusx-artifacts after wheel build; "
-            "build.rs may not have run or did not finish the FastTree bundle step."
-        )
-
     artifacts: list[tuple[Path, Path]] = []
-    for fasttree_file in fasttree_files:
-        artifacts.append((fasttree_file, Path("janusx") / "bin" / fasttree_file.name))
     for dll in win_dlls:
         artifacts.append((dll, Path("janusx") / dll.name))
     for dylib in mac_dylibs:
@@ -727,8 +687,6 @@ def _inject_runtime_artifacts(
         artifacts,
         require_bundled_extension=require_bundled_extension,
     )
-    joined_fasttree = ", ".join(f"janusx/bin/{p.name}" for p in fasttree_files)
-    print(f"[build-backend] injected FastTree artifacts: {joined_fasttree}", flush=True)
     if win_dlls:
         joined = ", ".join(sorted(d.name for d in win_dlls))
         print(f"[build-backend] injected runtime DLLs: {joined}", flush=True)

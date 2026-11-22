@@ -49,7 +49,6 @@ JanusX is used in two common ways:
 The research modules are shared across both modes. The main boundary is lifecycle management:
 
 - Launcher-only flags: `-update`, `-upgrade`, `-list`, `-clean`, `-uninstall`
-- Python-dispatcher note: `fastq2vcf` and `fastq2count` run compatibility checks only; use launcher `jx fastq2vcf ...` or `jx fastq2count ...` for the full external pipeline
 
 Quick checks:
 
@@ -292,18 +291,6 @@ The main reporting modules are:
 - `postgs`: GS summary plotting from `summary.json`
 - `postgarfield`: pseudo-genotype GWAS/post-GWAS workflow
 - `postbsa`: BSA filtering, smoothing, and plotting
-- `webui`: browser UI for exploring generated results
-
-### 3.7 External pipeline preflight
-
-In Python-dispatcher mode, these commands validate the environment and stop:
-
-```bash
-python -m janusx.script.JanusX fastq2vcf --check-only
-python -m janusx.script.JanusX fastq2count --check-only
-```
-
-Use launcher `jx` when you want the full external workflow to run.
 
 ## 4. Module catalog
 
@@ -336,29 +323,25 @@ Use launcher `jx` when you want the full external workflow to run.
 - `adamixture`: population structure inference via ADAMIXTURE
 - `fst`: compute windowed population FST
 - `xpclr`: compute windowed XP-CLR selection scan
-- `tree`: tree workflow entry
-- `treeplot`: visualize Newick or GRM-derived trees
-- `webui`: start the JanusX web interface
 
-### 4.5 K-mer and external pipeline helpers
+### 4.5 K-mer
 
-- `kmer`: KMC counting or WASTER tree workflow entry
+- `kmer`: KMC counting workflow entry
 - `kmerge`: merge KMC outputs into a genotype-like matrix
-- `fastq2vcf`: FASTQ-to-VCF compatibility check in Python mode; full pipeline in launcher mode
-- `fastq2count`: FASTQ-to-count compatibility check in Python mode; full pipeline in launcher mode
+- `kstats`: compute pairwise KMC k-mer statistics
+- `kformat`: filter and convert JanusX kfile bitmatrices
 
 ### 4.6 Simulation
 
 - `sim`: quick simulation workflow
 - `simulation`: extended simulation and benchmarking workflow
 
-Other current command entrypoints include `fvlmm2`, `hybrid`, `tree`,
-`treeplot`, `refcheck`, `view`, and the `kformat` K-mer utility. Their exact
-availability and arguments are defined by their module help.
+Other current command entrypoints include `hybrid`, `refcheck`, and `view`.
+Their exact availability and arguments are defined by their module help.
 
 ## 5. Practical notes
 
 - Use `jx <module> -h` as the source of truth for flags. The dispatcher help is intentionally broad; module help is precise.
 - Prefer PLINK BED input when you expect to rerun the same cohort many times. Packed BED paths are reused more efficiently than repeated VCF parsing.
-- Use `-prefix` deliberately. It makes downstream files easier to chain into `postgwas`, `postgs`, and `webui`.
+- Use `-prefix` deliberately. It makes downstream files easier to chain into `postgwas` and `postgs`.
 - For large GS runs, use `-debug` when you need thread policy, BLAS backend, or packed-path diagnostics.

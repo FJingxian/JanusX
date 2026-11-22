@@ -958,6 +958,7 @@ pub(super) fn prepare_max6_interval_streamed_ld_with_callback(
                                 sample_plan.as_slice(),
                                 maf_threshold,
                                 max_missing_rate,
+                                het_threshold,
                                 simple_snp_alleles,
                                 dst_words,
                                 missing_words.as_mut_slice(),

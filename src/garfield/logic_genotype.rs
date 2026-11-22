@@ -14,6 +14,7 @@ pub(super) struct LogicSamplePlanEntry {
 #[derive(Clone, Copy, Default)]
 pub(super) struct Max6SubsetByteLutEntry {
     pub(super) logic_missing: u8,
+    pub(super) het_count: u8,
     pub(super) hom_alt: u8,
     pub(super) logic_alt_bits: u8,
     pub(super) logic_missing_bits: u8,
@@ -43,6 +44,7 @@ pub(super) fn max6_subset_byte_lut() -> &'static [Max6SubsetByteLutEntry; 16 * 2
                         }
                         0b10 => {
                             entry.logic_missing += 1;
+                            entry.het_count += 1;
                             entry.logic_missing_bits |= 1u8 << dst_lane;
                             entry.flags |= 0b10;
                         }
@@ -148,9 +150,10 @@ pub(super) fn scan_max6_subset_row_and_pack(
     sample_plan: &[LogicSamplePlanEntry],
     dst_words: &mut [u64],
     missing_words: &mut [u64],
-) -> (usize, usize, usize, bool, bool) {
+) -> (usize, usize, usize, usize, bool, bool) {
     let lut = max6_subset_byte_lut();
     let mut logic_missing = 0usize;
+    let mut het_count = 0usize;
     let mut hom_alt = 0usize;
     let mut hom_ref = 0usize;
     let mut has_het = false;
@@ -160,6 +163,7 @@ pub(super) fn scan_max6_subset_row_and_pack(
         let lut_index = entry.src_lane_mask as usize * 256 + byte as usize;
         let packed = lut[lut_index];
         logic_missing += packed.logic_missing as usize;
+        het_count += packed.het_count as usize;
         hom_alt += packed.hom_alt as usize;
         hom_ref += (entry.n_lanes as usize)
             .saturating_sub(packed.logic_missing as usize)
@@ -192,7 +196,14 @@ pub(super) fn scan_max6_subset_row_and_pack(
             }
         }
     }
-    (logic_missing, hom_alt, hom_ref, has_het, has_raw_missing)
+    (
+        logic_missing,
+        het_count,
+        hom_alt,
+        hom_ref,
+        has_het,
+        has_raw_missing,
+    )
 }
 
 #[inline]

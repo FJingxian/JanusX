@@ -1,14 +1,13 @@
 use crate::bedmath::is_identity_indices;
 use crate::decode::decode_prepared_additive_block_packed_f32;
 use crate::garfield::residual::{
-    estimate_lmm_lambda_from_grm_rust, null_validation_seed, standardize_residualized_y,
-    GarfieldResidualResult,
+    estimate_lmm_lambda_from_grm_rust, null_validation_seed, rank_aware_fixed_design,
+    standardize_residualized_y, GarfieldResidualResult, RankAwareFixedDesign,
 };
 use crate::gblup::{build_grm_from_meta_stream, StreamKernelMode};
 use crate::gfcore::read_fam;
 use crate::gload::WindowedBedMatrix;
 use crate::he::he_variance_components_meta_stream_with_covariates;
-use crate::linalg::{cholesky_inplace, cholesky_solve_into};
 use crate::pcg::{pcg_preconditioner_fn, pcg_solve, PcgOperator};
 use crate::stats_common::get_cached_pool;
 use rand::rngs::StdRng;
@@ -83,8 +82,11 @@ struct PcgLambdaEstimate {
 struct CovariateProjector {
     n: usize,
     p: usize,
+    rank: usize,
     c: Vec<f64>,
-    chol_ctc: Vec<f64>,
+    q: Vec<f64>,
+    single_col_norm: Option<f64>,
+    design: RankAwareFixedDesign,
 }
 
 #[inline]
@@ -114,36 +116,30 @@ impl CovariateProjector {
         if c.iter().any(|v| !v.is_finite()) {
             return Err("fixed-effect design contains non-finite values".to_string());
         }
-        if n <= p {
-            return Err(format!(
-                "PCG residualization requires n > rank(C): n={n}, p={p}"
-            ));
-        }
-
-        let mut ctc = vec![0.0_f64; p * p];
-        for row in c.chunks_exact(p) {
-            for a in 0..p {
-                for b in 0..=a {
-                    ctc[a * p + b] += row[a] * row[b];
-                }
+        let design = rank_aware_fixed_design(c, n, p)?;
+        let rank = design.rank;
+        let (q, single_col_norm) = if p == 1 {
+            let norm = design.x.iter().fold(0.0_f64, |acc, &v| acc.hypot(v));
+            if !(norm.is_finite() && norm > 0.0) {
+                return Err("PCG residualization fixed-effect design has zero norm".to_string());
             }
+            let q = design.x.iter().map(|&v| v / norm).collect::<Vec<_>>();
+            (q, Some(norm))
+        } else {
+            (design.x.clone(), None)
+        };
+        if q.iter().any(|v| !v.is_finite()) {
+            return Err("PCG residualization QR produced a non-finite basis".to_string());
         }
-        for a in 0..p {
-            for b in 0..a {
-                ctc[b * p + a] = ctc[a * p + b];
-            }
-        }
-        cholesky_inplace(&mut ctc, p).ok_or_else(|| {
-            format!(
-                "PCG residualization fixed-effect design is singular or ill-conditioned (p={p})"
-            )
-        })?;
 
         Ok(Self {
             n,
             p,
+            rank,
             c: c.to_vec(),
-            chol_ctc: ctc,
+            q,
+            single_col_norm,
+            design,
         })
     }
 
@@ -158,27 +154,20 @@ impl CovariateProjector {
         if y.iter().any(|v| !v.is_finite()) {
             return Err("fixed-effect response contains non-finite values".to_string());
         }
-        let mut cty = vec![0.0_f64; self.p];
-        for (i, row) in self.c.chunks_exact(self.p).enumerate() {
-            for j in 0..self.p {
-                cty[j] += row[j] * y[i];
+        let mut coords = vec![0.0_f64; self.rank];
+        for (i, q_row) in self.q.chunks_exact(self.rank).enumerate() {
+            let yi = y[i];
+            for j in 0..self.rank {
+                coords[j] += q_row[j] * yi;
             }
         }
-        let mut beta = vec![0.0_f64; self.p];
-        cholesky_solve_into(&self.chol_ctc, self.p, &cty, &mut beta);
-        Ok(beta)
+        if let Some(norm) = self.single_col_norm {
+            coords[0] /= norm;
+        }
+        Ok(self.design.expand_beta(&coords))
     }
 
     fn project_f64_in_place(&self, values: &mut [f64]) -> Result<(), String> {
-        let beta = self.coefficients_for_f64(values)?;
-        for (i, row) in self.c.chunks_exact(self.p).enumerate() {
-            let fitted = row.iter().zip(beta.iter()).map(|(x, b)| x * b).sum::<f64>();
-            values[i] -= fitted;
-        }
-        Ok(())
-    }
-
-    fn project_f32_in_place(&self, values: &mut [f32]) -> Result<(), String> {
         if values.len() != self.n {
             return Err(format!(
                 "projected sample vector length mismatch: got {}, expected {}",
@@ -186,11 +175,63 @@ impl CovariateProjector {
                 self.n
             ));
         }
-        let as_f64 = values.iter().map(|v| *v as f64).collect::<Vec<_>>();
-        let beta = self.coefficients_for_f64(as_f64.as_slice())?;
-        for (i, row) in self.c.chunks_exact(self.p).enumerate() {
-            let fitted = row.iter().zip(beta.iter()).map(|(x, b)| x * b).sum::<f64>();
-            values[i] = (as_f64[i] - fitted) as f32;
+        if values.iter().any(|v| !v.is_finite()) {
+            return Err("projected sample vector contains non-finite values".to_string());
+        }
+        let mut coords = vec![0.0_f64; self.rank];
+        for (i, q_row) in self.q.chunks_exact(self.rank).enumerate() {
+            let vi = values[i];
+            for j in 0..self.rank {
+                coords[j] += q_row[j] * vi;
+            }
+        }
+        for (i, q_row) in self.q.chunks_exact(self.rank).enumerate() {
+            let fitted = q_row
+                .iter()
+                .zip(coords.iter())
+                .map(|(q, c)| q * c)
+                .sum::<f64>();
+            values[i] -= fitted;
+        }
+        Ok(())
+    }
+
+    fn project_f32_in_place_with_scratch(
+        &self,
+        values: &mut [f32],
+        coords: &mut [f64],
+    ) -> Result<(), String> {
+        if values.len() != self.n {
+            return Err(format!(
+                "projected sample vector length mismatch: got {}, expected {}",
+                values.len(),
+                self.n
+            ));
+        }
+        if coords.len() != self.rank {
+            return Err(format!(
+                "projected coordinate scratch length mismatch: got {}, expected {}",
+                coords.len(),
+                self.rank
+            ));
+        }
+        if values.iter().any(|v| !v.is_finite()) {
+            return Err("projected sample vector contains non-finite values".to_string());
+        }
+        coords.fill(0.0_f64);
+        for (i, q_row) in self.q.chunks_exact(self.rank).enumerate() {
+            let vi = values[i] as f64;
+            for j in 0..self.rank {
+                coords[j] += q_row[j] * vi;
+            }
+        }
+        for (i, q_row) in self.q.chunks_exact(self.rank).enumerate() {
+            let fitted = q_row
+                .iter()
+                .zip(coords.iter())
+                .map(|(q, c)| q * c)
+                .sum::<f64>();
+            values[i] = (values[i] as f64 - fitted) as f32;
         }
         Ok(())
     }
@@ -773,13 +814,15 @@ pub(crate) fn garfield_residualize_pcg_from_bed(
     } else {
         f64::NAN
     };
-    let pve = if additive_var.is_finite()
+    let pve = if lambda.pve.is_finite() {
+        lambda.pve
+    } else if additive_var.is_finite()
         && residual_var.is_finite()
         && additive_var + residual_var > 0.0
     {
         additive_var / (additive_var + residual_var)
     } else {
-        lambda.pve
+        f64::NAN
     };
     Ok(GarfieldResidualResult {
         beta: fit.fixed_effects,
@@ -820,6 +863,8 @@ struct ProjectedMarkerOperator<'a, D> {
     design: &'a mut D,
     projector: &'a CovariateProjector,
     lambda_marker: f32,
+    sample_buf: Vec<f32>,
+    coords_buf: Vec<f64>,
 }
 
 impl<D: MarkerDesign> PcgOperator<f32> for ProjectedMarkerOperator<'_, D> {
@@ -832,10 +877,10 @@ impl<D: MarkerDesign> PcgOperator<f32> for ProjectedMarkerOperator<'_, D> {
                 self.design.n_markers()
             ));
         }
-        let mut sample = vec![0.0_f32; self.design.n_samples()];
-        self.design.marker_to_samples(input, &mut sample)?;
-        self.projector.project_f32_in_place(&mut sample)?;
-        self.design.samples_to_markers(&sample, output)?;
+        self.design.marker_to_samples(input, &mut self.sample_buf)?;
+        self.projector
+            .project_f32_in_place_with_scratch(&mut self.sample_buf, &mut self.coords_buf)?;
+        self.design.samples_to_markers(&self.sample_buf, output)?;
         for (dst, &src) in output.iter_mut().zip(input.iter()) {
             *dst += self.lambda_marker * src;
         }
@@ -910,10 +955,14 @@ fn fit_projected_rrblup<D: MarkerDesign>(
         }
         Ok(())
     });
+    let sample_buf = vec![0.0_f32; design.n_samples()];
+    let coords_buf = vec![0.0_f64; projector.rank];
     let operator = ProjectedMarkerOperator {
         design: &mut *design,
         projector: &projector,
         lambda_marker: lambda32,
+        sample_buf,
+        coords_buf,
     };
     let pcg_fit = pcg_solve(
         rhs.as_slice(),
@@ -1091,6 +1140,38 @@ mod tests {
             .zip(fit.residual.iter())
             .map(|(row, residual)| row[1] * residual)
             .sum::<f64>();
+        assert!(intercept_residual.abs() < 1e-6);
+        assert!(covariate_residual.abs() < 1e-6);
+        for (yi, (fi, ri)) in y.iter().zip(fit.fitted.iter().zip(fit.residual.iter())) {
+            assert!((yi - fi - ri).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn projected_rrblup_handles_collinear_covariates() {
+        let n = 6usize;
+        let cov = [-2.5, -1.5, -0.5, 0.5, 1.5, 2.5];
+        let c = cov
+            .iter()
+            .flat_map(|&x| [1.0, x, 2.0 * x])
+            .collect::<Vec<_>>();
+        let w = vec![
+            -1.0, 0.0, 1.0, -1.0, 0.0, 1.0, 1.0, 0.5, 0.0, -0.5, -1.0, -0.25,
+        ];
+        let y = vec![-6.55, -2.9, 1.3, 3.05, 6.8, 10.55];
+        let design = DenseMarkerDesign::new(w, 2, n);
+        let fit = fit_projected_rrblup_dense(&design, &c, 3, &y, 0.25, 200, 1e-10)
+            .expect("projected rrBLUP should handle collinear covariates via rank-aware QR");
+
+        assert!(fit.converged);
+        assert_eq!(fit.fixed_effects.len(), 3);
+        assert!(fit.fixed_effects.iter().all(|v| v.is_finite()));
+        let intercept_residual: f64 = fit.residual.iter().sum();
+        let covariate_residual: f64 = cov
+            .iter()
+            .zip(fit.residual.iter())
+            .map(|(x, r)| x * r)
+            .sum();
         assert!(intercept_residual.abs() < 1e-6);
         assert!(covariate_residual.abs() < 1e-6);
         for (yi, (fi, ri)) in y.iter().zip(fit.fitted.iter().zip(fit.residual.iter())) {

@@ -196,11 +196,12 @@ pub(super) fn pack_max6_identity_row_logic(
 pub(super) fn scan_max6_identity_row_qc_counts(
     row: &[u8],
     n_samples: usize,
-) -> (usize, usize, usize, bool, bool) {
+) -> (usize, usize, usize, usize, bool, bool) {
     const LOW_BITS: u64 = 0x5555_5555_5555_5555;
 
     let full_word_bytes = (n_samples / 32) * 8;
     let mut logic_missing = 0usize;
+    let mut het_count = 0usize;
     let mut hom_alt = 0usize;
     let mut has_het = false;
     let mut has_raw_missing = false;
@@ -212,10 +213,13 @@ pub(super) fn scan_max6_identity_row_qc_counts(
         );
         let low = packed & LOW_BITS;
         let high = (packed >> 1) & LOW_BITS;
+        let het_bits = high & !low;
+        let raw_missing_bits = low & !high;
         logic_missing += (low ^ high).count_ones() as usize;
+        het_count += het_bits.count_ones() as usize;
         hom_alt += (low & high).count_ones() as usize;
-        has_het |= high & !low != 0;
-        has_raw_missing |= low & !high != 0;
+        has_het |= het_bits != 0;
+        has_raw_missing |= raw_missing_bits != 0;
     }
 
     let lut = packed_byte_lut();
@@ -233,6 +237,7 @@ pub(super) fn scan_max6_identity_row_qc_counts(
         }
         let idx = byte as usize;
         logic_missing += lut.logic_missing[idx] as usize;
+        het_count += lut.het_sum[idx] as usize;
         hom_alt += lut.hom_alt[idx] as usize;
         has_het |= lut.has_het[idx];
         has_raw_missing |= lut.has_raw_missing[idx];
@@ -240,7 +245,14 @@ pub(super) fn scan_max6_identity_row_qc_counts(
     let hom_ref = n_samples
         .saturating_sub(logic_missing)
         .saturating_sub(hom_alt);
-    (logic_missing, hom_alt, hom_ref, has_het, has_raw_missing)
+    (
+        logic_missing,
+        het_count,
+        hom_alt,
+        hom_ref,
+        has_het,
+        has_raw_missing,
+    )
 }
 
 /// Count pure-line QC statistics and build the Max6 BIN row in one traversal
@@ -248,6 +260,7 @@ pub(super) fn scan_max6_identity_row_qc_counts(
 /// the homozygous counts collected here also determine the existing majority
 /// imputation and allele orientation.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn scan_max6_row_qc_and_pack_logic(
     row: &[u8],
     n_samples: usize,
@@ -255,11 +268,13 @@ pub(super) fn scan_max6_row_qc_and_pack_logic(
     sample_plan: &[LogicSamplePlanEntry],
     maf_threshold: f32,
     max_missing_rate: f32,
+    het_threshold: f32,
     simple_snp_alleles: bool,
     dst_words: &mut [u64],
     missing_words: &mut [u64],
 ) -> Max6FusedRowQc {
-    let (logic_missing, hom_alt, hom_ref, has_het, has_raw_missing) = if sample_identity {
+    let (logic_missing, het_count, hom_alt, hom_ref, has_het, has_raw_missing) = if sample_identity
+    {
         scan_max6_identity_row_qc_counts(row, n_samples)
     } else {
         dst_words.fill(0);
@@ -268,8 +283,16 @@ pub(super) fn scan_max6_row_qc_and_pack_logic(
     };
 
     let logic_missing = logic_missing.min(n_samples);
+    let het_count = het_count.min(logic_missing);
+    let raw_missing = logic_missing.saturating_sub(het_count);
+    let non_missing = n_samples.saturating_sub(raw_missing);
     let missing_rate = if n_samples > 0 {
         logic_missing as f32 / n_samples as f32
+    } else {
+        0.0
+    };
+    let het_rate = if non_missing > 0 {
+        het_count as f64 / non_missing as f64
     } else {
         0.0
     };
@@ -284,6 +307,8 @@ pub(super) fn scan_max6_row_qc_and_pack_logic(
     let reason =
         if !crate::gfreader::rate_within_threshold(f64::from(missing_rate), max_missing_rate) {
             MAX6_FUSED_QC_FAIL_MISSING
+        } else if !crate::gfreader::rate_within_threshold(het_rate, het_threshold) {
+            MAX6_FUSED_QC_FAIL_HET
         } else if usable_homo == 0 {
             MAX6_FUSED_QC_FAIL_NO_HOMOZYGOUS
         } else if !crate::gfreader::maf_passes_threshold(f64::from(maf), maf_threshold) {
@@ -1297,6 +1322,7 @@ pub(super) fn prepare_max6_global_qc_and_logic_bits(
                     sample_plan.as_slice(),
                     maf_threshold,
                     max_missing_rate,
+                    het_threshold,
                     simple_snp_alleles,
                     dst_words,
                     missing_words,

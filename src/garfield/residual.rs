@@ -357,9 +357,9 @@ impl NoGrmCovariateProjector {
 /// Fix the design rank once, before the covariance metric changes during REML.
 /// Column normalization makes the QR decision independent of covariate units.
 /// The single-column fast path preserves the common intercept-only arithmetic.
-struct RankAwareFixedDesign {
-    x: Vec<f64>,
-    rank: usize,
+pub(crate) struct RankAwareFixedDesign {
+    pub(crate) x: Vec<f64>,
+    pub(crate) rank: usize,
     original_p: usize,
     selected: Vec<usize>,
     upper: Vec<f64>,
@@ -367,7 +367,7 @@ struct RankAwareFixedDesign {
 }
 
 impl RankAwareFixedDesign {
-    fn expand_beta(&self, beta: &[f64]) -> Vec<f64> {
+    pub(crate) fn expand_beta(&self, beta: &[f64]) -> Vec<f64> {
         // Return a deterministic basic solution in the original column order.
         // Redundant-column coefficients are not individually identifiable;
         // their zero entries do not imply absence of a fixed-effect signal.
@@ -386,7 +386,11 @@ impl RankAwareFixedDesign {
     }
 }
 
-fn rank_aware_fixed_design(x: &[f64], n: usize, p: usize) -> Result<RankAwareFixedDesign, String> {
+pub(crate) fn rank_aware_fixed_design(
+    x: &[f64],
+    n: usize,
+    p: usize,
+) -> Result<RankAwareFixedDesign, String> {
     if n == 0
         || p == 0
         || x.len() != n.saturating_mul(p)

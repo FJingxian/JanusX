@@ -319,6 +319,7 @@ fn max6_ordered_subset_lut_packing_matches_scalar_genotypes_across_word_boundary
     let mut actual_missing = vec![0u64; row_words];
     let (
         observed_logic_missing,
+        observed_het_count,
         observed_hom_alt,
         observed_hom_ref,
         observed_has_het,
@@ -330,6 +331,13 @@ fn max6_ordered_subset_lut_packing_matches_scalar_genotypes_across_word_boundary
         &mut actual_missing,
     );
     assert_eq!(observed_logic_missing, expected_logic_missing);
+    assert_eq!(
+        observed_het_count,
+        sample_indices
+            .iter()
+            .filter(|&&src_sample| source_codes[src_sample] == 0b10)
+            .count()
+    );
     assert_eq!(observed_hom_alt, expected_hom_alt);
     assert_eq!(observed_hom_ref, expected_hom_ref);
     assert_eq!(observed_has_raw_missing, expected_has_raw_missing);
@@ -357,6 +365,7 @@ fn max6_ordered_subset_lut_packing_matches_scalar_genotypes_across_word_boundary
         false,
         plan.as_slice(),
         0.0,
+        1.0,
         1.0,
         true,
         &mut subset_scan_alt,
@@ -407,7 +416,7 @@ fn max6_ordered_subset_lut_packing_matches_scalar_genotypes_across_word_boundary
     assert!(reordered_plan.iter().any(|entry| !entry.dst_contiguous));
     let mut reordered_alt = vec![0u64; row_words];
     let mut reordered_missing = vec![0u64; row_words];
-    let (reordered_logic_missing, reordered_hom_alt, reordered_hom_ref, _, _) =
+    let (reordered_logic_missing, _reordered_het_count, reordered_hom_alt, reordered_hom_ref, _, _) =
         scan_max6_subset_row_and_pack(
             row.as_slice(),
             reordered_plan.as_slice(),
@@ -438,6 +447,64 @@ fn max6_ordered_subset_lut_packing_matches_scalar_genotypes_across_word_boundary
     assert_eq!(reordered_logic_missing, expected_reordered_logic_missing);
     assert_eq!(reordered_hom_alt, expected_reordered_hom_alt);
     assert_eq!(reordered_hom_ref, expected_reordered_hom_ref);
+}
+
+#[test]
+fn max6_fused_qc_enforces_het_threshold_in_identity_and_subset_paths() {
+    // 20 samples: 8 hom_ref (0b00), 8 hom_alt (0b11), 4 het (0b10), 0 raw missing.
+    // het_rate = 4 / 20 = 0.20, logic_missing_rate = 4 / 20 = 0.20.
+    let n_samples = 20usize;
+    let mut row = vec![0u8; n_samples.div_ceil(4)];
+    for sample in 0..n_samples {
+        let code = if sample < 8 {
+            0b00u8
+        } else if sample < 16 {
+            0b11u8
+        } else {
+            0b10u8
+        };
+        row[sample >> 2] |= code << ((sample & 3) * 2);
+    }
+    let sample_indices = (0..n_samples).collect::<Vec<_>>();
+    let plan = build_logic_sample_plan(sample_indices.as_slice());
+    let row_words = words_for_samples(n_samples);
+
+    for sample_identity in [true, false] {
+        let mut alt = vec![0u64; row_words];
+        let mut missing = vec![0u64; row_words];
+        let rejected = scan_max6_row_qc_and_pack_logic(
+            row.as_slice(),
+            n_samples,
+            sample_identity,
+            plan.as_slice(),
+            0.05,
+            0.5,
+            0.05,
+            true,
+            &mut alt,
+            &mut missing,
+        );
+        assert!(!rejected.keep, "sample_identity={sample_identity}");
+        assert_eq!(
+            rejected.reason, MAX6_FUSED_QC_FAIL_HET,
+            "sample_identity={sample_identity}"
+        );
+
+        let accepted = scan_max6_row_qc_and_pack_logic(
+            row.as_slice(),
+            n_samples,
+            sample_identity,
+            plan.as_slice(),
+            0.05,
+            0.5,
+            0.5,
+            true,
+            &mut alt,
+            &mut missing,
+        );
+        assert!(accepted.keep, "sample_identity={sample_identity}");
+        assert_eq!(accepted.reason, 0, "sample_identity={sample_identity}");
+    }
 }
 
 #[test]

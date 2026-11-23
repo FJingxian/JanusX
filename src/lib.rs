@@ -102,6 +102,8 @@ mod gmerge;
 
 #[path = "io/gwriter.rs"]
 mod gwriter;
+#[path = "haploid/mod.rs"]
+pub mod haploid;
 #[path = "imp/mod.rs"]
 mod imp;
 #[path = "io/imp_reader.rs"]
@@ -333,6 +335,18 @@ fn imp_run(
 }
 
 #[pyfunction]
+fn haploid_ibd_run(py: Python<'_>, options_json: String) -> PyResult<String> {
+    let config = serde_json::from_str::<haploid::types::HaploidIbdConfig>(&options_json)
+        .map_err(|error| PyRuntimeError::new_err(format!("invalid haploid ibd options: {error}")))?;
+    let summary = py
+        .detach(move || haploid::run_haploid_ibd(config))
+        .map_err(PyRuntimeError::new_err)?;
+    serde_json::to_string(&summary).map_err(|error| {
+        PyRuntimeError::new_err(format!("serialize haploid ibd summary: {error}"))
+    })
+}
+
+#[pyfunction]
 fn imp_estimate_window_bytes(
     options_json: String,
     target_samples: usize,
@@ -437,6 +451,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<PyMax6PreparedGenotypeUniverse>()?;
     m.add_class::<Bin01StreamWriter>()?;
     m.add_function(wrap_pyfunction!(imp_run, m)?)?;
+    m.add_function(wrap_pyfunction!(haploid_ibd_run, m)?)?;
     m.add_function(wrap_pyfunction!(imp_estimate_window_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(imp_convert_to_pgen, m)?)?;
     m.add_function(wrap_pyfunction!(spgrm_bed_to_jxgrm, m)?)?;

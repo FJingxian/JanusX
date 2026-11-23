@@ -43,6 +43,7 @@ Modules:
     gformat       Convert genotype files across plink/vcf/txt/npy
     gmerge        Merge genotype/variant tables
     imp           Windowed genotype phasing and reference imputation
+    ibd           Whole-chromosome PBWT IBD segmentation and ancestry painting
 '''
 import sys
 import subprocess
@@ -168,6 +169,7 @@ _CLI_MODULE_SECTIONS = [
             ("gformat", "Convert genotype files across plink/vcf/txt/npy"),
             ("gmerge", "Merge genotype/variant tables"),
             ("imp", "Windowed genotype phasing and reference imputation"),
+            ("ibd", "Whole-chromosome PBWT IBD segmentation and ancestry painting"),
         ],
     ),
 ]
@@ -175,7 +177,7 @@ _CLI_MODULE_SECTIONS = [
 _MODULE_NAMES = [
     "gwas", "ct", "postgwas", "postgarfield", "postbsa",
     "garfield", "grm", "pca", "gstats", "gs", "reml", "postgs",
-    "sim", "simulation", "adamixture", "fst", "xpclr", "gformat", "gmerge", "imp", "hybrid",
+    "sim", "simulation", "adamixture", "fst", "xpclr", "gformat", "gmerge", "imp", "ibd", "hybrid",
     "kmer", "kmerge", "kstats", "kformat", "view", "refcheck",
 ]
 _SCRIPT_MODULE_ALIASES = {

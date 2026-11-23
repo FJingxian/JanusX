@@ -17,13 +17,16 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::bedmath::{
-    decode_row_centered_full_lut, decode_row_centered_full_lut_f64, packed_byte_lut,
-    packed_pair_lut,
+    decode_row_centered_full_lut, packed_byte_lut, packed_pair_lut,
 };
+#[cfg(test)]
+use crate::bedmath::decode_row_centered_full_lut_f64;
 use crate::blas::{
-    cblas_dsyrk_dispatch, cblas_ssyrk_dispatch, CblasInt, OpenBlasThreadGuard, CBLAS_COL_MAJOR,
-    CBLAS_TRANS, CBLAS_UPPER,
+    cblas_ssyrk_dispatch, CblasInt, OpenBlasThreadGuard, CBLAS_COL_MAJOR, CBLAS_TRANS,
+    CBLAS_UPPER,
 };
+#[cfg(test)]
+use crate::blas::cblas_dsyrk_dispatch;
 use crate::math_ld::{
     build_bitplanes_u64, build_bitplanes_u64_for_samples, build_row_bitplanes_u64_with_aux,
     classify_ld_pair_by_maf, compute_packed_row_stats, compute_packed_row_stats_for_samples,
@@ -1190,6 +1193,7 @@ fn ld_r2_matrix_from_packed_rows_blas(
     Ok(out)
 }
 
+#[cfg(test)]
 fn ld_corr_matrix_from_packed_rows_blas(
     packed_rows: &[u8],
     m: usize,

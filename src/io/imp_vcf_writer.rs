@@ -297,6 +297,7 @@ fn compress_bgzf_block(raw: Vec<u8>) -> Result<CompressedBgzfBlock, String> {
 }
 
 impl ImpVcfWriter {
+    #[cfg(test)]
     pub(crate) fn create(
         path: &Path,
         samples: &[String],
@@ -343,36 +344,7 @@ impl ImpVcfWriter {
         Ok(out)
     }
 
-    fn write_header(&mut self) -> Result<(), String> {
-        self.write_text("##fileformat=VCFv4.3\n")?;
-        self.write_text("##source=JanusX-jx-imp\n")?;
-        self.write_text("##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Phased genotype\">\n")?;
-        if self.fields.dosage {
-            self.write_text("##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"Imputed alternate allele dosage\">\n")?;
-            self.write_text("##INFO=<ID=AF,Number=A,Type=Float,Description=\"Estimated alternate allele frequency\">\n")?;
-            self.write_text(
-                "##INFO=<ID=DR2,Number=A,Type=Float,Description=\"Estimated dosage r-squared\">\n",
-            )?;
-            self.write_text("##INFO=<ID=IMP,Number=0,Type=Flag,Description=\"Variant absent from the target input\">\n")?;
-        }
-        if self.fields.allele_probabilities {
-            self.write_text("##FORMAT=<ID=AP1,Number=A,Type=Float,Description=\"Haplotype 1 allele probability\">\n")?;
-            self.write_text("##FORMAT=<ID=AP2,Number=A,Type=Float,Description=\"Haplotype 2 allele probability\">\n")?;
-        }
-        if self.fields.genotype_probabilities {
-            self.write_text(
-                "##FORMAT=<ID=GP,Number=G,Type=Float,Description=\"Genotype probabilities\">\n",
-            )?;
-        }
-        self.write_text("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT")?;
-        let samples = self.samples.clone();
-        for sample in samples {
-            self.write_text("\t")?;
-            self.write_text(&sample)?;
-        }
-        self.write_text("\n")
-    }
-
+    #[cfg(test)]
     pub(crate) fn write_row(
         &mut self,
         row: &PhasedRow,
@@ -405,6 +377,36 @@ impl ImpVcfWriter {
         result?;
         self.rows_written = self.rows_written.saturating_add(1);
         Ok(())
+    }
+
+    fn write_header(&mut self) -> Result<(), String> {
+        self.write_text("##fileformat=VCFv4.3\n")?;
+        self.write_text("##source=JanusX-jx-imp\n")?;
+        self.write_text("##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Phased genotype\">\n")?;
+        if self.fields.dosage {
+            self.write_text("##FORMAT=<ID=DS,Number=A,Type=Float,Description=\"Imputed alternate allele dosage\">\n")?;
+            self.write_text("##INFO=<ID=AF,Number=A,Type=Float,Description=\"Estimated alternate allele frequency\">\n")?;
+            self.write_text(
+                "##INFO=<ID=DR2,Number=A,Type=Float,Description=\"Estimated dosage r-squared\">\n",
+            )?;
+            self.write_text("##INFO=<ID=IMP,Number=0,Type=Flag,Description=\"Variant absent from the target input\">\n")?;
+        }
+        if self.fields.allele_probabilities {
+            self.write_text("##FORMAT=<ID=AP1,Number=A,Type=Float,Description=\"Haplotype 1 allele probability\">\n")?;
+            self.write_text("##FORMAT=<ID=AP2,Number=A,Type=Float,Description=\"Haplotype 2 allele probability\">\n")?;
+        }
+        if self.fields.genotype_probabilities {
+            self.write_text(
+                "##FORMAT=<ID=GP,Number=G,Type=Float,Description=\"Genotype probabilities\">\n",
+            )?;
+        }
+        self.write_text("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT")?;
+        let samples = self.samples.clone();
+        for sample in samples {
+            self.write_text("\t")?;
+            self.write_text(&sample)?;
+        }
+        self.write_text("\n")
     }
 
     pub(crate) fn write_rows(
@@ -565,10 +567,6 @@ impl ImpVcfWriter {
             VcfStream::Bgzip(writer) => writer.write_bytes(bytes, Some(worker_pool))?,
         }
         Ok(())
-    }
-
-    pub(crate) fn rows_written(&self) -> u64 {
-        self.rows_written
     }
 
     pub(crate) fn finish(self, worker_pool: Option<&rayon::ThreadPool>) -> Result<(), String> {

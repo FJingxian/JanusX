@@ -9,11 +9,6 @@
 //! binary states 0/1, while heterozygotes and missing values are excluded by
 //! the strict valid mask rather than imputed.
 
-use numpy::PyReadonlyArray2;
-use pyo3::exceptions::PyValueError;
-use pyo3::prelude::*;
-use pyo3::types::PyDict;
-
 const N_CELLS: usize = 4;
 const N_TEMPLATES: usize = 5;
 const CLASSIFICATION_EPS: f64 = 1.0e-12;
@@ -35,19 +30,6 @@ pub(crate) enum BinaryEncoding {
     Auto,
 }
 
-impl BinaryEncoding {
-    pub(crate) fn parse(raw: &str) -> Result<Self, String> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "auto" => Ok(Self::Auto),
-            "01" | "0/1" | "binary" => Ok(Self::ZeroOne),
-            "02" | "0/2" | "homozygous" => Ok(Self::ZeroTwo),
-            other => Err(format!(
-                "encoding must be one of auto, 01, or 02; got {other}"
-            )),
-        }
-    }
-}
-
 /// The architecture template selected from the four cell means.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TemplateLabel {
@@ -59,34 +41,11 @@ pub(crate) enum TemplateLabel {
     Unresolved,
 }
 
-impl TemplateLabel {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::And00 => "AND_00",
-            Self::And01 => "AND_01",
-            Self::And10 => "AND_10",
-            Self::And11 => "AND_11",
-            Self::Xor => "XOR",
-            Self::Unresolved => "UNRESOLVED",
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EffectDirection {
     Positive,
     Negative,
     Neutral,
-}
-
-impl EffectDirection {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Positive => "positive",
-            Self::Negative => "negative",
-            Self::Neutral => "neutral",
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,17 +54,6 @@ pub(crate) enum ClassificationStatus {
     Ambiguous,
     InsufficientSupport,
     Unresolved,
-}
-
-impl ClassificationStatus {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Classified => "classified",
-            Self::Ambiguous => "ambiguous",
-            Self::InsufficientSupport => "insufficient_support",
-            Self::Unresolved => "unresolved",
-        }
-    }
 }
 
 /// Four-cell summary and template classification for one pair.
@@ -474,143 +422,6 @@ pub(crate) fn summarize_binary_pairs_marker_major(
         )?);
     }
     Ok(summaries)
-}
-
-pub(crate) fn array2_to_vec(array: &PyReadonlyArray2<'_, f64>) -> Vec<f64> {
-    let view = array.as_array();
-    let shape = view.shape();
-    let mut out = Vec::with_capacity(view.len());
-    for row in 0..shape[0] {
-        for column in 0..shape[1] {
-            out.push(view[[row, column]]);
-        }
-    }
-    out
-}
-
-pub(crate) fn bool_array2_to_vec(array: &PyReadonlyArray2<'_, bool>) -> Vec<bool> {
-    let view = array.as_array();
-    let shape = view.shape();
-    let mut out = Vec::with_capacity(view.len());
-    for row in 0..shape[0] {
-        for column in 0..shape[1] {
-            out.push(view[[row, column]]);
-        }
-    }
-    out
-}
-
-pub(crate) fn set_summary_columns<'py>(
-    out: &Bound<'py, PyDict>,
-    summaries: &[PairCellSummary],
-) -> PyResult<()> {
-    out.set_item(
-        "n00",
-        summaries
-            .iter()
-            .map(|summary| summary.counts[0])
-            .collect::<Vec<_>>(),
-    )?;
-    out.set_item(
-        "n01",
-        summaries
-            .iter()
-            .map(|summary| summary.counts[1])
-            .collect::<Vec<_>>(),
-    )?;
-    out.set_item(
-        "n10",
-        summaries
-            .iter()
-            .map(|summary| summary.counts[2])
-            .collect::<Vec<_>>(),
-    )?;
-    out.set_item(
-        "n11",
-        summaries
-            .iter()
-            .map(|summary| summary.counts[3])
-            .collect::<Vec<_>>(),
-    )?;
-    for (name, cell) in [
-        ("mean00", 0usize),
-        ("mean01", 1),
-        ("mean10", 2),
-        ("mean11", 3),
-    ] {
-        out.set_item(
-            name,
-            summaries
-                .iter()
-                .map(|summary| summary.means[cell])
-                .collect::<Vec<_>>(),
-        )?;
-    }
-    out.set_item(
-        "template_label",
-        summaries
-            .iter()
-            .map(|summary| summary.template_label.as_str())
-            .collect::<Vec<_>>(),
-    )?;
-    out.set_item(
-        "template_score",
-        summaries
-            .iter()
-            .map(|summary| summary.template_score)
-            .collect::<Vec<_>>(),
-    )?;
-    out.set_item(
-        "template_margin",
-        summaries
-            .iter()
-            .map(|summary| summary.template_margin)
-            .collect::<Vec<_>>(),
-    )?;
-    out.set_item(
-        "effect_direction",
-        summaries
-            .iter()
-            .map(|summary| summary.effect_direction.as_str())
-            .collect::<Vec<_>>(),
-    )?;
-    out.set_item(
-        "classification_status",
-        summaries
-            .iter()
-            .map(|summary| summary.classification_status.as_str())
-            .collect::<Vec<_>>(),
-    )?;
-    out.set_item(
-        "n_valid",
-        summaries
-            .iter()
-            .map(|summary| summary.n_valid)
-            .collect::<Vec<_>>(),
-    )?;
-    Ok(())
-}
-
-pub(crate) fn summaries_to_py_dict<'py>(
-    py: Python<'py>,
-    pairs: &[(usize, usize)],
-    summaries: &[PairCellSummary],
-) -> PyResult<Bound<'py, PyDict>> {
-    if pairs.len() != summaries.len() {
-        return Err(PyValueError::new_err(format!(
-            "pair cell summary output mismatch: pairs={}, summaries={}",
-            pairs.len(),
-            summaries.len()
-        )));
-    }
-    let out = PyDict::new(py);
-    out.set_item("first", pairs.iter().map(|pair| pair.0).collect::<Vec<_>>())?;
-    out.set_item(
-        "second",
-        pairs.iter().map(|pair| pair.1).collect::<Vec<_>>(),
-    )?;
-    set_summary_columns(&out, summaries)?;
-    Ok(out)
 }
 
 #[cfg(test)]

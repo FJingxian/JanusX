@@ -72,9 +72,6 @@ fn configure_macos_deployment_target() {
     }
 
     env::set_var("MACOSX_DEPLOYMENT_TARGET", "11.0");
-    println!(
-        "cargo:warning=MACOSX_DEPLOYMENT_TARGET was unset; defaulting to 11.0 for macOS arm64 C/C++ builds."
-    );
 }
 
 fn has_library_with_prefix(lib_dir_s: &str, prefix: &str) -> bool {
@@ -731,7 +728,7 @@ fn emit_bed_decode_simd_defaults() {
 }
 
 fn configure_openblas_from_dir(lib_dir_s: &str, source_label: &str) -> bool {
-    if !Path::new(lib_dir_s).exists() {
+    if lib_dir_s.trim().is_empty() || !Path::new(lib_dir_s).exists() {
         return false;
     }
 
@@ -761,7 +758,7 @@ fn configure_openblas_from_dir(lib_dir_s: &str, source_label: &str) -> bool {
     if cfg!(any(target_os = "linux", target_os = "macos")) {
         // Ensure wheel-repair tools can resolve @rpath-linked dependencies
         // (e.g. libopenblas.0.dylib -> libiconv.2.dylib in conda environments).
-        println!("cargo:rustc-link-arg=-Wl,-rpath,{lib_dir_s}");
+        emit_rpath(lib_dir_s);
     }
     maybe_link_blas_family_from_dir(lib_dir_s, source_label);
     println!("cargo:rustc-cfg=jx_openblas_available");
@@ -812,6 +809,12 @@ fn configure_openblas_from_dir(lib_dir_s: &str, source_label: &str) -> bool {
     true
 }
 
+fn emit_rpath(lib_dir_s: &str) {
+    if !lib_dir_s.trim().is_empty() {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{lib_dir_s}");
+    }
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=PYO3_BUILD_EXTENSION_MODULE");
     println!("cargo:rerun-if-env-changed=JANUSX_BUILD_VERBOSE");
@@ -822,7 +825,11 @@ fn main() {
         .unwrap_or(false);
     if build_extension_module {
         pyo3_build_config::add_extension_module_link_args();
-    } else {
+    } else if pyo3_build_config::get()
+        .python_framework_prefix
+        .as_deref()
+        .is_some_and(|prefix| !prefix.trim().is_empty())
+    {
         pyo3_build_config::add_python_framework_link_args();
     }
 
@@ -867,9 +874,9 @@ Enable default features or pass --features blas-openblas."
         if cfg!(target_os = "linux") {
             if let Some(lib_dir) = env::var_os("BLAS_LIB_DIR") {
                 let lib_dir_s = lib_dir.to_string_lossy().to_string();
-                if Path::new(&lib_dir_s).exists() {
+                if !lib_dir_s.trim().is_empty() && Path::new(&lib_dir_s).exists() {
                     println!("cargo:rustc-link-search=native={lib_dir_s}");
-                    println!("cargo:rustc-link-arg=-Wl,-rpath,{lib_dir_s}");
+                    emit_rpath(&lib_dir_s);
                     println!("cargo:rustc-cfg=jx_blas_available");
                     emit_verbose_note("BLAS enabled via BLAS_LIB_DIR.");
                     return;
@@ -998,9 +1005,9 @@ Set OPENBLAS_LIB_DIR/OPENBLAS_INCLUDE_DIR or install OpenBLAS + pkg-config metad
             if cfg!(target_os = "linux") {
                 if let Some(lib_dir) = env::var_os("BLAS_LIB_DIR") {
                     let lib_dir_s = lib_dir.to_string_lossy().to_string();
-                    if Path::new(&lib_dir_s).exists() {
+                    if !lib_dir_s.trim().is_empty() && Path::new(&lib_dir_s).exists() {
                         println!("cargo:rustc-link-search=native={lib_dir_s}");
-                        println!("cargo:rustc-link-arg=-Wl,-rpath,{lib_dir_s}");
+                        emit_rpath(&lib_dir_s);
                         println!("cargo:rustc-cfg=jx_blas_available");
                         println!(
                             "cargo:warning=OpenBLAS feature requested but library not found ({err}); \

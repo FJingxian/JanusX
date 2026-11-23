@@ -13,8 +13,6 @@
 //!   - `JX_GARFIELD_PAIRWISE_AND_MAX_CANDIDATES` (default 100)
 //!   - `JX_GARFIELD_PAIRWISE_AND_ALPHA`          (default 0.5)
 
-#![allow(dead_code)]
-
 use crate::ml::common::{topk_indices, ResponseKind};
 use crate::ml::extra_trees::ExtraTreesConfig;
 use rayon::prelude::*;
@@ -94,6 +92,7 @@ fn words_for_samples(n_samples: usize) -> usize {
 
 /// Pack a dense `&[u8]` row into `Vec<u64>`.
 #[inline]
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn pack_dense(row: &[u8], n_words: usize) -> Vec<u64> {
     let mut out = vec![0u64; n_words];
     for (i, &v) in row.iter().enumerate() {
@@ -404,6 +403,7 @@ fn pair_scores_packed_dual(
 ///
 /// By centered-gain complement symmetry this also covers the full OR family:
 ///   `i|j` ≡ `!(!i&!j)`, `i|!j` ≡ `!(!i&j)`, etc.
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn pair_gains_packed(
     pi: &[u64],
     pj: &[u64],
@@ -489,6 +489,7 @@ fn pair_gains_packed_fast(
     (gain_and, gain_nij, gain_ij, gain_ji)
 }
 
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn feature_scores_pairwise_and_packed_core(
     bits_flat: &[u64],
     row_words: usize,
@@ -788,6 +789,7 @@ fn feature_scores_pairwise_and_packed_dual_core(
 // ---------------------------------------------------------------------------
 
 /// Feature scores directly from packed-u64 flat matrix.
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 pub fn feature_scores_pairwise_and_packed(
     bits_flat: &[u64],
     row_words: usize,
@@ -798,6 +800,7 @@ pub fn feature_scores_pairwise_and_packed(
     feature_scores_pairwise_and_packed_core(bits_flat, row_words, n_features, y, n_samples, None)
 }
 
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 pub fn feature_scores_pairwise_and_packed_dual(
     bits_ge1_flat: &[u64],
     bits_ge2_flat: &[u64],
@@ -817,6 +820,7 @@ pub fn feature_scores_pairwise_and_packed_dual(
     )
 }
 
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 pub fn feature_scores_pairwise_and_packed_with_stage1(
     bits_flat: &[u64],
     row_words: usize,
@@ -867,6 +871,7 @@ pub fn feature_scores_pairwise_and_packed_dual_with_stage1(
 /// `data` is `[row0_s0, row0_s1, ..., row1_s0, ...]` with `row_stride` bytes
 /// per row.  Stage 1 reads directly from flat; Stage 2 packs only the top-M'
 /// candidates into u64.
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 pub fn feature_scores_pairwise_and_flat(
     data: &[u8],
     row_stride: usize,
@@ -1007,6 +1012,7 @@ pub fn feature_scores_pairwise_and_flat(
 /// Dense count+sum (branch per sample).  Faster than pack+count for Stage 1
 /// because it is a single sequential scan with simple writes.
 #[inline]
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn count_sum_y_dense(row: &[u8], y: &[f64]) -> (usize, f64) {
     let mut n = 0usize;
     let mut s = 0.0f64;

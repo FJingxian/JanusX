@@ -1067,21 +1067,6 @@ fn rank_bin_leads(sz: i64, pvalue: &[f64], pos: &[i64]) -> Vec<usize> {
     bins.into_iter().map(|(_, idx)| idx).collect()
 }
 
-pub(crate) fn select_lead_indices(
-    sz: i64,
-    n_lead: usize,
-    pvalue: &[f64],
-    pos: &[i64],
-) -> Vec<usize> {
-    if n_lead == 0 {
-        return Vec::new();
-    }
-    let mut lead = rank_bin_leads(sz, pvalue, pos);
-    lead.truncate(n_lead);
-    lead.sort_unstable();
-    lead
-}
-
 fn farmcpu_raw_prepare_seq_qtn(
     qtn_saved: &[usize],
     opt_lead: &[usize],
@@ -2122,52 +2107,6 @@ fn farmcpu_ll_score_from_sample_major_legacy_prepared(
         return Err("legacy FarmCPU ll scorer failed to find a finite optimum".to_string());
     }
     Ok(-2.0_f64 * best_ll)
-}
-
-pub(crate) fn farmcpu_ll_score_from_sample_major(
-    y: &[f64],
-    x: &[f64],
-    n: usize,
-    p: usize,
-    snp_pool_sample_major: &[f64],
-    k: usize,
-    delta_exp_start: f64,
-    delta_exp_end: f64,
-    delta_step: f64,
-    svd_eps: f64,
-) -> Result<f64, String> {
-    if n == 0 || p == 0 {
-        return Err("invalid shape in legacy FarmCPU ll score: empty y/X".to_string());
-    }
-    if y.len() != n {
-        return Err("invalid y length in legacy FarmCPU ll score".to_string());
-    }
-    if x.len() != n.saturating_mul(p) {
-        return Err("invalid X length in legacy FarmCPU ll score".to_string());
-    }
-    if k == 0 {
-        return Err("legacy FarmCPU ll scorer received zero candidate markers".to_string());
-    }
-    if snp_pool_sample_major.len() != n.saturating_mul(k) {
-        return Err("invalid snp_pool length in legacy FarmCPU ll score".to_string());
-    }
-    if !(delta_step.is_finite() && delta_step > 0.0_f64) {
-        return Err("legacy FarmCPU ll scorer requires finite delta_step > 0".to_string());
-    }
-    if !(svd_eps.is_finite() && svd_eps >= 0.0_f64) {
-        return Err("legacy FarmCPU ll scorer requires finite svd_eps >= 0".to_string());
-    }
-    let prepared = prepare_farmcpu_exact_rem(y, x, n, p)?;
-    farmcpu_ll_score_from_sample_major_legacy_prepared(
-        &prepared,
-        snp_pool_sample_major,
-        k,
-        delta_exp_start,
-        delta_exp_end,
-        delta_step,
-        svd_eps,
-        1e-12_f64,
-    )
 }
 
 pub(crate) fn farmcpu_super_keep_from_sample_major(

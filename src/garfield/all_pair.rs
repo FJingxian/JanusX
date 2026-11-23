@@ -7,11 +7,7 @@
 //! order-2 exploratory searches.  It is a proposal/raw-design primitive;
 //! formal inference remains owned by the existing GARFIELD pipeline.
 
-use crate::breader::load_bin01_as_u64_words;
 use crate::bstats::{tail_mask, words_for_samples};
-use numpy::PyReadonlyArray1;
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
-use pyo3::prelude::*;
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::cmp::Reverse;
@@ -420,31 +416,6 @@ pub(crate) fn scan_all_pairs_continuous_packed_with_parallel_and_xor(
         n_rows,
         n_samples,
     })
-}
-
-/// Python diagnostic wrapper for the independent order-2 scanner.
-///
-/// Returns `(candidates, pairs_evaluated, polarity_evaluated, n_rows,
-/// n_samples)`, with candidates represented as `(first, second, polarity,
-/// raw_score, support)` tuples.  The API is intentionally standalone so the
-/// production Beam/search path remains unchanged while all-pair benchmarks
-/// establish the raw-score oracle ceiling.
-fn scan_all_pair_bin_py_impl<'py>(
-    bin_path: &str,
-    y: PyReadonlyArray1<'py, f64>,
-    top_k: usize,
-    xor_search: bool,
-) -> PyResult<AllPairScanResult> {
-    let (bits, row_words, n_rows, n_samples) =
-        load_bin01_as_u64_words(bin_path, "garfield_all_pair_scan_bin")
-            .map_err(PyRuntimeError::new_err)?;
-    let y_vec = y
-        .as_slice()
-        .map_err(|e| PyValueError::new_err(format!("garfield_all_pair_scan_bin: {e}")))?;
-    scan_all_pairs_continuous_packed_with_parallel_and_xor(
-        &bits, row_words, n_rows, y_vec, n_samples, top_k, true, xor_search,
-    )
-    .map_err(PyValueError::new_err)
 }
 
 #[cfg(test)]

@@ -28,6 +28,7 @@ pub(crate) struct PbwtIndex {
     pub(crate) inverse: Vec<usize>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct SegmentPbwtIndex {
     pub(crate) n_haplotypes: usize,
@@ -104,6 +105,7 @@ impl DonorProposalStorage {
         }
     }
 
+    #[cfg(test)]
     fn len(&self) -> usize {
         match self {
             Self::Compact(values) => values.len(),
@@ -259,6 +261,7 @@ impl PbwtDirection {
 /// Build Beagle-style IBS donor proposals using one batch per available worker
 /// and 1 cM overlap buffers. Beagle's PBWT partition intentionally depends on
 /// the requested thread count.
+#[cfg(test)]
 pub(crate) fn build_phase_donor_index_with_pool(
     window: &PhasedWindow,
     cm_positions: &[f64],
@@ -577,6 +580,7 @@ pub(crate) fn build_phase_donor_index(
 /// updated from the projected Stage1 markers; within each step, low-frequency
 /// allele carriers add adjacency links that can select donors with a rare
 /// allele even when the Stage1 sequence itself is not unique.
+#[cfg(test)]
 pub(crate) fn build_low_frequency_phase_donor_index(
     stage1_window: &PhasedWindow,
     stage1_cm_positions: &[f64],
@@ -630,6 +634,7 @@ pub(crate) fn build_low_frequency_phase_donor_index(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn build_low_frequency_phase_donor_index_view(
     stage1_view: &PhaseHaplotypeView<'_>,
     full_view: &PhaseHaplotypeView<'_>,
@@ -1127,6 +1132,7 @@ fn low_frequency_fallback_interval(
     (right - left > 1).then_some((left, right))
 }
 
+#[cfg(test)]
 fn low_frequency_hap_neighbors(
     window: &PhaseWindow,
     start_marker: usize,
@@ -1513,6 +1519,7 @@ fn build_phase_donor_batch<T: DonorProposalId>(
 /// Encode the exact multi-marker allele sequence in each genetic step as one
 /// categorical PBWT symbol. Beagle assigns category IDs in first-haplotype
 /// order, which also fixes the stable order of distinct sequence groups.
+#[cfg(test)]
 fn encode_step_sequences(
     window: &PhasedWindow,
     start: usize,
@@ -1727,6 +1734,7 @@ fn encode_biallelic_step_sequences_view(
     Some(next_code as usize)
 }
 
+#[cfg(test)]
 fn encode_biallelic_step_sequences(
     window: &PhasedWindow,
     start: usize,
@@ -1859,6 +1867,7 @@ fn hash_packed_biallelic_sequence(
     hash ^ (hash >> 33)
 }
 
+#[cfg(test)]
 fn same_step_sequence(
     window: &PhasedWindow,
     start: usize,
@@ -2331,6 +2340,7 @@ pub(crate) fn beagle_window_seed(master_seed: u64, window_index: u64) -> u64 {
     seed
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct PbwtSegment {
     pub(crate) start: usize,
@@ -2339,6 +2349,7 @@ pub(crate) struct PbwtSegment {
     pub(crate) order: Vec<usize>,
 }
 
+#[cfg(test)]
 pub(crate) fn build_index(window: &PhasedWindow) -> Result<PbwtIndex, String> {
     if window.rows.is_empty() {
         return Err("cannot build a PBWT index for an empty phased window".to_owned());
@@ -2455,6 +2466,7 @@ pub(crate) fn neighbors(
 
 /// Build one local PBWT order per genetic segment. Only the order at the end
 /// of each segment is retained; scan buffers are reused between segments.
+#[cfg(test)]
 pub(crate) fn build_segment_index(
     window: &PhasedWindow,
     cm_positions: &[f64],
@@ -2572,6 +2584,7 @@ pub(crate) fn build_segment_index(
 /// Build a segment PBWT directly from an allele accessor. This allows callers
 /// with a marker-major packed panel to avoid materializing a second diploid
 /// row matrix just to build the donor index.
+#[cfg(test)]
 pub(crate) fn build_segment_index_from_alleles<F>(
     n_haplotypes: usize,
     n_markers: usize,
@@ -2671,6 +2684,7 @@ where
     })
 }
 
+#[cfg(test)]
 fn segment_end(cm_positions: &[f64], start: usize, segment_cm: f64) -> usize {
     let segment_cm_start = cm_positions[start];
     let mut end = start + 1;
@@ -2680,6 +2694,7 @@ fn segment_end(cm_positions: &[f64], start: usize, segment_cm: f64) -> usize {
     end
 }
 
+#[cfg(test)]
 fn nearest_segment_haplotypes<T, F>(order: &[T], limit: usize, compare: F) -> Vec<T>
 where
     T: Copy,
@@ -2731,6 +2746,7 @@ where
 
 /// Locate a target sequence in a segment's reversed-prefix order and return
 /// exact matches first, followed by the nearest haplotypes on both sides.
+#[cfg(test)]
 pub(crate) fn segment_neighbors(
     index: &SegmentPbwtIndex,
     segment_index: usize,
@@ -2764,6 +2780,7 @@ pub(crate) fn segment_neighbors(
 
 /// Locate a target sequence in a segment PBWT order using a packed-panel
 /// allele accessor rather than a materialized `PhasedWindow`.
+#[cfg(test)]
 pub(crate) fn segment_neighbors_from_alleles<F>(
     index: &SegmentPbwtIndex,
     segment_index: usize,
@@ -2808,6 +2825,7 @@ where
 /// step. Beagle's phase IBS proposals require a match that reaches the
 /// current step; a lexicographically nearby but mismatching haplotype is not
 /// an IBS proposal.
+#[cfg(test)]
 pub(crate) fn segment_exact_neighbors(
     index: &SegmentPbwtIndex,
     segment_index: usize,
@@ -2870,6 +2888,7 @@ pub(crate) fn segment_exact_neighbors(
         .collect())
 }
 
+#[cfg(test)]
 fn compare_haplotype_to_query(
     window: &PhasedWindow,
     haplotype: usize,
@@ -2891,6 +2910,7 @@ fn compare_haplotype_to_query(
     )
 }
 
+#[cfg(test)]
 fn compare_haplotype_to_query_by<F>(
     haplotype: usize,
     segment: &PbwtSegment,
@@ -2919,10 +2939,12 @@ where
     .unwrap_or(std::cmp::Ordering::Equal)
 }
 
+#[cfg(test)]
 pub(crate) fn initialize(window: &PhaseWindow, seed: u64) -> Result<PhasedWindow, String> {
     initialize_with_threads(window, seed, 1)
 }
 
+#[cfg(test)]
 pub(crate) fn initialize_with_threads(
     window: &PhaseWindow,
     seed: u64,

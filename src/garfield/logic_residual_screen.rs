@@ -15,7 +15,9 @@ use pyo3::types::PyDict;
 use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap};
+#[cfg(test)]
+use std::collections::HashSet;
 use std::time::Instant;
 
 // Keep the historical names private to this module while making the
@@ -3746,6 +3748,7 @@ fn scan_residual_pairs_packed_max6_batch_with_min_anchor_len_and_profile(
 /// compact packed rows in `bits_flat` back to their marker indices in the full
 /// window.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn rerank_residual_pairs_packed(
     bits_flat: &[u64],
     valid_flat: Option<&[u64]>,

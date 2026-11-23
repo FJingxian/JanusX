@@ -481,30 +481,7 @@ pub(crate) fn sample_requires_phase_baum(
 /// evidence and are reinitialized from the genotype track at each unresolved
 /// heterozygote. Backward checkpoints are retained per 256 clusters, while
 /// only allele-level hard calls survive the window pass.
-pub(crate) fn update_sample(
-    input: &PhaseWindow,
-    snapshot: &PhasedWindow,
-    sample: usize,
-    finished: &[u64],
-    any_unphased_heterozygote: bool,
-    panel: &CompositePanel,
-    config: &HMMConfig,
-) -> Result<JointPhaseUpdate, String> {
-    let unmasked = vec![0u64; input.rows.len().div_ceil(64)];
-    update_sample_with_diagnostic(
-        input,
-        snapshot,
-        sample,
-        finished,
-        any_unphased_heterozygote,
-        &unmasked,
-        panel,
-        config,
-        None,
-        |_| {},
-    )
-}
-
+#[cfg(test)]
 pub(crate) fn update_sample_with_diagnostic<F>(
     input: &PhaseWindow,
     snapshot: &PhasedWindow,
@@ -3423,45 +3400,6 @@ fn backward_project(
 }
 
 #[inline]
-fn backward_project_from_codes(
-    beta_after: &[f32],
-    projected: &mut [f32],
-    codes: &[u8],
-    cluster_offset: usize,
-    cluster_kind: ClusterKind,
-    switch: f32,
-    probabilities: [f32; 2],
-) {
-    let state_count = beta_after.len() / 3;
-    let probability_table = [1.0, probabilities[0], probabilities[1]];
-    debug_assert_eq!(beta_after.len(), projected.len());
-    for track in 0..3 {
-        let begin = track * state_count;
-        let end = begin + state_count;
-        let mut emission_sum = 0.0f32;
-        if let Some(row) = emission_row_offset(cluster_kind, cluster_offset, state_count, track) {
-            for state in 0..state_count {
-                let value =
-                    beta_after[begin + state] * probability_table[codes[row + state] as usize];
-                projected[begin + state] = value;
-                emission_sum += value;
-            }
-        } else {
-            for state in begin..end {
-                let value = beta_after[state] * probabilities[0];
-                projected[state] = value;
-                emission_sum += value;
-            }
-        }
-        let shift = switch / state_count as f32;
-        let scale = (1.0f32 - switch) / emission_sum;
-        for probability in &mut projected[begin..end] {
-            *probability = scale * *probability + shift;
-        }
-    }
-}
-
-#[inline]
 fn project_coded_emissions(
     beta_after: &[f32],
     projected: &mut [f32],
@@ -4264,6 +4202,7 @@ where
     sum
 }
 
+#[cfg(test)]
 #[inline]
 fn beagle_forward_update_codes(
     probabilities: &mut [f32],
@@ -4785,6 +4724,7 @@ unsafe fn beagle_forward_update_codes_six_complete_avx2(
     ([sums[0], sums[1], sums[2]], [sums[3], sums[4], sums[5]])
 }
 
+#[cfg(test)]
 fn beagle_backward_update<E>(probabilities: &mut [f32], switch: f32, mut emission: E)
 where
     E: FnMut(usize) -> f32,

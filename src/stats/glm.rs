@@ -122,7 +122,6 @@ pub(crate) struct LmQrProjection {
     q: Vec<f64>,
     q_f32: Vec<f32>,
     qty: Vec<f64>,
-    y_resid: Vec<f64>,
     rss0: f64,
     rank: usize,
     n: usize,
@@ -236,7 +235,6 @@ impl LmQrProjection {
             q,
             q_f32,
             qty,
-            y_resid,
             rss0,
             rank,
             n,
@@ -251,16 +249,6 @@ impl LmQrProjection {
     #[inline]
     pub(crate) fn q_f32(&self) -> &[f32] {
         self.q_f32.as_slice()
-    }
-
-    #[inline]
-    pub(crate) fn y_resid(&self) -> &[f64] {
-        self.y_resid.as_slice()
-    }
-
-    #[inline]
-    pub(crate) fn rss0(&self) -> f64 {
-        self.rss0
     }
 
     #[inline]

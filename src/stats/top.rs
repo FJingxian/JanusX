@@ -25,14 +25,18 @@ pub(crate) enum TopMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ModelSelectMode {
     PerTrait,
+    #[allow(dead_code)] // Retained reference/scoring helper.
     Global,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ModelSelectMetric {
     Pearson,
+    #[allow(dead_code)] // Retained reference/scoring helper.
     Spearman,
+    #[allow(dead_code)] // Retained reference/scoring helper.
     Rmse,
+    #[allow(dead_code)] // Retained reference/scoring helper.
     Nrmse,
 }
 
@@ -62,7 +66,9 @@ pub(crate) struct TopConfig {
     pub eps: f64,
     pub normalize_weights: bool,
     pub seed: u64,
+    #[allow(dead_code)] // Retained reference/scoring helper.
     pub model_select_mode: ModelSelectMode,
+    #[allow(dead_code)] // Retained reference/scoring helper.
     pub model_select_metric: ModelSelectMetric,
     pub calibration_mode: CalibrationMode,
 }
@@ -588,6 +594,7 @@ pub(crate) fn normalize_sum_to_one(w: &mut [f64]) {
     }
 }
 
+#[allow(dead_code)] // Retained reference/scoring helper.
 pub(crate) fn pearson(x: &[f64], y: &[f64]) -> Option<f64> {
     if x.len() != y.len() || x.is_empty() {
         return None;
@@ -624,6 +631,7 @@ pub(crate) fn pearson(x: &[f64], y: &[f64]) -> Option<f64> {
     }
 }
 
+#[allow(dead_code)] // Retained reference/scoring helper.
 pub(crate) fn rmse(x: &[f64], y: &[f64]) -> Option<f64> {
     if x.len() != y.len() || x.is_empty() {
         return None;
@@ -645,6 +653,7 @@ pub(crate) fn rmse(x: &[f64], y: &[f64]) -> Option<f64> {
     }
 }
 
+#[allow(dead_code)] // Retained reference/scoring helper.
 pub(crate) fn mae(x: &[f64], y: &[f64]) -> Option<f64> {
     if x.len() != y.len() || x.is_empty() {
         return None;
@@ -665,6 +674,7 @@ pub(crate) fn mae(x: &[f64], y: &[f64]) -> Option<f64> {
     }
 }
 
+#[allow(dead_code)] // Retained reference/scoring helper.
 pub(crate) fn nrmse(x: &[f64], y: &[f64]) -> Option<f64> {
     let rmse_v = rmse(x, y)?;
     let (_, std_y) = mean_std(y).ok()?;
@@ -675,6 +685,7 @@ pub(crate) fn nrmse(x: &[f64], y: &[f64]) -> Option<f64> {
     }
 }
 
+#[allow(dead_code)] // Retained reference/scoring helper.
 pub(crate) fn spearman(x: &[f64], y: &[f64]) -> Option<f64> {
     if x.len() != y.len() || x.is_empty() {
         return None;
@@ -815,6 +826,7 @@ pub(crate) fn calibrate_matrix_by_trait_inplace(
     Ok(())
 }
 
+#[allow(dead_code)] // Retained reference/scoring helper.
 pub(crate) fn calibrate_matrix_by_trait(
     data: &[f64],
     n: usize,
@@ -826,6 +838,7 @@ pub(crate) fn calibrate_matrix_by_trait(
     Ok(out)
 }
 
+#[allow(dead_code)] // Retained reference/scoring helper.
 pub(crate) fn find_target_by_sample_id(data: &TopData, target_id: &str) -> Option<Vec<f64>> {
     let idx = data.sample_ids.iter().position(|x| x == target_id)?;
     let mut out = vec![0.0; data.k];
@@ -835,6 +848,7 @@ pub(crate) fn find_target_by_sample_id(data: &TopData, target_id: &str) -> Optio
     Some(out)
 }
 
+#[allow(dead_code)] // Retained reference/scoring helper.
 pub(crate) fn prepare_target(model: &TopModel, mut target_raw: Vec<f64>) -> TopResult<Vec<f64>> {
     model.standardizer.transform_row(&mut target_raw)?;
     Ok(target_raw)
@@ -926,6 +940,7 @@ pub(crate) fn exact_objective_with_workspace(
     Ok(TopObjective { loss, grad, hess })
 }
 
+#[allow(dead_code)] // Retained reference/scoring helper.
 pub(crate) fn exact_objective(
     y_pred_std: &[f64],
     y_true_std: &[f64],
@@ -1020,6 +1035,7 @@ pub(crate) fn minibatch_loss_grad_with_workspace(
     Ok((loss, grad))
 }
 
+#[allow(dead_code)] // Retained reference/scoring helper.
 pub(crate) fn minibatch_loss_grad(
     y_pred_std: &[f64],
     y_true_std: &[f64],
@@ -1706,6 +1722,7 @@ pub(crate) fn rank_candidates(
     Ok(records)
 }
 
+#[allow(dead_code)] // Retained reference/scoring helper.
 pub(crate) fn rank_candidates_to_target_sample(
     model: &TopModel,
     candidate_ids: &[String],
@@ -1799,6 +1816,7 @@ fn validate_finite_matrix(name: &str, data: &[f64]) -> TopResult<()> {
     validate_finite_slice(name, data)
 }
 
+#[allow(dead_code)] // Retained reference/scoring helper.
 fn mean_std(data: &[f64]) -> TopResult<(f64, f64)> {
     if data.is_empty() {
         return Err("mean_std requires a non-empty slice.".to_string());
@@ -1840,6 +1858,7 @@ fn vector_sub(a: &[f64], b: &[f64]) -> Vec<f64> {
     a.iter().zip(b.iter()).map(|(x, y)| x - y).collect()
 }
 
+#[allow(dead_code)] // Retained reference/scoring helper.
 fn rank_with_ties(values: &[f64]) -> Option<Vec<f64>> {
     if values.is_empty() {
         return None;

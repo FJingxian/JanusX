@@ -413,28 +413,6 @@ pub(crate) fn apply_prepared_grm_stream_row_copy_f32(
 }
 
 #[inline]
-pub(crate) fn apply_prepared_grm_stream_row_copy_f64(
-    src: &[f32],
-    dst: &mut [f64],
-    mean_g: f64,
-    std_scale: f64,
-    flip_major: bool,
-) {
-    for (g_src, g_dst) in src.iter().zip(dst.iter_mut()) {
-        if *g_src < 0.0_f32 {
-            *g_dst = 0.0_f64;
-            continue;
-        }
-        let gv = if flip_major {
-            2.0_f64 - (*g_src as f64)
-        } else {
-            *g_src as f64
-        };
-        *g_dst = (gv - mean_g) * std_scale;
-    }
-}
-
-#[inline]
 pub(crate) fn prepare_packed_block_row_indices(
     row_indices: Option<&[usize]>,
     row_start: usize,

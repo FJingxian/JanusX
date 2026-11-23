@@ -120,6 +120,7 @@ enum MutateBackend {
     Neon,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct KingBitCounts {
     pub(crate) shared_nonmissing: u64,
@@ -130,6 +131,7 @@ pub(crate) struct KingBitCounts {
     pub(crate) het_j_obs: u64,
 }
 
+#[cfg(test)]
 impl KingBitCounts {
     #[inline]
     pub(crate) fn add_assign(&mut self, rhs: Self) {
@@ -252,6 +254,7 @@ fn and_popcount_scalar_block8(lhs: &[u64], rhs: &[u64]) -> u64 {
 }
 
 #[inline]
+#[cfg(test)]
 fn king_pair_counts_serial(
     zi: &[u64],
     hi: &[u64],
@@ -296,6 +299,7 @@ fn bitand_assign_serial(dst: &mut [u64], rhs: &[u64]) {
 }
 
 #[inline]
+#[cfg(test)]
 fn bitor_into_serial(dst: &mut [u64], src: &[u64]) {
     debug_assert_eq!(dst.len(), src.len());
     for (d, &s) in dst.iter_mut().zip(src.iter()) {
@@ -444,6 +448,7 @@ unsafe fn and_popcount_simd_avx2_block8(lhs: &[u64], rhs: &[u64]) -> u64 {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[cfg(test)]
 #[target_feature(enable = "avx2")]
 unsafe fn king_pair_counts_simd_avx2(
     zi: &[u64],
@@ -518,6 +523,7 @@ unsafe fn bitand_assign_simd_avx2(dst: &mut [u64], rhs: &[u64]) {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[cfg(test)]
 #[target_feature(enable = "avx2")]
 unsafe fn bitor_into_simd_avx2(dst: &mut [u64], src: &[u64]) {
     use core::arch::x86_64::*;
@@ -608,6 +614,7 @@ unsafe fn and_popcount_simd_neon_block8(lhs: &[u64], rhs: &[u64]) -> u64 {
 }
 
 #[cfg(target_arch = "aarch64")]
+#[cfg(test)]
 unsafe fn king_pair_counts_simd_neon(
     zi: &[u64],
     hi: &[u64],
@@ -673,6 +680,7 @@ unsafe fn bitand_assign_simd_neon(dst: &mut [u64], rhs: &[u64]) {
 }
 
 #[cfg(target_arch = "aarch64")]
+#[cfg(test)]
 unsafe fn bitor_into_simd_neon(dst: &mut [u64], src: &[u64]) {
     use core::arch::aarch64::*;
     let mut i = 0usize;
@@ -738,6 +746,7 @@ fn popcount_chunk_by_backend(words: &[u64], backend: ReduceBackend) -> u64 {
 }
 
 #[inline]
+#[cfg(test)]
 fn king_pair_counts_chunk_by_backend(
     zi: &[u64],
     hi: &[u64],
@@ -1176,6 +1185,7 @@ fn bitand_assign_chunk_by_backend(dst: &mut [u64], rhs: &[u64], backend: MutateB
 }
 
 #[inline]
+#[cfg(test)]
 fn bitor_into_chunk_by_backend(dst: &mut [u64], src: &[u64], backend: MutateBackend) {
     match backend {
         MutateBackend::Scalar => bitor_into_serial(dst, src),
@@ -1493,6 +1503,7 @@ pub fn and_popcount(lhs: &[u64], rhs: &[u64]) -> u64 {
     and_popcount_with_backend(lhs, rhs, resolve_reduce_backend())
 }
 
+#[cfg(test)]
 pub(crate) fn king_pair_counts(
     zi: &[u64],
     hi: &[u64],
@@ -1555,6 +1566,7 @@ pub fn bitand_assign(dst: &mut [u64], rhs: &[u64]) {
 }
 
 /// In-place `dst |= src` for packed `u64` bit-vectors.
+#[cfg(test)]
 pub fn bitor_into(dst: &mut [u64], src: &[u64]) {
     assert_eq!(
         dst.len(),

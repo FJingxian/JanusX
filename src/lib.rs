@@ -63,7 +63,6 @@ mod rsvd;
 mod spgrm;
 #[path = "stats/splmm.rs"]
 mod splmm;
-#[allow(dead_code)]
 #[path = "stats/splmm_approx.rs"]
 mod splmm_approx;
 #[path = "stats/spreml.rs"]
@@ -72,7 +71,6 @@ mod spreml;
 mod stats_common;
 #[path = "stats/susie.rs"]
 mod susie;
-#[allow(dead_code)]
 #[path = "stats/top.rs"]
 mod top;
 

@@ -15,6 +15,7 @@ const EM_BACKWARD_BLOCK: usize = 128;
 // recomputation; large high-density windows automatically coarsen them.
 const CHECKPOINT_VALUE_BUDGET: usize = 4 * 1024 * 1024;
 
+#[cfg(target_arch = "x86_64")]
 fn simd_disabled() -> bool {
     static DISABLED: OnceLock<bool> = OnceLock::new();
     *DISABLED.get_or_init(|| std::env::var_os("JANUSX_IMP_DISABLE_SIMD").is_some())
@@ -44,6 +45,7 @@ fn checkpoint_stride(n_markers: usize, n_states: usize) -> usize {
 
 #[derive(Debug, Clone)]
 pub(crate) struct HMMRecursionDiagnostic {
+    #[allow(dead_code)]
     pub(crate) marker: usize,
     pub(crate) transition_probability: f32,
     pub(crate) emission_probabilities: Vec<f32>,
@@ -1031,6 +1033,7 @@ pub(crate) fn forward_backward(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn forward_backward_for_em(
     observations: &PackedHaplotypes,
     states: &CompositePanel,
@@ -1048,6 +1051,7 @@ pub(crate) fn forward_backward_for_em(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn forward_backward_for_em_with_transition_data(
     observations: &PackedHaplotypes,
     states: &CompositePanel,
@@ -1058,6 +1062,7 @@ pub(crate) fn forward_backward_for_em_with_transition_data(
     beagle_em_parameter_stats(observations, states, cm_positions, config, transitions)
 }
 
+#[cfg(test)]
 pub(crate) fn forward_backward_for_em_pair_with_transition_data(
     observations0: &[Option<u16>],
     observations1: &[Option<u16>],
@@ -1178,6 +1183,7 @@ pub(crate) fn forward_backward_for_em_pair_with_workspace(
 /// arithmetic. The state vectors are checkpointed so the estimator keeps
 /// bounded memory while preserving Beagle's float update and accumulation
 /// order at every marker.
+#[cfg(test)]
 fn beagle_em_parameter_stats(
     observations: &PackedHaplotypes,
     states: &CompositePanel,
@@ -1780,6 +1786,7 @@ where
     )
 }
 
+#[cfg(test)]
 pub(crate) fn forward_backward_with_selected_state_callback<F>(
     observations: &PackedHaplotypes,
     states: &CompositePanel,
@@ -3141,6 +3148,7 @@ fn paired_normalize_backward(backward: &mut [f32], sum: f32, switch: f32) {
     }
 }
 
+#[cfg(test)]
 fn forward_backward_selected_state_impl<F>(
     observations: &PackedHaplotypes,
     states: &CompositePanel,
@@ -4503,6 +4511,7 @@ fn transition_emit_biallelic_scalar(
     }
 }
 
+#[cfg(target_arch = "aarch64")]
 const fn build_match_masks_4() -> [[u32; 4]; 16] {
     let mut masks = [[0u32; 4]; 16];
     let mut bits = 0usize;
@@ -4519,6 +4528,7 @@ const fn build_match_masks_4() -> [[u32; 4]; 16] {
     masks
 }
 
+#[cfg(target_arch = "aarch64")]
 const MATCH_MASKS_4: [[u32; 4]; 16] = build_match_masks_4();
 
 #[cfg(target_arch = "x86_64")]

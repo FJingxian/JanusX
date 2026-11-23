@@ -753,6 +753,7 @@ impl ReferenceWindowStream {
 /// Run the phasing/imputation pipeline.
 ///
 /// Stream target and optional reference genotypes through bounded windows.
+#[cfg(test)]
 pub fn run_imp(config: ImpConfig) -> Result<ImpSummary, String> {
     run_imp_with_progress(config, |_| Ok(()))
 }

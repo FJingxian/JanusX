@@ -5,7 +5,7 @@ use super::hmm;
 use super::types::{
     validate_phased_reference_calls, CompositePanel, DiploidCall, DiploidCalls, HMMConfig,
     ImputeConfig, ImputedWindow, PackedHaplotypes, PhaseWindow, PhasedRow, PhasedWindow,
-    VariantKey, VariantMeta, VariantRow,
+    VariantMeta, VariantRow,
 };
 use rayon::prelude::*;
 use rayon::ThreadPool;
@@ -97,10 +97,12 @@ impl ReferenceMarkerAlignment {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn low_frequency_markers(window: &PhaseWindow) -> Result<Vec<bool>, String> {
     low_frequency_markers_with_reference(window, None)
 }
 
+#[cfg(test)]
 pub(crate) fn low_frequency_markers_with_reference(
     window: &PhaseWindow,
     reference: Option<&PhasedWindow>,
@@ -111,6 +113,7 @@ pub(crate) fn low_frequency_markers_with_reference(
     low_frequency_markers_with_alignment(window, reference, alignment.as_ref())
 }
 
+#[cfg(test)]
 pub(crate) fn low_frequency_markers_with_alignment(
     window: &PhaseWindow,
     reference: Option<&PhasedWindow>,
@@ -120,6 +123,7 @@ pub(crate) fn low_frequency_markers_with_alignment(
         .map(|(marker_flags, _)| marker_flags)
 }
 
+#[cfg(test)]
 pub(crate) fn low_frequency_allele_flags_with_alignment(
     window: &PhaseWindow,
     reference: Option<&PhasedWindow>,
@@ -219,10 +223,12 @@ pub(crate) fn beagle_rare_carrier_limit(sample_count: usize) -> usize {
     ((sample_count as f32 * 0.002_f32).floor() as usize).max(3)
 }
 
+#[cfg(test)]
 pub(crate) fn use_two_stage_phase(window: &PhaseWindow) -> Result<bool, String> {
     use_two_stage_phase_with_reference(window, None)
 }
 
+#[cfg(test)]
 pub(crate) fn use_two_stage_phase_with_reference(
     window: &PhaseWindow,
     reference: Option<&PhasedWindow>,
@@ -271,24 +277,6 @@ fn add_sample_carriers(counts: &mut [usize], alleles: [Option<u16>; 2], cap: usi
             *count = count.saturating_add(1).min(cap.saturating_add(1));
         }
     }
-}
-
-pub(crate) fn merge_target_and_reference(
-    target: &PhaseWindow,
-    reference: &PhasedWindow,
-) -> Result<Vec<VariantKey>, String> {
-    let indices = merge_sorted_indices(&target.rows, &reference.rows, None)?;
-    let mut keys = Vec::with_capacity(indices.len());
-    for (target_index, reference_index) in indices {
-        let target_meta = target_index.map(|index| &target.rows[index].meta);
-        let reference_meta = reference_index.map(|index| &reference.rows[index].meta);
-        if let (Some(target_meta), Some(reference_meta)) = (target_meta, reference_meta) {
-            harmonization(target_meta, reference_meta)?;
-        }
-        let meta = target_meta.or(reference_meta).unwrap();
-        keys.push(meta.key());
-    }
-    Ok(keys)
 }
 
 pub(crate) fn merged_marker_count(
@@ -861,6 +849,7 @@ fn phase_estimate_cluster_errors(
 /// estimates at originally missing GTs as the haplotype observations here;
 /// the error rate is scaled by the number of available phased alleles in each
 /// marker cluster.
+#[cfg(test)]
 fn build_imputation_hmm_inputs(
     full_panel: &CompositePanel,
     phased_alleles: &[Option<u16>],
@@ -872,6 +861,7 @@ fn build_imputation_hmm_inputs(
     Ok((observations, states, errors))
 }
 
+#[cfg(test)]
 fn build_cluster_hmm_panels(
     full_panel: &CompositePanel,
     phased_alleles: &[Option<u16>],
@@ -1494,6 +1484,7 @@ fn owned_output_indices(
     owned
 }
 
+#[cfg(test)]
 pub(crate) fn impute_window_prevalidated(
     target: &PhaseWindow,
     phased_target: &PhasedWindow,
@@ -1724,9 +1715,11 @@ fn impute_window_with_output(
         ReferenceInput::Phased(window) => {
             merge_sorted_indices(&target.rows, &window.rows, Some(config.window_markers))?
         }
-        ReferenceInput::Compact(window) => {
-            merge_sorted_indices_from_metas(&target.rows, &window.metas, Some(config.window_markers))?
-        }
+        ReferenceInput::Compact(window) => merge_sorted_indices_from_metas(
+            &target.rows,
+            &window.metas,
+            Some(config.window_markers),
+        )?,
     };
     let mut target_row_indices = Vec::with_capacity(merged_indices.len());
     let mut reference_row_indices = Vec::with_capacity(merged_indices.len());
@@ -1862,10 +1855,7 @@ fn impute_window_with_output(
                     profile_started.elapsed().as_secs_f64(),
                 );
             }
-            return Ok(ImputedWindow {
-                rows: Vec::new(),
-                emit_indices: Vec::new(),
-            });
+            return Ok(ImputedWindow { rows: Vec::new() });
         }
 
         let mut output_rows = metadata
@@ -1915,10 +1905,7 @@ fn impute_window_with_output(
                 profile_started.elapsed().as_secs_f64(),
             );
         }
-        return Ok(ImputedWindow {
-            rows: output_rows,
-            emit_indices: owned,
-        });
+        return Ok(ImputedWindow { rows: output_rows });
     }
 
     let (packed_reference, mut reference_metas): (
@@ -2438,10 +2425,7 @@ fn impute_window_with_output(
                 profile_started.elapsed().as_secs_f64(),
             );
         }
-        return Ok(ImputedWindow {
-            rows: Vec::new(),
-            emit_indices: Vec::new(),
-        });
+        return Ok(ImputedWindow { rows: Vec::new() });
     }
     if collect_dosage_statistics {
         for marker in 0..metadata.len() {
@@ -2473,10 +2457,7 @@ fn impute_window_with_output(
             profile_started.elapsed().as_secs_f64(),
         );
     }
-    Ok(ImputedWindow {
-        rows: output_rows,
-        emit_indices: owned,
-    })
+    Ok(ImputedWindow { rows: output_rows })
 }
 
 fn rescale_hmm_config_haplotype_count(
@@ -3891,6 +3872,7 @@ fn panel_allele_probability(
 /// Interpolate state probabilities and project them to an allele marginal in
 /// one pass. The projection is linear, so materializing an intermediate
 /// per-state vector is unnecessary.
+#[cfg(test)]
 fn interpolated_panel_allele_probability(
     panel: &super::types::CompositePanel,
     marker: usize,
@@ -4267,7 +4249,7 @@ unsafe fn interpolated_complete_mosaic_probability_avx2(
     }
 }
 
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(target_arch = "aarch64")]
 const fn make_projection_masks4() -> [[u32; 4]; 16] {
     let mut masks = [[0u32; 4]; 16];
     let mut pattern = 0usize;
@@ -4284,7 +4266,7 @@ const fn make_projection_masks4() -> [[u32; 4]; 16] {
     masks
 }
 
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[cfg(target_arch = "aarch64")]
 const PROJECTION_MASKS4: [[u32; 4]; 16] = make_projection_masks4();
 
 #[cfg(target_arch = "aarch64")]
@@ -4464,7 +4446,12 @@ fn merge_sorted_indices(
 ) -> Result<Vec<(Option<usize>, Option<usize>)>, String> {
     validate_sorted_unique(target.iter().map(|row| &row.meta), "target")?;
     validate_sorted_unique(reference.iter().map(|row| &row.meta), "reference")?;
-    merge_sorted_indices_impl(target, reference.len(), |index| &reference[index].meta, max_rows)
+    merge_sorted_indices_impl(
+        target,
+        reference.len(),
+        |index| &reference[index].meta,
+        max_rows,
+    )
 }
 
 fn merge_sorted_indices_from_metas(

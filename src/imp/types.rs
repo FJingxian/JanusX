@@ -27,14 +27,6 @@ impl DiploidCall {
         }
     }
 
-    pub const fn is_fully_missing(self) -> bool {
-        self.alleles[0].is_none() && self.alleles[1].is_none()
-    }
-
-    pub const fn is_partially_missing(self) -> bool {
-        self.alleles[0].is_some() != self.alleles[1].is_some()
-    }
-
     pub const fn is_complete(self) -> bool {
         self.alleles[0].is_some() && self.alleles[1].is_some()
     }
@@ -217,6 +209,7 @@ impl DiploidCalls {
     }
 
     /// Update a sample call without rebuilding or widening the packed row.
+    #[cfg(test)]
     pub fn set_call(&mut self, sample: usize, call: DiploidCall) -> Result<(), String> {
         if sample >= self.len {
             return Err(format!(
@@ -297,10 +290,6 @@ impl DiploidCalls {
         None
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
     pub(crate) fn set_phase_set(
         &mut self,
         sample: usize,
@@ -367,6 +356,7 @@ impl DiploidCalls {
     }
 
     #[inline(always)]
+    #[cfg(test)]
     pub(crate) fn common_biallelic_code(&self, sample: usize) -> Option<u8> {
         if sample >= self.len {
             return None;
@@ -624,14 +614,6 @@ impl VariantMeta {
         1 + self.alt_alleles.len()
     }
 
-    pub fn key(&self) -> VariantKey {
-        VariantKey {
-            chrom: self.chrom.clone(),
-            pos: self.pos,
-            ref_allele: self.ref_allele.clone(),
-            alt_alleles: self.alt_alleles.clone(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -938,6 +920,7 @@ impl PackedHaplotypes {
     /// Refresh a complete biallelic state-major matrix from sample-major hard
     /// calls. Each haplotype track is packed in marker chunks so destination
     /// writes stay contiguous even when the marker count is not word aligned.
+    #[cfg(test)]
     pub(crate) fn overwrite_complete_biallelic_state_major_from_calls<F>(
         &mut self,
         n_samples: usize,
@@ -1021,11 +1004,7 @@ impl PackedHaplotypes {
         self.layout == PackedLayout::StateMajor
     }
 
-    #[inline]
-    pub(crate) fn state_major_capacity_haplotypes(&self) -> Option<usize> {
-        (self.layout == PackedLayout::StateMajor).then_some(self.n_haplotypes_capacity)
-    }
-
+    #[cfg(test)]
     pub(crate) fn reset_state_major(
         &mut self,
         n_haplotypes: usize,
@@ -1295,6 +1274,7 @@ impl PackedHaplotypes {
     /// When the state count is not word aligned, this uses the scalar writer
     /// to preserve marker-boundary bit offsets exactly.
     #[inline]
+    #[cfg(test)]
     pub fn set_biallelic_marker_with(
         &mut self,
         marker: usize,
@@ -1481,22 +1461,6 @@ impl PackedHaplotypes {
         Ok(projected)
     }
 
-    #[inline]
-    pub(crate) fn state_major_biallelic_allele(&self, marker: usize, state: usize) -> Option<u16> {
-        if marker >= self.n_markers
-            || state >= self.n_haplotypes
-            || self.bits_per_allele != 1
-            || self.layout != PackedLayout::StateMajor
-        {
-            return None;
-        }
-        let index = state * self.n_markers + marker;
-        if self.get_missing(index) {
-            return None;
-        }
-        Some(((self.allele_bits[index >> 6] >> (index & 63)) & 1) as u16)
-    }
-
     /// Read a complete state-major biallelic entry after dimensions and the
     /// zero missingness plane have been validated by the caller.
     #[inline(always)]
@@ -1617,18 +1581,6 @@ impl PackedHaplotypes {
         Ok(())
     }
 
-    pub(crate) fn reset_all_missing(&mut self) {
-        self.allele_bits.fill(0);
-        self.missing_bits.fill(u64::MAX);
-        let bit_len = self.n_haplotypes * self.n_markers;
-        if let Some(last) = self.missing_bits.last_mut() {
-            let used = bit_len & 63;
-            if used != 0 {
-                *last &= (1u64 << used) - 1;
-            }
-        }
-    }
-
     fn get_missing(&self, index: usize) -> bool {
         self.missing_bits
             .get(index >> 6)
@@ -1734,9 +1686,11 @@ pub struct PosteriorWindow {
     pub leave_one_out_allele_probabilities: Vec<f32>,
     /// Half-open offsets into `allele_probabilities`, with one extra end entry.
     pub allele_offsets: Vec<usize>,
+    #[allow(dead_code)] // Diagnostic snapshots are populated for native tests.
     pub state_probabilities: Vec<Vec<f32>>,
     /// Expected latent mismatch and state-transition counts for Li-Stephens
     /// parameter updates.
+    #[allow(dead_code)] // Retained with diagnostic posterior snapshots.
     pub parameter_stats: HMMParameterStats,
 }
 
@@ -1773,17 +1727,8 @@ impl PosteriorWindow {
 
 #[derive(Debug, Clone)]
 pub struct ImputedWindow {
+    #[allow(dead_code)] // Consumed by native assembly/stitching tests.
     pub rows: Vec<PhasedRow>,
-    /// Row indexes owned by this target window after overlap stitching.
-    pub emit_indices: Vec<usize>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct VariantKey {
-    pub chrom: String,
-    pub pos: u64,
-    pub ref_allele: String,
-    pub alt_alleles: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1912,10 +1857,12 @@ pub struct RegionSpec {
 }
 
 impl RegionSpec {
+    #[cfg(test)]
     pub fn contains_chromosome(&self, chrom: &str) -> bool {
         normalize_region_chromosome(chrom) == normalize_region_chromosome(&self.chrom)
     }
 
+    #[cfg(test)]
     pub fn contains(&self, chrom: &str, pos: u64) -> bool {
         self.contains_chromosome(chrom)
             && self.start.is_none_or(|start| pos >= start)

@@ -75,11 +75,13 @@ pub(crate) struct ResidualizedApproxScanModel {
     xtx_chol: Vec<f64>,
     a_resid: Vec<f64>,
     gamma: f64,
+    #[allow(dead_code)] // Retained reference/scoring helper.
     n: usize,
     p: usize,
 }
 
 struct ResidualizedApproxEvaluator {
+    #[allow(dead_code)] // Retained reference/scoring helper.
     n: usize,
     n_eff: usize,
     threads: usize,
@@ -393,6 +395,7 @@ fn residualize_vector_with_chol(
     Ok(())
 }
 
+#[allow(dead_code)] // Retained reference/scoring helper.
 fn residualized_sumsq_from_xtx_chol(
     xtx_chol: &[f64],
     p: usize,
@@ -554,6 +557,7 @@ pub(crate) fn fit_sparse_reml_on_residualized_response(
     })
 }
 
+#[allow(dead_code)] // Retained reference/scoring helper.
 pub(crate) fn build_residualized_approx_null_from_components(
     analysis: &SparseJxgrmCholeskyAnalysis,
     x_design: &[f64],
@@ -608,6 +612,7 @@ fn residualized_scan_sigma2_from_lambda(
     Ok((y_resid, sigma2_scan))
 }
 
+#[allow(dead_code)] // Retained reference/scoring helper.
 fn build_residualized_approx_null_from_residualized_response(
     analysis: &SparseJxgrmCholeskyAnalysis,
     y_resid: Vec<f64>,
@@ -1172,6 +1177,7 @@ impl ResidualizedApproxScanModel {
         })
     }
 
+    #[allow(dead_code)] // Retained reference/scoring helper.
     pub(crate) fn from_a_vec(x_design: &[f64], a_vec: &[f64], gamma: f64) -> Result<Self, String> {
         let (n, p) = validate_design_and_response(x_design, a_vec)?;
         if !(gamma.is_finite() && gamma > 0.0) {
@@ -1234,6 +1240,7 @@ impl ResidualizedApproxScanModel {
         self.gamma
     }
 
+    #[allow(dead_code)] // Retained reference/scoring helper.
     pub(crate) fn assoc_from_marker(&self, g: &[f64]) -> Result<(f64, f64, f64), String> {
         if g.len() != self.n {
             return Err(format!(

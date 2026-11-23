@@ -7,6 +7,7 @@ mod four_cell;
 mod grm_max6;
 mod input;
 mod logic_candidates;
+#[cfg(test)]
 mod logic_classifier;
 mod logic_genotype;
 mod logic_output;
@@ -67,7 +68,8 @@ use universe::*;
 use self::all_pair::{
     scan_all_pairs_continuous_packed_with_parallel_and_xor, AllPairCandidate, AllPairGate,
 };
-use self::bs::{beam_search_and_binary_mcc, beam_search_and_continuous_abs_corr, BeamAndResult};
+#[cfg(test)]
+use self::bs::BeamAndResult;
 use self::bs::{
     beam_search_train_test_continuous_fuzzy,
     beam_search_train_test_continuous_fuzzy_with_literal_scores,
@@ -97,27 +99,27 @@ use self::proposal::{
     SharedMaxTAccumulator,
 };
 use crate::bedmath::packed_byte_lut;
-use crate::bincore::{
-    append_suffix, bin01_id_sidecar_path, bin_prefix, discover_id_sidecar, discover_site_sidecar,
-    resolve_bin01_path, BinWindow,
-};
+use crate::bincore::{discover_site_sidecar, resolve_bin01_path, BinWindow};
 #[cfg(test)]
-use crate::binwriter::Bin01SiteMode;
+use crate::bincore::bin01_id_sidecar_path;
+#[cfg(test)]
 use crate::binwriter::{Bin01SiteRecordRef, Bin01Writer};
 use crate::bitwise::{
-    and_popcount, and_popcount_bounded_blocks_with_backend, bitand_assign, bitnot_masked,
-    resolve_reduce_backend, ReduceBackend,
+    and_popcount, and_popcount_bounded_blocks_with_backend, bitnot_masked, resolve_reduce_backend,
+    ReduceBackend,
 };
+#[cfg(test)]
+use crate::bitwise::bitand_assign;
 use crate::blas::BlasThreadGuard;
 use crate::breader::{
     gather_rows_by_indices, gather_rows_by_range, load_bin01_packed_payload_owned,
 };
-use crate::bstats::{apply_tail_mask, tail_mask, words_for_samples};
+use crate::bstats::{tail_mask, words_for_samples};
+#[cfg(test)]
+use crate::bstats::apply_tail_mask;
 use crate::eigh::load_square_matrix_f64_from_file;
 use crate::gblup::{build_grm_from_meta_stream, StreamKernelMode};
-use crate::gfcore::{
-    read_bim, read_fam, BedSnpIter, BimChunkReader, HmpSnpIter, SiteInfo, TxtSnpIter, VcfSnpIter,
-};
+use crate::gfcore::{read_bim, read_fam, BedSnpIter, BimChunkReader, SiteInfo};
 use crate::gfreader::{
     build_sample_selection, compute_bed_row_meta_owned_for_source_rows,
     format_zero_sites_pure_line_error, is_simple_snp_allele,
@@ -207,7 +209,9 @@ pub use score::{
     score_cont_weighted_mean_diff_packed, support_size_packed, ContinuousRuleScore,
     PackedYSumLookup,
 };
+#[cfg(test)]
 const GARFIELD_CONSTRAINED_BEAM_PAR_MIN_TOTAL_CANDS: usize = 1_024;
+#[cfg(test)]
 const GARFIELD_CONSTRAINED_BEAM_PAR_CHUNK_CANDS: usize = 256;
 const GARFIELD_NULL_ML_TOP_FRAC: f64 = 0.80;
 const GARFIELD_SCAN_MIN_GAIN_EPS: f64 = 1e-6;
@@ -1297,12 +1301,14 @@ struct GarfieldMemoryDebugSummary {
     structure_prior: GarfieldStageMemoryDebug,
 }
 
+#[cfg(test)]
 #[derive(Clone)]
 struct EncodedRow {
     site: SiteInfo,
     bits: Vec<u8>,
 }
 
+#[cfg(test)]
 fn write_encoded_rows_bin(writer: &mut Bin01Writer, rows: &[EncodedRow]) -> Result<(), String> {
     for row in rows.iter() {
         writer.write_bitrow(
@@ -1311,24 +1317,6 @@ fn write_encoded_rows_bin(writer: &mut Bin01Writer, rows: &[EncodedRow]) -> Resu
         )?;
     }
     Ok(())
-}
-
-enum GarfieldInputReader {
-    Bed(BedSnpIter),
-    Vcf(VcfSnpIter),
-    Hmp(HmpSnpIter),
-    Txt(TxtSnpIter),
-}
-
-impl GarfieldInputReader {
-    fn sample_ids(&self) -> &[String] {
-        match self {
-            GarfieldInputReader::Bed(it) => &it.samples,
-            GarfieldInputReader::Vcf(it) => &it.samples,
-            GarfieldInputReader::Hmp(it) => &it.samples,
-            GarfieldInputReader::Txt(it) => &it.samples,
-        }
-    }
 }
 
 type GarfieldWindow = BinWindow;
@@ -1378,6 +1366,7 @@ impl GarfieldPermutationNullSource {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 struct ConstrainedBeamNode {
     selected: Vec<usize>,
@@ -1407,22 +1396,6 @@ fn format_structure_alpha_placeholder(display_len: usize) -> String {
 }
 
 #[inline]
-fn garfield_progress_notify(
-    progress_callback: Option<&Py<PyAny>>,
-    done: usize,
-    total: usize,
-) -> PyResult<()> {
-    if let Some(cb) = progress_callback {
-        Python::attach(|py2| -> PyResult<()> {
-            py2.check_signals()?;
-            cb.call1(py2, (done, total))?;
-            Ok(())
-        })?;
-    }
-    Ok(())
-}
-
-#[inline]
 fn garfield_stage_progress_notify(
     progress_callback: Option<&Py<PyAny>>,
     stage: &str,
@@ -1442,6 +1415,7 @@ fn garfield_stage_progress_notify(
     Ok(())
 }
 
+#[cfg(test)]
 #[inline]
 fn row_prefix<'a>(
     bits_flat: &'a [u64],
@@ -1453,6 +1427,7 @@ fn row_prefix<'a>(
     &bits_flat[st..st + needed_words]
 }
 
+#[cfg(test)]
 #[inline]
 fn score_key(s: f64) -> f64 {
     if s.is_nan() {
@@ -1462,6 +1437,7 @@ fn score_key(s: f64) -> f64 {
     }
 }
 
+#[cfg(test)]
 #[inline]
 fn cmp_constrained_nodes(a: &ConstrainedBeamNode, b: &ConstrainedBeamNode) -> std::cmp::Ordering {
     let sa = score_key(a.score);
@@ -1475,11 +1451,13 @@ fn cmp_constrained_nodes(a: &ConstrainedBeamNode, b: &ConstrainedBeamNode) -> st
     }
 }
 
+#[cfg(test)]
 #[inline]
 fn constrained_node_better(a: &ConstrainedBeamNode, b: &ConstrainedBeamNode) -> bool {
     cmp_constrained_nodes(a, b) == std::cmp::Ordering::Less
 }
 
+#[cfg(test)]
 #[inline]
 fn push_top_k_constrained_streaming(
     nodes: &mut Vec<ConstrainedBeamNode>,
@@ -1506,11 +1484,13 @@ fn push_top_k_constrained_streaming(
     }
 }
 
+#[cfg(test)]
 #[inline]
 fn garfield_should_parallel_constrained(total_cands: usize) -> bool {
     rayon::current_num_threads() > 1 && total_cands >= GARFIELD_CONSTRAINED_BEAM_PAR_MIN_TOTAL_CANDS
 }
 
+#[cfg(test)]
 #[inline]
 fn sort_truncate_nodes(mut nodes: Vec<ConstrainedBeamNode>, k: usize) -> Vec<ConstrainedBeamNode> {
     nodes.sort_by(cmp_constrained_nodes);
@@ -1520,6 +1500,7 @@ fn sort_truncate_nodes(mut nodes: Vec<ConstrainedBeamNode>, k: usize) -> Vec<Con
     nodes
 }
 
+#[cfg(test)]
 #[inline]
 fn validate_constrained_inputs(
     bits_flat: &[u64],
@@ -1573,6 +1554,7 @@ fn validate_constrained_inputs(
     Ok(needed_words)
 }
 
+#[cfg(test)]
 fn beam_search_and_with_group_exclusion<F>(
     bits_flat: &[u64],
     row_words: usize,
@@ -1757,90 +1739,11 @@ where
     })
 }
 
-fn run_beam_with_feature_exclusion(
-    bits_flat: &[u64],
-    row_words: usize,
-    n_rows: usize,
-    n_samples: usize,
-    response: GarfieldResponse,
-    y_train_f64: &[f64],
-    y_train_bin: Option<&[u8]>,
-    max_pick: usize,
-    beam_width: usize,
-    local_group_ids: Option<&[usize]>,
-) -> Result<BeamAndResult, String> {
-    if let Some(groups) = local_group_ids {
-        return match response {
-            GarfieldResponse::Binary => {
-                let yb = y_train_bin.ok_or_else(|| "binary y is not prepared".to_string())?;
-                beam_search_and_with_group_exclusion(
-                    bits_flat,
-                    row_words,
-                    n_rows,
-                    n_samples,
-                    max_pick,
-                    beam_width,
-                    groups,
-                    |combined| score_binary_mcc_packed(yb, combined, n_samples),
-                )
-            }
-            GarfieldResponse::Continuous => beam_search_and_with_group_exclusion(
-                bits_flat,
-                row_words,
-                n_rows,
-                n_samples,
-                max_pick,
-                beam_width,
-                groups,
-                |combined| score_cont_corr_packed(y_train_f64, combined, n_samples).abs(),
-            ),
-        };
-    }
-
-    match response {
-        GarfieldResponse::Binary => {
-            let yb = y_train_bin.ok_or_else(|| "binary y is not prepared".to_string())?;
-            beam_search_and_binary_mcc(
-                yb, bits_flat, row_words, n_rows, n_samples, max_pick, beam_width,
-            )
-        }
-        GarfieldResponse::Continuous => beam_search_and_continuous_abs_corr(
-            y_train_f64,
-            bits_flat,
-            row_words,
-            n_rows,
-            n_samples,
-            max_pick,
-            beam_width,
-        ),
-    }
-}
-
 fn read_y_f64(arr: &PyReadonlyArray1<'_, f64>) -> Vec<f64> {
     match crate::stats_common::array_standard_slice(&arr) {
         Ok(s) => s.to_vec(),
         Err(_) => crate::stats_common::copy_array_standard_layout(&arr.as_array()),
     }
-}
-
-fn validate_binary_y(y: &[f64]) -> Result<Vec<u8>, String> {
-    let mut out = Vec::with_capacity(y.len());
-    for (i, &v) in y.iter().enumerate() {
-        if !v.is_finite() {
-            return Err(format!("binary y contains non-finite value at index {}", i));
-        }
-        if v == 0.0 {
-            out.push(0u8);
-        } else if v == 1.0 {
-            out.push(1u8);
-        } else {
-            return Err(format!(
-                "binary response requires y in {{0,1}}; got y[{}]={}",
-                i, v
-            ));
-        }
-    }
-    Ok(out)
 }
 
 fn validate_continuous_y(y: &[f64]) -> Result<(), String> {

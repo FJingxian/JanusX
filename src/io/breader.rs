@@ -340,80 +340,10 @@ pub fn load_bin01_as_u64_words(
     Ok((bits_flat, row_words, n_rows, n_samples))
 }
 
-pub fn load_bin01_selected_rows_as_u64_words(
-    path: &str,
-    row_indices: &[usize],
-    ctx: &str,
-) -> Result<(Vec<u64>, usize, usize, usize), String> {
-    if row_indices.is_empty() {
-        return Err(format!("{ctx}: row_indices is empty"));
-    }
-    let file = File::open(path).map_err(|e| format!("{ctx}: failed to open {path}: {e}"))?;
-    let mmap = unsafe { Mmap::map(&file) }
-        .map_err(|e| format!("{ctx}: failed to mmap {}: {}", path, e))?;
-    let (n_rows_all, n_samples, row_bytes, data_offset) = parse_bin01_header(&mmap[..], ctx)?;
-
-    let row_words = words_for_samples(n_samples);
-    let n_rows = row_indices.len();
-    let total_words = n_rows
-        .checked_mul(row_words)
-        .ok_or_else(|| format!("{ctx}: n_rows * row_words overflow"))?;
-    let mut bits_flat = vec![0u64; total_words];
-
-    let mask = tail_mask(n_samples);
-    for (ri, &src_row_idx) in row_indices.iter().enumerate() {
-        if src_row_idx >= n_rows_all {
-            return Err(format!(
-                "{ctx}: row index out of range: {} (n_rows={})",
-                src_row_idx, n_rows_all
-            ));
-        }
-        let src_start = data_offset
-            .checked_add(
-                src_row_idx
-                    .checked_mul(row_bytes)
-                    .ok_or_else(|| format!("{ctx}: row byte offset overflow"))?,
-            )
-            .ok_or_else(|| format!("{ctx}: row byte offset overflow"))?;
-        let src_end = src_start
-            .checked_add(row_bytes)
-            .ok_or_else(|| format!("{ctx}: row byte end overflow"))?;
-        let src = &mmap[src_start..src_end];
-
-        let dst_start = ri
-            .checked_mul(row_words)
-            .ok_or_else(|| format!("{ctx}: row word offset overflow"))?;
-        let dst = &mut bits_flat[dst_start..dst_start + row_words];
-
-        for w in 0..row_words {
-            let b0 = w * 8;
-            if b0 >= row_bytes {
-                break;
-            }
-            let b1 = (b0 + 8).min(row_bytes);
-            let mut buf = [0u8; 8];
-            let n = b1 - b0;
-            buf[..n].copy_from_slice(&src[b0..b1]);
-            dst[w] = u64::from_le_bytes(buf);
-        }
-        apply_tail_mask(dst, mask);
-    }
-
-    Ok((bits_flat, row_words, n_rows, n_samples))
-}
-
 /// Read only the dimensions of a marker-major BIN01 file.
 ///
 /// Candidate-only consumers use this instead of materializing every marker
 /// row merely to learn the full marker count and packed row width.
-pub fn bin01_shape(path: &str, ctx: &str) -> Result<(usize, usize, usize), String> {
-    let file = File::open(path).map_err(|e| format!("{ctx}: failed to open {path}: {e}"))?;
-    let mmap = unsafe { Mmap::map(&file) }
-        .map_err(|e| format!("{ctx}: failed to mmap {}: {}", path, e))?;
-    let (n_rows, n_samples, _row_bytes, _data_offset) = parse_bin01_header(&mmap[..], ctx)?;
-    Ok((n_rows, words_for_samples(n_samples), n_samples))
-}
-
 pub fn gather_rows_by_indices(
     bits_flat: &[u64],
     row_words: usize,

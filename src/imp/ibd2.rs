@@ -2,7 +2,9 @@
 //! composite reference panels.
 
 use super::impute::ReferenceMarkerAlignment;
-use super::types::{Ibd2Interval, PhaseWindow, PhasedWindow};
+use super::types::{Ibd2Interval, PhaseWindow};
+#[cfg(test)]
+use super::types::PhasedWindow;
 use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_MISS_FREQ: f32 = 0.1;
@@ -31,6 +33,7 @@ struct SampledIbs2Haplotypes {
     reference: Vec<usize>,
 }
 
+#[cfg(test)]
 pub(crate) fn detect_intervals(
     window: &PhaseWindow,
     cm_positions: &[f64],
@@ -182,6 +185,7 @@ fn detect_intervals_with_marker_flags(
 /// Detects IBS2 intervals after projecting a full window to a marker set.
 /// The returned marker coordinates are local to `marker_indices`, matching
 /// Beagle's Stage1 `Ibs2`, which is constructed from its restricted Stage1 GT.
+#[cfg(test)]
 pub(crate) fn detect_projected_intervals(
     window: &PhaseWindow,
     marker_indices: &[usize],
@@ -199,6 +203,7 @@ pub(crate) fn detect_projected_intervals(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn detect_projected_intervals_with_reference(
     window: &PhaseWindow,
     marker_indices: &[usize],
@@ -220,6 +225,7 @@ pub(crate) fn detect_projected_intervals_with_reference(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn detect_projected_intervals_with_reference_map(
     window: &PhaseWindow,
     marker_indices: &[usize],

@@ -838,6 +838,7 @@ fn pcg_normalize_sample_idx(
 pub(crate) struct PcgSplmmNullModel {
     pub(crate) df: f64,
     pub(crate) ypy: f64,
+    #[cfg(test)]
     pub(crate) sigma2: f64,
     pub(crate) py: Vec<f64>,
     pub(crate) xt_w_x_chol: Vec<f64>,

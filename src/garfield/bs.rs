@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 // Shared beam-search kernels used by GARFIELD.
 //
 // Active GARFIELD continuous search is intentionally restricted to:
@@ -46,7 +45,9 @@ const GARFIELD_EXHAUSTIVE_PAR_CHUNK_CANDS: usize = 32;
 /// reach it if negated singletons enter the beam at layer 1.
 const GARFIELD_INITIAL_SINGLETON_NEGATIONS: [bool; 2] = [false, true];
 const GARFIELD_INITIAL_SINGLETON_NEGATIONS_POS_ONLY: [bool; 1] = [false];
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 const GARFIELD_AND_NOT_SHORTER_SUBRULE_GAIN_MAX: f64 = 0.08;
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 const GARFIELD_AND_NOT_SHORTER_SUBRULE_HAMMING_FRAC_MAX: f64 = 0.05;
 const GARFIELD_LITERAL_BATCH_MAX_ROWS_DEFAULT: usize = 16_384;
 const GARFIELD_LITERAL_BATCH_MAX_WORK_WORDS_DEFAULT: usize = 1_048_576;
@@ -444,6 +445,7 @@ impl Default for BeamSearchParams {
 }
 
 #[inline]
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn sum_y_where_both1_for_params(
     lhs: &[u64],
     rhs: &[u64],
@@ -673,6 +675,7 @@ static GARFIELD_LAYER_DEBUG_COUNTS: [AtomicU64;
         * GARFIELD_LAYER_DEBUG_METRIC_COUNT];
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 pub struct BeamAndResult {
     pub selected_indices: Vec<usize>,
     pub score: f64,
@@ -1782,6 +1785,7 @@ fn reconstruct_selected_from_layers(
     out_rev
 }
 
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn beam_search_and_with_score<F>(
     bits_flat: &[u64],
     row_words: usize,
@@ -1902,6 +1906,7 @@ where
     })
 }
 
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn beam_search_and_binary_mcc_with_options(
     y: &[u8],
     bits_flat: &[u64],
@@ -2108,6 +2113,7 @@ fn beam_search_and_binary_mcc_with_options(
     })
 }
 
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 pub fn beam_search_and_binary_mcc(
     y: &[u8],
     bits_flat: &[u64],
@@ -2129,6 +2135,7 @@ pub fn beam_search_and_binary_mcc(
     )
 }
 
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 pub fn beam_search_and_continuous_abs_corr(
     y: &[f64],
     bits_flat: &[u64],
@@ -2152,6 +2159,7 @@ pub fn beam_search_and_continuous_abs_corr(
 }
 
 #[inline]
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn penalty_for_rule(rule: &BeamRule, params: &BeamSearchParams) -> f64 {
     let len_pen = if rule.len() > 1 {
         params.lambda_len * ((rule.len() - 1) as f64)
@@ -2173,10 +2181,12 @@ fn rank_mode_uses_gain(rule_len: usize, params: &BeamSearchParams) -> bool {
 }
 
 #[inline]
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn rule_is_pure_or(rule: &BeamRule) -> bool {
     !rule.rest.is_empty() && rule.rest.iter().all(|(op, _)| *op == BeamBinaryOp::Or)
 }
 #[inline]
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn rule_is_pure_and(rule: &BeamRule) -> bool {
     !rule.rest.is_empty() && rule.rest.iter().all(|(op, _)| *op == BeamBinaryOp::And)
 }
@@ -2251,6 +2261,7 @@ pub fn rank_rule_score_components_with_bucket(
 }
 
 #[inline]
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn use_parent_delta(rule_len: usize, params: &BeamSearchParams) -> bool {
     if params.disable_parent_delta {
         return false;
@@ -2657,6 +2668,7 @@ fn score_sum_hit(sc: &ContinuousRuleScore) -> f64 {
 }
 
 #[inline]
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn centered_y_sum_squares(y: &[f64], n_samples: usize) -> f64 {
     if n_samples == 0 {
         return 0.0;
@@ -2732,6 +2744,7 @@ fn optimistic_raw_score_upper_bound_with_l1(
 }
 
 #[inline]
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn binary_pair_intersection(
     parent_bits: &[u64],
     row: &[u64],
@@ -2910,6 +2923,7 @@ fn evaluate_child_train_from_parent_virtual_with_intersection_impl(
 }
 
 #[inline]
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn evaluate_child_train_from_parent_virtual(
     parent_bits: &[u64],
     parent_train: &ContinuousRuleScore,
@@ -2990,6 +3004,7 @@ fn keep_state_after_min_gain_pruning(
 }
 
 #[inline]
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn rule_parent(rule: &BeamRule) -> Option<BeamRule> {
     if rule.rest.is_empty() {
         return None;
@@ -3194,6 +3209,7 @@ fn best_ancestor_raw_baseline_cached(
     Ok(ret)
 }
 
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn best_ancestor_raw_baseline(
     rule: &BeamRule,
     y: &[f64],
@@ -5506,6 +5522,7 @@ fn dedup_states_by_support_signature(
 }
 
 #[inline]
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn same_rule(a: &BeamRule, b: &BeamRule) -> bool {
     a == b
 }
@@ -6056,6 +6073,7 @@ fn expand_states_exhaustive(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn final_test_score_for_state(
     state: &BeamState,
     test: &ContinuousRuleScore,
@@ -6092,6 +6110,7 @@ fn final_test_score_for_state(
 }
 
 #[inline]
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn rule_abs_score_for_eval(
     rule: &BeamRule,
     raw: &ContinuousRuleScore,
@@ -6165,6 +6184,7 @@ fn rule_abs_score_for_eval_cached(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn final_rule_score_for_eval(
     rule: &BeamRule,
     raw: &ContinuousRuleScore,
@@ -6229,6 +6249,7 @@ fn final_rule_score_for_eval_cached(
 }
 
 #[inline]
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn surrogate_collapse_enabled(params: &BeamSearchParams) -> bool {
     params.surrogate_test_gain_max.is_finite()
         && params.surrogate_test_gain_max > 0.0
@@ -6237,6 +6258,7 @@ fn surrogate_collapse_enabled(params: &BeamSearchParams) -> bool {
 }
 
 #[inline]
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn bit_hamming_fraction(a: &[u64], b: &[u64], n_bits: usize) -> f64 {
     if n_bits == 0 || a.len() != b.len() {
         return 1.0;
@@ -6250,12 +6272,14 @@ fn bit_hamming_fraction(a: &[u64], b: &[u64], n_bits: usize) -> f64 {
 }
 
 #[inline]
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn surrogate_delta_small_enough(child_score: f64, parent_score: f64, max_gain: f64) -> bool {
     let child = score_key(child_score);
     let parent = score_key(parent_score);
     child.is_finite() && parent.is_finite() && (child - parent) <= max_gain
 }
 
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn singleton_literal_map(rule: &BeamRule) -> Vec<(usize, usize)> {
     let mut out = Vec::<(usize, usize)>::with_capacity(rule.len());
     out.push((rule.first.row_index, rule.first.group_id));
@@ -6267,6 +6291,7 @@ fn singleton_literal_map(rule: &BeamRule) -> Vec<(usize, usize)> {
     out
 }
 
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn pure_rule_literals(rule: &BeamRule) -> Option<(BeamBinaryOp, Vec<BeamLiteral>)> {
     let op = rule.rest.first().map(|(op, _)| *op)?;
     if !rule.rest.iter().all(|(rest_op, _)| *rest_op == op) {
@@ -6278,6 +6303,7 @@ fn pure_rule_literals(rule: &BeamRule) -> Option<(BeamBinaryOp, Vec<BeamLiteral>
     Some((op, lits))
 }
 
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn drop_literal_from_pure_rule(rule: &BeamRule, drop_idx: usize) -> Option<BeamRule> {
     let (op, mut lits) = pure_rule_literals(rule)?;
     if lits.len() <= 1 || drop_idx >= lits.len() {
@@ -6294,6 +6320,7 @@ fn drop_literal_from_pure_rule(rule: &BeamRule, drop_idx: usize) -> Option<BeamR
 }
 
 #[inline]
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn shorter_subrule_surrogate_limits(
     current_rule: &BeamRule,
     subrule: &BeamRule,
@@ -7095,6 +7122,7 @@ pub(crate) fn beam_search_train_test_continuous_with_literal_scores(
 /// can use it to hand a bounded exact-rank list to a later refinement stage,
 /// while `PairSeedReason::ProposalRescue` remains available for a separate
 /// proposal-only queue.
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 pub(crate) fn exact_pair_seeds_from_candidates(
     candidates: &[BeamRuleCandidate],
     k2: usize,
@@ -7143,6 +7171,7 @@ fn masked_not_vec(bits: &[u64], n_samples: usize) -> Vec<u64> {
 }
 
 #[inline]
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn complement_dual_bits_in_place_local(
     ge1_bits: &mut [u64],
     ge2_bits: &mut [u64],
@@ -7589,6 +7618,7 @@ fn evaluate_child_train_from_parent_virtual_fuzzy_with_intersections(
 }
 
 #[inline]
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn evaluate_child_train_from_parent_virtual_fuzzy(
     parent_ge1: &[u64],
     parent_ge2: &[u64],

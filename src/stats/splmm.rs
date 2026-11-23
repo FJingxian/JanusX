@@ -3063,6 +3063,7 @@ pub(crate) fn emit_progress_callback(
     Ok(())
 }
 
+#[cfg(test)]
 fn xtx_chol_from_design(x_design: &[f64], n: usize, p: usize) -> Result<Vec<f64>, String> {
     if n == 0 || p == 0 {
         return Err("SparseLMM XtX chol requires n > 0 and p > 0".to_string());
@@ -5223,7 +5224,9 @@ struct SplmmPreparedScanState {
 
 struct SplmmBuiltNullState {
     x_design_col_major: Vec<f64>,
+    #[cfg(test)]
     py: Vec<f64>,
+    #[cfg(test)]
     beta_hat: Vec<f64>,
     null_model: PcgSplmmNullModel,
     null_info: PcgSplmmNullModelInfo,
@@ -5355,6 +5358,7 @@ fn build_sparse_splmm_null_state(
     let null_model = PcgSplmmNullModel {
         df,
         ypy,
+        #[cfg(test)]
         sigma2,
         py: py.clone(),
         xt_w_x_chol: xt_v_inv_x_chol,
@@ -5383,7 +5387,9 @@ fn build_sparse_splmm_null_state(
     };
     Ok(SplmmBuiltNullState {
         x_design_col_major,
+        #[cfg(test)]
         py,
+        #[cfg(test)]
         beta_hat,
         null_model,
         null_info,

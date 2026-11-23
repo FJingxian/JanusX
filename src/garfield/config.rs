@@ -1,15 +1,6 @@
 use super::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum GarfieldInputKind {
-    Auto,
-    Bfile,
-    Vcf,
-    Hmp,
-    File,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(super) enum GarfieldBinMode {
     Bin,
@@ -19,35 +10,6 @@ pub(super) enum GarfieldBinMode {
 pub(super) enum GarfieldMlKeepPolicy {
     TopK,
     TopKPlusRandom { top_frac: f64 },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum GarfieldResponse {
-    Binary,
-    Continuous,
-}
-
-#[inline]
-pub(super) fn parse_response(response: &str) -> Result<GarfieldResponse, String> {
-    let t = response.trim().to_ascii_lowercase();
-    match t.as_str() {
-        "binary" | "bin" | "b" => Ok(GarfieldResponse::Binary),
-        "continuous" | "cont" | "c" => Ok(GarfieldResponse::Continuous),
-        _ => Err("response must be 'binary' or 'continuous'".to_string()),
-    }
-}
-
-#[inline]
-pub(super) fn parse_input_kind(input_kind: &str) -> Result<GarfieldInputKind, String> {
-    let t = input_kind.trim().to_ascii_lowercase();
-    match t.as_str() {
-        "" | "auto" => Ok(GarfieldInputKind::Auto),
-        "bfile" | "plink" | "bed" => Ok(GarfieldInputKind::Bfile),
-        "vcf" => Ok(GarfieldInputKind::Vcf),
-        "hmp" | "hapmap" => Ok(GarfieldInputKind::Hmp),
-        "file" | "txt" | "npy" | "bin" => Ok(GarfieldInputKind::File),
-        _ => Err("input_kind must be one of: auto, bfile, vcf, hmp, file".to_string()),
-    }
 }
 
 #[inline]

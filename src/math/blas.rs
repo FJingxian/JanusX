@@ -145,6 +145,7 @@ pub(crate) fn ensure_garfield_blas_backend() -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[allow(unused_macros)]
 macro_rules! declare_cblas_extern_block {
     (
         $(#[$block_attr:meta])*
@@ -262,6 +263,7 @@ macro_rules! declare_cblas_extern_block {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[allow(unused_macros)]
 macro_rules! declare_openblas_extern {
     ($(#[$block_attr:meta])*) => {
         declare_cblas_extern_block! {

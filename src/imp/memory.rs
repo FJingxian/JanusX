@@ -966,13 +966,6 @@ pub(crate) fn phase_expansion_fixed_bytes(n_samples: usize) -> Result<usize, Str
         .ok_or_else(|| "phase-call memory estimate overflow".to_owned())
 }
 
-pub(crate) fn phase_expansion_row_bytes(
-    row: &VariantRow,
-    n_samples: usize,
-) -> Result<usize, String> {
-    phase_expansion_row_bytes_with_extra_samples(row, n_samples, 0)
-}
-
 pub(crate) fn phase_expansion_row_bytes_with_extra_samples(
     row: &VariantRow,
     target_samples: usize,
@@ -1298,34 +1291,6 @@ pub(crate) fn set_worker_count(
     }
     estimate.worker_count = workers;
     recompute_stage_totals(estimate)
-}
-
-pub(crate) fn derive_seed(
-    master: u64,
-    chrom: &str,
-    window_index: u64,
-    sample_index: usize,
-    iteration: u32,
-) -> u64 {
-    // FNV-1a over a canonical byte stream, followed by SplitMix64 avalanche.
-    // This is stable across Rust versions and independent of thread scheduling.
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in master
-        .to_le_bytes()
-        .into_iter()
-        .chain(chrom.as_bytes().iter().copied())
-        .chain([0xff])
-        .chain(window_index.to_le_bytes())
-        .chain((sample_index as u64).to_le_bytes())
-        .chain(iteration.to_le_bytes())
-    {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    let mut z = hash.wrapping_add(0x9e3779b97f4a7c15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
-    z ^ (z >> 31)
 }
 
 #[cfg(test)]

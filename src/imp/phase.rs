@@ -479,6 +479,7 @@ fn phase_hmm_for_haplotypes(
 /// Reference-only markers are intentionally omitted. A target marker absent
 /// from the reference remains missing in the packed matrix and is excluded
 /// from the Stage1 PBWT by the caller.
+#[cfg(test)]
 pub(crate) fn with_reference_haplotypes(
     target: &PhaseWindow,
     reference: &PhasedWindow,
@@ -737,6 +738,7 @@ pub(crate) fn splice_phase_overlap(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn phase_window(
     window: &PhaseWindow,
     config: &PhaseConfig,
@@ -4061,6 +4063,7 @@ impl<'a> Stage2DonorCursor<'a> {
     }
 }
 
+#[cfg(test)]
 fn donor_haplotypes_at_anchors(
     donor_segments: &[Vec<composite::DonorHapSegment>],
     anchors: &[usize],
@@ -4479,10 +4482,12 @@ fn beagle_allele_map(probabilities: &[f32]) -> u16 {
     best_allele as u16
 }
 
+#[cfg(test)]
 fn low_frequency_allele_flags(window: &PhaseWindow, max_carriers: usize) -> Vec<Vec<bool>> {
     low_frequency_allele_flags_rows(&window.rows, max_carriers)
 }
 
+#[cfg(test)]
 fn low_frequency_allele_flags_rows(
     rows: &[super::types::VariantRow],
     max_carriers: usize,
@@ -5149,6 +5154,7 @@ fn em_initialization_converged(previous_intensity: f32, intensity: f32) -> bool 
         && f64::from((intensity - previous_intensity).abs()) <= 0.1 * f64::from(previous_intensity)
 }
 
+#[cfg(test)]
 fn em_sample_should_be_analyzed(index: usize, sample_count: usize) -> bool {
     index < sample_count
 }
@@ -5314,6 +5320,7 @@ fn phase_lr_threshold(iteration: usize, burnin: usize, iterations: usize, initia
     4.0 * (initial_lr / 4.0).powf(exponent)
 }
 
+#[cfg(test)]
 fn trailing_unphased_het_mask(
     window: &PhaseWindow,
     sample: usize,

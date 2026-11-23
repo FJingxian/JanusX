@@ -25,7 +25,9 @@ use std::time::Instant;
 
 const DENOMINATOR_EPS: f64 = 1.0e-12;
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub(crate) struct Phase1Geometry {
     pub(crate) pair_i: Vec<usize>,
     pub(crate) pair_j: Vec<usize>,
@@ -38,7 +40,9 @@ pub(crate) struct Phase1Geometry {
     pub(crate) mincell_support: Option<Vec<usize>>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
+#[allow(dead_code)]
 pub(crate) struct Phase1Timing {
     pub(crate) pcx_seconds: f64,
     pub(crate) a_seconds: f64,
@@ -53,7 +57,9 @@ pub(crate) struct Phase1Timing {
     pub(crate) mincell_q_timing: Option<MinCellQTiming>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
+#[allow(dead_code)]
 pub(crate) struct Phase1ScoreTiming {
     pub(crate) py_seconds: f64,
     pub(crate) b_seconds: f64,
@@ -65,13 +71,16 @@ pub(crate) struct Phase1ScoreTiming {
     pub(crate) target_rank_seconds: f64,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
+#[allow(dead_code)]
 pub(crate) struct SubsetQWork {
     pub(crate) work_subset: f64,
     pub(crate) work_dense: f64,
     pub(crate) work_ratio: f64,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct SubsetQTiming {
     pub(crate) support_seconds: f64,
@@ -85,9 +94,13 @@ pub(crate) struct SubsetQTiming {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct MinCellQWork {
+    #[allow(dead_code)]
     pub(crate) work_mincell: f64,
+    #[allow(dead_code)]
     pub(crate) work_subset: f64,
+    #[allow(dead_code)]
     pub(crate) work_dense: f64,
+    #[allow(dead_code)]
     pub(crate) mincell_subset_ratio: f64,
 }
 
@@ -112,17 +125,10 @@ impl MinCellQTiming {
     }
 }
 
-impl SubsetQTiming {
-    fn sum(self) -> f64 {
-        self.support_seconds
-            + self.psub_seconds
-            + self.xsub_seconds
-            + self.gemm_seconds
-            + self.reduce_seconds
-            + self.alloc_zero_seconds
-    }
-}
+#[cfg(test)]
+impl SubsetQTiming {}
 
+#[cfg(test)]
 struct SubsetQResult {
     q: Vec<f64>,
     work_subset: f64,
@@ -135,6 +141,7 @@ struct MinCellQResult {
     q_min: Vec<f64>,
     cell: Vec<u8>,
     support: Vec<usize>,
+    #[allow(dead_code)]
     work: MinCellQWork,
     timing: MinCellQTiming,
 }
@@ -144,6 +151,7 @@ struct MinSupportEncoding {
     flipped: Vec<bool>,
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq)]
 struct SampleRowWeightedCResult {
     c_upper: Vec<f64>,
@@ -303,14 +311,15 @@ fn best_max6_channel_name(logic: &[f64; 5], dosage: f64) -> &'static str {
         .unwrap_or("NONE")
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WeightedCKernel {
     DenseReference,
     BinarySparse,
-    MinorSupport,
     SampleRowSparse,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 pub(crate) struct Phase1Scores {
     pub(crate) logic: Vec<[f64; 5]>,
@@ -435,6 +444,7 @@ fn validate_candidate_rerank_shapes(
     Ok(())
 }
 
+#[cfg(test)]
 fn pair_indices(n_markers: usize) -> (Vec<usize>, Vec<usize>) {
     let n_pairs = n_markers.saturating_mul(n_markers.saturating_sub(1)) / 2;
     let mut pair_i = Vec::with_capacity(n_pairs);
@@ -1111,6 +1121,7 @@ pub(crate) fn project_phenotype_for_candidate_rerank(
     matvec_row_major(p_c, n_samples, y)
 }
 
+#[cfg(test)]
 fn old_q_kernel(
     x: &[f64],
     n_samples: usize,
@@ -1221,6 +1232,7 @@ fn best_logic_gate_index(values: &[f64; 5]) -> i64 {
     best_gate
 }
 
+#[cfg(test)]
 fn canonical_q_kernel_name(name: &str) -> Option<&'static str> {
     match name {
         "subset_min_support" | "subset_minor_support" => Some("subset_min_support"),
@@ -1229,6 +1241,7 @@ fn canonical_q_kernel_name(name: &str) -> Option<&'static str> {
     }
 }
 
+#[cfg(test)]
 fn canonical_weighted_c_kernel_name(name: &str) -> Option<&'static str> {
     match name {
         "dense" | "dense_reference" => Some("dense_reference"),
@@ -1239,6 +1252,7 @@ fn canonical_weighted_c_kernel_name(name: &str) -> Option<&'static str> {
     }
 }
 
+#[cfg(test)]
 fn resolve_full_exact_kernel_names<'a>(
     requested_q_kernel: Option<&'a str>,
     requested_c_kernel: Option<&'a str>,
@@ -1264,6 +1278,7 @@ fn resolve_full_exact_kernel_names<'a>(
 /// anchor's support. The returned q values remain in the caller's pair order;
 /// `support_sorted` changes only the internal anchor traversal order.
 #[inline(never)]
+#[cfg(test)]
 fn subset_q_kernel(
     x: &[f64],
     n_samples: usize,
@@ -1694,6 +1709,7 @@ fn mincell_q_from_bitsets(
 }
 
 #[inline(never)]
+#[cfg(test)]
 fn mincell_q_kernel(
     x: &[f64],
     n_samples: usize,
@@ -4268,6 +4284,7 @@ pub(crate) fn candidate_rerank_exact_packed_no_grm_covariate_with_py_trusted_sca
     Ok(result)
 }
 
+#[cfg(test)]
 fn validate_spectral_inputs(
     n_samples: usize,
     eigenvalues: &[f64],
@@ -4304,6 +4321,7 @@ fn validate_spectral_inputs(
 
 /// Compute `q=w'P_Cw` from a full GRM eigendecomposition without materializing
 /// or multiplying by `P_C` for each interaction block.
+#[cfg(test)]
 fn spectral_q_kernel(
     x: &[f64],
     n_samples: usize,
@@ -4466,6 +4484,7 @@ pub(crate) fn phase1_geometry(
     Ok(phase1_geometry_timed(x, n_samples, n_markers, p_c, block_pairs)?.0)
 }
 
+#[cfg(test)]
 pub(crate) fn phase1_geometry_timed(
     x: &[f64],
     n_samples: usize,
@@ -4489,42 +4508,7 @@ pub(crate) fn phase1_geometry_timed(
     )
 }
 
-fn phase2_geometry_timed(
-    x: &[f64],
-    n_samples: usize,
-    n_markers: usize,
-    p_c: &[f64],
-    eigenvalues: &[f64],
-    eigenvectors: &[f64],
-    lambda_vc: f64,
-    block_pairs: usize,
-) -> Result<(Phase1Geometry, Phase1Timing), String> {
-    geometry_with_q_timed(
-        x,
-        n_samples,
-        n_markers,
-        p_c,
-        block_pairs,
-        |pair_i, pair_j| {
-            Ok((
-                spectral_q_kernel(
-                    x,
-                    n_samples,
-                    n_markers,
-                    eigenvalues,
-                    eigenvectors,
-                    lambda_vc,
-                    pair_i,
-                    pair_j,
-                    block_pairs,
-                )?,
-                None,
-                None,
-            ))
-        },
-    )
-}
-
+#[cfg(test)]
 fn phase3_geometry_timed(
     x: &[f64],
     n_samples: usize,
@@ -4555,6 +4539,7 @@ fn phase3_geometry_timed(
     )
 }
 
+#[cfg(test)]
 fn phase6b_geometry_timed(
     x: &[f64],
     n_samples: usize,
@@ -4604,6 +4589,7 @@ fn phase6b_geometry_timed(
     Ok((geometry, timing))
 }
 
+#[cfg(test)]
 fn geometry_with_q_timed<Q>(
     x: &[f64],
     n_samples: usize,
@@ -4692,6 +4678,7 @@ fn score_ratio(numerator: f64, denominator: f64) -> f64 {
 }
 
 #[inline(never)]
+#[cfg(test)]
 fn weighted_interaction_py(
     x: &[f64],
     py: &[f64],
@@ -4721,6 +4708,7 @@ fn weighted_interaction_py(
 /// kernel. It does not materialize the `m x m` weighted Gram matrix; it only
 /// accumulates the upper-triangle pair vector required by the score loop.
 #[inline(never)]
+#[cfg(test)]
 fn weighted_interaction_py_binary_sparse(
     x: &[f64],
     py: &[f64],
@@ -4783,6 +4771,7 @@ fn weighted_interaction_py_binary_sparse(
 }
 
 #[inline]
+#[cfg(test)]
 fn packed_upper_index(n_markers: usize, row: usize, col: usize) -> usize {
     debug_assert!(row <= col && col < n_markers);
     let row_start = row * n_markers - row * row.saturating_sub(1) / 2;
@@ -4794,6 +4783,7 @@ fn packed_upper_index(n_markers: usize, row: usize, col: usize) -> usize {
 /// directly from `b_j = sum_i p_y[i] * x[i, j]` and is never accumulated as a
 /// sample-pair contribution.
 #[inline(never)]
+#[cfg(test)]
 fn sample_row_sparse_weighted_c(
     x: &[f64],
     py: &[f64],
@@ -4878,74 +4868,6 @@ fn sample_row_sparse_weighted_c(
     })
 }
 
-/// Compute the exact weighted interaction Gram values in minor-support space.
-///
-/// Each anchor visits only its active rows and evaluates the complete tail of
-/// markers from that support. This keeps the result in canonical pair order
-/// while avoiding both the dense `n x m x m` traversal and the sample-level
-/// active-pair updates used by `weighted_interaction_py_binary_sparse`.
-#[inline(never)]
-fn weighted_interaction_py_minor_support(
-    x: &[f64],
-    py: &[f64],
-    n_samples: usize,
-    n_markers: usize,
-    pair_i: &[usize],
-    pair_j: &[usize],
-) -> Result<Vec<f64>, String> {
-    validate_binary_genotype_inputs(x, n_samples, n_markers)?;
-    if py.len() != n_samples {
-        return Err(format!(
-            "minor-support C phenotype length mismatch: got {}, expected {n_samples}",
-            py.len()
-        ));
-    }
-    if py.iter().any(|value| !value.is_finite()) {
-        return Err("minor-support C phenotype values must be finite".to_string());
-    }
-    if pair_i.len() != pair_j.len() {
-        return Err("minor-support C pair index lengths differ".to_string());
-    }
-    let expected_pairs = n_markers
-        .checked_mul(n_markers.saturating_sub(1))
-        .map(|value| value / 2)
-        .ok_or_else(|| "minor-support C pair count overflow".to_string())?;
-    if pair_i.len() != expected_pairs {
-        return Err(format!(
-            "minor-support C requires all canonical pairs: got {}, expected {expected_pairs}",
-            pair_i.len()
-        ));
-    }
-    for i in 0..n_markers {
-        for j in (i + 1)..n_markers {
-            let pair = i * n_markers - i * (i + 1) / 2 + (j - i - 1);
-            if pair_i[pair] != i || pair_j[pair] != j {
-                return Err("minor-support C requires canonical pair order".to_string());
-            }
-        }
-    }
-
-    let mut interaction_py = vec![0.0; pair_i.len()];
-    let mut support_rows = Vec::with_capacity(n_samples);
-    for anchor in 0..n_markers.saturating_sub(1) {
-        support_rows.clear();
-        for row in 0..n_samples {
-            if x[row * n_markers + anchor] == 1.0 {
-                support_rows.push(row);
-            }
-        }
-        for marker in (anchor + 1)..n_markers {
-            let mut value = 0.0;
-            for &row in &support_rows {
-                value += py[row] * x[row * n_markers + marker];
-            }
-            let pair = anchor * n_markers - anchor * (anchor + 1) / 2 + (marker - anchor - 1);
-            interaction_py[pair] = value;
-        }
-    }
-    Ok(interaction_py)
-}
-
 #[cfg(test)]
 pub(crate) fn phase1_scores(
     geometry: &Phase1Geometry,
@@ -5005,6 +4927,7 @@ pub(crate) fn phase1_scores_timed_with_c_kernel(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn phase1_scores_timed_with_c_kernel_and_dosage(
     geometry: &Phase1Geometry,
     x: &[f64],
@@ -5055,14 +4978,6 @@ pub(crate) fn phase1_scores_timed_with_c_kernel_and_dosage(
             &geometry.pair_j,
         ),
         WeightedCKernel::BinarySparse => weighted_interaction_py_binary_sparse(
-            x,
-            &py,
-            n_samples,
-            n_markers,
-            &geometry.pair_i,
-            &geometry.pair_j,
-        )?,
-        WeightedCKernel::MinorSupport => weighted_interaction_py_minor_support(
             x,
             &py,
             n_samples,

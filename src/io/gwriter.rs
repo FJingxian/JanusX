@@ -227,7 +227,6 @@ impl VcfWriter {
     }
 
     #[allow(dead_code)] // Shared native writer API; exercised by unit tests.
-    #[allow(dead_code)] // Shared native writer API; exercised by unit tests.
     pub(crate) fn write_site<S: SiteRecord>(
         &mut self,
         site: &S,
@@ -824,16 +823,6 @@ impl PgenPfileWriter {
         })
     }
 
-    #[inline]
-    pub(crate) fn n_samples(&self) -> usize {
-        self.n_samples
-    }
-
-    #[inline]
-    pub(crate) fn written_sites(&self) -> usize {
-        self.written_sites
-    }
-
     fn write_pvar_row<S: SiteRecord>(
         &mut self,
         site: &S,
@@ -877,67 +866,6 @@ impl PgenPfileWriter {
             .write_all(&self.row_buf)
             .map_err(|e| e.to_string())?;
         self.written_sites = self.written_sites.saturating_add(1);
-        Ok(())
-    }
-
-    pub(crate) fn write_chunk<S: SiteRecord>(
-        &mut self,
-        arr: ArrayView2<'_, i8>,
-        sites: &[S],
-    ) -> Result<(), String> {
-        let shape = arr.shape();
-        if shape.len() != 2 {
-            return Err("geno_chunk must be 2D (m_chunk, n_samples)".into());
-        }
-        let m_chunk = shape[0];
-        let n_samples = shape[1];
-        if n_samples != self.n_samples {
-            return Err(format!(
-                "n_samples mismatch: writer expects {}, got {}",
-                self.n_samples, n_samples
-            ));
-        }
-        if sites.len() != m_chunk {
-            return Err(format!(
-                "sites length mismatch: sites={}, m_chunk={}",
-                sites.len(),
-                m_chunk
-            ));
-        }
-
-        for site in sites.iter() {
-            self.write_pvar_row(site, site.ref_allele(), site.alt_allele())?;
-        }
-
-        let strides = arr.strides();
-        let s0 = strides[0] as isize;
-        let s1 = strides[1] as isize;
-        let base = arr.as_ptr();
-
-        unsafe {
-            for snp in 0..m_chunk {
-                let snp_off = (snp as isize) * s0;
-                for byte_idx in 0..self.bytes_per_snp {
-                    let mut b: u8 = 0;
-                    for within in 0..4 {
-                        let si = byte_idx * 4 + within;
-                        let two = if si < self.n_samples {
-                            let off = snp_off + (si as isize) * s1;
-                            plink2bits_from_g_i8(*base.offset(off))
-                        } else {
-                            0b01
-                        };
-                        b |= two << (within * 2);
-                    }
-                    self.row_buf[byte_idx] = b;
-                }
-                self.pgen
-                    .write_all(&self.row_buf)
-                    .map_err(|e| e.to_string())?;
-                self.written_sites = self.written_sites.saturating_add(1);
-            }
-        }
-
         Ok(())
     }
 

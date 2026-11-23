@@ -275,6 +275,7 @@ pub(crate) enum ReferenceWindowAlleles {
 #[derive(Debug)]
 pub(crate) struct CompactReferenceWindow {
     pub(crate) chrom: String,
+    #[allow(dead_code)] // Retained for window trace/error metadata.
     pub(crate) index: u64,
     pub(crate) n_samples: usize,
     pub(crate) words_per_marker: usize,
@@ -363,6 +364,7 @@ impl CompactReferenceWindow {
             .saturating_mul(std::mem::size_of::<u64>())
     }
 
+    #[cfg(test)]
     #[inline]
     pub(crate) fn is_spilled(&self) -> bool {
         matches!(self.alleles, ReferenceWindowAlleles::Spilled(_))

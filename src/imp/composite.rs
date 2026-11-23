@@ -1,6 +1,8 @@
 //! Bounded reference-state selection for phase and imputation windows.
 
-use super::pbwt::{LowFrequencyPhasePbwtIndex, PbwtIndex, PhasePbwtIndex, SegmentPbwtIndex};
+use super::pbwt::{LowFrequencyPhasePbwtIndex, PbwtIndex, PhasePbwtIndex};
+#[cfg(test)]
+use super::pbwt::SegmentPbwtIndex;
 use super::types::{
     CompositePanel, DiploidCall, Ibd2Interval, PackedHaplotypes, PhaseWindow, PhasedWindow,
 };
@@ -114,6 +116,7 @@ impl<'a> PhaseHaplotypeView<'a> {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn target(window: &'a PhasedWindow) -> Self {
         Self {
             target: window,
@@ -126,11 +129,6 @@ impl<'a> PhaseHaplotypeView<'a> {
     #[inline(always)]
     pub(crate) fn target_samples(&self) -> usize {
         self.target_samples
-    }
-
-    #[inline(always)]
-    pub(crate) fn has_reference(&self) -> bool {
-        self.reference_packed.is_some()
     }
 
     #[inline(always)]
@@ -733,35 +731,6 @@ fn trace_phase_composite_target(view: &PhaseHaplotypeView<'_>, target_sample: us
     })
 }
 
-/// Build a shared phase donor panel from IBS candidates for both target
-/// haplotypes. A state retains its donor until it is evicted by the recency
-/// queue; replacement boundaries fall halfway between the old and new IBS
-/// steps. This keeps the genotype and two haplotype tracks on one state space.
-pub(crate) fn build_joint_phase_mosaic(
-    window: &PhasedWindow,
-    pbwt_index: &PhasePbwtIndex,
-    target_sample: usize,
-    max_states: usize,
-    min_lifetime_steps: usize,
-    seed: u64,
-    packed_window: Option<&PackedHaplotypes>,
-) -> Result<CompositePanel, String> {
-    let view = PhaseHaplotypeView::new(
-        window,
-        packed_window,
-        None,
-        window.rows.first().map_or(0, |row| row.calls.len()),
-    )?;
-    build_joint_phase_mosaic_view(
-        &view,
-        pbwt_index,
-        target_sample,
-        max_states,
-        min_lifetime_steps,
-        seed,
-    )
-}
-
 pub(crate) fn build_joint_phase_mosaic_view(
     view: &PhaseHaplotypeView<'_>,
     pbwt_index: &PhasePbwtIndex,
@@ -842,67 +811,6 @@ pub(crate) fn build_joint_phase_mosaic_view(
             .map(|marker| view.marker(marker).allele_count())
             .collect(),
     })
-}
-
-/// Fill a reusable state-major phase panel while retaining its bit storage.
-pub(crate) fn build_joint_phase_mosaic_reuse(
-    window: &PhasedWindow,
-    pbwt_index: &PhasePbwtIndex,
-    target_sample: usize,
-    max_states: usize,
-    min_lifetime_steps: usize,
-    seed: u64,
-    packed_window: Option<&PackedHaplotypes>,
-    panel_slot: &mut Option<CompositePanel>,
-    donor_workspace: &mut DonorSegmentWorkspace,
-) -> Result<(), String> {
-    let view = PhaseHaplotypeView::new(
-        window,
-        packed_window,
-        None,
-        window.rows.first().map_or(0, |row| row.calls.len()),
-    )?;
-    build_joint_phase_mosaic_reuse_impl::<false>(
-        &view,
-        pbwt_index,
-        target_sample,
-        max_states,
-        min_lifetime_steps,
-        seed,
-        panel_slot,
-        donor_workspace,
-    )
-}
-
-/// Sample-hot variant for callers that have validated the window once and
-/// obtained the PBWT index for this exact snapshot.
-pub(crate) fn build_joint_phase_mosaic_reuse_validated(
-    window: &PhasedWindow,
-    pbwt_index: &PhasePbwtIndex,
-    target_sample: usize,
-    max_states: usize,
-    min_lifetime_steps: usize,
-    seed: u64,
-    packed_window: Option<&PackedHaplotypes>,
-    panel_slot: &mut Option<CompositePanel>,
-    donor_workspace: &mut DonorSegmentWorkspace,
-) -> Result<(), String> {
-    let view = PhaseHaplotypeView::new(
-        window,
-        packed_window,
-        None,
-        window.rows.first().map_or(0, |row| row.calls.len()),
-    )?;
-    build_joint_phase_mosaic_reuse_impl::<true>(
-        &view,
-        pbwt_index,
-        target_sample,
-        max_states,
-        min_lifetime_steps,
-        seed,
-        panel_slot,
-        donor_workspace,
-    )
 }
 
 pub(crate) fn build_joint_phase_mosaic_reuse_validated_view(
@@ -1126,6 +1034,7 @@ fn build_joint_phase_mosaic_reuse_impl<const INPUT_VALIDATED: bool>(
     Ok(())
 }
 
+#[cfg(test)]
 fn fill_joint_phase_mosaic(
     window: &PhasedWindow,
     state_segments: &[Vec<DonorHapSegment>],
@@ -1245,6 +1154,7 @@ fn validate_joint_phase_segments_view(
     Ok(source_samples)
 }
 
+#[cfg(test)]
 fn validate_joint_phase_segments(
     window: &PhasedWindow,
     state_segments: &[Vec<DonorHapSegment>],
@@ -1287,6 +1197,7 @@ fn validate_joint_phase_segments(
     Ok(source_samples)
 }
 
+#[cfg(test)]
 fn fill_joint_phase_mosaic_from_packed(
     window: &PhasedWindow,
     packed_window: &PackedHaplotypes,
@@ -1341,6 +1252,7 @@ fn fill_joint_phase_mosaic_from_packed(
 /// Forward and backward IBS proposals are consumed in step order and the
 /// returned marker-major donor map preserves each state's source haplotype
 /// for the Stage2 rare-allele genotype projection.
+#[cfg(test)]
 pub(crate) fn build_low_frequency_phase_mosaic(
     window: &PhasedWindow,
     pbwt_index: &LowFrequencyPhasePbwtIndex,
@@ -1362,6 +1274,7 @@ pub(crate) fn build_low_frequency_phase_mosaic(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn build_low_frequency_phase_mosaic_view(
     view: &PhaseHaplotypeView<'_>,
     pbwt_index: &LowFrequencyPhasePbwtIndex,
@@ -1767,12 +1680,14 @@ fn build_random_low_frequency_phase_panel_view(
     ))
 }
 
+#[cfg(test)]
 pub(crate) fn donor_haplotype_at(segments: &[DonorHapSegment], marker: usize) -> Option<usize> {
     let segment = segments.get(segments.partition_point(|segment| segment.end_marker <= marker))?;
     (segment.start_marker <= marker && marker < segment.end_marker)
         .then_some(segment.donor_haplotype)
 }
 
+#[cfg(test)]
 fn build_random_phase_panel(
     window: &PhasedWindow,
     target_sample: usize,
@@ -1885,14 +1800,7 @@ fn build_random_phase_panel_view(
     })
 }
 
-pub(crate) fn build_reference(
-    window: &PhasedWindow,
-    exclude_sample: Option<usize>,
-    max_states: usize,
-) -> Result<CompositePanel, String> {
-    build_reference_with_index(window, exclude_sample, max_states, None)
-}
-
+#[cfg(test)]
 pub(crate) fn reference_major_alleles(window: &PhasedWindow) -> Result<Vec<Option<u16>>, String> {
     let Some(first) = window.rows.first() else {
         return Err("cannot estimate reference alleles from an empty window".to_owned());
@@ -1938,6 +1846,7 @@ pub(crate) struct PackedBiallelicReference {
 }
 
 #[derive(Debug, Clone)]
+#[cfg(test)]
 struct PackedTargetMosaicSegment {
     start: usize,
     end: usize,
@@ -1948,16 +1857,20 @@ struct PackedTargetMosaicSegment {
 /// markers. Dense reference-only markers are projected from the segment's
 /// donor list on demand, avoiding a full `imp_states × reference_markers`
 /// matrix per target haplotype.
+#[cfg(test)]
 pub(crate) struct PackedTargetMosaic {
     pub(crate) panel: CompositePanel,
     segments: Vec<PackedTargetMosaicSegment>,
 }
 
+#[cfg(test)]
 impl PackedTargetMosaic {
+    #[cfg(test)]
     pub(crate) fn donors_at(&self, marker: usize) -> Option<&[usize]> {
         self.donor_run_at(marker).map(|(_, donors)| donors)
     }
 
+    #[cfg(test)]
     pub(crate) fn donor_run_at(&self, marker: usize) -> Option<(usize, &[usize])> {
         let segment_index = self
             .segments
@@ -1968,18 +1881,7 @@ impl PackedTargetMosaic {
             .map(|segment| (segment.end, segment.donors.as_slice()))
     }
 
-    pub(crate) fn pack_marker(
-        &self,
-        reference: &PackedBiallelicReference,
-        marker: usize,
-        output: &mut PackedHaplotypes,
-    ) -> Result<(), String> {
-        let Some(donors) = self.donors_at(marker) else {
-            return Err("target mosaic marker is outside its PBWT segments".to_owned());
-        };
-        reference.set_mosaic_marker_at(marker, 0, donors, output)
-    }
-
+    #[cfg(test)]
     pub(crate) fn pack_marker_words(
         &self,
         reference: &PackedBiallelicReference,
@@ -1993,6 +1895,7 @@ impl PackedTargetMosaic {
         reference.mosaic_marker_words_at(marker, donors, allele_words, missing_words)
     }
 
+    #[cfg(test)]
     pub(crate) fn pack_marker_allele_words(
         &self,
         reference: &PackedBiallelicReference,
@@ -2102,6 +2005,7 @@ impl PackedTargetMosaic {
     }
 }
 
+#[cfg(test)]
 #[inline]
 fn pack_donor_alleles(reference_words: &[u64], donors: &[usize], allele_scratch: &mut [u64]) {
     debug_assert!(!donors.is_empty());
@@ -2121,6 +2025,7 @@ fn pack_donor_alleles(reference_words: &[u64], donors: &[usize], allele_scratch:
     pack_donor_alleles_scalar(reference_words, donors, allele_scratch);
 }
 
+#[cfg(test)]
 #[inline]
 fn pack_donor_alleles_scalar(
     reference_words: &[u64],
@@ -2138,6 +2043,7 @@ fn pack_donor_alleles_scalar(
 }
 
 #[cfg(target_arch = "x86_64")]
+#[cfg(test)]
 #[target_feature(enable = "avx2")]
 unsafe fn pack_donor_alleles_avx2(
     reference_words: &[u64],
@@ -2488,10 +2394,12 @@ impl PackedBiallelicReference {
         (major_alleles, alt_frequencies)
     }
 
+    #[cfg(test)]
     pub(crate) fn major_alleles(&self) -> Vec<Option<u16>> {
         self.allele_summaries().0
     }
 
+    #[cfg(test)]
     pub(crate) fn from_window(
         window: &PhasedWindow,
         reference_present: &[bool],
@@ -2562,6 +2470,7 @@ impl PackedBiallelicReference {
         }))
     }
 
+    #[cfg(test)]
     fn set_mosaic_marker(
         &self,
         marker: usize,
@@ -2571,6 +2480,7 @@ impl PackedBiallelicReference {
         self.set_mosaic_marker_at(marker, marker, donors, output)
     }
 
+    #[cfg(test)]
     fn set_mosaic_marker_at(
         &self,
         reference_marker: usize,
@@ -2597,6 +2507,7 @@ impl PackedBiallelicReference {
         })
     }
 
+    #[cfg(test)]
     fn mosaic_marker_words_at(
         &self,
         reference_marker: usize,
@@ -2632,6 +2543,7 @@ impl PackedBiallelicReference {
         Ok(())
     }
 
+    #[cfg(test)]
     fn mosaic_marker_allele_words_at(
         &self,
         reference_marker: usize,
@@ -2655,6 +2567,7 @@ impl PackedBiallelicReference {
         Ok(true)
     }
 
+    #[cfg(test)]
     fn set_mosaic_marker_at_with_scratch(
         &self,
         reference_marker: usize,
@@ -2689,6 +2602,7 @@ impl PackedBiallelicReference {
 /// Reorder a new segment's donor set so donors retained from the preceding
 /// segment keep their HMM state indices. New donors fill the remaining slots
 /// in PBWT rank order.
+#[cfg(test)]
 fn align_mosaic_donor_states(previous: &[usize], current: Vec<usize>) -> Vec<usize> {
     debug_assert_eq!(previous.len(), current.len());
 
@@ -2727,6 +2641,7 @@ fn align_mosaic_donor_states(previous: &[usize], current: Vec<usize>) -> Vec<usi
 /// Construct a compact target-specific mosaic. Only target-observed marker
 /// rows are materialized for the HMM; donor lists retain the dense reference
 /// projection for every marker in each PBWT segment.
+#[cfg(test)]
 pub(crate) fn build_pbwt_target_mosaic_hmm_packed(
     packed_reference: &PackedBiallelicReference,
     pbwt_index: &SegmentPbwtIndex,
@@ -2829,6 +2744,7 @@ pub(crate) fn build_pbwt_target_mosaic_hmm_packed(
 /// Construct a target-specific HMM mosaic from Beagle-style IBS candidates.
 /// The number of states is the number of composite tracks that were actually
 /// created, which can be smaller than `max_states`.
+#[cfg(test)]
 pub(crate) fn build_ibs_target_mosaic_hmm_packed(
     packed_reference: &PackedBiallelicReference,
     hmm_marker_indices: &[usize],
@@ -2952,6 +2868,7 @@ pub(crate) fn build_ibs_target_mosaic_hmm_packed(
 
 /// Build a target-specific donor mosaic from a marker-major reference plane.
 /// This path avoids constructing a second full `PhasedWindow` copy.
+#[cfg(test)]
 pub(crate) fn build_pbwt_target_mosaic_packed(
     packed_reference: &PackedBiallelicReference,
     pbwt_index: &SegmentPbwtIndex,
@@ -3025,6 +2942,7 @@ pub(crate) fn build_pbwt_target_mosaic_packed(
 /// Construct a target-specific local IBS mosaic directly from the full
 /// reference window. Each genetic segment queries its own shared PBWT order,
 /// so no full reference haplotype matrix or per-target full scan is needed.
+#[cfg(test)]
 pub(crate) fn build_pbwt_target_mosaic(
     window: &PhasedWindow,
     pbwt_index: &SegmentPbwtIndex,
@@ -3140,16 +3058,6 @@ pub(crate) fn build_pbwt_target_mosaic(
             .map(|row| row.meta.allele_count())
             .collect(),
     })
-}
-
-fn build_reference_with_index(
-    window: &PhasedWindow,
-    exclude_sample: Option<usize>,
-    max_states: usize,
-    pbwt_index: Option<&PbwtIndex>,
-) -> Result<CompositePanel, String> {
-    let view = PhaseHaplotypeView::target(window);
-    build_reference_with_index_view(&view, exclude_sample, max_states, pbwt_index)
 }
 
 fn build_reference_with_index_view(
@@ -3332,17 +3240,6 @@ pub(crate) fn build_target_mosaic(
     })
 }
 
-pub(crate) fn build_reference_with_ibd2(
-    window: &PhasedWindow,
-    exclude_sample: Option<usize>,
-    max_states: usize,
-    intervals: &[Ibd2Interval],
-    pbwt_index: &PbwtIndex,
-) -> Result<CompositePanel, String> {
-    let view = PhaseHaplotypeView::target(window);
-    build_reference_with_ibd2_view(&view, exclude_sample, max_states, intervals, pbwt_index)
-}
-
 fn build_reference_with_ibd2_view(
     view: &PhaseHaplotypeView<'_>,
     exclude_sample: Option<usize>,
@@ -3370,6 +3267,7 @@ fn build_reference_with_ibd2_view(
     Ok(panel)
 }
 
+#[cfg(test)]
 pub(crate) fn build_phase_reference(
     window: &PhasedWindow,
     input: &PhaseWindow,
@@ -5803,64 +5701,6 @@ mod tests {
             expected_merged.missing_markers
         );
     }
-}
-
-pub(crate) fn build_panel_from_calls(
-    rows: &[Vec<DiploidCall>],
-    target_sample: usize,
-    max_states: usize,
-) -> Result<CompositePanel, String> {
-    if rows.is_empty() || max_states == 0 {
-        return Err("composite panel requires variants and a positive state count".to_owned());
-    }
-    let n_samples = rows[0].len();
-    if target_sample >= n_samples || n_samples < 2 {
-        return Err(
-            "phase panel requires at least two samples and a valid target index".to_owned(),
-        );
-    }
-    if rows.iter().any(|row| row.len() != n_samples) {
-        return Err("phase rows have inconsistent sample counts".to_owned());
-    }
-    let candidate_count = n_samples
-        .saturating_sub(1)
-        .checked_mul(2)
-        .ok_or_else(|| "phase candidate haplotype count overflow".to_owned())?;
-    if candidate_count == 0 {
-        return Err("phase composite panel is empty".to_owned());
-    }
-    let max_allele = rows
-        .iter()
-        .flat_map(|row| row.iter())
-        .flat_map(|call| call.alleles.into_iter().flatten())
-        .max()
-        .unwrap_or(1);
-    let allele_counts = rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                .flat_map(|call| call.alleles.into_iter().flatten())
-                .max()
-                .map_or(1, |allele| usize::from(allele) + 1)
-        })
-        .collect::<Vec<_>>();
-    let selected = systematic_indices(candidate_count, max_states);
-    let mut haplotypes =
-        PackedHaplotypes::empty(selected.len(), rows.len(), allele_width(max_allele))?;
-    let mut source_samples = Vec::with_capacity(selected.len());
-    for (state, &candidate) in selected.iter().enumerate() {
-        let (sample, hap) = candidate_sample_hap(candidate, n_samples, Some(target_sample));
-        source_samples.push(sample);
-        for (marker, row) in rows.iter().enumerate() {
-            haplotypes.set_allele(marker, state, row[sample].alleles[hap])?;
-        }
-    }
-    Ok(CompositePanel {
-        haplotypes,
-        source_samples,
-        marker_indices: (0..rows.len()).collect(),
-        allele_counts,
-    })
 }
 
 fn systematic_indices(candidate_count: usize, max_states: usize) -> Vec<usize> {

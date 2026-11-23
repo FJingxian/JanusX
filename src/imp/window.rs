@@ -245,6 +245,7 @@ where
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn next_window(&mut self) -> Result<Option<PhaseWindow>, String> {
         self.next_window_with_admission(&mut |_, _| Ok(()))
     }
@@ -529,14 +530,6 @@ where
             return Ok(Some((row, cm)));
         }
     }
-}
-
-pub(crate) fn cursor_from_reader<I>(rows: I, config: &ImpConfig) -> Result<WindowCursor<I>, String>
-where
-    I: Iterator<Item = Result<VariantRow, String>>,
-{
-    let map = map_from_config(config)?;
-    Ok(WindowCursor::new(rows, map, config))
 }
 
 pub(crate) fn map_from_config(config: &ImpConfig) -> Result<GeneticMap, String> {

@@ -1,5 +1,3 @@
-use crate::gfcore::SiteInfo;
-use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -14,7 +12,6 @@ pub struct BinWindow {
     pub bp_end: i32,
     pub indices: Vec<usize>,
 }
-
 #[inline]
 pub fn append_suffix(prefix: &Path, suffix: &str) -> PathBuf {
     let mut os: OsString = prefix.as_os_str().to_os_string();
@@ -120,6 +117,7 @@ pub fn bin_prefix(path: &str) -> PathBuf {
 }
 
 #[inline]
+#[cfg(test)]
 pub fn bin01_id_sidecar_path(path: &str) -> PathBuf {
     append_suffix(&bin_prefix(path), ".bin.id")
 }
@@ -144,150 +142,4 @@ pub fn discover_site_sidecar(path: &str) -> Option<PathBuf> {
         append_suffix(&prefix, ".bim"),
     ];
     candidates.into_iter().find(|cand| cand.exists())
-}
-
-pub fn discover_id_sidecar(path: &str) -> Option<PathBuf> {
-    let prefix = bin_prefix(path);
-    let candidates = [
-        append_suffix(&prefix, ".bin.id"),
-        append_suffix(&prefix, ".id"),
-        append_suffix(&prefix, ".fam"),
-    ];
-    candidates.into_iter().find(|cand| cand.exists())
-}
-
-fn global_window(n_rows: usize) -> Vec<BinWindow> {
-    vec![BinWindow {
-        chrom: "ALL".to_string(),
-        bp_start: 0,
-        bp_end: 0,
-        indices: (0..n_rows).collect(),
-    }]
-}
-
-pub fn build_windows_from_sites<F>(
-    sites: &[SiteInfo],
-    n_rows: usize,
-    extension: usize,
-    step: usize,
-    normalize_chrom: F,
-) -> Vec<BinWindow>
-where
-    F: Fn(&str) -> String,
-{
-    if n_rows == 0 {
-        return Vec::new();
-    }
-    if extension == 0 || step == 0 || sites.is_empty() {
-        return global_window(n_rows);
-    }
-
-    let mut groups: HashMap<String, Vec<(i32, usize)>> = HashMap::new();
-    let mut chrom_order: Vec<String> = Vec::new();
-    for (idx, site) in sites.iter().enumerate().take(n_rows) {
-        let chrom = normalize_chrom(&site.chrom);
-        if !groups.contains_key(&chrom) {
-            groups.insert(chrom.clone(), Vec::new());
-            chrom_order.push(chrom.clone());
-        }
-        if let Some(v) = groups.get_mut(&chrom) {
-            v.push((site.pos, idx));
-        }
-    }
-    if groups.is_empty() {
-        return global_window(n_rows);
-    }
-
-    let mut windows: Vec<BinWindow> = Vec::new();
-    for chrom in chrom_order {
-        let Some(mut pairs) = groups.remove(&chrom) else {
-            continue;
-        };
-        if pairs.is_empty() {
-            continue;
-        }
-        pairs.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-
-        let n = pairs.len();
-        let bps: Vec<i32> = pairs.iter().map(|(bp, _)| *bp).collect();
-        let idxs: Vec<usize> = pairs.iter().map(|(_, i)| *i).collect();
-        let min_bp = bps[0];
-        let max_bp = bps[n - 1];
-        let mut l = 0usize;
-        let mut r = 0usize;
-        let mut center = min_bp;
-        let mut prev_sig: Option<(usize, usize, usize)> = None;
-
-        loop {
-            let left_i64 = (center as i64)
-                .saturating_sub(extension as i64)
-                .max(min_bp as i64);
-            let right_i64 = (center as i64)
-                .saturating_add(extension as i64)
-                .min(max_bp as i64);
-
-            while l < n && (bps[l] as i64) < left_i64 {
-                l += 1;
-            }
-            if r < l {
-                r = l;
-            }
-            while r < n && (bps[r] as i64) <= right_i64 {
-                r += 1;
-            }
-
-            if r > l {
-                let chunk = idxs[l..r].to_vec();
-                let sig = (chunk[0], chunk[chunk.len() - 1], chunk.len());
-                if prev_sig != Some(sig) {
-                    let bp_start = if left_i64 > i32::MAX as i64 {
-                        i32::MAX
-                    } else if left_i64 < i32::MIN as i64 {
-                        i32::MIN
-                    } else {
-                        left_i64 as i32
-                    };
-                    let bp_end = if right_i64 > i32::MAX as i64 {
-                        i32::MAX
-                    } else if right_i64 < i32::MIN as i64 {
-                        i32::MIN
-                    } else {
-                        right_i64 as i32
-                    };
-                    windows.push(BinWindow {
-                        chrom: chrom.clone(),
-                        bp_start,
-                        bp_end,
-                        indices: chunk,
-                    });
-                    prev_sig = Some(sig);
-                }
-            }
-
-            if center >= max_bp {
-                break;
-            }
-            let next = (center as i64).saturating_add(step as i64);
-            if next > i32::MAX as i64 {
-                break;
-            }
-            center = next as i32;
-        }
-
-        let has_chrom_window = windows.last().map(|w| w.chrom == chrom).unwrap_or(false);
-        if !has_chrom_window {
-            windows.push(BinWindow {
-                chrom: chrom.clone(),
-                bp_start: min_bp,
-                bp_end: max_bp.saturating_add(1),
-                indices: idxs,
-            });
-        }
-    }
-
-    if windows.is_empty() {
-        global_window(n_rows)
-    } else {
-        windows
-    }
 }

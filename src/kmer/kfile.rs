@@ -235,6 +235,7 @@ fn build_sample_selection(
     Ok((indices, ids))
 }
 
+#[cfg(test)]
 fn decode_bsite_chunk(
     bytes: &[u8],
     n_samples: usize,
@@ -284,6 +285,7 @@ fn decode_bsite_chunk(
 }
 
 #[inline]
+#[cfg(test)]
 fn maf_from_presence(presence: u64, n_samples: usize) -> f32 {
     if n_samples == 0 {
         return f32::NAN;

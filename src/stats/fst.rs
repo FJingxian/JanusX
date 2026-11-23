@@ -9,18 +9,27 @@ use crate::gfcore::SiteInfo;
 use crate::stats_common::{
     emit_progress_callback, get_cached_pool, map_err_string_to_py, progress_step,
 };
+#[cfg(test)]
 use memmap2::Mmap;
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(test)]
+use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
+#[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const BED_HEADER_LEN: usize = 3;
+#[cfg(test)]
 const FST_BLOCK_SITES: usize = 4096;
+#[cfg(test)]
 const FST_SITE_TASK_SITES: usize = 256;
+#[cfg(test)]
 const FST_OUTPUT_BUFFER_SIZE: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -84,6 +93,7 @@ impl FstScratch {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug)]
 struct FstOutput {
     sites: Vec<SiteInfo>,
@@ -93,6 +103,7 @@ struct FstOutput {
     pair_names: Vec<(String, String)>,
 }
 
+#[cfg(test)]
 struct FstInput {
     mmap: Mmap,
     n_samples: usize,
@@ -370,6 +381,7 @@ fn transpose_bed_word(row: &[u8], sample_start: usize, n_samples: usize) -> BitP
     out
 }
 
+#[cfg(test)]
 fn build_group_masks(
     group_by_sample: &[Option<String>],
     n_samples: usize,
@@ -507,6 +519,7 @@ fn read_within_groups(
     Ok(out)
 }
 
+#[cfg(test)]
 fn open_bed(prefix: &str) -> Result<(Mmap, usize, usize, usize), String> {
     let fam_path = format!("{prefix}.fam");
     let n_samples = read_fam_keys(&fam_path)?.len();
@@ -569,6 +582,7 @@ fn allele_frequency(stats: &GroupStats) -> Option<f64> {
 }
 
 /// Weir--Cockerham's per-site theta estimator.
+#[cfg(test)]
 pub(crate) fn wc_fst(groups: &[GroupStats]) -> Option<f64> {
     wc_components(groups).map(|(a, denominator)| a / denominator)
 }
@@ -651,6 +665,7 @@ pub(crate) fn wc_window_summary(sites: &[Vec<GroupStats>]) -> Option<FstWindowSu
 }
 
 /// Hudson's unbiased two-population per-site estimator.
+#[cfg(test)]
 pub(crate) fn hudson_fst(lhs: &GroupStats, rhs: &GroupStats) -> Option<f64> {
     hudson_components(lhs, rhs).map(|(numerator, denominator)| numerator / denominator)
 }
@@ -683,6 +698,7 @@ fn normalize_plink_prefix(prefix: &str) -> String {
     }
 }
 
+#[cfg(test)]
 fn pair_names(masks: &[GroupMask], method: FstMethod) -> Vec<(String, String)> {
     match method {
         FstMethod::Wc => vec![("ALL".to_string(), "ALL".to_string())],
@@ -698,6 +714,7 @@ fn pair_names(masks: &[GroupMask], method: FstMethod) -> Vec<(String, String)> {
     }
 }
 
+#[cfg(test)]
 fn open_fst_input(prefix: &str, within_path: &str, method_name: &str) -> Result<FstInput, String> {
     let method = FstMethod::parse(method_name)?;
     let bed_prefix = normalize_plink_prefix(prefix);
@@ -732,6 +749,7 @@ fn open_fst_input(prefix: &str, within_path: &str, method_name: &str) -> Result<
     })
 }
 
+#[cfg(test)]
 fn compute_fst_block(
     input: &FstInput,
     start: usize,
@@ -815,22 +833,7 @@ fn compute_fst_block(
     })
 }
 
-fn compute_fst_core(
-    prefix: &str,
-    within_path: &str,
-    method_name: &str,
-    threads: usize,
-) -> Result<FstOutput, String> {
-    let input = open_fst_input(prefix, within_path, method_name)?;
-    let mut output = compute_fst_block(&input, 0, input.n_sites, threads)?;
-    let mut bim_reader = FstBimReader::open(&normalize_plink_prefix(prefix))?;
-    output.sites = read_fst_sites(&mut bim_reader, input.n_sites)?;
-    if bim_reader.next_site()?.is_some() {
-        return Err("BIM contains more rows than BED while loading FST".to_string());
-    }
-    Ok(output)
-}
-
+#[cfg(test)]
 fn write_fst_header<W: Write>(writer: &mut W, method: FstMethod, path: &str) -> Result<(), String> {
     match method {
         FstMethod::Wc => {
@@ -844,6 +847,7 @@ fn write_fst_header<W: Write>(writer: &mut W, method: FstMethod, path: &str) -> 
     Ok(())
 }
 
+#[cfg(test)]
 fn write_fst_rows<W: Write>(
     writer: &mut W,
     output: &FstOutput,
@@ -890,6 +894,7 @@ fn write_fst_rows<W: Write>(
     Ok(())
 }
 
+#[cfg(test)]
 fn read_fst_sites(reader: &mut FstBimReader, count: usize) -> Result<Vec<SiteInfo>, String> {
     let mut sites = Vec::with_capacity(count);
     for _ in 0..count {
@@ -902,6 +907,7 @@ fn read_fst_sites(reader: &mut FstBimReader, count: usize) -> Result<Vec<SiteInf
     Ok(sites)
 }
 
+#[cfg(test)]
 fn temporary_fst_output_path(output_path: &str) -> PathBuf {
     let output = Path::new(output_path);
     let file_name = output
@@ -918,6 +924,7 @@ fn temporary_fst_output_path(output_path: &str) -> PathBuf {
     ))
 }
 
+#[cfg(test)]
 fn write_fst_tsv_streaming(
     prefix: &str,
     within_path: &str,

@@ -59,6 +59,7 @@ impl AssocResultCols {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum AssocMissBlock<'a> {
+    #[allow(dead_code)] // Covered by count/rate compatibility tests.
     CountI64 {
         values: &'a [i64],
         n_samples: usize,
@@ -202,7 +203,6 @@ pub(crate) fn resolve_assoc_tsv_metadata(
 pub(crate) struct AssocTsvSink {
     path: String,
     result_cols: Option<AssocResultCols>,
-    custom_header_written: bool,
     rows_written: usize,
     buffer_bytes: usize,
     queue_depth: usize,
@@ -222,7 +222,6 @@ impl AssocTsvSink {
         Self {
             path,
             result_cols: None,
-            custom_header_written: false,
             rows_written: 0,
             buffer_bytes: cap,
             queue_depth: queue_depth.max(1),
@@ -234,24 +233,6 @@ impl AssocTsvSink {
     #[inline]
     pub(crate) fn rows_written(&self) -> usize {
         self.rows_written
-    }
-
-    #[inline]
-    pub(crate) fn ensure_custom_header(&mut self, header: &[u8]) -> Result<(), String> {
-        if self.result_cols.is_some() {
-            return Err("fixed-schema writer already initialized".to_string());
-        }
-        if self.custom_header_written {
-            return Ok(());
-        }
-        self.writer = Some(AsyncTsvWriter::with_config(
-            &self.path,
-            header,
-            64 * 1024 * 1024,
-            self.queue_depth,
-        )?);
-        self.custom_header_written = true;
-        Ok(())
     }
 
     #[inline]
@@ -340,14 +321,6 @@ impl AssocTsvSink {
             .as_ref()
             .ok_or_else(|| "writer is closed".to_string())?;
         writer.send(data)
-    }
-
-    pub(crate) fn flush_external_text(&self, text_buf: &mut String) -> Result<(), String> {
-        let writer = self
-            .writer
-            .as_ref()
-            .ok_or_else(|| "writer is closed".to_string())?;
-        send_text_buf(writer, text_buf)
     }
 
     pub(crate) fn finish(&mut self) -> Result<(), String> {

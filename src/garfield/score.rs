@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //
 // Active GARFIELD continuous search uses the dual-bitplane fuzzy dosage route
 // (`g >= 1`, `g >= 2`) together with dosage-aware centered-gain scoring.
@@ -24,6 +23,7 @@ const SUM_Y_LOOKUP_MIN_POPCNT: u32 = 7;
 #[cfg(target_arch = "x86_64")]
 const SUM_Y_MASKLOAD_MIN_POPCNT: u32 = 10;
 #[cfg(target_arch = "aarch64")]
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 const SUM_Y_NEON_MIN_POPCNT: u32 = 14;
 
 #[cfg(target_arch = "x86_64")]
@@ -47,6 +47,7 @@ const SUM_Y_MASK4_LUT: [[i64; 4]; 16] = [
 ];
 
 #[cfg(target_arch = "aarch64")]
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 const SUM_Y_MASK2_LUT: [[u64; 2]; 4] = [[0, 0], [u64::MAX, 0], [0, u64::MAX], [u64::MAX, u64::MAX]];
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -88,6 +89,7 @@ fn require_n_valid(n: usize, y_len: usize, bit_words: usize, ctx: &str) -> Resul
 }
 
 #[inline]
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn validate_binary_y(y: &[u8], n_samples: usize, ctx: &str) -> Result<(), String> {
     if let Some((idx, bad)) = y.iter().take(n_samples).enumerate().find(|(_, v)| **v > 1) {
         return Err(format!("{ctx}: y must be binary 0/1; found y[{idx}]={bad}"));
@@ -143,6 +145,7 @@ pub(crate) struct BatchScoreParts {
     sum_hit: Vec<f64>,
     total_sum: f64,
     n_rows: usize,
+    #[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
     row_words: usize,
     n_samples: usize,
 }
@@ -253,6 +256,7 @@ fn score_cont_centered_gain_batch_packed_cpu_impl(
     build_score_parts_from_sum_hit(sum_hit, n_hit, n_samples, total_sum, row_words)
 }
 
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn batch_score_parts_to_pydict<'py>(
     py: Python<'py>,
     parts: BatchScoreParts,
@@ -300,6 +304,7 @@ fn batch_score_parts_to_pydict<'py>(
 }
 
 #[inline]
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn tail_mask(n_samples: usize) -> Option<u64> {
     let rem = n_samples & 63;
     if rem == 0 {
@@ -310,6 +315,7 @@ fn tail_mask(n_samples: usize) -> Option<u64> {
 }
 
 #[inline]
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn apply_tail_mask(bits: &mut [u64], mask: Option<u64>) {
     if let Some(mask) = mask {
         if let Some(last) = bits.last_mut() {
@@ -319,6 +325,7 @@ fn apply_tail_mask(bits: &mut [u64], mask: Option<u64>) {
 }
 
 #[inline]
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn complement_first_literal(bits: &[u64], n_samples: usize) -> Vec<u64> {
     let needed_words = words_for_samples(n_samples);
     let mut out = bits[..needed_words].to_vec();
@@ -881,6 +888,7 @@ unsafe fn sum_y_where_both1_avx2(lhs: &[u64], rhs: &[u64], y: &[f64], n_samples:
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 unsafe fn sum_y_where_both1_neon(lhs: &[u64], rhs: &[u64], y: &[f64], n_samples: usize) -> f64 {
     use core::arch::aarch64::{
         float64x2_t, uint64x2_t, vaddq_f64, vandq_u64, vdupq_n_f64, vld1q_f64, vld1q_u64,
@@ -979,6 +987,7 @@ pub fn sum_y_where_both1(lhs: &[u64], rhs: &[u64], y: &[f64], n_samples: usize) 
 /// Sum phenotype residuals where both packed supports are set, reusing a
 /// trait-level subset-sum table for dense intersections.
 #[inline]
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 pub fn sum_y_where_both1_with_lookup(
     lhs: &[u64],
     rhs: &[u64],
@@ -1145,6 +1154,7 @@ pub fn sum_y_where_both1_four(
 }
 
 /// Balanced Accuracy for binary `y` (0/1) vs packed 0/1 bit-vector.
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 pub fn score_binary_ba_packed(y: &[u8], bits: &[u64], n_samples: usize) -> f64 {
     if n_samples == 0 {
         return f64::NAN;
@@ -1173,6 +1183,7 @@ pub fn score_binary_mcc_packed(y: &[u8], bits: &[u64], n_samples: usize) -> f64 
 }
 
 /// Mean difference (`mean(x=1) - mean(x=0)`) for continuous `y` vs packed 0/1 bit-vector.
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 pub fn score_cont_mean_diff_packed(y: &[f64], bits: &[u64], n_samples: usize) -> f64 {
     if n_samples == 0 {
         return f64::NAN;
@@ -1211,6 +1222,7 @@ pub fn score_cont_corr_packed(y: &[f64], bits: &[u64], n_samples: usize) -> f64 
 ///
 /// `bits_flat` is row-major with `n_rows` rows and `row_words` words per row.
 /// Returns `(ba, mcc)`, both length `n_rows`.
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 pub fn score_binary_ba_mcc_batch_packed(
     y: &[u8],
     bits_flat: &[u64],
@@ -1273,6 +1285,7 @@ pub fn score_binary_ba_mcc_batch_packed(
 ///
 /// `bits_flat` is row-major with `n_rows` rows and `row_words` words per row.
 /// Returns `(mean_diff, corr)`, both length `n_rows`.
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 pub fn score_cont_mean_diff_corr_batch_packed(
     y: &[f64],
     bits_flat: &[u64],
@@ -1484,6 +1497,7 @@ pub fn score_cont_centered_gain_dual_packed_with_sum(
     score_cont_centered_gain_dual_from_summary(total_sum, n_samples, n_ge1, n_ge2, sum_ge1, sum_ge2)
 }
 
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 pub fn score_cont_centered_gain_dual_packed(
     y: &[f64],
     ge1_bits: &[u64],
@@ -1500,6 +1514,7 @@ pub fn score_cont_centered_gain_dual_packed(
 }
 
 #[inline]
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn readonly_u8_to_cow<'a>(arr: &'a PyReadonlyArray1<'a, u8>) -> Cow<'a, [u8]> {
     match crate::stats_common::array_standard_slice(&arr) {
         Ok(s) => Cow::Borrowed(s),
@@ -1510,6 +1525,7 @@ fn readonly_u8_to_cow<'a>(arr: &'a PyReadonlyArray1<'a, u8>) -> Cow<'a, [u8]> {
 }
 
 #[inline]
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn readonly_f64_to_cow<'a>(arr: &'a PyReadonlyArray1<'a, f64>) -> Cow<'a, [f64]> {
     match crate::stats_common::array_standard_slice(&arr) {
         Ok(s) => Cow::Borrowed(s),
@@ -1520,6 +1536,7 @@ fn readonly_f64_to_cow<'a>(arr: &'a PyReadonlyArray1<'a, f64>) -> Cow<'a, [f64]>
 }
 
 #[inline]
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn readonly_u64_to_cow<'a>(arr: &'a PyReadonlyArray1<'a, u64>) -> Cow<'a, [u64]> {
     match crate::stats_common::array_standard_slice(&arr) {
         Ok(s) => Cow::Borrowed(s),
@@ -1530,6 +1547,7 @@ fn readonly_u64_to_cow<'a>(arr: &'a PyReadonlyArray1<'a, u64>) -> Cow<'a, [u64]>
 }
 
 #[inline]
+#[allow(dead_code)] // Retained GARFIELD reference/benchmark kernel.
 fn readonly_u64_2d_to_flat_cow<'a>(arr: &'a PyReadonlyArray2<'a, u64>) -> Cow<'a, [u64]> {
     match crate::stats_common::array_standard_slice(&arr) {
         Ok(s) => Cow::Borrowed(s),

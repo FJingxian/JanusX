@@ -1044,6 +1044,7 @@ pub(crate) struct ImpNumericReader {
     samples: Vec<String>,
     mmap: Mmap,
     data_offset: usize,
+    #[allow(dead_code)] // Used by native numeric-reader tests.
     n_samples: usize,
     n_variants: usize,
     row_bytes: usize,
@@ -3612,38 +3613,6 @@ impl BedSnpIter {
     }
 
     #[inline]
-    fn decode_snp_bytes_selected_into_with_counts(
-        &self,
-        snp_bytes: &[u8],
-        sample_indices: &[usize],
-        out: &mut [f32],
-    ) -> DecodedSnpRowCounts {
-        let value_lut: [f32; 4] = [0.0_f32, -9.0_f32, 1.0_f32, 2.0_f32];
-        let mut counts = DecodedSnpRowCounts::default();
-        for (out_i, &samp_idx) in sample_indices.iter().enumerate() {
-            let byte = snp_bytes[samp_idx >> 2];
-            let code = (byte >> ((samp_idx & 3) * 2)) & 0b11;
-            out[out_i] = value_lut[code as usize];
-            match code {
-                0b00 => {
-                    counts.non_missing += 1;
-                }
-                0b10 => {
-                    counts.non_missing += 1;
-                    counts.alt_sum += 1.0;
-                    counts.het_count += 1;
-                }
-                0b11 => {
-                    counts.non_missing += 1;
-                    counts.alt_sum += 2.0;
-                }
-                _ => {}
-            }
-        }
-        counts
-    }
-
-    #[inline]
     fn decode_snp_bytes_selected_counts_only(
         &self,
         snp_bytes: &[u8],
@@ -4171,73 +4140,6 @@ impl BedSnpIter {
 
             let (alt_sum, non_missing) = self.decode_snp_bytes_into_with_stats(&snp_bytes, out);
             return Some((snp_idx, alt_sum, non_missing));
-        }
-        None
-    }
-
-    pub(crate) fn next_snp_raw_into_with_counts(
-        &mut self,
-        out: &mut [f32],
-    ) -> Option<(usize, SiteInfo, DecodedSnpRowCounts)> {
-        if out.len() < self.n_samples {
-            return None;
-        }
-        while self.cur < self.n_snps {
-            let snp_idx = self.cur;
-            self.cur += 1;
-
-            if self.window_snps.is_some() {
-                let window_end = self.window_start_snp + self.window_len_snps;
-                if snp_idx < self.window_start_snp || snp_idx >= window_end {
-                    if let Err(e) = self.remap_window(snp_idx) {
-                        panic!("failed to remap BED window: {e}");
-                    }
-                }
-            }
-
-            let snp_bytes = match self.snp_bytes(snp_idx) {
-                Some(bytes) => bytes,
-                None => return None,
-            };
-            let counts = self.decode_snp_bytes_into_with_counts(&snp_bytes, out);
-            let site = self.sites[snp_idx].clone();
-            return Some((snp_idx, site, counts));
-        }
-        None
-    }
-
-    pub(crate) fn next_snp_selected_raw_into_with_counts(
-        &mut self,
-        sample_indices: &[usize],
-        out: &mut [f32],
-    ) -> Option<(usize, SiteInfo, DecodedSnpRowCounts)> {
-        if sample_indices.len() == self.n_samples {
-            return self.next_snp_raw_into_with_counts(out);
-        }
-        if out.len() < sample_indices.len() {
-            return None;
-        }
-        while self.cur < self.n_snps {
-            let snp_idx = self.cur;
-            self.cur += 1;
-
-            if self.window_snps.is_some() {
-                let window_end = self.window_start_snp + self.window_len_snps;
-                if snp_idx < self.window_start_snp || snp_idx >= window_end {
-                    if let Err(e) = self.remap_window(snp_idx) {
-                        panic!("failed to remap BED window: {e}");
-                    }
-                }
-            }
-
-            let snp_bytes = match self.snp_bytes(snp_idx) {
-                Some(bytes) => bytes,
-                None => return None,
-            };
-            let counts =
-                self.decode_snp_bytes_selected_into_with_counts(&snp_bytes, sample_indices, out);
-            let site = self.sites[snp_idx].clone();
-            return Some((snp_idx, site, counts));
         }
         None
     }

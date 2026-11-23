@@ -410,6 +410,46 @@ pub(crate) struct ResidentPackedBed {
     pub(crate) packed: Vec<u8>,
 }
 
+pub(crate) fn hint_file_nocache(file: &File) {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            let _ = libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            let _ = libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = file;
+    }
+}
+
+pub(crate) fn hint_file_dontneed(file: &File, offset: u64, len: u64) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            let _ = libc::posix_fadvise(
+                file.as_raw_fd(),
+                offset as libc::off_t,
+                len as libc::off_t,
+                libc::POSIX_FADV_DONTNEED,
+            );
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (file, offset, len);
+    }
+}
+
 struct ActiveResidentSlot {
     entry: Arc<ResidentPackedBed>,
     owners: std::collections::HashSet<u64>,
@@ -575,7 +615,8 @@ pub(crate) fn load_resident_packed_bed(
             .checked_mul(bytes_per_snp)
             .ok_or_else(|| "resident packed PGEN size overflow".to_string())?;
         let pgen_path = Path::new(&format!("{canon_prefix}.pgen")).to_path_buf();
-        let mut reader = crate::pgen::PgenReader::open(&pgen_path, n_samples_full, n_snps)?;
+        let mut reader =
+            crate::pgen::PgenReader::open_for_preload(&pgen_path, n_samples_full, n_snps)?;
         let mut packed = vec![0u8; total_bytes];
         let pool = if threads > 0 {
             crate::stats_common::get_cached_pool(threads).map_err(|e| e.to_string())?
@@ -602,6 +643,7 @@ pub(crate) fn load_resident_packed_bed(
             }
             start = start.saturating_add(rows);
         }
+        reader.advise_preload_dontneed();
         (n_samples_full, n_snps, bytes_per_snp, packed)
     } else {
         let n_samples_full = gfcore::read_fam(&canon_prefix)?.len();
@@ -611,19 +653,37 @@ pub(crate) fn load_resident_packed_bed(
             return Err("no SNP sites found in PLINK BED input".to_string());
         }
         let mut file = File::open(&bed_path).map_err(|e| format!("open {bed_path}: {e}"))?;
-        let mut header = [0u8; BED_HEADER_LEN];
-        file.read_exact(&mut header)
-            .map_err(|e| format!("read BED header {bed_path}: {e}"))?;
-        validate_plink_bed_header(header)?;
+        // Set F_NOCACHE / sequential hint BEFORE any read, and read from offset 0
+        // in page-aligned 16 MiB chunks so macOS F_NOCACHE and Linux DONTNEED
+        // apply to every full page instead of leaving unaligned tail pages cached.
+        hint_file_nocache(&file);
+        let total_file_bytes = BED_HEADER_LEN
+            .checked_add(info.payload_size)
+            .ok_or_else(|| "resident packed BED size overflow".to_string())?;
         let mut packed = vec![0u8; info.payload_size];
-        const IO_CHUNK: usize = 16 * 1024 * 1024;
-        let mut offset = 0usize;
-        while offset < packed.len() {
+        const IO_CHUNK: usize = 4 * 1024 * 1024;
+        let mut aligned_buf = vec![0u8; IO_CHUNK.min(total_file_bytes)];
+        let mut file_offset = 0usize;
+        let mut dst_offset = 0usize;
+        while file_offset < total_file_bytes {
             crate::stats_common::check_ctrlc()?;
-            let end = (offset + IO_CHUNK).min(packed.len());
-            file.read_exact(&mut packed[offset..end])
+            let to_read = (total_file_bytes - file_offset).min(aligned_buf.len());
+            file.read_exact(&mut aligned_buf[..to_read])
                 .map_err(|e| format!("read BED payload {bed_path}: {e}"))?;
-            offset = end;
+            if file_offset == 0 {
+                if to_read < BED_HEADER_LEN {
+                    return Err(format!("read BED header {bed_path}: truncated file"));
+                }
+                validate_plink_bed_header([aligned_buf[0], aligned_buf[1], aligned_buf[2]])?;
+                let copy_len = to_read - BED_HEADER_LEN;
+                packed[..copy_len].copy_from_slice(&aligned_buf[BED_HEADER_LEN..to_read]);
+                dst_offset = copy_len;
+            } else {
+                packed[dst_offset..dst_offset + to_read].copy_from_slice(&aligned_buf[..to_read]);
+                dst_offset += to_read;
+            }
+            hint_file_dontneed(&file, file_offset as u64, to_read as u64);
+            file_offset += to_read;
         }
         (n_samples_full, info.n_snps_total, info.bytes_per_snp, packed)
     };

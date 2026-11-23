@@ -181,6 +181,8 @@ pub(crate) struct PgenReader {
     block_payload_loaded: bool,
     block_meta: BlockMeta,
     block_records: Vec<u8>,
+    block_records_lead: usize,
+    block_records_len: usize,
     block_record_cursor: usize,
     next_variant: usize,
     record_offset: u64,
@@ -188,6 +190,7 @@ pub(crate) struct PgenReader {
     current_categories: Vec<u8>,
     record_buf: Vec<u8>,
     scratch_packed: Vec<u8>,
+    preload_nocache: bool,
 }
 
 impl PgenReader {
@@ -196,10 +199,30 @@ impl PgenReader {
         n_samples: usize,
         n_variants_expected: usize,
     ) -> Result<Self, String> {
+        Self::open_with_options(path, n_samples, n_variants_expected, false)
+    }
+
+    pub(crate) fn open_for_preload(
+        path: &Path,
+        n_samples: usize,
+        n_variants_expected: usize,
+    ) -> Result<Self, String> {
+        Self::open_with_options(path, n_samples, n_variants_expected, true)
+    }
+
+    fn open_with_options(
+        path: &Path,
+        n_samples: usize,
+        n_variants_expected: usize,
+        preload_nocache: bool,
+    ) -> Result<Self, String> {
         if n_samples == 0 || n_variants_expected == 0 {
             return Err("PGEN input contains zero samples or variants".to_string());
         }
         let raw_file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+        if preload_nocache {
+            crate::gload::hint_file_nocache(&raw_file);
+        }
         let file_size = raw_file
             .metadata()
             .map_err(|e| format!("stat {}: {e}", path.display()))?
@@ -404,6 +427,8 @@ impl PgenReader {
             block_payload_loaded: false,
             block_meta: BlockMeta::default(),
             block_records: Vec::new(),
+            block_records_lead: 0,
+            block_records_len: 0,
             block_record_cursor: 0,
             next_variant: 0,
             record_offset: fixed_data_offset,
@@ -411,6 +436,7 @@ impl PgenReader {
             current_categories: vec![0u8; bytes_per_variant],
             record_buf: Vec::new(),
             scratch_packed: vec![0u8; bytes_per_variant],
+            preload_nocache,
         };
         match out.mode {
             StorageMode::BedCompat => {}
@@ -425,6 +451,10 @@ impl PgenReader {
             StorageMode::Variable => {}
         }
         Ok(out)
+    }
+
+    pub(crate) fn advise_preload_dontneed(&self) {
+        crate::gload::hint_file_dontneed(self.file.get_ref(), 0, 0);
     }
 
     pub(crate) fn read_source_block(
@@ -610,7 +640,7 @@ impl PgenReader {
             let hardcall_end = hardcall_start + local_rows * self.bytes_per_variant;
             let record_types = &self.block_meta.record_types;
             let record_offsets = &self.block_meta.record_offsets;
-            let block_records = &self.block_records;
+            let block_records = self.block_records_payload();
             let path = &self.path;
             phase_present[phase_start..phase_end]
                 .par_chunks_mut(words_per_row)
@@ -883,6 +913,11 @@ impl PgenReader {
         Ok(())
     }
 
+    #[inline]
+    fn block_records_payload(&self) -> &[u8] {
+        &self.block_records[self.block_records_lead..self.block_records_lead + self.block_records_len]
+    }
+
     fn load_block(&mut self, block_idx: usize) -> Result<(), String> {
         self.load_block_metadata(block_idx)?;
         if self.block_payload_loaded {
@@ -894,13 +929,41 @@ impl PgenReader {
             .record_offsets
             .last()
             .ok_or_else(|| "PGEN block has no record offsets".to_string())?;
-        self.file
-            .seek(SeekFrom::Start(block_data_offset))
-            .map_err(|e| format!("seek {} variant block: {e}", self.path.display()))?;
-        self.block_records.resize(block_bytes, 0);
-        self.file
-            .read_exact(&mut self.block_records)
+        if self.preload_nocache && block_bytes > 0 {
+            const PAGE_ALIGN: u64 = 16 * 1024;
+            let aligned_start = block_data_offset & !(PAGE_ALIGN - 1);
+            let raw_end = block_data_offset.saturating_add(block_bytes as u64);
+            let aligned_end = raw_end
+                .div_ceil(PAGE_ALIGN)
+                .saturating_mul(PAGE_ALIGN)
+                .min(self.file_size);
+            let read_len = (aligned_end - aligned_start) as usize;
+            let lead = (block_data_offset - aligned_start) as usize;
+            self.block_records.resize(read_len, 0);
+            crate::gload::read_file_exact_at(
+                self.file.get_ref(),
+                &mut self.block_records[..read_len],
+                aligned_start,
+            )
             .map_err(|e| format!("read {} variant block payload: {e}", self.path.display()))?;
+            self.block_records_lead = lead;
+            self.block_records_len = block_bytes;
+            crate::gload::hint_file_dontneed(
+                self.file.get_ref(),
+                aligned_start,
+                read_len as u64,
+            );
+        } else {
+            self.file
+                .seek(SeekFrom::Start(block_data_offset))
+                .map_err(|e| format!("seek {} variant block: {e}", self.path.display()))?;
+            self.block_records.resize(block_bytes, 0);
+            self.file
+                .read_exact(&mut self.block_records)
+                .map_err(|e| format!("read {} variant block payload: {e}", self.path.display()))?;
+            self.block_records_lead = 0;
+            self.block_records_len = block_bytes;
+        }
         self.block_record_cursor = 0;
         self.record_offset = block_data_offset;
         self.block_payload_loaded = true;
@@ -1050,6 +1113,8 @@ impl PgenReader {
         };
         self.current_block = Some(block_idx);
         self.block_records.clear();
+        self.block_records_lead = 0;
+        self.block_records_len = 0;
         self.block_record_cursor = 0;
         self.record_offset = block_data_offset;
         self.block_payload_loaded = false;
@@ -1202,7 +1267,7 @@ impl PgenReader {
                 let record_end = self.block_meta.record_offsets[variant + 1];
                 decode_packed_record(
                     record_type,
-                    &self.block_records[record_start..record_end],
+                    &self.block_records_payload()[record_start..record_end],
                     self.n_samples,
                     block_start + variant,
                     &self.path,
@@ -1402,7 +1467,7 @@ impl PgenReader {
                 let record_end = self.block_meta.record_offsets[variant + 1];
                 decode_packed_record(
                     record_type,
-                    &self.block_records[record_start..record_end],
+                    &self.block_records_payload()[record_start..record_end],
                     self.n_samples,
                     block_start + variant,
                     &self.path,
@@ -1533,7 +1598,7 @@ impl PgenReader {
                 let record_end = self.block_meta.record_offsets[variant + 1];
                 decode_packed_record(
                     record_type,
-                    &self.block_records[record_start..record_end],
+                    &self.block_records_payload()[record_start..record_end],
                     self.n_samples,
                     block_start + variant,
                     &self.path,
@@ -1679,7 +1744,7 @@ impl PgenReader {
                     .block_record_cursor
                     .checked_add(record_len)
                     .ok_or_else(|| "PGEN block record cursor overflow".to_string())?;
-                if record_end > self.block_records.len() {
+                if record_end > self.block_records_len {
                     return Err(format!(
                         "{}: variant {} record exceeds the loaded PGEN block payload",
                         self.path.display(),
@@ -1690,7 +1755,8 @@ impl PgenReader {
                 self.block_record_cursor = record_end;
                 let decoded = decode_packed_record(
                     record_type,
-                    &self.block_records[record_start..record_end],
+                    &self.block_records[self.block_records_lead + record_start
+                        ..self.block_records_lead + record_end],
                     self.n_samples,
                     self.next_variant,
                     &self.path,

@@ -350,6 +350,23 @@ def genotype_load_status_progress(src: str, detail: str) -> str:
     return f"Loading genotype from {src}... {str(detail).strip()}"
 
 
+def format_compact_snp_count(n_snps: int) -> str:
+    n = int(n_snps)
+    if n < 1_000:
+        return str(n)
+    for threshold, unit in ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "k")):
+        if n >= threshold:
+            rounded = round(n / float(threshold), 1)
+            if rounded >= 1000.0 and unit == "k":
+                return "1M"
+            if rounded >= 1000.0 and unit == "M":
+                return "1B"
+            if abs(rounded - round(rounded)) < 1e-9:
+                return f"{int(round(rounded))}{unit}"
+            return f"{rounded:.1f}{unit}"
+    return str(n)
+
+
 def genotype_load_status_done(
     src: str,
     *,
@@ -357,7 +374,8 @@ def genotype_load_status_done(
     n_snps: int,
     mode: str | None = None,
 ) -> str:
-    base = f"Loading genotype from {src} (n={int(n_samples)}, nSNP={int(n_snps)}"
+    snp_text = format_compact_snp_count(int(n_snps))
+    base = f"Loading genotype from {src} (n={int(n_samples)}, nSNP={snp_text}"
     if mode is not None and str(mode).strip() != "":
         return f"{base}, {str(mode).strip()})"
     return f"{base})"

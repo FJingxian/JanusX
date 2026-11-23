@@ -126,6 +126,7 @@ from janusx.script._common.cli_args import (
 from janusx.script._common.genoio import (
     determine_genotype_source as _determine_genotype_source_raw,
     determine_genotype_source_force_kind_from_args,
+    format_compact_snp_count,
     genotype_load_status_done,
     genotype_load_status_fail,
     genotype_load_status_open,
@@ -4244,6 +4245,7 @@ def prepare_streaming_context(
     prewarm_global_scanmeta: bool = False,
     scanmeta_outprefix: Optional[str] = None,
     inverse_normal: bool = False,
+    suppress_genotype_status: bool = False,
 ):
     """
     Prepare all shared resources for streaming LMM/LM once:
@@ -4326,7 +4328,7 @@ def prepare_streaming_context(
                 het_threshold=float(het_threshold),
                 warning_collector=deferred_cache_warnings,
                 force_kind=force_kind,
-                emit_complete=(not delay_genotype_complete),
+                emit_complete=(not delay_genotype_complete and not bool(suppress_genotype_status)),
             )
             for w in caught:
                 try:
@@ -4482,7 +4484,7 @@ def prepare_streaming_context(
                 emit_status=False,
             )
             prewarm_scanmeta_secs = max(time.monotonic() - scanmeta_t0, 0.0)
-    if delay_genotype_complete:
+    if delay_genotype_complete and not bool(suppress_genotype_status):
         log_success(
             logger,
             (
@@ -8041,9 +8043,11 @@ def parse_args(argv: Optional[list[str]] = None):
         action="store_true",
         default=False,
         help=(
-            "Preload the full 2-bit packed genotype payload (-bfile/.bed or -pfile/.pgen) "
-            "into RAM once and stream all GWAS models (lm, lmm, lmm2, fvlmm, splmm, farmcpu) "
-            "from that single in-memory copy (aliases: -memload, --memload)."
+            "Preload the full 2-bit packed genotype payload and variant metadata "
+            "(-bfile/.bed+.bim or -pfile/.pgen+.pvar) into RAM once and stream all GWAS models "
+            "(lm, lmm, lmm2, fvlmm, splmm, farmcpu) from that single in-memory copy; "
+            "automatically falls back to disk streaming if estimated size exceeds 50% of physical RAM "
+            "(aliases: -memload, --memload)."
         ),
     )
     optional_group.add_argument(
@@ -8904,7 +8908,11 @@ def _run_gwas_pipeline_impl(
             preinspect_elapsed_secs = max(time.monotonic() - preinspect_t0, 0.0)
             preinspect_src_for_merge = str(preinspect_src)
             qcov_needs_grm = _gwas_qcov_prefers_grm_route(args.qcov, int(len(preinspect_ids)))
-            if not bool(defer_genotype_success_until_scanmeta):
+            preload_genotypes_requested = (
+                bool(getattr(args, "preload_genotypes", False))
+                or bool(getattr(args, "memload", False))
+            )
+            if not bool(defer_genotype_success_until_scanmeta) and not bool(preload_genotypes_requested):
                 _queue_preconfig_success(
                     f"{genotype_load_status_done(preinspect_src, n_samples=len(preinspect_ids), n_snps=int(preinspect_n_snps))} "
                     f"[{format_elapsed(preinspect_elapsed_secs)}]"
@@ -9679,33 +9687,118 @@ def _run_gwas_pipeline_impl(
                     _section(terminal_logger, "GWAS task")
                 if (not bool(preconfig_successes_flushed)) and len(preconfig_terminal_successes) > 0:
                     _flush_preconfig_successes()
+                preload_genotypes_active = False
                 if (
                     bool(getattr(args, "preload_genotypes", False))
                     or bool(getattr(args, "memload", False))
                 ) and hasattr(jxrs, "gwas_memload_register"):
                     memload_resolved = detect_existing_plink_kind(str(genofile_stream))
                     if memload_resolved is not None and memload_resolved[0] in {"bfile", "pfile"}:
+                        ml_kind, ml_prefix = memload_resolved[0], str(memload_resolved[1])
                         memload_src = (
-                            f"{memload_resolved[1]}.pgen"
-                            if memload_resolved[0] == "pfile"
-                            else f"{memload_resolved[1]}.bed"
+                            f"{ml_prefix}.pgen"
+                            if ml_kind == "pfile"
+                            else f"{ml_prefix}.bed"
                         )
-                        memload_t0 = time.monotonic()
-                        ml_reg = jxrs.gwas_memload_register(
-                            memload_src,
-                            int(args.thread or 0),
+                        est_packed_bytes: Optional[int] = None
+                        if preinspect_ids is not None and preinspect_n_snps is not None:
+                            est_packed_bytes = ((int(len(preinspect_ids)) + 3) // 4) * int(preinspect_n_snps)
+                        elif ml_kind == "bfile" and os.path.isfile(memload_src):
+                            est_packed_bytes = max(0, int(os.path.getsize(memload_src)) - 3)
+                        elif ml_kind == "pfile" and os.path.isfile(memload_src):
+                            try:
+                                with open(memload_src, "rb") as _pg_fh:
+                                    _pg_hdr = _pg_fh.read(11)
+                                if len(_pg_hdr) >= 3 and _pg_hdr[0:2] == b"\x6c\x1b":
+                                    if _pg_hdr[2] == 0x01:
+                                        est_packed_bytes = max(0, int(os.path.getsize(memload_src)) - 3)
+                                    elif len(_pg_hdr) >= 11 and _pg_hdr[2] in (0x02, 0x10):
+                                        _pg_m = int.from_bytes(_pg_hdr[3:7], "little")
+                                        _pg_n = int.from_bytes(_pg_hdr[7:11], "little")
+                                        est_packed_bytes = ((_pg_n + 3) // 4) * _pg_m
+                            except OSError:
+                                est_packed_bytes = None
+                        est_meta_bytes = 0
+                        if ml_kind == "pfile":
+                            for _meta_cand in (f"{ml_prefix}.pvar.zst", f"{ml_prefix}.pvar"):
+                                if os.path.isfile(_meta_cand):
+                                    est_meta_bytes = int(os.path.getsize(_meta_cand))
+                                    break
+                        elif os.path.isfile(f"{ml_prefix}.bim"):
+                            est_meta_bytes = int(os.path.getsize(f"{ml_prefix}.bim"))
+                        total_ram_bytes = int(psutil.virtual_memory().total)
+                        max_preload_bytes = total_ram_bytes // 2
+                        est_total_bytes = (
+                            int(est_packed_bytes) + int(est_meta_bytes)
+                            if est_packed_bytes is not None
+                            else None
                         )
-                        ml_samples, ml_snps, ml_bytes = int(ml_reg[0]), int(ml_reg[1]), int(ml_reg[2])
-                        if len(ml_reg) >= 4:
-                            _runlog_context["preload_genotypes_token"] = int(ml_reg[3])
-                        ml_elapsed = time.monotonic() - memload_t0
-                        logger.info(
-                            f"Preloaded packed genotypes into RAM (-pg/--preload-genotypes): "
-                            f"{ml_samples} samples x {ml_snps} SNPs "
-                            f"({ml_bytes / (1024 ** 3):.2f} GiB) in {ml_elapsed:.2f}s"
-                        )
+                        if (
+                            est_total_bytes is not None
+                            and max_preload_bytes > 0
+                            and est_total_bytes > max_preload_bytes
+                        ):
+                            _emit_warning_line(
+                                logger,
+                                (
+                                    f"Skipping -pg/--preload-genotypes: estimated RAM "
+                                    f"({est_total_bytes / (1024 ** 3):.2f} GiB) exceeds 50% of "
+                                    f"physical memory ({max_preload_bytes / (1024 ** 3):.2f} / "
+                                    f"{total_ram_bytes / (1024 ** 3):.2f} GiB); falling back to "
+                                    "streaming from disk."
+                                ),
+                                use_spinner=bool(use_spinner),
+                            )
+                            if (
+                                preinspect_ids is not None
+                                and preinspect_n_snps is not None
+                                and preinspect_src_for_merge is not None
+                                and not bool(defer_genotype_success_until_scanmeta)
+                            ):
+                                log_success(
+                                    logger,
+                                    (
+                                        f"{genotype_load_status_done(preinspect_src_for_merge, n_samples=len(preinspect_ids), n_snps=int(preinspect_n_snps))} "
+                                        f"[{format_elapsed(float(preinspect_elapsed_secs or 0.0))}]"
+                                    ),
+                                    force_color=bool(use_spinner),
+                                )
+                        else:
+                            memload_label = _basename_only(memload_src)
+                            memload_open = f"Preloading genotype from {memload_label}..."
+                            memload_fail = f"Preloading genotype from {memload_label} ...Failed"
+                            memload_t0 = time.monotonic()
+                            with CliStatus(
+                                memload_open,
+                                enabled=bool(terminal_rich),
+                                use_process=True,
+                            ) as preload_task:
+                                try:
+                                    ml_reg = jxrs.gwas_memload_register(
+                                        memload_src,
+                                        int(args.thread or 0),
+                                    )
+                                except Exception:
+                                    preload_task.fail(memload_fail)
+                                    raise
+                                ml_samples, ml_snps, _ml_bytes = int(ml_reg[0]), int(ml_reg[1]), int(ml_reg[2])
+                                if len(ml_reg) >= 4:
+                                    _runlog_context["preload_genotypes_token"] = int(ml_reg[3])
+                                ml_elapsed = time.monotonic() - memload_t0
+                                memload_done = (
+                                    f"Preloading genotype from {memload_label} "
+                                    f"(n={ml_samples}, nSNP={format_compact_snp_count(ml_snps)})"
+                                )
+                                preload_task.complete(memload_done)
+                            _log_file_only(
+                                logger,
+                                logging.INFO,
+                                f"{memload_done} [{format_elapsed(ml_elapsed)}]",
+                            )
+                            preload_genotypes_active = True
                 _append_advanced_note("Prepare shared context (phenotype/genotype meta/GRM/Q/cov)")
                 pheno, ids, n_snps, grm, qmatrix, cov_all, eff_m, genofile_stream, preloaded_packed = prepare_streaming_context(
+                    suppress_genotype_status=bool(preload_genotypes_active),
                     genofile=genofile_stream,
                     phenofile=args.pheno,
                     pheno_cols=args.ncol,

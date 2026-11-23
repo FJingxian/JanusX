@@ -68,6 +68,7 @@ _RESET = "\033[0m"
 JANUSX_SPINNER_NAME = _SPINNER_NAME
 _LOADING_PREFIXES = (
     "loading ",
+    "preloading ",
     "inspecting ",
     "loaded ",
     "running ",

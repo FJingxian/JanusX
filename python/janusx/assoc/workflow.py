@@ -8046,7 +8046,7 @@ def parse_args(argv: Optional[list[str]] = None):
             "Preload the full 2-bit packed genotype payload and variant metadata "
             "(-bfile/.bed+.bim or -pfile/.pgen+.pvar) into RAM once and stream all GWAS models "
             "(lm, lmm, lmm2, fvlmm, splmm, farmcpu) from that single in-memory copy; "
-            "automatically falls back to disk streaming if estimated size exceeds 50% of physical RAM "
+            "automatically falls back to disk streaming if estimated size exceeds 50%% of physical RAM "
             "(aliases: -memload, --memload)."
         ),
     )

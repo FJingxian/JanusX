@@ -54,7 +54,7 @@ use crate::reml::{gwas_max_output_rows_env, reml_loglike, run_rotated_assoc_bloc
 use crate::stats_common::{
     env_truthy, get_cached_pool, parse_index_vec_i64, parse_index_vec_i64_result, AsyncTsvWriter,
 };
-use memmap2::Mmap;
+
 
 
 
@@ -2228,7 +2228,6 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
             if bytes_per_snp == 0 {
                 return Err("bytes_per_snp is zero".to_string());
             }
-            let bed_path = format!("{bed_prefix_owned}.bed");
             // Experimental path for network-backed BED files: explicit
             // source-order reads avoid faulting mmap pages from Rayon QC tasks.
             // The existing two-buffer pipeline reuses one packed buffer per
@@ -2236,11 +2235,8 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
             // and association of the previous block.
             let use_pread_bed = fvlmm_bed_pread_enabled();
             let mut bed_window = if !use_pread_bed {
-                if let Some(window_mb) = mmap_window_mb.filter(|&v| v > 0) {
-                    Some(WindowedBedMatrix::open(&bed_prefix_owned, window_mb)?)
-                } else {
-                    None
-                }
+                let window_mb = mmap_window_mb.filter(|&v| v > 0).unwrap_or(64);
+                Some(WindowedBedMatrix::open(&bed_prefix_owned, window_mb)?)
             } else {
                 None
             };
@@ -2252,33 +2248,12 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
             } else {
                 None
             };
-            let full_mmap = if bed_window.is_none() && !use_pread_bed {
-                let bed_file =
-                    File::open(&bed_path).map_err(|e| format!("open {bed_path}: {e}"))?;
-                let mmap =
-                    unsafe { Mmap::map(&bed_file) }.map_err(|e| format!("mmap {bed_path}: {e}"))?;
-                if mmap.len() < 3 || mmap[0] != 0x6C || mmap[1] != 0x1B || mmap[2] != 0x01 {
-                    return Err("only SNP-major BED supported".to_string());
-                }
-                let data_len = mmap.len() - 3;
-                if data_len % bytes_per_snp != 0 {
-                    return Err(format!(
-                        "BED payload length {data_len} not a multiple of {bytes_per_snp}"
-                    ));
-                }
-                Some(mmap)
-            } else {
-                None
-            };
             let n_snps = if let Some(reader) = packed_reader.as_ref() {
                 reader.n_snps()
             } else if let Some(window) = bed_window.as_ref() {
                 window.n_source_snps()
             } else {
-                let mmap = full_mmap
-                    .as_ref()
-                    .ok_or_else(|| "internal error: missing BED source".to_string())?;
-                (mmap.len() - 3) / bytes_per_snp
+                return Err("internal error: missing BED source".to_string());
             };
             let mut bim_reader = BimChunkReader::open(&bed_prefix_owned)?;
             let prepared_meta: Option<(Vec<usize>, Vec<bool>, Vec<f32>, Vec<usize>)> =
@@ -2351,10 +2326,8 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
             let stage_tsv_nanos = AtomicU64::new(0);
             let bed_source_mode = if use_pread_bed {
                 "pread"
-            } else if bed_window.is_some() {
-                "windowed-mmap"
             } else {
-                "mmap"
+                "windowed-mmap"
             };
 
             let scan_chunk_snps = rotate_block_rows.max(1).min(total_scan_units.max(1));
@@ -2473,55 +2446,29 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
                         }
                     }
                 } else if let Some((source_rows, _, _, _)) = prepared_batch.as_ref() {
-                    match bed_window.as_mut() {
-                        Some(window) => {
-                            match window.prepare_source_rows(source_rows, &mut rel_row_indices) {
-                                Ok(slice) => slice,
-                                Err(e) => {
-                                    let _ = producer_err_bg.set(e);
-                                    return false;
-                                }
-                            }
-                        }
-                        None => {
-                            let mmap = match full_mmap.as_ref() {
-                                Some(mmap) => mmap,
-                                None => {
-                                    let _ = producer_err_bg
-                                        .set("internal error: missing full BED mmap".to_string());
-                                    return false;
-                                }
-                            };
-                            let packed = &mmap[3..];
-                            let src_start = source_rows[0];
-                            let src_end = source_rows[source_rows.len() - 1] + 1;
-                            let start_byte = src_start * bytes_per_snp;
-                            let end_byte = src_end * bytes_per_snp;
-                            &packed[start_byte..end_byte]
+                    let Some(window) = bed_window.as_mut() else {
+                        let _ = producer_err_bg
+                            .set("internal error: missing windowed BED reader".to_string());
+                        return false;
+                    };
+                    match window.prepare_source_rows(source_rows, &mut rel_row_indices) {
+                        Ok(slice) => slice,
+                        Err(e) => {
+                            let _ = producer_err_bg.set(e);
+                            return false;
                         }
                     }
                 } else {
-                    match bed_window.as_mut() {
-                        Some(window) => match window.read_source_range(chunk_start, chunk_end) {
-                            Ok(slice) => slice,
-                            Err(e) => {
-                                let _ = producer_err_bg.set(e);
-                                return false;
-                            }
-                        },
-                        None => {
-                            let mmap = match full_mmap.as_ref() {
-                                Some(mmap) => mmap,
-                                None => {
-                                    let _ = producer_err_bg
-                                        .set("internal error: missing full BED mmap".to_string());
-                                    return false;
-                                }
-                            };
-                            let packed = &mmap[3..];
-                            let start_byte = chunk_start * bytes_per_snp;
-                            let end_byte = chunk_end * bytes_per_snp;
-                            &packed[start_byte..end_byte]
+                    let Some(window) = bed_window.as_mut() else {
+                        let _ = producer_err_bg
+                            .set("internal error: missing windowed BED reader".to_string());
+                        return false;
+                    };
+                    match window.read_source_range(chunk_start, chunk_end) {
+                        Ok(slice) => slice,
+                        Err(e) => {
+                            let _ = producer_err_bg.set(e);
+                            return false;
                         }
                     }
                 };

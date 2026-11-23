@@ -3404,6 +3404,32 @@ def _estimate_dense_f32_bytes(
     return int(rows * cols * np.dtype(np.float32).itemsize * max(1, int(copies)))
 
 
+def _check_ml_dense_memory_guard(n_rows_total: int, n_markers: int) -> None:
+    if n_rows_total <= 0 or n_markers <= 0:
+        return
+    est_working_bytes = _estimate_dense_f32_bytes(n_rows_total, n_markers, copies=2)
+    available_bytes, memory_limit_bytes, rss_bytes = _detect_gs_available_memory_bytes()
+    effective_available: int | None = None
+    if available_bytes is not None:
+        effective_available = max(0, int(available_bytes))
+    if memory_limit_bytes is not None and int(memory_limit_bytes) > 0:
+        limit_avail = max(0, int(memory_limit_bytes) - int(rss_bytes or 0))
+        effective_available = (
+            limit_avail
+            if effective_available is None
+            else min(effective_available, limit_avail)
+        )
+    if effective_available is not None and est_working_bytes > effective_available:
+        est_gb = float(est_working_bytes) / float(1024**3)
+        avail_gb = float(effective_available) / float(1024**3)
+        raise MemoryError(
+            f"ML dense genotype matrix requires ~{est_gb:.2f} GiB working RAM "
+            f"(n={n_rows_total}, m={n_markers}, float32 x2), exceeding available memory "
+            f"({avail_gb:.2f} GiB). Use --hash-dim (e.g. --hash-dim 4096), stricter "
+            "-maf / --ld-prune filtering, or streaming models (-BLUP / -BayesA/B/C/R)."
+        )
+
+
 def _build_memmap_cache_from_chunks(
     *,
     genotype_path: str,
@@ -10988,7 +11014,6 @@ def _run_method_task(
     cv_splits: typing.Optional[list[tuple[np.ndarray, np.ndarray]]],
     n_jobs: int,
     seed: int,
-    strict_cv: bool,
     force_fast: bool,
     packed_ctx: dict[str, typing.Any] | None = None,
     train_sample_indices: np.ndarray | None = None,
@@ -11412,18 +11437,6 @@ def _run_method_task(
             "final_predict_skipped": False,
         }
 
-    if method in _ML_METHOD_MAP and (not strict_cv):
-        if train_snp_ml is None:
-            raise ValueError(f"{method} requires raw genotype matrix.")
-        ml_tuning_cache = _tune_ml_method_once(
-            method=method,
-            Y=train_pheno,
-            Xtrain=train_snp_ml,
-            PCAdec=pca_dec,
-            n_jobs=n_jobs,
-            seed=int(seed),
-            progress_hook=search_progress_hook,
-        )
 
     if method == "GBLUP":
         if precomputed_train_grm is not None:
@@ -13950,6 +13963,7 @@ def _run_gs_model_only_prediction(
                 "could not be recovered from the prediction genotype."
             )
         if packed_genotype is not None:
+            _check_ml_dense_memory_guard(int(sample_ids.size), int(source_rows.size))
             genotype = _decode_model_only_packed(
                 packed=packed_genotype,
                 n_samples=int(sample_ids.size),
@@ -14110,7 +14124,6 @@ def _run_methods_parallel(
     cv_splits: typing.Optional[list[tuple[np.ndarray, np.ndarray]]],
     n_jobs: int,
     seed: int,
-    strict_cv: bool,
     force_fast: bool = False,
     packed_ctx: dict[str, typing.Any] | None = None,
     bayes_packed_ctx: dict[str, typing.Any] | None = None,
@@ -14702,7 +14715,6 @@ def _run_methods_parallel(
             cv_splits,
             model_n_jobs,
             int(seed),
-            strict_cv,
             force_fast,
             packed_ctx=packed_ctx,
             train_sample_indices=train_sample_indices,
@@ -14733,6 +14745,7 @@ def _run_methods_parallel(
     test_snp_ml_runtime = test_snp_ml
     ml_dense_materialized = False
 
+
     def _ensure_ml_dense_runtime() -> None:
         nonlocal train_snp_runtime, test_snp_runtime
         nonlocal train_snp_add_runtime, test_snp_add_runtime
@@ -14743,6 +14756,10 @@ def _run_methods_parallel(
         # If dense/ml arrays are already provided (including memmap-backed slices),
         # materialize once to in-RAM float32 for sklearn/XGBoost routes.
         if train_snp_ml_runtime is not None and test_snp_ml_runtime is not None:
+            _check_ml_dense_memory_guard(
+                int(train_snp_ml_runtime.shape[1]) + int(test_snp_ml_runtime.shape[1]),
+                int(train_snp_ml_runtime.shape[0]),
+            )
             train_snp_ml_runtime = np.ascontiguousarray(
                 np.asarray(train_snp_ml_runtime, dtype=np.float32),
                 dtype=np.float32,
@@ -14761,6 +14778,10 @@ def _run_methods_parallel(
             if train_sample_indices is None or test_sample_indices is None:
                 raise ValueError("Packed->ML dense decode requires train/test sample indices.")
             packed_payload = typing.cast(dict[str, typing.Any], packed_ctx)
+            _check_ml_dense_memory_guard(
+                int(np.asarray(train_sample_indices).size) + int(np.asarray(test_sample_indices).size),
+                int(_packed_ctx_active_rows(packed_payload)),
+            )
             train_snp_ml_runtime = _decode_packed_subset_to_dense_raw_f32(
                 packed_payload,
                 np.ascontiguousarray(
@@ -14787,6 +14808,10 @@ def _run_methods_parallel(
             return
         if train_snp_runtime is None or test_snp_runtime is None:
             raise ValueError("ML models require dense train/test genotype matrices.")
+        _check_ml_dense_memory_guard(
+            int(train_snp_runtime.shape[1]) + int(test_snp_runtime.shape[1]),
+            int(train_snp_runtime.shape[0]),
+        )
         train_snp_ml_runtime = np.ascontiguousarray(
             np.asarray(train_snp_runtime, dtype=np.float32),
             dtype=np.float32,
@@ -14960,7 +14985,7 @@ def _run_methods_parallel(
                         pass
                 cv_total = int(max(1, fold_total_map.get(m, 1)))
                 telemetry = GSProgressLog(progress_logger, m_disp, progress_trait, len(cv_splits or []))
-                has_search_stage = bool((m in _ML_METHOD_MAP) and (not strict_cv))
+                has_search_stage = False
                 has_rrblup_iter_progress = bool(
                     rrblup_progress_enabled_by_method.get(str(m), False)
                 )
@@ -15611,7 +15636,6 @@ def _run_methods_parallel(
                         cv_splits,
                         model_n_jobs,
                         seed,
-                        strict_cv,
                         force_fast,
                         packed_ctx=_select_gs_packed_context(
                             str(m), packed_ctx, bayes_packed_ctx
@@ -15708,7 +15732,7 @@ def _run_methods_parallel(
                     pass
             cv_total = int(max(1, fold_total_map.get(m, 1)))
             telemetry = GSProgressLog(progress_logger, m_disp, progress_trait, len(cv_splits or []))
-            has_search_stage = bool((m in _ML_METHOD_MAP) and (not strict_cv))
+            has_search_stage = False
             has_rrblup_iter_progress = bool(
                 rrblup_progress_enabled_by_method.get(str(m), False)
             )
@@ -16446,7 +16470,6 @@ def _run_methods_parallel(
                         cv_splits,
                         model_n_jobs,
                         seed,
-                        strict_cv,
                         force_fast,
                         packed_ctx=_select_gs_packed_context(
                             str(m), packed_ctx, bayes_packed_ctx
@@ -18490,14 +18513,6 @@ def parse_args(argv: typing.Optional[list[str]] = None):
         help=argparse.SUPPRESS,
     )
     optional_group.add_argument(
-        "-strict-cv", "--strict-cv",
-        action="store_true",
-        # Keep nested, training-fold-only hyperparameter selection as the
-        # default so outer validation samples never select model parameters.
-        default=True,
-        help=argparse.SUPPRESS,
-    )
-    optional_group.add_argument(
         "-force-fast", "--force-fast",
         action="store_true",
         default=False,
@@ -19550,7 +19565,7 @@ def _run_gs_pipeline_impl(
             else ",".join(str(x) for x in args.ncol)
         )
         cv_cfg = (
-            f"{int(args.cv)}-fold, seed={int(args.seed)}, strict={bool(args.strict_cv)}"
+            f"{int(args.cv)}-fold, seed={int(args.seed)}"
             if cv_enabled
             else (
                 "off (--model: predict-only)"
@@ -20075,6 +20090,7 @@ def _run_gs_pipeline_impl(
                 "could not be recovered from the genotype input."
             )
         if packed_genotype is not None:
+            _check_ml_dense_memory_guard(int(sample_ids.size), int(source_rows.size))
             genotype_aligned = _decode_model_only_packed(
                 packed=packed_genotype,
                 n_samples=int(sample_ids.size),
@@ -20756,6 +20772,7 @@ def _run_gs_pipeline_impl(
         packed_payload_for_ml = typing.cast(dict[str, typing.Any], packed_lmm_ctx)
         active_m = _packed_ctx_active_rows(packed_payload_for_ml)
         n_all = int(packed_payload_for_ml["n_samples"])
+        _check_ml_dense_memory_guard(n_all, active_m)
         dense_est = _estimate_dense_f32_bytes(active_m, n_all, copies=1)
         with CliStatus(
             "Materializing dense genotype for ML methods "
@@ -22679,6 +22696,10 @@ def _run_gs_pipeline_impl(
             if loaded_train_snp_ml is None or loaded_test_snp_ml is None:
                 if _looks_like_packed_payload(trait_packed_ctx):
                     packed_payload_local = typing.cast(dict[str, typing.Any], trait_packed_ctx)
+                    _check_ml_dense_memory_guard(
+                        int(np.asarray(method_train_sample_idx).size) + int(np.asarray(method_test_sample_idx).size),
+                        int(_packed_ctx_active_rows(packed_payload_local)),
+                    )
                     loaded_train_snp_ml = _decode_packed_subset_to_dense_raw_f32(
                         packed_payload_local,
                         np.ascontiguousarray(
@@ -22694,6 +22715,10 @@ def _run_gs_pipeline_impl(
                         ),
                     )
                 elif train_snp is not None and test_snp is not None:
+                    _check_ml_dense_memory_guard(
+                        int(train_snp.shape[1]) + int(test_snp.shape[1]),
+                        int(train_snp.shape[0]),
+                    )
                     loaded_train_snp_ml = np.ascontiguousarray(
                         np.asarray(train_snp, dtype=np.float32),
                         dtype=np.float32,
@@ -22781,7 +22806,6 @@ def _run_gs_pipeline_impl(
                 cv_splits=cv_splits,
                 n_jobs=int(max(1, args.thread)),
                 seed=int(args.seed),
-                strict_cv=bool(args.strict_cv),
                 force_fast=bool(args.force_fast),
                 packed_ctx=trait_packed_ctx,
                 bayes_packed_ctx=packed_bayes_ctx,
@@ -23590,7 +23614,7 @@ def _run_gs_pipeline(
             "methods": [],
             "resource": dict(resource_metrics),
         }
-    return None
+    raise SystemExit(130 if exc is None else 1)
 
 
 def main(

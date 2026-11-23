@@ -363,7 +363,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/vcpkg-binary-cache
-          key: vcpkg-openblas-arm64-windows-static-md-v1
+          key: vcpkg-openblas-arm64-windows-static-md-lapack-v2
 
       - name: Install OpenBLAS (Windows ARM64 via vcpkg)
         if: ${{ matrix.label == 'windows-arm64' }}
@@ -371,8 +371,7 @@ jobs:
         run: |
           $binaryCache = Join-Path $env:RUNNER_TEMP "vcpkg-binary-cache"
           New-Item -ItemType Directory -Force -Path $binaryCache | Out-Null
-          "VCPKG_BINARY_SOURCES=clear;files,$binaryCache,readwrite" |
-            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $env:VCPKG_BINARY_SOURCES = "clear;files,$binaryCache,readwrite"
           $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
           if (-not $vcpkgRoot -or -not (Test-Path $vcpkgRoot)) {
             $vcpkgRoot = Join-Path $env:RUNNER_TEMP "vcpkg"
@@ -386,7 +385,32 @@ jobs:
           # layout and switch OpenBLAS extern linkage to kind=static.
           $triplet = "arm64-windows-static-md"
 
-          & "$vcpkgRoot\vcpkg.exe" install "openblas[threads]:$triplet"
+          # The stock port disables LAPACK. Keep NOFORTRAN=ON so OpenBLAS uses
+          # the C LAPACK sources on Windows ARM64.
+          $overlayRoot = Join-Path $env:RUNNER_TEMP "vcpkg-overlays"
+          New-Item -ItemType Directory -Force -Path $overlayRoot | Out-Null
+          $overlayPort = Join-Path $overlayRoot "openblas"
+          Copy-Item -LiteralPath (Join-Path $vcpkgRoot "ports\openblas") -Destination $overlayPort -Recurse
+          $portfile = Join-Path $overlayPort "portfile.cmake"
+          $port = Get-Content -LiteralPath $portfile -Raw
+          $configure = "vcpkg_cmake_configure("
+          $withoutLapack = "-DBUILD_WITHOUT_LAPACK=ON"
+          if (-not $port.Contains($configure) -or -not $port.Contains($withoutLapack) -or
+              -not $port.Contains("-DNOFORTRAN=ON")) {
+            throw "The vcpkg OpenBLAS port changed. Review the Windows ARM64 LAPACK overlay."
+          }
+          $configureWithLapack = @'
+          if(VCPKG_TARGET_ARCHITECTURE STREQUAL "arm64")
+              list(APPEND OPTIONS -DBUILD_WITHOUT_LAPACK=OFF -DUSE_OPENMP=OFF)
+          else()
+              list(APPEND OPTIONS -DBUILD_WITHOUT_LAPACK=ON)
+          endif()
+          vcpkg_cmake_configure(
+          '@
+          $port = $port.Replace($withoutLapack, "").Replace($configure, $configureWithLapack)
+          [System.IO.File]::WriteAllText($portfile, $port)
+
+          & "$vcpkgRoot\vcpkg.exe" install "openblas[threads]:$triplet" "--overlay-ports=$overlayPort"
           if ($LASTEXITCODE -ne 0) {
             throw "vcpkg install openblas[threads] failed for triplet $triplet"
           }
@@ -498,6 +522,8 @@ jobs:
             # Cross-building Windows ARM64 from x64 host: avoid binding to host-arch Python import libs.
             export PYO3_CROSS=1
             export PYO3_CROSS_PYTHON_VERSION=3.10
+            # Fail at link time if the static archive lacks LAPACK.
+            export JANUSX_FORCE_OPENBLAS_LAPACK=1
             # Skip KMC prebuild on cross target; vendored pybind11 in KMC is not
             # Python 3.14 friendly and this path is not required for arm64 wheel sanity.
             export JANUSX_PREBUILD_KMC_BIND=0

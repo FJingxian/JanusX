@@ -2228,12 +2228,11 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
             if bytes_per_snp == 0 {
                 return Err("bytes_per_snp is zero".to_string());
             }
-            // Experimental path for network-backed BED files: explicit
-            // source-order reads avoid faulting mmap pages from Rayon QC tasks.
-            // The existing two-buffer pipeline reuses one packed buffer per
-            // StreamingChunk, so read-ahead overlaps this I/O with projection
-            // and association of the previous block.
-            let use_pread_bed = fvlmm_bed_pread_enabled();
+            // Route PGEN inputs (and optional BED pread mode) through
+            // PackedBedSourceReader so both disk streaming and -pg resident
+            // preload use the unified Rust double-buffered pipeline.
+            let pgen_source = crate::pgen::path_uses_pgen(&bed_prefix_owned);
+            let use_pread_bed = pgen_source || fvlmm_bed_pread_enabled();
             let mut bed_window = if !use_pread_bed {
                 let window_mb = mmap_window_mb.filter(|&v| v > 0).unwrap_or(64);
                 Some(WindowedBedMatrix::open(&bed_prefix_owned, window_mb)?)
@@ -2324,7 +2323,9 @@ pub fn fvlmm_assoc_bed_to_tsv_f32<'py>(
             let stage_projection_nanos = AtomicU64::new(0);
             let stage_association_nanos = AtomicU64::new(0);
             let stage_tsv_nanos = AtomicU64::new(0);
-            let bed_source_mode = if use_pread_bed {
+            let bed_source_mode = if pgen_source {
+                "pgen"
+            } else if use_pread_bed {
                 "pread"
             } else {
                 "windowed-mmap"

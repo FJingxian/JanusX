@@ -1004,7 +1004,26 @@ where
             return false;
         }
         chunk.clear();
-        let chunk_end = (chunk_start + scan_chunk_snps).min(total_scan_units);
+        let nominal_chunk_end = (chunk_start + scan_chunk_snps).min(total_scan_units);
+        let chunk_end = if pgen_source {
+            prepared_source_rows
+                .as_ref()
+                .map(|source_rows_all| {
+                    let src_start = source_rows_all[chunk_start] as usize;
+                    let mut end = chunk_start + 1;
+                    while end < nominal_chunk_end {
+                        let next_src = source_rows_all[end] as usize;
+                        if next_src.saturating_sub(src_start) + 1 > scan_chunk_snps {
+                            break;
+                        }
+                        end += 1;
+                    }
+                    end
+                })
+                .unwrap_or(nominal_chunk_end)
+        } else {
+            nominal_chunk_end
+        };
         let prepared_batch =
             prepared_source_rows
                 .as_ref()

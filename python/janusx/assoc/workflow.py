@@ -7145,10 +7145,6 @@ def run_chunked_gwas_lmm_lm(*args, **kwargs):
     from janusx.assoc.workflow_model_stream import run_chunked_gwas_lmm_lm as _impl
     return _impl(*args, **kwargs)
 
-def run_chunked_gwas_streaming_shared(*args, **kwargs):
-    from janusx.assoc.workflow_model_stream import run_chunked_gwas_streaming_shared as _impl
-    return _impl(*args, **kwargs)
-
 
 def run_chunked_gwas_kfile(*args, **kwargs):
     from janusx.assoc.workflow_model_stream import run_chunked_gwas_kfile as _impl
@@ -10358,8 +10354,8 @@ def _run_gwas_pipeline_impl(
                         "fvlmm_rust": "fvlmm_stream",
                         "farm": "farmcpu",
                     }
-                    stream_group_routes = {"lm_stream", "lmm_stream", "lmm2_stream", "fvlmm_stream"}
-                    meta_capable_routes = stream_group_routes | {"splmm", "algwas", "farmcpu"}
+                    stream_model_routes = {"lm_stream", "lmm_stream", "lmm2_stream", "fvlmm_stream"}
+                    meta_capable_routes = stream_model_routes | {"splmm", "algwas", "farmcpu"}
                     trait_shared_meta_cache: dict[str, dict[str, object]] = {}
                     global_trait_meta_shared: Union[dict[str, object], None] = None
                     normalized_tasks: list[dict[str, object]] = []
@@ -10585,6 +10581,10 @@ def _run_gwas_pipeline_impl(
                     ) -> bool:
                         route_key = str(route_name).lower().strip()
                         model_key = str(model_token or "").lower().strip()
+                        if len(scan_bimranges) > 0 and model_key in {"lmm", "lmm2", "fvlmm"}:
+                            # Unified LMM/LMM2/FvLMM Rust pipelines filter -bimrange via
+                            # precomputed row_indices rather than an inline range argument.
+                            return False
                         if model_key == "lm":
                             binding_available = hasattr(jxrs, "lm_stream_bed_to_tsv")
                         elif model_key == "lmm":
@@ -10644,11 +10644,9 @@ def _run_gwas_pipeline_impl(
                             )
                             and os.path.isfile(f"{resolved_source[1]}.psam")
                         ):
-                            # FvLMM's PREAD source reader natively accepts PGEN;
-                            # its mmap/window readers are BED-only.
-                            packed_source_available = str(
-                                os.environ.get("JX_FVLMM_BED_PREAD", "1")
-                            ).strip().lower() not in {"0", "false", "no", "off"}
+                            # fvlmm_assoc_bed_to_tsv_f32 always routes PGEN through
+                            # PackedBedSourceReader regardless of JX_FVLMM_BED_PREAD.
+                            packed_source_available = True
                         return _kinship_fused_qc_eligible(
                             model_token=model_key,
                             route_name=route_key,
@@ -11410,78 +11408,6 @@ def _run_gwas_pipeline_impl(
                             model_token=mk,
                         )
 
-                        if route in stream_group_routes:
-                            group_end = task_idx + 1
-                            grouped_models: list[str] = [mk]
-                            while group_end < len(normalized_tasks):
-                                next_item = normalized_tasks[group_end]
-                                next_route = str(next_item.get("route", "")).lower().strip()
-                                next_trait = str(next_item.get("trait_token", ""))
-                                next_model = str(next_item.get("model", "")).lower().strip()
-                                if (
-                                    next_route not in stream_group_routes
-                                    or next_trait != trait_token_use
-                                ):
-                                    break
-                                grouped_models.append(next_model)
-                                group_end += 1
-                            if len(grouped_models) >= 2:
-                                run_chunked_gwas_streaming_shared(
-                                    model_names=grouped_models,
-                                    trait_name=trait_name_use,
-                                    genofile=genofile_stream,
-                                    pheno=pheno,
-                                    ids=ids,
-                                    n_snps=n_snps,
-                                    outprefix=outprefix,
-                                    maf_threshold=maf_threshold_scan,
-                                    max_missing_rate=max_missing_rate_scan,
-                                    genetic_model=args.model,
-                                    het_threshold=het_threshold_scan,
-                                    chunk_size=args.chunksize,
-                                    mmap_limit=mmap_limit_effective,
-                                    grm=grm,
-                                    qmatrix=qmatrix,
-                                    cov_all=cov_all,
-                                    plot=args.plot,
-                                    threads=args.thread,
-                                    logger=logger,
-                                    use_spinner=use_spinner,
-                                    snps_only=bool(args.snps_only),
-                                    eff_snp_by_trait=eff_snp_by_trait,
-                                    summary_rows=gwas_summary_rows,
-                                    saved_paths=saved_result_paths,
-                                    chunk_size_user_set=bool(
-                                        getattr(args, "_chunksize_user_set", True)
-                                    ),
-                                    force_model=bool(args.force_model),
-                                    emit_trait_header=bool(emit_trait_header_model),
-                                    trait_prepared_meta=trait_meta_shared,
-                                    bimranges=scan_bimranges,
-                                )
-                                next_idx = group_end
-                                trait_done = (
-                                    next_idx >= len(normalized_tasks)
-                                    or str(normalized_tasks[next_idx].get("trait_token", "")) != trait_token_use
-                                )
-                                if trait_done:
-                                    _emit_gwas_trait_summary(
-                                        logger,
-                                        gwas_summary_rows[current_trait_summary_start:],
-                                    )
-                                if bool(
-                                    normalized_tasks[group_end - 1].get(
-                                        "emit_blank_after", False
-                                    )
-                                ):
-                                    logger.info("")
-                                if not _trait_meta_needed_later(
-                                    group_end, trait_token_use
-                                ) and gwas_row_stat_mode == "strict-train":
-                                    trait_shared_meta_cache.pop(trait_token_use, None)
-                                task_idx = group_end
-                                continue
-
                         trait_one = [trait_name_use]
                         route_handler = route_handlers.get(route)
                         if route_handler is not None:
@@ -11493,7 +11419,7 @@ def _run_gwas_pipeline_impl(
                                     preloaded_packed=None,
                                     trait_prepared_meta=trait_meta_shared,
                                 )
-                            elif route in stream_group_routes:
+                            elif route in stream_model_routes:
                                 if mk == "lm":
                                     route_handler(
                                         trait_one,

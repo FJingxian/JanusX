@@ -2156,7 +2156,7 @@ fn paired_mismatch_fill_emissions(
 }
 
 #[allow(clippy::too_many_arguments)]
-const STAGE2_FORWARD_CHECKPOINT_STRIDE: usize = 256;
+pub(crate) const STAGE2_FORWARD_CHECKPOINT_STRIDE: usize = 256;
 const DEFAULT_STAGE2_FORWARD_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 
 static STAGE2_FORWARD_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -2213,7 +2213,7 @@ fn resolve_stage2_forward_budget_bytes(raw: Option<&str>) -> Option<usize> {
     }
 }
 
-fn stage2_forward_budget_bytes() -> Option<usize> {
+pub(crate) fn stage2_forward_budget_bytes() -> Option<usize> {
     let raw = std::env::var("JX_IMP_STAGE2_FORWARD_BUDGET_MB").ok();
     resolve_stage2_forward_budget_bytes(raw.as_deref())
 }

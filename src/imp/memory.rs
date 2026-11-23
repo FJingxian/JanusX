@@ -38,6 +38,256 @@ impl RowStorage for PhasedRow {
     }
 }
 
+const PHASE_CHECKPOINT_STRIDE: usize = super::phase_baum::CHECKPOINT_STRIDE;
+const STAGE2_CHECKPOINT_STRIDE: usize = super::hmm::STAGE2_FORWARD_CHECKPOINT_STRIDE;
+
+/// Read current process `(VmRSS, VmHWM)` in bytes from `/proc/self/status` on Linux.
+/// Returns `None` on platforms without procfs.
+pub(crate) fn read_process_rss_hwm_bytes() -> Option<(u64, u64)> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let mut rss_kb = None;
+    let mut hwm_kb = None;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            rss_kb = rest
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse::<u64>().ok());
+        } else if let Some(rest) = line.strip_prefix("VmHWM:") {
+            hwm_kb = rest
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse::<u64>().ok());
+        }
+    }
+    Some((rss_kb?.saturating_mul(1024), hwm_kb?.saturating_mul(1024)))
+}
+
+/// Bound per-worker Stage 1 PhaseBaum backward cache (2 paired samples/worker,
+/// two haplotype tracks) using the active `JX_IMP_PHASE_BETA_BUDGET_MB` budget.
+pub(crate) fn budgeted_phase_checkpoint_bytes_per_worker(
+    target_markers: usize,
+    phase_states: usize,
+    budget_bytes: Option<usize>,
+) -> Result<usize, String> {
+    // A paired PhaseBaum workspace keeps the two haplotype tracks in its beta
+    // cache. The genotype track is a separate alpha vector and is accounted
+    // for by the HMM worker scratch.
+    let per_marker_two_track = phase_states
+        .checked_mul(2 * std::mem::size_of::<f32>())
+        .ok_or_else(|| "phase checkpoint per-marker overflow".to_owned())?;
+    let full_per_sample = target_markers
+        .checked_mul(per_marker_two_track)
+        .ok_or_else(|| "phase full beta cache overflow".to_owned())?;
+    let per_sample = if let Some(budget) = budget_bytes {
+        if full_per_sample <= budget {
+            full_per_sample
+        } else {
+            // The checkpointed runtime stores only the event slots in one
+            // marker block plus one state vector per block. A block can contain
+            // at most 256 markers, and every marker can be an event.
+            let block_markers = PHASE_CHECKPOINT_STRIDE.min(target_markers);
+            let checkpoints = target_markers.div_ceil(PHASE_CHECKPOINT_STRIDE);
+            block_markers
+                .checked_add(checkpoints)
+                .and_then(|slots| slots.checked_mul(per_marker_two_track))
+                .ok_or_else(|| "phase budgeted checkpoint overflow".to_owned())?
+        }
+    } else {
+        full_per_sample
+    };
+    per_sample
+        .checked_mul(2)
+        .ok_or_else(|| "phase pair-worker beta cache overflow".to_owned())
+}
+
+/// Bound per-worker selected-forward / imputation checkpoint storage (2
+/// haplotypes/worker, single-track) using the active
+/// `JX_IMP_STAGE2_FORWARD_BUDGET_MB` budget and selected anchor count.
+pub(crate) fn budgeted_imputation_checkpoint_bytes_per_worker(
+    selected_markers: usize,
+    union_markers: usize,
+    imp_states: usize,
+    budget_bytes: Option<usize>,
+) -> Result<usize, String> {
+    let per_marker = imp_states
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| "imputation checkpoint per-marker overflow".to_owned())?;
+    let full_per_hap = selected_markers
+        .checked_mul(per_marker)
+        .ok_or_else(|| "imputation full forward cache overflow".to_owned())?;
+    let per_hap = if let Some(budget) = budget_bytes {
+        let checkpoints_required = union_markers > STAGE2_CHECKPOINT_STRIDE
+            && selected_markers > 0
+            && full_per_hap > budget;
+        if !checkpoints_required {
+            full_per_hap
+        } else {
+            // Stage 2 checkpoints are indexed over every union marker. Keep
+            // the budget allowance plus the independently allocated checkpoint
+            // state vectors; Vec capacity may remain above the requested
+            // shrink target, so counting only the active block would
+            // underestimate the real allocation.
+            let checkpoint_blocks = union_markers.div_ceil(STAGE2_CHECKPOINT_STRIDE);
+            let checkpoint_bytes = checkpoint_blocks
+                .checked_mul(per_marker)
+                .ok_or_else(|| "imputation checkpoint state storage overflow".to_owned())?;
+            budget
+                .checked_add(checkpoint_bytes)
+                .ok_or_else(|| "imputation budgeted checkpoint overflow".to_owned())?
+                .min(full_per_hap)
+        }
+    } else {
+        full_per_hap
+    };
+    per_hap
+        .checked_mul(2)
+        .ok_or_else(|| "imputation pair-worker checkpoint overflow".to_owned())
+}
+
+/// Update imputation/Stage-2 checkpoint bytes per worker using the actual
+/// selected anchor marker count rather than the full union marker count.
+pub(crate) fn set_imputation_selected_markers(
+    estimate: &mut MemoryEstimate,
+    selected_markers: usize,
+    union_markers: usize,
+    imp_states: usize,
+) -> Result<(), String> {
+    estimate.imputation_checkpoint_bytes_per_worker =
+        budgeted_imputation_checkpoint_bytes_per_worker(
+            selected_markers,
+            union_markers,
+            imp_states,
+            super::hmm::stage2_forward_budget_bytes(),
+        )?;
+    recompute_stage_totals(estimate)
+}
+
+pub(crate) fn set_phase_stage2_selected_markers(
+    estimate: &mut MemoryEstimate,
+    selected_markers: usize,
+    target_markers: usize,
+    phase_states: usize,
+) -> Result<(), String> {
+    let stage2_states = (phase_states / 2).max(1);
+    estimate.phase_stage2_checkpoint_bytes_per_worker =
+        budgeted_imputation_checkpoint_bytes_per_worker(
+            selected_markers,
+            target_markers,
+            stage2_states,
+            super::hmm::stage2_forward_budget_bytes(),
+        )?;
+    recompute_stage_totals(estimate)
+}
+
+/// Recompute lifecycle stage peaks (phasing sub-stages: initial PBWT, Stage 1,
+/// and Stage 2; imputation+streaming output; and pure output) and set
+/// `total_bytes` to their maximum rather than summing mutually exclusive stages.
+pub(crate) fn recompute_stage_totals(estimate: &mut MemoryEstimate) -> Result<(), String> {
+    let phase_common_fixed = estimate
+        .input_window_bytes
+        .checked_add(estimate.phase_snapshot_bytes)
+        .ok_or_else(|| "phase lifecycle common fixed memory estimate overflow".to_owned())?;
+
+    let phase_init_pbwt_stage_bytes = if estimate.phase_initial_pbwt_bytes > 0 {
+        phase_common_fixed
+            .checked_add(estimate.phase_initial_pbwt_bytes)
+            .ok_or_else(|| "initial PBWT lifecycle memory estimate overflow".to_owned())?
+    } else {
+        0
+    };
+
+    let phase_stage1_fixed = phase_common_fixed
+        .checked_add(estimate.composite_panel_bytes)
+        .and_then(|value| value.checked_add(estimate.phase_stage1_pbwt_donors_bytes))
+        .ok_or_else(|| "phase stage1 fixed memory estimate overflow".to_owned())?;
+    let phase_stage1_per_worker = estimate
+        .checkpoint_bytes_per_worker
+        .checked_add(estimate.phase_event_workspace_bytes_per_worker)
+        .and_then(|value| value.checked_add(estimate.scratch_bytes_per_worker))
+        .ok_or_else(|| "phase stage1 per-worker memory estimate overflow".to_owned())?;
+    let phase_stage1_worker_bytes = phase_stage1_per_worker
+        .checked_mul(estimate.worker_count)
+        .ok_or_else(|| "phase stage1 worker pool memory estimate overflow".to_owned())?;
+    let phase_stage1_bytes = phase_stage1_fixed
+        .checked_add(phase_stage1_worker_bytes)
+        .ok_or_else(|| "phase stage1 total memory estimate overflow".to_owned())?;
+
+    let phase_stage2_bytes = if estimate.phase_stage2_pbwt_donors_bytes > 0 {
+        let stage2_fixed = phase_common_fixed
+            .checked_add(estimate.phase_stage2_pbwt_donors_bytes)
+            .ok_or_else(|| "phase stage2 fixed memory estimate overflow".to_owned())?;
+        let stage2_per_worker = estimate
+            .phase_stage2_checkpoint_bytes_per_worker
+            .checked_add(estimate.phase_stage2_scratch_bytes_per_worker)
+            .ok_or_else(|| "phase stage2 per-worker memory estimate overflow".to_owned())?;
+        let stage2_worker_bytes = stage2_per_worker
+            .checked_mul(estimate.worker_count)
+            .ok_or_else(|| "phase stage2 worker pool memory estimate overflow".to_owned())?;
+        stage2_fixed
+            .checked_add(stage2_worker_bytes)
+            .ok_or_else(|| "phase stage2 total memory estimate overflow".to_owned())?
+    } else {
+        0
+    };
+
+    let phase_stage_bytes = phase_init_pbwt_stage_bytes
+        .max(phase_stage1_bytes)
+        .max(phase_stage2_bytes);
+
+    let imputation_active = estimate.imputation_fixed_bytes > 0
+        || estimate.imputation_checkpoint_bytes_per_worker > 0
+        || estimate.imputation_scratch_bytes_per_worker > 0;
+    let imputation_stage_bytes = if imputation_active {
+        let imp_fixed = estimate
+            .input_window_bytes
+            .checked_add(estimate.imputation_fixed_bytes)
+            .and_then(|value| value.checked_add(estimate.output_buffer_bytes))
+            .ok_or_else(|| "imputation lifecycle fixed memory estimate overflow".to_owned())?;
+        let imp_per_worker = estimate
+            .imputation_checkpoint_bytes_per_worker
+            .checked_add(estimate.imputation_scratch_bytes_per_worker)
+            .and_then(|value| value.checked_add(estimate.output_scratch_bytes_per_worker))
+            .ok_or_else(|| "imputation lifecycle per-worker memory estimate overflow".to_owned())?;
+        let imp_worker_bytes = imp_per_worker
+            .checked_mul(estimate.worker_count)
+            .ok_or_else(|| {
+                "imputation lifecycle worker pool memory estimate overflow".to_owned()
+            })?;
+        imp_fixed
+            .checked_add(imp_worker_bytes)
+            .ok_or_else(|| "imputation lifecycle total memory estimate overflow".to_owned())?
+    } else {
+        0
+    };
+
+    let output_active =
+        estimate.output_buffer_bytes > 0 || estimate.output_scratch_bytes_per_worker > 0;
+    let output_stage_bytes = if output_active {
+        let out_worker_bytes = estimate
+            .output_scratch_bytes_per_worker
+            .checked_mul(estimate.worker_count)
+            .ok_or_else(|| "output lifecycle worker pool memory estimate overflow".to_owned())?;
+        estimate
+            .output_buffer_bytes
+            .checked_add(out_worker_bytes)
+            .ok_or_else(|| "output lifecycle total memory estimate overflow".to_owned())?
+    } else {
+        0
+    };
+
+    estimate.phase_init_pbwt_stage_bytes = phase_init_pbwt_stage_bytes;
+    estimate.phase_stage1_bytes = phase_stage1_bytes;
+    estimate.phase_stage2_bytes = phase_stage2_bytes;
+    estimate.phase_stage_bytes = phase_stage_bytes;
+    estimate.imputation_stage_bytes = imputation_stage_bytes;
+    estimate.output_stage_bytes = output_stage_bytes;
+    estimate.total_bytes = phase_stage_bytes
+        .max(imputation_stage_bytes)
+        .max(output_stage_bytes);
+    Ok(())
+}
+
 /// Reserve bounded streaming-writer memory for one BGZF batch. Each worker
 /// can hold a raw block, an encoded block, and a temporary Deflate buffer.
 /// The extra fixed block is the writer's active fill buffer; 64 KiB also
@@ -47,23 +297,15 @@ pub(crate) fn include_bgzf_writer_workspace(estimate: &mut MemoryEstimate) -> Re
     const FIXED_BYTES: usize = BLOCK_ALLOWANCE + 8 * 1024;
     const WORKER_BYTES: usize = 3 * BLOCK_ALLOWANCE;
 
-    let worker_bytes = WORKER_BYTES
-        .checked_mul(estimate.worker_count)
-        .ok_or_else(|| "BGZF writer workspace estimate overflow".to_owned())?;
     estimate.output_buffer_bytes = estimate
         .output_buffer_bytes
         .checked_add(FIXED_BYTES)
         .ok_or_else(|| "BGZF writer workspace estimate overflow".to_owned())?;
-    estimate.scratch_bytes_per_worker = estimate
-        .scratch_bytes_per_worker
+    estimate.output_scratch_bytes_per_worker = estimate
+        .output_scratch_bytes_per_worker
         .checked_add(WORKER_BYTES)
         .ok_or_else(|| "BGZF writer workspace estimate overflow".to_owned())?;
-    estimate.total_bytes = estimate
-        .total_bytes
-        .checked_add(FIXED_BYTES)
-        .and_then(|value| value.checked_add(worker_bytes))
-        .ok_or_else(|| "total BGZF writer workspace estimate overflow".to_owned())?;
-    Ok(())
+    recompute_stage_totals(estimate)
 }
 
 pub(crate) fn estimate_window(
@@ -156,34 +398,50 @@ pub(crate) fn estimate_window(
     // The phasing path constructs one shared composite panel for the genotype
     // and two haplotype tracks inside each worker.
     let composite_panel_bytes = 0usize;
-    let checkpoint_stride = 256usize;
-    let checkpoints = union_markers.div_ceil(checkpoint_stride).saturating_add(1);
-    let hmm_states = phase_states.max(imp_states);
-    let checkpoint_bytes_per_worker = checked_mul(
-        checked_mul(
-            checked_mul(checkpoints, hmm_states, "HMM checkpoints")?,
-            std::mem::size_of::<f32>(),
-            "HMM checkpoints",
-        )?,
-        3,
-        "three-track HMM checkpoints",
-    )?;
-    // Three forward tracks and their matching emission caches are bounded by
-    // one checkpoint block per worker.
-    let segment_markers = checkpoint_stride.min(union_markers);
-    let per_marker_scratch =
-        checked_mul(hmm_states, 6 * std::mem::size_of::<f32>(), "HMM scratch")?;
+    let segment_markers = PHASE_CHECKPOINT_STRIDE.min(union_markers);
     let marker_marginal_scratch = checked_mul(
         union_markers,
         100,
         "HMM transitions, marker marginals, and phase ranking",
     )?;
+
+    // Phasing lifecycle per-worker workspace (bounded by `phase_states` and the
+    // active `JX_IMP_PHASE_BETA_BUDGET_MB` budget across 2 paired samples/worker).
+    let checkpoint_bytes_per_worker = budgeted_phase_checkpoint_bytes_per_worker(
+        target_markers,
+        phase_states,
+        super::phase_baum::phase_beta_cache_budget_bytes(),
+    )?;
+    // Dedicated PhaseBaum dynamic event workspace for 2 paired samples/worker.
+    // A marker is an upper bound for the number of event clusters. The
+    // emission-code term assumes one observed row per marker; this is a
+    // calibration heuristic rather than a two-row heterozygous worst case.
+    let event_meta_per_pair = checked_mul(
+        target_markers,
+        2 * super::phase_baum::EVENT_META_BYTES_PER_CLUSTER,
+        "phase event metadata workspace",
+    )?;
+    let event_emission_codes_per_pair = checked_mul(
+        target_markers,
+        phase_states,
+        "phase event emission_codes workspace",
+    )?;
+    let phase_event_workspace_bytes_per_worker = checked_add(
+        event_meta_per_pair,
+        event_emission_codes_per_pair,
+        "phase event workspace",
+    )?;
+    let phase_per_marker_scratch = checked_mul(
+        phase_states,
+        6 * std::mem::size_of::<f32>(),
+        "phase HMM scratch",
+    )?;
     // update_sample keeps local/carry/projected backward arrays, forward
     // tracks, event and block scratch, plus the genotype alpha vector.
-    let hmm_vector_scratch = checked_mul(
-        checked_mul(hmm_states, 19, "HMM vector scratch")?,
+    let phase_hmm_vector_scratch = checked_mul(
+        checked_mul(phase_states, 19, "phase HMM vector scratch")?,
         std::mem::size_of::<f32>(),
-        "HMM vector scratch",
+        "phase HMM vector scratch",
     )?;
     let phase_panel_bytes = checked_mul(
         phase_states,
@@ -201,7 +459,55 @@ pub(crate) fn estimate_window(
             .and_then(|samples| value.checked_add(samples))
     })
     .ok_or_else(|| "phase reference panel memory estimate overflow".to_owned())?;
-    // Reference imputation still uses a separate target-specific mosaic panel.
+    let phase_hmm_scratch = checked_add(
+        checked_mul(
+            segment_markers,
+            phase_per_marker_scratch,
+            "phase HMM segment scratch",
+        )?,
+        checked_add(
+            phase_hmm_vector_scratch,
+            marker_marginal_scratch,
+            "phase HMM scratch",
+        )?,
+        "phase HMM scratch",
+    )?;
+    let mosaic_rank_states = phase_states
+        .checked_mul(2)
+        .ok_or_else(|| "mosaic ranking memory estimate overflow".to_owned())?;
+    let mosaic_rank_scratch = checked_mul(
+        mosaic_rank_states,
+        std::mem::size_of::<i64>() + 2 * std::mem::size_of::<usize>(),
+        "mosaic ranking scratch",
+    )?;
+    let scratch_bytes_per_worker = checked_add(
+        checked_add(
+            phase_panel_bytes,
+            phase_hmm_scratch,
+            "per-worker phase panel and HMM scratch",
+        )?,
+        mosaic_rank_scratch,
+        "per-worker phase panel, HMM, and mosaic scratch",
+    )?;
+
+    // Imputation lifecycle per-worker workspace (single-track, bounded by
+    // `imp_states`, target/selected markers, and the active Stage 2 budget).
+    let imputation_checkpoint_bytes_per_worker = budgeted_imputation_checkpoint_bytes_per_worker(
+        target_markers,
+        union_markers,
+        imp_states,
+        super::hmm::stage2_forward_budget_bytes(),
+    )?;
+    let imputation_per_marker_scratch = checked_mul(
+        imp_states,
+        2 * std::mem::size_of::<f32>(),
+        "imputation HMM scratch",
+    )?;
+    let imputation_hmm_vector_scratch = checked_mul(
+        checked_mul(imp_states, 8, "imputation HMM vector scratch")?,
+        std::mem::size_of::<f32>(),
+        "imputation HMM vector scratch",
+    )?;
     let mosaic_panel_bytes =
         checked_mul(imp_states, haplotype_bytes_per_state, "target mosaic panel")?
             .checked_add(
@@ -215,58 +521,91 @@ pub(crate) fn estimate_window(
                     .and_then(|samples| value.checked_add(samples))
             })
             .ok_or_else(|| "target mosaic panel memory estimate overflow".to_owned())?;
-    let hmm_scratch = checked_add(
-        checked_mul(segment_markers, per_marker_scratch, "HMM segment scratch")?,
-        checked_add(hmm_vector_scratch, marker_marginal_scratch, "HMM scratch")?,
-        "HMM scratch",
-    )?;
-    let mosaic_rank_states = phase_states
-        .checked_mul(2)
-        .ok_or_else(|| "mosaic ranking memory estimate overflow".to_owned())?;
-    let mosaic_rank_scratch = checked_mul(
-        mosaic_rank_states,
-        std::mem::size_of::<i64>() + 2 * std::mem::size_of::<usize>(),
-        "mosaic ranking scratch",
-    )?;
-    let scratch_bytes_per_worker = checked_add(
-        checked_add(
-            checked_add(
-                phase_panel_bytes,
-                mosaic_panel_bytes,
-                "per-worker composite and imputation panels",
-            )?,
-            hmm_scratch,
-            "per-worker panels and HMM scratch",
+    let imputation_hmm_scratch = checked_add(
+        checked_mul(
+            segment_markers,
+            imputation_per_marker_scratch,
+            "imputation HMM segment scratch",
         )?,
-        mosaic_rank_scratch,
-        "per-worker panels, HMM, and mosaic scratch",
+        checked_add(
+            imputation_hmm_vector_scratch,
+            marker_marginal_scratch,
+            "imputation HMM scratch",
+        )?,
+        "imputation HMM scratch",
     )?;
-    let output_buffer_bytes = checked_mul(target_samples, 256, "output buffer")?;
-    let per_worker = checked_add(
-        checkpoint_bytes_per_worker,
-        scratch_bytes_per_worker,
-        "per-worker HMM",
+    let imputation_scratch_bytes_per_worker = checked_add(
+        mosaic_panel_bytes,
+        imputation_hmm_scratch,
+        "per-worker imputation panel and HMM scratch",
     )?;
-    let worker_bytes = checked_mul(workers, per_worker, "worker pool")?;
-    let total_bytes = [
-        input_window_bytes,
-        phase_snapshot_bytes,
-        composite_panel_bytes,
-        output_buffer_bytes,
-        worker_bytes,
-    ]
-    .into_iter()
-    .try_fold(0usize, |sum, item| checked_add(sum, item, "total window"))?;
-    Ok(MemoryEstimate {
-        input_window_bytes,
-        phase_snapshot_bytes,
-        composite_panel_bytes,
-        checkpoint_bytes_per_worker,
-        scratch_bytes_per_worker,
-        output_buffer_bytes,
-        worker_count: workers,
-        total_bytes,
+
+    // Stage 2 low-frequency phasing per-worker workspace (2 haplotypes/worker,
+    // `stage2_states = (phase_states / 2).max(1)`).
+    let stage2_states = (phase_states / 2).max(1);
+    let phase_stage2_checkpoint_bytes_per_worker =
+        budgeted_imputation_checkpoint_bytes_per_worker(
+            target_markers,
+            target_markers,
+            stage2_states,
+            super::hmm::stage2_forward_budget_bytes(),
+        )?;
+    let stage2_panel_bytes = checked_mul(
+        stage2_states,
+        haplotype_bytes_per_state,
+        "stage2 reference panel",
+    )?
+    .checked_add(
+        target_markers
+            .checked_mul(2 * std::mem::size_of::<usize>())
+            .ok_or_else(|| "stage2 panel marker-index estimate overflow".to_owned())?,
+    )
+    .and_then(|value| {
+        stage2_states
+            .checked_mul(std::mem::size_of::<usize>())
+            .and_then(|samples| value.checked_add(samples))
     })
+    .ok_or_else(|| "stage2 reference panel memory estimate overflow".to_owned())?;
+    // Two haplotype panels + paired marginals + streaming Stage2DonorCursor.
+    let phase_stage2_scratch_bytes_per_worker = checked_add(
+        checked_mul(stage2_panel_bytes, 2, "stage2 paired panels")?,
+        checked_add(
+            checked_mul(target_markers, 4 * std::mem::size_of::<f32>(), "stage2 marginals")?,
+            checked_mul(stage2_states, 4 * std::mem::size_of::<usize>(), "stage2 donor cursors")?,
+            "stage2 marginals and donor cursors",
+        )?,
+        "per-worker stage2 scratch",
+    )?;
+
+    let output_buffer_bytes = checked_mul(target_samples, 256, "output buffer")?;
+    let mut estimate = MemoryEstimate {
+        input_window_bytes,
+        phase_snapshot_bytes,
+        phase_initial_pbwt_bytes: 0,
+        phase_stage1_pbwt_donors_bytes: 0,
+        phase_stage2_pbwt_donors_bytes: 0,
+        composite_panel_bytes,
+        checkpoint_bytes_per_worker,
+        phase_event_workspace_bytes_per_worker,
+        scratch_bytes_per_worker,
+        phase_stage2_checkpoint_bytes_per_worker,
+        phase_stage2_scratch_bytes_per_worker,
+        output_buffer_bytes,
+        imputation_fixed_bytes: 0,
+        imputation_checkpoint_bytes_per_worker,
+        imputation_scratch_bytes_per_worker,
+        output_scratch_bytes_per_worker: 0,
+        phase_init_pbwt_stage_bytes: 0,
+        phase_stage1_bytes: 0,
+        phase_stage2_bytes: 0,
+        phase_stage_bytes: 0,
+        imputation_stage_bytes: 0,
+        output_stage_bytes: 0,
+        worker_count: workers,
+        total_bytes: 0,
+    };
+    recompute_stage_totals(&mut estimate)?;
+    Ok(estimate)
 }
 
 /// Account for the two dense, per-marker tracks retained by the initial
@@ -346,15 +685,11 @@ pub(crate) fn include_initial_phase_pbwt_workspace_exact(
         .and_then(|value| value.checked_add(marker_words_bytes))
         .and_then(|value| value.checked_add(phaser_bytes))
         .ok_or_else(|| "initial PBWT workspace memory estimate overflow".to_owned())?;
-    estimate.phase_snapshot_bytes = estimate
-        .phase_snapshot_bytes
+    estimate.phase_initial_pbwt_bytes = estimate
+        .phase_initial_pbwt_bytes
         .checked_add(bytes)
         .ok_or_else(|| "initial PBWT phase memory estimate overflow".to_owned())?;
-    estimate.total_bytes = estimate
-        .total_bytes
-        .checked_add(bytes)
-        .ok_or_else(|| "total initial PBWT memory estimate overflow".to_owned())?;
-    Ok(())
+    recompute_stage_totals(estimate)
 }
 
 #[cfg(test)]
@@ -393,11 +728,7 @@ pub(crate) fn include_reference_window(
         .input_window_bytes
         .checked_add(bytes)
         .ok_or_else(|| "reference window memory estimate overflow".to_owned())?;
-    estimate.total_bytes = estimate
-        .total_bytes
-        .checked_add(bytes)
-        .ok_or_else(|| "total reference memory estimate overflow".to_owned())?;
-    Ok(())
+    recompute_stage_totals(estimate)
 }
 
 /// Account for a compact 1-bit reference window (`CompactReferenceWindow`).
@@ -430,11 +761,7 @@ pub(crate) fn include_compact_reference_window(
         .input_window_bytes
         .checked_add(bytes)
         .ok_or_else(|| "compact reference window memory estimate overflow".to_owned())?;
-    estimate.total_bytes = estimate
-        .total_bytes
-        .checked_add(bytes)
-        .ok_or_else(|| "total compact reference memory estimate overflow".to_owned())?;
-    Ok(())
+    recompute_stage_totals(estimate)
 }
 
 pub(crate) fn include_imp_ibs_reference_index(
@@ -463,26 +790,24 @@ pub(crate) fn include_imp_ibs_reference_index(
         .and_then(|count| count.checked_mul(per_haplotype_step_bytes))
         .ok_or_else(|| "imputation IBS hash index memory estimate overflow".to_owned())?;
     // Each Rayon worker sorts a temporary (u64, u32) donor entry for the
-    // current step. These entries coexist before the compact vectors are
-    // filled.
-    let construction_entry_bytes = reference_haplotypes
-        .checked_mul(workers)
-        .and_then(|count| count.checked_mul(std::mem::size_of::<(u64, u32)>()))
+    // current step. This scratch belongs to the worker lifecycle rather than
+    // the fixed shared index, so changing the worker count can re-price it.
+    let construction_entry_bytes_per_worker = reference_haplotypes
+        .checked_mul(std::mem::size_of::<(u64, u32)>())
         .ok_or_else(|| "imputation IBS construction scratch estimate overflow".to_owned())?;
     let bytes = range_bytes
         .checked_add(marker_index_bytes)
         .and_then(|value| value.checked_add(retained_step_bytes))
-        .and_then(|value| value.checked_add(construction_entry_bytes))
         .ok_or_else(|| "imputation IBS index memory estimate overflow".to_owned())?;
-    estimate.phase_snapshot_bytes = estimate
-        .phase_snapshot_bytes
+    estimate.imputation_fixed_bytes = estimate
+        .imputation_fixed_bytes
         .checked_add(bytes)
         .ok_or_else(|| "imputation IBS index memory estimate overflow".to_owned())?;
-    estimate.total_bytes = estimate
-        .total_bytes
-        .checked_add(bytes)
-        .ok_or_else(|| "total imputation IBS index memory estimate overflow".to_owned())?;
-    Ok(())
+    estimate.imputation_scratch_bytes_per_worker = estimate
+        .imputation_scratch_bytes_per_worker
+        .checked_add(construction_entry_bytes_per_worker)
+        .ok_or_else(|| "imputation IBS construction scratch estimate overflow".to_owned())?;
+    recompute_stage_totals(estimate)
 }
 
 pub(crate) fn include_phase_pbwt_donors(
@@ -490,7 +815,12 @@ pub(crate) fn include_phase_pbwt_donors(
     target_samples: usize,
     step_count: usize,
 ) -> Result<(), String> {
-    include_phase_pbwt_donor_storage(estimate, target_samples, step_count, 1)
+    let bytes = phase_pbwt_donor_storage_bytes(target_samples, step_count, 1)?;
+    estimate.phase_stage1_pbwt_donors_bytes = estimate
+        .phase_stage1_pbwt_donors_bytes
+        .checked_add(bytes)
+        .ok_or_else(|| "phase stage1 PBWT donor index memory estimate overflow".to_owned())?;
+    recompute_stage_totals(estimate)
 }
 
 pub(crate) fn include_low_frequency_phase_pbwt_donors(
@@ -498,15 +828,26 @@ pub(crate) fn include_low_frequency_phase_pbwt_donors(
     target_samples: usize,
     step_count: usize,
 ) -> Result<(), String> {
-    include_phase_pbwt_donor_storage(estimate, target_samples, step_count, 2)
+    // Two-stage phasing retains 1 proposal copy during Stage 1 and 2 copies
+    // during Stage 2; these do not coexist with each other.
+    let stage1_bytes = phase_pbwt_donor_storage_bytes(target_samples, step_count, 1)?;
+    let stage2_bytes = phase_pbwt_donor_storage_bytes(target_samples, step_count, 2)?;
+    estimate.phase_stage1_pbwt_donors_bytes = estimate
+        .phase_stage1_pbwt_donors_bytes
+        .checked_add(stage1_bytes)
+        .ok_or_else(|| "phase stage1 PBWT donor index memory estimate overflow".to_owned())?;
+    estimate.phase_stage2_pbwt_donors_bytes = estimate
+        .phase_stage2_pbwt_donors_bytes
+        .checked_add(stage2_bytes)
+        .ok_or_else(|| "phase stage2 PBWT donor index memory estimate overflow".to_owned())?;
+    recompute_stage_totals(estimate)
 }
 
-fn include_phase_pbwt_donor_storage(
-    estimate: &mut MemoryEstimate,
+fn phase_pbwt_donor_storage_bytes(
     target_samples: usize,
     step_count: usize,
     proposal_copies: usize,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     let target_haplotypes = target_samples
         .checked_mul(2)
         .ok_or_else(|| "phase PBWT haplotype count overflow".to_owned())?;
@@ -526,19 +867,10 @@ fn include_phase_pbwt_donor_storage(
         .checked_mul(512)
         .and_then(|bytes| bytes.checked_add(16 * 1024))
         .ok_or_else(|| "phase PBWT scan scratch memory estimate overflow".to_owned())?;
-    let bytes = proposal_bytes
+    proposal_bytes
         .checked_add(step_range_bytes)
         .and_then(|value| value.checked_add(scan_scratch_bytes))
-        .ok_or_else(|| "phase PBWT donor index memory estimate overflow".to_owned())?;
-    estimate.phase_snapshot_bytes = estimate
-        .phase_snapshot_bytes
-        .checked_add(bytes)
-        .ok_or_else(|| "phase PBWT donor index memory estimate overflow".to_owned())?;
-    estimate.total_bytes = estimate
-        .total_bytes
-        .checked_add(bytes)
-        .ok_or_else(|| "total phase PBWT donor index memory estimate overflow".to_owned())?;
-    Ok(())
+        .ok_or_else(|| "phase PBWT donor index memory estimate overflow".to_owned())
 }
 
 pub(crate) fn include_variant_storage<T: RowStorage>(
@@ -614,11 +946,7 @@ pub(crate) fn include_row_storage_excess(
         .input_window_bytes
         .checked_add(bytes)
         .ok_or_else(|| "variant storage estimate overflow".to_owned())?;
-    estimate.total_bytes = estimate
-        .total_bytes
-        .checked_add(bytes)
-        .ok_or_else(|| "total variant storage estimate overflow".to_owned())?;
-    Ok(())
+    recompute_stage_totals(estimate)
 }
 
 pub(crate) fn phase_expansion_fixed_bytes(n_samples: usize) -> Result<usize, String> {
@@ -775,11 +1103,7 @@ pub(crate) fn include_phase_expansion(
         .phase_snapshot_bytes
         .checked_add(bytes)
         .ok_or_else(|| "phase-call memory estimate overflow".to_owned())?;
-    estimate.total_bytes = estimate
-        .total_bytes
-        .checked_add(bytes)
-        .ok_or_else(|| "total phase-call memory estimate overflow".to_owned())?;
-    Ok(())
+    recompute_stage_totals(estimate)
 }
 
 pub(crate) fn include_ibd2_intervals(
@@ -796,35 +1120,30 @@ pub(crate) fn include_ibd2_intervals(
         .phase_snapshot_bytes
         .checked_add(bytes)
         .ok_or_else(|| "IBD2 interval memory estimate overflow".to_owned())?;
-    estimate.total_bytes = estimate
-        .total_bytes
-        .checked_add(bytes)
-        .ok_or_else(|| "total IBD2 memory estimate overflow".to_owned())?;
-    Ok(())
+    recompute_stage_totals(estimate)
 }
 
 pub(crate) fn include_multiallelic_marginal_storage(
     estimate: &mut MemoryEstimate,
     extra_allele_marginals: usize,
 ) -> Result<(), String> {
-    let bytes_per_worker = extra_allele_marginals
+    let imp_bytes_per_worker = extra_allele_marginals
         .checked_mul(std::mem::size_of::<f32>())
-        // Phasing can retain the posterior vectors for both haplotypes at
-        // once; imputation uses one at a time, so two is the safe bound.
-        .and_then(|bytes| bytes.checked_mul(2))
         .ok_or_else(|| "multiallelic posterior memory estimate overflow".to_owned())?;
-    let total_bytes = bytes_per_worker
-        .checked_mul(estimate.worker_count)
+    // Phasing can retain posterior vectors for both haplotypes at once;
+    // imputation evaluates one haplotype at a time.
+    let phase_bytes_per_worker = imp_bytes_per_worker
+        .checked_mul(2)
         .ok_or_else(|| "multiallelic posterior memory estimate overflow".to_owned())?;
     estimate.scratch_bytes_per_worker = estimate
         .scratch_bytes_per_worker
-        .checked_add(bytes_per_worker)
+        .checked_add(phase_bytes_per_worker)
         .ok_or_else(|| "multiallelic posterior memory estimate overflow".to_owned())?;
-    estimate.total_bytes = estimate
-        .total_bytes
-        .checked_add(total_bytes)
-        .ok_or_else(|| "total multiallelic posterior estimate overflow".to_owned())?;
-    Ok(())
+    estimate.imputation_scratch_bytes_per_worker = estimate
+        .imputation_scratch_bytes_per_worker
+        .checked_add(imp_bytes_per_worker)
+        .ok_or_else(|| "multiallelic imputation posterior memory estimate overflow".to_owned())?;
+    recompute_stage_totals(estimate)
 }
 
 /// Account for the production streaming path used by `impute_window_stream`.
@@ -864,13 +1183,11 @@ pub(crate) fn include_streamed_imputation_window(
     // HaplotypeScratch retains Option<u16> query values, and may retain one
     // full marker vector of f32 per active worker when projection markers are
     // not dense.
-    let query_scratch = n_markers
+    let query_scratch_per_worker = n_markers
         .checked_mul(std::mem::size_of::<Option<u16>>())
-        .and_then(|bytes| bytes.checked_mul(workers))
         .ok_or_else(|| "streamed imputation query scratch overflow".to_owned())?;
-    let full_projection_scratch = n_markers
+    let full_projection_scratch_per_worker = n_markers
         .checked_mul(std::mem::size_of::<f32>())
-        .and_then(|bytes| bytes.checked_mul(workers))
         .ok_or_else(|| "streamed imputation projection scratch overflow".to_owned())?;
     let statistics_bytes = n_markers
         .checked_mul(2 * std::mem::size_of::<f64>())
@@ -881,20 +1198,19 @@ pub(crate) fn include_streamed_imputation_window(
     let bytes = posterior_batch_bytes
         .checked_add(tile_bytes)
         .and_then(|value| value.checked_add(packed_reference_bytes))
-        .and_then(|value| value.checked_add(query_scratch))
-        .and_then(|value| value.checked_add(full_projection_scratch))
         .and_then(|value| value.checked_add(statistics_bytes))
         .and_then(|value| value.checked_add(metadata_bytes))
         .ok_or_else(|| "streamed imputation memory estimate overflow".to_owned())?;
-    estimate.output_buffer_bytes = estimate
-        .output_buffer_bytes
+    estimate.imputation_fixed_bytes = estimate
+        .imputation_fixed_bytes
         .checked_add(bytes)
-        .ok_or_else(|| "streamed imputation output estimate overflow".to_owned())?;
-    estimate.total_bytes = estimate
-        .total_bytes
-        .checked_add(bytes)
-        .ok_or_else(|| "total streamed imputation estimate overflow".to_owned())?;
-    Ok(())
+        .ok_or_else(|| "streamed imputation fixed estimate overflow".to_owned())?;
+    estimate.imputation_scratch_bytes_per_worker = estimate
+        .imputation_scratch_bytes_per_worker
+        .checked_add(query_scratch_per_worker)
+        .and_then(|value| value.checked_add(full_projection_scratch_per_worker))
+        .ok_or_else(|| "streamed imputation worker scratch estimate overflow".to_owned())?;
+    recompute_stage_totals(estimate)
 }
 
 /// Replace the full dense donor mosaic allowance with the compact IBS layout
@@ -965,23 +1281,12 @@ pub(crate) fn set_compact_target_mosaic_storage(
         })
         .ok_or_else(|| "compact target mosaic memory estimate overflow".to_owned())?;
 
-    estimate.scratch_bytes_per_worker = estimate
-        .scratch_bytes_per_worker
+    estimate.imputation_scratch_bytes_per_worker = estimate
+        .imputation_scratch_bytes_per_worker
         .checked_sub(old_panel_bytes)
         .and_then(|value| value.checked_add(new_panel_bytes))
         .ok_or_else(|| "compact target mosaic scratch estimate overflow".to_owned())?;
-    let old_workers = old_panel_bytes
-        .checked_mul(estimate.worker_count)
-        .ok_or_else(|| "old worker mosaic estimate overflow".to_owned())?;
-    let new_workers = new_panel_bytes
-        .checked_mul(estimate.worker_count)
-        .ok_or_else(|| "compact worker mosaic estimate overflow".to_owned())?;
-    estimate.total_bytes = estimate
-        .total_bytes
-        .checked_sub(old_workers)
-        .and_then(|value| value.checked_add(new_workers))
-        .ok_or_else(|| "compact total mosaic estimate overflow".to_owned())?;
-    Ok(())
+    recompute_stage_totals(estimate)
 }
 
 pub(crate) fn set_worker_count(
@@ -991,24 +1296,8 @@ pub(crate) fn set_worker_count(
     if workers == 0 {
         return Err("threads must be a positive integer".to_owned());
     }
-    let fixed_bytes = estimate
-        .input_window_bytes
-        .checked_add(estimate.phase_snapshot_bytes)
-        .and_then(|value| value.checked_add(estimate.composite_panel_bytes))
-        .and_then(|value| value.checked_add(estimate.output_buffer_bytes))
-        .ok_or_else(|| "fixed window memory estimate overflow".to_string())?;
-    let per_worker = estimate
-        .checkpoint_bytes_per_worker
-        .checked_add(estimate.scratch_bytes_per_worker)
-        .ok_or_else(|| "per-worker memory estimate overflow".to_string())?;
-    let worker_bytes = per_worker
-        .checked_mul(workers)
-        .ok_or_else(|| "worker pool memory estimate overflow".to_string())?;
     estimate.worker_count = workers;
-    estimate.total_bytes = fixed_bytes
-        .checked_add(worker_bytes)
-        .ok_or_else(|| "total window memory estimate overflow".to_string())?;
-    Ok(())
+    recompute_stage_totals(estimate)
 }
 
 pub(crate) fn derive_seed(
@@ -1042,8 +1331,12 @@ pub(crate) fn derive_seed(
 #[cfg(test)]
 mod tests {
     use super::{
-        include_initial_phase_pbwt_workspace, include_phase_pbwt_donors,
-        set_compact_target_mosaic_storage,
+        budgeted_imputation_checkpoint_bytes_per_worker,
+        budgeted_phase_checkpoint_bytes_per_worker, estimate_window, include_bgzf_writer_workspace,
+        include_imp_ibs_reference_index, include_initial_phase_pbwt_workspace,
+        include_low_frequency_phase_pbwt_donors, include_phase_pbwt_donors,
+        include_streamed_imputation_window, set_compact_target_mosaic_storage,
+        set_imputation_selected_markers, set_phase_stage2_selected_markers, set_worker_count,
     };
     use crate::imp::types::MemoryEstimate;
 
@@ -1056,7 +1349,8 @@ mod tests {
         include_initial_phase_pbwt_workspace(&mut estimate, 5, 11).unwrap();
 
         assert!(estimate.total_bytes - before >= expected_track_bytes);
-        assert_eq!(estimate.total_bytes, estimate.phase_snapshot_bytes);
+        assert_eq!(estimate.phase_init_pbwt_stage_bytes, estimate.phase_initial_pbwt_bytes);
+        assert_eq!(estimate.total_bytes, estimate.phase_init_pbwt_stage_bytes);
     }
 
     #[test]
@@ -1067,8 +1361,9 @@ mod tests {
 
         let haplotypes = 8usize;
         let minimum_scan_scratch = haplotypes * 512 + 16 * 1024;
-        assert!(estimate.phase_snapshot_bytes >= minimum_scan_scratch);
-        assert_eq!(estimate.total_bytes, estimate.phase_snapshot_bytes);
+        assert!(estimate.phase_stage1_pbwt_donors_bytes >= minimum_scan_scratch);
+        assert_eq!(estimate.phase_stage1_bytes, estimate.phase_stage1_pbwt_donors_bytes);
+        assert_eq!(estimate.total_bytes, estimate.phase_stage1_bytes);
     }
 
     #[test]
@@ -1081,8 +1376,9 @@ mod tests {
             + union_markers * 2 * std::mem::size_of::<usize>()
             + states * std::mem::size_of::<usize>();
         let mut estimate = MemoryEstimate {
-            scratch_bytes_per_worker: old_panel_bytes + 123,
+            imputation_scratch_bytes_per_worker: old_panel_bytes + 123,
             worker_count: workers,
+            imputation_stage_bytes: (old_panel_bytes + 123) * workers,
             total_bytes: (old_panel_bytes + 123) * workers,
             ..MemoryEstimate::default()
         };
@@ -1097,10 +1393,146 @@ mod tests {
         )
         .unwrap();
 
-        assert!(estimate.scratch_bytes_per_worker < old_panel_bytes + 123);
+        assert!(estimate.imputation_scratch_bytes_per_worker < old_panel_bytes + 123);
+        assert_eq!(
+            estimate.imputation_stage_bytes,
+            estimate.imputation_scratch_bytes_per_worker * workers
+        );
+        assert_eq!(estimate.total_bytes, estimate.imputation_stage_bytes);
+    }
+
+    #[test]
+    fn lifecycle_stage_peaks_do_not_sum_mutually_exclusive_stages() {
+        let mut estimate =
+            estimate_window(674, 2_693, 196_759, 196_759, 1_000, 2_000, 1, 8).unwrap();
+        assert!(estimate.phase_event_workspace_bytes_per_worker > 0);
+        let phase_before_imp = estimate.phase_stage_bytes;
+        let imp_before_phase_donors = estimate.imputation_stage_bytes;
+
+        include_phase_pbwt_donors(&mut estimate, 674 + 2_693, 200).unwrap();
+        assert!(estimate.phase_stage_bytes > phase_before_imp);
+        assert_eq!(estimate.imputation_stage_bytes, imp_before_phase_donors);
+
+        let phase_after_donors = estimate.phase_stage_bytes;
+        include_imp_ibs_reference_index(&mut estimate, 2_693 * 2, 196_759, 200, 8).unwrap();
+        include_streamed_imputation_window(&mut estimate, 674, 196_759, 2_693 * 2, 8).unwrap();
+        include_bgzf_writer_workspace(&mut estimate).unwrap();
+
+        assert_eq!(estimate.phase_stage_bytes, phase_after_donors);
+        assert!(estimate.imputation_stage_bytes > imp_before_phase_donors);
+        // Pure output stage does not retain the full input window.
+        assert!(estimate.output_stage_bytes < estimate.input_window_bytes);
         assert_eq!(
             estimate.total_bytes,
-            estimate.scratch_bytes_per_worker * workers
+            estimate
+                .phase_stage_bytes
+                .max(estimate.imputation_stage_bytes)
+                .max(estimate.output_stage_bytes)
         );
+        let naive_sum = estimate.phase_stage_bytes + estimate.imputation_fixed_bytes;
+        assert!(estimate.total_bytes < naive_sum);
+
+        // Selecting fewer anchors shrinks imputation checkpoint storage without affecting phasing.
+        let imp_ckpt_before = estimate.imputation_checkpoint_bytes_per_worker;
+        set_imputation_selected_markers(&mut estimate, 2_000, 196_759, 2_000).unwrap();
+        assert!(estimate.imputation_checkpoint_bytes_per_worker <= imp_ckpt_before);
+        assert_eq!(estimate.phase_stage_bytes, phase_after_donors);
+
+        set_worker_count(&mut estimate, 4).unwrap();
+        assert_eq!(estimate.worker_count, 4);
+        assert_eq!(
+            estimate.total_bytes,
+            estimate
+                .phase_stage_bytes
+                .max(estimate.imputation_stage_bytes)
+                .max(estimate.output_stage_bytes)
+        );
+    }
+
+    #[test]
+    fn budgeted_checkpoint_helpers_cap_full_cache_and_respect_disable() {
+        let phase_budgeted =
+            budgeted_phase_checkpoint_bytes_per_worker(196_759, 1_000, Some(32 * 1024 * 1024))
+                .unwrap();
+        let phase_unbudgeted =
+            budgeted_phase_checkpoint_bytes_per_worker(196_759, 1_000, None).unwrap();
+        assert!(phase_budgeted < phase_unbudgeted);
+        assert_eq!(
+            phase_budgeted,
+            2 * (super::PHASE_CHECKPOINT_STRIDE
+                + 196_759_usize.div_ceil(super::PHASE_CHECKPOINT_STRIDE))
+                * 1_000
+                * 2
+                * std::mem::size_of::<f32>()
+        );
+
+        let imp_budgeted = budgeted_imputation_checkpoint_bytes_per_worker(
+            70_000,
+            196_759,
+            2_000,
+            Some(16 * 1024 * 1024),
+        )
+        .unwrap();
+        let imp_unbudgeted =
+            budgeted_imputation_checkpoint_bytes_per_worker(70_000, 196_759, 2_000, None).unwrap();
+        assert!(imp_budgeted < imp_unbudgeted);
+        assert!(imp_budgeted > 2 * 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn worker_count_reprices_imputation_scratch_but_not_fixed_storage() {
+        let mut estimate =
+            estimate_window(674, 2_693, 196_759, 196_759, 1_000, 2_000, 1, 8).unwrap();
+        include_imp_ibs_reference_index(&mut estimate, 2_693 * 2, 196_759, 200, 8).unwrap();
+        include_streamed_imputation_window(&mut estimate, 674, 196_759, 2_693 * 2, 8).unwrap();
+
+        let fixed = estimate.imputation_fixed_bytes;
+        set_worker_count(&mut estimate, 1).unwrap();
+        let one_worker_stage = estimate.imputation_stage_bytes;
+        assert_eq!(estimate.imputation_fixed_bytes, fixed);
+
+        set_worker_count(&mut estimate, 8).unwrap();
+        let eight_worker_stage = estimate.imputation_stage_bytes;
+        let fixed_stage = estimate.input_window_bytes
+            + estimate.imputation_fixed_bytes
+            + estimate.output_buffer_bytes;
+        assert_eq!(estimate.imputation_fixed_bytes, fixed);
+        assert!(eight_worker_stage > one_worker_stage);
+        assert_eq!(
+            eight_worker_stage,
+            fixed_stage
+                + 8 * (estimate.imputation_checkpoint_bytes_per_worker
+                    + estimate.imputation_scratch_bytes_per_worker
+                    + estimate.output_scratch_bytes_per_worker)
+        );
+    }
+
+    #[test]
+    fn phase_sub_lifecycles_take_max_instead_of_summing() {
+        let mut estimate =
+            estimate_window(674, 2_693, 196_759, 196_759, 1_000, 2_000, 1, 8).unwrap();
+        include_initial_phase_pbwt_workspace(&mut estimate, 674, 24_595).unwrap();
+        include_low_frequency_phase_pbwt_donors(&mut estimate, 674 + 2_693, 52_444).unwrap();
+        set_phase_stage2_selected_markers(&mut estimate, 70_000, 196_759, 1_000).unwrap();
+
+        assert!(estimate.phase_init_pbwt_stage_bytes > 0);
+        assert!(estimate.phase_stage1_bytes > 0);
+        assert!(estimate.phase_stage2_bytes > 0);
+        assert_eq!(
+            estimate.phase_stage_bytes,
+            estimate
+                .phase_init_pbwt_stage_bytes
+                .max(estimate.phase_stage1_bytes)
+                .max(estimate.phase_stage2_bytes)
+        );
+        // Initial PBWT, Stage 1 donors, and Stage 2 donors must not be summed together.
+        let naive_phase_sum = estimate.input_window_bytes
+            + estimate.phase_snapshot_bytes
+            + estimate.phase_initial_pbwt_bytes
+            + estimate.phase_stage2_pbwt_donors_bytes
+            + 8 * (estimate.checkpoint_bytes_per_worker
+                + estimate.phase_event_workspace_bytes_per_worker
+                + estimate.scratch_bytes_per_worker);
+        assert!(estimate.phase_stage_bytes < naive_phase_sum);
     }
 }

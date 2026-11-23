@@ -143,7 +143,7 @@ fn resolve_beta_cache_budget_bytes(raw: Option<&str>) -> Option<usize> {
     }
 }
 
-fn phase_beta_cache_budget_bytes() -> Option<usize> {
+pub(crate) fn phase_beta_cache_budget_bytes() -> Option<usize> {
     let raw = std::env::var("JX_IMP_PHASE_BETA_BUDGET_MB").ok();
     resolve_beta_cache_budget_bytes(raw.as_deref())
 }
@@ -236,7 +236,7 @@ pub(crate) fn count_profile_totals() -> [u64; 12] {
     ]
 }
 
-const CHECKPOINT_STRIDE: usize = 256;
+pub(crate) const CHECKPOINT_STRIDE: usize = 256;
 const MAX_CLUSTER_CM: f64 = 0.005;
 const MAX_CLUSTER_MARKERS: usize = 255;
 const FULL_EMISSION_CACHE_BUDGET_BYTES: usize = 8 * 1024 * 1024;
@@ -310,6 +310,11 @@ struct PhaseCluster {
     end: usize,
     kind: ClusterKind,
 }
+
+pub(crate) const EVENT_META_BYTES_PER_CLUSTER: usize = std::mem::size_of::<PhaseCluster>()
+    + std::mem::size_of::<f32>()
+    + 2 * std::mem::size_of::<usize>()
+    + std::mem::size_of::<[f32; 2]>();
 
 #[derive(Debug, Clone, Copy)]
 enum PhaseClusterTemplateKind {

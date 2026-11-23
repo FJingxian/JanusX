@@ -44,10 +44,17 @@ fn emit_stage_timestamp(stage: &str, chrom: &str, window_index: u64, run_started
     let unix_s = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |duration| duration.as_secs_f64());
-    eprintln!(
-        "JANUSX_IMP_STAGE_TIMESTAMP stage={stage} window={chrom}:{window_index} unix_s={unix_s:.6} run_elapsed_s={:.6}",
-        run_started.elapsed().as_secs_f64()
-    );
+    if let Some((vm_rss_bytes, vm_hwm_bytes)) = memory::read_process_rss_hwm_bytes() {
+        eprintln!(
+            "JANUSX_IMP_STAGE_TIMESTAMP stage={stage} window={chrom}:{window_index} unix_s={unix_s:.6} run_elapsed_s={:.6} vm_rss_bytes={vm_rss_bytes} vm_hwm_bytes={vm_hwm_bytes}",
+            run_started.elapsed().as_secs_f64()
+        );
+    } else {
+        eprintln!(
+            "JANUSX_IMP_STAGE_TIMESTAMP stage={stage} window={chrom}:{window_index} unix_s={unix_s:.6} run_elapsed_s={:.6}",
+            run_started.elapsed().as_secs_f64()
+        );
+    }
 }
 
 struct ReferenceWindowStream {
@@ -1578,6 +1585,7 @@ where
             bits_per_allele,
             requested_workers,
         )?;
+        let phase_base_snapshot_bytes = active_estimate.phase_snapshot_bytes;
         if !phase_bypass_allowed {
             memory::include_initial_phase_pbwt_workspace_exact(
                 &mut active_estimate,
@@ -1589,6 +1597,7 @@ where
                 requested_workers,
             )?;
         }
+        let initial_pbwt_bytes = active_estimate.phase_initial_pbwt_bytes;
         if is_bgzf_vcf_output(config) {
             memory::include_bgzf_writer_workspace(&mut active_estimate)?;
         }
@@ -1605,7 +1614,11 @@ where
                 })?;
             memory::include_row_storage_excess(&mut active_estimate, stage1_storage_excess, 2)?;
         }
+        let before_phase_expansion_bytes = active_estimate.phase_snapshot_bytes;
         memory::include_phase_expansion(&mut active_estimate, target_phase_expansion_bytes)?;
+        let phase_expansion_bytes = active_estimate
+            .phase_snapshot_bytes
+            .saturating_sub(before_phase_expansion_bytes);
         let mut marginal_excess = target_marginal_excess;
         if !phase_bypass_allowed {
             if stage1_low_frequency_mask.is_some() {
@@ -1613,6 +1626,12 @@ where
                     &mut active_estimate,
                     samples.len().saturating_add(reference_samples),
                     phase_pbwt_step_count(&config, &stage1_cm_positions, stage1_marker_count),
+                )?;
+                memory::set_phase_stage2_selected_markers(
+                    &mut active_estimate,
+                    stage1_marker_count,
+                    window.rows.len(),
+                    phase_config.hmm.phase_states,
                 )?;
             } else {
                 memory::include_phase_pbwt_donors(
@@ -1787,10 +1806,62 @@ where
             .as_ref()
             .or(ibd2_intervals.as_ref())
             .unwrap_or(&no_ibd2_intervals);
+        let before_ibd2_bytes = active_estimate.phase_snapshot_bytes;
         memory::include_ibd2_intervals(&mut active_estimate, phase_ibd2_intervals)?;
+        let ibd2_bytes = active_estimate
+            .phase_snapshot_bytes
+            .saturating_sub(before_ibd2_bytes);
         memory::include_multiallelic_marginal_storage(&mut active_estimate, marginal_excess)?;
+        if perform_imputation {
+            memory::set_imputation_selected_markers(
+                &mut active_estimate,
+                stage1_marker_count,
+                merged_markers,
+                imp_states,
+            )?;
+        }
         let workers = requested_workers;
         memory::set_worker_count(&mut active_estimate, workers)?;
+        if stage_timestamp_enabled() {
+            let phase_worker_bytes = active_estimate
+                .checkpoint_bytes_per_worker
+                .saturating_add(active_estimate.phase_event_workspace_bytes_per_worker)
+                .saturating_add(active_estimate.scratch_bytes_per_worker)
+                .saturating_mul(active_estimate.worker_count);
+            let imputation_worker_bytes = active_estimate
+                .imputation_checkpoint_bytes_per_worker
+                .saturating_add(active_estimate.imputation_scratch_bytes_per_worker)
+                .saturating_add(active_estimate.output_scratch_bytes_per_worker)
+                .saturating_mul(active_estimate.worker_count);
+            eprintln!(
+                "JANUSX_IMP_MEMORY_ESTIMATE_PROFILE window={}:{} bits_per_allele={} phase_stage_bytes={} phase_init_pbwt_stage_bytes={} phase_stage1_bytes={} phase_stage2_bytes={} imputation_stage_bytes={} output_stage_bytes={} total_bytes={} input_window_bytes={} phase_snapshot_bytes={} phase_base_snapshot_bytes={} initial_pbwt_bytes={} phase_expansion_bytes={} stage1_pbwt_donors_bytes={} stage2_pbwt_donors_bytes={} ibd2_bytes={} phase_worker_bytes={} phase_event_workspace_per_worker={} phase_checkpoint_per_worker={} phase_scratch_per_worker={} imputation_fixed_bytes={} imputation_worker_bytes={} imputation_checkpoint_per_worker={}",
+                window.chrom,
+                window.index,
+                bits_per_allele,
+                active_estimate.phase_stage_bytes,
+                active_estimate.phase_init_pbwt_stage_bytes,
+                active_estimate.phase_stage1_bytes,
+                active_estimate.phase_stage2_bytes,
+                active_estimate.imputation_stage_bytes,
+                active_estimate.output_stage_bytes,
+                active_estimate.total_bytes,
+                active_estimate.input_window_bytes,
+                active_estimate.phase_snapshot_bytes,
+                phase_base_snapshot_bytes,
+                initial_pbwt_bytes,
+                phase_expansion_bytes,
+                active_estimate.phase_stage1_pbwt_donors_bytes,
+                active_estimate.phase_stage2_pbwt_donors_bytes,
+                ibd2_bytes,
+                phase_worker_bytes,
+                active_estimate.phase_event_workspace_bytes_per_worker,
+                active_estimate.checkpoint_bytes_per_worker,
+                active_estimate.scratch_bytes_per_worker,
+                active_estimate.imputation_fixed_bytes,
+                imputation_worker_bytes,
+                active_estimate.imputation_checkpoint_bytes_per_worker,
+            );
+        }
         summary.peak_window_bytes = summary
             .peak_window_bytes
             .max(active_estimate.total_bytes as u64);
@@ -2262,6 +2333,9 @@ fn phase_pbwt_step_count_with_step_cm(
 ) -> usize {
     if max_markers == 0 || cm_positions.is_empty() {
         return 0;
+    }
+    if let Ok(ranges) = pbwt::phase_step_ranges(cm_positions, step_cm) {
+        return ranges.len().min(max_markers).max(1);
     }
     let span =
         cm_positions.last().copied().unwrap_or(0.0) - cm_positions.first().copied().unwrap_or(0.0);

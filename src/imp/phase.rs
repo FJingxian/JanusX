@@ -1728,10 +1728,19 @@ fn phase_window_prepared_impl(
                 let unix_s = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0.0, |duration| duration.as_secs_f64());
-                eprintln!(
-                    "JANUSX_IMP_STAGE_TIMESTAMP stage=stage2_start window={}:{} unix_s={unix_s:.6}",
-                    target_window.chrom, target_window.index
-                );
+                if let Some((vm_rss_bytes, vm_hwm_bytes)) =
+                    super::memory::read_process_rss_hwm_bytes()
+                {
+                    eprintln!(
+                        "JANUSX_IMP_STAGE_TIMESTAMP stage=stage2_start window={}:{} unix_s={unix_s:.6} vm_rss_bytes={vm_rss_bytes} vm_hwm_bytes={vm_hwm_bytes}",
+                        target_window.chrom, target_window.index
+                    );
+                } else {
+                    eprintln!(
+                        "JANUSX_IMP_STAGE_TIMESTAMP stage=stage2_start window={}:{} unix_s={unix_s:.6}",
+                        target_window.chrom, target_window.index
+                    );
+                }
             }
             let snapshot = PhasedWindow {
                 chrom: current.chrom.clone(),
@@ -1861,10 +1870,19 @@ fn phase_window_prepared_impl(
                 let unix_s = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0.0, |duration| duration.as_secs_f64());
-                eprintln!(
-                    "JANUSX_IMP_STAGE_TIMESTAMP stage=stage2_end window={}:{} unix_s={unix_s:.6}",
-                    target_window.chrom, target_window.index
-                );
+                if let Some((vm_rss_bytes, vm_hwm_bytes)) =
+                    super::memory::read_process_rss_hwm_bytes()
+                {
+                    eprintln!(
+                        "JANUSX_IMP_STAGE_TIMESTAMP stage=stage2_end window={}:{} unix_s={unix_s:.6} vm_rss_bytes={vm_rss_bytes} vm_hwm_bytes={vm_hwm_bytes}",
+                        target_window.chrom, target_window.index
+                    );
+                } else {
+                    eprintln!(
+                        "JANUSX_IMP_STAGE_TIMESTAMP stage=stage2_end window={}:{} unix_s={unix_s:.6}",
+                        target_window.chrom, target_window.index
+                    );
+                }
                 let stage2_forward = hmm::stage2_forward_profile_totals();
                 eprintln!(
                     "JANUSX_IMP_STAGE2_FORWARD_PROFILE window={}:{} calls={} checkpointed_calls={} budget_bytes={} max_selected_markers={} max_states={} max_full_forward_bytes={} max_active_forward_bytes={}",

@@ -2198,7 +2198,7 @@ impl ImpConfig {
     }
 
     pub fn phase_config(&self, haplotype_count: usize) -> Result<PhaseConfig, String> {
-        const DEFAULT_PACKED_CACHE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+        const DEFAULT_PACKED_CACHE_BUDGET_BYTES: usize = usize::MAX;
         let hmm = self.hmm_config(haplotype_count)?;
         Ok(PhaseConfig {
             window_cm: self.window,
@@ -2390,7 +2390,7 @@ mod packed_mosaic_tests {
                 .phase_config(1_000)
                 .unwrap()
                 .packed_cache_budget_bytes,
-            256 * 1024 * 1024
+            usize::MAX
         );
     }
 

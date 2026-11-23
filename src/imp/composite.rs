@@ -1631,15 +1631,20 @@ fn build_low_frequency_phase_mosaic_view_selected(
         .unwrap_or(1);
     let state_count = state_segments.len();
     let marker_count = marker_indices.len();
-    let mut haplotypes = if view.target_packed.is_some() {
-        PackedHaplotypes::empty_state_major(state_count, marker_count, allele_width(max_allele))?
-    } else {
-        PackedHaplotypes::empty(state_count, marker_count, allele_width(max_allele))?
-    };
     let selected_packed_view = packed_stage1_view.filter(|packed_view| {
         stage2_panel_fast_path_enabled()
             && stage2_panel_packed_view_eligible(packed_view, marker_indices.len())
     });
+    let mut haplotypes =
+        if view.target_packed.is_some() || selected_packed_view.is_some() {
+            PackedHaplotypes::empty_state_major(
+                state_count,
+                marker_count,
+                allele_width(max_allele),
+            )?
+        } else {
+            PackedHaplotypes::empty(state_count, marker_count, allele_width(max_allele))?
+        };
     let profile_started = stage2_panel_profiling_enabled().then(Instant::now);
     let source_samples = fill_low_frequency_phase_mosaic_haplotypes(
         view,

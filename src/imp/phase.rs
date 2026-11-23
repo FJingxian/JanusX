@@ -371,12 +371,10 @@ fn pack_complete_biallelic_window(
     let n_haplotypes = n_samples
         .checked_mul(2)
         .ok_or_else(|| "phase snapshot haplotype count overflow".to_owned())?;
-    let packed_bytes = window
-        .rows
-        .len()
-        .div_ceil(64)
-        .checked_mul(2 * std::mem::size_of::<u64>())
-        .and_then(|bytes| bytes.checked_mul(n_haplotypes))
+    let packed_bytes = n_haplotypes
+        .checked_mul(window.rows.len())
+        .map(|bits| bits.div_ceil(64))
+        .and_then(|words| words.checked_mul(std::mem::size_of::<u64>()))
         .ok_or_else(|| "phase snapshot cache size overflow".to_owned())?;
     if packed_bytes > cache_budget {
         return Ok(None);
@@ -1750,19 +1748,15 @@ fn phase_window_prepared_impl(
                 emit_end: current.emit_end,
             };
             let snapshot_started = profile.then(Instant::now);
-            let full_packed_snapshot =
-                pack_complete_biallelic_window(&snapshot, packed_cache_budget)?;
             let full_haplotype_view = composite::PhaseHaplotypeView::new(
                 &snapshot,
-                full_packed_snapshot.as_ref(),
+                None,
                 reference_packed,
                 target_samples,
             )?;
             let stage1_snapshot = project_phased_window(&snapshot, &stage1_marker_indices)?;
-            let packed_stage1_snapshot = full_packed_snapshot
-                .as_ref()
-                .map(|packed| packed.project_state_major_biallelic(&stage1_marker_indices))
-                .transpose()?;
+            let packed_stage1_snapshot =
+                pack_complete_biallelic_window(&stage1_snapshot, packed_cache_budget)?;
             let stage1_haplotype_view = composite::PhaseHaplotypeView::new(
                 &stage1_snapshot,
                 packed_stage1_snapshot.as_ref(),

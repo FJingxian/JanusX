@@ -49,6 +49,11 @@ use crate::bedmath::{
     decode_plink_bed_hardcall, decode_row_centered_full_lut, decode_row_centered_full_lut_f64,
     decode_subset_row_from_full_scratch, is_identity_indices, packed_byte_lut, SubsetDecodePlan,
 };
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+use crate::blas::{
+    cblas_dgemm_dispatch, rust_sgemm_backend_tag, CblasInt, CBLAS_NO_TRANS, CBLAS_ROW_MAJOR,
+    CBLAS_TRANS,
+};
 use crate::blas::OpenBlasThreadGuard;
 use crate::brent::brent_minimize;
 use crate::decode::decode_standardized_additive_block_from_maf_f32;
@@ -250,6 +255,119 @@ fn grm_scale_and_symmetrize_inplace_f64(grm: &mut [f64], n: usize, inv_scale: f6
             grm[j * n + i] = v;
         }
     }
+}
+
+#[inline]
+fn gblup_should_use_blas_rotate(s: &[f64], n: usize) -> bool {
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    {
+        if n < 64 || s.len() != n || rust_sgemm_backend_tag() == "rust" {
+            return false;
+        }
+        // Preserve legacy scalar summation on flat/equicorrelated spectra (including
+        // both-end outlier spectra where the interior eigenvalues are flat) where
+        // variance components are unidentifiable and Brent is sensitive to ULP order.
+        let scale = s[0].abs().max(s[n - 1].abs());
+        let tol = 1e-10_f64 * (1.0_f64 + scale);
+        (s[n - 2] - s[1]).abs() > tol
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    {
+        let _ = (s, n);
+        false
+    }
+}
+
+fn gblup_rotate_xy_f64(u: &[f64], y_center: &[f64], s: &[f64], n: usize) -> (Vec<f64>, Vec<f64>) {
+    let mut x_rot = vec![0.0_f64; n];
+    let mut y_rot = vec![0.0_f64; n];
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    if gblup_should_use_blas_rotate(s, n) {
+        let mut xy = vec![0.0_f64; n * 2];
+        for r in 0..n {
+            xy[r * 2] = 1.0_f64;
+            xy[r * 2 + 1] = y_center[r];
+        }
+        let mut xy_rot = vec![0.0_f64; n * 2];
+        unsafe {
+            cblas_dgemm_dispatch(
+                CBLAS_ROW_MAJOR,
+                CBLAS_TRANS,
+                CBLAS_NO_TRANS,
+                n as CblasInt,
+                2 as CblasInt,
+                n as CblasInt,
+                1.0_f64,
+                u.as_ptr(),
+                n as CblasInt,
+                xy.as_ptr(),
+                2 as CblasInt,
+                0.0_f64,
+                xy_rot.as_mut_ptr(),
+                2 as CblasInt,
+            );
+        }
+        for k in 0..n {
+            x_rot[k] = xy_rot[k * 2];
+            y_rot[k] = xy_rot[k * 2 + 1];
+        }
+        return (x_rot, y_rot);
+    }
+    let _ = s;
+    for k in 0..n {
+        let mut xk = 0.0_f64;
+        let mut yk = 0.0_f64;
+        for r in 0..n {
+            let urk = u[r * n + k];
+            xk += urk;
+            yk += urk * y_center[r];
+        }
+        x_rot[k] = xk;
+        y_rot[k] = yk;
+    }
+    (x_rot, y_rot)
+}
+
+fn gblup_backproject_alpha_f64(
+    u: &[f64],
+    v_inv: &[f64],
+    r: &[f64],
+    s: &[f64],
+    n: usize,
+) -> Vec<f64> {
+    let mut alpha = vec![0.0_f64; n];
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    if gblup_should_use_blas_rotate(s, n) {
+        let rhs: Vec<f64> = v_inv.iter().zip(r.iter()).map(|(&vi, &ri)| vi * ri).collect();
+        unsafe {
+            cblas_dgemm_dispatch(
+                CBLAS_ROW_MAJOR,
+                CBLAS_NO_TRANS,
+                CBLAS_NO_TRANS,
+                n as CblasInt,
+                1 as CblasInt,
+                n as CblasInt,
+                1.0_f64,
+                u.as_ptr(),
+                n as CblasInt,
+                rhs.as_ptr(),
+                1 as CblasInt,
+                0.0_f64,
+                alpha.as_mut_ptr(),
+                1 as CblasInt,
+            );
+        }
+        return alpha;
+    }
+    let _ = s;
+    for row in 0..n {
+        let mut acc = 0.0_f64;
+        for k in 0..n {
+            acc += u[row * n + k] * (v_inv[k] * r[k]);
+        }
+        alpha[row] = acc;
+    }
+    alpha
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1121,19 +1239,7 @@ fn fit_gblup_reml_from_grm_row_major_f64(
     let (s, u, evd_backend) = symmetric_eigh_f64_row_major(grm_f64, n)?;
     let evd_elapsed = t_evd.elapsed().as_secs_f64();
 
-    let mut x_rot = vec![0.0_f64; n];
-    let mut y_rot = vec![0.0_f64; n];
-    for k in 0..n {
-        let mut xk = 0.0_f64;
-        let mut yk = 0.0_f64;
-        for r in 0..n {
-            let urk = u[r * n + k];
-            xk += urk;
-            yk += urk * y_center[r];
-        }
-        x_rot[k] = xk;
-        y_rot[k] = yk;
-    }
+    let (x_rot, y_rot) = gblup_rotate_xy_f64(&u, &y_center, &s, n);
 
     let v_floor = 1e-12_f64;
     let n_eff = (n - 1) as f64;
@@ -1194,14 +1300,7 @@ fn fit_gblup_reml_from_grm_row_major_f64(
         .ok_or_else(|| "GBLUP REML optimization failed to produce a valid optimum.".to_string())?;
     let lambda = 10.0_f64.powf(best_log10);
 
-    let mut alpha = vec![0.0_f64; n];
-    for row in 0..n {
-        let mut acc = 0.0_f64;
-        for k in 0..n {
-            acc += u[row * n + k] * (v_inv[k] * r[k]);
-        }
-        alpha[row] = acc;
-    }
+    let alpha = gblup_backproject_alpha_f64(&u, &v_inv, &r, &s, n);
 
     let sigma_g2 = rtv_invr / n_eff.max(1.0);
     let sigma_e2 = lambda * sigma_g2;
@@ -1753,19 +1852,7 @@ pub fn gblup_reml_packed_bed<'py>(
                 let (s, u, evd_backend) = symmetric_eigh_f64_row_major(&grm_f64, n)?;
                 let evd_elapsed = t_evd.elapsed().as_secs_f64();
 
-                let mut x_rot = vec![0.0_f64; n];
-                let mut y_rot = vec![0.0_f64; n];
-                for k in 0..n {
-                    let mut xk = 0.0_f64;
-                    let mut yk = 0.0_f64;
-                    for r in 0..n {
-                        let urk = u[r * n + k];
-                        xk += urk;
-                        yk += urk * y_center[r];
-                    }
-                    x_rot[k] = xk;
-                    y_rot[k] = yk;
-                }
+                let (x_rot, y_rot) = gblup_rotate_xy_f64(&u, &y_center, &s, n);
 
                 let v_floor = 1e-12_f64;
                 let n_eff = (n - 1) as f64;
@@ -1830,14 +1917,7 @@ pub fn gblup_reml_packed_bed<'py>(
                     })?;
                 let lambda = 10.0_f64.powf(best_log10);
 
-                let mut alpha = vec![0.0_f64; n];
-                for row in 0..n {
-                    let mut acc = 0.0_f64;
-                    for k in 0..n {
-                        acc += u[row * n + k] * (v_inv[k] * r[k]);
-                    }
-                    alpha[row] = acc;
-                }
+                let alpha = gblup_backproject_alpha_f64(&u, &v_inv, &r, &s, n);
 
                 let sigma_g2 = rtv_invr / n_eff.max(1.0);
                 let sigma_e2 = lambda * sigma_g2;
@@ -2509,19 +2589,7 @@ pub fn gblup_reml_packed_bed<'py>(
                 let (s, u, evd_backend) = symmetric_eigh_f64_row_major(&grm_f64, n)?;
                 let evd_elapsed = t_evd.elapsed().as_secs_f64();
 
-                let mut x_rot = vec![0.0_f64; n];
-                let mut y_rot = vec![0.0_f64; n];
-                for k in 0..n {
-                    let mut xk = 0.0_f64;
-                    let mut yk = 0.0_f64;
-                    for r in 0..n {
-                        let urk = u[r * n + k];
-                        xk += urk; // intercept column is all ones in centered space
-                        yk += urk * y_center[r];
-                    }
-                    x_rot[k] = xk;
-                    y_rot[k] = yk;
-                }
+                let (x_rot, y_rot) = gblup_rotate_xy_f64(&u, &y_center, &s, n);
 
                 let v_floor = 1e-12_f64;
                 let n_eff = (n - 1) as f64;
@@ -2585,14 +2653,7 @@ pub fn gblup_reml_packed_bed<'py>(
                     })?;
                 let lambda = 10.0_f64.powf(best_log10);
 
-                let mut alpha = vec![0.0_f64; n];
-                for row in 0..n {
-                    let mut acc = 0.0_f64;
-                    for k in 0..n {
-                        acc += u[row * n + k] * (v_inv[k] * r[k]);
-                    }
-                    alpha[row] = acc;
-                }
+                let alpha = gblup_backproject_alpha_f64(&u, &v_inv, &r, &s, n);
 
                 let sigma_g2 = rtv_invr / n_eff.max(1.0);
                 let sigma_e2 = lambda * sigma_g2;
@@ -3316,5 +3377,27 @@ mod pgen_stream_tests {
         assert_eq!(rows, [0x78, 0x78, 0x00]);
 
         fs::remove_dir_all(dir).expect("remove temporary PGEN directory");
+    }
+
+    #[test]
+    fn gblup_spectrum_guard_rejects_flat_middle_with_both_end_outliers() {
+        let mut s_both_outliers = vec![1.0_f64; 64];
+        s_both_outliers[0] = 0.05;
+        s_both_outliers[63] = 5.0;
+        assert!(!super::gblup_should_use_blas_rotate(&s_both_outliers, 64));
+
+        let mut s_high_outlier = vec![1.0_f64; 64];
+        s_high_outlier[63] = 5.0;
+        assert!(!super::gblup_should_use_blas_rotate(&s_high_outlier, 64));
+
+        let s_small: Vec<f64> = (0..16).map(|i| 0.1 + i as f64).collect();
+        assert!(!super::gblup_should_use_blas_rotate(&s_small, 16));
+
+        let s_spread: Vec<f64> = (0..64).map(|i| 0.1 + (i as f64) * 0.2).collect();
+        #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+        let expected = crate::blas::rust_sgemm_backend_tag() != "rust";
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+        let expected = false;
+        assert_eq!(super::gblup_should_use_blas_rotate(&s_spread, 64), expected);
     }
 }

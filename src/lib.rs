@@ -98,6 +98,7 @@ mod gffanno;
 mod gfreader;
 #[path = "io/gload.rs"]
 mod gload;
+use gload::{gwas_memload_clear, gwas_memload_register};
 #[path = "io/gmerge.rs"]
 mod gmerge;
 
@@ -569,6 +570,8 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(packed_mtm_f64, m)?)?;
     m.add_function(wrap_pyfunction!(farmcpu_q_packed_grm_pca_f32, m)?)?;
     m.add_function(wrap_pyfunction!(farmcpu_packed_to_tsv, m)?)?;
+    m.add_function(wrap_pyfunction!(gwas_memload_register, m)?)?;
+    m.add_function(wrap_pyfunction!(gwas_memload_clear, m)?)?;
     m.add_function(wrap_pyfunction!(gwas_packed_unified_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(gwas_trait_model_dispatch_v2, m)?)?;
     m.add_function(wrap_pyfunction!(gwas_trait_model_schedule, m)?)?;

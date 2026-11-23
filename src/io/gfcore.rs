@@ -2687,6 +2687,7 @@ pub struct BedSnpIter {
     pread_buffer: Vec<u8>,
     bed_len: usize,
     bed_file: Option<File>,
+    resident: Option<Arc<crate::gload::ResidentPackedBed>>,
     pgen_source: Option<Arc<Mutex<PgenIterSource>>>,
     pgen_window: Vec<u8>,
     pgen_window_start: usize,
@@ -2858,6 +2859,7 @@ impl BedSnpIter {
             pread_buffer: Vec::new(),
             bed_len: 0,
             bed_file: None,
+            resident: None,
             pgen_source: Some(pgen_source),
             pgen_window: Vec::new(),
             pgen_window_start: 0,
@@ -2922,6 +2924,20 @@ impl BedSnpIter {
     ) -> Result<Self, String> {
         let samples = read_fam(prefix)?;
         let sites = read_bim(prefix)?;
+        let n_samples = samples.len();
+        if let Some(iter) = Self::try_new_resident(
+            prefix,
+            &samples,
+            &sites,
+            n_samples,
+            maf,
+            miss,
+            fill_missing,
+            apply_het_filter,
+            het_threshold,
+        )? {
+            return Ok(iter);
+        }
         if let Some(iter) = Self::try_new_pgen(
             prefix,
             &samples,
@@ -2934,7 +2950,6 @@ impl BedSnpIter {
         )? {
             return Ok(iter);
         }
-        let n_samples = samples.len();
         let (file, bed_len, bytes_per_snp, n_snps) =
             Self::open_bed_and_infer_shape(prefix, n_samples)?;
         if n_snps != sites.len() {
@@ -2958,6 +2973,7 @@ impl BedSnpIter {
             pread_buffer: Vec::new(),
             bed_len,
             bed_file: None,
+            resident: None,
             pgen_source: None,
             pgen_window: Vec::new(),
             pgen_window_start: 0,
@@ -2989,6 +3005,20 @@ impl BedSnpIter {
         }
         let samples = read_fam(prefix)?;
         let sites = read_bim(prefix)?;
+        let n_samples = samples.len();
+        if let Some(iter) = Self::try_new_resident(
+            prefix,
+            &samples,
+            &sites,
+            n_samples,
+            maf,
+            miss,
+            fill_missing,
+            apply_het_filter,
+            het_threshold,
+        )? {
+            return Ok(iter);
+        }
         if let Some(iter) = Self::try_new_pgen(
             prefix,
             &samples,
@@ -3001,7 +3031,6 @@ impl BedSnpIter {
         )? {
             return Ok(iter);
         }
-        let n_samples = samples.len();
         let (file, bed_len, bytes_per_snp, n_snps) =
             Self::open_bed_and_infer_shape(prefix, n_samples)?;
         if n_snps != sites.len() {
@@ -3028,6 +3057,7 @@ impl BedSnpIter {
             pread_buffer: Vec::new(),
             bed_len,
             bed_file: Some(file),
+            resident: None,
             pgen_source: None,
             pgen_window: Vec::new(),
             pgen_window_start: 0,
@@ -3060,6 +3090,20 @@ impl BedSnpIter {
         }
         let samples = read_fam(prefix)?;
         let sites = read_bim(prefix)?;
+        let n_samples = samples.len();
+        if let Some(iter) = Self::try_new_resident(
+            prefix,
+            &samples,
+            &sites,
+            n_samples,
+            maf,
+            miss,
+            fill_missing,
+            apply_het_filter,
+            het_threshold,
+        )? {
+            return Ok(iter);
+        }
         if let Some(iter) = Self::try_new_pgen(
             prefix,
             &samples,
@@ -3072,7 +3116,6 @@ impl BedSnpIter {
         )? {
             return Ok(iter);
         }
-        let n_samples = samples.len();
         let (file, bed_len, bytes_per_snp, n_snps) =
             Self::open_bed_and_infer_shape(prefix, n_samples)?;
         if n_snps != sites.len() {
@@ -3097,6 +3140,7 @@ impl BedSnpIter {
             pread_buffer: Vec::new(),
             bed_len,
             bed_file: Some(file),
+            resident: None,
             pgen_source: None,
             pgen_window: Vec::new(),
             pgen_window_start: 0,
@@ -3118,6 +3162,11 @@ impl BedSnpIter {
     /// parses FAM count and BED shape, skips full BIM metadata parse.
     pub fn new_for_grm(prefix: &str) -> Result<Self, String> {
         let n_samples = count_fam_samples(prefix)?;
+        if let Some(iter) =
+            Self::try_new_resident(prefix, &[], &[], n_samples, 0.0, 1.0, false, false, 0.02)?
+        {
+            return Ok(iter);
+        }
         if let Some(iter) = Self::try_new_pgen(prefix, &[], &[], 0.0, 1.0, false, false, 0.02)? {
             return Ok(iter);
         }
@@ -3137,6 +3186,7 @@ impl BedSnpIter {
             pread_buffer: Vec::new(),
             bed_len,
             bed_file: None,
+            resident: None,
             pgen_source: None,
             pgen_window: Vec::new(),
             pgen_window_start: 0,
@@ -3170,6 +3220,65 @@ impl BedSnpIter {
         Self::new_for_grm_window_count_mode(prefix, mmap_window_mb, false)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn try_new_resident(
+        prefix: &str,
+        samples: &[String],
+        sites: &[SiteInfo],
+        n_samples: usize,
+        maf: f32,
+        miss: f32,
+        fill_missing: bool,
+        apply_het_filter: bool,
+        het_threshold: f32,
+    ) -> Result<Option<Self>, String> {
+        let Some(resident) = crate::gload::lookup_resident_packed_bed(prefix) else {
+            return Ok(None);
+        };
+        if resident.n_samples_full != n_samples {
+            return Ok(None);
+        }
+        if !sites.is_empty() && resident.n_snps != sites.len() {
+            return Err(format!(
+                "BED/BIM SNP count mismatch: bed={}, bim={}",
+                resident.n_snps,
+                sites.len()
+            ));
+        }
+        let n_snps = resident.n_snps;
+        let bytes_per_snp = resident.bytes_per_snp;
+        let bed_len = BED_HEADER_LEN.saturating_add(resident.packed.len());
+        Ok(Some(Self {
+            prefix: prefix.to_string(),
+            samples: samples.to_vec(),
+            sites: sites.to_vec(),
+            mmap: None,
+            mmap_offset: 0,
+            window_snps: None,
+            window_start_snp: 0,
+            window_len_snps: n_snps,
+            pread: false,
+            pread_buffer: Vec::new(),
+            bed_len,
+            bed_file: None,
+            resident: Some(resident),
+            pgen_source: None,
+            pgen_window: Vec::new(),
+            pgen_window_start: 0,
+            pgen_window_rows: 0,
+            pgen_window_max_rows: 0,
+            n_samples,
+            n_snps,
+            bytes_per_snp,
+            cur: 0,
+            maf,
+            miss,
+            fill_missing,
+            apply_het_filter,
+            het_threshold,
+        }))
+    }
+
     fn new_for_grm_window_count_mode(
         prefix: &str,
         mmap_window_mb: usize,
@@ -3179,6 +3288,11 @@ impl BedSnpIter {
             return Err("mmap_window_mb must be > 0".into());
         }
         let n_samples = count_fam_samples(prefix)?;
+        if let Some(iter) =
+            Self::try_new_resident(prefix, &[], &[], n_samples, 0.0, 1.0, false, false, 0.02)?
+        {
+            return Ok(iter);
+        }
         if let Some(iter) = Self::try_new_pgen_with_count_mode(
             prefix,
             &[],
@@ -3211,6 +3325,7 @@ impl BedSnpIter {
             pread_buffer: Vec::new(),
             bed_len,
             bed_file: Some(file),
+            resident: None,
             pgen_source: None,
             pgen_window: Vec::new(),
             pgen_window_start: 0,
@@ -3307,6 +3422,11 @@ impl BedSnpIter {
     }
 
     fn bed_snp_bytes(&self, snp_idx: usize) -> Option<&[u8]> {
+        if let Some(resident) = self.resident.as_ref() {
+            let start = snp_idx.checked_mul(self.bytes_per_snp)?;
+            let end = start.checked_add(self.bytes_per_snp)?;
+            return resident.packed.get(start..end);
+        }
         let offset = BED_HEADER_LEN + snp_idx * self.bytes_per_snp;
         if let Some(_window_snps) = self.window_snps {
             let window_end = self.window_start_snp + self.window_len_snps;

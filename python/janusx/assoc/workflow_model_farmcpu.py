@@ -123,10 +123,7 @@ def _farmcpu_compact_retry_enabled() -> bool:
 def _normalize_packed_ctx_for_farmcpu_cache(
     packed_obj: dict[str, object],
 ) -> dict[str, object]:
-    packed_num = np.ascontiguousarray(
-        np.asarray(packed_obj["packed"], dtype=np.uint8)
-    )
-    packed_rows = int(packed_num.shape[0])
+    packed_raw = packed_obj.get("packed", None)
     packed_n = int(packed_obj["n_samples"])
 
     def _raw_vec(key: str, dtype) -> np.ndarray:
@@ -140,7 +137,58 @@ def _normalize_packed_ctx_for_farmcpu_cache(
         np.asarray(packed_obj.get("af", packed_obj["maf"]), dtype=np.float32).reshape(-1),
         dtype=np.float32,
     )
+    if packed_raw is None:
+        row_idx_obj = packed_obj.get("row_indices", packed_obj.get("active_row_idx"))
+        if row_idx_obj is None:
+            row_idx_obj = np.arange(int(maf_raw.shape[0]), dtype=np.int64)
+        row_idx = np.ascontiguousarray(
+            np.asarray(row_idx_obj, dtype=np.int64).reshape(-1),
+            dtype=np.int64,
+        )
+        active_rows = int(row_idx.shape[0])
+        if active_rows == 0:
+            raise ValueError("FarmCPU stream cache row index set is empty.")
+        source_row_idx = np.ascontiguousarray(
+            np.asarray(packed_obj.get("source_row_indices", row_idx), dtype=np.int64).reshape(-1),
+            dtype=np.int64,
+        )
+        if int(source_row_idx.shape[0]) != active_rows or int(source_row_idx.min()) < 0:
+            raise ValueError("FarmCPU stream cache source_row_indices are invalid.")
+        row_flip_obj = packed_obj.get("row_flip")
+        if row_flip_obj is None:
+            row_flip_obj = np.zeros(active_rows, dtype=np.bool_)
+        row_flip_arr = np.ascontiguousarray(
+            np.asarray(row_flip_obj, dtype=np.bool_).reshape(-1),
+            dtype=np.bool_,
+        )
+        if (
+            int(miss_raw.shape[0]) != active_rows
+            or int(maf_raw.shape[0]) != active_rows
+            or int(row_flip_arr.shape[0]) != active_rows
+        ):
+            raise ValueError(
+                "FarmCPU stream cache metadata length mismatch: "
+                f"miss={int(miss_raw.shape[0])}, maf={int(maf_raw.shape[0])}, "
+                f"row_flip={int(row_flip_arr.shape[0])}, active_rows={active_rows}."
+            )
+        return {
+            "packed": None,
+            "missing_rate": miss_raw,
+            "maf": maf_raw,
+            "row_flip": row_flip_arr,
+            "row_indices": row_idx,
+            "source_row_indices": source_row_idx,
+            "active_row_idx": row_idx,
+            "site_keep": None,
+            "packed_filter_mode": "stream",
+            "n_samples": packed_n,
+            "source_prefix": packed_obj.get("source_prefix"),
+        }
 
+    packed_num = np.ascontiguousarray(
+        np.asarray(packed_raw, dtype=np.uint8)
+    )
+    packed_rows = int(packed_num.shape[0])
     row_flip_obj = packed_obj.get("row_flip")
     if row_flip_obj is None:
         row_flip_obj = np.zeros(packed_rows, dtype=np.bool_)
@@ -303,11 +351,32 @@ def build_qmatrix_farmcpu(
         packed_ctx_obj: dict[str, object],
         qdim: int = 0,
     ) -> np.ndarray:
+        packed_raw = packed_ctx_obj.get("packed", None)
+        if packed_raw is None:
+            src_prefix = str(packed_ctx_obj.get("source_prefix") or genofile or "").strip()
+            if not src_prefix:
+                raise RuntimeError("FarmCPU streaming GRM build requires a genotype source prefix.")
+            if not hasattr(jxrs, "grm_stream_bed_f32"):
+                raise RuntimeError("rust symbol grm_stream_bed_f32 is unavailable.")
+            grm_raw, _eff_m, _n_grm = jxrs.grm_stream_bed_f32(
+                src_prefix,
+                1,
+                float(maf_threshold),
+                float(max_missing_rate),
+                float(het_threshold),
+                bool(snps_only),
+                max(1, int(chunk_size)),
+                max(1, int(threads)),
+                None,
+                max(1, int(chunk_size)),
+                None,
+            )
+            return np.asarray(grm_raw, dtype="float32")
         if not hasattr(jxrs, "grm_packed_f32"):
             raise RuntimeError("rust symbol grm_packed_f32 is unavailable.")
 
         packed = np.ascontiguousarray(
-            np.asarray(packed_ctx_obj["packed"], dtype=np.uint8),
+            np.asarray(packed_raw, dtype=np.uint8),
             dtype=np.uint8,
         )
         maf = np.ascontiguousarray(
@@ -729,102 +798,110 @@ def run_farmcpu_fullmem(
     ) -> tuple[dict[str, object], object]:
         from janusx.assoc.workflow_model_packed import (
             _coerce_trait_prepared_scan_meta,
+            _filter_trait_prepared_meta_by_bimranges,
             _gwas_logic_meta_global_cached,
-            _prepare_packed_bed_once_for_gwas,
+            _gwas_logic_meta_selected_cached,
         )
 
-        use_fused_qc = bool(
-            fused_qc_load
-            and (
-                bool(getattr(args, "global_stats", False))
-                or stats_sample_indices is not None
-            )
-        )
+        packed_load_t0 = time.monotonic()
         prepared_scan_meta = _coerce_trait_prepared_scan_meta(trait_prepared_meta)
         effective_scan_meta = (
             trait_prepared_meta if prepared_scan_meta is not None else None
         )
-        if use_fused_qc:
-            effective_scan_meta = None
-        elif effective_scan_meta is None:
-            effective_scan_meta = _gwas_logic_meta_global_cached(
-                str(packed_prefix),
-                maf_threshold=float(args.maf),
-                max_missing_rate=float(args.geno),
-                het_threshold=float(args.het),
-                snps_only=bool(snps_only),
-                outprefix=(
-                    outprefix_base
-                    if outprefix_base != ""
-                    else None
-                ),
+        if effective_scan_meta is None:
+            if (
+                stats_sample_indices is not None
+                and not bool(getattr(args, "global_stats", False))
+            ):
+                effective_scan_meta = _gwas_logic_meta_selected_cached(
+                    str(packed_prefix),
+                    sample_indices=np.asarray(stats_sample_indices, dtype=np.int64).reshape(-1),
+                    maf_threshold=float(args.maf),
+                    max_missing_rate=float(args.geno),
+                    het_threshold=float(args.het),
+                    snps_only=bool(snps_only),
+                    outprefix=(outprefix_base if outprefix_base != "" else None),
+                    logger=logger,
+                    threads=int(getattr(args, "thread", 1) or 1),
+                    use_cache=False,
+                )
+            else:
+                effective_scan_meta = _gwas_logic_meta_global_cached(
+                    str(packed_prefix),
+                    maf_threshold=float(args.maf),
+                    max_missing_rate=float(args.geno),
+                    het_threshold=float(args.het),
+                    snps_only=bool(snps_only),
+                    outprefix=(outprefix_base if outprefix_base != "" else None),
+                    logger=logger,
+                    use_spinner=bool(use_spinner),
+                    emit_status=bool(emit_status),
+                )
+
+        scan_bimranges = list(getattr(args, "bimrange_ranges", []) or [])
+        if scan_bimranges:
+            effective_scan_meta = _filter_trait_prepared_meta_by_bimranges(
+                effective_scan_meta,
+                prefix=str(packed_prefix),
+                bimranges=scan_bimranges,
                 logger=logger,
-                use_spinner=bool(use_spinner),
-                emit_status=bool(emit_status),
+                route_label="FarmCPU",
             )
 
-        packed_load_t0 = time.monotonic()
-        _prefix_loaded, _full_ids_loaded, packed_ctx_loaded, _sites_meta = _prepare_packed_bed_once_for_gwas(
-            genofile=str(packed_prefix),
-            maf_threshold=float(args.maf),
-            max_missing_rate=float(args.geno),
-            het_threshold=float(args.het),
-            snps_only=bool(snps_only),
-            use_spinner=bool(use_spinner),
-            preloaded_packed=None,
-            load_site_meta=False,
-            status_label=str(status_label),
-            trait_prepared_meta=effective_scan_meta,
-            emit_status=bool(emit_status),
-            fused_qc_load=bool(use_fused_qc),
-            stats_sample_indices=stats_sample_indices,
-            bimranges=list(getattr(args, "bimrange_ranges", []) or []),
-        )
-        full_ids_loaded = np.asarray(_full_ids_loaded, dtype=str).reshape(-1)
-        if (
-            int(expected_n_samples) > 0
-            and int(full_ids_loaded.shape[0]) > 0
-            and int(full_ids_loaded.shape[0]) != int(expected_n_samples)
-        ):
-            raise ValueError(
-                "FarmCPU packed sample count mismatch: "
-                f"expected={int(expected_n_samples)}, loaded={int(full_ids_loaded.shape[0])}."
-            )
-        _log_file_only(
-            logger,
-            logging.INFO,
-            f"{status_label} ({int(expected_n_samples)} samples) "
-            f"[{format_elapsed(time.monotonic() - packed_load_t0)}]",
-        )
         row_idx_loaded = np.ascontiguousarray(
-            np.asarray(
-                packed_ctx_loaded.get(
-                    "row_indices",
-                    packed_ctx_loaded.get("active_row_idx", []),
-                ),
-                dtype=np.int64,
-            ).reshape(-1),
+            np.asarray(effective_scan_meta["row_indices"], dtype=np.int64).reshape(-1),
             dtype=np.int64,
         )
         if int(row_idx_loaded.shape[0]) == 0:
-            raise ValueError("FarmCPU packed context produced zero active SNPs.")
-        source_row_idx_loaded = np.ascontiguousarray(
-            np.asarray(
-                packed_ctx_loaded.get("source_row_indices", row_idx_loaded),
-                dtype=np.int64,
-            ).reshape(-1),
-            dtype=np.int64,
+            raise ValueError("FarmCPU streaming context produced zero active SNPs.")
+        miss_loaded = np.ascontiguousarray(
+            np.asarray(effective_scan_meta["missing_rate"], dtype=np.float32).reshape(-1),
+            dtype=np.float32,
         )
-        if int(source_row_idx_loaded.shape[0]) != int(row_idx_loaded.shape[0]):
+        maf_loaded = np.ascontiguousarray(
+            np.asarray(
+                effective_scan_meta.get("af", effective_scan_meta["maf"]),
+                dtype=np.float32,
+            ).reshape(-1),
+            dtype=np.float32,
+        )
+        row_flip_loaded = np.ascontiguousarray(
+            np.asarray(effective_scan_meta["row_flip"], dtype=np.bool_).reshape(-1),
+            dtype=np.bool_,
+        )
+        n_samples_meta = int(effective_scan_meta.get("n_samples_full", 0) or 0)
+        if (
+            int(expected_n_samples) > 0
+            and n_samples_meta > 0
+            and n_samples_meta != int(expected_n_samples)
+        ):
             raise ValueError(
-                "FarmCPU packed context source-row mapping length mismatch: "
-                f"source_rows={int(source_row_idx_loaded.shape[0])}, "
-                f"active_rows={int(row_idx_loaded.shape[0])}."
+                "FarmCPU stream sample count mismatch: "
+                f"expected={int(expected_n_samples)}, meta={n_samples_meta}."
             )
+        packed_ctx_loaded = {
+            "packed": None,
+            "missing_rate": miss_loaded,
+            "maf": maf_loaded,
+            "row_flip": row_flip_loaded,
+            "row_indices": row_idx_loaded,
+            "source_row_indices": row_idx_loaded,
+            "active_row_idx": row_idx_loaded,
+            "site_keep": None,
+            "packed_filter_mode": "stream",
+            "n_samples": int(expected_n_samples if int(expected_n_samples) > 0 else n_samples_meta),
+            "source_prefix": str(packed_prefix),
+        }
+        _log_file_only(
+            logger,
+            logging.INFO,
+            f"{status_label} (stream, {int(packed_ctx_loaded['n_samples'])} samples) "
+            f"[{format_elapsed(time.monotonic() - packed_load_t0)}]",
+        )
         ref_alt_loaded = _make_deferred_bim_metadata(
             str(packed_prefix),
-            source_row_idx_loaded,
-            n_markers=int(source_row_idx_loaded.shape[0]),
+            row_idx_loaded,
+            n_markers=int(row_idx_loaded.shape[0]),
         )
         return packed_ctx_loaded, ref_alt_loaded
 
@@ -1385,7 +1462,7 @@ def run_farmcpu_fullmem(
             rust_stage1_secs: Union[float, None] = None
             rust_stage2_secs: Union[float, None] = None
             try:
-                packed_arr = packed_payload["packed"]
+                packed_arr = packed_payload.get("packed", None)
                 row_flip_arr = packed_payload["row_flip"]
                 maf_arr = packed_payload["maf"]
                 sample_idx_use = (
@@ -1418,8 +1495,12 @@ def run_farmcpu_fullmem(
                     ).reshape(-1),
                     dtype=np.int64,
                 )
-                packed_rows = int(np.asarray(packed_arr, dtype=np.uint8).shape[0])
                 meta_rows = int(row_idx_arr.shape[0])
+                packed_rows = (
+                    int(np.asarray(packed_arr, dtype=np.uint8).shape[0])
+                    if packed_arr is not None
+                    else meta_rows
+                )
                 if int(source_row_idx_arr.shape[0]) != meta_rows:
                     raise ValueError(
                         "FarmCPU packed source row mapping length mismatch: "
@@ -1519,7 +1600,8 @@ def run_farmcpu_fullmem(
                     except Exception as ex:
                         msg = str(ex)
                         compact_retry_candidate = (
-                            ("metadata length mismatch" in msg or "row metadata length mismatch" in msg or "row_indices[" in msg)
+                            packed_arr is not None
+                            and ("metadata length mismatch" in msg or "row metadata length mismatch" in msg or "row_indices[" in msg)
                             and int(packed_rows) != int(meta_rows)
                             and int(row_idx_arr.shape[0]) == int(meta_rows)
                         )

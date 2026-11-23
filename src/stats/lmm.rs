@@ -864,10 +864,14 @@ where
     if bytes_per_snp == 0 {
         return Err("bytes_per_snp is zero".to_string());
     }
-    let pgen_source = crate::pgen::path_uses_pgen(bed_prefix);
+    let resident_bed = crate::gload::lookup_resident_packed_bed(bed_prefix)
+        .filter(|res| res.n_samples_full == n_samples_full && res.bytes_per_snp == bytes_per_snp);
+    let pgen_source = resident_bed.is_none() && crate::pgen::path_uses_pgen(bed_prefix);
     let mut bed_window = None;
     let mut full_mmap = None;
-    let n_snps = if pgen_source {
+    let n_snps = if let Some(res) = resident_bed.as_ref() {
+        res.n_snps
+    } else if pgen_source {
         crate::pgen::count_pgen_variants(bed_prefix, n_samples_full)?
     } else {
         let bed_path = format!("{bed_prefix}.bed");
@@ -1031,7 +1035,11 @@ where
                 chunk_start = chunk_end;
                 return chunk_start < total_scan_units;
             }
-            if pgen_source {
+            if let Some(res) = resident_bed.as_ref() {
+                let src_start = source_rows[0];
+                let src_end = source_rows[source_rows.len() - 1] + 1;
+                &res.packed[src_start * bytes_per_snp..src_end * bytes_per_snp]
+            } else if pgen_source {
                 let src_start = source_rows[0];
                 let src_end = source_rows[source_rows.len() - 1] + 1;
                 let rows = src_end - src_start;
@@ -1080,6 +1088,8 @@ where
                     }
                 }
             }
+        } else if let Some(res) = resident_bed.as_ref() {
+            &res.packed[chunk_start * bytes_per_snp..chunk_end * bytes_per_snp]
         } else if pgen_source {
             let rows = chunk_end - chunk_start;
             pgen_packed.resize(rows * bytes_per_snp, 0);

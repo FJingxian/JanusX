@@ -3341,12 +3341,24 @@ pub fn lm_pgen_to_tsv_f32<'py>(
             sample_indices.len()
         )));
     }
-    let n_snps = crate::pgen::count_pgen_variants(&norm_prefix, n_samples_full)
-        .map_err(PyRuntimeError::new_err)?;
     let bytes_per_snp = n_samples_full.div_ceil(4);
-    let pgen_path = std::path::PathBuf::from(&pgen_path_str);
-    let mut reader = crate::pgen::PgenReader::open(&pgen_path, n_samples_full, n_snps)
-        .map_err(PyRuntimeError::new_err)?;
+    let resident_bed = crate::gload::lookup_resident_packed_bed(&pgen_path_str)
+        .filter(|res| res.n_samples_full == n_samples_full && res.bytes_per_snp == bytes_per_snp);
+    let n_snps = if let Some(res) = resident_bed.as_ref() {
+        res.n_snps
+    } else {
+        crate::pgen::count_pgen_variants(&norm_prefix, n_samples_full)
+            .map_err(PyRuntimeError::new_err)?
+    };
+    let mut reader = if resident_bed.is_none() {
+        let pgen_path = std::path::PathBuf::from(&pgen_path_str);
+        Some(
+            crate::pgen::PgenReader::open(&pgen_path, n_samples_full, n_snps)
+                .map_err(PyRuntimeError::new_err)?,
+        )
+    } else {
+        None
+    };
     let mut bim_reader = BimChunkReader::open(&pgen_path_str).map_err(PyRuntimeError::new_err)?;
 
     let decode_plan = AdditiveDecodePlan::from_sample_indices(n_samples_full, &sample_indices);
@@ -3383,7 +3395,11 @@ pub fn lm_pgen_to_tsv_f32<'py>(
             .map_err(PyRuntimeError::new_err)?;
 
         let mut chunk_start = 0usize;
-        let mut pgen_packed = vec![0u8; scan_chunk_snps.saturating_mul(bytes_per_snp)];
+        let mut pgen_packed = if resident_bed.is_some() {
+            Vec::new()
+        } else {
+            vec![0u8; scan_chunk_snps.saturating_mul(bytes_per_snp)]
+        };
         let producer_err = Arc::new(OnceLock::<String>::new());
         let producer_err_bg = Arc::clone(&producer_err);
         let producer = |chunk: &mut LmUnifiedStreamingChunk| -> bool {
@@ -3398,14 +3414,25 @@ pub fn lm_pgen_to_tsv_f32<'py>(
             let chunk_end = (chunk_start + scan_chunk_snps).min(n_snps);
             let rows = chunk_end - chunk_start;
             let byte_len = rows.saturating_mul(bytes_per_snp);
-            if pgen_packed.len() < byte_len {
-                pgen_packed.resize(byte_len, 0);
-            }
-            if let Err(e) = reader.read_source_block(chunk_start, rows, &mut pgen_packed[..byte_len])
-            {
-                let _ = producer_err_bg.set(e);
-                return false;
-            }
+            let chunk_packed: &[u8] = if let Some(res) = resident_bed.as_ref() {
+                let byte_start = chunk_start.saturating_mul(bytes_per_snp);
+                &res.packed[byte_start..byte_start + byte_len]
+            } else {
+                if pgen_packed.len() < byte_len {
+                    pgen_packed.resize(byte_len, 0);
+                }
+                let Some(pgen_reader) = reader.as_mut() else {
+                    let _ = producer_err_bg.set("internal error: missing PGEN reader".to_string());
+                    return false;
+                };
+                if let Err(e) =
+                    pgen_reader.read_source_block(chunk_start, rows, &mut pgen_packed[..byte_len])
+                {
+                    let _ = producer_err_bg.set(e);
+                    return false;
+                }
+                &pgen_packed[..byte_len]
+            };
             let chunk_sites = match bim_reader.read_range(chunk_start, chunk_end) {
                 Ok(sites) => sites,
                 Err(e) => {
@@ -3413,7 +3440,6 @@ pub fn lm_pgen_to_tsv_f32<'py>(
                     return false;
                 }
             };
-            let chunk_packed = &pgen_packed[..byte_len];
             let count_rows = || -> Vec<Option<LmUnifiedSnpCounts>> {
                 (0..rows)
                     .into_par_iter()

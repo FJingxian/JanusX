@@ -13,9 +13,11 @@
 use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use memmap2::{Mmap, MmapOptions};
+use pyo3::exceptions::PyRuntimeError;
+use pyo3::prelude::*;
 use rayon::prelude::*;
 
 use crate::bedmath::{decode_mean_imputed_additive_packed_block_rows_f32, packed_byte_lut};
@@ -398,6 +400,275 @@ pub trait GenotypeMatrix: Send + Sync {
 /// Direct source-order BED reader with a caller-owned packed destination.
 /// It validates the file header and row shape once, then reads only requested
 /// source rows into the supplied buffer.
+/// Single process-wide resident 2-bit packed BED buffer populated by `-memload`.
+/// Keeping strictly one slot guarantees at most one packed BED copy in RAM.
+pub(crate) struct ResidentPackedBed {
+    pub(crate) key: String,
+    pub(crate) n_samples_full: usize,
+    pub(crate) n_snps: usize,
+    pub(crate) bytes_per_snp: usize,
+    pub(crate) packed: Vec<u8>,
+}
+
+struct ActiveResidentSlot {
+    entry: Arc<ResidentPackedBed>,
+    owners: std::collections::HashSet<u64>,
+}
+
+struct ResidentSlotState {
+    active: Option<ActiveResidentSlot>,
+    last_weak: std::sync::Weak<ResidentPackedBed>,
+}
+
+fn resident_packed_bed_slot() -> &'static Mutex<ResidentSlotState> {
+    static SLOT: OnceLock<Mutex<ResidentSlotState>> = OnceLock::new();
+    SLOT.get_or_init(|| {
+        Mutex::new(ResidentSlotState {
+            active: None,
+            last_weak: std::sync::Weak::new(),
+        })
+    })
+}
+
+fn resident_packed_bed_load_lock() -> &'static Mutex<()> {
+    static LOAD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOAD_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn next_resident_owner_token() -> u64 {
+    static NEXT_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn resolve_resident_source(prefix: &str) -> (bool, String, String) {
+    let is_pgen = crate::pgen::path_uses_pgen(prefix);
+    let kind = if is_pgen { "pgen" } else { "bed" };
+    let mut trimmed = prefix.trim().to_string();
+    let lower = trimmed.to_ascii_lowercase();
+    for suffix in [
+        ".pvar.zst",
+        ".pgen",
+        ".pvar",
+        ".psam",
+        ".bed",
+        ".bim",
+        ".fam",
+    ] {
+        if lower.ends_with(suffix) {
+            trimmed.truncate(trimmed.len().saturating_sub(suffix.len()));
+            break;
+        }
+    }
+    let path = Path::new(&trimmed);
+    let canon_prefix = if let Some(name) = path.file_name() {
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+        let parent_dir = parent.unwrap_or_else(|| Path::new("."));
+        if let Ok(canon_parent) = std::fs::canonicalize(parent_dir) {
+            canon_parent.join(name).to_string_lossy().to_string()
+        } else if let Ok(cwd) = std::env::current_dir() {
+            cwd.join(path).to_string_lossy().to_string()
+        } else {
+            trimmed
+        }
+    } else if let Ok(canon) = std::fs::canonicalize(path) {
+        canon.to_string_lossy().to_string()
+    } else {
+        trimmed
+    };
+    let key = format!("{kind}:{canon_prefix}");
+    (is_pgen, canon_prefix, key)
+}
+
+pub(crate) fn resident_packed_bed_key(prefix: &str) -> String {
+    resolve_resident_source(prefix).2
+}
+
+pub(crate) fn lookup_resident_packed_bed(prefix: &str) -> Option<Arc<ResidentPackedBed>> {
+    let key = resident_packed_bed_key(prefix);
+    let guard = resident_packed_bed_slot().lock().ok()?;
+    guard
+        .active
+        .as_ref()
+        .filter(|state| state.entry.key == key)
+        .map(|state| Arc::clone(&state.entry))
+}
+
+pub(crate) fn clear_resident_packed_bed(token: Option<u64>) {
+    if let Ok(mut guard) = resident_packed_bed_slot().lock() {
+        match token {
+            None => {
+                if let Some(prev) = guard.active.take() {
+                    guard.last_weak = Arc::downgrade(&prev.entry);
+                }
+            }
+            Some(tok) => {
+                let should_clear = if let Some(state) = guard.active.as_mut() {
+                    state.owners.remove(&tok);
+                    state.owners.is_empty()
+                } else {
+                    false
+                };
+                if should_clear {
+                    if let Some(prev) = guard.active.take() {
+                        guard.last_weak = Arc::downgrade(&prev.entry);
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn load_resident_packed_bed(
+    prefix: &str,
+    threads: usize,
+) -> Result<(Arc<ResidentPackedBed>, u64), String> {
+    // Serialize concurrent registrations so two threads never allocate two full
+    // packed buffers at the same time.
+    let _load_guard = resident_packed_bed_load_lock()
+        .lock()
+        .map_err(|_| "resident packed BED load lock was poisoned".to_string())?;
+    let (pgen_source, canon_prefix, key) = resolve_resident_source(prefix);
+    let token = next_resident_owner_token();
+    {
+        let mut guard = resident_packed_bed_slot()
+            .lock()
+            .map_err(|_| "resident packed BED cache lock was poisoned".to_string())?;
+        if let Some(state) = guard.active.as_mut() {
+            if state.entry.key == key {
+                state.owners.insert(token);
+                return Ok((Arc::clone(&state.entry), token));
+            }
+            if !state.owners.is_empty() || Arc::strong_count(&state.entry) > 1 {
+                return Err(format!(
+                    "cannot preload '{}' while resident genotype cache '{}' is still held by {} active owner(s) or reader(s); release it first",
+                    key,
+                    state.entry.key,
+                    state.owners.len()
+                ));
+            }
+            if let Some(prev) = guard.active.take() {
+                guard.last_weak = Arc::downgrade(&prev.entry);
+            }
+        }
+        if let Some(live_prev) = guard.last_weak.upgrade() {
+            if live_prev.key == key {
+                let mut owners = std::collections::HashSet::new();
+                owners.insert(token);
+                guard.active = Some(ActiveResidentSlot {
+                    entry: Arc::clone(&live_prev),
+                    owners,
+                });
+                return Ok((live_prev, token));
+            }
+            return Err(format!(
+                "cannot preload '{}' while a previous resident genotype buffer '{}' is still held by an active reader",
+                key, live_prev.key
+            ));
+        }
+    }
+
+    let (n_samples_full, n_snps, bytes_per_snp, packed) = if pgen_source {
+        let n_samples_full = crate::pgen::count_psam_samples(&canon_prefix)?;
+        let n_snps = crate::pgen::count_pgen_variants(&canon_prefix, n_samples_full)?;
+        let bytes_per_snp = n_samples_full.div_ceil(4);
+        let total_bytes = n_snps
+            .checked_mul(bytes_per_snp)
+            .ok_or_else(|| "resident packed PGEN size overflow".to_string())?;
+        let pgen_path = Path::new(&format!("{canon_prefix}.pgen")).to_path_buf();
+        let mut reader = crate::pgen::PgenReader::open(&pgen_path, n_samples_full, n_snps)?;
+        let mut packed = vec![0u8; total_bytes];
+        let pool = if threads > 0 {
+            crate::stats_common::get_cached_pool(threads).map_err(|e| e.to_string())?
+        } else {
+            None
+        };
+        const BLOCK_ROWS: usize = 1 << 16;
+        let mut start = 0usize;
+        while start < n_snps {
+            crate::stats_common::check_ctrlc()?;
+            let rows = (n_snps - start).min(BLOCK_ROWS);
+            let byte_start = start.saturating_mul(bytes_per_snp);
+            let byte_end = byte_start.saturating_add(rows.saturating_mul(bytes_per_snp));
+            let dst = &mut packed[byte_start..byte_end];
+            let got = if let Some(tp) = pool.as_ref() {
+                tp.install(|| reader.read_source_block(start, rows, dst))?
+            } else {
+                reader.read_source_block(start, rows, dst)?
+            };
+            if got != rows {
+                return Err(format!(
+                    "PGEN resident load returned {got} rows; expected {rows} at {start}"
+                ));
+            }
+            start = start.saturating_add(rows);
+        }
+        (n_samples_full, n_snps, bytes_per_snp, packed)
+    } else {
+        let n_samples_full = gfcore::read_fam(&canon_prefix)?.len();
+        let bed_path = format!("{canon_prefix}.bed");
+        let info = read_plink_bed_header_info(Path::new(&bed_path), n_samples_full)?;
+        if info.n_snps_total == 0 {
+            return Err("no SNP sites found in PLINK BED input".to_string());
+        }
+        let mut file = File::open(&bed_path).map_err(|e| format!("open {bed_path}: {e}"))?;
+        let mut header = [0u8; BED_HEADER_LEN];
+        file.read_exact(&mut header)
+            .map_err(|e| format!("read BED header {bed_path}: {e}"))?;
+        validate_plink_bed_header(header)?;
+        let mut packed = vec![0u8; info.payload_size];
+        const IO_CHUNK: usize = 16 * 1024 * 1024;
+        let mut offset = 0usize;
+        while offset < packed.len() {
+            crate::stats_common::check_ctrlc()?;
+            let end = (offset + IO_CHUNK).min(packed.len());
+            file.read_exact(&mut packed[offset..end])
+                .map_err(|e| format!("read BED payload {bed_path}: {e}"))?;
+            offset = end;
+        }
+        (n_samples_full, info.n_snps_total, info.bytes_per_snp, packed)
+    };
+
+    let entry = Arc::new(ResidentPackedBed {
+        key,
+        n_samples_full,
+        n_snps,
+        bytes_per_snp,
+        packed,
+    });
+    let mut owners = std::collections::HashSet::new();
+    owners.insert(token);
+    let mut guard = resident_packed_bed_slot()
+        .lock()
+        .map_err(|_| "resident packed BED cache lock was poisoned".to_string())?;
+    guard.last_weak = Arc::downgrade(&entry);
+    guard.active = Some(ActiveResidentSlot {
+        entry: Arc::clone(&entry),
+        owners,
+    });
+    Ok((entry, token))
+}
+
+#[pyfunction]
+#[pyo3(signature = (prefix, threads=0))]
+pub fn gwas_memload_register(
+    py: Python<'_>,
+    prefix: String,
+    threads: usize,
+) -> PyResult<(usize, usize, usize, u64)> {
+    py.detach(move || {
+        let (entry, token) =
+            load_resident_packed_bed(&prefix, threads).map_err(PyRuntimeError::new_err)?;
+        Ok((entry.n_samples_full, entry.n_snps, entry.packed.len(), token))
+    })
+}
+
+#[pyfunction]
+#[pyo3(signature = (token=None))]
+pub fn gwas_memload_clear(token: Option<u64>) -> PyResult<()> {
+    clear_resident_packed_bed(token);
+    Ok(())
+}
+
 pub(crate) struct PackedBedSourceReader {
     source: PackedBedSource,
     n_samples_full: usize,
@@ -409,10 +680,24 @@ pub(crate) struct PackedBedSourceReader {
 enum PackedBedSource {
     Bed(File),
     Pgen(crate::pgen::PgenReader),
+    Memory(Arc<ResidentPackedBed>),
 }
 
 impl PackedBedSourceReader {
     pub(crate) fn open(prefix: &str, n_samples_full: usize) -> Result<Self, String> {
+        if let Some(resident) = lookup_resident_packed_bed(prefix) {
+            if resident.n_samples_full == n_samples_full {
+                let bytes_per_snp = resident.bytes_per_snp;
+                let n_snps = resident.n_snps;
+                return Ok(Self {
+                    source: PackedBedSource::Memory(resident),
+                    n_samples_full,
+                    bytes_per_snp,
+                    n_snps,
+                    qc_scratch: Vec::new(),
+                });
+            }
+        }
         let pgen_source = crate::pgen::path_uses_pgen(prefix);
         let bed_prefix = normalize_plink_prefix(prefix);
         if pgen_source {
@@ -505,6 +790,11 @@ impl PackedBedSourceReader {
                         ));
                     }
                 }
+                PackedBedSource::Memory(resident) => {
+                    let src_start = source_start.saturating_mul(self.bytes_per_snp);
+                    let src_end = src_start.saturating_add(byte_len);
+                    out[..byte_len].copy_from_slice(&resident.packed[src_start..src_end]);
+                }
             }
         }
         Ok(rows)
@@ -555,6 +845,15 @@ impl PackedBedSourceReader {
             }
             PackedBedSource::Pgen(reader) => {
                 reader.read_source_rows_sparse(source_rows, out)?;
+            }
+            PackedBedSource::Memory(resident) => {
+                for (output_row, &source_row) in source_rows.iter().enumerate() {
+                    let src_start = source_row.saturating_mul(self.bytes_per_snp);
+                    let dst_start = output_row.saturating_mul(self.bytes_per_snp);
+                    out[dst_start..dst_start + self.bytes_per_snp].copy_from_slice(
+                        &resident.packed[src_start..src_start + self.bytes_per_snp],
+                    );
+                }
             }
         }
         Ok(())
@@ -611,6 +910,15 @@ impl PackedBedSourceReader {
                 requested_rows,
                 out,
             ),
+            PackedBedSource::Memory(resident) => read_packed_slice_block_values(
+                &resident.packed,
+                self.n_samples_full,
+                self.bytes_per_snp,
+                self.n_snps,
+                source_start,
+                requested_rows,
+                out,
+            ),
         }
     }
 
@@ -637,6 +945,15 @@ impl PackedBedSourceReader {
                 self.bytes_per_snp,
                 self.n_snps,
                 &mut self.qc_scratch,
+                source_start,
+                requested_rows,
+                out,
+            ),
+            PackedBedSource::Memory(resident) => read_packed_slice_block_values(
+                &resident.packed,
+                self.n_samples_full,
+                self.bytes_per_snp,
+                self.n_snps,
                 source_start,
                 requested_rows,
                 out,
@@ -705,6 +1022,28 @@ impl PackedBedSourceReader {
                     .saturating_add((source_start.saturating_mul(self.bytes_per_snp)) as u64);
                 read_file_exact_at(file, &mut out_packed[..byte_len], offset)
                     .map_err(|e| format!("read BED source rows [{source_start}..): {e}"))?;
+                for row_idx in 0..rows {
+                    let row_start = row_idx * self.bytes_per_snp;
+                    let row_end = row_start + self.bytes_per_snp;
+                    let stats = crate::pgen::count_bed_genotype_row(
+                        &out_packed[row_start..row_end],
+                        self.n_samples_full,
+                        sample_selection,
+                    );
+                    let keep = keep_variant(source_start + row_idx, stats);
+                    stats_out[row_idx] = stats;
+                    keep_out[row_idx] = keep;
+                    if !keep {
+                        out_packed[row_start..row_end].fill(0);
+                    }
+                }
+                Ok(rows)
+            }
+            PackedBedSource::Memory(resident) => {
+                sample_selection.validate(self.n_samples_full)?;
+                let src_offset = source_start.saturating_mul(self.bytes_per_snp);
+                out_packed[..byte_len]
+                    .copy_from_slice(&resident.packed[src_offset..src_offset + byte_len]);
                 for row_idx in 0..rows {
                     let row_start = row_idx * self.bytes_per_snp;
                     let row_end = row_start + self.bytes_per_snp;
@@ -791,8 +1130,60 @@ impl PackedBedSourceReader {
                 }
                 Ok(rows)
             }
+            PackedBedSource::Memory(resident) => {
+                sample_selection.validate(self.n_samples_full)?;
+                for row_idx in 0..rows {
+                    let src_start = (source_start + row_idx) * self.bytes_per_snp;
+                    let src_end = src_start + self.bytes_per_snp;
+                    let stats = crate::pgen::count_bed_genotype_row(
+                        &resident.packed[src_start..src_end],
+                        self.n_samples_full,
+                        sample_selection,
+                    );
+                    stats_out[row_idx] = stats;
+                    keep_out[row_idx] = keep_variant(source_start + row_idx, stats);
+                }
+                Ok(rows)
+            }
         }
     }
+}
+
+#[allow(dead_code)]
+fn read_packed_slice_block_values<T: crate::pgen::PgenDosageValue>(
+    packed: &[u8],
+    n_samples: usize,
+    bytes_per_snp: usize,
+    n_snps: usize,
+    source_start: usize,
+    requested_rows: usize,
+    out: &mut [T],
+) -> Result<usize, String> {
+    let rows = requested_rows.min(n_snps - source_start);
+    let value_len = rows
+        .checked_mul(n_samples)
+        .ok_or_else(|| "genotype dosage block size overflow".to_string())?;
+    if out.len() < value_len {
+        return Err(format!(
+            "genotype dosage destination is too small: got {}, need {value_len}",
+            out.len()
+        ));
+    }
+    if rows == 0 {
+        return Ok(0);
+    }
+    for row_idx in 0..rows {
+        let packed_start = (source_start + row_idx) * bytes_per_snp;
+        let packed_end = packed_start + bytes_per_snp;
+        let values_start = row_idx * n_samples;
+        let values_end = values_start + n_samples;
+        crate::pgen::decode_bed_row_to_values(
+            &packed[packed_start..packed_end],
+            n_samples,
+            &mut out[values_start..values_end],
+        );
+    }
+    Ok(rows)
 }
 
 #[allow(dead_code)]
@@ -1209,7 +1600,8 @@ pub(crate) fn choose_lm_lmm_bed_pread(value: Option<&str>) -> bool {
 
 #[allow(dead_code)]
 pub struct WindowedBedMatrix {
-    file: std::fs::File,
+    file: Option<std::fs::File>,
+    resident: Option<Arc<ResidentPackedBed>>,
     n_samples_full: usize,
     bytes_per_snp: usize,
     bed_len: usize,
@@ -1244,6 +1636,27 @@ impl WindowedBedMatrix {
     fn open_inner(prefix: &str, mmap_window_mb: usize, pread: bool) -> Result<Self, String> {
         if mmap_window_mb == 0 {
             return Err("mmap_window_mb must be > 0".to_string());
+        }
+        if let Some(resident) = lookup_resident_packed_bed(prefix) {
+            let n_samples_full = resident.n_samples_full;
+            let bytes_per_snp = resident.bytes_per_snp;
+            let n_snps = resident.n_snps;
+            let bed_len = BED_HEADER_LEN.saturating_add(resident.packed.len());
+            return Ok(Self {
+                file: None,
+                resident: Some(resident),
+                n_samples_full,
+                bytes_per_snp,
+                bed_len,
+                mmap: None,
+                mmap_offset: 0,
+                window_start_snp: 0,
+                window_len_snps: n_snps,
+                target_window_snps: n_snps.max(1),
+                pread: false,
+                scratch: Vec::new(),
+                pread_buffer: Vec::new(),
+            });
         }
         let bed_prefix = normalize_plink_prefix(prefix);
         let n_samples_full = gfcore::read_fam(&bed_prefix)
@@ -1284,7 +1697,8 @@ impl WindowedBedMatrix {
             (Some(mmap), mmap_offset, window_len_snps)
         };
         Ok(Self {
-            file,
+            file: Some(file),
+            resident: None,
             n_samples_full,
             bytes_per_snp,
             bed_len,
@@ -1306,10 +1720,33 @@ impl WindowedBedMatrix {
     /// previously decoded block.  The file and mmap are independent, but the
     /// underlying BED pages remain shared by the operating system.
     pub fn duplicate(&self) -> Result<Self, String> {
-        let file = self.file.try_clone().map_err(|e| e.to_string())?;
+        if let Some(resident) = self.resident.as_ref() {
+            return Ok(Self {
+                file: None,
+                resident: Some(Arc::clone(resident)),
+                n_samples_full: self.n_samples_full,
+                bytes_per_snp: self.bytes_per_snp,
+                bed_len: self.bed_len,
+                mmap: None,
+                mmap_offset: 0,
+                window_start_snp: 0,
+                window_len_snps: self.window_len_snps,
+                target_window_snps: self.target_window_snps,
+                pread: false,
+                scratch: Vec::new(),
+                pread_buffer: Vec::new(),
+            });
+        }
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| "internal error: missing BED file handle".to_string())?
+            .try_clone()
+            .map_err(|e| e.to_string())?;
         if self.pread {
             return Ok(Self {
-                file,
+                file: Some(file),
+                resident: None,
                 n_samples_full: self.n_samples_full,
                 bytes_per_snp: self.bytes_per_snp,
                 bed_len: self.bed_len,
@@ -1335,7 +1772,8 @@ impl WindowedBedMatrix {
             self.bytes_per_snp,
         )?;
         Ok(Self {
-            file,
+            file: Some(file),
+            resident: None,
             n_samples_full: self.n_samples_full,
             bytes_per_snp: self.bytes_per_snp,
             bed_len: self.bed_len,
@@ -1404,10 +1842,14 @@ impl WindowedBedMatrix {
         if end_snp <= start_snp {
             return Err("invalid BED window range".to_string());
         }
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| "internal error: missing BED file handle".to_string())?;
         let span_snps = end_snp - start_snp;
         let window_snps = self.target_window_snps.max(span_snps);
         let (mmap, mmap_offset, window_len_snps) = Self::map_window(
-            &self.file,
+            file,
             self.bed_len,
             start_snp,
             window_snps,
@@ -1424,6 +1866,23 @@ impl WindowedBedMatrix {
         if end <= start {
             return Ok(&[]);
         }
+        if self.resident.is_none() && !self.pread {
+            let window_end = self.window_start_snp + self.window_len_snps;
+            if start < self.window_start_snp || end > window_end {
+                self.remap_window_for_range(start, end)?;
+            }
+        }
+        if let Some(resident) = self.resident.as_ref() {
+            if end > resident.n_snps {
+                return Err(format!(
+                    "resident BED range out of bounds: start={start}, end={end}, n_snps={}",
+                    resident.n_snps
+                ));
+            }
+            let byte_start = start.saturating_mul(self.bytes_per_snp);
+            let byte_end = end.saturating_mul(self.bytes_per_snp);
+            return Ok(&resident.packed[byte_start..byte_end]);
+        }
         if self.pread {
             if end > self.n_source_snps() {
                 return Err(format!(
@@ -1431,16 +1890,16 @@ impl WindowedBedMatrix {
                     self.n_source_snps()
                 ));
             }
+            let file = self
+                .file
+                .as_ref()
+                .ok_or_else(|| "internal error: missing BED file handle".to_string())?;
             let len = (end - start).saturating_mul(self.bytes_per_snp);
             self.pread_buffer.resize(len, 0);
             let offset =
                 BED_HEADER_LEN.saturating_add(start.saturating_mul(self.bytes_per_snp)) as u64;
-            read_file_exact_at(&self.file, &mut self.pread_buffer, offset)?;
+            read_file_exact_at(file, &mut self.pread_buffer, offset)?;
             return Ok(&self.pread_buffer);
-        }
-        let window_end = self.window_start_snp + self.window_len_snps;
-        if start < self.window_start_snp || end > window_end {
-            self.remap_window_for_range(start, end)?;
         }
         let desired_offset = BED_HEADER_LEN + start.saturating_mul(self.bytes_per_snp);
         let local_offset = desired_offset
@@ -1524,10 +1983,18 @@ impl GenotypeMatrix for WindowedBedMatrix {
         self.bytes_per_snp
     }
     fn packed_flat(&self) -> &[u8] {
-        &[]
+        self.resident
+            .as_deref()
+            .map_or(&[], |res| res.packed.as_slice())
     }
-    fn source_row_bytes(&self, _source_idx: usize) -> &[u8] {
-        &[]
+    fn source_row_bytes(&self, source_idx: usize) -> &[u8] {
+        if let Some(res) = self.resident.as_deref() {
+            let start = source_idx.saturating_mul(self.bytes_per_snp);
+            let end = start.saturating_add(self.bytes_per_snp);
+            res.packed.get(start..end).unwrap_or(&[])
+        } else {
+            &[]
+        }
     }
 
     fn decode_additive_block(

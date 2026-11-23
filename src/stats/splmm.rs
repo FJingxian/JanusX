@@ -893,6 +893,7 @@ impl SplmmScanMode {
 enum SplmmPreparedPayload {
     Packed(Arc<[u8]>),
     Mmap(Arc<Mmap>),
+    Resident(Arc<crate::gload::ResidentPackedBed>),
 }
 
 impl SplmmPreparedPayload {
@@ -901,6 +902,7 @@ impl SplmmPreparedPayload {
         match self {
             Self::Packed(bytes) => bytes.as_ref(),
             Self::Mmap(mmap) => &mmap[3..],
+            Self::Resident(resident) => resident.packed.as_slice(),
         }
     }
 }
@@ -2525,7 +2527,11 @@ fn prepare_prefix_input_from_external_meta<'py>(
         inspect_plink_bed_shape_local(&bed_prefix, n_samples_full)
             .map_err(PyRuntimeError::new_err)?
     };
-    let payload = if retain_payload && !pgen_source {
+    let resident_entry = crate::gload::lookup_resident_packed_bed(&bed_prefix)
+        .filter(|entry| entry.n_samples_full == n_samples_full);
+    let payload = if let Some(resident) = resident_entry {
+        Some(SplmmPreparedPayload::Resident(resident))
+    } else if retain_payload && !pgen_source {
         let mmap = if let Some(mmap) = payload_mmap {
             mmap
         } else {
@@ -2597,11 +2603,13 @@ fn prepare_prefix_input(
     if n_samples_full == 0 {
         return Err("No samples found in BED input.".to_string());
     }
-    let retain_payload = retain_payload && !pgen_source;
+    let resident_entry = crate::gload::lookup_resident_packed_bed(&bed_prefix)
+        .filter(|entry| entry.n_samples_full == n_samples_full);
+    let retain_payload = retain_payload && !pgen_source && resident_entry.is_none();
     let meta = if !retain_payload {
         let window_mb = mmap_window_mb
             .filter(|&v| v > 0)
-            .or_else(|| pgen_source.then_some(64))
+            .or_else(|| (pgen_source || resident_entry.is_some()).then_some(64))
             .ok_or_else(|| {
                 "SparseLMM non-resident BED preparation requires mmap_window_mb > 0.".to_string()
             })?;
@@ -2628,7 +2636,9 @@ fn prepare_prefix_input(
         )?
     };
     let meta = filter_meta_with_site_keep(meta, site_keep)?;
-    let payload = if retain_payload {
+    let payload = if let Some(resident) = resident_entry {
+        Some(SplmmPreparedPayload::Resident(resident))
+    } else if retain_payload {
         let mmap = if let Some(mmap) = payload_mmap {
             mmap
         } else {
@@ -2753,7 +2763,10 @@ fn prepare_splmm_assoc_inputs<'py>(
     // case defeats the memory bound and also makes the r-hat path decode from
     // the full BED payload.
     let pgen_source = crate::pgen::path_uses_pgen(&bed_prefix);
-    let skip_resident_bed_payload = !use_external_packed && (windowed_requested || pgen_source);
+    let resident_memload = crate::gload::lookup_resident_packed_bed(&bed_prefix)
+        .is_some_and(|entry| entry.n_samples_full == n_samples_full);
+    let skip_resident_bed_payload =
+        !use_external_packed && (windowed_requested || pgen_source || resident_memload);
     let shared_bed_mmap = if use_external_packed {
         None
     } else if skip_resident_bed_payload {
@@ -7955,6 +7968,8 @@ fn unified_input_from_splmm_prepared(
             n_samples_full: prepared.n_samples_full,
             bytes_per_snp: prepared.bytes_per_snp,
         }
+    } else if matches!(prepared.payload, Some(SplmmPreparedPayload::Resident(_))) {
+        SplmmPreparedMatrixAdapter::Direct { inner: prepared }
     } else if let Some(window_mb) = mmap_window_mb.filter(|&v| v > 0) {
         if let Some(prefix) = prepared.bed_prefix.as_deref() {
             SplmmPreparedMatrixAdapter::Windowed {

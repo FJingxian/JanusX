@@ -54,12 +54,13 @@ use crate::blas::{
 };
 use crate::brent::brent_minimize;
 use crate::eigh::symmetric_eigh_f64_row_major;
+use crate::gload::PackedBedSourceReader;
 use crate::linalg::{
     chisq_from_beta_se_and_optional_plrt, format_chisq_value, sanitize_assoc_pvalue,
 };
 use crate::stats_common::{
-    env_truthy, format_bytes, get_cached_pool, parse_index_vec_i64, process_memory_usage,
-    AsyncTsvWriter,
+    check_ctrlc, env_truthy, format_bytes, get_cached_pool, parse_index_vec_i64,
+    process_memory_usage, AsyncTsvWriter,
 };
 use nalgebra::DMatrix;
 use numpy::{PyReadonlyArray1, PyReadonlyArray2};
@@ -72,6 +73,7 @@ use std::f64::consts::LN_10;
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::sync::Mutex;
 use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1166,6 +1168,417 @@ fn farmcpu_sorted_overlap_ratio(a: &[usize], b: &[usize]) -> f64 {
     }
 }
 
+enum FarmcpuPackedSource<'a> {
+    Slice {
+        packed_flat: &'a [u8],
+        bytes_per_snp: usize,
+        m_packed: usize,
+    },
+    Stream {
+        prefix: String,
+        n_samples_full: usize,
+        bytes_per_snp: usize,
+        m_packed: usize,
+        reader: Mutex<PackedBedSourceReader>,
+    },
+}
+
+impl<'a> FarmcpuPackedSource<'a> {
+    fn slice(packed_flat: &'a [u8], bytes_per_snp: usize) -> Result<Self, String> {
+        if bytes_per_snp == 0 {
+            return Err("invalid packed shape".to_string());
+        }
+        if packed_flat.len() % bytes_per_snp != 0 {
+            return Err("packed length is not divisible by bytes_per_snp".to_string());
+        }
+        let m_packed = packed_flat.len() / bytes_per_snp;
+        Ok(Self::Slice {
+            packed_flat,
+            bytes_per_snp,
+            m_packed,
+        })
+    }
+
+    fn stream(prefix: &str, n_samples_full: usize) -> Result<Self, String> {
+        let reader = PackedBedSourceReader::open(prefix, n_samples_full)?;
+        let bytes_per_snp = reader.bytes_per_snp();
+        let m_packed = reader.n_snps();
+        Ok(Self::Stream {
+            prefix: prefix.to_string(),
+            n_samples_full,
+            bytes_per_snp,
+            m_packed,
+            reader: Mutex::new(reader),
+        })
+    }
+
+    #[inline]
+    fn bytes_per_snp(&self) -> usize {
+        match self {
+            Self::Slice { bytes_per_snp, .. } | Self::Stream { bytes_per_snp, .. } => *bytes_per_snp,
+        }
+    }
+
+    #[inline]
+    fn m_packed(&self) -> usize {
+        match self {
+            Self::Slice { m_packed, .. } | Self::Stream { m_packed, .. } => *m_packed,
+        }
+    }
+
+    fn open_scan_reader(&self) -> Result<Option<PackedBedSourceReader>, String> {
+        match self {
+            Self::Slice { .. } => Ok(None),
+            Self::Stream {
+                prefix,
+                n_samples_full,
+                ..
+            } => Ok(Some(PackedBedSourceReader::open(prefix, *n_samples_full)?)),
+        }
+    }
+
+    fn decode_rows_to_sample_major(
+        &self,
+        row_indices: &[usize],
+        packed_row_lookup: Option<&[usize]>,
+        sample_idx: &[usize],
+        row_flip: &[bool],
+        row_maf: &[f32],
+    ) -> Result<Vec<f64>, String> {
+        match self {
+            Self::Slice {
+                packed_flat,
+                bytes_per_snp,
+                ..
+            } => decode_packed_rows_to_sample_major(
+                packed_flat,
+                *bytes_per_snp,
+                row_indices,
+                packed_row_lookup,
+                sample_idx,
+                row_flip,
+                row_maf,
+            ),
+            Self::Stream {
+                bytes_per_snp,
+                reader,
+                ..
+            } => {
+                if row_indices.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let mut source_rows = Vec::with_capacity(row_indices.len());
+                let mut sub_flip = Vec::with_capacity(row_indices.len());
+                let mut sub_maf = Vec::with_capacity(row_indices.len());
+                for &local_row_idx in row_indices.iter() {
+                    if local_row_idx >= row_flip.len() || local_row_idx >= row_maf.len() {
+                        return Err(format!(
+                            "row metadata index out of bounds in packed decode: idx={}, row_flip={}, row_maf={}",
+                            local_row_idx,
+                            row_flip.len(),
+                            row_maf.len()
+                        ));
+                    }
+                    let src_row = if let Some(lookup) = packed_row_lookup {
+                        *lookup.get(local_row_idx).ok_or_else(|| {
+                            format!(
+                                "packed row lookup index out of bounds in packed decode: idx={}, lookup_len={}",
+                                local_row_idx,
+                                lookup.len()
+                            )
+                        })?
+                    } else {
+                        local_row_idx
+                    };
+                    source_rows.push(src_row);
+                    sub_flip.push(row_flip[local_row_idx]);
+                    sub_maf.push(row_maf[local_row_idx]);
+                }
+                let mut buf = vec![0u8; source_rows.len().saturating_mul(*bytes_per_snp)];
+                {
+                    let mut guard = reader
+                        .lock()
+                        .map_err(|_| "FarmCPU stream reader mutex poisoned".to_string())?;
+                    guard.read_source_rows_sparse(&source_rows, &mut buf)?;
+                }
+                let local_idx: Vec<usize> = (0..source_rows.len()).collect();
+                decode_packed_rows_to_sample_major(
+                    &buf,
+                    *bytes_per_snp,
+                    &local_idx,
+                    None,
+                    sample_idx,
+                    &sub_flip,
+                    &sub_maf,
+                )
+            }
+        }
+    }
+
+    fn read_sparse_row_missing_counts(
+        &self,
+        local_indices: &[usize],
+        packed_row_lookup: Option<&[usize]>,
+        n_samples: usize,
+        sample_idx: &[usize],
+    ) -> Result<Vec<usize>, String> {
+        if local_indices.is_empty() {
+            return Ok(Vec::new());
+        }
+        match self {
+            Self::Slice {
+                packed_flat,
+                bytes_per_snp,
+                ..
+            } => {
+                let mut out = Vec::with_capacity(local_indices.len());
+                for &idx in local_indices.iter() {
+                    let src_row = packed_row_lookup.map(|v| v[idx]).unwrap_or(idx);
+                    let row = &packed_flat[src_row * *bytes_per_snp..(src_row + 1) * *bytes_per_snp];
+                    out.push(packed_row_missing_count_selected(row, n_samples, sample_idx));
+                }
+                Ok(out)
+            }
+            Self::Stream {
+                bytes_per_snp,
+                reader,
+                ..
+            } => {
+                let source_rows: Vec<usize> = local_indices
+                    .iter()
+                    .map(|&idx| packed_row_lookup.map(|v| v[idx]).unwrap_or(idx))
+                    .collect();
+                let mut buf = vec![0u8; source_rows.len().saturating_mul(*bytes_per_snp)];
+                {
+                    let mut guard = reader
+                        .lock()
+                        .map_err(|_| "FarmCPU stream reader mutex poisoned".to_string())?;
+                    guard.read_source_rows_sparse(&source_rows, &mut buf)?;
+                }
+                let mut out = Vec::with_capacity(source_rows.len());
+                for i in 0..source_rows.len() {
+                    let row = &buf[i * *bytes_per_snp..(i + 1) * *bytes_per_snp];
+                    out.push(packed_row_missing_count_selected(row, n_samples, sample_idx));
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_scan_block(
+        &self,
+        scan_reader: &mut Option<PackedBedSourceReader>,
+        packed_scratch: &mut Vec<u8>,
+        rel_indices_scratch: &mut Vec<usize>,
+        n_samples: usize,
+        row_flip: &[bool],
+        row_maf: &[f32],
+        impute_major: bool,
+        sample_idx: &[usize],
+        full_sample_fast: bool,
+        row_indices: Option<&[usize]>,
+        row_start: usize,
+        n_block: usize,
+        rhs: &[f64],
+        geno_slice: &mut [f64],
+        sy_slice: &mut [f64],
+        ss_slice: &mut [f64],
+        miss_slice: Option<&mut [usize]>,
+        code4_lut: &[[u8; 4]; 256],
+        pool: Option<&std::sync::Arc<rayon::ThreadPool>>,
+    ) -> Result<(), String> {
+        let run_decode = |packed_buf: &[u8],
+                          bps: usize,
+                          flip_slice: &[bool],
+                          maf_slice: &[f32],
+                          lookup: Option<&[usize]>,
+                          start_idx: usize,
+                          geno_dst: &mut [f64],
+                          sy_dst: &mut [f64],
+                          ss_dst: &mut [f64],
+                          miss_dst: Option<&mut [usize]>| -> Result<(), String> {
+            let mut runner = || {
+                decode_mean_imputed_additive_packed_block_rows_f64_stats(
+                    packed_buf,
+                    bps,
+                    n_samples,
+                    flip_slice,
+                    maf_slice,
+                    impute_major,
+                    sample_idx,
+                    full_sample_fast,
+                    lookup,
+                    start_idx,
+                    rhs,
+                    geno_dst,
+                    sy_dst,
+                    ss_dst,
+                    code4_lut,
+                    pool,
+                )
+            };
+            if let Some(p) = pool {
+                p.install(&mut runner)?;
+            } else {
+                runner()?;
+            }
+            if let Some(miss_out) = miss_dst {
+                let mut fill_miss = || {
+                    miss_out
+                        .par_iter_mut()
+                        .enumerate()
+                        .for_each(|(local_idx, dst)| {
+                            let src_row = if let Some(l) = lookup {
+                                l[start_idx + local_idx]
+                            } else {
+                                start_idx + local_idx
+                            };
+                            let row = &packed_buf[src_row * bps..(src_row + 1) * bps];
+                            *dst = packed_row_missing_count_selected(row, n_samples, sample_idx);
+                        });
+                };
+                if let Some(p) = pool {
+                    p.install(fill_miss);
+                } else {
+                    fill_miss();
+                }
+            }
+            Ok(())
+        };
+        match self {
+            Self::Slice {
+                packed_flat,
+                bytes_per_snp,
+                ..
+            } => run_decode(
+                packed_flat,
+                *bytes_per_snp,
+                row_flip,
+                row_maf,
+                row_indices,
+                row_start,
+                geno_slice,
+                sy_slice,
+                ss_slice,
+                miss_slice,
+            ),
+            Self::Stream { bytes_per_snp, .. } => {
+                let reader = scan_reader
+                    .as_mut()
+                    .ok_or_else(|| "FarmCPU scan stream reader is unavailable".to_string())?;
+                let bps = *bytes_per_snp;
+                let row_end = row_start + n_block;
+                let sub_flip = &row_flip[row_start..row_end];
+                let sub_maf = &row_maf[row_start..row_end];
+                if let Some(ridx) = row_indices {
+                    let block_src = &ridx[row_start..row_end];
+                    let first = block_src[0];
+                    let is_contig = block_src.iter().enumerate().all(|(i, &r)| r == first + i);
+                    if is_contig {
+                        let need = n_block.saturating_mul(bps);
+                        if packed_scratch.len() < need {
+                            packed_scratch.resize(need, 0);
+                        }
+                        let got = reader.read_source_block(first, n_block, &mut packed_scratch[..need])?;
+                        if got != n_block {
+                            return Err(format!(
+                                "FarmCPU stream read truncated: requested {n_block} rows at {first}, got {got}"
+                            ));
+                        }
+                        run_decode(
+                            &packed_scratch[..need],
+                            bps,
+                            sub_flip,
+                            sub_maf,
+                            None,
+                            0,
+                            geno_slice,
+                            sy_slice,
+                            ss_slice,
+                            miss_slice,
+                        )
+                    } else {
+                        let is_sorted = block_src.windows(2).all(|w| w[0] <= w[1]);
+                        let span = if is_sorted {
+                            block_src[n_block - 1].saturating_sub(first).saturating_add(1)
+                        } else {
+                            usize::MAX
+                        };
+                        if is_sorted && span <= n_block.saturating_mul(4).max(4096) && span <= 65_536 {
+                            let need = span.saturating_mul(bps);
+                            if packed_scratch.len() < need {
+                                packed_scratch.resize(need, 0);
+                            }
+                            let got = reader.read_source_block(first, span, &mut packed_scratch[..need])?;
+                            if got != span {
+                                return Err(format!(
+                                    "FarmCPU stream span read truncated: requested {span} rows at {first}, got {got}"
+                                ));
+                            }
+                            rel_indices_scratch.clear();
+                            rel_indices_scratch.extend(block_src.iter().map(|&r| r - first));
+                            run_decode(
+                                &packed_scratch[..need],
+                                bps,
+                                sub_flip,
+                                sub_maf,
+                                Some(rel_indices_scratch.as_slice()),
+                                0,
+                                geno_slice,
+                                sy_slice,
+                                ss_slice,
+                                miss_slice,
+                            )
+                        } else {
+                            let need = n_block.saturating_mul(bps);
+                            if packed_scratch.len() < need {
+                                packed_scratch.resize(need, 0);
+                            }
+                            reader.read_source_rows_sparse(block_src, &mut packed_scratch[..need])?;
+                            run_decode(
+                                &packed_scratch[..need],
+                                bps,
+                                sub_flip,
+                                sub_maf,
+                                None,
+                                0,
+                                geno_slice,
+                                sy_slice,
+                                ss_slice,
+                                miss_slice,
+                            )
+                        }
+                    }
+                } else {
+                    let need = n_block.saturating_mul(bps);
+                    if packed_scratch.len() < need {
+                        packed_scratch.resize(need, 0);
+                    }
+                    let got = reader.read_source_block(row_start, n_block, &mut packed_scratch[..need])?;
+                    if got != n_block {
+                        return Err(format!(
+                            "FarmCPU stream read truncated: requested {n_block} rows at {row_start}, got {got}"
+                        ));
+                    }
+                    run_decode(
+                        &packed_scratch[..need],
+                        bps,
+                        sub_flip,
+                        sub_maf,
+                        None,
+                        0,
+                        geno_slice,
+                        sy_slice,
+                        ss_slice,
+                        miss_slice,
+                    )
+                }
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn farmcpu_raw_prior_from_model(
     y: &[f64],
@@ -1173,7 +1586,7 @@ fn farmcpu_raw_prior_from_model(
     ixx: &[f64],
     qtn_estimable: &[bool],
     rank_x: usize,
-    packed_flat: &[u8],
+    packed_source: &FarmcpuPackedSource<'_>,
     n_samples: usize,
     row_flip: &[bool],
     row_maf: &[f32],
@@ -1190,7 +1603,7 @@ fn farmcpu_raw_prior_from_model(
         y,
         x_qtn,
         ixx,
-        packed_flat,
+        packed_source,
         n_samples,
         row_flip,
         row_maf,
@@ -2037,6 +2450,7 @@ struct FarmcpuScanBlock {
     geno_block: Vec<f64>,
     sy_block: Vec<f64>,
     ss_block: Vec<f64>,
+    miss_block: Vec<usize>,
     xs_block: Vec<f64>,
     b21_block: Vec<f64>,
     stat_block: Vec<f64>,
@@ -2050,6 +2464,7 @@ impl FarmcpuScanBlock {
             geno_block: vec![0.0_f64; capacity.saturating_mul(n)],
             sy_block: vec![0.0_f64; capacity],
             ss_block: vec![0.0_f64; capacity],
+            miss_block: vec![0usize; capacity],
             xs_block: vec![0.0_f64; capacity.saturating_mul(q0)],
             b21_block: vec![0.0_f64; capacity.saturating_mul(q0)],
             stat_block: vec![f64::NAN; capacity.saturating_mul(stat_stride.max(1))],
@@ -2063,6 +2478,7 @@ struct FarmcpuOutputBlock {
     snp: Vec<String>,
     allele0: Vec<String>,
     allele1: Vec<String>,
+    miss_counts: Vec<usize>,
     stats: Vec<f64>,
 }
 
@@ -2148,8 +2564,7 @@ impl FarmcpuQtnColumnCache {
     fn ensure_decoded(
         &mut self,
         qtn_idx: &[usize],
-        packed_flat: &[u8],
-        bytes_per_snp: usize,
+        packed_source: &FarmcpuPackedSource<'_>,
         row_indices: Option<&[usize]>,
         sample_idx: &[usize],
         row_flip: &[bool],
@@ -2164,9 +2579,7 @@ impl FarmcpuQtnColumnCache {
         if missing.is_empty() {
             return Ok(());
         }
-        let decoded = decode_packed_rows_to_sample_major(
-            packed_flat,
-            bytes_per_snp,
+        let decoded = packed_source.decode_rows_to_sample_major(
             &missing,
             row_indices,
             sample_idx,
@@ -2190,8 +2603,7 @@ impl FarmcpuQtnColumnCache {
         base_x: &[f64],
         q_base: usize,
         qtn_idx: &[usize],
-        packed_flat: &[u8],
-        bytes_per_snp: usize,
+        packed_source: &FarmcpuPackedSource<'_>,
         row_indices: Option<&[usize]>,
         sample_idx: &[usize],
         row_flip: &[bool],
@@ -2202,8 +2614,7 @@ impl FarmcpuQtnColumnCache {
         }
         self.ensure_decoded(
             qtn_idx,
-            packed_flat,
-            bytes_per_snp,
+            packed_source,
             row_indices,
             sample_idx,
             row_flip,
@@ -2233,8 +2644,7 @@ impl FarmcpuQtnColumnCache {
     fn sample_major_matrix(
         &mut self,
         qtn_idx: &[usize],
-        packed_flat: &[u8],
-        bytes_per_snp: usize,
+        packed_source: &FarmcpuPackedSource<'_>,
         row_indices: Option<&[usize]>,
         sample_idx: &[usize],
         row_flip: &[bool],
@@ -2242,8 +2652,7 @@ impl FarmcpuQtnColumnCache {
     ) -> Result<Vec<f64>, String> {
         self.ensure_decoded(
             qtn_idx,
-            packed_flat,
-            bytes_per_snp,
+            packed_source,
             row_indices,
             sample_idx,
             row_flip,
@@ -2448,8 +2857,7 @@ fn farmcpu_best_rem_lead_set(
     global_pos: &[i64],
     szbin_i64: &[i64],
     nbin_vals: &[usize],
-    packed_flat: &[u8],
-    bytes_per_snp: usize,
+    packed_source: &FarmcpuPackedSource<'_>,
     row_indices: Option<&[usize]>,
     sample_idx: &[usize],
     row_flip: &[bool],
@@ -2495,9 +2903,7 @@ fn farmcpu_best_rem_lead_set(
                     .map(|ranked| ranked[..ranked.len().min(nn)].to_vec())
                     .unwrap_or_default();
                 leadidx.sort_unstable();
-                let sample_major = decode_packed_rows_to_sample_major(
-                    packed_flat,
-                    bytes_per_snp,
+                let sample_major = packed_source.decode_rows_to_sample_major(
                     &leadidx,
                     row_indices,
                     sample_idx,
@@ -2576,13 +2982,13 @@ fn farmcpu_best_rem_lead_set(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_x_with_qtn_packed(
     base_x: &[f64],
     n: usize,
     q_base: usize,
     qtn_idx: &[usize],
-    packed_flat: &[u8],
-    bytes_per_snp: usize,
+    packed_source: &FarmcpuPackedSource<'_>,
     row_indices: Option<&[usize]>,
     sample_idx: &[usize],
     row_flip: &[bool],
@@ -2594,8 +3000,7 @@ fn build_x_with_qtn_packed(
             base_x,
             q_base,
             qtn_idx,
-            packed_flat,
-            bytes_per_snp,
+            packed_source,
             row_indices,
             sample_idx,
             row_flip,
@@ -2614,9 +3019,7 @@ fn build_x_with_qtn_packed(
         dst.copy_from_slice(src);
     }
     if k > 0 {
-        let decoded = decode_packed_rows_to_sample_major(
-            packed_flat,
-            bytes_per_snp,
+        let decoded = packed_source.decode_rows_to_sample_major(
             qtn_idx,
             row_indices,
             sample_idx,
@@ -2763,11 +3166,12 @@ fn scan_packed_full_matrix(
     Ok((out, m, row_stride))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_packed_full_matrix_reduced(
     y: &[f64],
     x_flat: &[f64],   // row-major (n, q0)
     ixx_flat: &[f64], // row-major (q0, q0)
-    packed_flat: &[u8],
+    packed_source: &FarmcpuPackedSource<'_>,
     n_samples: usize,
     row_flip: &[bool],
     row_maf: &[f32],
@@ -2788,13 +3192,10 @@ fn scan_packed_full_matrix_reduced(
         return Err("n_samples must be > 0".to_string());
     }
     let bytes_per_snp = (n_samples + 3) / 4;
-    if bytes_per_snp == 0 {
+    if bytes_per_snp == 0 || packed_source.bytes_per_snp() != bytes_per_snp {
         return Err("invalid packed shape".to_string());
     }
-    if packed_flat.len() % bytes_per_snp != 0 {
-        return Err("packed length is not divisible by bytes_per_snp".to_string());
-    }
-    let m_packed = packed_flat.len() / bytes_per_snp;
+    let m_packed = packed_source.m_packed();
     let m = row_indices.map(|v| v.len()).unwrap_or(m_packed);
     if row_flip.len() != m || row_maf.len() != m {
         return Err("row_flip/row_maf length mismatch".to_string());
@@ -2859,10 +3260,18 @@ fn scan_packed_full_matrix_reduced(
     let pool = get_cached_pool(threads).map_err(|e| e.to_string())?;
     let row_block = farmcpu_scan_row_block_size(n, m);
     let mut qtn_min_p = vec![1.0_f64; k_qtn];
+    let mut scan_reader = packed_source.open_scan_reader()?;
+    let mut packed_scratch = Vec::<u8>::new();
+    let mut rel_indices_scratch = Vec::<usize>::new();
     let producer_err = std::sync::Arc::new(std::sync::OnceLock::<String>::new());
     let producer_err_bg = std::sync::Arc::clone(&producer_err);
     let mut next_row_start = 0usize;
     let producer = |chunk: &mut FarmcpuScanBlock| -> bool {
+        chunk.rows = 0usize;
+        if let Err(err) = check_ctrlc() {
+            let _ = producer_err_bg.set(err);
+            return false;
+        }
         if next_row_start >= m {
             return false;
         }
@@ -2874,31 +3283,27 @@ fn scan_packed_full_matrix_reduced(
         let geno_slice = &mut chunk.geno_block[..n_block * n];
         let sy_slice = &mut chunk.sy_block[..n_block];
         let ss_slice = &mut chunk.ss_block[..n_block];
-        let mut decode_runner = || {
-            decode_mean_imputed_additive_packed_block_rows_f64_stats(
-                packed_flat,
-                bytes_per_snp,
-                n_samples,
-                row_flip,
-                row_maf,
-                impute_major,
-                sample_idx,
-                full_sample_fast,
-                row_indices,
-                row_start,
-                y,
-                geno_slice,
-                sy_slice,
-                ss_slice,
-                code4_lut,
-                pool.as_ref(),
-            )
-        };
-        let decode_res = if let Some(p) = &pool {
-            p.install(&mut decode_runner)
-        } else {
-            decode_runner()
-        };
+        let decode_res = packed_source.decode_scan_block(
+            &mut scan_reader,
+            &mut packed_scratch,
+            &mut rel_indices_scratch,
+            n_samples,
+            row_flip,
+            row_maf,
+            impute_major,
+            sample_idx,
+            full_sample_fast,
+            row_indices,
+            row_start,
+            n_block,
+            y,
+            geno_slice,
+            sy_slice,
+            ss_slice,
+            None,
+            code4_lut,
+            pool.as_ref(),
+        );
         if let Err(err) = decode_res {
             let _ = producer_err_bg.set(err);
             chunk.rows = 0usize;
@@ -3109,7 +3514,7 @@ fn write_farmcpu_packed_main_scan(
     y: &[f64],
     x_qtn: &[f64],
     ixx_flat: &[f64],
-    packed_flat: &[u8],
+    packed_source: &FarmcpuPackedSource<'_>,
     n_samples: usize,
     row_flip: &[bool],
     row_maf: &[f32],
@@ -3120,7 +3525,6 @@ fn write_farmcpu_packed_main_scan(
     scan_progress_callback: Option<&Py<PyAny>>,
     chrom: &[String],
     pos: &[i64],
-    miss_counts: &[usize],
     q_base: usize,
     rank_x: usize,
     qtn_lookup: &HashMap<usize, usize>,
@@ -3145,7 +3549,7 @@ fn write_farmcpu_packed_main_scan(
         return Err("ixx shape mismatch".to_string());
     }
     let m = chrom.len();
-    if pos.len() != m || row_flip.len() != m || row_maf.len() != m || miss_counts.len() != m {
+    if pos.len() != m || row_flip.len() != m || row_maf.len() != m {
         return Err("FarmCPU metadata length mismatch during streaming scan".to_string());
     }
     if qtn_estimable.len() != qtn_lookup.len() {
@@ -3158,13 +3562,10 @@ fn write_farmcpu_packed_main_scan(
     }
 
     let bytes_per_snp = (n_samples + 3) / 4;
-    if bytes_per_snp == 0 {
+    if bytes_per_snp == 0 || packed_source.bytes_per_snp() != bytes_per_snp {
         return Err("invalid packed shape".to_string());
     }
-    if packed_flat.len() % bytes_per_snp != 0 {
-        return Err("packed length is not divisible by bytes_per_snp".to_string());
-    }
-    let m_packed = packed_flat.len() / bytes_per_snp;
+    let m_packed = packed_source.m_packed();
     if row_indices
         .map(|v| v.iter().any(|&idx| idx >= m_packed))
         .unwrap_or(false)
@@ -3221,10 +3622,18 @@ fn write_farmcpu_packed_main_scan(
     let blas_threads = farmcpu_scan_blas_threads(threads);
     let row_block = farmcpu_scan_row_block_size(n, m);
     let row_stride = 3usize;
+    let mut scan_reader = packed_source.open_scan_reader()?;
+    let mut packed_scratch = Vec::<u8>::new();
+    let mut rel_indices_scratch = Vec::<usize>::new();
     let producer_err = std::sync::Arc::new(std::sync::OnceLock::<String>::new());
     let producer_err_bg = std::sync::Arc::clone(&producer_err);
     let mut next_row_start = 0usize;
     let producer = |chunk: &mut FarmcpuScanBlock| -> bool {
+        chunk.rows = 0usize;
+        if let Err(err) = check_ctrlc() {
+            let _ = producer_err_bg.set(err);
+            return false;
+        }
         if next_row_start >= m {
             return false;
         }
@@ -3236,31 +3645,28 @@ fn write_farmcpu_packed_main_scan(
         let geno_slice = &mut chunk.geno_block[..n_block * n];
         let sy_slice = &mut chunk.sy_block[..n_block];
         let ss_slice = &mut chunk.ss_block[..n_block];
-        let mut decode_runner = || {
-            decode_mean_imputed_additive_packed_block_rows_f64_stats(
-                packed_flat,
-                bytes_per_snp,
-                n_samples,
-                row_flip,
-                row_maf,
-                impute_major,
-                sample_idx,
-                full_sample_fast,
-                row_indices,
-                row_start,
-                &y_resid,
-                geno_slice,
-                sy_slice,
-                ss_slice,
-                code4_lut,
-                pool.as_ref(),
-            )
-        };
-        let decode_res = if let Some(p) = &pool {
-            p.install(&mut decode_runner)
-        } else {
-            decode_runner()
-        };
+        let miss_slice = &mut chunk.miss_block[..n_block];
+        let decode_res = packed_source.decode_scan_block(
+            &mut scan_reader,
+            &mut packed_scratch,
+            &mut rel_indices_scratch,
+            n_samples,
+            row_flip,
+            row_maf,
+            impute_major,
+            sample_idx,
+            full_sample_fast,
+            row_indices,
+            row_start,
+            n_block,
+            &y_resid,
+            geno_slice,
+            sy_slice,
+            ss_slice,
+            Some(miss_slice),
+            code4_lut,
+            pool.as_ref(),
+        );
         if let Err(err) = decode_res {
             let _ = producer_err_bg.set(err);
             chunk.rows = 0usize;
@@ -3410,6 +3816,7 @@ fn write_farmcpu_packed_main_scan(
             snp: snp_block,
             allele0: allele0_block,
             allele1: allele1_block,
+            miss_counts: chunk.miss_block[..n_block].to_vec(),
             stats: stats_slice.to_vec(),
         };
         output_tx_consumer
@@ -3460,7 +3867,7 @@ fn write_farmcpu_packed_main_scan(
                         &block.allele0[local_idx],
                         &block.allele1[local_idx],
                         row_maf[i],
-                        miss_counts[i],
+                        block.miss_counts[local_idx],
                         n,
                         block.stats[stat_base],
                         block.stats[stat_base + 1],
@@ -3662,7 +4069,7 @@ pub fn farmcpu_packed_to_tsv(
     py: Python<'_>,
     y: PyReadonlyArray1<'_, f64>,
     x_cov: PyReadonlyArray2<'_, f64>,
-    packed: PyReadonlyArray2<'_, u8>,
+    packed: Option<PyReadonlyArray2<'_, u8>>,
     n_samples: usize,
     row_flip: PyReadonlyArray1<'_, bool>,
     row_maf: PyReadonlyArray1<'_, f32>,
@@ -3726,20 +4133,89 @@ pub fn farmcpu_packed_to_tsv(
         )));
     }
 
-    let packed_arr = packed.as_array();
-    if packed_arr.ndim() != 2 {
-        return Err(PyRuntimeError::new_err(
-            "packed must be 2D (m, bytes_per_snp)",
-        ));
-    }
-    let m_packed = packed_arr.shape()[0];
-    let bytes_per_snp = packed_arr.shape()[1];
     let expected_bps = (n_samples + 3) / 4;
-    if bytes_per_snp != expected_bps {
-        return Err(PyRuntimeError::new_err(format!(
-            "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps}"
-        )));
-    }
+    let (packed_flat_owner, stream_source_opt, m_packed, bytes_per_snp): (
+        Option<Cow<'_, [u8]>>,
+        Option<FarmcpuPackedSource<'static>>,
+        usize,
+        usize,
+    ) = if let Some(ref packed_ro) = packed {
+        let packed_arr = packed_ro.as_array();
+        if packed_arr.ndim() != 2 {
+            return Err(PyRuntimeError::new_err(
+                "packed must be 2D (m, bytes_per_snp)",
+            ));
+        }
+        let m_packed = packed_arr.shape()[0];
+        let bytes_per_snp = packed_arr.shape()[1];
+        if bytes_per_snp != expected_bps {
+            return Err(PyRuntimeError::new_err(format!(
+                "packed second dimension mismatch: got {bytes_per_snp}, expected {expected_bps}"
+            )));
+        }
+        let flat: Cow<'_, [u8]> = match crate::stats_common::array_standard_slice(packed_ro) {
+            Ok(s) => {
+                farmcpu_emit_mem_debug(
+                    "farmcpu_packed_to_tsv/packed_slice",
+                    &format!(
+                        "mode=borrowed rows={m_packed} bytes_per_snp={bytes_per_snp} packed_bytes={}",
+                        format_bytes(s.len() as u64),
+                    ),
+                );
+                Cow::Borrowed(s)
+            }
+            Err(_) => {
+                farmcpu_emit_mem_debug(
+                    "farmcpu_packed_to_tsv/packed_slice",
+                    &format!(
+                        "mode=owned_copy_start rows={m_packed} bytes_per_snp={bytes_per_snp}"
+                    ),
+                );
+                let owned: Vec<u8> = packed_arr.iter().copied().collect();
+                farmcpu_emit_mem_debug(
+                    "farmcpu_packed_to_tsv/packed_slice",
+                    &format!(
+                        "mode=owned_copy_done packed_bytes={}",
+                        format_bytes(owned.len() as u64)
+                    ),
+                );
+                Cow::Owned(owned)
+            }
+        };
+        if flat.len() != m_packed * bytes_per_snp {
+            return Err(PyRuntimeError::new_err("invalid packed flattened length"));
+        }
+        (Some(flat), None, m_packed, bytes_per_snp)
+    } else {
+        let prefix_str = bed_prefix
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                PyRuntimeError::new_err(
+                    "FarmCPU streaming mode (packed=None) requires non-empty bed_prefix",
+                )
+            })?;
+        let src = FarmcpuPackedSource::stream(prefix_str, n_samples)
+            .map_err(PyRuntimeError::new_err)?;
+        let m_packed = src.m_packed();
+        let bytes_per_snp = src.bytes_per_snp();
+        if bytes_per_snp != expected_bps {
+            return Err(PyRuntimeError::new_err(format!(
+                "stream source bytes_per_snp mismatch: got {bytes_per_snp}, expected {expected_bps}"
+            )));
+        }
+        farmcpu_emit_mem_debug(
+            "farmcpu_packed_to_tsv/packed_source",
+            &format!("mode=stream rows={m_packed} bytes_per_snp={bytes_per_snp}"),
+        );
+        (None, Some(src), m_packed, bytes_per_snp)
+    };
+    let packed_source: FarmcpuPackedSource<'_> = match (&packed_flat_owner, stream_source_opt) {
+        (Some(flat), None) => FarmcpuPackedSource::slice(flat.as_ref(), bytes_per_snp)
+            .map_err(PyRuntimeError::new_err)?,
+        (None, Some(src)) => src,
+        _ => unreachable!(),
+    };
     let row_idx: Option<Vec<usize>> = if let Some(ridx) = row_indices {
         Some(parse_index_vec_i64(
             ridx.as_slice()?,
@@ -3783,38 +4259,6 @@ pub fn farmcpu_packed_to_tsv(
             row_maf.len(),
             row_missing.len(),
         )));
-    }
-    let packed_flat: Cow<[u8]> = match crate::stats_common::array_standard_slice(&packed) {
-        Ok(s) => {
-            farmcpu_emit_mem_debug(
-                "farmcpu_packed_to_tsv/packed_slice",
-                &format!(
-                    "mode=borrowed rows={m_packed} active_rows={m} bytes_per_snp={bytes_per_snp} packed_bytes={}",
-                    format_bytes(s.len() as u64),
-                ),
-            );
-            Cow::Borrowed(s)
-        }
-        Err(_) => {
-            farmcpu_emit_mem_debug(
-                "farmcpu_packed_to_tsv/packed_slice",
-                &format!(
-                    "mode=owned_copy_start rows={m_packed} active_rows={m} bytes_per_snp={bytes_per_snp}"
-                ),
-            );
-            let owned: Vec<u8> = packed_arr.iter().copied().collect();
-            farmcpu_emit_mem_debug(
-                "farmcpu_packed_to_tsv/packed_slice",
-                &format!(
-                    "mode=owned_copy_done packed_bytes={}",
-                    format_bytes(owned.len() as u64)
-                ),
-            );
-            Cow::Owned(owned)
-        }
-    };
-    if packed_flat.len() != m_packed * bytes_per_snp {
-        return Err(PyRuntimeError::new_err("invalid packed flattened length"));
     }
 
     let x_cov_flat: Cow<[f64]> = match crate::stats_common::array_standard_slice(&x_cov) {
@@ -3942,8 +4386,7 @@ pub fn farmcpu_packed_to_tsv(
                         n,
                         q_base,
                         &qtn_idx,
-                        &packed_flat,
-                        bytes_per_snp,
+                        &packed_source,
                         row_idx.as_deref(),
                         &sample_idx,
                         row_flip,
@@ -3992,7 +4435,7 @@ pub fn farmcpu_packed_to_tsv(
                         &ixx,
                         &estimable_cols[q_base..],
                         rank_x,
-                        &packed_flat,
+                        &packed_source,
                         n_samples,
                         row_flip,
                         row_maf,
@@ -4110,8 +4553,7 @@ pub fn farmcpu_packed_to_tsv(
                     &global_pos,
                     &szbin_i64,
                     &nbin_vals,
-                    &packed_flat,
-                    bytes_per_snp,
+                    &packed_source,
                     row_idx.as_deref(),
                     &sample_idx,
                     row_flip,
@@ -4177,8 +4619,7 @@ pub fn farmcpu_packed_to_tsv(
                     let sample_major = qtn_cache
                         .sample_major_matrix(
                             &qtn_union,
-                            &packed_flat,
-                            bytes_per_snp,
+                            &packed_source,
                             row_idx.as_deref(),
                             &sample_idx,
                             row_flip,
@@ -4309,8 +4750,7 @@ pub fn farmcpu_packed_to_tsv(
                         n,
                         q_base,
                         &qtn_next,
-                        &packed_flat,
-                        bytes_per_snp,
+                        &packed_source,
                         row_idx.as_deref(),
                         &sample_idx,
                         row_flip,
@@ -4353,7 +4793,7 @@ pub fn farmcpu_packed_to_tsv(
                         &next_ixx,
                         &next_estimable_cols[q_base..],
                         next_rank_x,
-                        &packed_flat,
+                        &packed_source,
                         n_samples,
                         row_flip,
                         row_maf,
@@ -4461,8 +4901,7 @@ pub fn farmcpu_packed_to_tsv(
                 n,
                 q_base,
                 &qtn_idx,
-                &packed_flat,
-                bytes_per_snp,
+                &packed_source,
                 row_idx.as_deref(),
                 &sample_idx,
                 row_flip,
@@ -4511,15 +4950,14 @@ pub fn farmcpu_packed_to_tsv(
                         )
                         .map_err(PyRuntimeError::new_err)?;
                     let qtn_maf = qtn_idx.iter().map(|&idx| row_maf[idx]).collect::<Vec<f32>>();
-                    let qtn_miss = qtn_idx
-                        .iter()
-                        .map(|&idx| {
-                            let src_row = row_idx.as_ref().map(|v| v[idx]).unwrap_or(idx);
-                            let row =
-                                &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
-                            packed_row_missing_count_selected(row, n_samples, &sample_idx)
-                        })
-                        .collect::<Vec<usize>>();
+                    let qtn_miss = packed_source
+                        .read_sparse_row_missing_counts(
+                            &qtn_idx,
+                            row_idx.as_deref(),
+                            n_samples,
+                            &sample_idx,
+                        )
+                        .map_err(PyRuntimeError::new_err)?;
                     write_farmcpu_pseudo_qtn_only(
                         pseudo_path,
                         y,
@@ -4546,24 +4984,6 @@ pub fn farmcpu_packed_to_tsv(
                 0usize
             }
         } else {
-            let mut miss_counts = vec![0usize; m];
-            let mut fill_miss = || {
-                miss_counts
-                    .par_iter_mut()
-                    .enumerate()
-                    .for_each(|(idx, dst)| {
-                        let src_row = row_idx.as_ref().map(|v| v[idx]).unwrap_or(idx);
-                        let row =
-                            &packed_flat[src_row * bytes_per_snp..(src_row + 1) * bytes_per_snp];
-                        *dst = packed_row_missing_count_selected(row, n_samples, &sample_idx);
-                    });
-            };
-            if let Some(tp) = &pool {
-                tp.install(fill_miss);
-            } else {
-                fill_miss();
-            }
-
             let out_path = out_tsv.to_string();
             let writer = AsyncTsvWriter::with_config(
                 &out_path,
@@ -4607,7 +5027,7 @@ pub fn farmcpu_packed_to_tsv(
                 y,
                 &x_qtn,
                 &ixx,
-                &packed_flat,
+                &packed_source,
                 n_samples,
                 row_flip,
                 row_maf,
@@ -4618,7 +5038,6 @@ pub fn farmcpu_packed_to_tsv(
                 progress_callback.as_ref(),
                 &chrom,
                 &pos,
-                &miss_counts,
                 q_base,
                 rank_x,
                 &qtn_lookup,
@@ -4870,11 +5289,13 @@ mod tests {
         assert_eq!(m_ref, row_indices.len());
         assert_eq!(row_stride, q0 + 3);
 
+        let packed_source = FarmcpuPackedSource::slice(&packed_flat, (n_samples + 3) / 4)
+            .expect("valid packed source");
         let (marker_p, qtn_min_p) = scan_packed_full_matrix_reduced(
             &y,
             &x_flat,
             &ixx,
-            &packed_flat,
+            &packed_source,
             n_samples,
             &row_flip,
             &row_maf,

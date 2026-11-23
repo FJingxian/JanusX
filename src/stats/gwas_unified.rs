@@ -534,7 +534,7 @@ pub fn gwas_packed_unified_to_tsv<'py>(
                         py,
                         y,
                         x_cov,
-                        packed.clone(),
+                        Some(packed.clone()),
                         n_samples,
                         row_flip.clone(),
                         row_maf.clone(),

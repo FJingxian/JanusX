@@ -8039,6 +8039,18 @@ def parse_args(argv: Optional[list[str]] = None):
         include_hidden_legacy_single_dash_alias=True,
     )
     optional_group.add_argument(
+        "-pg", "--preload-genotypes",
+        "-memload", "--memload",
+        dest="preload_genotypes",
+        action="store_true",
+        default=False,
+        help=(
+            "Preload the full 2-bit packed genotype payload (-bfile/.bed or -pfile/.pgen) "
+            "into RAM once and stream all GWAS models (lm, lmm, lmm2, fvlmm, splmm, farmcpu) "
+            "from that single in-memory copy (aliases: -memload, --memload)."
+        ),
+    )
+    optional_group.add_argument(
         "-force-model", "--force-model", action="store_true", default=False,
         help=(
             "Force the requested GWAS model(s) and disable automatic "
@@ -8497,6 +8509,7 @@ def _run_gwas_pipeline(
         "initial_log_fingerprint": initial_log_fingerprint,
         "file_handler": None,
         "finalized": False,
+        "preload_genotypes_token": None,
     }
     try:
         result = _run_gwas_pipeline_impl(
@@ -8521,6 +8534,13 @@ def _run_gwas_pipeline(
                 pass
         _finish_gwas_runlog(context)
         raise
+    finally:
+        preload_token = context.get("preload_genotypes_token")
+        if preload_token is not None and hasattr(jxrs, "gwas_memload_clear"):
+            try:
+                jxrs.gwas_memload_clear(int(preload_token))
+            except Exception:
+                pass
 
     published_log_path = _finish_gwas_runlog(context)
     if isinstance(result, dict):
@@ -9663,6 +9683,31 @@ def _run_gwas_pipeline_impl(
                     _section(terminal_logger, "GWAS task")
                 if (not bool(preconfig_successes_flushed)) and len(preconfig_terminal_successes) > 0:
                     _flush_preconfig_successes()
+                if (
+                    bool(getattr(args, "preload_genotypes", False))
+                    or bool(getattr(args, "memload", False))
+                ) and hasattr(jxrs, "gwas_memload_register"):
+                    memload_resolved = detect_existing_plink_kind(str(genofile_stream))
+                    if memload_resolved is not None and memload_resolved[0] in {"bfile", "pfile"}:
+                        memload_src = (
+                            f"{memload_resolved[1]}.pgen"
+                            if memload_resolved[0] == "pfile"
+                            else f"{memload_resolved[1]}.bed"
+                        )
+                        memload_t0 = time.monotonic()
+                        ml_reg = jxrs.gwas_memload_register(
+                            memload_src,
+                            int(args.thread or 0),
+                        )
+                        ml_samples, ml_snps, ml_bytes = int(ml_reg[0]), int(ml_reg[1]), int(ml_reg[2])
+                        if len(ml_reg) >= 4:
+                            _runlog_context["preload_genotypes_token"] = int(ml_reg[3])
+                        ml_elapsed = time.monotonic() - memload_t0
+                        logger.info(
+                            f"Preloaded packed genotypes into RAM (-pg/--preload-genotypes): "
+                            f"{ml_samples} samples x {ml_snps} SNPs "
+                            f"({ml_bytes / (1024 ** 3):.2f} GiB) in {ml_elapsed:.2f}s"
+                        )
                 _append_advanced_note("Prepare shared context (phenotype/genotype meta/GRM/Q/cov)")
                 pheno, ids, n_snps, grm, qmatrix, cov_all, eff_m, genofile_stream, preloaded_packed = prepare_streaming_context(
                     genofile=genofile_stream,

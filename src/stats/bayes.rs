@@ -2290,6 +2290,92 @@ pub(crate) fn update_marker_residual_f32(
     }
 }
 
+pub(crate) const BAYES_RESIDUAL_RECOMPUTE_INTERVAL: usize = 50;
+
+#[inline]
+pub(crate) fn should_recompute_residual(actual_iterations: usize) -> bool {
+    actual_iterations > 0 && actual_iterations % BAYES_RESIDUAL_RECOMPUTE_INTERVAL == 0
+}
+
+pub(crate) fn recompute_residual_dense_f64(
+    y: &[f64],
+    x: &[f64],
+    q: usize,
+    alpha: &[f64],
+    m: &[f32],
+    beta: &[f64],
+    r: &mut [f64],
+) {
+    let n = y.len();
+    for i in 0..n {
+        let mut xa = 0.0_f64;
+        let row = &x[i * q..(i + 1) * q];
+        for k in 0..q {
+            xa += row[k] * alpha[k];
+        }
+        r[i] = y[i] - xa;
+    }
+    for (j, &bj) in beta.iter().enumerate() {
+        if bj == 0.0 {
+            continue;
+        }
+        let m_j = &m[j * n..(j + 1) * n];
+        for i in 0..n {
+            r[i] -= (m_j[i] as f64) * bj;
+        }
+    }
+}
+
+pub(crate) fn recompute_residual_backend_multi_f64<B: BayesMarkerBackend>(
+    y: &[f64],
+    x: &[f64],
+    q: usize,
+    backend: &mut B,
+    chains: &mut [(&[f64], &[f64], &mut [f64])],
+) -> Result<(), String> {
+    let n = y.len();
+    for (alpha, _beta, r) in chains.iter_mut() {
+        for i in 0..n {
+            let mut xa = 0.0_f64;
+            let row = &x[i * q..(i + 1) * q];
+            for k in 0..q {
+                xa += row[k] * alpha[k];
+            }
+            r[i] = y[i] - xa;
+        }
+    }
+    backend.for_each_block(|st, ed, m_block| {
+        let br = ed - st;
+        for off in 0..br {
+            let j = st + off;
+            let m_row = &m_block[off * n..(off + 1) * n];
+            for (_alpha, beta, r) in chains.iter_mut() {
+                let bj = beta[j];
+                if bj == 0.0 {
+                    continue;
+                }
+                for i in 0..n {
+                    r[i] -= (m_row[i] as f64) * bj;
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+pub(crate) fn recompute_residual_backend_f64<B: BayesMarkerBackend>(
+    y: &[f64],
+    x: &[f64],
+    q: usize,
+    backend: &mut B,
+    alpha: &[f64],
+    beta: &[f64],
+    r: &mut [f64],
+) -> Result<(), String> {
+    let mut one = [(alpha, beta, r)];
+    recompute_residual_backend_multi_f64(y, x, q, backend, &mut one)
+}
+
 /// Unified marker Gibbs kernel.  The conditional score is reduced once, the
 /// caller samples the model-specific new effect from that score, and the
 /// maintained f32 residual is updated before returning.  Keeping this
@@ -3474,7 +3560,11 @@ fn bayesb_core_impl(
             beta[j] = new_beta;
         }
 
-        copy_f32_to_f64(&marker_residual, &mut r);
+        if should_recompute_residual(schedule.actual_iterations()) {
+            recompute_residual_dense_f64(y, x, q, &alpha, m, &beta, &mut r);
+        } else {
+            copy_f32_to_f64(&marker_residual, &mut r);
+        }
         let mut n_active = 0usize;
         for j in 0..p {
             if d[j] == 1 {
@@ -3773,7 +3863,11 @@ fn bayesc_core_impl(
             beta[j] = new_beta;
         }
 
-        copy_f32_to_f64(&marker_residual, &mut r);
+        if should_recompute_residual(schedule.actual_iterations()) {
+            recompute_residual_dense_f64(y, x, q, &alpha, m, &beta, &mut r);
+        } else {
+            copy_f32_to_f64(&marker_residual, &mut r);
+        }
         let mut mrk_in_usize = 0usize;
         let mut ss_b = 0.0;
         for j in 0..p {
@@ -4037,7 +4131,11 @@ fn bayesa_core_impl(
             beta[j] = new_beta;
         }
 
-        copy_f32_to_f64(&marker_residual, &mut r);
+        if should_recompute_residual(schedule.actual_iterations()) {
+            recompute_residual_dense_f64(y, x, q, &alpha, m, &beta, &mut r);
+        } else {
+            copy_f32_to_f64(&marker_residual, &mut r);
+        }
         for j in 0..p {
             var_b[j] = (s + beta[j] * beta[j]) / rng.sample(chi_b);
             if !(var_b[j].is_finite() && var_b[j] > 0.0) {
@@ -4585,8 +4683,18 @@ fn bayesa_lockstep_core_impl<B: BayesMarkerBackend>(
             Ok(())
         })?;
 
+        let recompute_now = should_recompute_residual(controller.actual_iterations());
+        if recompute_now {
+            let mut chain_views: Vec<(&[f64], &[f64], &mut [f64])> = states
+                .iter_mut()
+                .map(|s| (s.alpha.as_slice(), s.beta.as_slice(), s.residual.as_mut_slice()))
+                .collect();
+            recompute_residual_backend_multi_f64(y, x, q, backend, &mut chain_views)?;
+        }
         let chain_summaries = bayes_chain_try_map_mut(&mut states, chain_pool, |state| {
-            copy_f32_to_f64(&state.marker_residual, &mut state.residual);
+            if !recompute_now {
+                copy_f32_to_f64(&state.marker_residual, &mut state.residual);
+            }
             for j in 0..p {
                 state.var_b[j] = bayes_positive_floor(
                     (state.s + state.beta[j] * state.beta[j]) / state.rng.sample(chi_b),
@@ -4914,8 +5022,18 @@ fn bayesb_lockstep_core_impl<B: BayesMarkerBackend>(
             })
         })?;
 
+        let recompute_now = should_recompute_residual(controller.actual_iterations());
+        if recompute_now {
+            let mut chain_views: Vec<(&[f64], &[f64], &mut [f64])> = states
+                .iter_mut()
+                .map(|s| (s.alpha.as_slice(), s.beta.as_slice(), s.residual.as_mut_slice()))
+                .collect();
+            recompute_residual_backend_multi_f64(y, x, q, backend, &mut chain_views)?;
+        }
         let chain_summaries = bayes_chain_try_map_mut(&mut states, chain_pool, |state| {
-            copy_f32_to_f64(&state.marker_residual, &mut state.residual);
+            if !recompute_now {
+                copy_f32_to_f64(&state.marker_residual, &mut state.residual);
+            }
             let mut n_active = 0usize;
             for j in 0..p {
                 let distribution = if state.d[j] == 1 {
@@ -5254,8 +5372,18 @@ fn bayesc_lockstep_core_impl<B: BayesMarkerBackend>(
                 Ok(())
             })
         })?;
+        let recompute_now = should_recompute_residual(controller.actual_iterations());
+        if recompute_now {
+            let mut chain_views: Vec<(&[f64], &[f64], &mut [f64])> = states
+                .iter_mut()
+                .map(|s| (s.alpha.as_slice(), s.beta.as_slice(), s.residual.as_mut_slice()))
+                .collect();
+            recompute_residual_backend_multi_f64(y, x, q, backend, &mut chain_views)?;
+        }
         let chain_summaries = bayes_chain_try_map_mut(&mut states, chain_pool, |state| {
-            copy_f32_to_f64(&state.marker_residual, &mut state.residual);
+            if !recompute_now {
+                copy_f32_to_f64(&state.marker_residual, &mut state.residual);
+            }
             let mut active = 0usize;
             let mut ss_b = 0.0;
             for j in 0..p {
@@ -5801,7 +5929,11 @@ fn bayesa_packed_core_impl(
             Ok(())
         })?;
 
-        copy_f32_to_f64(&marker_residual, &mut r);
+        if should_recompute_residual(schedule.actual_iterations()) {
+            recompute_residual_backend_f64(y, x, q, &mut backend, &alpha, &beta, &mut r)?;
+        } else {
+            copy_f32_to_f64(&marker_residual, &mut r);
+        }
         for j in 0..p {
             var_b[j] = (s + beta[j] * beta[j]) / rng.sample(chi_b);
             if !(var_b[j].is_finite() && var_b[j] > 0.0) {
@@ -6134,7 +6266,11 @@ fn bayesb_packed_core_impl(
             Ok(())
         })?;
 
-        copy_f32_to_f64(&marker_residual, &mut r);
+        if should_recompute_residual(schedule.actual_iterations()) {
+            recompute_residual_backend_f64(y, x, q, &mut backend, &alpha, &beta, &mut r)?;
+        } else {
+            copy_f32_to_f64(&marker_residual, &mut r);
+        }
         let mut n_active = 0usize;
         for j in 0..p {
             if d[j] == 1 {
@@ -6496,7 +6632,11 @@ fn bayesc_packed_core_impl(
             Ok(())
         })?;
 
-        copy_f32_to_f64(&marker_residual, &mut r);
+        if should_recompute_residual(schedule.actual_iterations()) {
+            recompute_residual_backend_f64(y, x, q, &mut backend, &alpha, &beta, &mut r)?;
+        } else {
+            copy_f32_to_f64(&marker_residual, &mut r);
+        }
         let mut mrk_in_usize = 0usize;
         let mut ss_b = 0.0;
         for j in 0..p {
@@ -9234,7 +9374,11 @@ fn bayesa_packed_trace_core_impl(
             Ok(())
         })?;
 
-        copy_f32_to_f64(&marker_residual, &mut r);
+        if should_recompute_residual(it + 1) {
+            recompute_residual_backend_f64(y, x, q, &mut backend, &alpha, &beta, &mut r)?;
+        } else {
+            copy_f32_to_f64(&marker_residual, &mut r);
+        }
         for j in 0..p {
             var_b[j] = (s + beta[j] * beta[j]) / rng.sample(chi_b);
             if !(var_b[j].is_finite() && var_b[j] > 0.0) {
@@ -9560,7 +9704,11 @@ fn bayesb_packed_trace_core_impl(
             Ok(())
         })?;
 
-        copy_f32_to_f64(&marker_residual, &mut r);
+        if should_recompute_residual(it + 1) {
+            recompute_residual_backend_f64(y, x, q, &mut backend, &alpha, &beta, &mut r)?;
+        } else {
+            copy_f32_to_f64(&marker_residual, &mut r);
+        }
         let mut n_active = 0usize;
         for j in 0..p {
             if d[j] == 1 {
@@ -9911,7 +10059,11 @@ fn bayesc_packed_trace_core_impl(
             Ok(())
         })?;
 
-        copy_f32_to_f64(&marker_residual, &mut r);
+        if should_recompute_residual(it + 1) {
+            recompute_residual_backend_f64(y, x, q, &mut backend, &alpha, &beta, &mut r)?;
+        } else {
+            copy_f32_to_f64(&marker_residual, &mut r);
+        }
         let mut mrk_in_usize = 0usize;
         let mut ss_b = 0.0;
         for j in 0..p {

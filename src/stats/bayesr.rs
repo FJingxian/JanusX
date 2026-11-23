@@ -473,7 +473,19 @@ fn bayesr_core_impl<B: BayesMarkerBackend>(
             Ok(())
         })?;
 
-        copy_f32_to_f64(&marker_residual, &mut residual);
+        if super::bayes::should_recompute_residual(schedule.actual_iterations()) {
+            super::bayes::recompute_residual_backend_f64(
+                y,
+                x,
+                q,
+                backend,
+                &alpha,
+                &beta,
+                &mut residual,
+            )?;
+        } else {
+            copy_f32_to_f64(&marker_residual, &mut residual);
+        }
 
         let mut active_count = 0usize;
         let mut scaled_sum = 0.0_f64;
@@ -867,9 +879,23 @@ fn bayesr_lockstep_core_impl<B: BayesMarkerBackend>(
             })
         })?;
 
-        bayes_chain_for_each_mut(&mut states, chain_pool, |state| {
-            copy_f32_to_f64(&state.marker_residual, &mut state.residual);
-        });
+        if super::bayes::should_recompute_residual(controller.actual_iterations()) {
+            let mut chain_views: Vec<(&[f64], &[f64], &mut [f64])> = states
+                .iter_mut()
+                .map(|s| (s.alpha.as_slice(), s.beta.as_slice(), s.residual.as_mut_slice()))
+                .collect();
+            super::bayes::recompute_residual_backend_multi_f64(
+                y,
+                x,
+                q,
+                backend,
+                &mut chain_views,
+            )?;
+        } else {
+            bayes_chain_for_each_mut(&mut states, chain_pool, |state| {
+                copy_f32_to_f64(&state.marker_residual, &mut state.residual);
+            });
+        }
 
         let chain_summaries = bayes_chain_try_map_mut(&mut states, chain_pool, |state| {
             let mut active_count = 0usize;

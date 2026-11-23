@@ -10,7 +10,7 @@ Files synced:
 
 Usage:
   python scripts/sync_version_from_tag.py v1.2.3
-  python scripts/sync_version_from_tag.py 1.2.3
+  python scripts/sync_version_from_tag.py 1.2.3 /path/to/source-root
 """
 
 from __future__ import annotations
@@ -22,14 +22,6 @@ import sys
 import urllib.request
 from datetime import date
 from pathlib import Path
-
-
-ROOT = Path(__file__).resolve().parents[1]
-PYPROJECT = ROOT / "pyproject.toml"
-CARGO = ROOT / "Cargo.toml"
-JANUSX_CLI = ROOT / "python" / "janusx" / "script" / "JanusX.py"
-BIOCONDA_META = ROOT / "bioconda-recipes" / "recipes" / "janusx" / "meta.yaml"
-BIOCONDA_LOCALCHECK_META = ROOT / "bioconda-recipes" / "recipes" / "janusx-localcheck" / "meta.yaml"
 
 
 def _normalize_tag(tag: str) -> str:
@@ -125,10 +117,22 @@ def _fetch_pypi_sdist_sha256(name: str, version: str) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _git_head_date() -> str:
+def _resolve_source_root(raw_root: str | None) -> Path:
+    root = (
+        Path(raw_root).expanduser()
+        if raw_root is not None
+        else Path(__file__).resolve().parents[1]
+    )
+    root = root.resolve()
+    if not root.is_dir():
+        raise ValueError(f"Source root is not a directory: {root}")
+    return root
+
+
+def _git_head_date(root: Path) -> str:
     try:
         out = subprocess.check_output(
-            ["git", "-C", str(ROOT), "log", "-1", "--date=format:%Y-%m-%d", "--format=%cd"],
+            ["git", "-C", str(root), "log", "-1", "--date=format:%Y-%m-%d", "--format=%cd"],
             text=True,
             stderr=subprocess.DEVNULL,
         ).strip()
@@ -141,35 +145,50 @@ def _git_head_date() -> str:
 
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
-    if len(args) != 1:
-        print("Usage: python scripts/sync_version_from_tag.py <tag-or-version>")
+    if len(args) not in {1, 2}:
+        print(
+            "Usage: python scripts/sync_version_from_tag.py "
+            "<tag-or-version> [source-root]"
+        )
         return 2
 
     version = _normalize_tag(args[0])
     rust_version = _rust_semver_from_python_version(version)
-    build_date = _git_head_date()
-    _replace_section_version(PYPROJECT, "project", version)
-    _replace_section_version(CARGO, "package", rust_version)
-    _replace_build_date_fallback(JANUSX_CLI, build_date)
-    _replace_recipe_version(BIOCONDA_META, version)
-    if BIOCONDA_LOCALCHECK_META.exists():
-        _replace_recipe_version(BIOCONDA_LOCALCHECK_META, version)
+    root = _resolve_source_root(args[1] if len(args) == 2 else None)
+    pyproject = root / "pyproject.toml"
+    cargo = root / "Cargo.toml"
+    janusx_cli = root / "python" / "janusx" / "script" / "JanusX.py"
+    bioconda_meta = root / "bioconda-recipes" / "recipes" / "janusx" / "meta.yaml"
+    bioconda_localcheck_meta = (
+        root / "bioconda-recipes" / "recipes" / "janusx-localcheck" / "meta.yaml"
+    )
+    build_date = _git_head_date(root)
+    _replace_section_version(pyproject, "project", version)
+    _replace_section_version(cargo, "package", rust_version)
+    _replace_build_date_fallback(janusx_cli, build_date)
+    _replace_recipe_version(bioconda_meta, version)
+    if bioconda_localcheck_meta.exists():
+        _replace_recipe_version(bioconda_localcheck_meta, version)
     if (os.environ.get("SYNC_PYPI_SOURCE_SHA256") or "").strip().lower() in {
         "1",
         "true",
         "yes",
         "on",
     }:
-        _replace_recipe_sha256(BIOCONDA_META, _fetch_pypi_sdist_sha256("janusx", version))
+        _replace_recipe_sha256(
+            bioconda_meta,
+            _fetch_pypi_sdist_sha256("janusx", version),
+        )
     print(
         "Synchronized version/build date:\n"
         f"  py_version = {version}\n"
         f"  rs_version = {rust_version}\n"
         f"  build_date = {build_date}\n"
-        f"  bioconda   = {BIOCONDA_META.relative_to(ROOT)}"
+        f"  source_root = {root}\n"
+        f"  bioconda   = {bioconda_meta.relative_to(root)}"
     )
-    if BIOCONDA_LOCALCHECK_META.exists():
-        print(f"  localcheck = {BIOCONDA_LOCALCHECK_META.relative_to(ROOT)}")
+    if bioconda_localcheck_meta.exists():
+        print(f"  localcheck = {bioconda_localcheck_meta.relative_to(root)}")
     return 0
 
 

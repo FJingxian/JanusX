@@ -263,6 +263,17 @@ jobs:
           ref: ${{ inputs.source_ref }}
           token: ${{ secrets.checkout_token != '' && secrets.checkout_token || github.token }}
 
+      - name: Checkout workflow CI helpers
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: .ci-helpers
+          sparse-checkout: |
+            scripts/ci
+            scripts/sync_version_from_tag.py
+          sparse-checkout-cone-mode: false
+
       - name: Sync version for package build
         shell: bash
         run: |
@@ -281,7 +292,7 @@ jobs:
           echo "Using package version: $VERSION"
           PY=python
           command -v python >/dev/null 2>&1 || PY=python3
-          $PY scripts/sync_version_from_tag.py "$VERSION"
+          $PY .ci-helpers/scripts/sync_version_from_tag.py "$VERSION" "$GITHUB_WORKSPACE"
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -312,7 +323,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/janusx-openblas-macos-cache
-          key: openblas-${{ matrix.label }}-0.3.33-pthreads-${{ hashFiles('scripts/ci/build_macos_openblas.sh') }}
+          key: openblas-${{ matrix.label }}-0.3.33-pthreads-${{ hashFiles('.ci-helpers/scripts/ci/build_macos_openblas.sh') }}
 
       - name: Install OpenBLAS (macOS, pthreads)
         if: ${{ matrix.platform == 'macos' }}
@@ -326,7 +337,7 @@ jobs:
           else
             OPENBLAS_BUILD_ROOT="${RUNNER_TEMP}/janusx-openblas-macos-cache/build" \
             OPENBLAS_PREFIX="${OPENBLAS_CACHE_PREFIX}" \
-              bash scripts/ci/build_macos_openblas.sh
+              bash .ci-helpers/scripts/ci/build_macos_openblas.sh
             rm -rf "${RUNNER_TEMP}/janusx-openblas-macos-cache/build"
           fi
           {
@@ -340,7 +351,7 @@ jobs:
         shell: pwsh
         run: |
           $dest = Join-Path $env:RUNNER_TEMP "condaforge-openblas-win64"
-          python scripts/ci/install_windows_condaforge_openblas.py `
+          python .ci-helpers/scripts/ci/install_windows_condaforge_openblas.py `
             --subdir win-64 `
             --flavor pthreads `
             --dest "$dest" `
@@ -414,7 +425,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/janusx-openblas-cache
-          key: openblas-${{ matrix.label }}-0.3.33-shared-${{ hashFiles('scripts/ci/build_linux_openblas.sh') }}
+          key: openblas-${{ matrix.label }}-0.3.33-shared-${{ hashFiles('.ci-helpers/scripts/ci/build_linux_openblas.sh') }}
 
       - name: Prepare Linux OpenBLAS cache directory
         if: ${{ matrix.platform == 'linux' }}
@@ -454,18 +465,18 @@ jobs:
               else
                 export OPENBLAS_BUILD_ROOT=/openblas-cache/build
                 export OPENBLAS_PREFIX=/openblas-cache/prefix
-                . /io/scripts/ci/build_linux_openblas.sh
+                . /io/.ci-helpers/scripts/ci/build_linux_openblas.sh
               fi
               rm -rf /openblas-cache/build
               export JANUSX_REQUIRE_OPENBLAS=1
               export JANUSX_STRICT_KMC_BIND=1
               ${INTERP} -m build --wheel --outdir dist_raw --no-isolation
-              ${INTERP} /io/scripts/ci/check_wheel_kmc.py --exactly-one dist_raw/*.whl
+              ${INTERP} /io/.ci-helpers/scripts/ci/check_wheel_kmc.py --exactly-one dist_raw/*.whl
               auditwheel show dist_raw/*.whl
               auditwheel repair dist_raw/*.whl -w dist
-              ${INTERP} /io/scripts/ci/check_wheel_kmc.py --exactly-one dist/*.whl
+              ${INTERP} /io/.ci-helpers/scripts/ci/check_wheel_kmc.py --exactly-one dist/*.whl
               ${INTERP} -m pip install --force-reinstall --no-deps dist/*.whl
-              CXX=/bin/false ${INTERP} /io/scripts/ci/check_installed_runtime.py \
+              CXX=/bin/false ${INTERP} /io/.ci-helpers/scripts/ci/check_installed_runtime.py \
                 --require-openblas \
                 --require-pthreads-openblas \
                 --check-kmc-load
@@ -499,7 +510,7 @@ jobs:
         if: ${{ matrix.platform == 'macos' }}
         shell: bash
         run: |
-          python scripts/ci/check_macos_linkedit.py dist/*.whl
+          python .ci-helpers/scripts/ci/check_macos_linkedit.py dist/*.whl
 
       - name: Clear build-only Windows OpenBLAS hints
         if: ${{ matrix.label == 'windows-x86_64' }}
@@ -532,7 +543,7 @@ jobs:
         run: |
           PY=python
           command -v python >/dev/null 2>&1 || PY=python3
-          "$PY" scripts/ci/check_installed_runtime.py --check-macos-bundled-openblas
+          "$PY" .ci-helpers/scripts/ci/check_installed_runtime.py --check-macos-bundled-openblas
 
       - name: Verify Rust eigh LAPACK backend (windows-x86_64)
         if: ${{ matrix.label == 'windows-x86_64' }}
@@ -541,9 +552,13 @@ jobs:
           PY=python
           command -v python >/dev/null 2>&1 || PY=python3
           "$PY" - <<'PY'
+          import numpy as np
           import janusx.janusx as _jx
-          _ = _jx.rust_eigh_debug_f64(n=128, threads=4, driver="auto", jobz="V", require_lapack=True)
-          print("[janusx] rust_eigh_debug_f64(require_lapack=True) passed")
+          rng = np.random.default_rng(20260501)
+          raw = rng.random((128, 128), dtype=np.float64) - 0.5
+          a = np.ascontiguousarray(0.5 * (raw + raw.T), dtype=np.float64)
+          _ = _jx.rust_eigh_from_array_f64(a, threads=4, driver="auto", jobz="V", require_lapack=True)
+          print("[janusx] rust_eigh_from_array_f64(require_lapack=True) passed")
           PY
 
       - name: Verify bundled OpenBLAS is pthreads (windows-x86_64)
@@ -552,7 +567,7 @@ jobs:
         run: |
           PY=python
           command -v python >/dev/null 2>&1 || PY=python3
-          "$PY" scripts/ci/check_installed_runtime.py --require-openblas --require-pthreads-openblas
+          "$PY" .ci-helpers/scripts/ci/check_installed_runtime.py --require-openblas --require-pthreads-openblas
 
       - name: Verify OpenBLAS threading (windows-x86_64)
         if: ${{ matrix.label == 'windows-x86_64' }}
@@ -562,6 +577,7 @@ jobs:
           command -v python >/dev/null 2>&1 || PY=python3
           "$PY" - <<'PY'
           import os
+          import numpy as np
           import janusx.janusx as _jx
 
           target = 8
@@ -579,8 +595,11 @@ jobs:
                   "Strict mode failed: OpenBLAS thread control ineffective "
                   f"(expected >=2, got {got})."
               )
-          _ = _jx.rust_eigh_debug_f64(
-              n=256,
+          rng = np.random.default_rng(20260501)
+          raw = rng.random((256, 256), dtype=np.float64) - 0.5
+          a = np.ascontiguousarray(0.5 * (raw + raw.T), dtype=np.float64)
+          _ = _jx.rust_eigh_from_array_f64(
+              a,
               threads=target,
               driver="auto",
               jobz="V",
@@ -597,8 +616,8 @@ jobs:
           command -v python >/dev/null 2>&1 || PY=python3
           "$PY" -m pip install --upgrade pip
           "$PY" -m pip install --force-reinstall --no-deps dist/*.whl
-          "$PY" scripts/ci/check_wheel_kmc.py --exactly-one
-          "$PY" scripts/ci/check_installed_runtime.py --check-kmc-load
+          "$PY" .ci-helpers/scripts/ci/check_wheel_kmc.py --exactly-one
+          "$PY" .ci-helpers/scripts/ci/check_installed_runtime.py --check-kmc-load
 
       - name: Wheel runtime smoke test
         if: ${{ matrix.run_smoke_test == 'true' }}
@@ -654,11 +673,15 @@ jobs:
           jx grm -bfile "$TEST_PREFIX" -o test
           "$PY" - <<'PY'
           import os
+          import numpy as np
           import janusx.janusx as _jx
           bundled = os.environ.get("JX_OPENBLAS_LIB_PATH", "")
           print(f"[janusx] JX_OPENBLAS_LIB_PATH={bundled}")
-          backend, evd_backend, *_ = _jx.rust_eigh_debug_f64(
-              n=128,
+          rng = np.random.default_rng(20260501)
+          raw = rng.random((128, 128), dtype=np.float64) - 0.5
+          a = np.ascontiguousarray(0.5 * (raw + raw.T), dtype=np.float64)
+          _, _, backend, evd_backend, *_ = _jx.rust_eigh_from_array_f64(
+              a,
               threads=2,
               driver="auto",
               jobz="V",
@@ -711,7 +734,7 @@ jobs:
           PY=python
           command -v python >/dev/null 2>&1 || PY=python3
           if [[ "${LABEL}" != "windows-arm64" ]]; then
-            "$PY" scripts/ci/check_wheel_kmc.py --exactly-one dist/*.whl
+            "$PY" .ci-helpers/scripts/ci/check_wheel_kmc.py --exactly-one dist/*.whl
           else
             echo "[wheel-build] skip KMC prebuilt wheel check for ${LABEL} (cross-build path sets JANUSX_PREBUILD_KMC_BIND=0)"
           fi
@@ -733,7 +756,7 @@ jobs:
         if: ${{ matrix.upload_wheel == 'true' && inputs.retention_days != '' }}
         uses: actions/upload-artifact@v7
         with:
-          name: wheels-${{ matrix.label }}
+          name: wheel-platform-${{ matrix.label }}
           path: wheelhouse/*.whl
           if-no-files-found: error
           retention-days: ${{ inputs.retention_days }}
@@ -743,7 +766,7 @@ jobs:
         if: ${{ matrix.upload_wheel == 'true' && inputs.retention_days == '' }}
         uses: actions/upload-artifact@v7
         with:
-          name: wheels-${{ matrix.label }}
+          name: wheel-platform-${{ matrix.label }}
           path: wheelhouse/*.whl
           if-no-files-found: error
           compression-level: 0
@@ -758,28 +781,128 @@ jobs:
           cat <<EOF >> "$GITHUB_STEP_SUMMARY"
           ### ${{ matrix.label }}
           - Wheel: \`${WHEEL_NAME}\`
-          - Platform artifact: \`wheels-${{ matrix.label }}\`
+          - Platform artifact: \`wheel-platform-${{ matrix.label }}\`
           - Actions artifact: individual files are merged into \`wheels-all\`. GitHub Actions artifacts require a GitHub login.
           - Run page: [workflow run](${RUN_URL})
           - Retention: Actions artifacts remain valid until the artifact or run expires.
           EOF
 
+  verify-windows-arm64:
+    name: Verify Windows ARM64 wheel
+    needs:
+      - build-wheels
+    if: ${{ inputs.target == 'all' || inputs.target == 'windows-arm64' }}
+    runs-on: windows-11-arm
+    steps:
+      - name: Download Windows ARM64 wheel
+        uses: actions/download-artifact@v8
+        with:
+          name: wheel-platform-windows-arm64
+          path: dist
+
+      - name: Set up Python (ARM64)
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          architecture: arm64
+
+      - name: Verify Windows ARM64 runtime (import, OpenBLAS threading, LAPACK eigh)
+        shell: bash
+        run: |
+          set -euo pipefail
+          PY=python
+          command -v python >/dev/null 2>&1 || PY=python3
+          "$PY" -m pip install --upgrade pip
+          "$PY" -m pip install "numpy>=1.23"
+          "$PY" -m pip install --force-reinstall --no-deps dist/*.whl
+          "$PY" - <<'PY'
+          import os
+          import platform
+          import numpy as np
+          import janusx.janusx as _jx
+
+          arch = platform.machine().lower()
+          print(f"[windows-arm64] platform.machine()={arch}")
+          if "arm" not in arch and "aarch64" not in arch:
+              raise SystemExit(f"Expected ARM64 Python runtime, got {arch!r}")
+
+          backend = _jx.rust_sgemm_backend()
+          print(f"[windows-arm64] rust_sgemm_backend={backend}")
+          if backend != "openblas":
+              raise SystemExit(
+                  f"Strict mode failed: expected 'openblas' backend, got {backend!r}"
+              )
+
+          target = 4
+          for k in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+              os.environ[k] = str(target)
+          ok = bool(_jx.rust_blas_set_num_threads(target))
+          got = int(_jx.rust_blas_get_num_threads())
+          print(f"[windows-arm64] rust_blas_set_num_threads({target}) -> {ok}")
+          print(f"[windows-arm64] rust_blas_get_num_threads() -> {got}")
+          if not ok:
+              raise SystemExit("Strict mode failed: rust_blas_set_num_threads returned False")
+          if got < 2:
+              raise SystemExit(
+                  "Strict mode failed: OpenBLAS thread control ineffective "
+                  f"(expected >=2, got {got})."
+              )
+
+          rng = np.random.default_rng(20260501)
+          raw = rng.random((128, 128), dtype=np.float64) - 0.5
+          a = np.ascontiguousarray(0.5 * (raw + raw.T), dtype=np.float64)
+          evals, evecs, sgemm_backend, evd_backend, *_ = _jx.rust_eigh_from_array_f64(
+              a,
+              threads=target,
+              driver="auto",
+              jobz="V",
+              require_lapack=True,
+          )
+          residual = float(np.max(np.abs(a @ evecs - evecs * evals)))
+          print(
+              f"[windows-arm64] rust_eigh_from_array_f64: sgemm={sgemm_backend} "
+              f"eigh={evd_backend} max_residual={residual:.3e}"
+          )
+          if not np.isfinite(residual) or residual > 1e-10:
+              raise SystemExit(f"Unexpected eigh residual on Windows ARM64: {residual}")
+          PY
+
   bundle-wheels:
     name: Bundle wheels
     needs:
       - build-wheels
+      - verify-windows-arm64
+    if: ${{ !failure() && !cancelled() && needs.build-wheels.result == 'success' && (needs.verify-windows-arm64.result == 'success' || needs.verify-windows-arm64.result == 'skipped') }}
     runs-on: ubuntu-latest
     permissions:
       actions: write
       contents: read
     steps:
+      - name: Remove previous merged wheels artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          artifact_ids="$(
+            gh api --paginate \
+              "/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts?per_page=100" \
+              --jq '.artifacts[] | select(.name == "wheels-all") | .id'
+          )"
+          while IFS= read -r artifact_id; do
+            if [[ -z "$artifact_id" ]]; then
+              continue
+            fi
+            gh api --method DELETE \
+              "/repos/${{ github.repository }}/actions/artifacts/${artifact_id}"
+          done <<< "$artifact_ids"
+
       - name: Merge platform wheels into one artifact
         if: ${{ inputs.retention_days != '' }}
         uses: actions/upload-artifact/merge@v4
         with:
           name: wheels-all
-          pattern: wheels-*
-          delete-merged: true
+          pattern: wheel-platform-*
+          delete-merged: false
           retention-days: ${{ inputs.retention_days }}
 
       - name: Merge platform wheels into one artifact
@@ -787,8 +910,8 @@ jobs:
         uses: actions/upload-artifact/merge@v4
         with:
           name: wheels-all
-          pattern: wheels-*
-          delete-merged: true
+          pattern: wheel-platform-*
+          delete-merged: false
 
   build-sdist:
     name: Build source distribution
@@ -801,6 +924,16 @@ jobs:
           repository: ${{ inputs.source_repository != '' && inputs.source_repository || github.repository }}
           ref: ${{ inputs.source_ref }}
           token: ${{ secrets.checkout_token != '' && secrets.checkout_token || github.token }}
+
+      - name: Checkout workflow CI helpers
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.sha }}
+          path: .ci-helpers
+          sparse-checkout: |
+            scripts/sync_version_from_tag.py
+          sparse-checkout-cone-mode: false
 
       - name: Sync version for package build
         shell: bash
@@ -815,12 +948,14 @@ jobs:
           fi
           if [[ -z "$VERSION" ]]; then
             echo "Skip sync_version_from_tag.py (no package version override)"
+            rm -rf .ci-helpers
             exit 0
           fi
           echo "Using package version: $VERSION"
           PY=python
           command -v python >/dev/null 2>&1 || PY=python3
-          $PY scripts/sync_version_from_tag.py "$VERSION"
+          $PY .ci-helpers/scripts/sync_version_from_tag.py "$VERSION" "$GITHUB_WORKSPACE"
+          rm -rf .ci-helpers
 
       - name: Set up Python
         uses: actions/setup-python@v6

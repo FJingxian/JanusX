@@ -175,9 +175,8 @@ jobs:
       - name: Download wheels
         uses: actions/download-artifact@v8
         with:
-          pattern: wheels-*
+          name: wheels-all
           path: wheelhouse
-          merge-multiple: true
 
       - name: Download source distribution
         uses: actions/download-artifact@v8

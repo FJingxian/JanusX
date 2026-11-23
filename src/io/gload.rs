@@ -408,6 +408,54 @@ pub(crate) struct ResidentPackedBed {
     pub(crate) n_snps: usize,
     pub(crate) bytes_per_snp: usize,
     pub(crate) packed: Vec<u8>,
+    pub(crate) meta_bytes: Option<Arc<Vec<u8>>>,
+    pub(crate) meta_is_zst: bool,
+}
+
+struct ArcBytesCursor {
+    data: Arc<Vec<u8>>,
+    pos: usize,
+}
+
+impl std::io::Read for ArcBytesCursor {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let rem = &self.data[self.pos..];
+        let n = rem.len().min(buf.len());
+        buf[..n].copy_from_slice(&rem[..n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+impl std::io::BufRead for ArcBytesCursor {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        Ok(&self.data[self.pos..])
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.pos = self.pos.saturating_add(amt).min(self.data.len());
+    }
+}
+
+fn read_file_nocache_aligned(path: &Path) -> Result<Vec<u8>, String> {
+    let mut file = File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    hint_file_nocache(&file);
+    let total_bytes = file
+        .metadata()
+        .map_err(|e| format!("stat {}: {e}", path.display()))?
+        .len() as usize;
+    let mut out = vec![0u8; total_bytes];
+    const IO_CHUNK: usize = 4 * 1024 * 1024;
+    let mut offset = 0usize;
+    while offset < total_bytes {
+        crate::stats_common::check_ctrlc()?;
+        let to_read = (total_bytes - offset).min(IO_CHUNK);
+        file.read_exact(&mut out[offset..offset + to_read])
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        hint_file_dontneed(&file, offset as u64, to_read as u64);
+        offset += to_read;
+    }
+    Ok(out)
 }
 
 pub(crate) fn hint_file_nocache(file: &File) {
@@ -531,6 +579,28 @@ pub(crate) fn lookup_resident_packed_bed(prefix: &str) -> Option<Arc<ResidentPac
         .as_ref()
         .filter(|state| state.entry.key == key)
         .map(|state| Arc::clone(&state.entry))
+}
+
+pub(crate) fn open_resident_variant_meta_reader(
+    prefix: &str,
+) -> Result<Option<Box<dyn std::io::BufRead + Send>>, String> {
+    let Some(entry) = lookup_resident_packed_bed(prefix) else {
+        return Ok(None);
+    };
+    let Some(bytes) = entry.meta_bytes.as_ref() else {
+        return Ok(None);
+    };
+    let cursor = ArcBytesCursor {
+        data: Arc::clone(bytes),
+        pos: 0,
+    };
+    if entry.meta_is_zst {
+        let decoder = zstd::stream::read::Decoder::new(cursor)
+            .map_err(|e| format!("open resident zstd metadata reader: {e}"))?;
+        Ok(Some(Box::new(std::io::BufReader::with_capacity(1 << 20, decoder))))
+    } else {
+        Ok(Some(Box::new(cursor)))
+    }
 }
 
 pub(crate) fn clear_resident_packed_bed(token: Option<u64>) {
@@ -688,12 +758,36 @@ pub(crate) fn load_resident_packed_bed(
         (n_samples_full, info.n_snps_total, info.bytes_per_snp, packed)
     };
 
+    let (meta_bytes, meta_is_zst) = if pgen_source {
+        let pvar_path = crate::pgen::pvar_path_for_prefix(&canon_prefix);
+        if pvar_path.is_file() {
+            let is_zst = pvar_path
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .ends_with(".zst");
+            let bytes = read_file_nocache_aligned(&pvar_path)?;
+            (Some(Arc::new(bytes)), is_zst)
+        } else {
+            (None, false)
+        }
+    } else {
+        let bim_path = Path::new(&format!("{canon_prefix}.bim")).to_path_buf();
+        if bim_path.is_file() {
+            let bytes = read_file_nocache_aligned(&bim_path)?;
+            (Some(Arc::new(bytes)), false)
+        } else {
+            (None, false)
+        }
+    };
+
     let entry = Arc::new(ResidentPackedBed {
         key,
         n_samples_full,
         n_snps,
         bytes_per_snp,
         packed,
+        meta_bytes,
+        meta_is_zst,
     });
     let mut owners = std::collections::HashSet::new();
     owners.insert(token);

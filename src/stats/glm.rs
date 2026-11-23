@@ -2444,8 +2444,9 @@ pub fn lm_stream_bed_to_tsv(
     };
 
     let norm_prefix = normalize_plink_prefix_local(&prefix);
+    let bed_source_path = format!("{norm_prefix}.bed");
     if let Some(prepared_meta_input) = prepared_meta_input {
-        let samples = gfcore::read_fam(&norm_prefix).map_err(PyRuntimeError::new_err)?;
+        let samples = gfcore::read_fam(&bed_source_path).map_err(PyRuntimeError::new_err)?;
         let (sample_indices, _sample_ids_ordered) =
             build_sample_selection(&samples, sample_ids, None).map_err(PyRuntimeError::new_err)?;
         if sample_indices.len() != n {
@@ -2460,7 +2461,7 @@ pub fn lm_stream_bed_to_tsv(
         let out_tsv_path = out_tsv.clone();
         return py.detach(move || -> PyResult<(usize, usize)> {
             lm_stream_bed_additive_prepared_unified(
-                norm_prefix.as_str(),
+                bed_source_path.as_str(),
                 &qr_ctx,
                 rhs_add_f32.as_slice(),
                 out_tsv_path.as_str(),
@@ -2475,7 +2476,7 @@ pub fn lm_stream_bed_to_tsv(
             .map_err(PyRuntimeError::new_err)
         });
     }
-    let samples = gfcore::read_fam(&norm_prefix).map_err(PyRuntimeError::new_err)?;
+    let samples = gfcore::read_fam(&bed_source_path).map_err(PyRuntimeError::new_err)?;
     let (sample_indices, _sample_ids_ordered) =
         build_sample_selection(&samples, sample_ids, None).map_err(PyRuntimeError::new_err)?;
     if sample_indices.len() != n {
@@ -2487,7 +2488,7 @@ pub fn lm_stream_bed_to_tsv(
     let out_tsv_path = out_tsv.clone();
     py.detach(move || -> PyResult<(usize, usize)> {
         lm_stream_bed_additive_windowed_unified(
-            norm_prefix.as_str(),
+            bed_source_path.as_str(),
             y_raw.as_slice(),
             &qr_ctx,
             out_tsv_path.as_str(),

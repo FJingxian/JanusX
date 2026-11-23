@@ -2517,7 +2517,11 @@ fn prepare_prefix_input_from_external_meta<'py>(
         )
     })?;
     let pgen_source = crate::pgen::path_uses_pgen(&bed_prefix);
-    let (bytes_per_snp, n_snps_bed) = if pgen_source {
+    let resident_entry = crate::gload::lookup_resident_packed_bed(&bed_prefix)
+        .filter(|entry| entry.n_samples_full == n_samples_full);
+    let (bytes_per_snp, n_snps_bed) = if let Some(resident) = resident_entry.as_ref() {
+        (resident.bytes_per_snp, resident.n_snps)
+    } else if pgen_source {
         (
             n_samples_full.div_ceil(4),
             crate::pgen::count_pgen_variants(&bed_prefix, n_samples_full)
@@ -2527,8 +2531,6 @@ fn prepare_prefix_input_from_external_meta<'py>(
         inspect_plink_bed_shape_local(&bed_prefix, n_samples_full)
             .map_err(PyRuntimeError::new_err)?
     };
-    let resident_entry = crate::gload::lookup_resident_packed_bed(&bed_prefix)
-        .filter(|entry| entry.n_samples_full == n_samples_full);
     let payload = if let Some(resident) = resident_entry {
         Some(SplmmPreparedPayload::Resident(resident))
     } else if retain_payload && !pgen_source {
@@ -5892,6 +5894,8 @@ pub fn splmm_assoc_pcg_bed_to_tsv_fused_exact<'py>(
     if !(lbd.is_finite() && lbd >= 0.0) {
         return Err(PyRuntimeError::new_err("lbd must be finite and >= 0"));
     }
+    let _input_kind_override =
+        crate::pgen::scoped_input_kind_override(&prefix).map_err(PyRuntimeError::new_err)?;
     let bed_prefix = normalize_plink_prefix_local(&prefix);
     let n_samples_full = read_fam(&bed_prefix)
         .map_err(PyRuntimeError::new_err)?
@@ -6181,6 +6185,8 @@ pub fn splmm_assoc_pcg_bed<'py>(
         })
         .collect::<Vec<_>>();
     let _ = (std_eps, use_train_maf, rhat_tol);
+    let _input_kind_override =
+        crate::pgen::scoped_input_kind_override(&prefix).map_err(PyRuntimeError::new_err)?;
     emit_progress_callback(stage1_progress_callback.as_ref(), 0, 0, 1)
         .map_err(PyRuntimeError::new_err)?;
     let prepared = prepare_splmm_assoc_inputs(
@@ -6378,6 +6384,8 @@ pub fn splmm_assoc_pcg_bed_to_tsv<'py>(
         })
         .collect::<Vec<_>>();
     let _ = (std_eps, use_train_maf, rhat_tol);
+    let _input_kind_override =
+        crate::pgen::scoped_input_kind_override(&prefix).map_err(PyRuntimeError::new_err)?;
 
     emit_progress_callback(stage1_progress_callback.as_ref(), 0, 0, 1)
         .map_err(PyRuntimeError::new_err)?;
@@ -7248,6 +7256,8 @@ pub fn splmm_assoc_pcg_bed_to_tsv_fused_approx<'py>(
     if !(lbd.is_finite() && lbd >= 0.0) {
         return Err(PyRuntimeError::new_err("lbd must be finite and >= 0"));
     }
+    let _input_kind_override =
+        crate::pgen::scoped_input_kind_override(&prefix).map_err(PyRuntimeError::new_err)?;
     let bed_prefix = normalize_plink_prefix_local(&prefix);
     let n_samples_full = read_fam(&bed_prefix)
         .map_err(PyRuntimeError::new_err)?

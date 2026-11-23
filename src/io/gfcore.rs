@@ -151,18 +151,23 @@ struct PvarLineFields<'a> {
 
 impl BimChunkReader {
     pub fn open(prefix: &str) -> Result<Self, String> {
-        let pgen_source = genotype_prefix_uses_pgen(prefix);
+        let raw_prefix = prefix;
+        let pgen_source = genotype_prefix_uses_pgen(raw_prefix);
         let prefix = if pgen_source {
-            crate::pgen::normalize_pgen_prefix(prefix)
+            crate::pgen::normalize_pgen_prefix(raw_prefix)
         } else {
-            normalize_genotype_prefix(prefix)
+            normalize_genotype_prefix(raw_prefix)
         };
         let path = if pgen_source {
             crate::pgen::pvar_path_for_prefix(&prefix)
         } else {
             PathBuf::from(format!("{prefix}.bim"))
         };
-        let mut reader = if pgen_source {
+        let mut reader = if let Some(resident_reader) =
+            crate::gload::open_resident_variant_meta_reader(raw_prefix)?
+        {
+            resident_reader
+        } else if pgen_source {
             crate::pgen::open_text_reader(&path)?
         } else {
             let file = File::open(&path).map_err(|e| e.to_string())?;
@@ -2057,8 +2062,14 @@ fn default_sites(n_rows: usize) -> Vec<SiteInfo> {
 }
 
 fn read_bim_file(path: &Path) -> Result<Vec<SiteInfo>, String> {
-    let file = File::open(path).map_err(|e| e.to_string())?;
-    let reader = BufReader::new(file);
+    let reader: Box<dyn BufRead + Send> = if let Some(resident_reader) =
+        crate::gload::open_resident_variant_meta_reader(&path.to_string_lossy())?
+    {
+        resident_reader
+    } else {
+        let file = File::open(path).map_err(|e| e.to_string())?;
+        Box::new(BufReader::new(file))
+    };
 
     let mut sites = Vec::new();
     for (line_no, line) in reader.lines().enumerate() {
@@ -2286,8 +2297,14 @@ fn read_bim_columns_file(
         }
     }
 
-    let file = File::open(path).map_err(|e| e.to_string())?;
-    let reader = BufReader::new(file);
+    let reader: Box<dyn BufRead + Send> = if let Some(resident_reader) =
+        crate::gload::open_resident_variant_meta_reader(&path.to_string_lossy())?
+    {
+        resident_reader
+    } else {
+        let file = File::open(path).map_err(|e| e.to_string())?;
+        Box::new(BufReader::new(file))
+    };
     let want_len = select.map(|idx| idx.len()).unwrap_or(0);
     let mut chrom = Vec::with_capacity(want_len);
     let mut pos = Vec::with_capacity(want_len);

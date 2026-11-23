@@ -599,11 +599,18 @@ fn read_pvar_chrom_pos_selected(
     row_indices: Option<&[usize]>,
     expected_len: usize,
 ) -> Result<(Vec<String>, Vec<i64>), String> {
+    let raw_prefix = prefix;
     let prefix = crate::pgen::normalize_pgen_prefix(prefix);
     let path = crate::pgen::pvar_path_for_prefix(&prefix)
         .to_string_lossy()
         .into_owned();
-    let mut reader = crate::pgen::open_text_reader(std::path::Path::new(&path))?;
+    let mut reader = if let Some(resident_reader) =
+        crate::gload::open_resident_variant_meta_reader(raw_prefix)?
+    {
+        resident_reader
+    } else {
+        crate::pgen::open_text_reader(std::path::Path::new(&path))?
+    };
     let (columns, mut line_no) = read_pvar_header(&mut reader, &path)?;
 
     let mut requested = row_indices
@@ -746,8 +753,14 @@ fn resolve_assoc_chrom_pos_metadata(
         }
     }
 
-    let file = File::open(&bim_path).map_err(|e| format!("{bim_path}: {e}"))?;
-    let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
+    let reader: Box<dyn BufRead + Send> = if let Some(resident_reader) =
+        crate::gload::open_resident_variant_meta_reader(prefix)?
+    {
+        resident_reader
+    } else {
+        let file = File::open(&bim_path).map_err(|e| format!("{bim_path}: {e}"))?;
+        Box::new(BufReader::with_capacity(8 * 1024 * 1024, file))
+    };
     let mut chrom_out = Vec::<String>::with_capacity(expected_len);
     let mut pos_out = Vec::<i64>::with_capacity(expected_len);
     let mut want_ptr = 0usize;
@@ -823,7 +836,11 @@ impl BimSelectedFieldStream {
         } else {
             format!("{normalized_prefix}.bim")
         };
-        let mut reader = if is_pgen {
+        let mut reader = if let Some(resident_reader) =
+            crate::gload::open_resident_variant_meta_reader(prefix)?
+        {
+            resident_reader
+        } else if is_pgen {
             crate::pgen::open_text_reader(std::path::Path::new(&metadata_path))?
         } else {
             let file = File::open(&metadata_path).map_err(|e| format!("{metadata_path}: {e}"))?;

@@ -2469,7 +2469,12 @@ type InputKindOverrides = HashMap<String, (bool, usize)>;
 static INPUT_KIND_OVERRIDES: OnceLock<Mutex<InputKindOverrides>> = OnceLock::new();
 
 fn input_kind_override_key(path_or_prefix: &str) -> String {
-    let prefix = normalize_pgen_prefix(path_or_prefix);
+    let path = path_or_prefix.trim();
+    let prefix = if explicit_input_kind(path) == Some(false) {
+        path[..path.len() - 4].to_string()
+    } else {
+        normalize_pgen_prefix(path)
+    };
     if cfg!(windows) {
         prefix.replace('/', "\\").to_ascii_lowercase()
     } else {
@@ -2681,7 +2686,13 @@ pub(crate) fn count_psam_samples(path_or_prefix: &str) -> Result<usize, String> 
 pub(crate) fn read_pvar_sites(path_or_prefix: &str) -> Result<Vec<PgenSite>, String> {
     let prefix = normalize_pgen_prefix(path_or_prefix);
     let path = pvar_path_for_prefix(&prefix);
-    let reader = open_text_reader(&path)?;
+    let reader = if let Some(resident_reader) =
+        crate::gload::open_resident_variant_meta_reader(path_or_prefix)?
+    {
+        resident_reader
+    } else {
+        open_text_reader(&path)?
+    };
     let mut header: Option<Vec<String>> = None;
     let mut sites = Vec::new();
     for (line_idx, line) in reader.lines().enumerate() {

@@ -419,6 +419,7 @@ fn kmc_arch_source_files(kmc_src_dir: &Path) -> Vec<PathBuf> {
 fn configure_kmc_build(build: &mut cc::Build, compat_include: &Path, kmc_src_dir: &Path) {
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
 
     build.cpp(true).warnings(false);
     build.include(compat_include);
@@ -430,6 +431,17 @@ fn configure_kmc_build(build: &mut cc::Build, compat_include: &Path, kmc_src_dir
     // x86 cpuid path and fails in cpu_info.cpp.
     if target_arch == "aarch64" && target_os == "windows" {
         build.define("__aarch64__", None);
+    }
+    if target_os == "windows" && target_env == "msvc" {
+        // Vendored KMC's template-heavy translation units exceed MSVC's default
+        // COFF section limit (C1128) and require C++ exception unwinding (/EHsc).
+        // Under recent MSVC toolsets, optimizing KMC with /bigobj can also hit
+        // compiler ICE C1001, so default to /Od unless overridden.
+        build.flag_if_supported("/EHsc");
+        build.flag_if_supported("/bigobj");
+        if !env_flag("JANUSX_KMC_MSVC_OPT") && env_value("CXXFLAGS").is_none() {
+            build.opt_level(0);
+        }
     }
     build.flag_if_supported("-std=c++14");
     build.flag_if_supported("/std:c++14");
@@ -485,6 +497,7 @@ fn compile_kmc_arch_sources(compat_include: &Path, kmc_src_dir: &Path, arch_sour
 
 fn compile_kmc_wrapper() {
     println!("cargo:rerun-if-env-changed=JANUSX_KMC_SRC");
+    println!("cargo:rerun-if-env-changed=JANUSX_KMC_MSVC_OPT");
     println!("cargo:rerun-if-env-changed=JANUSX_ZLIB_LIB");
     println!("cargo:rerun-if-env-changed=JANUSX_ZLIB_LIB_DIR");
     println!("cargo:rerun-if-env-changed=VCPKG_LIB_DIR");

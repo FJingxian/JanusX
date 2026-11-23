@@ -402,8 +402,14 @@ pub trait GenotypeMatrix: Send + Sync {
 /// source rows into the supplied buffer.
 /// Single process-wide resident 2-bit packed BED buffer populated by `-memload`.
 /// Keeping strictly one slot guarantees at most one packed BED copy in RAM.
+fn next_resident_generation() -> u64 {
+    static NEXT_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 pub(crate) struct ResidentPackedBed {
     pub(crate) key: String,
+    pub(crate) generation: u64,
     pub(crate) n_samples_full: usize,
     pub(crate) n_snps: usize,
     pub(crate) bytes_per_snp: usize,
@@ -782,6 +788,7 @@ pub(crate) fn load_resident_packed_bed(
 
     let entry = Arc::new(ResidentPackedBed {
         key,
+        generation: next_resident_generation(),
         n_samples_full,
         n_snps,
         bytes_per_snp,
@@ -1737,6 +1744,76 @@ mod packed_source_tests {
 
         fs::remove_dir_all(dir).expect("remove temporary BED directory");
     }
+
+    #[test]
+    fn windowed_bed_matrix_populates_non_empty_platform_fingerprint() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("janusx_window_fp_{stamp}"));
+        fs::create_dir_all(&dir).expect("create temporary BED directory");
+        let prefix = dir.join("tiny");
+        fs::write(
+            prefix.with_extension("bed"),
+            [0x6c, 0x1b, 0x01, 0x31, 0x72, 0xB4, 0xA5],
+        )
+        .expect("write BED fixture");
+        fs::write(
+            prefix.with_extension("fam"),
+            "1 1 0 0 1 -9\n2 2 0 0 1 -9\n3 3 0 0 1 -9\n4 4 0 0 1 -9\n",
+        )
+        .expect("write FAM fixture");
+
+        let mut matrix =
+            WindowedBedMatrix::open(prefix.to_str().unwrap(), 1).expect("open BED window");
+        let fp = matrix
+            .source_fingerprint()
+            .expect("BED source fingerprint must be populated")
+            .to_string();
+        assert!(!fp.is_empty());
+        assert!(fp.starts_with("bed:"));
+        #[cfg(unix)]
+        {
+            assert!(fp.contains("|dev=") && fp.contains("|ino="));
+        }
+        #[cfg(windows)]
+        {
+            assert!(fp.contains("|vol=") && fp.contains("|idx="));
+        }
+        let dup = matrix.duplicate().expect("duplicate BED window");
+        assert_eq!(dup.source_fingerprint(), Some(fp.as_str()));
+
+        matrix.clear_source_fingerprint_for_test();
+        assert_eq!(matrix.source_fingerprint(), None);
+
+        fs::remove_dir_all(dir).expect("remove temporary BED directory");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_identity_returns_non_empty_id_and_rejects_invalid_handle() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("janusx_win_id_{stamp}"));
+        fs::create_dir_all(&dir).expect("create temporary dir");
+        let path = dir.join("sample.bed");
+        fs::write(&path, [0x6c, 0x1b, 0x01, 0x31]).expect("write temp file");
+
+        let file = fs::File::open(&path).expect("open temp file");
+        let (vol, idx, crt, wrt) =
+            super::windows_file_identity(&file).expect("valid Windows file handle identity");
+        assert!(vol != 0 || idx != 0);
+        assert!(crt != 0 || wrt != 0);
+
+        assert!(super::windows_file_identity_raw(std::ptr::null_mut()).is_err());
+        assert!(super::windows_file_identity_raw((-1isize) as *mut std::ffi::c_void).is_err());
+
+        drop(file);
+        fs::remove_dir_all(dir).expect("remove temporary dir");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1753,9 +1830,69 @@ pub(crate) fn choose_lm_lmm_bed_pread(value: Option<&str>) -> bool {
 }
 
 #[allow(dead_code)]
+#[cfg(windows)]
+fn windows_file_identity_raw(
+    handle: *mut std::ffi::c_void,
+) -> Result<(u32, u64, u64, u64), String> {
+    #[repr(C)]
+    struct FileTime {
+        dw_low_date_time: u32,
+        dw_high_date_time: u32,
+    }
+
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        dw_file_attributes: u32,
+        ft_creation_time: FileTime,
+        ft_last_access_time: FileTime,
+        ft_last_write_time: FileTime,
+        dw_volume_serial_number: u32,
+        n_file_size_high: u32,
+        n_file_size_low: u32,
+        n_number_of_links: u32,
+        n_file_index_high: u32,
+        n_file_index_low: u32,
+    }
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandle(
+            h_file: *mut std::ffi::c_void,
+            lp_file_information: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+
+    let mut info = std::mem::MaybeUninit::<ByHandleFileInformation>::zeroed();
+    let ok = unsafe { GetFileInformationByHandle(handle, info.as_mut_ptr()) };
+    if ok == 0 {
+        return Err(format!(
+            "GetFileInformationByHandle failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let info = unsafe { info.assume_init() };
+    let file_index = ((info.n_file_index_high as u64) << 32) | (info.n_file_index_low as u64);
+    if info.dw_volume_serial_number == 0 && file_index == 0 {
+        return Err("Windows file handle returned empty volume/file identity".to_string());
+    }
+    let ctime = ((info.ft_creation_time.dw_high_date_time as u64) << 32)
+        | (info.ft_creation_time.dw_low_date_time as u64);
+    let wtime = ((info.ft_last_write_time.dw_high_date_time as u64) << 32)
+        | (info.ft_last_write_time.dw_low_date_time as u64);
+    Ok((info.dw_volume_serial_number, file_index, ctime, wtime))
+}
+
+#[allow(dead_code)]
+#[cfg(windows)]
+fn windows_file_identity(file: &std::fs::File) -> Result<(u32, u64, u64, u64), String> {
+    use std::os::windows::io::AsRawHandle;
+    windows_file_identity_raw(file.as_raw_handle())
+}
+
 pub struct WindowedBedMatrix {
     file: Option<std::fs::File>,
     resident: Option<Arc<ResidentPackedBed>>,
+    source_fingerprint: Option<String>,
     n_samples_full: usize,
     bytes_per_snp: usize,
     bed_len: usize,
@@ -1796,9 +1933,16 @@ impl WindowedBedMatrix {
             let bytes_per_snp = resident.bytes_per_snp;
             let n_snps = resident.n_snps;
             let bed_len = BED_HEADER_LEN.saturating_add(resident.packed.len());
+            let source_fingerprint = Some(format!(
+                "resident:{}|gen={}|len={}",
+                resident.key,
+                resident.generation,
+                resident.packed.len()
+            ));
             return Ok(Self {
                 file: None,
                 resident: Some(resident),
+                source_fingerprint,
                 n_samples_full,
                 bytes_per_snp,
                 bed_len,
@@ -1828,13 +1972,53 @@ impl WindowedBedMatrix {
         if header != [0x6C, 0x1B, 0x01] {
             return Err("only SNP-major BED supported".to_string());
         }
-        let bed_len = file
+        let meta = file
             .metadata()
-            .map_err(|e| format!("metadata {bed_path}: {e}"))?
-            .len() as usize;
+            .map_err(|e| format!("metadata {bed_path}: {e}"))?;
+        let bed_len = meta.len() as usize;
         if bed_len < BED_HEADER_LEN {
             return Err("BED too small".to_string());
         }
+        let source_fingerprint = {
+            let base = std::fs::canonicalize(&bed_path)
+                .ok()
+                .and_then(|canon_path| {
+                    let mtime_ns = meta
+                        .modified()
+                        .ok()?
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()?
+                        .as_nanos();
+                    Some((canon_path.to_string_lossy().into_owned(), mtime_ns))
+                });
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                base.map(|(canon, mtime_ns)| {
+                    format!(
+                        "bed:{canon}|dev={}|ino={}|len={bed_len}|mod={mtime_ns}|chg={}:{}",
+                        meta.dev(),
+                        meta.ino(),
+                        meta.ctime(),
+                        meta.ctime_nsec()
+                    )
+                })
+            }
+            #[cfg(windows)]
+            {
+                base.and_then(|(canon, mtime_ns)| {
+                    let (vol, idx, crt, wrt) = windows_file_identity(&file).ok()?;
+                    Some(format!(
+                        "bed:{canon}|vol={vol}|idx={idx}|len={bed_len}|mod={mtime_ns}|crt={crt}|wrt={wrt}"
+                    ))
+                })
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                let _ = base;
+                None
+            }
+        };
         let payload_len = bed_len - BED_HEADER_LEN;
         if bytes_per_snp == 0 || payload_len % bytes_per_snp != 0 {
             return Err(format!(
@@ -1853,6 +2037,7 @@ impl WindowedBedMatrix {
         Ok(Self {
             file: Some(file),
             resident: None,
+            source_fingerprint,
             n_samples_full,
             bytes_per_snp,
             bed_len,
@@ -1867,6 +2052,16 @@ impl WindowedBedMatrix {
         })
     }
 
+    #[inline]
+    pub(crate) fn source_fingerprint(&self) -> Option<&str> {
+        self.source_fingerprint.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_source_fingerprint_for_test(&mut self) {
+        self.source_fingerprint = None;
+    }
+
     /// Create an independent mmap/window cursor over the same BED payload.
     ///
     /// The duplicate is used by streamed Bayesian double buffering: one
@@ -1878,6 +2073,7 @@ impl WindowedBedMatrix {
             return Ok(Self {
                 file: None,
                 resident: Some(Arc::clone(resident)),
+                source_fingerprint: self.source_fingerprint.clone(),
                 n_samples_full: self.n_samples_full,
                 bytes_per_snp: self.bytes_per_snp,
                 bed_len: self.bed_len,
@@ -1901,6 +2097,7 @@ impl WindowedBedMatrix {
             return Ok(Self {
                 file: Some(file),
                 resident: None,
+                source_fingerprint: self.source_fingerprint.clone(),
                 n_samples_full: self.n_samples_full,
                 bytes_per_snp: self.bytes_per_snp,
                 bed_len: self.bed_len,
@@ -1928,6 +2125,7 @@ impl WindowedBedMatrix {
         Ok(Self {
             file: Some(file),
             resident: None,
+            source_fingerprint: self.source_fingerprint.clone(),
             n_samples_full: self.n_samples_full,
             bytes_per_snp: self.bytes_per_snp,
             bed_len: self.bed_len,
@@ -2464,8 +2662,7 @@ pub fn open_bed_mmap_unified(
 // ---------------------------------------------------------------------------
 
 #[inline]
-#[allow(dead_code)]
-fn normalize_plink_prefix(prefix: &str) -> String {
+pub(crate) fn normalize_plink_prefix(prefix: &str) -> String {
     let mut out = prefix.trim().to_string();
     let lower = out.to_ascii_lowercase();
     for suffix in [

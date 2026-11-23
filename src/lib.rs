@@ -259,10 +259,12 @@ use reml::{
     lmm_rotate_x_y_with_ut_f64, lmm_rotate_y_with_ut_f64, ml_loglike_null_f32,
 };
 use rrblup::{
-    rrblup_exact_snp_fit_prepared_bed, rrblup_exact_snp_prepare_bed_from_meta, rrblup_pcg_bed,
-    rrblup_standardized_grm_from_source, rrblupc_exact_snp_fit_prepared_bed,
-    rrblupc_exact_snp_prepare_bed_from_meta, rrblupc_pcg_bed, RrblupCenteredExactSnpCache,
-    RrblupExactSnpCache,
+    rrblup_exact_snp_fit_prepared_bed, rrblup_exact_snp_prepare_bed_from_meta,
+    rrblup_exact_snp_prepare_bed_from_raw_cache, rrblup_exact_snp_prepare_raw_bed_from_meta,
+    rrblup_pcg_bed, rrblup_standardized_grm_from_source, rrblupc_exact_snp_fit_prepared_bed,
+    rrblupc_exact_snp_prepare_bed_from_meta, rrblupc_exact_snp_prepare_bed_from_raw_cache,
+    rrblupc_exact_snp_prepare_raw_bed_from_meta, rrblupc_pcg_bed, RrblupCenteredExactSnpCache,
+    RrblupExactSnpCache, RrblupExactSnpRawCache,
 };
 use rsvd::{admx_rsvd_stream_sample, admx_set_threads, py_rsvd_packed_subset};
 use sim::{SimChunkGenerator, SimEngine, SimTraitAccumulator};
@@ -429,6 +431,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<FvLmmAssocCache>()?;
     m.add_class::<RrblupExactSnpCache>()?;
     m.add_class::<RrblupCenteredExactSnpCache>()?;
+    m.add_class::<RrblupExactSnpRawCache>()?;
     m.add_class::<SparseOneHotBlupCache>()?;
     m.add_class::<PyMergeStats>()?;
     m.add_class::<PyConvertStats>()?;
@@ -533,10 +536,26 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rrblup_pcg_bed, m)?)?;
     m.add_function(wrap_pyfunction!(rrblup_standardized_grm_from_source, m)?)?;
     m.add_function(wrap_pyfunction!(rrblup_exact_snp_prepare_bed_from_meta, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        rrblup_exact_snp_prepare_raw_bed_from_meta,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        rrblup_exact_snp_prepare_bed_from_raw_cache,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(rrblup_exact_snp_fit_prepared_bed, m)?)?;
     m.add_function(wrap_pyfunction!(rrblupc_pcg_bed, m)?)?;
     m.add_function(wrap_pyfunction!(
         rrblupc_exact_snp_prepare_bed_from_meta,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        rrblupc_exact_snp_prepare_raw_bed_from_meta,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        rrblupc_exact_snp_prepare_bed_from_raw_cache,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(rrblupc_exact_snp_fit_prepared_bed, m)?)?;

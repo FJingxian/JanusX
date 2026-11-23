@@ -3404,6 +3404,37 @@ def _estimate_dense_f32_bytes(
     return int(rows * cols * np.dtype(np.float32).itemsize * max(1, int(copies)))
 
 
+def _can_admit_rrblup_exact_raw_cache(
+    n_markers: int,
+    *,
+    sample_block: int = 0,
+    already_resident: bool = False,
+) -> bool:
+    m = max(0, int(n_markers))
+    if m <= 0:
+        return False
+    raw_cache_bytes = int(m * m * 8 + m * 8)
+    decode_bytes = int(m * max(0, int(sample_block)) * 12)
+    if already_resident:
+        peak_bytes = max(raw_cache_bytes * 4, raw_cache_bytes + decode_bytes)
+    else:
+        peak_bytes = max(raw_cache_bytes * 5, raw_cache_bytes * 2 + decode_bytes)
+    available_bytes, memory_limit_bytes, rss_bytes = _detect_gs_available_memory_bytes()
+    effective_available: int | None = None
+    if available_bytes is not None:
+        effective_available = max(0, int(available_bytes))
+    if memory_limit_bytes is not None and int(memory_limit_bytes) > 0:
+        limit_avail = max(0, int(memory_limit_bytes) - int(rss_bytes or 0))
+        effective_available = (
+            limit_avail
+            if effective_available is None
+            else min(effective_available, limit_avail)
+        )
+    if effective_available is not None and peak_bytes > effective_available:
+        return False
+    return True
+
+
 def _check_ml_dense_memory_guard(n_rows_total: int, n_markers: int) -> None:
     if n_rows_total <= 0 or n_markers <= 0:
         return
@@ -9736,6 +9767,32 @@ def GSapi(
                     None,
                 )
             )
+            exact_prepare_raw_meta_fn = (
+                None
+                if _jxrs is None
+                else getattr(
+                    _jxrs,
+                    (
+                        "rrblupc_exact_snp_prepare_raw_bed_from_meta"
+                        if rr_operator_mode == "centered"
+                        else "rrblup_exact_snp_prepare_raw_bed_from_meta"
+                    ),
+                    None,
+                )
+            )
+            exact_prepare_from_raw_fn = (
+                None
+                if _jxrs is None
+                else getattr(
+                    _jxrs,
+                    (
+                        "rrblupc_exact_snp_prepare_bed_from_raw_cache"
+                        if rr_operator_mode == "centered"
+                        else "rrblup_exact_snp_prepare_bed_from_raw_cache"
+                    ),
+                    None,
+                )
+            )
             exact_fit_meta_fn = (
                 None
                 if _jxrs is None
@@ -9913,24 +9970,154 @@ def GSapi(
                     "exact_snp_prepare_start",
                     backend="snp",
                 )
+                raw_full_indices_obj = packed_train.get("__rrblup_exact_raw_full_indices__", None)
+                can_use_raw_subtraction = bool(
+                    (raw_full_indices_obj is not None)
+                    and (exact_prepare_raw_meta_fn is not None)
+                    and (exact_prepare_from_raw_fn is not None)
+                    and (
+                        str(rr_operator_mode).strip().lower() == "centered"
+                        or str(rr_std_mode).strip().lower() != "strict_train"
+                    )
+                )
+                raw_full_idx_arr: np.ndarray | None = None
+                if can_use_raw_subtraction:
+                    raw_full_idx_arr = np.ascontiguousarray(
+                        np.asarray(raw_full_indices_obj, dtype=np.int64).reshape(-1),
+                        dtype=np.int64,
+                    )
+                    n_full_cand = int(raw_full_idx_arr.shape[0])
+                    n_val_cand = n_full_cand - int(train_abs.shape[0])
+                    if not (
+                        n_full_cand > 1
+                        and 0 <= n_val_cand < int(train_abs.shape[0])
+                        and bool(np.all(np.isin(train_abs, raw_full_idx_arr)))
+                    ):
+                        can_use_raw_subtraction = False
                 with runtime_thread_stage(
                     blas_threads=int(max(1, int(n_jobs))),
                     rayon_threads=int(max(1, int(n_jobs))),
                 ):
-                    rr_exact_cache = exact_prepare_meta_fn(
-                        str(source_prefix_arg),
-                        train_abs,
-                        row_source_indices_arg,
-                        row_maf_arg,
-                        row_flip_stream_arg,
-                        rr_row_mean_arg,
-                        rr_row_inv_arg,
-                        int(exact_sample_block),
-                        int(exact_stream_row_block),
-                        float(exact_std_eps),
-                        int(max(1, int(n_jobs))),
-                        int(max(1, int(n_jobs))),
-                    )
+                    if can_use_raw_subtraction and raw_full_idx_arr is not None:
+                        raw_cache_key = (
+                            str(source_prefix_arg),
+                            str(rr_operator_mode),
+                            str(rr_std_mode),
+                            float(exact_std_eps),
+                            int(n_snp_local),
+                            int(raw_full_idx_arr.shape[0]),
+                        )
+                        raw_sample_block = int(
+                            max(
+                                1,
+                                min(
+                                    int(raw_full_idx_arr.shape[0]),
+                                    int(
+                                        rr_cfg_shared.get(
+                                            "exact_sample_block",
+                                            rr_cfg_shared.get("snp_block_size", 2048),
+                                        )
+                                    ),
+                                ),
+                            )
+                        )
+                        reuse_sample_block = (
+                            0
+                            if n_val_cand <= 0
+                            else max(
+                                min(int(n_val_cand), int(exact_sample_block)),
+                                int(exact_sample_block),
+                            )
+                        )
+                        cached_raw_entry = packed_train.get("__rrblup_exact_raw_full_cache__", None)
+                        if (
+                            isinstance(cached_raw_entry, tuple)
+                            and len(cached_raw_entry) == 2
+                            and cached_raw_entry[0] == raw_cache_key
+                        ):
+                            if _can_admit_rrblup_exact_raw_cache(
+                                int(n_snp_local),
+                                sample_block=reuse_sample_block,
+                                already_resident=True,
+                            ):
+                                raw_full_cache = cached_raw_entry[1]
+                            else:
+                                raw_full_cache = None
+                                packed_train.pop("__rrblup_exact_raw_full_cache__", None)
+                            cached_raw_entry = None
+                        elif n_val_cand == 0 or (
+                            not _can_admit_rrblup_exact_raw_cache(
+                                int(n_snp_local),
+                                sample_block=max(int(raw_sample_block), int(reuse_sample_block)),
+                            )
+                        ):
+                            cached_raw_entry = None
+                            raw_full_cache = None
+                        else:
+                            raw_full_cache = exact_prepare_raw_meta_fn(
+                                str(source_prefix_arg),
+                                raw_full_idx_arr,
+                                row_source_indices_arg,
+                                row_maf_arg,
+                                row_flip_stream_arg,
+                                rr_row_mean_arg,
+                                rr_row_inv_arg,
+                                int(raw_sample_block),
+                                int(exact_stream_row_block),
+                                float(exact_std_eps),
+                                int(max(1, int(n_jobs))),
+                                int(max(1, int(n_jobs))),
+                            )
+                            packed_train["__rrblup_exact_raw_full_cache__"] = (
+                                raw_cache_key,
+                                raw_full_cache,
+                            )
+                        if raw_full_cache is not None:
+                            rr_exact_cache = exact_prepare_from_raw_fn(
+                                raw_full_cache,
+                                str(source_prefix_arg),
+                                train_abs,
+                                row_source_indices_arg,
+                                row_maf_arg,
+                                row_flip_stream_arg,
+                                rr_row_mean_arg,
+                                rr_row_inv_arg,
+                                int(exact_sample_block),
+                                int(exact_stream_row_block),
+                                float(exact_std_eps),
+                                int(max(1, int(n_jobs))),
+                                int(max(1, int(n_jobs))),
+                            )
+                        else:
+                            rr_exact_cache = exact_prepare_meta_fn(
+                                str(source_prefix_arg),
+                                train_abs,
+                                row_source_indices_arg,
+                                row_maf_arg,
+                                row_flip_stream_arg,
+                                rr_row_mean_arg,
+                                rr_row_inv_arg,
+                                int(exact_sample_block),
+                                int(exact_stream_row_block),
+                                float(exact_std_eps),
+                                int(max(1, int(n_jobs))),
+                                int(max(1, int(n_jobs))),
+                            )
+                    else:
+                        rr_exact_cache = exact_prepare_meta_fn(
+                            str(source_prefix_arg),
+                            train_abs,
+                            row_source_indices_arg,
+                            row_maf_arg,
+                            row_flip_stream_arg,
+                            rr_row_mean_arg,
+                            rr_row_inv_arg,
+                            int(exact_sample_block),
+                            int(exact_stream_row_block),
+                            float(exact_std_eps),
+                            int(max(1, int(n_jobs))),
+                            int(max(1, int(n_jobs))),
+                        )
                 _emit_rrblup_progress(
                     "exact_snp_prepare_end",
                     backend="snp",
@@ -11540,6 +11727,41 @@ def _run_method_task(
                     flush=True,
                 )
 
+    if (
+        (method == "rrBLUP")
+        and (cv_splits is not None)
+        and (packed_method_ctx is not None)
+        and (train_sample_indices is not None)
+    ):
+        packed_method_ctx = dict(packed_method_ctx)
+        _full_n = int(np.asarray(train_sample_indices).size)
+        _beneficial_cv_folds = sum(
+            1
+            for _, _tr_idx in cv_splits
+            if (_full_n - int(np.asarray(_tr_idx).size)) < int(np.asarray(_tr_idx).size)
+        )
+        _exact_sample_block_est = int(
+            max(
+                1,
+                min(
+                    _full_n,
+                    int(
+                        rrblup_cfg_base.get(
+                            "exact_sample_block",
+                            rrblup_cfg_base.get("snp_block_size", 2048),
+                        )
+                    ),
+                ),
+            )
+        )
+        if _beneficial_cv_folds >= 1 and _can_admit_rrblup_exact_raw_cache(
+            _packed_ctx_active_rows(packed_method_ctx),
+            sample_block=_exact_sample_block_est,
+        ):
+            packed_method_ctx["__rrblup_exact_raw_full_indices__"] = np.ascontiguousarray(
+                np.asarray(train_sample_indices, dtype=np.int64).reshape(-1),
+                dtype=np.int64,
+            )
     if cv_splits is not None:
         cv_total = int(max(1, len(cv_splits)))
         oof_pred = np.full((int(train_pheno.shape[0]),), np.nan, dtype=np.float64)
@@ -12706,6 +12928,9 @@ def _run_method_task(
             bayes_r2_n_used_final = int(bayes_cv_shared_n_used)
         if bayes_r2_n_total_final <= 0 and bayes_cv_shared_n_total > 0:
             bayes_r2_n_total_final = int(bayes_cv_shared_n_total)
+    if packed_method_ctx is not None:
+        packed_method_ctx.pop("__rrblup_exact_raw_full_cache__", None)
+        packed_method_ctx.pop("__rrblup_exact_raw_full_indices__", None)
     _elapsed_total = float(max(0.0, time.time() - _t_method_begin))
     _cv_elapsed, _fit_elapsed, _predict_elapsed = _stage_elapsed_metrics(_elapsed_total)
     _bayes_meta_state = dict(bayes_state_final or {})

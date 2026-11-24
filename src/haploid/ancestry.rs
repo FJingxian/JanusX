@@ -662,7 +662,8 @@ fn build_genetic_step_ranges(cm_positions: &[f64], step_cm: f64) -> Vec<(usize, 
 }
 
 /// Compress all ancestry segments on a chromosome into the exact population-wide
-/// Union-of-Breakpoints sparse dosage matrix (bin-major CSC-like layout).
+/// Union-of-Breakpoints sparse dosage matrix (bin-major CSC-like layout) using
+/// lock-free block-partitioned parallel sort-and-coalesce on the active Rayon pool.
 pub fn build_union_breakpoint_sparse_matrix(
     chrom_idx: u16,
     target_layout: &SampleHaplotypeLayout,
@@ -678,7 +679,7 @@ pub fn build_union_breakpoint_sparse_matrix(
         };
     }
 
-    // Collect unique sorted breakpoint coordinates `(bp, cm)`.
+    // Collect unique sorted breakpoint coordinates `(bp, cm)` in parallel.
     // Because adjacent segments share `left.end_bp + 1 == right.start_bp`,
     // recombination boundaries deduplicate to a single breakpoint with zero empty bins.
     let mut bp_to_cm: Vec<(u64, f32)> = Vec::with_capacity(segments.len() * 2);
@@ -686,7 +687,7 @@ pub fn build_union_breakpoint_sparse_matrix(
         bp_to_cm.push((seg.start_bp, seg.start_cm));
         bp_to_cm.push((seg.end_bp.saturating_add(1), seg.end_cm));
     }
-    bp_to_cm.sort_by_key(|&(bp, _)| bp);
+    bp_to_cm.par_sort_by_key(|&(bp, _)| bp);
     bp_to_cm.dedup_by_key(|(bp, _)| *bp);
     if bp_to_cm.len() < 2 {
         return ChromosomeAncestryBinsSparse {
@@ -698,63 +699,168 @@ pub fn build_union_breakpoint_sparse_matrix(
     }
 
     let n_bins = bp_to_cm.len() - 1;
-    let mut bin_starts_bp = Vec::with_capacity(n_bins);
-    let mut bin_ends_bp = Vec::with_capacity(n_bins);
-    let mut bin_starts_cm = Vec::with_capacity(n_bins);
-    let mut bin_ends_cm = Vec::with_capacity(n_bins);
-    for b in 0..n_bins {
-        bin_starts_bp.push(bp_to_cm[b].0);
-        bin_ends_bp.push(bp_to_cm[b + 1].0.saturating_sub(1));
-        bin_starts_cm.push(bp_to_cm[b].1);
-        bin_ends_cm.push(bp_to_cm[b + 1].1);
-    }
 
-    // Map each segment onto covered bins and sum haplotype dosages per `(bin, sample, parent)`.
-    let mut bin_entries: Vec<HashMap<(u32, u32), f32>> = vec![HashMap::new(); n_bins];
-    for seg in segments {
-        let b_start = bp_to_cm
-            .binary_search_by_key(&seg.start_bp, |&(bp, _)| bp)
-            .unwrap_or(0);
-        let b_end = bp_to_cm
-            .binary_search_by_key(&seg.end_bp.saturating_add(1), |&(bp, _)| bp)
-            .unwrap_or(n_bins);
-        let weight = if target_layout.is_inbred[seg.target_sample as usize] {
-            1.0f32
-        } else {
-            0.5f32
-        };
-        for b in b_start..b_end.min(n_bins) {
-            *bin_entries[b]
-                .entry((seg.target_sample, seg.parent_sample))
-                .or_insert(0.0) += weight;
+    // Parallel binary-search mapping of every segment onto `[b_start, b_end)`.
+    let seg_ranges: Vec<(u32, u32, u32, u32, f32)> = segments
+        .par_iter()
+        .filter_map(|seg| {
+            let b_start = bp_to_cm
+                .binary_search_by_key(&seg.start_bp, |&(bp, _)| bp)
+                .unwrap_or(0);
+            let b_end = bp_to_cm
+                .binary_search_by_key(&seg.end_bp.saturating_add(1), |&(bp, _)| bp)
+                .unwrap_or(n_bins)
+                .min(n_bins);
+            if b_start >= b_end {
+                return None;
+            }
+            let weight = if target_layout.is_inbred[seg.target_sample as usize] {
+                1.0f32
+            } else {
+                0.5f32
+            };
+            Some((
+                b_start as u32,
+                b_end as u32,
+                seg.target_sample,
+                seg.parent_sample,
+                weight,
+            ))
+        })
+        .collect();
+
+    // Partition bins into disjoint contiguous blocks so each Rayon worker builds
+    // its bins independently with cache-local Vec sort+coalesce (zero HashMaps).
+    const BIN_BLOCK: usize = 256;
+    let n_blocks = n_bins.div_ceil(BIN_BLOCK);
+    let mut block_counts = vec![0usize; n_blocks];
+    for &(b_start, b_end, _, _, _) in &seg_ranges {
+        let blk0 = (b_start as usize) / BIN_BLOCK;
+        let blk1 = ((b_end as usize) - 1) / BIN_BLOCK;
+        for c in &mut block_counts[blk0..=blk1] {
+            *c += 1;
         }
     }
+    let mut block_ptr = Vec::with_capacity(n_blocks + 1);
+    let mut total_refs = 0usize;
+    block_ptr.push(0usize);
+    for &c in &block_counts {
+        total_refs += c;
+        block_ptr.push(total_refs);
+    }
+    let mut block_write = block_ptr[..n_blocks].to_vec();
+    let mut block_segs = vec![0u32; total_refs];
+    for (seg_idx, &(b_start, b_end, _, _, _)) in seg_ranges.iter().enumerate() {
+        let blk0 = (b_start as usize) / BIN_BLOCK;
+        let blk1 = ((b_end as usize) - 1) / BIN_BLOCK;
+        let seg_u32 = seg_idx as u32;
+        for blk in blk0..=blk1 {
+            let pos = block_write[blk];
+            block_segs[pos] = seg_u32;
+            block_write[blk] = pos + 1;
+        }
+    }
+    drop(block_counts);
+    drop(block_write);
 
-    let mut out_bin_starts_bp = Vec::with_capacity(n_bins);
-    let mut out_bin_ends_bp = Vec::with_capacity(n_bins);
-    let mut out_bin_starts_cm = Vec::with_capacity(n_bins);
-    let mut out_bin_ends_cm = Vec::with_capacity(n_bins);
-    let mut bin_ptr = Vec::with_capacity(n_bins + 1);
-    let mut sample_idx = Vec::new();
-    let mut parent_idx = Vec::new();
-    let mut dosage = Vec::new();
+    struct BlockOut {
+        starts_bp: Vec<u64>,
+        ends_bp: Vec<u64>,
+        starts_cm: Vec<f32>,
+        ends_cm: Vec<f32>,
+        bin_lens: Vec<u32>,
+        sample_idx: Vec<u32>,
+        parent_idx: Vec<u32>,
+        dosage: Vec<f32>,
+    }
+
+    let block_outputs: Vec<BlockOut> = (0..n_blocks)
+        .into_par_iter()
+        .map(|blk| {
+            let b0 = blk * BIN_BLOCK;
+            let b1 = (b0 + BIN_BLOCK).min(n_bins);
+            let local_n = b1 - b0;
+            let slice = &block_segs[block_ptr[blk]..block_ptr[blk + 1]];
+            let mut local_bins: Vec<Vec<(u32, u32, f32)>> = vec![Vec::new(); local_n];
+            for &seg_idx in slice {
+                let (b_start, b_end, s, p, w) = seg_ranges[seg_idx as usize];
+                let lo = (b_start as usize).max(b0);
+                let hi = (b_end as usize).min(b1);
+                for b in lo..hi {
+                    local_bins[b - b0].push((s, p, w));
+                }
+            }
+
+            let mut out = BlockOut {
+                starts_bp: Vec::with_capacity(local_n),
+                ends_bp: Vec::with_capacity(local_n),
+                starts_cm: Vec::with_capacity(local_n),
+                ends_cm: Vec::with_capacity(local_n),
+                bin_lens: Vec::with_capacity(local_n),
+                sample_idx: Vec::new(),
+                parent_idx: Vec::new(),
+                dosage: Vec::new(),
+            };
+            for (offset, mut entries) in local_bins.into_iter().enumerate() {
+                if entries.is_empty() {
+                    continue;
+                }
+                entries.sort_unstable_by_key(|&(s, p, _)| (s, p));
+                let b = b0 + offset;
+                out.starts_bp.push(bp_to_cm[b].0);
+                out.ends_bp.push(bp_to_cm[b + 1].0.saturating_sub(1));
+                out.starts_cm.push(bp_to_cm[b].1);
+                out.ends_cm.push(bp_to_cm[b + 1].1);
+
+                let before = out.sample_idx.len();
+                let mut cur_s = entries[0].0;
+                let mut cur_p = entries[0].1;
+                let mut cur_d = entries[0].2;
+                for &(s, p, w) in &entries[1..] {
+                    if s == cur_s && p == cur_p {
+                        cur_d += w;
+                    } else {
+                        out.sample_idx.push(cur_s);
+                        out.parent_idx.push(cur_p);
+                        out.dosage.push(cur_d);
+                        cur_s = s;
+                        cur_p = p;
+                        cur_d = w;
+                    }
+                }
+                out.sample_idx.push(cur_s);
+                out.parent_idx.push(cur_p);
+                out.dosage.push(cur_d);
+                out.bin_lens.push((out.sample_idx.len() - before) as u32);
+            }
+            out
+        })
+        .collect();
+
+    let total_bins: usize = block_outputs.iter().map(|b| b.starts_bp.len()).sum();
+    let total_nnz: usize = block_outputs.iter().map(|b| b.sample_idx.len()).sum();
+    let mut out_bin_starts_bp = Vec::with_capacity(total_bins);
+    let mut out_bin_ends_bp = Vec::with_capacity(total_bins);
+    let mut out_bin_starts_cm = Vec::with_capacity(total_bins);
+    let mut out_bin_ends_cm = Vec::with_capacity(total_bins);
+    let mut bin_ptr = Vec::with_capacity(total_bins + 1);
+    let mut sample_idx = Vec::with_capacity(total_nnz);
+    let mut parent_idx = Vec::with_capacity(total_nnz);
+    let mut dosage = Vec::with_capacity(total_nnz);
     bin_ptr.push(0u64);
-    for (b, map) in bin_entries.into_iter().enumerate() {
-        if map.is_empty() {
-            continue;
+    for blk in block_outputs {
+        out_bin_starts_bp.extend(blk.starts_bp);
+        out_bin_ends_bp.extend(blk.ends_bp);
+        out_bin_starts_cm.extend(blk.starts_cm);
+        out_bin_ends_cm.extend(blk.ends_cm);
+        sample_idx.extend(blk.sample_idx);
+        parent_idx.extend(blk.parent_idx);
+        dosage.extend(blk.dosage);
+        let mut cursor = *bin_ptr.last().unwrap_or(&0);
+        for len in blk.bin_lens {
+            cursor += len as u64;
+            bin_ptr.push(cursor);
         }
-        out_bin_starts_bp.push(bin_starts_bp[b]);
-        out_bin_ends_bp.push(bin_ends_bp[b]);
-        out_bin_starts_cm.push(bin_starts_cm[b]);
-        out_bin_ends_cm.push(bin_ends_cm[b]);
-        let mut sorted: Vec<((u32, u32), f32)> = map.into_iter().collect();
-        sorted.sort_by_key(|&(k, _)| k);
-        for ((s, p), d) in sorted {
-            sample_idx.push(s);
-            parent_idx.push(p);
-            dosage.push(d);
-        }
-        bin_ptr.push(sample_idx.len() as u64);
     }
 
     ChromosomeAncestryBinsSparse {

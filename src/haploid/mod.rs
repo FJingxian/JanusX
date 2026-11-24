@@ -19,7 +19,7 @@ use ancestry::{paint_chromosome_ancestry_cancellable, ChromosomeAncestryBinsSpar
 use ibd::{build_sparse_ibd_kinship_csr, detect_chromosome_ibd_cancellable};
 use phasing::{phase_unphased_diploids_one_pass, DisjointPhaseBlock, SampleHaplotypeLayout};
 use sparse_io::{
-    write_segments_tsv_gz_cancellable, write_sparse_archive, HaploidSparseArchive,
+    write_segments_tsv_gz_parallel, write_sparse_archive_with_threads, HaploidSparseArchive,
     HaploidSparsePayload,
 };
 use std::collections::HashMap;
@@ -568,7 +568,7 @@ where
     if is_cancelled(cancelled) {
         return Err("Interrupted".to_owned());
     }
-    write_sparse_archive(&output_path, &archive)?;
+    pool.install(|| write_sparse_archive_with_threads(&output_path, &archive, threads))?;
 
     let tsv_path = if config.write_tsv {
         let mut p = output_path.clone();
@@ -577,7 +577,7 @@ where
             .and_then(|s| s.to_str())
             .unwrap_or("haploid_ibd");
         p.set_file_name(format!("{file_name}.tsv.gz"));
-        write_segments_tsv_gz_cancellable(&p, &archive, cancelled)?;
+        pool.install(|| write_segments_tsv_gz_parallel(&p, &archive, threads, cancelled))?;
         Some(p.to_string_lossy().into_owned())
     } else {
         None

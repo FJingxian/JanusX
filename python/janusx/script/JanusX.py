@@ -44,6 +44,7 @@ Modules:
     gmerge        Merge genotype/variant tables
     imp           Windowed genotype phasing and reference imputation
     ibd           Whole-chromosome PBWT IBD segmentation and ancestry painting
+    postibd       Post-process .jhibd ancestry archives and render diagnostic plots
 '''
 import sys
 import subprocess
@@ -170,12 +171,13 @@ _CLI_MODULE_SECTIONS = [
             ("gmerge", "Merge genotype/variant tables"),
             ("imp", "Windowed genotype phasing and reference imputation"),
             ("ibd", "Whole-chromosome PBWT IBD segmentation and ancestry painting"),
+            ("postibd", "Post-process .jhibd ancestry archives and render diagnostic plots"),
         ],
     ),
 ]
 
 _MODULE_NAMES = [
-    "gwas", "ct", "postgwas", "postgarfield", "postbsa",
+    "gwas", "ct", "postgwas", "postgarfield", "postbsa", "postibd",
     "garfield", "grm", "pca", "gstats", "gs", "reml", "postgs",
     "sim", "simulation", "adamixture", "fst", "xpclr", "gformat", "gmerge", "imp", "ibd", "hybrid",
     "kmer", "kmerge", "kstats", "kformat", "view", "refcheck",

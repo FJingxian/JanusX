@@ -479,6 +479,17 @@ fn haploid_ibd_run(
 }
 
 #[pyfunction]
+fn haploid_ibd_post_extract(py: Python<'_>, options_json: String) -> PyResult<String> {
+    let config = serde_json::from_str::<haploid::post::PostIbdConfig>(&options_json)
+        .map_err(|error| PyRuntimeError::new_err(format!("invalid postibd options: {error}")))?;
+    let result = py
+        .detach(move || haploid::post::extract_post_ibd(&config))
+        .map_err(PyRuntimeError::new_err)?;
+    serde_json::to_string(&result)
+        .map_err(|error| PyRuntimeError::new_err(format!("serialize postibd result: {error}")))
+}
+
+#[pyfunction]
 fn imp_estimate_window_bytes(
     options_json: String,
     target_samples: usize,
@@ -584,6 +595,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<Bin01StreamWriter>()?;
     m.add_function(wrap_pyfunction!(imp_run, m)?)?;
     m.add_function(wrap_pyfunction!(haploid_ibd_run, m)?)?;
+    m.add_function(wrap_pyfunction!(haploid_ibd_post_extract, m)?)?;
     m.add_function(wrap_pyfunction!(imp_estimate_window_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(imp_convert_to_pgen, m)?)?;
     m.add_function(wrap_pyfunction!(spgrm_bed_to_jxgrm, m)?)?;

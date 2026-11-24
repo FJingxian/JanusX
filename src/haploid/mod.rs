@@ -9,6 +9,7 @@ pub mod ancestry;
 pub mod ibd;
 pub mod pbwt;
 pub mod phasing;
+pub mod post;
 pub mod sparse_io;
 pub mod types;
 

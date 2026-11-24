@@ -7,6 +7,7 @@
 
 pub mod ancestry;
 pub mod ibd;
+pub mod mott;
 pub mod pbwt;
 pub mod phasing;
 pub mod post;
@@ -17,21 +18,25 @@ use crate::imp::types::{PhaseSetId, VariantRow};
 use crate::imp_reader::ImpReader;
 use ancestry::{paint_chromosome_ancestry_cancellable, ChromosomeAncestryBinsSparse};
 use ibd::{build_sparse_ibd_kinship_csr, detect_chromosome_ibd_cancellable};
+use mott::{
+    paint_chromosome_mott_cancellable, select_even_marker_indices, MottCoreConfig,
+    MottPosteriorMatrix,
+};
 use phasing::{phase_unphased_diploids_one_pass, DisjointPhaseBlock, SampleHaplotypeLayout};
 use sparse_io::{
     write_segments_tsv_gz_parallel, write_sparse_archive_with_threads, HaploidSparseArchive,
     HaploidSparsePayload,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 use rayon::prelude::*;
 use types::{
-    AncestrySegment, BitHaplotypeMatrix, GeneticMap, HaploidIbdConfig, HaploidIbdMode,
-    HaploidIbdProgress, HaploidIbdSummary, IbdSegment, PloidyMode,
+    AncestryModel, AncestrySegment, BitHaplotypeMatrix, GeneticMap, HaploidIbdConfig,
+    HaploidIbdMode, HaploidIbdProgress, HaploidIbdSummary, IbdSegment, PloidyMode,
 };
 
 #[inline]
@@ -118,6 +123,15 @@ where
     } else {
         HaploidIbdMode::PairwiseIbd
     };
+    if mode == HaploidIbdMode::MultiParentAncestry && config.ancestry_model == AncestryModel::Mott {
+        MottCoreConfig::from_ibd_config(&config)?;
+        if config.mott_write_posterior && target_sample_ids.len() != 1 {
+            return Err(format!(
+                "--mott-write-posterior requires exactly 1 target sample, got {}",
+                target_sample_ids.len()
+            ));
+        }
+    }
 
     let mut ref_reader_opt = if let Some(ref_path) = &config.reference {
         let mut r = ImpReader::open(ref_path)?;
@@ -166,6 +180,11 @@ where
     let mut chrom_names: Vec<String> = Vec::new();
     let mut raw_target_markers_scanned: u64 = 0;
     let mut markers_processed: u64 = 0;
+    let mut aligned_exact_markers: u64 = 0;
+    let mut aligned_swapped_markers: u64 = 0;
+    let mut aligned_incompatible_markers: u64 = 0;
+    let mut mott_informative_markers: u64 = 0;
+    let mut mott_selected_markers: u64 = 0;
     let mut total_genome_cm: f64 = 0.0;
     let mut last_inbred_count: usize = 0;
     let mut last_diploid_count: usize = 0;
@@ -173,6 +192,7 @@ where
     let mut all_ibd_segments: Vec<IbdSegment> = Vec::new();
     let mut all_ancestry_segments: Vec<AncestrySegment> = Vec::new();
     let mut all_chrom_bins: Vec<ChromosomeAncestryBinsSparse> = Vec::new();
+    let mut all_mott_posteriors: Vec<MottPosteriorMatrix> = Vec::new();
 
     let mut emit_progress = |stage: &str,
                              chrom: &str,
@@ -359,12 +379,41 @@ where
                     continue;
                 }
 
-                let aligned_pairs = pool.install(|| align_chromosome_row_indices(&ref_rows, &target_rows));
+                let (mut aligned_pairs, align_stats) = pool.install(|| {
+                    align_chromosome_row_indices(
+                        &ref_rows,
+                        &target_rows,
+                        config.ancestry_model == AncestryModel::Mott,
+                    )
+                });
+                aligned_exact_markers += align_stats.exact;
+                aligned_swapped_markers += align_stats.swapped;
+                aligned_incompatible_markers += align_stats.incompatible;
                 if aligned_pairs.is_empty() {
                     drop(ref_rows);
                     drop(target_rows);
                     raw_target_markers_scanned += chrom_raw_target_rows;
                     continue;
+                }
+
+                if config.ancestry_model == AncestryModel::Mott {
+                    let (selected_pairs, chrom_informative) = pool.install(|| {
+                        select_mott_aligned_pairs(
+                            &ref_rows,
+                            &aligned_pairs,
+                            reference_sample_ids.len(),
+                            config.mott_max_markers_per_chrom,
+                            cancelled,
+                        )
+                    })?;
+                    mott_informative_markers += chrom_informative;
+                    aligned_pairs = selected_pairs;
+                    if aligned_pairs.is_empty() {
+                        drop(ref_rows);
+                        drop(target_rows);
+                        raw_target_markers_scanned += chrom_raw_target_rows;
+                        continue;
+                    }
                 }
 
                 let chrom_idx = chrom_names.len() as u16;
@@ -387,7 +436,7 @@ where
                         reference_sample_ids.len(),
                         config.ploidy_mode,
                         config.inbred_het_threshold,
-                        |m| &ref_rows[aligned_pairs[m].0],
+                        |m| &ref_rows[aligned_pairs[m].ref_idx],
                     )
                 });
                 let (tgt_inbred, tgt_unphased_hets, tgt_ps_blocks) = pool.install(|| {
@@ -396,7 +445,7 @@ where
                         target_sample_ids.len(),
                         config.ploidy_mode,
                         config.inbred_het_threshold,
-                        |m| &target_rows[aligned_pairs[m].1],
+                        |m| &target_rows[aligned_pairs[m].target_idx],
                     )
                 });
                 last_inbred_count = tgt_inbred.iter().filter(|&&b| b).count();
@@ -462,22 +511,48 @@ where
                     markers_processed,
                     all_ancestry_segments.len() as u64,
                 )?;
-                let (segs, bins) = pool.install(|| {
-                    paint_chromosome_ancestry_cancellable(
-                        &joint_matrix,
-                        &ref_layout,
-                        &tgt_layout,
-                        chrom_idx,
-                        &positions_bp,
-                        &cm_positions,
-                        &config,
-                        cancelled,
-                    )
-                })?;
-                all_ancestry_segments.extend(segs);
-                all_chrom_bins.push(bins);
+                let analyzed_chrom_markers = match config.ancestry_model {
+                    AncestryModel::Viterbi => {
+                        let (segs, bins) = pool.install(|| {
+                            paint_chromosome_ancestry_cancellable(
+                                &joint_matrix,
+                                &ref_layout,
+                                &tgt_layout,
+                                chrom_idx,
+                                &positions_bp,
+                                &cm_positions,
+                                &config,
+                                cancelled,
+                            )
+                        })?;
+                        all_ancestry_segments.extend(segs);
+                        all_chrom_bins.push(bins);
+                        joint_matrix.n_markers as u64
+                    }
+                    AncestryModel::Mott => {
+                        let mott_out = pool.install(|| {
+                            paint_chromosome_mott_cancellable(
+                                &joint_matrix,
+                                &ref_layout,
+                                &tgt_layout,
+                                chrom_idx,
+                                &positions_bp,
+                                &cm_positions,
+                                &config,
+                                cancelled,
+                            )
+                        })?;
+                        all_ancestry_segments.extend(mott_out.segments);
+                        all_chrom_bins.push(mott_out.bins);
+                        if let Some(post) = mott_out.posterior {
+                            all_mott_posteriors.push(post);
+                        }
+                        mott_selected_markers += mott_out.selected_markers as u64;
+                        mott_out.selected_markers as u64
+                    }
+                };
                 raw_target_markers_scanned += chrom_raw_target_rows;
-                markers_processed += joint_matrix.n_markers as u64;
+                markers_processed += analyzed_chrom_markers;
                 emit_progress(
                     "chrom_done",
                     &chrom,
@@ -583,6 +658,17 @@ where
         None
     };
 
+    let posterior_path = if mode == HaploidIbdMode::MultiParentAncestry
+        && config.ancestry_model == AncestryModel::Mott
+        && config.mott_write_posterior
+    {
+        let post_path = posterior_tsv_output_path(&config.output);
+        write_mott_posterior_tsv_atomic(&post_path, &all_mott_posteriors, cancelled)?;
+        Some(post_path.to_string_lossy().into_owned())
+    } else {
+        None
+    };
+
     emit_progress(
         "complete",
         "",
@@ -606,11 +692,18 @@ where
         sparse_nnz,
         output_path: output_path.to_string_lossy().into_owned(),
         tsv_path,
+        posterior_path,
+        aligned_exact_markers,
+        aligned_swapped_markers,
+        aligned_incompatible_markers,
+        mott_informative_markers,
+        mott_selected_markers,
         elapsed_s: started.elapsed().as_secs_f64(),
     })
 }
 
 static SPOOL_COUNTER: AtomicU64 = AtomicU64::new(0);
+static MOTT_POSTERIOR_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Disk-backed per-chromosome reference spool that keeps peak RAM strictly
 /// bounded to a single chromosome even when target and reference files have
@@ -806,13 +899,111 @@ fn is_binary_plink_input(path: &std::path::Path) -> bool {
         || lower.ends_with(".fam")
 }
 
-fn normalize_jhibd_output_path(path: &std::path::Path) -> PathBuf {
+fn normalize_jhibd_output_path(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
     if s.ends_with(".jhibd") {
         path.to_path_buf()
     } else {
         PathBuf::from(format!("{s}.jhibd"))
     }
+}
+
+fn posterior_tsv_output_path(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    let stem = s.strip_suffix(".jhibd").unwrap_or(&s);
+    PathBuf::from(format!("{stem}.posterior.tsv"))
+}
+
+fn write_mott_posterior_tsv_atomic(
+    path: &Path,
+    chrom_posteriors: &[MottPosteriorMatrix],
+    cancelled: Option<&AtomicBool>,
+) -> Result<(), String> {
+    if is_cancelled(cancelled) {
+        return Err("Interrupted".to_owned());
+    }
+    for mat in chrom_posteriors {
+        let k = mat.n_states;
+        if k == 0 {
+            if !mat.values.is_empty() {
+                return Err(format!(
+                    "posterior matrix length ({}) is not divisible by n_states (0)",
+                    mat.values.len()
+                ));
+            }
+            continue;
+        }
+        if mat.values.len() % k != 0 {
+            return Err(format!(
+                "posterior matrix length ({}) is not divisible by n_states ({k})",
+                mat.values.len()
+            ));
+        }
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| format!("create directory {}: {err}", parent.display()))?;
+        }
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("posterior.tsv");
+    let tmp_id = MOTT_POSTERIOR_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = path.with_file_name(format!(
+        ".{file_name}.tmp.{}.{tmp_id}",
+        std::process::id()
+    ));
+    let write_res = (|| -> Result<(), String> {
+        let file = File::create(&tmp_path)
+            .map_err(|err| format!("create temp posterior {}: {err}", tmp_path.display()))?;
+        let mut writer = BufWriter::new(file);
+        let mut rows_written = 0usize;
+        for mat in chrom_posteriors {
+            let k = mat.n_states;
+            if k == 0 {
+                continue;
+            }
+            for row in mat.values.chunks_exact(k) {
+                if (rows_written & 1023) == 0 && is_cancelled(cancelled) {
+                    return Err("Interrupted".to_owned());
+                }
+                for (j, &val) in row.iter().enumerate() {
+                    if j > 0 {
+                        writer
+                            .write_all(b"\t")
+                            .map_err(|err| format!("write posterior {}: {err}", path.display()))?;
+                    }
+                    write!(writer, "{val}")
+                        .map_err(|err| format!("write posterior {}: {err}", path.display()))?;
+                }
+                writer
+                    .write_all(b"\n")
+                    .map_err(|err| format!("write posterior {}: {err}", path.display()))?;
+                rows_written += 1;
+            }
+        }
+        writer
+            .flush()
+            .map_err(|err| format!("flush posterior {}: {err}", path.display()))?;
+        if is_cancelled(cancelled) {
+            return Err("Interrupted".to_owned());
+        }
+        Ok(())
+    })();
+    if let Err(err) = write_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    std::fs::rename(&tmp_path, path).map_err(|err| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!(
+            "rename temp posterior {} -> {}: {err}",
+            tmp_path.display(),
+            path.display()
+        )
+    })
 }
 
 /// Classify samples as inbred/DH vs diploid and collect diploid heterozygotes
@@ -1009,6 +1200,26 @@ fn set_bit_in_row(allele_row: &mut [u64], missing_row: &mut [u64], hap: usize, v
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AlignedVariantPair {
+    ref_idx: usize,
+    target_idx: usize,
+    swap_alleles: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AlignChromStats {
+    exact: u64,
+    swapped: u64,
+    incompatible: u64,
+}
+
+#[inline]
+fn flipped_biallelic_code(allele: Option<u16>, swap: bool) -> Option<u8> {
+    let code = biallelic_code(allele)?;
+    Some(if swap { 1 - code } else { code })
+}
+
 fn encode_rows_to_matrix(
     rows: &[VariantRow],
     layout: &SampleHaplotypeLayout,
@@ -1069,7 +1280,7 @@ fn encode_rows_to_matrix(
 fn encode_joint_rows_to_matrix_indexed(
     ref_rows: &[VariantRow],
     tgt_rows: &[VariantRow],
-    aligned_pairs: &[(usize, usize)],
+    aligned_pairs: &[AlignedVariantPair],
     ref_layout: &SampleHaplotypeLayout,
     tgt_layout: &SampleHaplotypeLayout,
     map: &GeneticMap,
@@ -1079,12 +1290,12 @@ fn encode_joint_rows_to_matrix_indexed(
     let mut matrix = BitHaplotypeMatrix::new(total_haps, n_markers);
     let positions_bp: Vec<u64> = aligned_pairs
         .par_iter()
-        .map(|&(_, tidx)| tgt_rows[tidx].meta.pos)
+        .map(|pair| tgt_rows[pair.target_idx].meta.pos)
         .collect();
     let cm_positions: Vec<f64> = aligned_pairs
         .par_iter()
-        .map(|&(_, tidx)| {
-            let row = &tgt_rows[tidx];
+        .map(|pair| {
+            let row = &tgt_rows[pair.target_idx];
             map.interpolate_cm(&row.meta.chrom, row.meta.pos)
         })
         .collect();
@@ -1096,9 +1307,9 @@ fn encode_joint_rows_to_matrix_indexed(
             .par_chunks_mut(stride)
             .zip(matrix.missing_bits.par_chunks_mut(stride))
             .zip(aligned_pairs.par_iter())
-            .for_each(|((allele_row, missing_row), &(ridx, tidx))| {
-                let rrow = &ref_rows[ridx];
-                let trow = &tgt_rows[tidx];
+            .for_each(|((allele_row, missing_row), pair)| {
+                let rrow = &ref_rows[pair.ref_idx];
+                let trow = &tgt_rows[pair.target_idx];
                 for s in 0..ref_layout.n_samples {
                     let off = ref_layout.hap_offset[s];
                     let call = rrow.calls.get(s);
@@ -1136,7 +1347,13 @@ fn encode_joint_rows_to_matrix_indexed(
                     let call = trow.calls.get(s);
                     if tgt_layout.is_inbred[s] {
                         let val = call.and_then(|c| match c.alleles {
-                            [Some(a0), Some(a1)] if a0 == a1 && a0 <= 1 => Some(a0 as u8),
+                            [Some(a0), Some(a1)] if a0 == a1 && a0 <= 1 => Some(
+                                if pair.swap_alleles {
+                                    1 - a0 as u8
+                                } else {
+                                    a0 as u8
+                                },
+                            ),
                             _ => None,
                         });
                         set_bit_in_row(allele_row, missing_row, off, val);
@@ -1147,13 +1364,19 @@ fn encode_joint_rows_to_matrix_indexed(
                                     allele_row,
                                     missing_row,
                                     off,
-                                    biallelic_code(c.alleles[0]),
+                                    flipped_biallelic_code(
+                                        c.alleles[0],
+                                        pair.swap_alleles,
+                                    ),
                                 );
                                 set_bit_in_row(
                                     allele_row,
                                     missing_row,
                                     off + 1,
-                                    biallelic_code(c.alleles[1]),
+                                    flipped_biallelic_code(
+                                        c.alleles[1],
+                                        pair.swap_alleles,
+                                    ),
                                 );
                             }
                             None => {
@@ -1168,17 +1391,89 @@ fn encode_joint_rows_to_matrix_indexed(
     (matrix, positions_bp, cm_positions)
 }
 
+fn select_mott_aligned_pairs(
+    ref_rows: &[VariantRow],
+    aligned_pairs: &[AlignedVariantPair],
+    n_ref_samples: usize,
+    cap: usize,
+    cancelled: Option<&AtomicBool>,
+) -> Result<(Vec<AlignedVariantPair>, u64), String> {
+    if aligned_pairs.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+    const SCAN_CHUNK: usize = 32_768;
+    let mut informative = Vec::with_capacity(aligned_pairs.len());
+    for start in (0..aligned_pairs.len()).step_by(SCAN_CHUNK) {
+        if is_cancelled(cancelled) {
+            return Err("Interrupted".to_owned());
+        }
+        let end = (start + SCAN_CHUNK).min(aligned_pairs.len());
+        let chunk: Vec<bool> = aligned_pairs[start..end]
+            .par_iter()
+            .map(|pair| {
+                let row = &ref_rows[pair.ref_idx];
+                let mut seen0 = false;
+                let mut seen1 = false;
+                for s in 0..n_ref_samples {
+                    let Some(call) = row.calls.get(s) else {
+                        continue;
+                    };
+                    match call.alleles {
+                        [Some(0), Some(0)] => seen0 = true,
+                        [Some(1), Some(1)] => seen1 = true,
+                        _ => {}
+                    }
+                    if seen0 && seen1 {
+                        return true;
+                    }
+                }
+                false
+            })
+            .collect();
+        informative.extend(chunk);
+    }
+    let informative_count = informative.iter().filter(|&&b| b).count() as u64;
+    if cap == 0 {
+        return Ok((aligned_pairs.to_vec(), informative_count));
+    }
+    let selected = select_even_marker_indices(&informative, cap)
+        .into_iter()
+        .map(|idx| aligned_pairs[idx])
+        .collect();
+    Ok((selected, informative_count))
+}
+
 fn align_chromosome_row_indices(
     ref_rows: &[VariantRow],
     tgt_rows: &[VariantRow],
-) -> Vec<(usize, usize)> {
+    allow_swapped_alleles: bool,
+) -> (Vec<AlignedVariantPair>, AlignChromStats) {
     if ref_rows.is_empty() || tgt_rows.is_empty() {
-        return Vec::new();
+        return (Vec::new(), AlignChromStats::default());
     }
+    let match_orientation = |ref_row: &VariantRow, target_row: &VariantRow| -> Option<bool> {
+        let [ref_alt] = ref_row.meta.alt_alleles.as_slice() else {
+            return None;
+        };
+        let [target_alt] = target_row.meta.alt_alleles.as_slice() else {
+            return None;
+        };
+        if ref_row.meta.ref_allele == target_row.meta.ref_allele && ref_alt == target_alt {
+            Some(false)
+        } else if allow_swapped_alleles
+            && ref_row.meta.ref_allele.as_str() == target_alt.as_str()
+            && ref_alt.as_str() == target_row.meta.ref_allele.as_str()
+        {
+            Some(true)
+        } else {
+            None
+        }
+    };
     let ref_sorted = ref_rows.par_windows(2).all(|w| w[0].meta.pos <= w[1].meta.pos);
     let tgt_sorted = tgt_rows.par_windows(2).all(|w| w[0].meta.pos <= w[1].meta.pos);
     if ref_sorted && tgt_sorted {
         let mut aligned = Vec::with_capacity(ref_rows.len().min(tgt_rows.len()));
+        let mut stats = AlignChromStats::default();
         let mut ri = 0usize;
         let mut ti = 0usize;
         while ri < ref_rows.len() && ti < tgt_rows.len() {
@@ -1200,10 +1495,22 @@ fn align_chromosome_row_indices(
                 if r_end == ri + 1 && t_end == ti + 1 {
                     let rrow = &ref_rows[ri];
                     let trow = &tgt_rows[ti];
-                    let r_alt0 = rrow.meta.alt_alleles.first().map(String::as_str).unwrap_or("");
-                    let t_alt0 = trow.meta.alt_alleles.first().map(String::as_str).unwrap_or("");
-                    if rrow.meta.ref_allele == trow.meta.ref_allele && r_alt0 == t_alt0 {
-                        aligned.push((ri, ti));
+                    match match_orientation(rrow, trow) {
+                        Some(swap_alleles) => {
+                            if swap_alleles {
+                                stats.swapped += 1;
+                            } else {
+                                stats.exact += 1;
+                            }
+                            aligned.push(AlignedVariantPair {
+                                ref_idx: ri,
+                                target_idx: ti,
+                                swap_alleles,
+                            });
+                        }
+                        None => {
+                            stats.incompatible += 1;
+                        }
                     }
                 } else if (r_end - ri).saturating_mul(t_end - ti) > 64 {
                     let mut local_ref: HashMap<(&str, &str), usize> =
@@ -1215,24 +1522,67 @@ fn align_chromosome_row_indices(
                     }
                     for tidx in ti..t_end {
                         let trow = &tgt_rows[tidx];
-                        let t_alt0 = trow.meta.alt_alleles.first().map(String::as_str).unwrap_or("");
-                        if let Some(&ridx) = local_ref.get(&(trow.meta.ref_allele.as_str(), t_alt0)) {
-                            aligned.push((ridx, tidx));
+                        let t_alt0 = trow
+                            .meta
+                            .alt_alleles
+                            .first()
+                            .map(String::as_str)
+                            .unwrap_or("");
+                        if let Some(&ridx) =
+                            local_ref.get(&(trow.meta.ref_allele.as_str(), t_alt0))
+                        {
+                            stats.exact += 1;
+                            aligned.push(AlignedVariantPair {
+                                ref_idx: ridx,
+                                target_idx: tidx,
+                                swap_alleles: false,
+                            });
+                        } else {
+                            let mut matched = false;
+                            if allow_swapped_alleles {
+                                for ridx in (ri..r_end).rev() {
+                                    let rrow = &ref_rows[ridx];
+                                    if match_orientation(rrow, trow) == Some(true) {
+                                        stats.swapped += 1;
+                                        aligned.push(AlignedVariantPair {
+                                            ref_idx: ridx,
+                                            target_idx: tidx,
+                                            swap_alleles: true,
+                                        });
+                                        matched = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            if !matched {
+                                stats.incompatible += 1;
+                            }
                         }
                     }
                 } else {
                     for tidx in ti..t_end {
                         let trow = &tgt_rows[tidx];
-                        let t_alt0 = trow.meta.alt_alleles.first().map(String::as_str).unwrap_or("");
+                        let mut matched = false;
                         // Match HashMap::insert semantics: last matching reference row wins.
                         for ridx in (ri..r_end).rev() {
                             let rrow = &ref_rows[ridx];
-                            let r_alt0 =
-                                rrow.meta.alt_alleles.first().map(String::as_str).unwrap_or("");
-                            if rrow.meta.ref_allele == trow.meta.ref_allele && r_alt0 == t_alt0 {
-                                aligned.push((ridx, tidx));
+                            if let Some(swap_alleles) = match_orientation(rrow, trow) {
+                                if swap_alleles {
+                                    stats.swapped += 1;
+                                } else {
+                                    stats.exact += 1;
+                                }
+                                aligned.push(AlignedVariantPair {
+                                    ref_idx: ridx,
+                                    target_idx: tidx,
+                                    swap_alleles,
+                                });
+                                matched = true;
                                 break;
                             }
+                        }
+                        if !matched {
+                            stats.incompatible += 1;
                         }
                     }
                 }
@@ -1240,31 +1590,159 @@ fn align_chromosome_row_indices(
                 ti = t_end;
             }
         }
-        return aligned;
+        return (aligned, stats);
     }
 
     let mut ref_index: HashMap<(u64, &str, &str), usize> = HashMap::with_capacity(ref_rows.len());
+    let mut ref_positions: HashSet<u64> = HashSet::with_capacity(ref_rows.len());
     for (idx, row) in ref_rows.iter().enumerate() {
         let alt0 = row.meta.alt_alleles.first().map(String::as_str).unwrap_or("");
         ref_index.insert((row.meta.pos, row.meta.ref_allele.as_str(), alt0), idx);
+        ref_positions.insert(row.meta.pos);
     }
-    tgt_rows
+    enum UnsortedMatch {
+        Aligned(AlignedVariantPair),
+        Incompatible,
+    }
+    let matches: Vec<UnsortedMatch> = tgt_rows
         .par_iter()
         .enumerate()
         .filter_map(|(tidx, trow)| {
             let alt0 = trow.meta.alt_alleles.first().map(String::as_str).unwrap_or("");
-            ref_index
-                .get(&(trow.meta.pos, trow.meta.ref_allele.as_str(), alt0))
-                .map(|&ridx| (ridx, tidx))
+            if let Some(&ridx) =
+                ref_index.get(&(trow.meta.pos, trow.meta.ref_allele.as_str(), alt0))
+            {
+                return Some(UnsortedMatch::Aligned(AlignedVariantPair {
+                    ref_idx: ridx,
+                    target_idx: tidx,
+                    swap_alleles: false,
+                }));
+            }
+            if allow_swapped_alleles {
+                if let Some(&ridx) = ref_index.get(&(
+                    trow.meta.pos,
+                    alt0,
+                    trow.meta.ref_allele.as_str(),
+                )) {
+                    return Some(UnsortedMatch::Aligned(AlignedVariantPair {
+                        ref_idx: ridx,
+                        target_idx: tidx,
+                        swap_alleles: true,
+                    }));
+                }
+            }
+            if ref_positions.contains(&trow.meta.pos) {
+                Some(UnsortedMatch::Incompatible)
+            } else {
+                None
+            }
         })
-        .collect()
+        .collect();
+    let mut aligned = Vec::with_capacity(matches.len());
+    let mut stats = AlignChromStats::default();
+    for item in matches {
+        match item {
+            UnsortedMatch::Aligned(pair) => {
+                if pair.swap_alleles {
+                    stats.swapped += 1;
+                } else {
+                    stats.exact += 1;
+                }
+                aligned.push(pair);
+            }
+            UnsortedMatch::Incompatible => {
+                stats.incompatible += 1;
+            }
+        }
+    }
+    (aligned, stats)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_and_collect_hets, DisjointPhaseBlock, PloidyMode, RefChromSpool};
+    use super::{
+        align_chromosome_row_indices, classify_and_collect_hets,
+        encode_joint_rows_to_matrix_indexed, DisjointPhaseBlock, GeneticMap, PloidyMode,
+        RefChromSpool, SampleHaplotypeLayout, MottPosteriorMatrix,
+        write_mott_posterior_tsv_atomic,
+    };
     use crate::imp::types::{DiploidCall, DiploidCalls, PhaseSetId, VariantMeta, VariantRow};
     use std::io::Write;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn mott_alignment_accepts_swapped_biallelic_and_encodes_flipped_target() {
+        let ref_row = VariantRow {
+            meta: VariantMeta {
+                chrom: "1".to_owned(),
+                pos: 100,
+                id: "v1".to_owned(),
+                ref_allele: "A".to_owned(),
+                alt_alleles: vec!["G".to_owned()],
+            },
+            calls: DiploidCalls::from_calls(vec![DiploidCall {
+                alleles: [Some(0), Some(0)],
+                phased: true,
+            }]),
+        };
+        let target_row = VariantRow {
+            meta: VariantMeta {
+                chrom: "1".to_owned(),
+                pos: 100,
+                id: "v1".to_owned(),
+                ref_allele: "G".to_owned(),
+                alt_alleles: vec!["A".to_owned()],
+            },
+            calls: DiploidCalls::from_calls(vec![DiploidCall {
+                alleles: [Some(1), Some(1)],
+                phased: true,
+            }]),
+        };
+        let ref_rows = vec![ref_row];
+        let target_rows = vec![target_row];
+        let (aligned, stats) = align_chromosome_row_indices(&ref_rows, &target_rows, true);
+        assert_eq!(aligned.len(), 1);
+        assert!(aligned[0].swap_alleles);
+        assert_eq!(stats.exact, 0);
+        assert_eq!(stats.swapped, 1);
+        assert_eq!(stats.incompatible, 0);
+
+        let ref_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true]);
+        let target_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true]);
+        let map = GeneticMap::constant(1.0);
+        let (joint, _, _) = encode_joint_rows_to_matrix_indexed(
+            &ref_rows,
+            &target_rows,
+            &aligned,
+            &ref_layout,
+            &target_layout,
+            &map,
+        );
+        assert_eq!(joint.allele(0, 0), Some(0));
+        assert_eq!(joint.allele(0, 1), Some(0));
+    }
+
+    #[test]
+    fn mott_posterior_writer_rejects_ragged_rows() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "janusx_mott_ragged_{}_{}.tsv",
+            std::process::id(),
+            unique
+        ));
+        let matrices = vec![MottPosteriorMatrix {
+            n_states: 2,
+            values: vec![0.5, 0.5, 0.5],
+        }];
+        let cancelled = AtomicBool::new(false);
+        let err = write_mott_posterior_tsv_atomic(&path, &matrices, Some(&cancelled))
+            .expect_err("ragged posterior rows must be rejected");
+        assert!(err.contains("divisible"));
+        assert!(!path.exists());
+    }
 
     #[test]
     fn multiallelic_1_2_is_ignored_and_ps_blocks_include_partial_missing_phased_calls() {

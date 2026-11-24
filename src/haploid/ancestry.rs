@@ -685,13 +685,34 @@ pub fn build_union_breakpoint_sparse_matrix(
     n_parents: usize,
     segments: &[AncestrySegment],
 ) -> ChromosomeAncestryBinsSparse {
+    build_union_breakpoint_sparse_matrix_cancellable(
+        chrom_idx,
+        target_layout,
+        n_parents,
+        segments,
+        None,
+    )
+    .unwrap_or_default()
+}
+
+/// Cancellable variant of `build_union_breakpoint_sparse_matrix`.
+pub fn build_union_breakpoint_sparse_matrix_cancellable(
+    chrom_idx: u16,
+    target_layout: &SampleHaplotypeLayout,
+    n_parents: usize,
+    segments: &[AncestrySegment],
+    cancelled: Option<&AtomicBool>,
+) -> Result<ChromosomeAncestryBinsSparse, String> {
+    if is_cancelled(cancelled) {
+        return Err("Interrupted".to_owned());
+    }
     if segments.is_empty() || target_layout.n_samples == 0 || n_parents == 0 {
-        return ChromosomeAncestryBinsSparse {
+        return Ok(ChromosomeAncestryBinsSparse {
             chrom_idx,
             n_target_samples: target_layout.n_samples,
             n_parents,
             ..ChromosomeAncestryBinsSparse::default()
-        };
+        });
     }
 
     // Collect unique sorted breakpoint coordinates `(bp, cm)` in parallel.
@@ -704,13 +725,16 @@ pub fn build_union_breakpoint_sparse_matrix(
     }
     bp_to_cm.par_sort_by_key(|&(bp, _)| bp);
     bp_to_cm.dedup_by_key(|(bp, _)| *bp);
+    if is_cancelled(cancelled) {
+        return Err("Interrupted".to_owned());
+    }
     if bp_to_cm.len() < 2 {
-        return ChromosomeAncestryBinsSparse {
+        return Ok(ChromosomeAncestryBinsSparse {
             chrom_idx,
             n_target_samples: target_layout.n_samples,
             n_parents,
             ..ChromosomeAncestryBinsSparse::default()
-        };
+        });
     }
 
     let n_bins = bp_to_cm.len() - 1;
@@ -791,7 +815,10 @@ pub fn build_union_breakpoint_sparse_matrix(
 
     let block_outputs: Vec<BlockOut> = (0..n_blocks)
         .into_par_iter()
-        .map(|blk| {
+        .map(|blk| -> Result<BlockOut, String> {
+            if is_cancelled(cancelled) {
+                return Err("Interrupted".to_owned());
+            }
             let b0 = blk * BIN_BLOCK;
             let b1 = (b0 + BIN_BLOCK).min(n_bins);
             let local_n = b1 - b0;
@@ -848,9 +875,9 @@ pub fn build_union_breakpoint_sparse_matrix(
                 out.dosage.push(cur_d);
                 out.bin_lens.push((out.sample_idx.len() - before) as u32);
             }
-            out
+            Ok(out)
         })
-        .collect();
+        .collect::<Result<Vec<BlockOut>, String>>()?;
 
     let total_bins: usize = block_outputs.iter().map(|b| b.starts_bp.len()).sum();
     let total_nnz: usize = block_outputs.iter().map(|b| b.sample_idx.len()).sum();
@@ -878,7 +905,7 @@ pub fn build_union_breakpoint_sparse_matrix(
         }
     }
 
-    ChromosomeAncestryBinsSparse {
+    Ok(ChromosomeAncestryBinsSparse {
         chrom_idx,
         n_target_samples: target_layout.n_samples,
         n_parents,
@@ -890,7 +917,7 @@ pub fn build_union_breakpoint_sparse_matrix(
         sample_idx,
         parent_idx,
         dosage,
-    }
+    })
 }
 
 #[cfg(test)]

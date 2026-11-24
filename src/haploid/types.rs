@@ -29,6 +29,15 @@ pub enum HaploidIbdMode {
     MultiParentAncestry,
 }
 
+/// Multi-parent ancestry inference model (`--ancestry-model`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AncestryModel {
+    #[default]
+    Viterbi,
+    Mott,
+}
+
 fn default_threads() -> usize {
     1
 }
@@ -62,6 +71,21 @@ fn default_ancestry_step_cm() -> f64 {
 fn default_ancestry_step_max_markers() -> usize {
     0
 }
+fn default_mott_generations() -> f64 {
+    9.0
+}
+fn default_mott_parent_match_prob() -> f64 {
+    0.97
+}
+fn default_mott_map_scale_cm() -> f64 {
+    50.0
+}
+fn default_mott_unknown_fold() -> f64 {
+    2.0
+}
+fn default_mott_max_markers_per_chrom() -> usize {
+    0
+}
 fn default_cm_per_mb() -> f64 {
     1.0
 }
@@ -84,12 +108,19 @@ pub struct HaploidIbdConfig {
     pub max_gap_cm: f64,
     pub max_mismatch_rate: f64,
     pub min_markers: usize,
+    pub ancestry_model: AncestryModel,
     pub ancestry_switch_penalty: f32,
     pub ancestry_top_donors: usize,
     pub ancestry_step_cm: f64,
     /// Optional per-step effective marker cap for high-density WGS ancestry
     /// decoding (`0` = disabled / unscaled default).
     pub ancestry_step_max_markers: usize,
+    pub mott_generations: f64,
+    pub mott_parent_match_prob: f64,
+    pub mott_map_scale_cm: f64,
+    pub mott_unknown_fold: f64,
+    pub mott_max_markers_per_chrom: usize,
+    pub mott_write_posterior: bool,
     pub cm_per_mb: f64,
     pub write_tsv: bool,
 }
@@ -109,10 +140,17 @@ impl Default for HaploidIbdConfig {
             max_gap_cm: default_max_gap_cm(),
             max_mismatch_rate: default_max_mismatch_rate(),
             min_markers: default_min_markers(),
+            ancestry_model: AncestryModel::Viterbi,
             ancestry_switch_penalty: default_ancestry_switch_penalty(),
             ancestry_top_donors: default_ancestry_top_donors(),
             ancestry_step_cm: default_ancestry_step_cm(),
             ancestry_step_max_markers: default_ancestry_step_max_markers(),
+            mott_generations: default_mott_generations(),
+            mott_parent_match_prob: default_mott_parent_match_prob(),
+            mott_map_scale_cm: default_mott_map_scale_cm(),
+            mott_unknown_fold: default_mott_unknown_fold(),
+            mott_max_markers_per_chrom: default_mott_max_markers_per_chrom(),
+            mott_write_posterior: false,
             cm_per_mb: default_cm_per_mb(),
             write_tsv: false,
         }
@@ -133,6 +171,18 @@ pub struct HaploidIbdSummary {
     pub sparse_nnz: u64,
     pub output_path: String,
     pub tsv_path: Option<String>,
+    #[serde(default)]
+    pub posterior_path: Option<String>,
+    #[serde(default)]
+    pub aligned_exact_markers: u64,
+    #[serde(default)]
+    pub aligned_swapped_markers: u64,
+    #[serde(default)]
+    pub aligned_incompatible_markers: u64,
+    #[serde(default)]
+    pub mott_informative_markers: u64,
+    #[serde(default)]
+    pub mott_selected_markers: u64,
     pub elapsed_s: f64,
 }
 

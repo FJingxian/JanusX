@@ -1249,6 +1249,377 @@ def _run_mosaic_outputs(
 
 
 # ---------------------------------------------------------------------------
+# 3D. Opt-In Paper Fig. S5 Multi-Panel Mosaic Renderer (--paper-style)
+# ---------------------------------------------------------------------------
+
+_PAPER_UNKNOWN_COLOR = "#9CA3AF"
+_PAPER_PALETTE_24 = (
+    "#E41A1C", "#F15A24", "#F7931E", "#FBB03B", "#FCEE21", "#D9E021",
+    "#8CC63F", "#39B54A", "#009245", "#00A99D", "#29ABE2", "#0071BC",
+    "#2E3192", "#1B1464", "#4E2A84", "#662D91", "#92278F", "#9E005D",
+    "#D4145A", "#ED1E79", "#C1272D", "#A61C3C", "#D91B5C", "#E11D48",
+)
+
+
+def _read_paper_parent_order_file(order_path: Path) -> list[str]:
+    names: list[str] = []
+    with order_path.open("r", encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            token = line.split()[0].strip()
+            if token and token not in names:
+                names.append(token)
+    return names
+
+
+def _paper_parent_order(
+    reference_ids: Sequence[str],
+    order_override: Optional[Sequence[str]] = None,
+) -> list[int]:
+    """Return display order of reference parent indices (preserves input order when None)."""
+    n = len(reference_ids)
+    if not order_override:
+        return list(range(n))
+    id_to_idx = {str(pid): i for i, pid in enumerate(reference_ids)}
+    ordered: list[int] = []
+    seen: set[int] = set()
+    for name in order_override:
+        idx = id_to_idx.get(str(name).strip())
+        if idx is not None and idx not in seen:
+            ordered.append(idx)
+            seen.add(idx)
+    for i in range(n):
+        if i not in seen:
+            ordered.append(i)
+    return ordered
+
+
+def _build_paper_colors(n_parents: int, fallback_colors: Sequence[str]) -> list[str]:
+    if n_parents <= len(_PAPER_PALETTE_24):
+        return list(_PAPER_PALETTE_24[:n_parents])
+    if len(fallback_colors) >= n_parents:
+        return list(fallback_colors[:n_parents])
+    return _build_parent_colors(n_parents)
+
+
+def _resample_block_width(block: np.ndarray, target_width: int) -> np.ndarray:
+    n_rows, n_cols = block.shape
+    if n_cols <= 0 or target_width <= 0 or n_cols == target_width:
+        return block
+    idx = np.linspace(0, n_cols - 1, target_width).round().astype(int)
+    return block[:, idx]
+
+
+def _run_paper_mosaic_outputs(
+    data: dict[str, Any],
+    out_prefix: Path,
+    fmt: str,
+    dpi: int,
+    parent_colors: Sequence[str],
+    paper_samples: Optional[Sequence[str]] = None,
+    *,
+    parent_order_override: Optional[Sequence[str]] = None,
+    logger: Optional[logging.Logger] = None,
+) -> list[Path]:
+    """Render Liu et al. (2020) Fig. S5-style three-panel mosaic (panels a, b, c)."""
+    chrom_names: list[str] = list(data["chrom_names"])
+    chrom_lengths_bp: list[int] = [int(v) for v in data["chrom_lengths_bp"]]
+    parent_ids: list[str] = list(data["reference_sample_ids"])
+    target_ids: list[str] = list(data.get("target_sample_ids", []))
+    n_parents = len(parent_ids)
+    mosaic_samples: list[dict[str, Any]] = list(data.get("mosaic_samples", []))
+    mosaic_segments: list[dict[str, Any]] = list(data.get("mosaic_segments", []))
+    pop_mosaics: list[dict[str, Any]] = list(data.get("pop_mosaics", []))
+    ordered_c = _ordered_chrom_indices(chrom_names)
+    pop_by_c = {int(pm["chrom_idx"]): pm for pm in pop_mosaics}
+    active_c = [c for c in ordered_c if c in pop_by_c]
+    plot_c = active_c if active_c else ordered_c
+
+    display_order = _paper_parent_order(parent_ids, parent_order_override)
+    # Respect caller-provided colors and keep founder->color mapping invariant across legend reordering.
+    if parent_colors and len(parent_colors) >= n_parents:
+        color_by_parent = list(parent_colors[:n_parents])
+    else:
+        color_by_parent = _build_paper_colors(n_parents, parent_colors)
+
+    zoom_local_idx = 0
+    zoom_sample_id = mosaic_samples[0]["sample_id"] if mosaic_samples else ""
+    if paper_samples:
+        want = str(paper_samples[0]).strip()
+        found_zoom = False
+        for idx_s, s_info in enumerate(mosaic_samples):
+            if str(s_info["sample_id"]) == want:
+                zoom_local_idx = idx_s
+                zoom_sample_id = str(s_info["sample_id"])
+                found_zoom = True
+                break
+        if not found_zoom:
+            raise ValueError(
+                f"Requested --paper-zoom-samples '{want}' not found in mosaic samples."
+            )
+
+    zoom_segs = [
+        seg for seg in mosaic_segments if int(seg["local_sample_idx"]) == zoom_local_idx
+    ]
+
+    fig = plt.figure(figsize=(16.5, 8.2), facecolor="white")
+    outer = fig.add_gridspec(1, 2, width_ratios=[1.05, 1.15], wspace=0.18)
+    left_gs = outer[0].subgridspec(2, 1, height_ratios=[0.78, 1.22], hspace=0.28)
+
+    # --- Panel a: schematic of offspring genome assembled from founder blocks ---
+    ax_a = fig.add_subplot(left_gs[0])
+    ax_a.text(
+        -0.10, 1.04, "a", transform=ax_a.transAxes,
+        fontsize=18, fontweight="bold", va="top", ha="left", color="#111827",
+    )
+    panel_a_chrom = plot_c[0] if plot_c else 0
+    a_segs = sorted(
+        [s for s in zoom_segs if int(s["chrom_idx"]) == panel_a_chrom],
+        key=lambda s: int(s["start_bp"]),
+    )
+    if not a_segs and zoom_segs:
+        panel_a_chrom = int(zoom_segs[0]["chrom_idx"])
+        a_segs = sorted(
+            [s for s in zoom_segs if int(s["chrom_idx"]) == panel_a_chrom],
+            key=lambda s: int(s["start_bp"]),
+        )
+    present_a: list[int] = []
+    present_a_bp: dict[int, int] = {}
+    for seg in a_segs:
+        p = int(seg["parent_sample"])
+        if 0 <= p < n_parents:
+            if p not in present_a:
+                present_a.append(p)
+            seg_bp = max(1, int(seg["end_bp"]) - int(seg["start_bp"]) + 1)
+            present_a_bp[p] = present_a_bp.get(p, 0) + seg_bp
+    if len(present_a) <= 8:
+        a_track_parents = list(present_a)
+        a_other_count = 0
+    else:
+        ranked_a = sorted(
+            present_a, key=lambda p: (-present_a_bp.get(p, 0), present_a.index(p))
+        )
+        a_track_parents = ranked_a[:6]
+        a_other_count = len(present_a) - len(a_track_parents)
+    track_idx_by_parent = {p: idx for idx, p in enumerate(a_track_parents)}
+    n_a_tracks = len(a_track_parents) + (1 if a_other_count > 0 else 0)
+    n_a_rows = max(1, n_a_tracks)
+    raw_a_len = (
+        int(pop_by_c[panel_a_chrom]["chrom_length_bp"])
+        if panel_a_chrom in pop_by_c and int(pop_by_c[panel_a_chrom].get("chrom_length_bp", 0)) > 0
+        else (chrom_lengths_bp[panel_a_chrom] if panel_a_chrom < len(chrom_lengths_bp) else 0)
+    )
+    seg_max_bp = max((int(s["end_bp"]) for s in a_segs), default=1)
+    a_chrom_len = max(1.0, float(max(raw_a_len, seg_max_bp)))
+    bar_y = -1.6
+    ax_a.add_patch(
+        Rectangle((0.0, bar_y - 0.28), 1.0, 0.56, facecolor=_PAPER_UNKNOWN_COLOR, edgecolor="none")
+    )
+    arrow_indices = (
+        set(range(len(a_segs)))
+        if len(a_segs) <= 12
+        else set(np.linspace(0, len(a_segs) - 1, 12).round().astype(int).tolist())
+    )
+    for seg_i, seg in enumerate(a_segs):
+        p = int(seg["parent_sample"])
+        if not (0 <= p < n_parents):
+            continue
+        row_idx = track_idx_by_parent.get(p, len(a_track_parents))
+        row_y = float(n_a_rows - 1 - row_idx)
+        x0 = max(0.0, float(seg["start_bp"]) / a_chrom_len)
+        x1 = min(1.0, float(seg["end_bp"]) / a_chrom_len)
+        w = max(x1 - x0, 0.004)
+        col = color_by_parent[p]
+        ax_a.add_patch(Rectangle((x0, bar_y - 0.28), w, 0.56, facecolor=col, edgecolor="none"))
+        ax_a.add_patch(Rectangle((x0, row_y - 0.24), w, 0.48, facecolor=col, edgecolor="none"))
+        if seg_i in arrow_indices:
+            xm = x0 + 0.5 * w
+            ax_a.annotate(
+                "",
+                xy=(xm, row_y - 0.26),
+                xytext=(xm, bar_y + 0.30),
+                arrowprops=dict(arrowstyle="->", linestyle="--", color="#111827", lw=0.75),
+            )
+    ax_a.set_xlim(-0.02, 1.02)
+    ax_a.set_ylim(bar_y - 0.7, float(n_a_rows) - 0.2)
+    track_labels = [parent_ids[p] for p in a_track_parents]
+    if a_other_count > 0:
+        track_labels.append(f"Other ({a_other_count})")
+    yticks_a = [float(n_a_rows - 1 - i) for i in range(len(track_labels))] + [bar_y]
+    ylabels_a = track_labels + ["Offspring\ngenome"]
+    ax_a.set_yticks(yticks_a)
+    ax_a.set_yticklabels(ylabels_a, fontsize=8.0, fontweight="bold")
+    ax_a.set_xticks([])
+    for spine in ax_a.spines.values():
+        spine.set_visible(False)
+    ax_a.tick_params(axis="y", length=0)
+
+    # --- Panel c: 2x5 chromosome zoom grid for selected offspring ---
+    n_c = len(plot_c)
+    ncols_c = min(5, max(1, n_c))
+    nrows_c = max(1, math.ceil(n_c / ncols_c))
+    plot_c_set = set(plot_c)
+    total_zoom_bp = sum(chrom_lengths_bp[c] for c in plot_c) or 1
+    called_zoom_bp = sum(
+        max(0, int(s["end_bp"]) - int(s["start_bp"]) + 1)
+        for s in zoom_segs
+        if int(s["chrom_idx"]) in plot_c_set
+    )
+    cov_frac = min(1.0, called_zoom_bp / float(total_zoom_bp))
+    c_gs = left_gs[1].subgridspec(
+        nrows_c + 1,
+        ncols_c,
+        height_ratios=[0.10, *([1.0] * nrows_c)],
+        wspace=0.14,
+        hspace=0.28,
+    )
+    ax_c_header = fig.add_subplot(c_gs[0, :])
+    ax_c_header.axis("off")
+    ax_c_header.text(
+        -0.06, 0.55, "c", transform=ax_c_header.transAxes,
+        fontsize=18, fontweight="bold", va="center", ha="left", color="#111827",
+    )
+    if zoom_sample_id:
+        ax_c_header.text(
+            0.5, 0.55,
+            f"{zoom_sample_id}  Cov ({cov_frac:.3f})  binN ({len(zoom_segs)})",
+            transform=ax_c_header.transAxes,
+            ha="center", va="center", fontsize=8.5, fontweight="bold", color="#111827",
+        )
+    present_c_set = {
+        int(seg["parent_sample"])
+        for seg in zoom_segs
+        if int(seg["chrom_idx"]) in plot_c_set and 0 <= int(seg["parent_sample"]) < n_parents
+    }
+    c_parents = [p for p in display_order if p in present_c_set] or list(display_order)
+    c_parent_to_y = {p: idx for idx, p in enumerate(c_parents)}
+
+    for pos_i, c in enumerate(plot_c):
+        r_i, col_i = divmod(pos_i, ncols_c)
+        ax_c = fig.add_subplot(c_gs[r_i + 1, col_i])
+        c_mb = max(1e-3, float(chrom_lengths_bp[c]) / 1_000_000.0)
+        c_segs = [s for s in zoom_segs if int(s["chrom_idx"]) == c]
+        for seg in c_segs:
+            p = int(seg["parent_sample"])
+            if p not in c_parent_to_y:
+                continue
+            y_val = float(c_parent_to_y[p])
+            x0 = float(seg["start_bp"]) / 1_000_000.0
+            x1 = float(seg["end_bp"]) / 1_000_000.0
+            ax_c.plot([x0, max(x1, x0 + c_mb * 0.008)], [y_val, y_val], color=color_by_parent[p], lw=2.6, solid_capstyle="butt")
+        ax_c.set_xlim(0.0, c_mb)
+        ax_c.set_ylim(-0.6, max(0.6, float(len(c_parents)) - 0.4))
+        ax_c.invert_yaxis()
+        ax_c.set_title(str(chrom_names[c]), fontsize=8.0, pad=2, backgroundcolor="#E5E7EB")
+        ax_c.grid(True, color="#E5E7EB", linewidth=0.45)
+        ax_c.tick_params(axis="x", labelsize=6.0)
+        if col_i == 0:
+            ax_c.set_yticks(range(len(c_parents)))
+            ax_c.set_yticklabels([parent_ids[p] for p in c_parents], fontsize=5.2)
+        else:
+            ax_c.set_yticks(range(len(c_parents)))
+            ax_c.set_yticklabels([])
+        if r_i == nrows_c - 1 and col_i == ncols_c // 2:
+            ax_c.set_xlabel("Physical position (Mb)", fontsize=7.5)
+        if r_i == 0 and col_i == 0:
+            ax_c.set_ylabel("Parents", fontsize=7.5)
+    # --- Panel b: equal-width chromosome mosaic columns across all offspring ---
+    ax_b = fig.add_subplot(outer[1])
+    ax_b.text(
+        -0.08, 1.01, "b", transform=ax_b.transAxes,
+        fontsize=18, fontweight="bold", va="top", ha="left", color="#111827",
+    )
+    ref_id_set = set(parent_ids)
+    zoom_row_idx: Optional[int] = None
+
+    if active_c:
+        cmap_b = mcolors.ListedColormap([_PAPER_UNKNOWN_COLOR] + color_by_parent)
+        norm_b = mcolors.BoundaryNorm(np.arange(-1.5, n_parents + 0.5, 1.0), cmap_b.N)
+        first_pm = pop_by_c[active_c[0]]
+        sample_indices = [int(i) for i in first_pm.get("sample_indices", range(int(first_pm["n_samples"])))]
+        keep_rows: list[int] = []
+        for local_r, global_s in enumerate(sample_indices):
+            sid = target_ids[global_s] if 0 <= global_s < len(target_ids) else ""
+            if sid and sid in ref_id_set:
+                continue
+            if zoom_sample_id and sid == zoom_sample_id:
+                zoom_row_idx = len(keep_rows)
+            keep_rows.append(local_r)
+        if not keep_rows:
+            raise ValueError(
+                "No non-founder offspring samples remain after excluding reference founders "
+                "in --paper-style mode."
+            )
+        n_rows_b = len(keep_rows)
+        col_width = 1.0
+        col_gap = 0.20
+        centers_b: list[float] = []
+        for idx_c, c in enumerate(active_c):
+            pm = pop_by_c[c]
+            n_s = int(pm["n_samples"])
+            n_b = int(pm["n_bins"])
+            mat = np.asarray(pm["parent_matrix"], dtype=np.int16).reshape((n_s, n_b))
+            mat_sub = mat[keep_rows, :]
+            mat_disp = _resample_block_width(mat_sub, max(80, min(250, n_b)))
+            x0 = idx_c * (col_width + col_gap)
+            x1 = x0 + col_width
+            centers_b.append(0.5 * (x0 + x1))
+            ax_b.imshow(
+                mat_disp,
+                aspect="auto",
+                interpolation="nearest",
+                cmap=cmap_b,
+                norm=norm_b,
+                extent=(x0, x1, float(n_rows_b), 0.0),
+            )
+        total_w = len(active_c) * (col_width + col_gap) - col_gap
+        if zoom_row_idx is not None:
+            band_h = max(1.0, n_rows_b * 0.012)
+            ax_b.add_patch(
+                Rectangle(
+                    (-0.08, max(0.0, zoom_row_idx - 0.5 * band_h)),
+                    total_w + 0.16,
+                    band_h,
+                    facecolor="none",
+                    edgecolor="#DC2626",
+                    linewidth=1.8,
+                    zorder=5,
+                    clip_on=False,
+                )
+            )
+        ax_b.set_xlim(-0.1, total_w + 0.1)
+        ax_b.set_ylim(float(n_rows_b), 0.0)
+        ax_b.set_xticks(centers_b)
+        ax_b.set_xticklabels([chrom_names[c] for c in active_c], fontsize=9.5)
+        ax_b.set_yticks([])
+        for spine in ax_b.spines.values():
+            spine.set_visible(False)
+        ax_b.tick_params(axis="x", length=0, pad=6)
+
+        handles = [Patch(facecolor=_PAPER_UNKNOWN_COLOR, label="unknown")] + [
+            Patch(facecolor=color_by_parent[p], label=parent_ids[p]) for p in display_order
+        ]
+        ax_b.legend(
+            handles=handles,
+            title="Parent state",
+            title_fontsize=9.5,
+            loc="center left",
+            bbox_to_anchor=(1.02, 0.5),
+            frameon=False,
+            fontsize=8.0,
+            handlelength=1.0,
+            labelspacing=0.35,
+        )
+
+    out_path = _save_figure(fig, Path(f"{out_prefix}.mosaic_paper.{fmt}"), fmt, dpi)
+    if logger is not None:
+        logger.info("Paper-style mosaic written: %s", out_path)
+    return [out_path]
+
+
+# ---------------------------------------------------------------------------
 # CLI Argument Parsing & Main Entry
 # ---------------------------------------------------------------------------
 
@@ -1399,6 +1770,25 @@ def build_parser() -> CliArgumentParser:
         default=2000,
         help="Total horizontal bin resolution distributed across chromosomes by physical length (default: 2000).",
     )
+    opt_group.add_argument(
+        "--paper-style",
+        dest="paper_style",
+        action="store_true",
+        default=False,
+        help="Render opt-in Liu et al. (2020) Fig. S5-style three-panel mosaic (<out>.mosaic_paper.<fmt>).",
+    )
+    opt_group.add_argument(
+        "--paper-parent-order",
+        dest="paper_parent_order",
+        default=None,
+        help="Optional newline-delimited parent ID order file for --paper-style legend and panels.",
+    )
+    opt_group.add_argument(
+        "--paper-zoom-samples",
+        dest="paper_zoom_samples",
+        default=None,
+        help="Optional comma-separated sample ID(s) zoomed in --paper-style panels a and c (defaults to --samples).",
+    )
     return parser
 
 
@@ -1472,11 +1862,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             raise FileNotFoundError(f"Ancestry group file not found: {args.group}")
         parent_groups = _read_parent_group_file(group_path)
 
-    mosaic_samples = (
+    paper_zoom_samples = (
+        [s.strip() for s in str(args.paper_zoom_samples).split(",") if s.strip()]
+        if args.paper_zoom_samples
+        else []
+    )
+    raw_samples = (
         [s.strip() for s in str(args.samples).split(",") if s.strip()]
         if args.samples
         else []
     )
+    mosaic_samples = list(dict.fromkeys([*raw_samples, *paper_zoom_samples]))
     mosaic_chroms = (
         [s.strip() for s in str(args.chrom).split(",") if s.strip()]
         if args.chrom
@@ -1558,7 +1954,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parent_colors = _build_parent_colors(len(data["reference_sample_ids"]))
     all_outputs: list[Path] = []
     combine_recomb_mosaic = bool(
-        want_recomb and want_mosaic and data.get("recomb_windows") and data.get("pop_mosaics")
+        not args.paper_style
+        and want_recomb
+        and want_mosaic
+        and data.get("recomb_windows")
+        and data.get("pop_mosaics")
     )
     recomb_ctx: Optional[dict[str, Any]] = None
 
@@ -1605,31 +2005,57 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             task.complete("Generating founder contribution outputs ...Finished")
 
     if want_mosaic:
-        mosaic_status = (
-            "Rendering aligned recombination + chromosome mosaic figure..."
-            if combine_recomb_mosaic
-            else "Rendering chromosome mosaic paintings..."
-        )
-        with CliStatus(mosaic_status, enabled=use_spinner) as task:
-            try:
-                all_outputs.extend(
-                    _run_mosaic_outputs(
-                        data=data,
-                        out_prefix=out_prefix,
-                        fmt=args.fmt,
-                        dpi=args.dpi,
-                        parent_colors=parent_colors,
-                        per_chrom_mosaic=bool(args.per_chrom_mosaic or len(mosaic_chroms) > 0),
-                        logger=logger,
-                        recomb_ctx=recomb_ctx if combine_recomb_mosaic else None,
-                        ext_map=ext_map,
-                        generations=args.generations,
+        if args.paper_style:
+            order_override = None
+            if args.paper_parent_order:
+                order_path = Path(str(args.paper_parent_order)).expanduser()
+                if not order_path.is_file():
+                    raise FileNotFoundError(f"Paper parent order file not found: {args.paper_parent_order}")
+                order_override = _read_paper_parent_order_file(order_path)
+            with CliStatus("Rendering Fig. S5 paper-style mosaic...", enabled=use_spinner) as task:
+                try:
+                    all_outputs.extend(
+                        _run_paper_mosaic_outputs(
+                            data=data,
+                            out_prefix=out_prefix,
+                            fmt=args.fmt,
+                            dpi=args.dpi,
+                            parent_colors=parent_colors,
+                            paper_samples=paper_zoom_samples or mosaic_samples or None,
+                            parent_order_override=order_override,
+                            logger=logger,
+                        )
                     )
-                )
-            except Exception:
-                task.fail("Rendering chromosome mosaic paintings ...Failed")
-                raise
-            task.complete("Rendering chromosome mosaic paintings ...Finished")
+                except Exception:
+                    task.fail("Rendering Fig. S5 paper-style mosaic ...Failed")
+                    raise
+                task.complete("Rendering Fig. S5 paper-style mosaic ...Finished")
+        else:
+            mosaic_status = (
+                "Rendering aligned recombination + chromosome mosaic figure..."
+                if combine_recomb_mosaic
+                else "Rendering chromosome mosaic paintings..."
+            )
+            with CliStatus(mosaic_status, enabled=use_spinner) as task:
+                try:
+                    all_outputs.extend(
+                        _run_mosaic_outputs(
+                            data=data,
+                            out_prefix=out_prefix,
+                            fmt=args.fmt,
+                            dpi=args.dpi,
+                            parent_colors=parent_colors,
+                            per_chrom_mosaic=bool(args.per_chrom_mosaic or len(mosaic_chroms) > 0),
+                            logger=logger,
+                            recomb_ctx=recomb_ctx if combine_recomb_mosaic else None,
+                            ext_map=ext_map,
+                            generations=args.generations,
+                        )
+                    )
+                except Exception:
+                    task.fail("Rendering chromosome mosaic paintings ...Failed")
+                    raise
+                task.complete("Rendering chromosome mosaic paintings ...Finished")
 
     elapsed = time.perf_counter() - t0
     log_success(

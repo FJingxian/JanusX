@@ -166,6 +166,8 @@ pub struct PostIbdResult {
     pub total_haplotype_tracks: usize,
     pub chrom_names: Vec<String>,
     pub chrom_lengths_bp: Vec<u64>,
+    #[serde(default)]
+    pub target_sample_ids: Vec<String>,
     pub reference_sample_ids: Vec<String>,
     #[serde(default)]
     pub grouped_parents: bool,
@@ -328,6 +330,7 @@ pub fn extract_post_ibd_from_archive(
         total_haplotype_tracks,
         chrom_names: archive.chrom_names.clone(),
         chrom_lengths_bp,
+        target_sample_ids: archive.target_sample_ids.clone(),
         reference_sample_ids: group_names,
         grouped_parents,
         recomb_windows,

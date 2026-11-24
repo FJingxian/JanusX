@@ -209,9 +209,17 @@ def _output_prefix(value: Path) -> Path:
     return path
 
 
-def _resolve_mode(requested_mode: str, reference: Path | None) -> str:
+def _resolve_mode(
+    requested_mode: str, reference: Path | None, ancestry_model: str = "viterbi"
+) -> str:
     mode = str(requested_mode).strip().lower()
+    model = str(ancestry_model).strip().lower()
     if mode == "pairwise":
+        if model == "mott":
+            raise ValueError(
+                "--ancestry-model mott cannot be used with --mode pairwise; "
+                "use --mode ancestry (or omit --mode) with -ref/--reference"
+            )
         if reference is not None:
             raise ValueError(
                 "-ref/--reference cannot be used with --mode pairwise; "
@@ -222,6 +230,8 @@ def _resolve_mode(requested_mode: str, reference: Path | None) -> str:
         if reference is None:
             raise ValueError("--mode ancestry requires -ref/--reference")
         return "ancestry"
+    if model == "mott" and reference is None:
+        raise ValueError("--ancestry-model mott requires -ref/--reference")
     return "ancestry" if reference is not None else "pairwise"
 
 
@@ -259,6 +269,19 @@ def _validate_parameters(args: argparse.Namespace) -> None:
         raise ValueError("--ancestry-switch-penalty must be a finite positive number")
     if args.ancestry_top_donors < 1:
         raise ValueError("--ancestry-top-donors must be a positive integer")
+    if str(args.ancestry_model).strip().lower() == "mott":
+        if not math.isfinite(args.mott_generations) or args.mott_generations <= 0.0:
+            raise ValueError("--mott-generations must be a finite positive number")
+        if not math.isfinite(args.mott_parent_match_prob) or not (
+            0.0 < args.mott_parent_match_prob < 1.0
+        ):
+            raise ValueError("--mott-parent-match-prob must be in (0, 1)")
+        if not math.isfinite(args.mott_map_scale_cm) or args.mott_map_scale_cm <= 0.0:
+            raise ValueError("--mott-map-scale-cm must be a finite positive number")
+        if not math.isfinite(args.mott_unknown_fold) or args.mott_unknown_fold <= 0.0:
+            raise ValueError("--mott-unknown-fold must be a finite positive number")
+        if args.mott_max_markers_per_chrom < 0:
+            raise ValueError("--mott-max-markers-per-chrom must be a nonnegative integer")
 
 
 def build_parser(argv: Sequence[str] | None = None) -> CliArgumentParser:
@@ -446,6 +469,71 @@ def build_parser(argv: Sequence[str] | None = None) -> CliArgumentParser:
         default=64,
         help=help_text(
             "Maximum candidate reference haplotypes scored per target haplotype (default: %(default)s).",
+            advanced=True,
+        ),
+    )
+
+    mott_group = parser.add_argument_group("Ancestry Model Arguments")
+    mott_group.add_argument(
+        "--ancestry-model",
+        choices=("viterbi", "mott"),
+        default="viterbi",
+        help=(
+            "Multi-parent ancestry inference model: 'viterbi' (default PBWT/Viterbi) "
+            "or 'mott' (author-compatible CUBIC Mott HMM) (default: %(default)s)."
+        ),
+    )
+    mott_group.add_argument(
+        "--mott-generations",
+        type=float,
+        default=9.0,
+        help=help_text(
+            "Effective generations G for Mott HMM transitions (default: %(default)s).",
+            advanced=True,
+        ),
+    )
+    mott_group.add_argument(
+        "--mott-parent-match-prob",
+        type=float,
+        default=0.97,
+        help=help_text(
+            "Founder match emission probability p1 for Mott HMM (default: %(default)s).",
+            advanced=True,
+        ),
+    )
+    mott_group.add_argument(
+        "--mott-map-scale-cm",
+        type=float,
+        default=50.0,
+        help=help_text(
+            "Genetic map scale denominator in cM for Mott HMM lambda (default: %(default)s).",
+            advanced=True,
+        ),
+    )
+    mott_group.add_argument(
+        "--mott-unknown-fold",
+        type=float,
+        default=2.0,
+        help=help_text(
+            "Strict unknown threshold multiplier: max_f P(s,f) > fold / K (default: %(default)s).",
+            advanced=True,
+        ),
+    )
+    mott_group.add_argument(
+        "--mott-max-markers-per-chrom",
+        type=int,
+        default=0,
+        help=help_text(
+            "Deterministic per-chromosome informative marker cap for Mott HMM; 0 keeps all (default: %(default)s).",
+            advanced=True,
+        ),
+    )
+    mott_group.add_argument(
+        "--mott-write-posterior",
+        action="store_true",
+        default=False,
+        help=help_text(
+            "Write <out>.posterior.tsv for single-sample Mott HMM runs (default: %(default)s).",
             advanced=True,
         ),
     )
@@ -668,7 +756,7 @@ def _estimate_peak_rss_bytes(
         target_rows_bytes + ref_rows_bytes + matrix_bytes + classify_scratch_bytes,
         matrix_bytes + ancestry_transpose_bytes + pbwt_scratch_bytes,
     )
-    calibrated_dynamic = int(dynamic_peak * 1.35)
+    calibrated_dynamic = int(dynamic_peak * 1.55)
     return max(_process_rss_bytes(), 0) + calibrated_dynamic
 
 
@@ -821,7 +909,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         _validate_parameters(args)
         target_kind, target = _selected_target(args)
         reference = _resolve_reference_arg(args.reference)
-        resolved_mode = _resolve_mode(args.mode, reference)
+        resolved_mode = _resolve_mode(args.mode, reference, args.ancestry_model)
         from ._common.outprefix import validate_output_prefix_arg
 
         args.out = validate_output_prefix_arg(str(args.out), auto_prefix="ibd")
@@ -915,6 +1003,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "max_gap_cm": float(args.max_gap_cm),
         "max_mismatch_rate": float(args.max_mismatch_rate),
         "min_markers": int(args.min_markers),
+        "ancestry_model": str(args.ancestry_model),
         "ancestry_switch_penalty": float(args.ancestry_switch_penalty),
         "ancestry_top_donors": int(args.ancestry_top_donors),
         "ancestry_step_cm": float(args.ancestry_step_cm),
@@ -922,6 +1011,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         "cm_per_mb": float(args.cm_per_mb),
         "write_tsv": bool(args.write_tsv),
     }
+    if str(args.ancestry_model).strip().lower() == "mott":
+        options.update(
+            {
+                "mott_generations": float(args.mott_generations),
+                "mott_parent_match_prob": float(args.mott_parent_match_prob),
+                "mott_map_scale_cm": float(args.mott_map_scale_cm),
+                "mott_unknown_fold": float(args.mott_unknown_fold),
+                "mott_max_markers_per_chrom": int(args.mott_max_markers_per_chrom),
+                "mott_write_posterior": bool(args.mott_write_posterior),
+            }
+        )
 
     inspected_samples: int | None = None
     progress_total: int | None = None
@@ -1012,6 +1112,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     generated_outputs = [Path(str(summary["output_path"]))]
     if summary.get("tsv_path"):
         generated_outputs.append(Path(str(summary["tsv_path"])))
+    if summary.get("posterior_path"):
+        generated_outputs.append(Path(str(summary["posterior_path"])))
 
     report_logger.info("")
     _report_block(report_logger, "Outputs Generated")
@@ -1028,21 +1130,60 @@ def main(argv: Sequence[str] | None = None) -> int:
     _report_kv(report_logger, "Inbred het threshold", float(args.inbred_het_threshold))
     _report_kv(report_logger, "cM per Mb", float(args.cm_per_mb))
     if resolved_mode == "ancestry":
-        _report_kv(report_logger, "Ancestry step cM", float(args.ancestry_step_cm))
-        if int(args.ancestry_step_max_markers) > 0:
+        _report_kv(report_logger, "Ancestry model", str(args.ancestry_model))
+        if str(args.ancestry_model) == "mott":
+            _report_kv(report_logger, "Mott generations", float(args.mott_generations))
             _report_kv(
                 report_logger,
-                "Step max markers",
-                int(args.ancestry_step_max_markers),
+                "Mott parent match",
+                float(args.mott_parent_match_prob),
             )
-        _report_kv(report_logger, "Switch penalty", float(args.ancestry_switch_penalty))
-        _report_kv(report_logger, "Top donors", int(args.ancestry_top_donors))
+            _report_kv(report_logger, "Mott map scale cM", float(args.mott_map_scale_cm))
+            _report_kv(report_logger, "Mott unknown fold", float(args.mott_unknown_fold))
+            _report_kv(
+                report_logger,
+                "Mott max markers",
+                int(args.mott_max_markers_per_chrom),
+            )
+            _report_kv(
+                report_logger,
+                "Mott posterior TSV",
+                "Yes" if bool(args.mott_write_posterior) else "No",
+            )
+        else:
+            _report_kv(report_logger, "Ancestry step cM", float(args.ancestry_step_cm))
+            if int(args.ancestry_step_max_markers) > 0:
+                _report_kv(
+                    report_logger,
+                    "Step max markers",
+                    int(args.ancestry_step_max_markers),
+                )
+            _report_kv(report_logger, "Switch penalty", float(args.ancestry_switch_penalty))
+            _report_kv(report_logger, "Top donors", int(args.ancestry_top_donors))
     report_logger.info("")
     _report_block(report_logger, "Execution Summary")
     _report_kv(report_logger, "Status", "done")
     _report_kv(report_logger, "Mode", str(summary["mode"]))
     _report_kv(report_logger, "Chromosomes", f"{int(summary['chromosomes']):,}")
     _report_kv(report_logger, "Markers analyzed", f"{int(summary['markers_processed']):,}")
+    if resolved_mode == "ancestry":
+        exact_n = int(summary.get("aligned_exact_markers", 0))
+        swapped_n = int(summary.get("aligned_swapped_markers", 0))
+        incompat_n = int(summary.get("aligned_incompatible_markers", 0))
+        if exact_n or swapped_n or incompat_n:
+            _report_kv(
+                report_logger,
+                "Aligned markers",
+                f"exact={exact_n:,}, swapped={swapped_n:,}, incompatible={incompat_n:,}",
+            )
+        if str(args.ancestry_model) == "mott":
+            info_n = int(summary.get("mott_informative_markers", 0))
+            sel_n = int(summary.get("mott_selected_markers", 0))
+            _report_kv(
+                report_logger,
+                "Mott marker pool",
+                f"informative={info_n:,}, selected={sel_n:,}",
+            )
     _report_kv(
         report_logger,
         "Target samples",

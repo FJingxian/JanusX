@@ -646,11 +646,15 @@ def _estimate_peak_rss_bytes(
     classify_scratch_bytes = classify_base_bytes + het_event_bytes + ps_event_bytes
 
     pbwt_scratch_bytes = n_threads * total_haps * 32 + m_max * 32
+    # Ancestry mode transposes `joint_matrix` into 64-bit haplotype-major words during Viterbi.
+    ancestry_transpose_bytes = (
+        total_haps * ((m_max + 63) // 64) * 16 if n_ref > 0 else 0
+    )
 
     # Calibrate dynamic peak for allocator/reader overhead (similar to imp.py).
     dynamic_peak = max(
         target_rows_bytes + ref_rows_bytes + matrix_bytes + classify_scratch_bytes,
-        matrix_bytes + pbwt_scratch_bytes,
+        matrix_bytes + ancestry_transpose_bytes + pbwt_scratch_bytes,
     )
     calibrated_dynamic = int(dynamic_peak * 1.35)
     return max(_process_rss_bytes(), 0) + calibrated_dynamic

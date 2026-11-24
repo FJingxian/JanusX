@@ -1171,6 +1171,77 @@ fn align_chromosome_row_indices(
     ref_rows: &[VariantRow],
     tgt_rows: &[VariantRow],
 ) -> Vec<(usize, usize)> {
+    if ref_rows.is_empty() || tgt_rows.is_empty() {
+        return Vec::new();
+    }
+    let ref_sorted = ref_rows.par_windows(2).all(|w| w[0].meta.pos <= w[1].meta.pos);
+    let tgt_sorted = tgt_rows.par_windows(2).all(|w| w[0].meta.pos <= w[1].meta.pos);
+    if ref_sorted && tgt_sorted {
+        let mut aligned = Vec::with_capacity(ref_rows.len().min(tgt_rows.len()));
+        let mut ri = 0usize;
+        let mut ti = 0usize;
+        while ri < ref_rows.len() && ti < tgt_rows.len() {
+            let rpos = ref_rows[ri].meta.pos;
+            let tpos = tgt_rows[ti].meta.pos;
+            if rpos < tpos {
+                ri += 1;
+            } else if rpos > tpos {
+                ti += 1;
+            } else {
+                let mut r_end = ri + 1;
+                while r_end < ref_rows.len() && ref_rows[r_end].meta.pos == rpos {
+                    r_end += 1;
+                }
+                let mut t_end = ti + 1;
+                while t_end < tgt_rows.len() && tgt_rows[t_end].meta.pos == tpos {
+                    t_end += 1;
+                }
+                if r_end == ri + 1 && t_end == ti + 1 {
+                    let rrow = &ref_rows[ri];
+                    let trow = &tgt_rows[ti];
+                    let r_alt0 = rrow.meta.alt_alleles.first().map(String::as_str).unwrap_or("");
+                    let t_alt0 = trow.meta.alt_alleles.first().map(String::as_str).unwrap_or("");
+                    if rrow.meta.ref_allele == trow.meta.ref_allele && r_alt0 == t_alt0 {
+                        aligned.push((ri, ti));
+                    }
+                } else if (r_end - ri).saturating_mul(t_end - ti) > 64 {
+                    let mut local_ref: HashMap<(&str, &str), usize> =
+                        HashMap::with_capacity(r_end - ri);
+                    for ridx in ri..r_end {
+                        let rrow = &ref_rows[ridx];
+                        let r_alt0 = rrow.meta.alt_alleles.first().map(String::as_str).unwrap_or("");
+                        local_ref.insert((rrow.meta.ref_allele.as_str(), r_alt0), ridx);
+                    }
+                    for tidx in ti..t_end {
+                        let trow = &tgt_rows[tidx];
+                        let t_alt0 = trow.meta.alt_alleles.first().map(String::as_str).unwrap_or("");
+                        if let Some(&ridx) = local_ref.get(&(trow.meta.ref_allele.as_str(), t_alt0)) {
+                            aligned.push((ridx, tidx));
+                        }
+                    }
+                } else {
+                    for tidx in ti..t_end {
+                        let trow = &tgt_rows[tidx];
+                        let t_alt0 = trow.meta.alt_alleles.first().map(String::as_str).unwrap_or("");
+                        // Match HashMap::insert semantics: last matching reference row wins.
+                        for ridx in (ri..r_end).rev() {
+                            let rrow = &ref_rows[ridx];
+                            let r_alt0 =
+                                rrow.meta.alt_alleles.first().map(String::as_str).unwrap_or("");
+                            if rrow.meta.ref_allele == trow.meta.ref_allele && r_alt0 == t_alt0 {
+                                aligned.push((ridx, tidx));
+                                break;
+                            }
+                        }
+                    }
+                }
+                ri = r_end;
+                ti = t_end;
+            }
+        }
+        return aligned;
+    }
+
     let mut ref_index: HashMap<(u64, &str, &str), usize> = HashMap::with_capacity(ref_rows.len());
     for (idx, row) in ref_rows.iter().enumerate() {
         let alt0 = row.meta.alt_alleles.first().map(String::as_str).unwrap_or("");

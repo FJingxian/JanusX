@@ -44,6 +44,154 @@ fn is_cancelled(cancelled: Option<&AtomicBool>) -> bool {
         .unwrap_or(false)
 }
 
+/// In-place 64x64 bit-matrix transpose (Hacker's Delight Fig. 7-2).
+/// Converts 64 marker-major 64-haplotype words into 64 haplotype-major 64-marker words.
+#[inline]
+fn transpose_64x64(a: &mut [u64; 64]) {
+    let mut m: u64 = 0x0000_0000_FFFF_FFFF;
+    let mut j: usize = 32;
+    while j != 0 {
+        let mut k = 0usize;
+        while k < 64 {
+            for i in 0..j {
+                let x = a[k + i];
+                let y = a[k + i + j];
+                let t = ((x >> j) ^ y) & m;
+                a[k + i + j] = y ^ t;
+                a[k + i] = x ^ (t << j);
+            }
+            k += j << 1;
+        }
+        j >>= 1;
+        m ^= m << j;
+    }
+}
+
+/// Haplotype-major 64-bit packed view of `BitHaplotypeMatrix` for O(M / 64)
+/// hardware-POPCNT mismatch counting with sequential L1 cache access.
+struct HaplotypeMajorBits {
+    words_per_hap: usize,
+    allele_words: Vec<u64>,
+    missing_words: Vec<u64>,
+}
+
+impl HaplotypeMajorBits {
+    fn from_matrix(
+        matrix: &BitHaplotypeMatrix,
+        cancelled: Option<&AtomicBool>,
+    ) -> Result<Self, String> {
+        let n_haps = matrix.n_haps;
+        let n_markers = matrix.n_markers;
+        let words_per_hap = n_markers.div_ceil(64);
+        let stride = matrix.words_per_marker;
+        let mut allele_words = vec![0u64; n_haps * words_per_hap];
+        let mut missing_words = vec![0u64; n_haps * words_per_hap];
+
+        if n_haps == 0 || n_markers == 0 || stride == 0 {
+            return Ok(Self {
+                words_per_hap,
+                allele_words,
+                missing_words,
+            });
+        }
+
+        let group_words = 64 * words_per_hap;
+        allele_words
+            .par_chunks_mut(group_words)
+            .zip(missing_words.par_chunks_mut(group_words))
+            .enumerate()
+            .try_for_each(|(hap_word_idx, (out_a, out_m))| -> Result<(), String> {
+                let haps_in_group = (n_haps - hap_word_idx * 64).min(64);
+                let mut block_a = [0u64; 64];
+                let mut block_m = [0u64; 64];
+                for w_idx in 0..words_per_hap {
+                    if (w_idx & 255) == 0 && is_cancelled(cancelled) {
+                        return Err("Interrupted".to_string());
+                    }
+                    let m_start = w_idx * 64;
+                    let m_len = (n_markers - m_start).min(64);
+                    for b in 0..m_len {
+                        let src = (m_start + b) * stride + hap_word_idx;
+                        block_a[b] = matrix.allele_bits[src];
+                        block_m[b] = matrix.missing_bits[src];
+                    }
+                    for b in m_len..64 {
+                        block_a[b] = 0;
+                        block_m[b] = 0;
+                    }
+                    transpose_64x64(&mut block_a);
+                    transpose_64x64(&mut block_m);
+                    for h in 0..haps_in_group {
+                        let dst = h * words_per_hap + w_idx;
+                        out_a[dst] = block_a[h];
+                        out_m[dst] = block_m[h];
+                    }
+                }
+                Ok(())
+            })?;
+
+        Ok(Self {
+            words_per_hap,
+            allele_words,
+            missing_words,
+        })
+    }
+
+    #[inline]
+    fn count_mismatches(
+        &self,
+        hap_a: usize,
+        hap_b: usize,
+        start_marker: usize,
+        end_marker: usize,
+    ) -> (u32, u32) {
+        if start_marker >= end_marker || self.words_per_hap == 0 {
+            return (0, 0);
+        }
+        let base_a = hap_a * self.words_per_hap;
+        let base_b = hap_b * self.words_per_hap;
+        let w_start = start_marker >> 6;
+        let w_end = (end_marker - 1) >> 6;
+        let start_mask = !0u64 << (start_marker & 63);
+        let end_rem = end_marker & 63;
+        let end_mask = if end_rem == 0 {
+            !0u64
+        } else {
+            (1u64 << end_rem) - 1
+        };
+
+        if w_start == w_end {
+            let mask = start_mask & end_mask;
+            let valid = !(self.missing_words[base_a + w_start] | self.missing_words[base_b + w_start])
+                & mask;
+            let mis = ((self.allele_words[base_a + w_start] ^ self.allele_words[base_b + w_start])
+                & valid)
+                .count_ones();
+            return (valid.count_ones(), mis);
+        }
+
+        let all_a = &self.allele_words[base_a..base_a + self.words_per_hap];
+        let all_b = &self.allele_words[base_b..base_b + self.words_per_hap];
+        let miss_a = &self.missing_words[base_a..base_a + self.words_per_hap];
+        let miss_b = &self.missing_words[base_b..base_b + self.words_per_hap];
+
+        let v0 = !(miss_a[w_start] | miss_b[w_start]) & start_mask;
+        let mut comp = v0.count_ones();
+        let mut mis = ((all_a[w_start] ^ all_b[w_start]) & v0).count_ones();
+
+        for w in (w_start + 1)..w_end {
+            let valid = !(miss_a[w] | miss_b[w]);
+            comp += valid.count_ones();
+            mis += ((all_a[w] ^ all_b[w]) & valid).count_ones();
+        }
+
+        let ve = !(miss_a[w_end] | miss_b[w_end]) & end_mask;
+        comp += ve.count_ones();
+        mis += ((all_a[w_end] ^ all_b[w_end]) & ve).count_ones();
+        (comp, mis)
+    }
+}
+
 pub fn paint_chromosome_ancestry(
     joint_matrix: &BitHaplotypeMatrix,
     ref_layout: &SampleHaplotypeLayout,
@@ -188,6 +336,10 @@ pub fn paint_chromosome_ancestry_cancellable(
     };
 
     // Step 3: Parallel step-level Viterbi mosaic decoding per target haplotype.
+    // Transpose `joint_matrix` once in parallel into 64-bit haplotype-major words
+    // so emission mismatch counts run at 64 markers per hardware POPCNT instruction
+    // with sequential L1 cache access.
+    let hap_major = HaplotypeMajorBits::from_matrix(joint_matrix, cancelled)?;
     // Log-likelihood ratio scores relative to uncalled random background (p=0.5, err≈0.005):
     //   match ≈ ln(0.995 / 0.5) ≈ 0.7, mismatch ≈ -ln(0.005 / 0.5) ≈ -4.5.
     let mismatch_penalty: f32 = 4.5;
@@ -238,7 +390,7 @@ pub fn paint_chromosome_ancestry_cancellable(
                 let mut curr_has_obs = false;
                 for (c_idx, &ref_col) in candidates.iter().enumerate() {
                     let (comp, mis) =
-                        joint_matrix.count_mismatches(tgt_col, ref_col, m_start, m_end);
+                        hap_major.count_mismatches(tgt_col, ref_col, m_start, m_end);
                     step_comparable[row_off + c_idx] = comp;
                     if comp > 0 {
                         curr_has_obs = true;
@@ -468,6 +620,8 @@ pub fn paint_chromosome_ancestry_cancellable(
         })
         .collect();
     let segments: Vec<AncestrySegment> = per_hap_segments?.into_iter().flatten().collect();
+    // Release the transposed haplotype-major bitplane before allocating sparse bins.
+    drop(hap_major);
 
     if is_cancelled(cancelled) {
         return Err("Interrupted".to_string());
@@ -885,5 +1039,42 @@ mod tests {
         assert_eq!(segs[0].parent_sample, (n_parents - 1) as u32);
         assert_eq!(segs[0].n_markers, n_markers as u32);
         assert_eq!(bins.bin_starts_bp.len(), 1);
+    }
+
+    #[test]
+    fn haplotype_major_popcnt_matches_marker_major_across_all_ranges() {
+        let n_haps = 131usize; // non-multiple of 64
+        let n_markers = 263usize; // non-multiple of 64
+        let mut matrix = BitHaplotypeMatrix::new(n_haps, n_markers);
+        for m in 0..n_markers {
+            for h in 0..n_haps {
+                let v = match (m * 17 + h * 31) % 11 {
+                    0 => None,
+                    1..=5 => Some(0),
+                    _ => Some(1),
+                };
+                matrix.set_allele(m, h, v);
+            }
+        }
+        let hap_major = super::HaplotypeMajorBits::from_matrix(&matrix, None).unwrap();
+        let ranges = [
+            (0, 1),
+            (0, 64),
+            (0, 65),
+            (13, 47),
+            (60, 70),
+            (63, 193),
+            (128, 263),
+            (0, n_markers),
+        ];
+        for &(s, e) in &ranges {
+            for (ha, hb) in [(0, 1), (0, 63), (63, 64), (64, 130), (129, 130)] {
+                assert_eq!(
+                    hap_major.count_mismatches(ha, hb, s, e),
+                    matrix.count_mismatches(ha, hb, s, e),
+                    "mismatch for haps ({ha}, {hb}) range [{s}, {e})"
+                );
+            }
+        }
     }
 }

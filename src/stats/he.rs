@@ -3,7 +3,7 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use rayon::prelude::*;
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::bedmath::{
@@ -16,6 +16,7 @@ use crate::blas::{
 use crate::gload::WindowedBedMatrix;
 use crate::linalg::{cholesky_inplace, cholesky_solve_into};
 use crate::packed::bed_packed_row_flip_mask;
+use crate::pipeline::run_double_buffer;
 use crate::stats_common::{env_truthy, get_cached_pool, map_err_string_to_py, parse_index_vec_i64};
 
 pub const HE_BOUNDARY_INTERIOR: u8 = 0;
@@ -157,14 +158,15 @@ fn he_stream_window_mb(
     bytes_per_snp: usize,
     mmap_window_mb: Option<usize>,
 ) -> usize {
-    if let Some(v) = mmap_window_mb {
-        return v.max(1);
-    }
     let need_bytes = block_rows
         .max(1)
         .saturating_mul(bytes_per_snp.max(1))
         .max(1);
-    need_bytes.div_ceil(1024 * 1024).max(1)
+    let need_mb = need_bytes.div_ceil(1024 * 1024).max(1);
+    mmap_window_mb
+        .map(|v| v.max(need_mb))
+        .unwrap_or(need_mb)
+        .max(1)
 }
 
 fn emit_he_stage_timing(
@@ -1666,6 +1668,57 @@ fn he_add_slice_f32(dst: &mut [f32], src: &[f32]) {
     }
 }
 
+const HE_FUSED_2BIT_TARGET_CHUNK_BYTES: usize = 32 * 1024 * 1024;
+
+#[inline]
+fn he_fused_2bit_packed_row_step(base_block_rows: usize, bytes_per_snp: usize, m: usize) -> usize {
+    let base = base_block_rows.clamp(1, 512).min(m.max(1));
+    let total_bytes = m.saturating_mul(bytes_per_snp.max(1));
+    if total_bytes <= HE_FUSED_2BIT_TARGET_CHUNK_BYTES.saturating_mul(2) {
+        return base;
+    }
+    let target_rows = (HE_FUSED_2BIT_TARGET_CHUNK_BYTES / bytes_per_snp.max(1)).clamp(1, 4096);
+    base.max(target_rows).min(m.max(1)).max(1)
+}
+
+#[inline]
+fn he_fused_2bit_bounded_chunk_end(
+    st: usize,
+    m: usize,
+    row_step: usize,
+    bytes_per_snp: usize,
+    row_source_indices: Option<&[usize]>,
+) -> usize {
+    let ed = st.saturating_add(row_step.max(1)).min(m);
+    if let Some(indices) = row_source_indices {
+        let cur_rows = ed.saturating_sub(st);
+        if cur_rows > 1 {
+            let src_start = indices[st];
+            let src_end = indices[ed - 1].saturating_add(1);
+            if src_end > src_start {
+                let span = src_end - src_start;
+                let max_span_bytes = HE_FUSED_2BIT_TARGET_CHUNK_BYTES.saturating_mul(2);
+                let max_span_rows = (max_span_bytes / bytes_per_snp.max(1)).max(row_step.max(1));
+                if span <= cur_rows.saturating_mul(8) && span > max_span_rows {
+                    let limit = src_start.saturating_add(max_span_rows);
+                    let keep = indices[st..ed].partition_point(|&r| r < limit).max(1);
+                    return st + keep;
+                }
+            }
+        }
+    }
+    ed
+}
+
+struct HePackedChunkBuffer {
+    row_start: usize,
+    row_end: usize,
+    io_secs: f64,
+    packed: Vec<u8>,
+    rel_indices: Vec<usize>,
+    has_rel_indices: bool,
+}
+
 /// Two-phase 2-bit fused GRM matmul `out = (1 / m_scale) * W^T (W R)` with
 /// majority-allele skipping (`0x00` for unflipped rows, `0xFF` for flipped
 /// rows). Eliminates `f32` decoded block allocation and per-thread `out`
@@ -1770,7 +1823,7 @@ fn apply_grm_to_mat_f32_fused_2bit_from_source(
         (Vec::new(), Vec::new())
     };
 
-    let row_step = block_rows.clamp(1, 512).min(m.max(1));
+    let row_step = he_fused_2bit_packed_row_step(block_rows, bps, m);
     let n_threads = pool
         .map(|tp| tp.current_num_threads().max(1))
         .unwrap_or(1usize);
@@ -1781,38 +1834,13 @@ fn apply_grm_to_mat_f32_fused_2bit_from_source(
     let mut decode_acc = 0.0_f64;
     let mut xmul_acc = 0.0_f64;
     let mut xtmul_acc = 0.0_f64;
-    let mut rel_indices = Vec::<usize>::with_capacity(row_step);
-    let mut source_rows_tmp = Vec::<usize>::with_capacity(row_step);
+    let use_double_buffer = matches!(source, HeGrmSource::Windowed { .. }) && m > row_step;
 
-    for st in (0..m).step_by(row_step) {
-        let ed = (st + row_step).min(m);
-        let cur_rows = ed - st;
-        let t_io = Instant::now();
-        let (packed_slice, rel_map, base_offset): (&[u8], Option<&[usize]>, usize) = match source {
-            HeGrmSource::Resident { packed_flat, .. } => {
-                if let Some(indices) = row_source_indices {
-                    (*packed_flat, Some(&indices[st..ed]), 0usize)
-                } else {
-                    (*packed_flat, None, st)
-                }
-            }
-            HeGrmSource::Windowed { matrix, .. } => {
-                if let Some(indices) = row_source_indices {
-                    rel_indices.clear();
-                    let slice = matrix.prepare_source_rows(&indices[st..ed], &mut rel_indices)?;
-                    (slice, Some(rel_indices.as_slice()), 0usize)
-                } else {
-                    source_rows_tmp.clear();
-                    source_rows_tmp.extend(st..ed);
-                    rel_indices.clear();
-                    let src_rows = source_rows_tmp.as_slice();
-                    let slice = matrix.prepare_source_rows(src_rows, &mut rel_indices)?;
-                    (slice, Some(rel_indices.as_slice()), 0usize)
-                }
-            }
-        };
-        decode_acc += t_io.elapsed().as_secs_f64();
-
+    let mut process_chunk = |st: usize,
+                             cur_rows: usize,
+                             packed_slice: &[u8],
+                             rel_map: Option<&[usize]>,
+                             base_offset: usize| {
         // Phase 1: parallel over SNPs in this block -> compute tmp (cur_rows x n_rhs).
         let t_p1 = Instant::now();
         let tmp_slice = &mut tmp[..cur_rows * n_rhs];
@@ -2009,6 +2037,133 @@ fn apply_grm_to_mat_f32_fused_2bit_from_source(
             }
         }
         xtmul_acc += t_p2.elapsed().as_secs_f64();
+    };
+
+    if use_double_buffer {
+        let mut next_row = 0usize;
+        let producer_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let producer_err_bg = Arc::clone(&producer_err);
+        let init_cap = row_step.saturating_mul(bps);
+        run_double_buffer(
+            2usize,
+            || HePackedChunkBuffer {
+                row_start: 0,
+                row_end: 0,
+                io_secs: 0.0,
+                packed: Vec::with_capacity(init_cap),
+                rel_indices: Vec::with_capacity(row_step),
+                has_rel_indices: false,
+            },
+            |buf| {
+                if next_row >= m {
+                    return false;
+                }
+                let st = next_row;
+                let ed = he_fused_2bit_bounded_chunk_end(st, m, row_step, bps, row_source_indices);
+                buf.row_start = st;
+                buf.row_end = ed;
+                let t_io = Instant::now();
+                let res = match source {
+                    HeGrmSource::Windowed { matrix, .. } => {
+                        if let Some(indices) = row_source_indices {
+                            buf.rel_indices.clear();
+                            buf.has_rel_indices = true;
+                            matrix.prepare_source_rows(&indices[st..ed], &mut buf.rel_indices)
+                        } else {
+                            buf.has_rel_indices = false;
+                            matrix.read_source_range(st, ed)
+                        }
+                    }
+                    HeGrmSource::Resident { .. } => unreachable!(),
+                };
+                match res {
+                    Ok(slice) => {
+                        let cur_rows = ed - st;
+                        let need_bytes = cur_rows.saturating_mul(bps);
+                        buf.packed.clear();
+                        if buf.has_rel_indices && slice.len() > need_bytes {
+                            buf.packed.reserve(need_bytes);
+                            for &rel_r in &buf.rel_indices {
+                                let off = rel_r * bps;
+                                buf.packed.extend_from_slice(&slice[off..off + bps]);
+                            }
+                            buf.has_rel_indices = false;
+                        } else {
+                            buf.packed.extend_from_slice(slice);
+                        }
+                    }
+                    Err(err) => {
+                        if let Ok(mut slot) = producer_err_bg.lock() {
+                            *slot = Some(err);
+                        }
+                        buf.row_end = buf.row_start;
+                        next_row = m;
+                        return false;
+                    }
+                }
+                buf.io_secs = t_io.elapsed().as_secs_f64();
+                next_row = ed;
+                next_row < m
+            },
+            |buf| {
+                if let Ok(slot) = producer_err.lock() {
+                    if let Some(err) = slot.as_ref() {
+                        return Err(err.clone());
+                    }
+                }
+                let cur_rows = buf.row_end.saturating_sub(buf.row_start);
+                if cur_rows == 0 {
+                    return Ok(());
+                }
+                decode_acc += buf.io_secs;
+                let rel_map = if buf.has_rel_indices {
+                    Some(buf.rel_indices.as_slice())
+                } else {
+                    None
+                };
+                process_chunk(buf.row_start, cur_rows, buf.packed.as_slice(), rel_map, 0);
+                Ok::<(), String>(())
+            },
+        )?;
+        let final_err = producer_err.lock().ok().and_then(|slot| slot.clone());
+        if let Some(err) = final_err {
+            return Err(err);
+        }
+    } else {
+        let mut rel_indices = Vec::<usize>::with_capacity(row_step);
+        let mut source_rows_tmp = Vec::<usize>::with_capacity(row_step);
+        for st in (0..m).step_by(row_step) {
+            let ed = (st + row_step).min(m);
+            let cur_rows = ed - st;
+            let t_io = Instant::now();
+            let (packed_slice, rel_map, base_offset): (&[u8], Option<&[usize]>, usize) =
+                match source {
+                    HeGrmSource::Resident { packed_flat, .. } => {
+                        if let Some(indices) = row_source_indices {
+                            (*packed_flat, Some(&indices[st..ed]), 0usize)
+                        } else {
+                            (*packed_flat, None, st)
+                        }
+                    }
+                    HeGrmSource::Windowed { matrix, .. } => {
+                        if let Some(indices) = row_source_indices {
+                            rel_indices.clear();
+                            let src_rows = &indices[st..ed];
+                            let slice = matrix.prepare_source_rows(src_rows, &mut rel_indices)?;
+                            (slice, Some(rel_indices.as_slice()), 0usize)
+                        } else {
+                            source_rows_tmp.clear();
+                            source_rows_tmp.extend(st..ed);
+                            rel_indices.clear();
+                            let src_rows = source_rows_tmp.as_slice();
+                            let slice = matrix.prepare_source_rows(src_rows, &mut rel_indices)?;
+                            (slice, Some(rel_indices.as_slice()), 0usize)
+                        }
+                    }
+                };
+            decode_acc += t_io.elapsed().as_secs_f64();
+            process_chunk(st, cur_rows, packed_slice, rel_map, base_offset);
+        }
     }
 
     let inv_m = 1.0_f32 / m_scale.max(1.0_f32);
@@ -2302,7 +2457,12 @@ pub(crate) fn he_variance_components_meta_stream_with_covariates(
         return Err("No samples found in BED input.".to_string());
     }
     let bytes_per_snp = n_samples.div_ceil(4);
-    let window_mb = he_stream_window_mb(block_rows, bytes_per_snp, mmap_window_mb);
+    let window_rows = if he_fused_2bit_enabled() {
+        he_fused_2bit_packed_row_step(block_rows, bytes_per_snp, row_source_indices.len())
+    } else {
+        block_rows
+    };
+    let window_mb = he_stream_window_mb(window_rows, bytes_per_snp, mmap_window_mb);
     let matrix = WindowedBedMatrix::open(prefix, window_mb)?;
     let mut source = HeGrmSource::Windowed {
         matrix,
@@ -3905,5 +4065,123 @@ mod tests {
         assert!((res_fused.sigma_g2 - res_block.sigma_g2).abs() < 1e-4);
         assert!((res_fused.sigma_e2 - res_block.sigma_e2).abs() < 1e-4);
         assert!((res_fused.h2 - res_block.h2).abs() < 1e-4);
+    }
+
+    #[test]
+    fn he_fused_2bit_chunk_step_window_mb_and_sparse_span_bounds() {
+        // Below 64 MiB total packed size: keep base_block_rows (clamped to 512).
+        assert_eq!(he_fused_2bit_packed_row_step(256, 12_500, 4_000), 256);
+        assert_eq!(he_fused_2bit_packed_row_step(1024, 12_500, 4_000), 512);
+        // 50k samples (12,500 B/SNP) x 500k SNPs (~5.9 GiB): ~32 MiB chunk (~2684 SNPs).
+        let step_50k = he_fused_2bit_packed_row_step(256, 12_500, 500_000);
+        assert_eq!(step_50k, 2684);
+        // Small bytes_per_snp caps at 4096 rows per chunk.
+        assert_eq!(he_fused_2bit_packed_row_step(256, 512, 500_000), 4096);
+
+        // Window MB must never shrink below required chunk bytes even with explicit override.
+        let need_mb = he_stream_window_mb(step_50k, 12_500, None);
+        assert_eq!(need_mb, 32);
+        assert_eq!(he_stream_window_mb(step_50k, 12_500, Some(8)), 32);
+        assert_eq!(he_stream_window_mb(step_50k, 12_500, Some(64)), 64);
+
+        // Dense indices: full row_step preserved.
+        let dense: Vec<usize> = (0..10_000).collect();
+        assert_eq!(
+            he_fused_2bit_bounded_chunk_end(0, dense.len(), step_50k, 12_500, Some(&dense)),
+            step_50k
+        );
+
+        // 1/8-density sparse indices: shrink chunk so contiguous span stays <= 64 MiB.
+        let sparse_8x: Vec<usize> = (0..10_000).map(|i| i * 8).collect();
+        let ed_8x =
+            he_fused_2bit_bounded_chunk_end(0, sparse_8x.len(), step_50k, 12_500, Some(&sparse_8x));
+        assert!(ed_8x > 0 && ed_8x < step_50k);
+        let span_bytes_8x = (sparse_8x[ed_8x - 1] - sparse_8x[0] + 1) * 12_500;
+        assert!(span_bytes_8x <= HE_FUSED_2BIT_TARGET_CHUNK_BYTES * 2);
+
+        // Very sparse (1/20-density): prepare_source_rows already uses per-row scratch.
+        let sparse_20x: Vec<usize> = (0..10_000).map(|i| i * 20).collect();
+        let ed_20x = he_fused_2bit_bounded_chunk_end(
+            0,
+            sparse_20x.len(),
+            step_50k,
+            12_500,
+            Some(&sparse_20x),
+        );
+        assert_eq!(ed_20x, step_50k);
+    }
+
+    #[test]
+    fn he_fused_2bit_windowed_double_buffer_producer_error_propagates() {
+        let n_samples = 32usize;
+        let m_total = 96usize;
+        let bps = n_samples.div_ceil(4);
+        let packed = vec![0xAAu8; m_total * bps];
+
+        let tag = format!("janusx_he_fused_prod_err_{}", std::process::id());
+        let dir = std::env::temp_dir().join(tag);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let prefix = dir.join("toy");
+        let prefix_str = prefix.to_string_lossy().to_string();
+        let mut fam = String::new();
+        for i in 0..n_samples {
+            fam.push_str(&format!("F{i} I{i} 0 0 0 -9\n"));
+        }
+        std::fs::write(format!("{prefix_str}.fam"), fam).expect("write fam");
+        let mut bim = String::new();
+        for j in 0..m_total {
+            bim.push_str(&format!("1 rs{j} 0 {} A G\n", (j + 1) * 100));
+        }
+        std::fs::write(format!("{prefix_str}.bim"), bim).expect("write bim");
+        let mut bed = Vec::with_capacity(3 + packed.len());
+        bed.extend_from_slice(&[0x6C, 0x1B, 0x01]);
+        bed.extend_from_slice(&packed);
+        let bed_path = format!("{prefix_str}.bed");
+        std::fs::write(&bed_path, &bed).expect("write bed");
+
+        // Open via pread while BED is intact so total_rows() == 96 passes upfront validation.
+        let matrix = WindowedBedMatrix::open_pread(&prefix_str, 1).expect("open pread");
+        // Truncate BED mid-file so chunk 0 succeeds and chunk 1 fails inside async producer.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&bed_path)
+            .expect("open bed for truncate")
+            .set_len((3 + 30 * bps) as u64)
+            .expect("truncate bed");
+
+        let mut src_err = HeGrmSource::Windowed {
+            matrix,
+            bytes_per_snp: bps,
+        };
+        let row_flip = vec![false; m_total];
+        let row_mean = vec![0.5_f32; m_total];
+        let row_inv_sd = vec![1.0_f32; m_total];
+        let sample_idx: Vec<usize> = (0..n_samples).collect();
+        let rhs = vec![1.0_f32; n_samples];
+        let mut out = vec![0.0_f32; n_samples];
+        let err_msg = apply_grm_to_mat_f32_fused_2bit_from_source(
+            &mut src_err,
+            &row_flip,
+            &row_mean,
+            &row_inv_sd,
+            &sample_idx,
+            None,
+            24,
+            &rhs,
+            1,
+            m_total as f32,
+            None,
+            None,
+            None,
+            &mut out,
+        )
+        .expect_err("expected async producer read error");
+        assert!(
+            err_msg.contains("read BED") || err_msg.contains("failed to fill whole buffer"),
+            "unexpected producer error: {err_msg}"
+        );
+        drop(src_err);
+        std::fs::remove_dir_all(dir).expect("remove temp BED dir");
     }
 }

@@ -1665,6 +1665,57 @@ fn build_train_sample_multiplicity(sample_idx: &[usize], padded_n: usize) -> Vec
     mult
 }
 
+const FUSED_2BIT_TARGET_CHUNK_BYTES: usize = 32 * 1024 * 1024;
+
+#[inline]
+fn fused_2bit_packed_row_step(base_block_rows: usize, bytes_per_snp: usize, m: usize) -> usize {
+    let base = base_block_rows.max(1).min(m.max(1));
+    let total_bytes = m.saturating_mul(bytes_per_snp.max(1));
+    if total_bytes <= FUSED_2BIT_TARGET_CHUNK_BYTES.saturating_mul(2) {
+        return base;
+    }
+    let target_rows = (FUSED_2BIT_TARGET_CHUNK_BYTES / bytes_per_snp.max(1)).clamp(1, 16_384);
+    base.max(target_rows).min(m.max(1)).max(1)
+}
+
+#[inline]
+fn fused_2bit_bounded_chunk_end(
+    st: usize,
+    m: usize,
+    row_step: usize,
+    bytes_per_snp: usize,
+    row_source_indices: Option<&[usize]>,
+) -> usize {
+    let ed = st.saturating_add(row_step.max(1)).min(m);
+    if let Some(indices) = row_source_indices {
+        let cur_rows = ed.saturating_sub(st);
+        if cur_rows > 1 {
+            let src_start = indices[st];
+            let src_end = indices[ed - 1].saturating_add(1);
+            if src_end > src_start {
+                let span = src_end - src_start;
+                let max_span_bytes = FUSED_2BIT_TARGET_CHUNK_BYTES.saturating_mul(2);
+                let max_span_rows = (max_span_bytes / bytes_per_snp.max(1)).max(row_step.max(1));
+                if span <= cur_rows.saturating_mul(8) && span > max_span_rows {
+                    let limit = src_start.saturating_add(max_span_rows);
+                    let keep = indices[st..ed].partition_point(|&r| r < limit).max(1);
+                    return st + keep;
+                }
+            }
+        }
+    }
+    ed
+}
+
+struct PackedChunkBuffer {
+    row_start: usize,
+    row_end: usize,
+    io_secs: f64,
+    packed: Vec<u8>,
+    rel_indices: Vec<usize>,
+    has_rel_indices: bool,
+}
+
 struct RrblupDualFusedPcgOperator<'a> {
     source: RrblupPcgSource<'a>,
     bytes_per_snp: usize,
@@ -1768,7 +1819,8 @@ impl PcgOperator<f32> for RrblupDualFusedPcgOperator<'_> {
         let capture_ss = !*self.sum_ss_captured;
         let mut io_acc = 0.0_f64;
         let mut fused_acc = 0.0_f64;
-        let row_step = self.block_rows.max(1).min(self.m.max(1));
+        let m = self.m;
+        let row_step = self.block_rows.max(1).min(m.max(1));
         let bps = self.bytes_per_snp;
         let n_threads = self.u_locals.len().max(1);
         let q_full = self.q_full.as_slice();
@@ -1779,42 +1831,16 @@ impl PcgOperator<f32> for RrblupDualFusedPcgOperator<'_> {
         let packed_row_indices = self.packed_row_indices;
         let pool = self.pool;
         let stage_timing = self.stage_timing;
+        let u_locals = &mut self.u_locals;
+        let ss_locals = &mut self.ss_locals;
+        let use_double_buffer =
+            matches!(self.source, RrblupPcgSource::Windowed { .. }) && m > row_step;
 
-        for row_start in (0..self.m).step_by(row_step) {
-            let cur_rows = (self.m - row_start).min(row_step);
-            let row_end = row_start + cur_rows;
-            let t0 = if stage_timing {
-                Some(Instant::now())
-            } else {
-                None
-            };
-            let (packed_slice, rel_map, base_offset): (&[u8], Option<&[usize]>, usize) =
-                match &mut self.source {
-                    RrblupPcgSource::Resident { packed_flat, .. } => {
-                        if let Some(indices) = packed_row_indices {
-                            (*packed_flat, Some(&indices[row_start..row_end]), 0usize)
-                        } else {
-                            (*packed_flat, None, row_start)
-                        }
-                    }
-                    RrblupPcgSource::Windowed { matrix, .. } => {
-                        if let Some(indices) = packed_row_indices {
-                            self.rel_indices.clear();
-                            let slice = matrix.prepare_source_rows(
-                                &indices[row_start..row_end],
-                                &mut self.rel_indices,
-                            )?;
-                            (slice, Some(self.rel_indices.as_slice()), 0usize)
-                        } else {
-                            let slice = matrix.read_source_range(row_start, row_end)?;
-                            (slice, None, 0usize)
-                        }
-                    }
-                };
-            if let Some(ts) = t0 {
-                io_acc += ts.elapsed().as_secs_f64();
-            }
-
+        let mut process_chunk = |row_start: usize,
+                                 cur_rows: usize,
+                                 packed_slice: &[u8],
+                                 rel_map: Option<&[usize]>,
+                                 base_offset: usize| {
             let t1 = if stage_timing {
                 Some(Instant::now())
             } else {
@@ -1831,7 +1857,9 @@ impl PcgOperator<f32> for RrblupDualFusedPcgOperator<'_> {
                     if inv_sd == 0.0_f32 {
                         continue;
                     }
-                    let src_r = rel_map.map(|m| m[local_r]).unwrap_or(base_offset + local_r);
+                    let src_r = rel_map
+                        .map(|mp| mp[local_r])
+                        .unwrap_or(base_offset + local_r);
                     let row = &packed_slice[src_r * bps..(src_r + 1) * bps];
                     let v_lut = row_2bit_value_lut(row_flip[global_r], row_mean[global_r], inv_sd);
                     if capture_ss {
@@ -1845,19 +1873,153 @@ impl PcgOperator<f32> for RrblupDualFusedPcgOperator<'_> {
             };
             if let Some(tp) = pool.filter(|_| n_threads > 1 && cur_rows > 1) {
                 tp.install(|| {
-                    self.u_locals
+                    u_locals
                         .par_iter_mut()
-                        .zip(self.ss_locals.par_iter_mut())
+                        .zip(ss_locals.par_iter_mut())
                         .enumerate()
                         .for_each(|(tid, (u_local, ss_local))| {
                             run_chunk(tid, u_local.as_mut_slice(), ss_local);
                         });
                 });
             } else {
-                run_chunk(0, self.u_locals[0].as_mut_slice(), &mut self.ss_locals[0]);
+                run_chunk(0, u_locals[0].as_mut_slice(), &mut ss_locals[0]);
             }
             if let Some(ts) = t1 {
                 fused_acc += ts.elapsed().as_secs_f64();
+            }
+        };
+
+        if use_double_buffer {
+            let source = &mut self.source;
+            let mut next_row = 0usize;
+            let producer_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+            let producer_err_bg = Arc::clone(&producer_err);
+            let init_cap = row_step.saturating_mul(bps);
+            run_double_buffer(
+                2usize,
+                || PackedChunkBuffer {
+                    row_start: 0,
+                    row_end: 0,
+                    io_secs: 0.0,
+                    packed: Vec::with_capacity(init_cap),
+                    rel_indices: Vec::with_capacity(row_step),
+                    has_rel_indices: false,
+                },
+                |buf| {
+                    if next_row >= m {
+                        return false;
+                    }
+                    let st = next_row;
+                    let ed = fused_2bit_bounded_chunk_end(st, m, row_step, bps, packed_row_indices);
+                    buf.row_start = st;
+                    buf.row_end = ed;
+                    let t_io = if stage_timing {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
+                    let res = match source {
+                        RrblupPcgSource::Windowed { matrix, .. } => {
+                            if let Some(indices) = packed_row_indices {
+                                buf.rel_indices.clear();
+                                buf.has_rel_indices = true;
+                                matrix.prepare_source_rows(&indices[st..ed], &mut buf.rel_indices)
+                            } else {
+                                buf.has_rel_indices = false;
+                                matrix.read_source_range(st, ed)
+                            }
+                        }
+                        RrblupPcgSource::Resident { .. } => unreachable!(),
+                    };
+                    match res {
+                        Ok(slice) => {
+                            let cur_rows = ed - st;
+                            let need_bytes = cur_rows.saturating_mul(bps);
+                            buf.packed.clear();
+                            if buf.has_rel_indices && slice.len() > need_bytes {
+                                buf.packed.reserve(need_bytes);
+                                for &rel_r in &buf.rel_indices {
+                                    let off = rel_r * bps;
+                                    buf.packed.extend_from_slice(&slice[off..off + bps]);
+                                }
+                                buf.has_rel_indices = false;
+                            } else {
+                                buf.packed.extend_from_slice(slice);
+                            }
+                        }
+                        Err(err) => {
+                            if let Ok(mut slot) = producer_err_bg.lock() {
+                                *slot = Some(err);
+                            }
+                            buf.row_end = buf.row_start;
+                            next_row = m;
+                            return false;
+                        }
+                    }
+                    buf.io_secs = t_io.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+                    next_row = ed;
+                    next_row < m
+                },
+                |buf| {
+                    if let Ok(slot) = producer_err.lock() {
+                        if let Some(err) = slot.as_ref() {
+                            return Err(err.clone());
+                        }
+                    }
+                    let cur_rows = buf.row_end.saturating_sub(buf.row_start);
+                    if cur_rows == 0 {
+                        return Ok(());
+                    }
+                    io_acc += buf.io_secs;
+                    let rel_map = if buf.has_rel_indices {
+                        Some(buf.rel_indices.as_slice())
+                    } else {
+                        None
+                    };
+                    process_chunk(buf.row_start, cur_rows, buf.packed.as_slice(), rel_map, 0);
+                    Ok::<(), String>(())
+                },
+            )?;
+            let final_err = producer_err.lock().ok().and_then(|slot| slot.clone());
+            if let Some(err) = final_err {
+                return Err(err);
+            }
+        } else {
+            for row_start in (0..m).step_by(row_step) {
+                let cur_rows = (m - row_start).min(row_step);
+                let row_end = row_start + cur_rows;
+                let t0 = if stage_timing {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                let (packed_slice, rel_map, base_offset): (&[u8], Option<&[usize]>, usize) =
+                    match &mut self.source {
+                        RrblupPcgSource::Resident { packed_flat, .. } => {
+                            if let Some(indices) = packed_row_indices {
+                                (*packed_flat, Some(&indices[row_start..row_end]), 0usize)
+                            } else {
+                                (*packed_flat, None, row_start)
+                            }
+                        }
+                        RrblupPcgSource::Windowed { matrix, .. } => {
+                            if let Some(indices) = packed_row_indices {
+                                self.rel_indices.clear();
+                                let slice = matrix.prepare_source_rows(
+                                    &indices[row_start..row_end],
+                                    &mut self.rel_indices,
+                                )?;
+                                (slice, Some(self.rel_indices.as_slice()), 0usize)
+                            } else {
+                                let slice = matrix.read_source_range(row_start, row_end)?;
+                                (slice, None, 0usize)
+                            }
+                        }
+                    };
+                if let Some(ts) = t0 {
+                    io_acc += ts.elapsed().as_secs_f64();
+                }
+                process_chunk(row_start, cur_rows, packed_slice, rel_map, base_offset);
             }
         }
 
@@ -1946,31 +2108,14 @@ fn rrblup_dual_recover_beta_and_test_fused(
     let mut dot_locals = vec![0.0_f64; n_threads];
     let mut ss_locals = vec![0.0_f64; n_threads];
     let mut rel_indices = Vec::new();
+    let use_double_buffer = matches!(source, RrblupPcgSource::Windowed { .. }) && m > row_step;
 
-    for row_start in (0..m).step_by(row_step) {
-        let cur_rows = (m - row_start).min(row_step);
+    let mut process_chunk = |row_start: usize,
+                             cur_rows: usize,
+                             packed_slice: &[u8],
+                             rel_map: Option<&[usize]>,
+                             base_offset: usize| {
         let row_end = row_start + cur_rows;
-        let (packed_slice, rel_map, base_offset): (&[u8], Option<&[usize]>, usize) = match source {
-            RrblupPcgSource::Resident { packed_flat, .. } => {
-                if let Some(indices) = packed_row_indices {
-                    (*packed_flat, Some(&indices[row_start..row_end]), 0usize)
-                } else {
-                    (*packed_flat, None, row_start)
-                }
-            }
-            RrblupPcgSource::Windowed { matrix, .. } => {
-                if let Some(indices) = packed_row_indices {
-                    rel_indices.clear();
-                    let slice = matrix
-                        .prepare_source_rows(&indices[row_start..row_end], &mut rel_indices)?;
-                    (slice, Some(rel_indices.as_slice()), 0usize)
-                } else {
-                    let slice = matrix.read_source_range(row_start, row_end)?;
-                    (slice, None, 0usize)
-                }
-            }
-        };
-
         let beta_chunk = &mut beta[row_start..row_end];
         let base = cur_rows / n_threads;
         let rem = cur_rows % n_threads;
@@ -2036,6 +2181,131 @@ fn rrblup_dual_recover_beta_and_test_fused(
             {
                 run_part(lo, part, u_loc.as_mut_slice(), d_loc, s_loc);
             }
+        }
+    };
+
+    if use_double_buffer {
+        let mut next_row = 0usize;
+        let producer_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let producer_err_bg = Arc::clone(&producer_err);
+        let init_cap = row_step.saturating_mul(bytes_per_snp);
+        run_double_buffer(
+            2usize,
+            || PackedChunkBuffer {
+                row_start: 0,
+                row_end: 0,
+                io_secs: 0.0,
+                packed: Vec::with_capacity(init_cap),
+                rel_indices: Vec::with_capacity(row_step),
+                has_rel_indices: false,
+            },
+            |buf| {
+                if next_row >= m {
+                    return false;
+                }
+                let st = next_row;
+                let ed = fused_2bit_bounded_chunk_end(
+                    st,
+                    m,
+                    row_step,
+                    bytes_per_snp,
+                    packed_row_indices,
+                );
+                buf.row_start = st;
+                buf.row_end = ed;
+                let res = match source {
+                    RrblupPcgSource::Windowed { matrix, .. } => {
+                        if let Some(indices) = packed_row_indices {
+                            buf.rel_indices.clear();
+                            buf.has_rel_indices = true;
+                            matrix.prepare_source_rows(&indices[st..ed], &mut buf.rel_indices)
+                        } else {
+                            buf.has_rel_indices = false;
+                            matrix.read_source_range(st, ed)
+                        }
+                    }
+                    RrblupPcgSource::Resident { .. } => unreachable!(),
+                };
+                match res {
+                    Ok(slice) => {
+                        let cur_rows = ed - st;
+                        let need_bytes = cur_rows.saturating_mul(bytes_per_snp);
+                        buf.packed.clear();
+                        if buf.has_rel_indices && slice.len() > need_bytes {
+                            buf.packed.reserve(need_bytes);
+                            for &rel_r in &buf.rel_indices {
+                                let off = rel_r * bytes_per_snp;
+                                buf.packed
+                                    .extend_from_slice(&slice[off..off + bytes_per_snp]);
+                            }
+                            buf.has_rel_indices = false;
+                        } else {
+                            buf.packed.extend_from_slice(slice);
+                        }
+                    }
+                    Err(err) => {
+                        if let Ok(mut slot) = producer_err_bg.lock() {
+                            *slot = Some(err);
+                        }
+                        buf.row_end = buf.row_start;
+                        next_row = m;
+                        return false;
+                    }
+                }
+                next_row = ed;
+                next_row < m
+            },
+            |buf| {
+                if let Ok(slot) = producer_err.lock() {
+                    if let Some(err) = slot.as_ref() {
+                        return Err(err.clone());
+                    }
+                }
+                let cur_rows = buf.row_end.saturating_sub(buf.row_start);
+                if cur_rows == 0 {
+                    return Ok(());
+                }
+                let rel_map = if buf.has_rel_indices {
+                    Some(buf.rel_indices.as_slice())
+                } else {
+                    None
+                };
+                process_chunk(buf.row_start, cur_rows, buf.packed.as_slice(), rel_map, 0);
+                Ok::<(), String>(())
+            },
+        )?;
+        let final_err = producer_err.lock().ok().and_then(|slot| slot.clone());
+        if let Some(err) = final_err {
+            return Err(err);
+        }
+    } else {
+        for row_start in (0..m).step_by(row_step) {
+            let cur_rows = (m - row_start).min(row_step);
+            let row_end = row_start + cur_rows;
+            let (packed_slice, rel_map, base_offset): (&[u8], Option<&[usize]>, usize) =
+                match source {
+                    RrblupPcgSource::Resident { packed_flat, .. } => {
+                        if let Some(indices) = packed_row_indices {
+                            (*packed_flat, Some(&indices[row_start..row_end]), 0usize)
+                        } else {
+                            (*packed_flat, None, row_start)
+                        }
+                    }
+                    RrblupPcgSource::Windowed { matrix, .. } => {
+                        if let Some(indices) = packed_row_indices {
+                            rel_indices.clear();
+                            let slice = matrix.prepare_source_rows(
+                                &indices[row_start..row_end],
+                                &mut rel_indices,
+                            )?;
+                            (slice, Some(rel_indices.as_slice()), 0usize)
+                        } else {
+                            let slice = matrix.read_source_range(row_start, row_end)?;
+                            (slice, None, 0usize)
+                        }
+                    }
+                };
+            process_chunk(row_start, cur_rows, packed_slice, rel_map, base_offset);
         }
     }
 
@@ -5407,12 +5677,17 @@ fn rrblup_pcg_bed_impl<'py>(
                     let resident_packed = resident_packed_flat.as_ref().map(|cow| cow.as_ref());
                     let mut sum_ss_global = 0.0_f64;
                     let mut sum_ss_captured = false;
+                    let dual_row_step = if dual_fused {
+                        fused_2bit_packed_row_step(row_step, bytes_per_snp, m)
+                    } else {
+                        row_step
+                    };
                     let dual_source = build_rrblup_source(
                         resident_packed,
                         bytes_per_snp,
                         prefix.as_str(),
                         n_samples,
-                        row_step,
+                        dual_row_step,
                     )?;
                     let dual_op = if dual_fused {
                         RrblupDualAnyPcgOperator::Fused(RrblupDualFusedPcgOperator::new(
@@ -5425,7 +5700,7 @@ fn rrblup_pcg_bed_impl<'py>(
                             &row_inv_sd,
                             &train_idx,
                             packed_row_indices.as_deref(),
-                            row_step,
+                            dual_row_step,
                             pool_ref,
                             lambda_use,
                             stage_timing,
@@ -5572,7 +5847,7 @@ fn rrblup_pcg_bed_impl<'py>(
                         bytes_per_snp,
                         prefix.as_str(),
                         n_samples,
-                        row_step,
+                        dual_row_step,
                     )?;
                     let (beta, alpha_use, pred_test_ret, sum_ss_rec) = if dual_fused {
                         rrblup_dual_recover_beta_and_test_fused(
@@ -5584,7 +5859,7 @@ fn rrblup_pcg_bed_impl<'py>(
                             &train_idx,
                             &test_idx,
                             packed_row_indices.as_deref(),
-                            row_step,
+                            dual_row_step,
                             &alpha_c,
                             y_mean,
                             !sum_ss_captured,
@@ -8304,5 +8579,37 @@ mod tests {
         // Duplicate test indices must receive identical predictions.
         assert_eq!(pred_te_f[1], pred_te_f[2]);
         assert_eq!(pred_te_f[6], pred_te_f[7]);
+    }
+
+    #[test]
+    fn rrblup_dual_fused_chunk_step_and_sparse_span_bounds() {
+        // Below 64 MiB total packed size: keep base_block_rows.
+        assert_eq!(fused_2bit_packed_row_step(256, 12_500, 4_000), 256);
+        // 50k samples (12,500 B/SNP) x 500k SNPs (~5.9 GiB): ~32 MiB chunk (~2684 SNPs).
+        let step_50k = fused_2bit_packed_row_step(256, 12_500, 500_000);
+        assert_eq!(step_50k, 2684);
+        // Small bytes_per_snp caps at 16,384 rows per chunk.
+        assert_eq!(fused_2bit_packed_row_step(256, 512, 500_000), 16_384);
+
+        // Dense indices: full row_step preserved.
+        let dense: Vec<usize> = (0..10_000).collect();
+        assert_eq!(
+            fused_2bit_bounded_chunk_end(0, dense.len(), step_50k, 12_500, Some(&dense)),
+            step_50k
+        );
+
+        // 1/8-density sparse indices: span would be ~8x (~256 MiB); shrink to <= 64 MiB span.
+        let sparse_8x: Vec<usize> = (0..10_000).map(|i| i * 8).collect();
+        let ed_8x =
+            fused_2bit_bounded_chunk_end(0, sparse_8x.len(), step_50k, 12_500, Some(&sparse_8x));
+        assert!(ed_8x > 0 && ed_8x < step_50k);
+        let span_bytes_8x = (sparse_8x[ed_8x - 1] - sparse_8x[0] + 1) * 12_500;
+        assert!(span_bytes_8x <= FUSED_2BIT_TARGET_CHUNK_BYTES * 2);
+
+        // Very sparse (1/20-density): prepare_source_rows already uses per-row scratch.
+        let sparse_20x: Vec<usize> = (0..10_000).map(|i| i * 20).collect();
+        let ed_20x =
+            fused_2bit_bounded_chunk_end(0, sparse_20x.len(), step_50k, 12_500, Some(&sparse_20x));
+        assert_eq!(ed_20x, step_50k);
     }
 }

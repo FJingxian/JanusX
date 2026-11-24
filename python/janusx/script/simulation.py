@@ -1411,10 +1411,7 @@ def simulate_phenotype_from_genofile(
             het=1.0 if het is None else float(het),
         )
         sample_ids = np.asarray(sample_ids, dtype=str)
-        prefer_plink_source = bool(
-            str(gfile).lower().endswith(".bed")
-            or os.path.exists(f"{gfile}.bed")
-        )
+        prefer_plink_source = detect_existing_plink_kind(str(gfile)) is not None
         grm, _grm_cache_path, _grm_input = _load_or_build_background_grm_auto(
             gfile=str(gfile),
             sample_ids=sample_ids,

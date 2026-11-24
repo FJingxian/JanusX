@@ -605,6 +605,7 @@ pub fn read_fam_founder_indices(prefix: &str) -> Result<Vec<usize>, String> {
         }
         return Ok(founder_indices);
     }
+    let prefix = normalize_genotype_prefix(prefix);
     let fam_path = format!("{prefix}.fam");
     let file = File::open(&fam_path).map_err(|e| format!("{fam_path}: {e}"))?;
     let reader = BufReader::new(file);

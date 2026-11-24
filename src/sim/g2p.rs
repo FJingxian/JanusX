@@ -2206,15 +2206,28 @@ fn term_label(sites: &[SimSiteRecord], members: &[usize], mode: Option<LogicGate
     out
 }
 
-fn normalize_plink_prefix_local(p: &str) -> String {
+fn has_complete_bfile(prefix: &str) -> bool {
+    Path::new(&(prefix.to_string() + ".bed")).is_file()
+        && Path::new(&(prefix.to_string() + ".bim")).is_file()
+        && Path::new(&(prefix.to_string() + ".fam")).is_file()
+}
+
+fn has_complete_pfile(prefix: &str) -> bool {
+    Path::new(&(prefix.to_string() + ".pgen")).is_file()
+        && (Path::new(&(prefix.to_string() + ".pvar")).is_file()
+            || Path::new(&(prefix.to_string() + ".pvar.zst")).is_file())
+        && Path::new(&(prefix.to_string() + ".psam")).is_file()
+}
+
+fn strip_plink_suffix<'a>(p: &'a str, suffixes: &[&str]) -> Option<&'a str> {
     let low = p.to_ascii_lowercase();
-    for ext in [".bed", ".bim", ".fam"] {
+    for ext in suffixes {
         if low.ends_with(ext) {
             let keep = p.len().saturating_sub(ext.len());
-            return p[..keep].to_string();
+            return Some(&p[..keep]);
         }
     }
-    p.to_string()
+    None
 }
 
 fn open_source_reader(
@@ -2244,13 +2257,32 @@ fn open_source_reader(
     {
         return Ok(SourceReader::Txt(TxtSnpIter::new(p, delimiter)?));
     }
-    let prefix = normalize_plink_prefix_local(p);
-    if Path::new(&(prefix.clone() + ".bed")).exists()
-        && Path::new(&(prefix.clone() + ".bim")).exists()
-        && Path::new(&(prefix.clone() + ".fam")).exists()
-    {
+    if let Some(prefix) = strip_plink_suffix(p, &[".pvar.zst", ".pgen", ".pvar", ".psam"]) {
+        if has_complete_pfile(prefix) {
+            let canonical = format!("{prefix}.pgen");
+            return Ok(SourceReader::Bed(BedSnpIter::new_with_fill(
+                &canonical, 0.0, 1.0, false, false, 0.02,
+            )?));
+        }
+    }
+    if let Some(prefix) = strip_plink_suffix(p, &[".bed", ".bim", ".fam"]) {
+        if has_complete_bfile(prefix) {
+            let canonical = format!("{prefix}.bed");
+            return Ok(SourceReader::Bed(BedSnpIter::new_with_fill(
+                &canonical, 0.0, 1.0, false, false, 0.02,
+            )?));
+        }
+    }
+    if has_complete_bfile(p) {
+        let canonical = format!("{p}.bed");
         return Ok(SourceReader::Bed(BedSnpIter::new_with_fill(
-            &prefix, 0.0, 1.0, false, false, 0.02,
+            &canonical, 0.0, 1.0, false, false, 0.02,
+        )?));
+    }
+    if has_complete_pfile(p) {
+        let canonical = format!("{p}.pgen");
+        return Ok(SourceReader::Bed(BedSnpIter::new_with_fill(
+            &canonical, 0.0, 1.0, false, false, 0.02,
         )?));
     }
     if Path::new(&(p.to_string() + ".npy")).exists()
@@ -2262,7 +2294,7 @@ fn open_source_reader(
         return Ok(SourceReader::Txt(TxtSnpIter::new(p, delimiter)?));
     }
     Err(
-        "Unable to infer genotype input type. Provide a VCF/HMP path, a PLINK prefix, or a FILE matrix path/prefix."
+        "Unable to infer genotype input type. Provide a VCF/HMP path, a PLINK BED/PGEN prefix, or a FILE matrix path/prefix."
             .to_string(),
     )
 }
@@ -2309,15 +2341,13 @@ where
 
 #[inline]
 fn is_plink_bed_prefix_available(path_or_prefix: &str) -> Option<String> {
-    let prefix = normalize_plink_prefix_local(path_or_prefix.trim());
+    let trimmed = path_or_prefix.trim();
+    let prefix = strip_plink_suffix(trimmed, &[".bed", ".bim", ".fam"]).unwrap_or(trimmed);
     if prefix.is_empty() {
         return None;
     }
-    if Path::new(&(prefix.clone() + ".bed")).exists()
-        && Path::new(&(prefix.clone() + ".bim")).exists()
-        && Path::new(&(prefix.clone() + ".fam")).exists()
-    {
-        Some(prefix)
+    if has_complete_bfile(prefix) {
+        Some(prefix.to_string())
     } else {
         None
     }

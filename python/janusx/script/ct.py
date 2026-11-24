@@ -12,6 +12,7 @@ from typing import Sequence
 
 import numpy as np
 
+from janusx._plink import normalize_plink_prefix
 from ._common.cli_args import (
     add_common_covariate_file_or_site_arg,
     add_common_grm_file_arg,
@@ -219,8 +220,7 @@ def _unique_ids(ids: Sequence[object], label: str) -> list[str]:
 
 
 def _has_bfile_trio(prefix: str) -> bool:
-    value = str(prefix)
-    base = value[:-4] if value.lower().endswith(".bed") else value
+    base = normalize_plink_prefix(str(prefix))
     return all(Path(f"{base}.{extension}").is_file() for extension in ("bed", "bim", "fam"))
 
 

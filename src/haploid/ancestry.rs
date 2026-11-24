@@ -342,9 +342,14 @@ pub fn paint_chromosome_ancestry_cancellable(
     let hap_major = HaplotypeMajorBits::from_matrix(joint_matrix, cancelled)?;
     // Log-likelihood ratio scores relative to uncalled random background (p=0.5, err≈0.005):
     //   match ≈ ln(0.995 / 0.5) ≈ 0.7, mismatch ≈ -ln(0.005 / 0.5) ≈ -4.5.
+    // Unscaled by default (`ancestry_step_max_markers == 0`) so true short segments remain
+    // recoverable. When explicitly enabled (`ancestry_step_max_markers > 0`), all candidates
+    // in a step share a single step-level scale factor `cap / max_c(comp[c])` so candidate
+    // ranking is preserved and low-coverage references cannot outrank full-coverage parents.
     let mismatch_penalty: f32 = 4.5;
     let match_reward: f32 = 0.7;
     let switch_penalty = config.ancestry_switch_penalty.max(0.5);
+    let step_eff_markers_cap = config.ancestry_step_max_markers as f32;
 
     let per_hap_segments: Result<Vec<Vec<AncestrySegment>>, String> = (0..n_target_haps)
         .into_par_iter()
@@ -388,16 +393,26 @@ pub fn paint_chromosome_ancestry_cancellable(
                 let bp_off = step_idx * n_states;
 
                 let mut curr_has_obs = false;
+                let mut step_max_comp = 0u32;
                 for (c_idx, &ref_col) in candidates.iter().enumerate() {
                     let (comp, mis) =
                         hap_major.count_mismatches(tgt_col, ref_col, m_start, m_end);
                     step_comparable[row_off + c_idx] = comp;
                     if comp > 0 {
                         curr_has_obs = true;
+                        if comp > step_max_comp {
+                            step_max_comp = comp;
+                        }
                     }
                     let matched = comp.saturating_sub(mis);
                     step_scores[row_off + c_idx] =
                         matched as f32 * match_reward - mis as f32 * mismatch_penalty;
+                }
+                if step_eff_markers_cap > 0.0 && (step_max_comp as f32) > step_eff_markers_cap {
+                    let step_scale = step_eff_markers_cap / step_max_comp as f32;
+                    for score in &mut step_scores[row_off..row_off + k] {
+                        *score *= step_scale;
+                    }
                 }
 
                 if step_idx == 0 {
@@ -1182,5 +1197,132 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn high_density_local_error_burst_does_not_fragment_or_drop_to_uncalled() {
+        // High-density WGS scenario: 2,000 markers over 1.0 cM (100 markers per 0.05 cM step).
+        // Target matches P0 on [0..1000) and P1 on [1000..2000), with a 25-marker local
+        // imputation error burst (25% mismatch in step 5, markers 500..525) flipped to P1.
+        // With opt-in step cap (`ancestry_step_max_markers = 8`), the burst must neither
+        // trigger a spurious switch nor drop to `Uncalled`, recovering 2 contiguous segments.
+        let n_markers = 2_000usize;
+        let ref_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true, true]);
+        let tgt_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true]);
+        let mut joint =
+            BitHaplotypeMatrix::new(ref_layout.total_haps + tgt_layout.total_haps, n_markers);
+        let pos: Vec<u64> = (0..n_markers).map(|m| (m as u64 + 1) * 500).collect();
+        let cm: Vec<f64> = (0..n_markers).map(|m| m as f64 * 0.0005).collect();
+
+        for m in 0..n_markers {
+            let p0 = (m % 2) as u8;
+            let p1 = 1 - p0;
+            joint.set_allele(m, 0, Some(p0));
+            joint.set_allele(m, 1, Some(p1));
+            let tgt = if m < 1_000 {
+                if (500..525).contains(&m) {
+                    p1
+                } else {
+                    p0
+                }
+            } else {
+                p1
+            };
+            joint.set_allele(m, 2, Some(tgt));
+        }
+
+        let cfg = HaploidIbdConfig {
+            ancestry_step_max_markers: 8,
+            ..HaploidIbdConfig::default()
+        };
+        let (segs, bins) =
+            paint_chromosome_ancestry(&joint, &ref_layout, &tgt_layout, 0, &pos, &cm, &cfg);
+        assert_eq!(
+            segs.len(),
+            2,
+            "opt-in step cap must prevent 25-SNP error burst from fragmenting, got {segs:?}"
+        );
+        assert_eq!(segs[0].parent_sample, 0);
+        assert_eq!(segs[1].parent_sample, 1);
+        assert_eq!(segs[0].end_bp + 1, segs[1].start_bp);
+        assert_eq!(bins.bin_starts_bp.len(), 2);
+    }
+
+    #[test]
+    fn default_unscaled_ancestry_recovers_short_single_step_segment() {
+        // Default `ancestry_step_max_markers == 0` (unscaled): a true 0.05 cM (100-SNP)
+        // short segment from P1 embedded inside a P0 background must be recovered.
+        let n_markers = 2_000usize;
+        let ref_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true, true]);
+        let tgt_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true]);
+        let mut joint =
+            BitHaplotypeMatrix::new(ref_layout.total_haps + tgt_layout.total_haps, n_markers);
+        let pos: Vec<u64> = (0..n_markers).map(|m| (m as u64 + 1) * 500).collect();
+        let cm: Vec<f64> = (0..n_markers).map(|m| m as f64 * 0.0005).collect();
+
+        for m in 0..n_markers {
+            let p0 = (m % 2) as u8;
+            let p1 = 1 - p0;
+            joint.set_allele(m, 0, Some(p0));
+            joint.set_allele(m, 1, Some(p1));
+            let tgt = if (500..600).contains(&m) { p1 } else { p0 };
+            joint.set_allele(m, 2, Some(tgt));
+        }
+
+        let cfg = HaploidIbdConfig::default();
+        assert_eq!(cfg.ancestry_step_max_markers, 0);
+        let (segs, _) =
+            paint_chromosome_ancestry(&joint, &ref_layout, &tgt_layout, 0, &pos, &cm, &cfg);
+        assert_eq!(
+            segs.len(),
+            3,
+            "default unscaled decoding must recover true 0.05 cM short segment, got {segs:?}"
+        );
+        assert_eq!(segs[0].parent_sample, 0);
+        assert_eq!(segs[1].parent_sample, 1);
+        assert_eq!(segs[1].n_markers, 100);
+        assert_eq!(segs[2].parent_sample, 0);
+    }
+
+    #[test]
+    fn shared_step_scale_prevents_low_coverage_decoy_from_beating_full_parent() {
+        // High-density step (100 markers per 0.05 cM) with opt-in `ancestry_step_max_markers = 8`.
+        // P0 is the true full-coverage parent with 1% genotyping error (99/100 match per step).
+        // P1 is a low-coverage decoy observed at only 8% of sites (8/100), matching all 8 sites.
+        // Step-wide shared scaling must preserve raw candidate ranking and choose P0 everywhere.
+        let n_markers = 1_000usize;
+        let ref_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true, true]);
+        let tgt_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true]);
+        let mut joint =
+            BitHaplotypeMatrix::new(ref_layout.total_haps + tgt_layout.total_haps, n_markers);
+        let pos: Vec<u64> = (0..n_markers).map(|m| (m as u64 + 1) * 500).collect();
+        let cm: Vec<f64> = (0..n_markers).map(|m| m as f64 * 0.0005).collect();
+
+        for m in 0..n_markers {
+            let a = (m % 2) as u8;
+            joint.set_allele(m, 0, Some(a));
+            if (m % 100) < 8 {
+                joint.set_allele(m, 1, Some(a));
+            } else {
+                joint.set_allele(m, 1, None);
+            }
+            // 1% genotyping error on target at offset 50 of each 100-SNP step
+            let tgt = if (m % 100) == 50 { 1 - a } else { a };
+            joint.set_allele(m, 2, Some(tgt));
+        }
+
+        let cfg = HaploidIbdConfig {
+            ancestry_step_max_markers: 8,
+            ..HaploidIbdConfig::default()
+        };
+        let (segs, _) =
+            paint_chromosome_ancestry(&joint, &ref_layout, &tgt_layout, 0, &pos, &cm, &cfg);
+        assert_eq!(
+            segs.len(),
+            1,
+            "shared step scaling must keep full-coverage true parent P0 over 8% decoy P1, got {segs:?}"
+        );
+        assert_eq!(segs[0].parent_sample, 0);
+        assert_eq!(segs[0].n_markers, n_markers as u32);
     }
 }

@@ -250,6 +250,8 @@ def _validate_parameters(args: argparse.Namespace) -> None:
         raise ValueError("--min-markers must be a positive integer")
     if not math.isfinite(args.ancestry_step_cm) or args.ancestry_step_cm <= 0.0:
         raise ValueError("--ancestry-step-cm must be a finite positive number")
+    if args.ancestry_step_max_markers < 0:
+        raise ValueError("--ancestry-step-max-markers must be a nonnegative integer")
     if (
         not math.isfinite(args.ancestry_switch_penalty)
         or args.ancestry_switch_penalty <= 0.0
@@ -416,6 +418,16 @@ def build_parser(argv: Sequence[str] | None = None) -> CliArgumentParser:
         default=0.05,
         help=help_text(
             "Genetic step size in cM for Viterbi ancestry decoding (default: %(default)s).",
+            advanced=True,
+        ),
+    )
+    model.add_argument(
+        "--ancestry-step-max-markers",
+        type=int,
+        default=0,
+        help=help_text(
+            "Optional per-step effective marker cap for high-density WGS ancestry "
+            "decoding; 0 disables step scaling (default: %(default)s).",
             advanced=True,
         ),
     )
@@ -903,6 +915,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "ancestry_switch_penalty": float(args.ancestry_switch_penalty),
         "ancestry_top_donors": int(args.ancestry_top_donors),
         "ancestry_step_cm": float(args.ancestry_step_cm),
+        "ancestry_step_max_markers": int(args.ancestry_step_max_markers),
         "cm_per_mb": float(args.cm_per_mb),
         "write_tsv": bool(args.write_tsv),
     }
@@ -1013,6 +1026,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     _report_kv(report_logger, "cM per Mb", float(args.cm_per_mb))
     if resolved_mode == "ancestry":
         _report_kv(report_logger, "Ancestry step cM", float(args.ancestry_step_cm))
+        if int(args.ancestry_step_max_markers) > 0:
+            _report_kv(
+                report_logger,
+                "Step max markers",
+                int(args.ancestry_step_max_markers),
+            )
         _report_kv(report_logger, "Switch penalty", float(args.ancestry_switch_penalty))
         _report_kv(report_logger, "Top donors", int(args.ancestry_top_donors))
     report_logger.info("")

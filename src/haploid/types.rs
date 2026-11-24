@@ -59,6 +59,9 @@ fn default_ancestry_top_donors() -> usize {
 fn default_ancestry_step_cm() -> f64 {
     0.05
 }
+fn default_ancestry_step_max_markers() -> usize {
+    0
+}
 fn default_cm_per_mb() -> f64 {
     1.0
 }
@@ -84,6 +87,9 @@ pub struct HaploidIbdConfig {
     pub ancestry_switch_penalty: f32,
     pub ancestry_top_donors: usize,
     pub ancestry_step_cm: f64,
+    /// Optional per-step effective marker cap for high-density WGS ancestry
+    /// decoding (`0` = disabled / unscaled default).
+    pub ancestry_step_max_markers: usize,
     pub cm_per_mb: f64,
     pub write_tsv: bool,
 }
@@ -106,6 +112,7 @@ impl Default for HaploidIbdConfig {
             ancestry_switch_penalty: default_ancestry_switch_penalty(),
             ancestry_top_donors: default_ancestry_top_donors(),
             ancestry_step_cm: default_ancestry_step_cm(),
+            ancestry_step_max_markers: default_ancestry_step_max_markers(),
             cm_per_mb: default_cm_per_mb(),
             write_tsv: false,
         }

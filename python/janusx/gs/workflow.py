@@ -183,6 +183,7 @@ from janusx.gs.progress import (
 from janusx.script._common.genocache import configure_genotype_cache_from_out
 from janusx._plink import (
     detect_existing_plink_kind,
+    normalize_plink_prefix,
     open_text_auto,
     pvar_path_for_prefix,
 )
@@ -17320,6 +17321,124 @@ def _load_plink_packed_for_lmm(
     return sample_ids_arr, packed_ctx
 
 
+def _estimate_pgen_resident_bytes(pgen_prefix: str) -> int | None:
+    pgen_prefix = normalize_plink_prefix(str(pgen_prefix))
+    pgen_path = f"{pgen_prefix}.pgen"
+    if not os.path.isfile(pgen_path):
+        return None
+    est_packed_bytes: int | None = None
+    try:
+        with open(pgen_path, "rb") as fh:
+            hdr = fh.read(11)
+        if len(hdr) >= 3 and hdr[0:2] == b"\x6c\x1b":
+            if hdr[2] == 0x01:
+                est_packed_bytes = max(0, int(os.path.getsize(pgen_path)) - 3)
+            elif len(hdr) >= 11 and hdr[2] in (0x02, 0x10):
+                n_snps = int.from_bytes(hdr[3:7], "little")
+                n_samples = int.from_bytes(hdr[7:11], "little")
+                est_packed_bytes = ((n_samples + 3) // 4) * n_snps
+    except OSError:
+        return None
+    if est_packed_bytes is None:
+        return None
+    est_meta_bytes = 0
+    for cand in (f"{pgen_prefix}.pvar.zst", f"{pgen_prefix}.pvar"):
+        if os.path.isfile(cand):
+            try:
+                est_meta_bytes = int(os.path.getsize(cand))
+            except OSError:
+                est_meta_bytes = 0
+            break
+    return int(est_packed_bytes) + int(est_meta_bytes)
+
+
+def _maybe_preload_gs_pgen_resident(
+    genotype_prefix: str,
+    *,
+    threads: int,
+    memory_gb: float | int | None,
+    memory_auto_requested: bool,
+    logger: logging.Logger,
+    debug_mode: bool,
+) -> int | None:
+    if not _cfg_truthy(os.environ.get("JX_GS_PGEN_PRELOAD", "1"), default=True):
+        return None
+    if _jxrs is None or not hasattr(_jxrs, "gwas_memload_register"):
+        return None
+    resolved = detect_existing_plink_kind(str(genotype_prefix))
+    if resolved is None or resolved[0] != "pfile":
+        return None
+    pgen_prefix = str(resolved[1])
+    est_bytes = _estimate_pgen_resident_bytes(pgen_prefix)
+    if est_bytes is None or est_bytes <= 0:
+        return None
+    total_bytes: int | None = None
+    try:
+        import psutil  # type: ignore
+
+        total_bytes = int(psutil.virtual_memory().total)
+    except Exception:
+        total_bytes = None
+    limit_bytes = _detect_gs_memory_limit_bytes()
+    effective_total: int | None = total_bytes if (total_bytes is not None and total_bytes > 0) else None
+    if limit_bytes is not None and int(limit_bytes) > 0:
+        effective_total = (
+            int(limit_bytes)
+            if effective_total is None
+            else min(int(effective_total), int(limit_bytes))
+        )
+    if effective_total is None or int(effective_total) <= 0:
+        if debug_mode:
+            logger.info(
+                "[GS-DEBUG] Skipping PGEN resident preload: total/limit memory could not be determined; streaming directly."
+            )
+        return None
+    # Follow PLINK's half-RAM budget (min(total_ram, cgroup_limit) / 2) so
+    # macOS dynamic file cache / inactive pages do not falsely block preload.
+    max_preload_bytes = int(effective_total) // 2
+    if (not bool(memory_auto_requested)) and (memory_gb is not None):
+        explicit_cap = max(0, int(float(memory_gb) * float(1024**3) * 0.5))
+        if explicit_cap <= 0:
+            return None
+        max_preload_bytes = min(max_preload_bytes, explicit_cap)
+    if max_preload_bytes <= 0 or est_bytes > max_preload_bytes:
+        if debug_mode:
+            logger.info(
+                "[GS-DEBUG] Skipping PGEN resident preload: est=%s exceeds safe budget (%s); streaming directly.",
+                _format_debug_bytes(est_bytes),
+                _format_debug_bytes(max_preload_bytes),
+            )
+        return None
+    pgen_src = f"{pgen_prefix}.pgen"
+    try:
+        reg = _jxrs.gwas_memload_register(pgen_src, int(max(1, int(threads))))
+    except Exception as exc:
+        if debug_mode:
+            logger.warning(
+                "[GS-DEBUG] PGEN resident preload failed (%s); falling back to streaming PGEN.",
+                exc,
+            )
+        return None
+    token = int(reg[3]) if len(reg) >= 4 else None
+    if debug_mode:
+        logger.info(
+            "[GS-DEBUG] Preloaded PGEN into resident 2-bit cache: n=%d nSNP=%d bytes=%s",
+            int(reg[0]),
+            int(reg[1]),
+            _format_debug_bytes(int(reg[2])),
+        )
+    return token
+
+
+def _release_gs_pgen_resident(token: int | None) -> None:
+    if token is None or _jxrs is None or not hasattr(_jxrs, "gwas_memload_clear"):
+        return
+    try:
+        _jxrs.gwas_memload_clear(int(token))
+    except Exception:
+        pass
+
+
 def _load_plink_stats_for_lmm(
     genotype_prefix: str,
     *,
@@ -17434,9 +17553,7 @@ def _decode_packed_ctx_to_dense(
 
 
 def _read_plink_bim_chrom_pos(prefix: str) -> tuple[np.ndarray, np.ndarray]:
-    bim_path = str(prefix)
-    if not bim_path.lower().endswith(".bim"):
-        bim_path = f"{bim_path}.bim"
+    bim_path = f"{normalize_plink_prefix(str(prefix))}.bim"
     if not os.path.isfile(bim_path):
         raise ValueError(f"Cannot find BIM file for PLINK prefix: {prefix}")
 
@@ -19253,6 +19370,28 @@ def _run_gs_pipeline_impl(
     log: bool = True,
     return_result: bool = False,
 ) -> typing.Optional[dict[str, typing.Any]]:
+    resident_tokens: list[int] = []
+    try:
+        return _run_gs_pipeline_impl_body(
+            args=args,
+            argv=argv,
+            log=log,
+            return_result=return_result,
+            _resident_tokens=resident_tokens,
+        )
+    finally:
+        for tok in reversed(resident_tokens):
+            _release_gs_pgen_resident(tok)
+
+
+def _run_gs_pipeline_impl_body(
+    args=None,
+    *,
+    argv: typing.Optional[list[str]] = None,
+    log: bool = True,
+    return_result: bool = False,
+    _resident_tokens: list[int] | None = None,
+) -> typing.Optional[dict[str, typing.Any]]:
     t_start = time.time()
     use_spinner = stdout_is_tty()
     if args is None:
@@ -20368,6 +20507,16 @@ def _run_gs_pipeline_impl(
             enabled=(bool(use_spinner) and (not bool(defer_geno_load_status))),
         ) as task:
             try:
+                pgen_tok = _maybe_preload_gs_pgen_resident(
+                    str(gfile),
+                    threads=int(max(1, int(args.thread))),
+                    memory_gb=args.memory,
+                    memory_auto_requested=bool(gs_memory_auto_requested),
+                    logger=logger,
+                    debug_mode=bool(debug_mode),
+                )
+                if pgen_tok is not None and _resident_tokens is not None:
+                    _resident_tokens.append(int(pgen_tok))
                 if packed_meta_only_main_requested:
                     sample_ids, packed_lmm_ctx = _load_plink_stats_for_lmm(
                         str(gfile),

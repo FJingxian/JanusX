@@ -603,7 +603,8 @@ pub(crate) fn open_resident_variant_meta_reader(
     if entry.meta_is_zst {
         let decoder = zstd::stream::read::Decoder::new(cursor)
             .map_err(|e| format!("open resident zstd metadata reader: {e}"))?;
-        Ok(Some(Box::new(std::io::BufReader::with_capacity(1 << 20, decoder))))
+        let reader = std::io::BufReader::with_capacity(1 << 20, decoder);
+        Ok(Some(Box::new(reader)))
     } else {
         Ok(Some(Box::new(cursor)))
     }
@@ -755,13 +756,19 @@ pub(crate) fn load_resident_packed_bed(
                 packed[..copy_len].copy_from_slice(&aligned_buf[BED_HEADER_LEN..to_read]);
                 dst_offset = copy_len;
             } else {
-                packed[dst_offset..dst_offset + to_read].copy_from_slice(&aligned_buf[..to_read]);
+                let dst = &mut packed[dst_offset..dst_offset + to_read];
+                dst.copy_from_slice(&aligned_buf[..to_read]);
                 dst_offset += to_read;
             }
             hint_file_dontneed(&file, file_offset as u64, to_read as u64);
             file_offset += to_read;
         }
-        (n_samples_full, info.n_snps_total, info.bytes_per_snp, packed)
+        (
+            n_samples_full,
+            info.n_snps_total,
+            info.bytes_per_snp,
+            packed,
+        )
     };
 
     let (meta_bytes, meta_is_zst) = if pgen_source {
@@ -819,7 +826,12 @@ pub fn gwas_memload_register(
     py.detach(move || {
         let (entry, token) =
             load_resident_packed_bed(&prefix, threads).map_err(PyRuntimeError::new_err)?;
-        Ok((entry.n_samples_full, entry.n_snps, entry.packed.len(), token))
+        Ok((
+            entry.n_samples_full,
+            entry.n_snps,
+            entry.packed.len(),
+            token,
+        ))
     })
 }
 
@@ -1293,17 +1305,24 @@ impl PackedBedSourceReader {
             }
             PackedBedSource::Memory(resident) => {
                 sample_selection.validate(self.n_samples_full)?;
-                for row_idx in 0..rows {
-                    let src_start = (source_start + row_idx) * self.bytes_per_snp;
-                    let src_end = src_start + self.bytes_per_snp;
-                    let stats = crate::pgen::count_bed_genotype_row(
-                        &resident.packed[src_start..src_end],
-                        self.n_samples_full,
-                        sample_selection,
-                    );
-                    stats_out[row_idx] = stats;
-                    keep_out[row_idx] = keep_variant(source_start + row_idx, stats);
-                }
+                let packed = resident.packed.as_slice();
+                let bps = self.bytes_per_snp;
+                let n_samples = self.n_samples_full;
+                stats_out[..rows]
+                    .par_iter_mut()
+                    .zip(keep_out[..rows].par_iter_mut())
+                    .enumerate()
+                    .for_each(|(row_idx, (stats_dst, keep_dst))| {
+                        let src_start = (source_start + row_idx) * bps;
+                        let src_end = src_start + bps;
+                        let stats = crate::pgen::count_bed_genotype_row(
+                            &packed[src_start..src_end],
+                            n_samples,
+                            sample_selection,
+                        );
+                        *stats_dst = stats;
+                        *keep_dst = keep_variant(source_start + row_idx, stats);
+                    });
                 Ok(rows)
             }
         }
@@ -1889,8 +1908,53 @@ fn windows_file_identity(file: &std::fs::File) -> Result<(u32, u64, u64, u64), S
     windows_file_identity_raw(file.as_raw_handle())
 }
 
+fn pgen_file_fingerprint(pgen_path: &Path) -> Option<String> {
+    let file = std::fs::File::open(pgen_path).ok()?;
+    let meta = file.metadata().ok()?;
+    let pgen_len = meta.len();
+    let canon = std::fs::canonicalize(pgen_path)
+        .ok()?
+        .to_string_lossy()
+        .into_owned();
+    let mtime_ns = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let _ = &file;
+        Some(format!(
+            "pgen:{canon}|dev={}|ino={}|len={pgen_len}|mod={mtime_ns}|chg={}:{}",
+            meta.dev(),
+            meta.ino(),
+            meta.ctime(),
+            meta.ctime_nsec()
+        ))
+    }
+    #[cfg(windows)]
+    {
+        let (vol, idx, crt, wrt) = windows_file_identity(&file).ok()?;
+        if vol == 0 && idx == 0 {
+            return None;
+        }
+        Some(format!(
+            "pgen:{canon}|vol={vol}|idx={idx}|len={pgen_len}|mod={mtime_ns}|crt={crt}|wrt={wrt}"
+        ))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (file, canon, pgen_len, mtime_ns);
+        None
+    }
+}
+
 pub struct WindowedBedMatrix {
     file: Option<std::fs::File>,
+    pgen: Option<crate::pgen::PgenReader>,
+    pgen_path: Option<std::path::PathBuf>,
     resident: Option<Arc<ResidentPackedBed>>,
     source_fingerprint: Option<String>,
     n_samples_full: usize,
@@ -1941,6 +2005,8 @@ impl WindowedBedMatrix {
             ));
             return Ok(Self {
                 file: None,
+                pgen: None,
+                pgen_path: None,
                 resident: Some(resident),
                 source_fingerprint,
                 n_samples_full,
@@ -1951,6 +2017,44 @@ impl WindowedBedMatrix {
                 window_start_snp: 0,
                 window_len_snps: n_snps,
                 target_window_snps: n_snps.max(1),
+                pread: false,
+                scratch: Vec::new(),
+                pread_buffer: Vec::new(),
+            });
+        }
+        if crate::pgen::path_uses_pgen(prefix) {
+            let pgen_prefix = crate::pgen::normalize_pgen_prefix(prefix);
+            let n_samples_full = crate::pgen::count_psam_samples(&pgen_prefix)?;
+            if n_samples_full == 0 {
+                return Err("no samples found in PGEN".to_string());
+            }
+            let bytes_per_snp = n_samples_full.div_ceil(4);
+            let n_snps = crate::pgen::count_pgen_variants(&pgen_prefix, n_samples_full)?;
+            let pgen_path = Path::new(&format!("{pgen_prefix}.pgen")).to_path_buf();
+            let reader = crate::pgen::PgenReader::open(&pgen_path, n_samples_full, n_snps)?;
+            let source_fingerprint = pgen_file_fingerprint(&pgen_path);
+            let payload_len = n_snps
+                .checked_mul(bytes_per_snp)
+                .ok_or_else(|| "PGEN packed payload size overflow".to_string())?;
+            let bed_len = BED_HEADER_LEN
+                .checked_add(payload_len)
+                .ok_or_else(|| "PGEN packed length overflow".to_string())?;
+            let window_bytes = mmap_window_mb.saturating_mul(1024 * 1024);
+            let target_window_snps = std::cmp::max(1, window_bytes / bytes_per_snp);
+            return Ok(Self {
+                file: None,
+                pgen: Some(reader),
+                pgen_path: Some(pgen_path),
+                resident: None,
+                source_fingerprint,
+                n_samples_full,
+                bytes_per_snp,
+                bed_len,
+                mmap: None,
+                mmap_offset: 0,
+                window_start_snp: 0,
+                window_len_snps: 0,
+                target_window_snps,
                 pread: false,
                 scratch: Vec::new(),
                 pread_buffer: Vec::new(),
@@ -2036,6 +2140,8 @@ impl WindowedBedMatrix {
         };
         Ok(Self {
             file: Some(file),
+            pgen: None,
+            pgen_path: None,
             resident: None,
             source_fingerprint,
             n_samples_full,
@@ -2072,6 +2178,8 @@ impl WindowedBedMatrix {
         if let Some(resident) = self.resident.as_ref() {
             return Ok(Self {
                 file: None,
+                pgen: None,
+                pgen_path: None,
                 resident: Some(Arc::clone(resident)),
                 source_fingerprint: self.source_fingerprint.clone(),
                 n_samples_full: self.n_samples_full,
@@ -2087,6 +2195,31 @@ impl WindowedBedMatrix {
                 pread_buffer: Vec::new(),
             });
         }
+        if let Some(pgen_path) = self.pgen_path.as_ref() {
+            let reader = crate::pgen::PgenReader::open(
+                pgen_path,
+                self.n_samples_full,
+                self.n_source_snps(),
+            )?;
+            return Ok(Self {
+                file: None,
+                pgen: Some(reader),
+                pgen_path: Some(pgen_path.clone()),
+                resident: None,
+                source_fingerprint: self.source_fingerprint.clone(),
+                n_samples_full: self.n_samples_full,
+                bytes_per_snp: self.bytes_per_snp,
+                bed_len: self.bed_len,
+                mmap: None,
+                mmap_offset: 0,
+                window_start_snp: 0,
+                window_len_snps: 0,
+                target_window_snps: self.target_window_snps,
+                pread: false,
+                scratch: Vec::new(),
+                pread_buffer: Vec::new(),
+            });
+        }
         let file = self
             .file
             .as_ref()
@@ -2096,6 +2229,8 @@ impl WindowedBedMatrix {
         if self.pread {
             return Ok(Self {
                 file: Some(file),
+                pgen: None,
+                pgen_path: None,
                 resident: None,
                 source_fingerprint: self.source_fingerprint.clone(),
                 n_samples_full: self.n_samples_full,
@@ -2124,6 +2259,8 @@ impl WindowedBedMatrix {
         )?;
         Ok(Self {
             file: Some(file),
+            pgen: None,
+            pgen_path: None,
             resident: None,
             source_fingerprint: self.source_fingerprint.clone(),
             n_samples_full: self.n_samples_full,
@@ -2218,7 +2355,7 @@ impl WindowedBedMatrix {
         if end <= start {
             return Ok(&[]);
         }
-        if self.resident.is_none() && !self.pread {
+        if self.resident.is_none() && self.pgen.is_none() && !self.pread {
             let window_end = self.window_start_snp + self.window_len_snps;
             if start < self.window_start_snp || end > window_end {
                 self.remap_window_for_range(start, end)?;
@@ -2234,6 +2371,27 @@ impl WindowedBedMatrix {
             let byte_start = start.saturating_mul(self.bytes_per_snp);
             let byte_end = end.saturating_mul(self.bytes_per_snp);
             return Ok(&resident.packed[byte_start..byte_end]);
+        }
+        if let Some(pgen) = self.pgen.as_mut() {
+            let n_snps = self
+                .bed_len
+                .saturating_sub(BED_HEADER_LEN)
+                .saturating_div(self.bytes_per_snp.max(1));
+            if end > n_snps {
+                return Err(format!(
+                    "PGEN range out of bounds: start={start}, end={end}, n_snps={n_snps}"
+                ));
+            }
+            let rows = end - start;
+            let len = rows.saturating_mul(self.bytes_per_snp);
+            self.pread_buffer.resize(len, 0);
+            let got = pgen.read_source_block(start, rows, &mut self.pread_buffer)?;
+            if got != rows {
+                return Err(format!(
+                    "PGEN read returned {got} rows; requested {rows} starting at {start}"
+                ));
+            }
+            return Ok(&self.pread_buffer);
         }
         if self.pread {
             if end > self.n_source_snps() {
@@ -2284,6 +2442,11 @@ impl WindowedBedMatrix {
             self.scratch.resize(need, 0);
         }
         rel_indices_out.clear();
+        if let Some(pgen) = self.pgen.as_mut() {
+            pgen.read_source_rows_sparse(source_indices, &mut self.scratch[..need])?;
+            rel_indices_out.extend(0..rows_here);
+            return Ok(&self.scratch[..need]);
+        }
         for (local_idx, &src_idx) in source_indices.iter().enumerate() {
             let row_bytes = self.read_source_range(src_idx, src_idx + 1)?.to_vec();
             let dst = &mut self.scratch[local_idx * bps..(local_idx + 1) * bps];
@@ -2302,10 +2465,12 @@ impl WindowedBedMatrix {
             rel_indices_out.clear();
             return Ok(&[]);
         }
+        let monotonic = source_indices.windows(2).all(|w| w[0] <= w[1]);
         let src_start = source_indices[0];
-        let src_end = source_indices[source_indices.len() - 1] + 1;
-        let source_span = src_end - src_start;
-        let zero_copy_ok = source_span <= source_indices.len().saturating_mul(8).max(1);
+        let src_end = source_indices[source_indices.len() - 1].saturating_add(1);
+        let source_span = src_end.saturating_sub(src_start);
+        let max_span = source_indices.len().saturating_mul(8).max(1);
+        let zero_copy_ok = monotonic && src_end > src_start && source_span <= max_span;
         if zero_copy_ok {
             rel_indices_out.clear();
             rel_indices_out.extend(source_indices.iter().map(|&src_idx| src_idx - src_start));
@@ -2723,4 +2888,222 @@ pub fn decode_centered_block_unified<G: GenotypeMatrix>(
         out,
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static RESIDENT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn write_toy_pgen_dataset(prefix: &str, n_samples: usize, n_snps: usize) -> Vec<u8> {
+        let mut psam = String::from("#FID\tIID\tSEX\n");
+        for i in 0..n_samples {
+            psam.push_str(&format!("F{i}\tI{i}\t0\n"));
+        }
+        std::fs::write(format!("{prefix}.psam"), psam).expect("write psam");
+
+        let mut pvar = String::from("#CHROM\tPOS\tID\tREF\tALT\n");
+        for j in 0..n_snps {
+            pvar.push_str(&format!("1\t{}\trs{j}\tA\tG\n", (j + 1) * 100));
+        }
+        std::fs::write(format!("{prefix}.pvar"), pvar).expect("write pvar");
+
+        let bps = n_samples.div_ceil(4);
+        let mut pgen = vec![0x6C, 0x1B, 0x02];
+        pgen.extend_from_slice(&(n_snps as u32).to_le_bytes());
+        pgen.extend_from_slice(&(n_samples as u32).to_le_bytes());
+        pgen.push(0);
+        let mut expected_bed = vec![0u8; n_snps * bps];
+        for r in 0..n_snps {
+            let mut cat_row = vec![0u8; bps];
+            for s in 0..n_samples {
+                let cat = ((r * 3 + s) % 4) as u8;
+                cat_row[s / 4] |= cat << ((s % 4) * 2);
+            }
+            pgen.extend_from_slice(&cat_row);
+            for b in 0..bps {
+                expected_bed[r * bps + b] = crate::pgen::pgen_category_byte_to_row_byte(cat_row[b]);
+            }
+        }
+        std::fs::write(format!("{prefix}.pgen"), pgen).expect("write pgen");
+        expected_bed
+    }
+
+    fn write_toy_pgen_var_dataset(prefix: &str, n_samples: usize, n_snps: usize) -> Vec<u8> {
+        let mut psam = String::from("#FID\tIID\tSEX\n");
+        for i in 0..n_samples {
+            psam.push_str(&format!("F{i}\tI{i}\t0\n"));
+        }
+        std::fs::write(format!("{prefix}.psam"), psam).expect("write psam");
+
+        let mut pvar = String::from("#CHROM\tPOS\tID\tREF\tALT\n");
+        for j in 0..n_snps {
+            pvar.push_str(&format!("1\t{}\trs{j}\tA\tG\n", (j + 1) * 100));
+        }
+        std::fs::write(format!("{prefix}.pvar"), pvar).expect("write pvar");
+
+        let bps = n_samples.div_ceil(4);
+        assert!(bps <= u8::MAX as usize);
+        let mut meta = vec![0u8; n_snps.div_ceil(2)];
+        meta.resize(n_snps.div_ceil(2) + n_snps, bps as u8);
+        let data_offset = (12 + 8 + meta.len()) as u64;
+        let mut pgen = Vec::new();
+        pgen.extend_from_slice(&[0x6C, 0x1B, 0x10]);
+        pgen.extend_from_slice(&(n_snps as u32).to_le_bytes());
+        pgen.extend_from_slice(&(n_samples as u32).to_le_bytes());
+        pgen.push(0);
+        pgen.extend_from_slice(&data_offset.to_le_bytes());
+        pgen.extend_from_slice(&meta);
+        let mut expected_bed = vec![0u8; n_snps * bps];
+        for r in 0..n_snps {
+            let mut cat_row = vec![0u8; bps];
+            for s in 0..n_samples {
+                let cat = ((r * 5 + s + 1) % 4) as u8;
+                cat_row[s / 4] |= cat << ((s % 4) * 2);
+            }
+            pgen.extend_from_slice(&cat_row);
+            for b in 0..bps {
+                expected_bed[r * bps + b] = crate::pgen::pgen_category_byte_to_row_byte(cat_row[b]);
+            }
+        }
+        std::fs::write(format!("{prefix}.pgen"), pgen).expect("write pgen");
+        expected_bed
+    }
+
+    #[test]
+    fn windowed_bed_matrix_reads_pgen_dense_sparse_duplicate_and_resident() {
+        pyo3::Python::initialize();
+        let n_samples = 13usize;
+        let n_snps = 40usize;
+        let bps = n_samples.div_ceil(4);
+        let tag = format!("janusx_gload_pgen_win_{}", std::process::id());
+        let dir = std::env::temp_dir().join(tag);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let prefix = dir.join("toy").to_string_lossy().to_string();
+        let expected_bed = write_toy_pgen_dataset(&prefix, n_samples, n_snps);
+
+        let mut mat = WindowedBedMatrix::open(&prefix, 1).expect("open PGEN in WindowedBedMatrix");
+        assert_eq!(mat.n_samples_full(), n_samples);
+        assert_eq!(mat.bytes_per_snp(), bps);
+        assert_eq!(mat.n_source_snps(), n_snps);
+        assert!(mat.source_fingerprint().is_some());
+
+        let full = mat.read_source_range(0, n_snps).expect("read full PGEN");
+        assert_eq!(full, expected_bed.as_slice());
+
+        let mut rel = Vec::new();
+        let dense_idx = [2usize, 3, 5, 7];
+        let dense_slice = mat
+            .prepare_source_rows(&dense_idx, &mut rel)
+            .expect("dense PGEN rows");
+        assert_eq!(rel, vec![0, 1, 3, 5]);
+        for (&src_r, &rel_r) in dense_idx.iter().zip(rel.iter()) {
+            assert_eq!(
+                &dense_slice[rel_r * bps..(rel_r + 1) * bps],
+                &expected_bed[src_r * bps..(src_r + 1) * bps]
+            );
+        }
+
+        let sparse_idx = [1usize, 15, 38];
+        let sparse_slice = mat
+            .prepare_source_rows(&sparse_idx, &mut rel)
+            .expect("sparse PGEN rows");
+        assert_eq!(rel, vec![0, 1, 2]);
+        for (&src_r, &rel_r) in sparse_idx.iter().zip(rel.iter()) {
+            assert_eq!(
+                &sparse_slice[rel_r * bps..(rel_r + 1) * bps],
+                &expected_bed[src_r * bps..(src_r + 1) * bps]
+            );
+        }
+
+        let mut dup = mat.duplicate().expect("duplicate PGEN cursor");
+        let dup_slice = dup.read_source_range(4, 12).expect("read dup PGEN");
+        assert_eq!(dup_slice, &expected_bed[4 * bps..12 * bps]);
+        drop(dup);
+        drop(mat);
+
+        let _resident_guard = RESIDENT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (entry, token) = load_resident_packed_bed(&prefix, 2).expect("preload PGEN resident");
+        assert_eq!(entry.packed.as_slice(), expected_bed.as_slice());
+        let mut res_mat = WindowedBedMatrix::open(&prefix, 1).expect("open resident PGEN");
+        assert_eq!(
+            res_mat.read_source_range(0, n_snps).expect("read resident"),
+            expected_bed.as_slice()
+        );
+        let mut reader = PackedBedSourceReader::open(&prefix, n_samples).expect("open reader");
+        let mut stats = vec![crate::pgen::GenotypeRowStats::default(); n_snps];
+        let mut keep = vec![false; n_snps];
+        let got = reader
+            .read_source_block_qc_only(
+                0,
+                n_snps,
+                crate::pgen::GenotypeSampleSelection::all(),
+                &mut stats,
+                &mut keep,
+                &|_, _| true,
+            )
+            .expect("resident parallel qc");
+        assert_eq!(got, n_snps);
+        assert!(keep.iter().all(|&k| k));
+        drop(reader);
+        drop(res_mat);
+        drop(entry);
+        clear_resident_packed_bed(Some(token));
+
+        std::fs::remove_dir_all(&dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn windowed_bed_matrix_reads_variable_mode_0x10_pgen() {
+        pyo3::Python::initialize();
+        let n_samples = 13usize;
+        let n_snps = 40usize;
+        let bps = n_samples.div_ceil(4);
+        let tag = format!("janusx_gload_pgen_var10_{}", std::process::id());
+        let dir = std::env::temp_dir().join(tag);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let prefix = dir.join("toy_var").to_string_lossy().to_string();
+        let expected_bed = write_toy_pgen_var_dataset(&prefix, n_samples, n_snps);
+
+        let mut mat = WindowedBedMatrix::open(&prefix, 1).expect("open 0x10 PGEN");
+        assert_eq!(mat.n_samples_full(), n_samples);
+        assert_eq!(mat.bytes_per_snp(), bps);
+        assert_eq!(mat.n_source_snps(), n_snps);
+        assert_eq!(
+            mat.read_source_range(0, n_snps).expect("read full 0x10"),
+            expected_bed.as_slice()
+        );
+
+        let mut rel = Vec::new();
+        let sparse_idx = [0usize, 17, 39];
+        let sparse_slice = mat
+            .prepare_source_rows(&sparse_idx, &mut rel)
+            .expect("sparse 0x10 rows");
+        assert_eq!(rel, vec![0, 1, 2]);
+        for (&src_r, &rel_r) in sparse_idx.iter().zip(rel.iter()) {
+            assert_eq!(
+                &sparse_slice[rel_r * bps..(rel_r + 1) * bps],
+                &expected_bed[src_r * bps..(src_r + 1) * bps]
+            );
+        }
+
+        let mut dup = mat.duplicate().expect("duplicate 0x10 PGEN");
+        assert_eq!(
+            dup.read_source_range(5, 15).expect("read dup 0x10"),
+            &expected_bed[5 * bps..15 * bps]
+        );
+        drop(dup);
+        drop(mat);
+
+        let _resident_guard = RESIDENT_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (entry, token) = load_resident_packed_bed(&prefix, 2).expect("preload 0x10 resident");
+        assert_eq!(entry.packed.as_slice(), expected_bed.as_slice());
+        drop(entry);
+        clear_resident_packed_bed(Some(token));
+
+        std::fs::remove_dir_all(&dir).expect("cleanup temp dir");
+    }
 }

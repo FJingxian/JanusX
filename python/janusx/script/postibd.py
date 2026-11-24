@@ -6,22 +6,22 @@ Directly reads `.jhibd` sparse binary archives produced by `jx ibd -ref ...`
 via Rust-native aggregation and generates publication-ready plots and tables:
   1. Recombination rate & hotspots (-recomb): empirical population genetic map,
      windowed recombination rate, and hotspot / Marey-curve visualization.
-  2. Parent contribution & segregation distortion (-segregation): genome-wide
-     and per-chromosome founder proportions plus along-chromosome descriptive
-     chi-square divergence from uniform 1/K.
+  2. Founder contribution (-segregation): genome-wide and per-chromosome
+     founder contribution proportions.
   3. Chromosome Mosaic painting (-mosaic): whole-genome all-sample clustered
      multi-chromosome mosaic heatmap (columns proportional to physical length,
      legend on the right), representative sample karyotype mosaic, and optional
-     per-chromosome heatmaps.
+     per-chromosome heatmaps. When both -recomb and -mosaic are enabled, the
+     two recombination tracks are aligned directly above the genome mosaic.
 
 Examples
 --------
-  # Run all three visualizations (PNG, 1 Mb windows)
+  # Run all visualizations (combined recomb+mosaic + founder contribution)
   jx postibd -i ./cubic_All.maf0.02.imp.jhibd -o ./cubic_post -fmt png
 
-  # Run only recombination & segregation with NAM map comparison (PDF)
+  # Run recombination + mosaic with NAM map comparison (PDF)
   jx postibd -i ./cubic_All.maf0.02.imp.jhibd -o ./cubic_post \\
-    -map ./NAM_joint_CN_US_B73v4_beagle.map -recomb -segregation -fmt pdf
+    -map ./NAM_joint_CN_US_B73v4_beagle.map -recomb -mosaic -fmt pdf
 
   # Render whole-genome clustered mosaic + specific lines (SVG)
   jx postibd -i ./cubic_All.maf0.02.imp.jhibd -o ./cubic_post \\
@@ -189,6 +189,36 @@ def _interp_external_map_cm(
     return float(np.interp(bp, bps, cms))
 
 
+_GROUP_HEADER_COL1 = {"id", "iid", "fid", "sample", "sample_id", "parent", "parent_id", "founder", "line"}
+_GROUP_HEADER_COL2 = {"group", "ancestry", "pop", "population", "cluster", "label", "type", "subpop"}
+
+
+def _read_parent_group_file(group_path: Path) -> dict[str, str]:
+    """Read a 2+ column whitespace/tab-delimited parent->ancestry-group mapping file."""
+    mapping: dict[str, str] = {}
+    first_data = True
+    with group_path.open("r", encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            col1, col2 = parts[0].strip(), parts[1].strip()
+            if first_data:
+                first_data = False
+                if col1.lower() in _GROUP_HEADER_COL1 and col2.lower() in _GROUP_HEADER_COL2:
+                    continue
+            if col1 and col2:
+                mapping[col1] = col2
+    if not mapping:
+        raise ValueError(
+            f"Ancestry group file contains no valid 2-column mappings: {group_path}"
+        )
+    return mapping
+
+
 def _save_figure(fig: plt.Figure, out_path: Path, fmt: str, dpi: int) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     save_kwargs: dict[str, Any] = {
@@ -207,6 +237,30 @@ def _ordered_chrom_indices(chrom_names: Sequence[str]) -> list[int]:
     return sorted(range(len(chrom_names)), key=lambda i: chrom_sort_key(chrom_names[i]))
 
 
+def _compute_exact_genome_spans(
+    chrom_lengths_bp: Sequence[int],
+    ordered_indices: Sequence[int],
+    gap_frac: float = 0.012,
+) -> tuple[dict[int, float], list[tuple[int, float, float, float]], list[float], float, float]:
+    """Compute exact physical-Mb x-offsets, spans, and inter-chrom separators."""
+    lengths_mb = [max(float(chrom_lengths_bp[c]) / 1_000_000.0, 1e-6) for c in ordered_indices]
+    total_mb = max(sum(lengths_mb), 1e-6)
+    gap_mb = total_mb * gap_frac if len(ordered_indices) > 1 else 0.0
+    offsets: dict[int, float] = {}
+    spans: list[tuple[int, float, float, float]] = []
+    sep_positions: list[float] = []
+    cursor = 0.0
+    for idx_c, (c, l_mb) in enumerate(zip(ordered_indices, lengths_mb)):
+        offsets[c] = cursor
+        spans.append((c, cursor, cursor + l_mb, cursor + 0.5 * l_mb))
+        cursor += l_mb
+        if idx_c + 1 < len(ordered_indices) and gap_mb > 0.0:
+            sep_positions.append(cursor + 0.5 * gap_mb)
+            cursor += gap_mb
+    total_x = max(cursor, 1e-6)
+    return offsets, spans, sep_positions, total_x, total_mb
+
+
 def _compute_genome_layout(
     chrom_names: Sequence[str],
     chrom_lengths_bp: Sequence[int],
@@ -214,17 +268,9 @@ def _compute_genome_layout(
     gap_frac: float = 0.015,
 ) -> tuple[dict[int, float], list[tuple[int, float, float, float]], float]:
     """Compute cumulative Mb x-offsets for multi-chromosome genome-wide plots."""
-    lengths_mb = [max(1.0, float(chrom_lengths_bp[c]) / 1_000_000.0) for c in ordered_indices]
-    total_raw = sum(lengths_mb)
-    gap_mb = max(2.0, total_raw * gap_frac) if len(ordered_indices) > 1 else 0.0
-    offsets: dict[int, float] = {}
-    spans: list[tuple[int, float, float, float]] = []
-    cursor = 0.0
-    for c, l_mb in zip(ordered_indices, lengths_mb):
-        offsets[c] = cursor
-        spans.append((c, cursor, cursor + l_mb, cursor + 0.5 * l_mb))
-        cursor += l_mb + gap_mb
-    total_x = max(cursor - gap_mb, 1.0)
+    offsets, spans, _seps, total_x, _total_mb = _compute_exact_genome_spans(
+        chrom_lengths_bp, ordered_indices, gap_frac=gap_frac
+    )
     return offsets, spans, total_x
 
 
@@ -234,6 +280,14 @@ def _style_clean_axes(ax: plt.Axes) -> None:
     ax.spines["left"].set_color("#374151")
     ax.spines["bottom"].set_color("#374151")
     ax.tick_params(colors="#1F2937", labelsize=9)
+
+
+def _ancestry_count_label(data: dict[str, Any]) -> str:
+    n_founders = int(data["n_reference_samples"])
+    n_categories = len(data["reference_sample_ids"])
+    if bool(data.get("grouped_parents", False)):
+        return f"{n_categories} ancestry categories ({n_founders} founders)"
+    return f"K={n_founders} founders"
 
 
 def _attach_right_founder_legend(
@@ -269,21 +323,17 @@ def _attach_right_founder_legend(
 # ---------------------------------------------------------------------------
 
 
-def _run_recomb_outputs(
+def _prepare_recomb_data(
     data: dict[str, Any],
-    out_prefix: Path,
-    fmt: str,
-    dpi: int,
     ext_map: Optional[dict[str, tuple[np.ndarray, np.ndarray]]],
     generations: Optional[float],
     logger: logging.Logger,
-) -> list[Path]:
+) -> Optional[dict[str, Any]]:
     chrom_names: list[str] = data["chrom_names"]
-    chrom_lengths_bp: list[int] = data["chrom_lengths_bp"]
     raw_rows: list[dict[str, Any]] = data["recomb_windows"]
     if not raw_rows:
         logger.warning("No recombination windows found in archive; skipping -recomb outputs.")
-        return []
+        return None
 
     ordered_c = _ordered_chrom_indices(chrom_names)
     by_chrom: dict[int, list[dict[str, Any]]] = {c: [] for c in ordered_c}
@@ -344,6 +394,37 @@ def _run_recomb_outputs(
             out_rows.append(item)
         enriched_by_chrom[c] = out_rows
 
+    scale_div = float(generations) if (generations is not None and generations > 0.0) else 1.0
+    callable_rates = [
+        float(r["per_meiosis_cm_per_mb"])
+        if (generations is not None and generations > 0.0)
+        else float(r["eff_rate_val"])
+        for c in ordered_c
+        for r in enriched_by_chrom[c]
+        if r["callable"]
+    ]
+    all_rates = np.asarray([v for v in callable_rates if math.isfinite(v)], dtype=np.float64)
+    hotspot_thr = float(np.percentile(all_rates, 95.0)) if all_rates.size > 0 else 0.0
+
+    return {
+        "ordered_c": ordered_c,
+        "enriched_by_chrom": enriched_by_chrom,
+        "has_ref_map": has_ref_map,
+        "scale_div": scale_div,
+        "hotspot_thr": hotspot_thr,
+    }
+
+
+def _write_recomb_tables(
+    chrom_names: Sequence[str],
+    recomb_ctx: dict[str, Any],
+    out_prefix: Path,
+    generations: Optional[float],
+) -> tuple[Path, Path]:
+    ordered_c: list[int] = recomb_ctx["ordered_c"]
+    enriched_by_chrom: dict[int, list[dict[str, Any]]] = recomb_ctx["enriched_by_chrom"]
+    scale_div: float = recomb_ctx["scale_div"]
+
     # Write <prefix>.recomb.window.tsv
     tsv_path = Path(f"{out_prefix}.recomb.window.tsv")
     with tsv_path.open("w", encoding="utf-8") as fh:
@@ -397,7 +478,6 @@ def _run_recomb_outputs(
 
     # Write standard 4-column PLINK empirical genetic map: <prefix>.empirical.map
     map_out_path = Path(f"{out_prefix}.empirical.map")
-    scale_div = float(generations) if (generations is not None and generations > 0.0) else 1.0
     with map_out_path.open("w", encoding="utf-8") as fh:
         for c in ordered_c:
             cname = chrom_names[c]
@@ -409,37 +489,48 @@ def _run_recomb_outputs(
                 cm_val = float(r["cum_effective_cm"]) / scale_div
                 fh.write(f"{cname}\t{cname}_win{idx}\t{cm_val:.6f}\t{int(r['end_bp'])}\n")
 
-    # Plot <prefix>.recomb_hotspots.<fmt>
-    offsets, spans, total_x = _compute_genome_layout(chrom_names, chrom_lengths_bp, ordered_c)
-    callable_rates = [
-        float(r["per_meiosis_cm_per_mb"])
-        if (generations is not None and generations > 0.0)
-        else float(r["eff_rate_val"])
-        for c in ordered_c
-        for r in enriched_by_chrom[c]
-        if r["callable"]
-    ]
-    all_rates = np.asarray([v for v in callable_rates if math.isfinite(v)], dtype=np.float64)
-    hotspot_thr = float(np.percentile(all_rates, 95.0)) if all_rates.size > 0 else 0.0
+    return tsv_path, map_out_path
 
-    fig, (ax1, ax2) = plt.subplots(
-        2,
-        1,
-        figsize=(max(11.0, min(18.0, 2.2 + 0.9 * len(ordered_c))), 6.8),
-        sharex=True,
-        gridspec_kw={"height_ratios": [1.35, 1.0], "hspace": 0.14},
-    )
 
-    for idx_s, (c, x0, x1, _xc) in enumerate(spans):
+def _plot_recomb_panels(
+    ax1: plt.Axes,
+    ax2: plt.Axes,
+    chrom_names: Sequence[str],
+    plot_chroms: Sequence[int],
+    offsets: dict[int, float],
+    spans: Sequence[tuple[int, float, float, float]],
+    sep_positions: Sequence[float],
+    total_x: float,
+    recomb_ctx: dict[str, Any],
+    ext_map: Optional[dict[str, tuple[np.ndarray, np.ndarray]]],
+    generations: Optional[float],
+    *,
+    show_bottom_xticks: bool = True,
+    title: Optional[str] = None,
+) -> None:
+    enriched_by_chrom: dict[int, list[dict[str, Any]]] = recomb_ctx["enriched_by_chrom"]
+    has_ref_map: bool = recomb_ctx["has_ref_map"]
+    scale_div: float = recomb_ctx["scale_div"]
+    hotspot_thr: float = recomb_ctx["hotspot_thr"]
+
+    for idx_s, (_c, x0, x1, _xc) in enumerate(spans):
         if idx_s % 2 == 1:
             ax1.axvspan(x0, x1, color="#F3F4F6", alpha=0.85, zorder=0)
             ax2.axvspan(x0, x1, color="#F3F4F6", alpha=0.85, zorder=0)
+    for sx in sep_positions:
+        ax1.axvline(sx, color="#D1D5DB", linewidth=0.5, alpha=0.7, zorder=1)
+        ax2.axvline(sx, color="#D1D5DB", linewidth=0.5, alpha=0.7, zorder=1)
 
     ax1_ref = ax1.twinx() if has_ref_map else None
     ax2_ref = ax2.twinx() if (has_ref_map and generations is None) else None
 
-    for idx_s, c in enumerate(ordered_c):
-        rows = enriched_by_chrom[c]
+    labeled_hot = False
+    labeled_cum = False
+    labeled_ref_r = False
+    labeled_ref_c = False
+
+    for idx_s, c in enumerate(plot_chroms):
+        rows = enriched_by_chrom.get(c, [])
         if not rows:
             continue
         off = offsets[c]
@@ -479,17 +570,19 @@ def _run_recomb_outputs(
                     s=14,
                     color="#DC2626",
                     zorder=4,
-                    label="Hotspot (>=95th pct)" if idx_s == 0 else None,
+                    label="Hotspot (>=95th pct)" if not labeled_hot else None,
                 )
+                labeled_hot = True
 
         ax2.plot(
             xs_cum,
             cum_y,
             color=color,
             linewidth=1.4,
-            label="Empirical cumulative cM" if idx_s == 0 else None,
+            label="Empirical cumulative cM" if not labeled_cum else None,
             zorder=3,
         )
+        labeled_cum = True
 
         if has_ref_map:
             ref_r = np.asarray([float(r["ref_cm_per_mb"]) for r in rows], dtype=np.float64)
@@ -510,9 +603,10 @@ def _run_recomb_outputs(
                     linestyle="--",
                     linewidth=0.85,
                     alpha=0.7,
-                    label="Reference map (cM/Mb)" if idx_s == 0 else None,
+                    label="Reference map (cM/Mb)" if not labeled_ref_r else None,
                     zorder=2,
                 )
+                labeled_ref_r = True
             target_ax2 = ax2_ref if ax2_ref is not None else ax2
             if np.any(np.isfinite(ref_c)):
                 target_ax2.plot(
@@ -522,9 +616,10 @@ def _run_recomb_outputs(
                     linestyle="--",
                     linewidth=1.0,
                     alpha=0.8,
-                    label="Reference map (cM)" if idx_s == 0 else None,
+                    label="Reference map (cM)" if not labeled_ref_c else None,
                     zorder=2,
                 )
+                labeled_ref_c = True
 
     if hotspot_thr > 0.0:
         ax1.axhline(hotspot_thr, color="#DC2626", linestyle=":", linewidth=0.9, alpha=0.8)
@@ -532,42 +627,43 @@ def _run_recomb_outputs(
     rate_ylabel = (
         f"Empirical rate (cM/Mb, G={generations:g})"
         if (generations is not None and generations > 0.0)
-        else "Empirical effective rate (cM/Mb)"
+        else "Empirical eff. rate (cM/Mb)"
     )
     cum_ylabel = (
         f"Empirical map (cM, G={generations:g})"
         if (generations is not None and generations > 0.0)
-        else "Empirical cumulative (eff. cM)"
+        else "Empirical cum. (eff. cM)"
     )
-    ax1.set_ylabel(rate_ylabel, fontsize=10, color="#1F2937")
-    ax2.set_ylabel(cum_ylabel, fontsize=10, color="#1F2937")
+    ax1.set_ylabel(rate_ylabel, fontsize=9.5, color="#1F2937")
+    ax2.set_ylabel(cum_ylabel, fontsize=9.5, color="#1F2937")
     ax1.set_ylim(bottom=0.0)
     ax2.set_ylim(bottom=0.0)
     _style_clean_axes(ax1)
     _style_clean_axes(ax2)
+    ax1.tick_params(labelbottom=False)
     if ax1_ref is not None:
-        ax1_ref.set_ylabel("Reference map (cM/Mb)", fontsize=9, color="#4B5563")
+        ax1_ref.set_ylabel("Reference (cM/Mb)", fontsize=8.5, color="#4B5563")
         ax1_ref.spines["top"].set_visible(False)
         ax1_ref.spines["right"].set_color("#6B7280")
-        ax1_ref.tick_params(colors="#4B5563", labelsize=8.5)
+        ax1_ref.tick_params(colors="#4B5563", labelsize=8.0)
         ax1_ref.set_ylim(bottom=0.0)
     if ax2_ref is not None:
-        ax2_ref.set_ylabel("Reference map (cM)", fontsize=9, color="#4B5563")
+        ax2_ref.set_ylabel("Reference (cM)", fontsize=8.5, color="#4B5563")
         ax2_ref.spines["top"].set_visible(False)
         ax2_ref.spines["right"].set_color("#6B7280")
-        ax2_ref.tick_params(colors="#4B5563", labelsize=8.5)
+        ax2_ref.tick_params(colors="#4B5563", labelsize=8.0)
         ax2_ref.set_ylim(bottom=0.0)
 
     ax2.set_xlim(0.0, total_x)
-    ax2.set_xticks([xc for (_c, _x0, _x1, xc) in spans])
-    ax2.set_xticklabels([chrom_names[c] for (c, _x0, _x1, _xc) in spans])
-    ax2.set_xlabel("Chromosome (physical position)", fontsize=10, color="#1F2937")
+    if show_bottom_xticks:
+        ax2.set_xticks([xc for (_c, _x0, _x1, xc) in spans])
+        ax2.set_xticklabels([chrom_names[c] for (c, _x0, _x1, _xc) in spans])
+        ax2.set_xlabel("Chromosome (physical position)", fontsize=10, color="#1F2937")
+    else:
+        ax2.tick_params(labelbottom=False)
 
-    title = (
-        f"Population Recombination Rate & Hotspots "
-        f"(N={data['n_target_samples']} lines, K={data['n_reference_samples']} founders)"
-    )
-    ax1.set_title(title, fontsize=11.5, fontweight="bold", pad=10, color="#111827")
+    if title:
+        ax1.set_title(title, fontsize=11.5, fontweight="bold", pad=10, color="#111827")
 
     handles, labels = ax1.get_legend_handles_labels()
     if ax1_ref is not None:
@@ -582,12 +678,71 @@ def _run_recomb_outputs(
             frameon=True,
             facecolor="white",
             framealpha=0.85,
-            fontsize=8.5,
+            fontsize=8.2,
         )
 
-    fig_path = _save_figure(fig, Path(f"{out_prefix}.recomb_hotspots.{fmt}"), fmt, dpi)
-    logger.info("Recombination outputs written: %s, %s, %s", tsv_path, map_out_path, fig_path)
-    return [tsv_path, map_out_path, fig_path]
+
+def _run_recomb_outputs(
+    data: dict[str, Any],
+    out_prefix: Path,
+    fmt: str,
+    dpi: int,
+    ext_map: Optional[dict[str, tuple[np.ndarray, np.ndarray]]],
+    generations: Optional[float],
+    logger: logging.Logger,
+    *,
+    write_plot: bool = True,
+) -> tuple[list[Path], Optional[dict[str, Any]]]:
+    recomb_ctx = _prepare_recomb_data(data, ext_map, generations, logger)
+    if recomb_ctx is None:
+        return [], None
+
+    chrom_names: list[str] = data["chrom_names"]
+    chrom_lengths_bp: list[int] = data["chrom_lengths_bp"]
+    ordered_c: list[int] = recomb_ctx["ordered_c"]
+
+    tsv_path, map_out_path = _write_recomb_tables(
+        chrom_names, recomb_ctx, out_prefix, generations
+    )
+    written: list[Path] = [tsv_path, map_out_path]
+
+    if write_plot:
+        offsets, spans, sep_positions, total_x, _total_mb = _compute_exact_genome_spans(
+            chrom_lengths_bp, ordered_c
+        )
+        fig, (ax1, ax2) = plt.subplots(
+            2,
+            1,
+            figsize=(max(11.0, min(18.0, 2.2 + 0.9 * len(ordered_c))), 6.8),
+            sharex=True,
+            gridspec_kw={"height_ratios": [1.35, 1.0], "hspace": 0.14},
+        )
+        title = (
+            f"Population Recombination Rate & Hotspots "
+            f"(N={data['n_target_samples']} lines, {_ancestry_count_label(data)})"
+        )
+        _plot_recomb_panels(
+            ax1,
+            ax2,
+            chrom_names,
+            ordered_c,
+            offsets,
+            spans,
+            sep_positions,
+            total_x,
+            recomb_ctx,
+            ext_map,
+            generations,
+            show_bottom_xticks=True,
+            title=title,
+        )
+        fig_path = _save_figure(fig, Path(f"{out_prefix}.recomb_hotspots.{fmt}"), fmt, dpi)
+        written.append(fig_path)
+        logger.info("Recombination outputs written: %s, %s, %s", tsv_path, map_out_path, fig_path)
+    else:
+        logger.info("Recombination tables written: %s, %s", tsv_path, map_out_path)
+
+    return written, recomb_ctx
 
 
 # ---------------------------------------------------------------------------
@@ -604,14 +759,12 @@ def _run_segregation_outputs(
     logger: logging.Logger,
 ) -> list[Path]:
     chrom_names: list[str] = data["chrom_names"]
-    chrom_lengths_bp: list[int] = data["chrom_lengths_bp"]
     parent_ids: list[str] = data["reference_sample_ids"]
     n_parents = len(parent_ids)
     contrib_chroms: list[dict[str, Any]] = data["parent_contrib_chroms"]
-    seg_windows: list[dict[str, Any]] = data["segregation_windows"]
 
-    if not contrib_chroms or not seg_windows:
-        logger.warning("No segregation data found in archive; skipping -segregation outputs.")
+    if not contrib_chroms:
+        logger.warning("No founder contribution data found in archive; skipping -segregation outputs.")
         return []
 
     ordered_c = _ordered_chrom_indices(chrom_names)
@@ -621,7 +774,6 @@ def _run_segregation_outputs(
     gw_bp = np.zeros(n_parents, dtype=np.float64)
     gw_cm = np.zeros(n_parents, dtype=np.float64)
     gw_called_bp = 0.0
-    gw_total_bp = 0.0
     chrom_props = np.zeros((len(ordered_c), n_parents), dtype=np.float64)
     for row_i, c in enumerate(ordered_c):
         entry = contrib_map.get(c)
@@ -630,11 +782,9 @@ def _run_segregation_outputs(
         p_bp = np.asarray(entry["parent_bp"], dtype=np.float64)
         p_cm = np.asarray(entry["parent_cm"], dtype=np.float64)
         c_bp = float(entry["called_bp"])
-        t_bp = float(entry["total_bp"])
         gw_bp += p_bp
         gw_cm += p_cm
         gw_called_bp += c_bp
-        gw_total_bp += t_bp
         if c_bp > 0.0:
             chrom_props[row_i, :] = p_bp / c_bp
 
@@ -672,7 +822,7 @@ def _run_segregation_outputs(
                 + "\n"
             )
 
-    # Plot 2A: <prefix>.parent_contribution.<fmt>
+    # Plot <prefix>.parent_contribution.<fmt>
     fig_h = max(5.5, min(14.0, 2.2 + 0.28 * n_parents))
     fig, (ax_l, ax_r) = plt.subplots(
         1,
@@ -697,7 +847,12 @@ def _run_segregation_outputs(
     ax_l.set_yticklabels(bar_labels, fontsize=8.5)
     ax_l.invert_yaxis()
     ax_l.set_xlabel("Genome-wide contribution (%)", fontsize=10)
-    ax_l.set_title("Genome-Wide Founder Contribution", fontsize=11, fontweight="bold")
+    grouped = bool(data.get("grouped_parents", False))
+    ax_l.set_title(
+        "Genome-Wide Ancestry Contribution" if grouped else "Genome-Wide Founder Contribution",
+        fontsize=11,
+        fontweight="bold",
+    )
     max_bar = max(bar_vals) if bar_vals else 10.0
     ax_l.set_xlim(0.0, max_bar * 1.18)
     for y_i, val in zip(y_pos, bar_vals):
@@ -727,144 +882,20 @@ def _run_segregation_outputs(
     ax_r.set_ylim(0.0, 100.0)
     ax_r.set_ylabel("Called ancestry proportion (%)", fontsize=10)
     ax_r.set_xlabel("Chromosome", fontsize=10)
-    ax_r.set_title("Per-Chromosome Founder Composition", fontsize=11, fontweight="bold")
+    ax_r.set_title(
+        "Per-Chromosome Ancestry Composition" if grouped else "Per-Chromosome Founder Composition",
+        fontsize=11,
+        fontweight="bold",
+    )
     _style_clean_axes(ax_r)
 
     contrib_fig = _save_figure(fig, Path(f"{out_prefix}.parent_contribution.{fmt}"), fmt, dpi)
-
-    # Group descriptive segregation windows per chromosome (retaining descriptive
-    # chi-square divergence without uncalibrated asymptotic p-values).
-    by_chrom_seg: dict[int, list[dict[str, Any]]] = {c: [] for c in ordered_c}
-    for r in seg_windows:
-        c = int(r["chrom_idx"])
-        if c not in by_chrom_seg:
-            continue
-        eff_n = float(r["eff_samples"])
-        expected = float(r.get("expected_per_parent", eff_n / max(1, n_parents)))
-        item = dict(r)
-        item["expected_per_parent"] = expected
-        by_chrom_seg[c].append(item)
-    for c in ordered_c:
-        by_chrom_seg[c].sort(key=lambda r: int(r["start_bp"]))
-
-    seg_tsv = Path(f"{out_prefix}.segregation.window.tsv")
-    with seg_tsv.open("w", encoding="utf-8") as fh:
-        fh.write(
-            "\t".join(
-                [
-                    "chrom",
-                    "start_bp",
-                    "end_bp",
-                    "mid_bp",
-                    "eff_samples",
-                    "uncalled_frac",
-                    "expected_per_parent",
-                    "chi2",
-                    "top_parent",
-                    "top_parent_prop",
-                ]
-                + [f"prop_{pid}" for pid in parent_ids]
-            )
-            + "\n"
-        )
-        for c in ordered_c:
-            cname = chrom_names[c]
-            for r in by_chrom_seg[c]:
-                top_p = (
-                    parent_ids[int(r["max_parent_idx"])]
-                    if int(r["max_parent_idx"]) < n_parents
-                    else "NA"
-                )
-                props_str = [f"{float(v):.5f}" for v in r["parent_props"]]
-                fh.write(
-                    "\t".join(
-                        [
-                            cname,
-                            str(int(r["start_bp"])),
-                            str(int(r["end_bp"])),
-                            str(int(r["mid_bp"])),
-                            f"{float(r['eff_samples']):.2f}",
-                            f"{float(r['uncalled_frac']):.5f}",
-                            f"{float(r['expected_per_parent']):.3f}",
-                            f"{float(r['chi2']):.4f}",
-                            top_p,
-                            f"{float(r['max_parent_prop']):.5f}",
-                        ]
-                        + props_str
-                    )
-                    + "\n"
-                )
-
-    # Plot 2B: <prefix>.segregation_distortion.<fmt>
-    offsets, spans, total_x = _compute_genome_layout(chrom_names, chrom_lengths_bp, ordered_c)
-
-    fig2, (ax_top, ax_bot) = plt.subplots(
-        2,
-        1,
-        figsize=(max(12.0, min(18.0, 2.5 + 0.9 * len(ordered_c))), 7.6),
-        sharex=True,
-        gridspec_kw={"height_ratios": [1.35, 1.0], "hspace": 0.14},
-    )
-
-    for idx_s, (c, x0, x1, _xc) in enumerate(spans):
-        if idx_s % 2 == 1:
-            ax_bot.axvspan(x0, x1, color="#F3F4F6", alpha=0.85, zorder=0)
-
-    stack_colors = [parent_colors[p] for p in parent_order] + [_UNCALLED_COLOR]
-    for idx_s, c in enumerate(ordered_c):
-        rows = by_chrom_seg[c]
-        if not rows:
-            continue
-        off = offsets[c]
-        xs = np.asarray([off + float(r["mid_bp"]) / 1_000_000.0 for r in rows], dtype=np.float64)
-        uncalled = np.asarray([float(r["uncalled_frac"]) for r in rows], dtype=np.float64)
-        called_scale = np.clip(1.0 - uncalled, 0.0, 1.0)
-        mat = np.zeros((n_parents + 1, len(rows)), dtype=np.float64)
-        for j, r in enumerate(rows):
-            props = r["parent_props"]
-            for row_p, p in enumerate(parent_order):
-                mat[row_p, j] = float(props[p]) * called_scale[j] * 100.0
-            mat[n_parents, j] = uncalled[j] * 100.0
-        ax_top.stackplot(xs, mat, colors=stack_colors, linewidth=0.0, antialiased=False)
-
-        line_c = "#1D4ED8" if idx_s % 2 == 0 else "#0F766E"
-        y_bot = np.asarray([float(r["chi2"]) for r in rows], dtype=np.float64)
-        valid_b = np.isfinite(y_bot)
-        if np.any(valid_b):
-            ax_bot.plot(xs, y_bot, color=line_c, linewidth=1.1, zorder=3)
-            ax_bot.fill_between(
-                xs, 0.0, y_bot, where=valid_b, color=line_c, alpha=0.16, linewidth=0.0, zorder=2
-            )
-
-    ax_top.set_ylim(0.0, 100.0)
-    ax_top.set_ylabel("Founder proportion (%)", fontsize=10)
-    ax_top.set_title(
-        f"Along-Chromosome Founder Proportion & Segregation Divergence "
-        f"(N={data['n_target_samples']}, K={n_parents})",
-        fontsize=11.5,
-        fontweight="bold",
-        pad=10,
-    )
-    ax_bot.set_ylim(bottom=0.0)
-    ax_bot.set_ylabel(r"Descriptive $\chi^2$ vs uniform ($1/K$)", fontsize=10)
-    ax_bot.set_xlim(0.0, total_x)
-    ax_bot.set_xticks([xc for (_c, _x0, _x1, xc) in spans])
-    ax_bot.set_xticklabels([chrom_names[c] for (c, _x0, _x1, _xc) in spans])
-    ax_bot.set_xlabel("Chromosome (physical position)", fontsize=10)
-    _style_clean_axes(ax_top)
-    _style_clean_axes(ax_bot)
-
-    _attach_right_founder_legend(ax_top, parent_ids, parent_colors, order=parent_order)
-
-    seg_fig = _save_figure(fig2, Path(f"{out_prefix}.segregation_distortion.{fmt}"), fmt, dpi)
     logger.info(
-        "Segregation outputs written: %s, %s, %s, %s",
+        "Founder contribution outputs written: %s, %s",
         contrib_tsv,
         contrib_fig,
-        seg_tsv,
-        seg_fig,
     )
-    return [contrib_tsv, contrib_fig, seg_tsv, seg_fig]
+    return [contrib_tsv, contrib_fig]
 
 
 # ---------------------------------------------------------------------------
@@ -909,6 +940,96 @@ def _cluster_pop_mosaic_rows(mat: np.ndarray) -> tuple[np.ndarray, str]:
     return np.asarray([k[1] for k in keys], dtype=int), "sorted by ancestry anchors"
 
 
+def _prepare_pop_mosaic_genome(
+    chrom_lengths_bp: Sequence[int],
+    pop_mosaics: Sequence[dict[str, Any]],
+    ordered_c: Sequence[int],
+) -> Optional[dict[str, Any]]:
+    pop_by_c = {int(pm["chrom_idx"]): pm for pm in pop_mosaics}
+    active_c = [c for c in ordered_c if c in pop_by_c]
+    if not active_c:
+        return None
+    n_s_genome = int(pop_by_c[active_c[0]]["n_samples"])
+    valid_c = [c for c in active_c if int(pop_by_c[c]["n_samples"]) == n_s_genome]
+    cluster_blocks: list[np.ndarray] = []
+    blocks_by_c: dict[int, np.ndarray] = {}
+    for c in valid_c:
+        pm = pop_by_c[c]
+        n_b = int(pm["n_bins"])
+        block = np.asarray(pm["parent_matrix"], dtype=np.int16).reshape((n_s_genome, n_b))
+        cluster_blocks.append(block)
+        blocks_by_c[c] = block
+    if not cluster_blocks:
+        return None
+
+    cluster_mat = np.concatenate(cluster_blocks, axis=1)
+    row_order, cluster_label = _cluster_pop_mosaic_rows(cluster_mat)
+    offsets, spans_mb, sep_positions, total_x, total_mb = _compute_exact_genome_spans(
+        chrom_lengths_bp, valid_c
+    )
+    return {
+        "pop_by_c": pop_by_c,
+        "active_c": active_c,
+        "valid_c": valid_c,
+        "n_s_genome": n_s_genome,
+        "blocks_by_c": blocks_by_c,
+        "row_order": row_order,
+        "cluster_label": cluster_label,
+        "offsets": offsets,
+        "spans_mb": spans_mb,
+        "sep_positions": sep_positions,
+        "total_x": total_x,
+        "total_mb": total_mb,
+    }
+
+
+def _plot_pop_mosaic_panel(
+    ax: plt.Axes,
+    chrom_names: Sequence[str],
+    genome_ctx: dict[str, Any],
+    parent_ids: Sequence[str],
+    parent_colors: Sequence[str],
+    *,
+    title: Optional[str] = None,
+    legend_title: str = "Founders",
+) -> None:
+    n_parents = len(parent_ids)
+    n_s_genome: int = genome_ctx["n_s_genome"]
+    spans_mb: list[tuple[int, float, float, float]] = genome_ctx["spans_mb"]
+    sep_positions: list[float] = genome_ctx["sep_positions"]
+    total_x: float = genome_ctx["total_x"]
+    blocks_by_c: dict[int, np.ndarray] = genome_ctx["blocks_by_c"]
+    row_order: np.ndarray = genome_ctx["row_order"]
+    cluster_label: str = genome_ctx["cluster_label"]
+
+    cmap_genome = mcolors.ListedColormap([_UNCALLED_COLOR] + list(parent_colors))
+    norm_genome = mcolors.BoundaryNorm(np.arange(-1.5, n_parents + 0.5, 1.0), cmap_genome.N)
+
+    for c, x0, x1, _xc in spans_mb:
+        block_sorted = blocks_by_c[c][row_order, :]
+        ax.imshow(
+            block_sorted,
+            aspect="auto",
+            interpolation="nearest",
+            cmap=cmap_genome,
+            norm=norm_genome,
+            extent=(x0, x1, float(n_s_genome), 0.0),
+        )
+    for sx in sep_positions:
+        ax.axvline(sx, color="#D1D5DB", linewidth=0.5, alpha=0.8)
+
+    ax.set_xlim(0.0, total_x)
+    ax.set_ylim(float(n_s_genome), 0.0)
+    ax.set_xticks([xc for (_c, _x0, _x1, xc) in spans_mb])
+    ax.set_xticklabels([chrom_names[c] for (c, _x0, _x1, _xc) in spans_mb], fontsize=9.5)
+    ax.set_xlabel("Chromosome (proportional to physical length)", fontsize=10.5)
+    ax.set_ylabel(f"Target lines ({cluster_label}, n={n_s_genome})", fontsize=10.5)
+    if title:
+        ax.set_title(title, fontsize=11.5, fontweight="bold", pad=10)
+    _style_clean_axes(ax)
+    _attach_right_founder_legend(ax, parent_ids, parent_colors, title=legend_title)
+
+
 def _run_mosaic_outputs(
     data: dict[str, Any],
     out_prefix: Path,
@@ -917,11 +1038,17 @@ def _run_mosaic_outputs(
     parent_colors: Sequence[str],
     per_chrom_mosaic: bool,
     logger: logging.Logger,
+    *,
+    recomb_ctx: Optional[dict[str, Any]] = None,
+    ext_map: Optional[dict[str, tuple[np.ndarray, np.ndarray]]] = None,
+    generations: Optional[float] = None,
 ) -> list[Path]:
     chrom_names: list[str] = data["chrom_names"]
     chrom_lengths_bp: list[int] = data["chrom_lengths_bp"]
     parent_ids: list[str] = data["reference_sample_ids"]
     n_parents = len(parent_ids)
+    ancestry_label = _ancestry_count_label(data)
+    legend_title = "Ancestry" if bool(data.get("grouped_parents", False)) else "Founders"
     mosaic_samples: list[dict[str, Any]] = data["mosaic_samples"]
     mosaic_segments: list[dict[str, Any]] = data["mosaic_segments"]
     pop_mosaics: list[dict[str, Any]] = data["pop_mosaics"]
@@ -929,77 +1056,76 @@ def _run_mosaic_outputs(
 
     written: list[Path] = []
 
-    # 3A: Whole-genome multi-chromosome clustered population mosaic (all samples
-    # as clustered rows, all chromosomes plotted at exact physical Mb extents,
-    # founder legend on the far right).
-    pop_by_c = {int(pm["chrom_idx"]): pm for pm in pop_mosaics}
-    active_c = [c for c in ordered_c if c in pop_by_c]
-    if active_c:
-        n_s_genome = int(pop_by_c[active_c[0]]["n_samples"])
-        valid_c = [c for c in active_c if int(pop_by_c[c]["n_samples"]) == n_s_genome]
-        cluster_blocks: list[np.ndarray] = []
-        blocks_by_c: dict[int, np.ndarray] = {}
-        for c in valid_c:
-            pm = pop_by_c[c]
-            n_b = int(pm["n_bins"])
-            block = np.asarray(pm["parent_matrix"], dtype=np.int16).reshape((n_s_genome, n_b))
-            cluster_blocks.append(block)
-            blocks_by_c[c] = block
+    # 3A: Whole-genome multi-chromosome clustered population mosaic (either
+    # combined with the two recombination tracks aligned above it when both
+    # -recomb and -mosaic are requested, or standalone mosaic_genome).
+    genome_ctx = _prepare_pop_mosaic_genome(chrom_lengths_bp, pop_mosaics, ordered_c)
+    active_c = genome_ctx["active_c"] if genome_ctx is not None else []
+    pop_by_c = genome_ctx["pop_by_c"] if genome_ctx is not None else {}
 
-        if cluster_blocks:
-            cluster_mat = np.concatenate(cluster_blocks, axis=1)
-            row_order, cluster_label = _cluster_pop_mosaic_rows(cluster_mat)
+    if genome_ctx is not None:
+        valid_c = genome_ctx["valid_c"]
+        n_s_genome = genome_ctx["n_s_genome"]
+        total_mb = genome_ctx["total_mb"]
+        fig_w = max(13.0, min(20.0, 4.5 + 1.0 * len(valid_c)))
 
-            # Exact physical Mb x-axis extents so column widths strictly match physical length.
-            lengths_mb = [float(chrom_lengths_bp[c]) / 1_000_000.0 for c in valid_c]
-            total_mb = max(sum(lengths_mb), 1e-6)
-            gap_mb = total_mb * 0.012 if len(valid_c) > 1 else 0.0
-            spans_mb: list[tuple[int, float, float, float]] = []
-            sep_positions: list[float] = []
-            cursor = 0.0
-            for idx_c, (c, l_mb) in enumerate(zip(valid_c, lengths_mb)):
-                spans_mb.append((c, cursor, cursor + l_mb, cursor + 0.5 * l_mb))
-                cursor += l_mb
-                if idx_c + 1 < len(valid_c) and gap_mb > 0.0:
-                    sep_positions.append(cursor + 0.5 * gap_mb)
-                    cursor += gap_mb
-            total_x = max(cursor, 1e-6)
-
-            cmap_genome = mcolors.ListedColormap([_UNCALLED_COLOR] + list(parent_colors))
-            norm_genome = mcolors.BoundaryNorm(np.arange(-1.5, n_parents + 0.5, 1.0), cmap_genome.N)
-
-            fig_w = max(13.0, min(20.0, 4.5 + 1.0 * len(valid_c)))
+        if recomb_ctx is not None:
+            mosaic_h = max(5.6, min(9.5, 4.2 + 0.0028 * n_s_genome))
+            fig_h = mosaic_h + 4.4
+            fig, (ax_rate, ax_cum, ax_mosaic) = plt.subplots(
+                3,
+                1,
+                figsize=(fig_w, fig_h),
+                sharex=True,
+                gridspec_kw={"height_ratios": [1.15, 0.90, 2.75], "hspace": 0.10},
+            )
+            combined_title = (
+                f"Population Recombination & Ancestry Mosaic "
+                f"(n={n_s_genome} lines, {len(valid_c)} chroms, {total_mb:.1f} Mb, {ancestry_label})"
+            )
+            _plot_recomb_panels(
+                ax_rate,
+                ax_cum,
+                chrom_names,
+                valid_c,
+                genome_ctx["offsets"],
+                genome_ctx["spans_mb"],
+                genome_ctx["sep_positions"],
+                genome_ctx["total_x"],
+                recomb_ctx,
+                ext_map,
+                generations,
+                show_bottom_xticks=False,
+                title=combined_title,
+            )
+            _plot_pop_mosaic_panel(
+                ax_mosaic,
+                chrom_names,
+                genome_ctx,
+                parent_ids,
+                parent_colors,
+                title=None,
+                legend_title=legend_title,
+            )
+            combined_path = _save_figure(
+                fig, Path(f"{out_prefix}.recomb_mosaic.{fmt}"), fmt, dpi
+            )
+            written.append(combined_path)
+        else:
             fig_h = max(6.2, min(11.0, 4.5 + 0.003 * n_s_genome))
             fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-            for c, x0, x1, _xc in spans_mb:
-                block_sorted = blocks_by_c[c][row_order, :]
-                ax.imshow(
-                    block_sorted,
-                    aspect="auto",
-                    interpolation="nearest",
-                    cmap=cmap_genome,
-                    norm=norm_genome,
-                    extent=(x0, x1, float(n_s_genome), 0.0),
-                )
-            for sx in sep_positions:
-                ax.axvline(sx, color="#D1D5DB", linewidth=0.5, alpha=0.8)
-
-            ax.set_xlim(0.0, total_x)
-            ax.set_ylim(float(n_s_genome), 0.0)
-            ax.set_xticks([xc for (_c, _x0, _x1, xc) in spans_mb])
-            ax.set_xticklabels([chrom_names[c] for (c, _x0, _x1, _xc) in spans_mb], fontsize=9.5)
-            ax.set_xlabel("Chromosome (proportional to physical length)", fontsize=10.5)
-            ax.set_ylabel(f"Target lines ({cluster_label}, n={n_s_genome})", fontsize=10.5)
-            ax.set_title(
-                f"Whole-Genome Population Ancestry Mosaic "
-                f"(n={n_s_genome} lines, {len(valid_c)} chroms, {total_mb:.1f} Mb, K={n_parents} founders)",
-                fontsize=11.5,
-                fontweight="bold",
-                pad=10,
+            _plot_pop_mosaic_panel(
+                ax,
+                chrom_names,
+                genome_ctx,
+                parent_ids,
+                parent_colors,
+                title=(
+                    f"Whole-Genome Population Ancestry Mosaic "
+                    f"(n={n_s_genome} lines, {len(valid_c)} chroms, {total_mb:.1f} Mb, {ancestry_label})"
+                ),
+                legend_title=legend_title,
             )
-            _style_clean_axes(ax)
-            _attach_right_founder_legend(ax, parent_ids, parent_colors)
-
             genome_path = _save_figure(fig, Path(f"{out_prefix}.mosaic_genome.{fmt}"), fmt, dpi)
             written.append(genome_path)
 
@@ -1068,13 +1194,13 @@ def _run_mosaic_outputs(
         ax.set_xticklabels([chrom_names[c] for (c, _x0, _x1, _xc) in spans], fontsize=9.5)
         ax.set_xlabel("Chromosome (physical position)", fontsize=10)
         ax.set_title(
-            f"Representative Sample Ancestry Mosaic ({n_show} lines, K={n_parents} founders)",
+            f"Representative Sample Ancestry Mosaic ({n_show} lines, {ancestry_label})",
             fontsize=11.5,
             fontweight="bold",
             pad=10,
         )
         _style_clean_axes(ax)
-        _attach_right_founder_legend(ax, parent_ids, parent_colors)
+        _attach_right_founder_legend(ax, parent_ids, parent_colors, title=legend_title)
 
         karyo_path = _save_figure(fig, Path(f"{out_prefix}.mosaic_samples.{fmt}"), fmt, dpi)
         written.append(karyo_path)
@@ -1105,13 +1231,13 @@ def _run_mosaic_outputs(
             ax.set_xlabel(f"Chromosome {cname} physical position (Mb)", fontsize=10)
             ax.set_ylabel(f"Target lines ({chrom_cluster_label}, n={n_s})", fontsize=10)
             ax.set_title(
-                f"Population Ancestry Mosaic — {cname} (K={n_parents} founders)",
+                f"Population Ancestry Mosaic — {cname} ({ancestry_label})",
                 fontsize=11.5,
                 fontweight="bold",
                 pad=10,
             )
             _style_clean_axes(ax)
-            _attach_right_founder_legend(ax, parent_ids, parent_colors)
+            _attach_right_founder_legend(ax, parent_ids, parent_colors, title=legend_title)
 
             safe_cname = str(cname).replace("/", "_").replace(" ", "_")
             chrom_tag = safe_cname if safe_cname.lower().startswith("chr") else f"chr{safe_cname}"
@@ -1138,7 +1264,7 @@ def build_parser() -> CliArgumentParser:
         epilog=minimal_help_epilog(
             [
                 "jx postibd -i cubic.jhibd -o cubic_post -fmt png",
-                "jx postibd -i cubic.jhibd -o cubic_post -map NAM.map -recomb -segregation -fmt pdf",
+                "jx postibd -i cubic.jhibd -o cubic_post -map NAM.map -recomb -mosaic -fmt pdf",
                 "jx postibd -i cubic.jhibd -o cubic_post -mosaic -fmt pdf",
             ]
         ),
@@ -1184,19 +1310,19 @@ def build_parser() -> CliArgumentParser:
         "-recomb",
         "--recomb",
         action="store_true",
-        help="Compute empirical recombination rate, write .recomb.window.tsv & .empirical.map, and plot hotspots.",
+        help="Compute empirical recombination rate, write .recomb.window.tsv & .empirical.map, and plot hotspots (combined above mosaic when -mosaic is also set).",
     )
     plot_group.add_argument(
         "-segregation",
         "--segregation",
         action="store_true",
-        help="Compute parent contributions & descriptive segregation divergence TSVs and plots.",
+        help="Compute genome-wide and per-chromosome founder contribution table and stacked bar plot.",
     )
     plot_group.add_argument(
         "-mosaic",
         "--mosaic",
         action="store_true",
-        help="Plot whole-genome clustered multi-chromosome population mosaic and representative sample karyotype.",
+        help="Plot whole-genome clustered multi-chromosome population mosaic and representative sample karyotype (aligned below recombination tracks when -recomb is also set).",
     )
 
     opt_group = parser.add_argument_group("Analysis & Display Options")
@@ -1206,7 +1332,7 @@ def build_parser() -> CliArgumentParser:
         dest="window_mb",
         type=float,
         default=1.0,
-        help="Physical window size in Mb for recombination & segregation curves (default: 1.0).",
+        help="Physical window size in Mb for recombination curves (default: 1.0).",
     )
     opt_group.add_argument(
         "--min-window-coverage",
@@ -1221,6 +1347,14 @@ def build_parser() -> CliArgumentParser:
         dest="map",
         default=None,
         help="Optional 4-column PLINK genetic map (.map) to overlay against empirical recombination rate.",
+    )
+    opt_group.add_argument(
+        "-group",
+        "--group",
+        "--parent-group",
+        dest="group",
+        default=None,
+        help="Optional 2-column whitespace/tab file mapping reference parent IDs to ancestry group names (e.g. A, B) for grouped coloring and contributions.",
     )
     opt_group.add_argument(
         "--generations",
@@ -1322,6 +1456,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     ("Window (Mb)", f"{args.window_mb:g}"),
                     ("Min window cov", f"{args.min_window_coverage:g}"),
                     ("Reference map", str(args.map) if args.map else "embedded / none"),
+                    ("Ancestry group", str(args.group) if args.group else "none"),
                 ],
             )
         ],
@@ -1330,6 +1465,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
 
     t0 = time.perf_counter()
+    parent_groups: dict[str, str] = {}
+    if args.group:
+        group_path = Path(str(args.group)).expanduser()
+        if not group_path.is_file():
+            raise FileNotFoundError(f"Ancestry group file not found: {args.group}")
+        parent_groups = _read_parent_group_file(group_path)
+
     mosaic_samples = (
         [s.strip() for s in str(args.samples).split(",") if s.strip()]
         if args.samples
@@ -1353,6 +1495,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "mosaic_chroms": mosaic_chroms,
         "pop_mosaic_bins": max(20, int(args.pop_bins)),
         "max_pop_samples": max(0, int(args.max_pop_samples)),
+        "parent_groups": parent_groups,
     }
 
     with CliStatus("Reading .jhibd sparse archive & aggregating metrics...", enabled=use_spinner) as task:
@@ -1364,6 +1507,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
             raw_json = jxrs.haploid_ibd_post_extract(json.dumps(rust_opts))
             data = json.loads(raw_json)
+            if parent_groups:
+                if "grouped_parents" not in data:
+                    raise RuntimeError(
+                        "Compiled Rust extension does not support -group / parent_groups; "
+                        "please rebuild the JanusX Rust extension."
+                    )
+                if not data["grouped_parents"]:
+                    logger.warning(
+                        "None of the %d reference parent IDs matched entries in the group file; "
+                        "keeping individual founder labels.",
+                        int(data["n_reference_samples"]),
+                    )
             if want_mosaic and mosaic_chroms and not data["pop_mosaics"]:
                 raise ValueError(
                     f"No ancestry data to plot for --chrom {','.join(mosaic_chroms)}."
@@ -1373,14 +1528,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             raise
         task.complete("Reading .jhibd sparse archive ...Finished")
 
-    logger.info(
-        "Loaded %s: %d lines, %d founders, %d chroms, %d ancestry segments.",
-        input_path.name,
-        int(data["n_target_samples"]),
-        int(data["n_reference_samples"]),
-        len(data["chrom_names"]),
-        int(data["total_segments"]),
-    )
+    if bool(data.get("grouped_parents", False)):
+        logger.info(
+            "Loaded %s: %d lines, %d founders (%d ancestry categories), %d chroms, %d ancestry segments.",
+            input_path.name,
+            int(data["n_target_samples"]),
+            int(data["n_reference_samples"]),
+            len(data["reference_sample_ids"]),
+            len(data["chrom_names"]),
+            int(data["total_segments"]),
+        )
+    else:
+        logger.info(
+            "Loaded %s: %d lines, %d founders, %d chroms, %d ancestry segments.",
+            input_path.name,
+            int(data["n_target_samples"]),
+            int(data["n_reference_samples"]),
+            len(data["chrom_names"]),
+            int(data["total_segments"]),
+        )
 
     ext_map = None
     if args.map:
@@ -1389,32 +1555,39 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             raise FileNotFoundError(f"Genetic map file not found: {args.map}")
         ext_map = _read_plink_map(map_path)
 
-    parent_colors = _build_parent_colors(int(data["n_reference_samples"]))
+    parent_colors = _build_parent_colors(len(data["reference_sample_ids"]))
     all_outputs: list[Path] = []
+    combine_recomb_mosaic = bool(
+        want_recomb and want_mosaic and data.get("recomb_windows") and data.get("pop_mosaics")
+    )
+    recomb_ctx: Optional[dict[str, Any]] = None
 
     if want_recomb:
-        with CliStatus("Generating recombination rate map & hotspot plot...", enabled=use_spinner) as task:
+        status_msg = (
+            "Computing recombination rate tables & empirical map..."
+            if combine_recomb_mosaic
+            else "Generating recombination rate map & hotspot plot..."
+        )
+        with CliStatus(status_msg, enabled=use_spinner) as task:
             try:
-                all_outputs.extend(
-                    _run_recomb_outputs(
-                        data=data,
-                        out_prefix=out_prefix,
-                        fmt=args.fmt,
-                        dpi=args.dpi,
-                        ext_map=ext_map,
-                        generations=args.generations,
-                        logger=logger,
-                    )
+                recomb_paths, recomb_ctx = _run_recomb_outputs(
+                    data=data,
+                    out_prefix=out_prefix,
+                    fmt=args.fmt,
+                    dpi=args.dpi,
+                    ext_map=ext_map,
+                    generations=args.generations,
+                    logger=logger,
+                    write_plot=not combine_recomb_mosaic,
                 )
+                all_outputs.extend(recomb_paths)
             except Exception:
                 task.fail("Generating recombination outputs ...Failed")
                 raise
             task.complete("Generating recombination outputs ...Finished")
 
     if want_segregation:
-        with CliStatus(
-            "Generating parent contribution & segregation divergence plots...", enabled=use_spinner
-        ) as task:
+        with CliStatus("Generating founder contribution table & plot...", enabled=use_spinner) as task:
             try:
                 all_outputs.extend(
                     _run_segregation_outputs(
@@ -1427,12 +1600,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     )
                 )
             except Exception:
-                task.fail("Generating segregation outputs ...Failed")
+                task.fail("Generating founder contribution outputs ...Failed")
                 raise
-            task.complete("Generating segregation outputs ...Finished")
+            task.complete("Generating founder contribution outputs ...Finished")
 
     if want_mosaic:
-        with CliStatus("Rendering chromosome mosaic paintings...", enabled=use_spinner) as task:
+        mosaic_status = (
+            "Rendering aligned recombination + chromosome mosaic figure..."
+            if combine_recomb_mosaic
+            else "Rendering chromosome mosaic paintings..."
+        )
+        with CliStatus(mosaic_status, enabled=use_spinner) as task:
             try:
                 all_outputs.extend(
                     _run_mosaic_outputs(
@@ -1443,6 +1621,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         parent_colors=parent_colors,
                         per_chrom_mosaic=bool(args.per_chrom_mosaic or len(mosaic_chroms) > 0),
                         logger=logger,
+                        recomb_ctx=recomb_ctx if combine_recomb_mosaic else None,
+                        ext_map=ext_map,
+                        generations=args.generations,
                     )
                 )
             except Exception:

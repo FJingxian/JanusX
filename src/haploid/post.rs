@@ -59,6 +59,10 @@ pub struct PostIbdConfig {
     pub pop_mosaic_bins: usize,
     /// Maximum samples included in population mosaic heatmaps (`0` = all samples).
     pub max_pop_samples: usize,
+    /// Optional mapping from reference parent ID to ancestry group name
+    /// (e.g., `{"YZW1": "A", "YZW2": "B"}`) used to aggregate contributions
+    /// and mosaic coloring by group while preserving founder-level breakpoints.
+    pub parent_groups: HashMap<String, String>,
 }
 
 impl Default for PostIbdConfig {
@@ -75,6 +79,7 @@ impl Default for PostIbdConfig {
             mosaic_chroms: Vec::new(),
             pop_mosaic_bins: default_pop_mosaic_bins(),
             max_pop_samples: default_max_pop_samples(),
+            parent_groups: HashMap::new(),
         }
     }
 }
@@ -162,6 +167,8 @@ pub struct PostIbdResult {
     pub chrom_names: Vec<String>,
     pub chrom_lengths_bp: Vec<u64>,
     pub reference_sample_ids: Vec<String>,
+    #[serde(default)]
+    pub grouped_parents: bool,
     pub recomb_windows: Vec<RecombWindowRow>,
     pub parent_contrib_chroms: Vec<ParentContributionChrom>,
     pub segregation_windows: Vec<SegregationWindowRow>,
@@ -277,13 +284,19 @@ pub fn extract_post_ibd_from_archive(
         (Vec::new(), vec![0u64; n_samples])
     };
 
-    // 2. Parent contribution & windowed segregation distortion.
+    // Resolve optional parent -> ancestry group mapping (sorted group names).
+    let (group_names, parent_to_group, grouped_parents) =
+        resolve_parent_groups(&archive.reference_sample_ids, &config.parent_groups)?;
+    let n_groups = group_names.len();
+
+    // 2. Parent / group contribution & windowed segregation distortion.
     let (parent_contrib_chroms, segregation_windows) = if config.want_segregation {
         compute_segregation_from_bins(
             &bins_by_chrom,
             &chrom_lengths_bp,
             n_samples,
-            n_parents,
+            n_groups,
+            &parent_to_group,
             config.window_bp,
         )
     } else {
@@ -299,6 +312,8 @@ pub fn extract_post_ibd_from_archive(
             &chrom_lengths_bp,
             &sample_n_haps,
             &sample_breakpoints,
+            n_groups,
+            &parent_to_group,
             config,
         )
     } else {
@@ -313,7 +328,8 @@ pub fn extract_post_ibd_from_archive(
         total_haplotype_tracks,
         chrom_names: archive.chrom_names.clone(),
         chrom_lengths_bp,
-        reference_sample_ids: archive.reference_sample_ids.clone(),
+        reference_sample_ids: group_names,
+        grouped_parents,
         recomb_windows,
         parent_contrib_chroms,
         segregation_windows,
@@ -321,6 +337,66 @@ pub fn extract_post_ibd_from_archive(
         mosaic_segments,
         pop_mosaics,
     })
+}
+
+fn resolve_parent_groups(
+    reference_sample_ids: &[String],
+    parent_groups: &HashMap<String, String>,
+) -> Result<(Vec<String>, Vec<usize>, bool), String> {
+    let n_parents = reference_sample_ids.len();
+    if parent_groups.is_empty() {
+        return Ok((
+            reference_sample_ids.to_vec(),
+            (0..n_parents).collect(),
+            false,
+        ));
+    }
+    let mut matched_any = false;
+    let mut mapped_group_names: HashSet<String> = HashSet::new();
+    let mut mapped_flags: Vec<bool> = Vec::with_capacity(n_parents);
+    let mut raw_labels: Vec<String> = Vec::with_capacity(n_parents);
+    for pid in reference_sample_ids {
+        if let Some(g) = parent_groups.get(pid) {
+            let trimmed = g.trim();
+            if !trimmed.is_empty() {
+                raw_labels.push(trimmed.to_owned());
+                mapped_group_names.insert(trimmed.to_owned());
+                mapped_flags.push(true);
+                matched_any = true;
+                continue;
+            }
+        }
+        raw_labels.push(pid.clone());
+        mapped_flags.push(false);
+    }
+    if !matched_any {
+        return Ok((
+            reference_sample_ids.to_vec(),
+            (0..n_parents).collect(),
+            false,
+        ));
+    }
+    for (pid, &is_mapped) in reference_sample_ids.iter().zip(mapped_flags.iter()) {
+        if !is_mapped && mapped_group_names.contains(pid) {
+            return Err(format!(
+                "ambiguous parent group mapping: unmapped reference parent '{pid}' has the same \
+                 name as a mapped ancestry group; rename the group or explicitly map '{pid}'"
+            ));
+        }
+    }
+    let mut group_names: Vec<String> = raw_labels.clone();
+    group_names.sort();
+    group_names.dedup();
+    let name_to_idx: HashMap<&str, usize> = group_names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name.as_str(), i))
+        .collect();
+    let parent_to_group: Vec<usize> = raw_labels
+        .iter()
+        .map(|lbl| name_to_idx[lbl.as_str()])
+        .collect();
+    Ok((group_names, parent_to_group, true))
 }
 
 fn interpolate_bin_cm(bins: &ChromosomeAncestryBinsSparse, bp: u64) -> f64 {
@@ -601,6 +677,7 @@ fn compute_segregation_from_bins(
     chrom_lengths_bp: &[u64],
     n_samples: usize,
     n_parents: usize,
+    parent_to_group: &[usize],
     window_bp: u64,
 ) -> (Vec<ParentContributionChrom>, Vec<SegregationWindowRow>) {
     let per_chrom: Vec<(ParentContributionChrom, Vec<SegregationWindowRow>)> = (0..bins_by_chrom
@@ -657,11 +734,14 @@ fn compute_segregation_from_bins(
                 let ptr_end = bins.bin_ptr[b + 1] as usize;
                 let mut bin_called = 0.0f64;
                 for idx in ptr_start..ptr_end {
-                    let p = bins.parent_idx[idx] as usize;
+                    let raw_p = bins.parent_idx[idx] as usize;
                     let d = bins.dosage[idx] as f64;
-                    if p < n_parents {
-                        bin_parent_dosage[p] += d;
-                        bin_called += d;
+                    if raw_p < parent_to_group.len() {
+                        let p = parent_to_group[raw_p];
+                        if p < n_parents {
+                            bin_parent_dosage[p] += d;
+                            bin_called += d;
+                        }
                     }
                 }
                 called_bp += bin_called * blen_bp;
@@ -789,6 +869,7 @@ fn select_evenly_spaced(indices: &[usize], limit: usize) -> Vec<usize> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_mosaic_data(
     archive: &HaploidSparseArchive,
     segs_by_chrom: &[Vec<&AncestrySegment>],
@@ -796,10 +877,12 @@ fn compute_mosaic_data(
     chrom_lengths_bp: &[u64],
     sample_n_haps: &[u8],
     sample_breakpoints: &[u64],
+    n_groups: usize,
+    parent_to_group: &[usize],
     config: &PostIbdConfig,
 ) -> (Vec<MosaicSampleInfo>, Vec<MosaicSegmentCompact>, Vec<PopMosaicChrom>) {
     let n_samples = archive.target_sample_ids.len();
-    let n_parents = archive.reference_sample_ids.len();
+    let n_parents = n_groups;
 
     // Select samples for whole-genome karyotype mosaic.
     let selected_sample_indices: Vec<usize> = if !config.mosaic_samples.is_empty() {
@@ -857,13 +940,19 @@ fn compute_mosaic_data(
         }
         for seg in chrom_segs {
             if let Some(&local_idx) = sample_to_local.get(&seg.target_sample) {
+                let raw_p = seg.parent_sample as usize;
+                let mapped_p = if raw_p < parent_to_group.len() {
+                    parent_to_group[raw_p] as u32
+                } else {
+                    seg.parent_sample
+                };
                 mosaic_segments.push(MosaicSegmentCompact {
                     chrom_idx: seg.chrom_idx,
                     local_sample_idx: local_idx,
                     hap: seg.hap,
                     start_bp: seg.start_bp,
                     end_bp: seg.end_bp,
-                    parent_sample: seg.parent_sample,
+                    parent_sample: mapped_p,
                 });
             }
         }
@@ -913,9 +1002,9 @@ fn compute_mosaic_data(
             let step_bp = (max_bp as f64 / n_bins_out as f64).max(1.0);
             let mut parent_matrix = vec![-1i16; n_pop_samples * n_bins_out];
 
-            // Accumulate total `dosage * overlap_bp` per `(sample, parent)` across ALL
-            // sparse bins overlapping each output heatmap bin so a parent split into
-            // multiple sparse sub-bins still reflects its true summed coverage.
+            // Accumulate total `dosage * overlap_bp` per `(sample, parent_or_group)` across ALL
+            // sparse bins overlapping each output heatmap bin so a parent or ancestry group
+            // split into multiple sparse sub-bins reflects its true summed coverage.
             let use_dense = n_pop_samples.saturating_mul(n_parents) <= 2_000_000;
             let mut dense_acc = if use_dense {
                 vec![0.0f32; n_pop_samples * n_parents]
@@ -969,7 +1058,11 @@ fn compute_mosaic_data(
                             let Some(s_local) = global_to_pop[s_global] else {
                                 continue;
                             };
-                            let p = bins.parent_idx[idx] as usize;
+                            let raw_p = bins.parent_idx[idx] as usize;
+                            if raw_p >= parent_to_group.len() {
+                                continue;
+                            }
+                            let p = parent_to_group[raw_p];
                             if p >= n_parents {
                                 continue;
                             }
@@ -1556,5 +1649,124 @@ mod tests {
         assert!(w0.callable);
         let rate = w0.effective_cm_per_mb.unwrap();
         assert!(rate < 101.0, "expected ~100 cM/Mb, got {rate}");
+    }
+
+    #[test]
+    fn parent_groups_aggregate_mosaic_bins_and_contributions_accurately() {
+        // 1 line, 3 parents (P0->A, P1->A, P2->B), chrom length 2,000 bp, 20 bins (100 bp/bin).
+        // Bin 0 ([1..100]): P0 covers [1..30] (30 bp), P2 covers [31..70] (40 bp), P1 covers [71..100] (30 bp).
+        // Individually P2 (40 bp) > P0 (30 bp) = P1 (30 bp), but grouped A (30+30=60 bp) > B (40 bp)!
+        let tgt_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true]);
+        let segments = vec![
+            AncestrySegment {
+                target_sample: 0,
+                hap: 0,
+                chrom_idx: 0,
+                start_bp: 1,
+                end_bp: 30,
+                start_cm: 0.0,
+                end_cm: 0.01,
+                parent_sample: 0,
+                parent_hap: 0,
+                confidence: 0.99,
+                ambiguous_parents: 1,
+                n_markers: 5,
+            },
+            AncestrySegment {
+                target_sample: 0,
+                hap: 0,
+                chrom_idx: 0,
+                start_bp: 31,
+                end_bp: 70,
+                start_cm: 0.01,
+                end_cm: 0.02,
+                parent_sample: 2,
+                parent_hap: 0,
+                confidence: 0.99,
+                ambiguous_parents: 1,
+                n_markers: 5,
+            },
+            AncestrySegment {
+                target_sample: 0,
+                hap: 0,
+                chrom_idx: 0,
+                start_bp: 71,
+                end_bp: 100,
+                start_cm: 0.02,
+                end_cm: 0.03,
+                parent_sample: 1,
+                parent_hap: 0,
+                confidence: 0.99,
+                ambiguous_parents: 1,
+                n_markers: 5,
+            },
+            AncestrySegment {
+                target_sample: 0,
+                hap: 0,
+                chrom_idx: 0,
+                start_bp: 101,
+                end_bp: 2_000,
+                start_cm: 0.03,
+                end_cm: 1.0,
+                parent_sample: 2,
+                parent_hap: 0,
+                confidence: 0.99,
+                ambiguous_parents: 1,
+                n_markers: 50,
+            },
+        ];
+        let bins = build_union_breakpoint_sparse_matrix(0, &tgt_layout, 3, &segments);
+        let archive = HaploidSparseArchive {
+            version: 1,
+            mode: HaploidIbdMode::MultiParentAncestry,
+            target_sample_ids: vec!["L0".to_owned()],
+            reference_sample_ids: vec!["P0".to_owned(), "P1".to_owned(), "P2".to_owned()],
+            chrom_names: vec!["chr1".to_owned()],
+            payload: HaploidSparsePayload::MultiParentAncestry {
+                segments,
+                chrom_bins: vec![bins],
+            },
+        };
+        let mut groups = HashMap::new();
+        groups.insert("P0".to_owned(), "A".to_owned());
+        groups.insert("P1".to_owned(), "A".to_owned());
+        groups.insert("P2".to_owned(), "B".to_owned());
+        let cfg = PostIbdConfig {
+            window_bp: 1_000,
+            want_recomb: false,
+            want_segregation: true,
+            want_mosaic: true,
+            pop_mosaic_bins: 20,
+            max_pop_samples: 1,
+            parent_groups: groups,
+            ..PostIbdConfig::default()
+        };
+        let res = extract_post_ibd_from_archive(&archive, &cfg).unwrap();
+        assert!(res.grouped_parents);
+        assert_eq!(res.reference_sample_ids, vec!["A", "B"]);
+        assert_eq!(res.n_reference_samples, 3);
+        let pm = &res.pop_mosaics[0];
+        assert_eq!(pm.parent_matrix[0], 0);
+        assert_eq!(pm.parent_matrix[1], 1);
+        let c0 = &res.parent_contrib_chroms[0];
+        assert!((c0.parent_bp[0] - 60.0).abs() < 1e-6);
+        assert!((c0.parent_bp[1] - 1940.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parent_groups_rejects_group_name_colliding_with_unmapped_parent() {
+        let archive = make_synthetic_archive();
+        let mut groups = HashMap::new();
+        groups.insert("P0".to_owned(), "P1".to_owned());
+        let cfg = PostIbdConfig {
+            want_recomb: false,
+            want_segregation: true,
+            want_mosaic: true,
+            parent_groups: groups,
+            ..PostIbdConfig::default()
+        };
+        let err = extract_post_ibd_from_archive(&archive, &cfg)
+            .expect_err("mapping P0 -> P1 while P1 is unmapped must be rejected");
+        assert!(err.contains("P1"), "unexpected error message: {err}");
     }
 }

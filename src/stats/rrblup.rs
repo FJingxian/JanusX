@@ -1562,6 +1562,505 @@ fn rrblup_dual_finalize_train_predictions(
     Ok((Vec::new(), f64::NAN))
 }
 
+#[inline]
+fn row_2bit_value_lut(flip: bool, mean_g: f32, inv_sd: f32) -> [f32; 4] {
+    if flip {
+        [
+            (2.0_f32 - mean_g) * inv_sd,
+            0.0_f32,
+            (1.0_f32 - mean_g) * inv_sd,
+            (0.0_f32 - mean_g) * inv_sd,
+        ]
+    } else {
+        [
+            (0.0_f32 - mean_g) * inv_sd,
+            0.0_f32,
+            (1.0_f32 - mean_g) * inv_sd,
+            (2.0_f32 - mean_g) * inv_sd,
+        ]
+    }
+}
+
+#[inline]
+fn row_2bit_dot_f32(row: &[u8], q_full: &[f32], v_lut: &[f32; 4]) -> f32 {
+    debug_assert_eq!(q_full.len(), row.len() * 4);
+    let mut acc0 = 0.0_f32;
+    let mut acc1 = 0.0_f32;
+    let mut acc2 = 0.0_f32;
+    let mut acc3 = 0.0_f32;
+    let lut = *v_lut;
+    for (b, &byte_u8) in row.iter().enumerate() {
+        let byte = byte_u8 as usize;
+        let q4 = &q_full[b * 4..b * 4 + 4];
+        acc0 += lut[byte & 3] * q4[0];
+        acc1 += lut[(byte >> 2) & 3] * q4[1];
+        acc2 += lut[(byte >> 4) & 3] * q4[2];
+        acc3 += lut[byte >> 6] * q4[3];
+    }
+    (acc0 + acc1) + (acc2 + acc3)
+}
+
+#[inline]
+fn row_2bit_axpy_f32(row: &[u8], scale: f32, v_lut: &[f32; 4], u_local: &mut [f32]) {
+    debug_assert_eq!(u_local.len(), row.len() * 4);
+    if scale == 0.0_f32 {
+        return;
+    }
+    let tv = [
+        scale * v_lut[0],
+        0.0_f32,
+        scale * v_lut[2],
+        scale * v_lut[3],
+    ];
+    for (b, &byte_u8) in row.iter().enumerate() {
+        let byte = byte_u8 as usize;
+        let u4 = &mut u_local[b * 4..b * 4 + 4];
+        u4[0] += tv[byte & 3];
+        u4[1] += tv[(byte >> 2) & 3];
+        u4[2] += tv[(byte >> 4) & 3];
+        u4[3] += tv[byte >> 6];
+    }
+}
+
+#[inline]
+fn row_2bit_train_counts(row: &[u8], train_mult: &[u32]) -> [u64; 4] {
+    debug_assert_eq!(train_mult.len(), row.len() * 4);
+    let mut cnt = [0u64; 4];
+    for (b, &byte_u8) in row.iter().enumerate() {
+        let byte = byte_u8 as usize;
+        let m4 = &train_mult[b * 4..b * 4 + 4];
+        cnt[byte & 3] += m4[0] as u64;
+        cnt[(byte >> 2) & 3] += m4[1] as u64;
+        cnt[(byte >> 4) & 3] += m4[2] as u64;
+        cnt[byte >> 6] += m4[3] as u64;
+    }
+    cnt
+}
+
+#[inline]
+fn row_2bit_centered_ss(cnt: &[u64; 4], v_lut: &[f32; 4], n_train_f64: f64) -> (f64, f64) {
+    let v0 = v_lut[0] as f64;
+    let v2 = v_lut[2] as f64;
+    let v3 = v_lut[3] as f64;
+    let c0 = cnt[0] as f64;
+    let c2 = cnt[2] as f64;
+    let c3 = cnt[3] as f64;
+    let row_sum = c0 * v0 + c2 * v2 + c3 * v3;
+    let row_sumsq = c0 * v0 * v0 + c2 * v2 * v2 + c3 * v3 * v3;
+    let mean = if n_train_f64 > 0.0 {
+        row_sum / n_train_f64
+    } else {
+        0.0_f64
+    };
+    let ss = (row_sumsq - n_train_f64 * mean * mean).max(0.0_f64);
+    (mean, ss)
+}
+
+#[inline]
+fn build_train_sample_multiplicity(sample_idx: &[usize], padded_n: usize) -> Vec<u32> {
+    let mut mult = vec![0u32; padded_n];
+    for &sid in sample_idx {
+        mult[sid] = mult[sid].saturating_add(1);
+    }
+    mult
+}
+
+struct RrblupDualFusedPcgOperator<'a> {
+    source: RrblupPcgSource<'a>,
+    bytes_per_snp: usize,
+    n_train: usize,
+    m: usize,
+    row_flip: &'a [bool],
+    row_mean: &'a [f32],
+    row_inv_sd: &'a [f32],
+    sample_idx: &'a [usize],
+    packed_row_indices: Option<&'a [usize]>,
+    block_rows: usize,
+    pool: Option<&'a Arc<rayon::ThreadPool>>,
+    lambda_use: f32,
+    stage_timing: bool,
+    stage_accum: &'a Mutex<PcgStageTimingAccum>,
+    q_full: Vec<f32>,
+    train_mult: Vec<u32>,
+    u_locals: Vec<Vec<f32>>,
+    ss_locals: Vec<f64>,
+    rel_indices: Vec<usize>,
+    sum_ss_global: &'a mut f64,
+    sum_ss_captured: &'a mut bool,
+}
+
+impl<'a> RrblupDualFusedPcgOperator<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        source: RrblupPcgSource<'a>,
+        bytes_per_snp: usize,
+        n_train: usize,
+        m: usize,
+        row_flip: &'a [bool],
+        row_mean: &'a [f32],
+        row_inv_sd: &'a [f32],
+        sample_idx: &'a [usize],
+        packed_row_indices: Option<&'a [usize]>,
+        block_rows: usize,
+        pool: Option<&'a Arc<rayon::ThreadPool>>,
+        lambda_use: f32,
+        stage_timing: bool,
+        stage_accum: &'a Mutex<PcgStageTimingAccum>,
+        sum_ss_global: &'a mut f64,
+        sum_ss_captured: &'a mut bool,
+    ) -> Self {
+        let padded_n = bytes_per_snp.saturating_mul(4);
+        let n_threads = pool
+            .map(|tp| tp.current_num_threads().max(1))
+            .unwrap_or(1usize);
+        let train_mult = build_train_sample_multiplicity(sample_idx, padded_n);
+        Self {
+            source,
+            bytes_per_snp,
+            n_train,
+            m,
+            row_flip,
+            row_mean,
+            row_inv_sd,
+            sample_idx,
+            packed_row_indices,
+            block_rows,
+            pool,
+            lambda_use,
+            stage_timing,
+            stage_accum,
+            q_full: vec![0.0_f32; padded_n],
+            train_mult,
+            u_locals: (0..n_threads).map(|_| vec![0.0_f32; padded_n]).collect(),
+            ss_locals: vec![0.0_f64; n_threads],
+            rel_indices: Vec::new(),
+            sum_ss_global,
+            sum_ss_captured,
+        }
+    }
+}
+
+impl PcgOperator<f32> for RrblupDualFusedPcgOperator<'_> {
+    fn apply(&mut self, input: &[f32], output: &mut [f32]) -> Result<(), String> {
+        if input.len() != self.n_train || output.len() != self.n_train {
+            return Err(format!(
+                "RrblupDualFusedPcgOperator length mismatch: input={}, output={}, n_train={}",
+                input.len(),
+                output.len(),
+                self.n_train
+            ));
+        }
+        let n = self.n_train;
+        if n == 0 {
+            return Ok(());
+        }
+        let n_f64 = n as f64;
+        let mean_p = (input.iter().map(|&v| v as f64).sum::<f64>() / n_f64) as f32;
+        self.q_full.fill(0.0_f32);
+        for (i, &sid) in self.sample_idx.iter().enumerate() {
+            self.q_full[sid] += input[i] - mean_p;
+        }
+        for u_loc in &mut self.u_locals {
+            u_loc.fill(0.0_f32);
+        }
+        self.ss_locals.fill(0.0_f64);
+
+        let capture_ss = !*self.sum_ss_captured;
+        let mut io_acc = 0.0_f64;
+        let mut fused_acc = 0.0_f64;
+        let row_step = self.block_rows.max(1).min(self.m.max(1));
+        let bps = self.bytes_per_snp;
+        let n_threads = self.u_locals.len().max(1);
+        let q_full = self.q_full.as_slice();
+        let train_mult = self.train_mult.as_slice();
+        let row_flip = self.row_flip;
+        let row_mean = self.row_mean;
+        let row_inv_sd = self.row_inv_sd;
+        let packed_row_indices = self.packed_row_indices;
+        let pool = self.pool;
+        let stage_timing = self.stage_timing;
+
+        for row_start in (0..self.m).step_by(row_step) {
+            let cur_rows = (self.m - row_start).min(row_step);
+            let row_end = row_start + cur_rows;
+            let t0 = if stage_timing {
+                Some(Instant::now())
+            } else {
+                None
+            };
+            let (packed_slice, rel_map, base_offset): (&[u8], Option<&[usize]>, usize) =
+                match &mut self.source {
+                    RrblupPcgSource::Resident { packed_flat, .. } => {
+                        if let Some(indices) = packed_row_indices {
+                            (*packed_flat, Some(&indices[row_start..row_end]), 0usize)
+                        } else {
+                            (*packed_flat, None, row_start)
+                        }
+                    }
+                    RrblupPcgSource::Windowed { matrix, .. } => {
+                        if let Some(indices) = packed_row_indices {
+                            self.rel_indices.clear();
+                            let slice = matrix.prepare_source_rows(
+                                &indices[row_start..row_end],
+                                &mut self.rel_indices,
+                            )?;
+                            (slice, Some(self.rel_indices.as_slice()), 0usize)
+                        } else {
+                            let slice = matrix.read_source_range(row_start, row_end)?;
+                            (slice, None, 0usize)
+                        }
+                    }
+                };
+            if let Some(ts) = t0 {
+                io_acc += ts.elapsed().as_secs_f64();
+            }
+
+            let t1 = if stage_timing {
+                Some(Instant::now())
+            } else {
+                None
+            };
+            let run_chunk = |tid: usize, u_local: &mut [f32], ss_local: &mut f64| {
+                let base = cur_rows / n_threads;
+                let rem = cur_rows % n_threads;
+                let lo = tid * base + tid.min(rem);
+                let hi = lo + base + usize::from(tid < rem);
+                for local_r in lo..hi {
+                    let global_r = row_start + local_r;
+                    let inv_sd = row_inv_sd[global_r];
+                    if inv_sd == 0.0_f32 {
+                        continue;
+                    }
+                    let src_r = rel_map.map(|m| m[local_r]).unwrap_or(base_offset + local_r);
+                    let row = &packed_slice[src_r * bps..(src_r + 1) * bps];
+                    let v_lut = row_2bit_value_lut(row_flip[global_r], row_mean[global_r], inv_sd);
+                    if capture_ss {
+                        let cnt = row_2bit_train_counts(row, train_mult);
+                        let (_mu, ss) = row_2bit_centered_ss(&cnt, &v_lut, n_f64);
+                        *ss_local += ss;
+                    }
+                    let t_j = row_2bit_dot_f32(row, q_full, &v_lut);
+                    row_2bit_axpy_f32(row, t_j, &v_lut, u_local);
+                }
+            };
+            if let Some(tp) = pool.filter(|_| n_threads > 1 && cur_rows > 1) {
+                tp.install(|| {
+                    self.u_locals
+                        .par_iter_mut()
+                        .zip(self.ss_locals.par_iter_mut())
+                        .enumerate()
+                        .for_each(|(tid, (u_local, ss_local))| {
+                            run_chunk(tid, u_local.as_mut_slice(), ss_local);
+                        });
+                });
+            } else {
+                run_chunk(0, self.u_locals[0].as_mut_slice(), &mut self.ss_locals[0]);
+            }
+            if let Some(ts) = t1 {
+                fused_acc += ts.elapsed().as_secs_f64();
+            }
+        }
+
+        if capture_ss {
+            *self.sum_ss_global = self.ss_locals.iter().sum::<f64>();
+            *self.sum_ss_captured = true;
+        }
+        let (first, rest) = self.u_locals.split_first_mut().expect("u_locals non-empty");
+        for other in rest.iter() {
+            for (dst, &src) in first.iter_mut().zip(other.iter()) {
+                *dst += src;
+            }
+        }
+        let mut sum_u = 0.0_f64;
+        for (i, &sid) in self.sample_idx.iter().enumerate() {
+            let v = first[sid];
+            output[i] = v;
+            sum_u += v as f64;
+        }
+        let mean_u = (sum_u / n_f64) as f32;
+        for i in 0..n {
+            output[i] = (output[i] - mean_u) + self.lambda_use * input[i];
+        }
+        if self.stage_timing {
+            if let Ok(mut acc) = self.stage_accum.lock() {
+                acc.decode_secs += io_acc;
+                acc.xmul_secs += fused_acc;
+            }
+        }
+        Ok(())
+    }
+}
+
+enum RrblupDualAnyPcgOperator<'a> {
+    Block(RrblupDualPcgOperator<'a>),
+    Fused(RrblupDualFusedPcgOperator<'a>),
+}
+
+impl PcgOperator<f32> for RrblupDualAnyPcgOperator<'_> {
+    #[inline]
+    fn apply(&mut self, input: &[f32], output: &mut [f32]) -> Result<(), String> {
+        match self {
+            Self::Block(inner) => inner.apply(input, output),
+            Self::Fused(inner) => inner.apply(input, output),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rrblup_dual_recover_beta_and_test_fused(
+    source: &mut RrblupPcgSource<'_>,
+    bytes_per_snp: usize,
+    row_flip: &[bool],
+    row_mean: &[f32],
+    row_inv_sd: &[f32],
+    train_idx: &[usize],
+    test_idx: &[usize],
+    packed_row_indices: Option<&[usize]>,
+    block_rows: usize,
+    alpha_c: &[f32],
+    y_mean: f64,
+    need_sum_ss: bool,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Result<(Vec<f32>, f32, Vec<f64>, f64), String> {
+    let m = row_mean.len();
+    let n_train = train_idx.len();
+    let n_test = test_idx.len();
+    let n_train_f64 = n_train as f64;
+    let row_step = block_rows.max(1).min(m.max(1));
+    let padded_n = bytes_per_snp.saturating_mul(4);
+    let n_threads = pool
+        .map(|tp| tp.current_num_threads().max(1))
+        .unwrap_or(1usize);
+
+    let mut alpha_full = vec![0.0_f32; padded_n];
+    for (i, &sid) in train_idx.iter().enumerate() {
+        alpha_full[sid] += alpha_c[i];
+    }
+    let train_mult = build_train_sample_multiplicity(train_idx, padded_n);
+    let mut beta = vec![0.0_f32; m];
+    let mut u_test_locals: Vec<Vec<f32>> = if n_test > 0 {
+        (0..n_threads).map(|_| vec![0.0_f32; padded_n]).collect()
+    } else {
+        (0..n_threads).map(|_| Vec::new()).collect()
+    };
+    let mut dot_locals = vec![0.0_f64; n_threads];
+    let mut ss_locals = vec![0.0_f64; n_threads];
+    let mut rel_indices = Vec::new();
+
+    for row_start in (0..m).step_by(row_step) {
+        let cur_rows = (m - row_start).min(row_step);
+        let row_end = row_start + cur_rows;
+        let (packed_slice, rel_map, base_offset): (&[u8], Option<&[usize]>, usize) = match source {
+            RrblupPcgSource::Resident { packed_flat, .. } => {
+                if let Some(indices) = packed_row_indices {
+                    (*packed_flat, Some(&indices[row_start..row_end]), 0usize)
+                } else {
+                    (*packed_flat, None, row_start)
+                }
+            }
+            RrblupPcgSource::Windowed { matrix, .. } => {
+                if let Some(indices) = packed_row_indices {
+                    rel_indices.clear();
+                    let slice = matrix
+                        .prepare_source_rows(&indices[row_start..row_end], &mut rel_indices)?;
+                    (slice, Some(rel_indices.as_slice()), 0usize)
+                } else {
+                    let slice = matrix.read_source_range(row_start, row_end)?;
+                    (slice, None, 0usize)
+                }
+            }
+        };
+
+        let beta_chunk = &mut beta[row_start..row_end];
+        let base = cur_rows / n_threads;
+        let rem = cur_rows % n_threads;
+        let mut beta_parts: Vec<(usize, &mut [f32])> = Vec::with_capacity(n_threads);
+        let mut tail = beta_chunk;
+        let mut offset = 0usize;
+        for tid in 0..n_threads {
+            let len = base + usize::from(tid < rem);
+            let (head, rest) = tail.split_at_mut(len);
+            beta_parts.push((offset, head));
+            offset += len;
+            tail = rest;
+        }
+
+        let run_part = |local_offset: usize,
+                        beta_part: &mut [f32],
+                        u_test_local: &mut [f32],
+                        dot_local: &mut f64,
+                        ss_local: &mut f64| {
+            for (off, beta_slot) in beta_part.iter_mut().enumerate() {
+                let local_r = local_offset + off;
+                let global_r = row_start + local_r;
+                let inv_sd = row_inv_sd[global_r];
+                if inv_sd == 0.0_f32 {
+                    *beta_slot = 0.0_f32;
+                    continue;
+                }
+                let src_r = rel_map
+                    .map(|mp| mp[local_r])
+                    .unwrap_or(base_offset + local_r);
+                let row = &packed_slice[src_r * bytes_per_snp..(src_r + 1) * bytes_per_snp];
+                let v_lut = row_2bit_value_lut(row_flip[global_r], row_mean[global_r], inv_sd);
+                let bj = row_2bit_dot_f32(row, &alpha_full, &v_lut);
+                *beta_slot = bj;
+                let cnt = row_2bit_train_counts(row, &train_mult);
+                let (row_mu, ss) = row_2bit_centered_ss(&cnt, &v_lut, n_train_f64);
+                *dot_local += row_mu * (bj as f64);
+                if need_sum_ss {
+                    *ss_local += ss;
+                }
+                if n_test > 0 {
+                    row_2bit_axpy_f32(row, bj, &v_lut, u_test_local);
+                }
+            }
+        };
+
+        if let Some(tp) = pool.filter(|_| n_threads > 1 && cur_rows > 1) {
+            tp.install(|| {
+                beta_parts
+                    .into_par_iter()
+                    .zip(u_test_locals.par_iter_mut())
+                    .zip(dot_locals.par_iter_mut())
+                    .zip(ss_locals.par_iter_mut())
+                    .for_each(|((((lo, part), u_loc), d_loc), s_loc)| {
+                        run_part(lo, part, u_loc.as_mut_slice(), d_loc, s_loc);
+                    });
+            });
+        } else {
+            for (((lo, part), u_loc), (d_loc, s_loc)) in beta_parts
+                .into_iter()
+                .zip(u_test_locals.iter_mut())
+                .zip(dot_locals.iter_mut().zip(ss_locals.iter_mut()))
+            {
+                run_part(lo, part, u_loc.as_mut_slice(), d_loc, s_loc);
+            }
+        }
+    }
+
+    let dot_mean_beta: f64 = dot_locals.iter().sum();
+    let sum_ss_global: f64 = ss_locals.iter().sum();
+    let alpha_use = (y_mean - dot_mean_beta) as f32;
+    let pred_test_ret: Vec<f64> = if n_test > 0 {
+        let (first, rest) = u_test_locals
+            .split_first_mut()
+            .expect("u_test_locals non-empty");
+        for other in rest.iter() {
+            for (dst, &src) in first.iter_mut().zip(other.iter()) {
+                *dst += src;
+            }
+        }
+        test_idx
+            .iter()
+            .map(|&sid| (first[sid] as f64) + (alpha_use as f64))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Ok((beta, alpha_use, pred_test_ret, sum_ss_global))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decode_standardized_block_f32(
     source: &mut RrblupPcgSource<'_>,
@@ -4857,6 +5356,14 @@ fn rrblup_pcg_bed_impl<'py>(
         .unwrap_or(100usize);
     let pcg_space_raw = std::env::var("JX_RRBLUP_PCG_SPACE").unwrap_or_else(|_| "dual".to_string());
     let pcg_space = RrblupPcgSpace::parse(&pcg_space_raw).map_err(PyRuntimeError::new_err)?;
+    let dual_fused = !matches!(
+        std::env::var("JX_RRBLUP_PCG_DUAL_FUSED")
+            .unwrap_or_else(|_| "1".to_string())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "off" | "no"
+    );
 
     let (row_mean, row_inv_sd, m_effective) = rrblup_subset_or_validate_stats(
         row_mean_external_full,
@@ -4900,34 +5407,56 @@ fn rrblup_pcg_bed_impl<'py>(
                     let resident_packed = resident_packed_flat.as_ref().map(|cow| cow.as_ref());
                     let mut sum_ss_global = 0.0_f64;
                     let mut sum_ss_captured = false;
-                    let dual_op = RrblupDualPcgOperator {
-                        source: build_rrblup_source(
-                            resident_packed,
-                            bytes_per_snp,
-                            prefix.as_str(),
-                            n_samples,
-                            row_step,
-                        )?,
+                    let dual_source = build_rrblup_source(
+                        resident_packed,
+                        bytes_per_snp,
+                        prefix.as_str(),
                         n_samples,
-                        n_train,
-                        m,
-                        row_flip: row_flip_keep.as_ref(),
-                        row_mean: &row_mean,
-                        row_inv_sd: &row_inv_sd,
-                        sample_idx: &train_idx,
-                        full_sample_fast: full_train_fast,
-                        packed_row_indices: packed_row_indices.as_deref(),
-                        block_rows: row_step,
-                        code4_lut: &code4_lut,
-                        pool: pool_ref,
-                        lambda_use,
-                        stage_timing,
-                        stage_accum: stage_accum.as_ref(),
-                        block_buf: Vec::new(),
-                        tmp_buf: vec![0.0_f32; row_step],
-                        q_buf: vec![0.0_f32; n_train],
-                        sum_ss_global: &mut sum_ss_global,
-                        sum_ss_captured: &mut sum_ss_captured,
+                        row_step,
+                    )?;
+                    let dual_op = if dual_fused {
+                        RrblupDualAnyPcgOperator::Fused(RrblupDualFusedPcgOperator::new(
+                            dual_source,
+                            bytes_per_snp,
+                            n_train,
+                            m,
+                            row_flip_keep.as_ref(),
+                            &row_mean,
+                            &row_inv_sd,
+                            &train_idx,
+                            packed_row_indices.as_deref(),
+                            row_step,
+                            pool_ref,
+                            lambda_use,
+                            stage_timing,
+                            stage_accum.as_ref(),
+                            &mut sum_ss_global,
+                            &mut sum_ss_captured,
+                        ))
+                    } else {
+                        RrblupDualAnyPcgOperator::Block(RrblupDualPcgOperator {
+                            source: dual_source,
+                            n_samples,
+                            n_train,
+                            m,
+                            row_flip: row_flip_keep.as_ref(),
+                            row_mean: &row_mean,
+                            row_inv_sd: &row_inv_sd,
+                            sample_idx: &train_idx,
+                            full_sample_fast: full_train_fast,
+                            packed_row_indices: packed_row_indices.as_deref(),
+                            block_rows: row_step,
+                            code4_lut: &code4_lut,
+                            pool: pool_ref,
+                            lambda_use,
+                            stage_timing,
+                            stage_accum: stage_accum.as_ref(),
+                            block_buf: Vec::new(),
+                            tmp_buf: vec![0.0_f32; row_step],
+                            q_buf: vec![0.0_f32; n_train],
+                            sum_ss_global: &mut sum_ss_global,
+                            sum_ss_captured: &mut sum_ss_captured,
+                        })
                     };
                     let pcg_res = pcg_solve(
                         &y_center_f32,
@@ -5045,7 +5574,23 @@ fn rrblup_pcg_bed_impl<'py>(
                         n_samples,
                         row_step,
                     )?;
-                    let (beta, alpha_use, pred_test_ret, sum_ss_rec) =
+                    let (beta, alpha_use, pred_test_ret, sum_ss_rec) = if dual_fused {
+                        rrblup_dual_recover_beta_and_test_fused(
+                            &mut recover_source,
+                            bytes_per_snp,
+                            row_flip_keep.as_ref(),
+                            &row_mean,
+                            &row_inv_sd,
+                            &train_idx,
+                            &test_idx,
+                            packed_row_indices.as_deref(),
+                            row_step,
+                            &alpha_c,
+                            y_mean,
+                            !sum_ss_captured,
+                            pool_ref,
+                        )?
+                    } else {
                         rrblup_dual_recover_beta_and_test(
                             &mut recover_source,
                             n_samples,
@@ -5063,7 +5608,8 @@ fn rrblup_pcg_bed_impl<'py>(
                             !sum_ss_captured,
                             &code4_lut,
                             pool_ref,
-                        )?;
+                        )?
+                    };
                     if !sum_ss_captured {
                         sum_ss_global = sum_ss_rec;
                     }
@@ -7299,5 +7845,464 @@ mod tests {
         drop(err_op);
 
         std::fs::remove_dir_all(dir).expect("remove temp BED dir");
+    }
+
+    #[test]
+    fn rrblup_dual_fused_2bit_matches_block_dual() {
+        let n_samples = 27usize;
+        let m_total = 112usize;
+        let block_rows = 32usize;
+        let bytes_per_snp = n_samples.div_ceil(4);
+        let mut packed = vec![0u8; m_total * bytes_per_snp];
+        for m in 0..m_total {
+            for b in 0..bytes_per_snp {
+                let mut byte = 0u8;
+                for k in 0..4 {
+                    let s = b * 4 + k;
+                    let code = if s < n_samples {
+                        match (m * 23 + s * 11 + (m ^ s)) % 5 {
+                            0 => 0b00,
+                            1 | 2 => 0b10,
+                            3 => 0b11,
+                            _ => 0b01,
+                        }
+                    } else {
+                        0b11
+                    };
+                    byte |= code << (2 * k);
+                }
+                packed[m * bytes_per_snp + b] = byte;
+            }
+        }
+        let packed_row_indices: Vec<usize> = (0..m_total).filter(|&i| i % 7 != 0).collect();
+        let eff_m = packed_row_indices.len();
+        let maf: Vec<f32> = (0..eff_m)
+            .map(|m| 0.1 + 0.35 * (((m * 19) % 100) as f32 / 100.0))
+            .collect();
+        let row_flip: Vec<bool> = (0..eff_m).map(|m| (m % 3) == 0).collect();
+        let (row_mean, mut row_inv_sd, _m_eff) = rrblup_parallel_row_standardization(
+            &maf,
+            1e-12_f32,
+            None,
+            RrblupScaleMode::Standardized,
+        );
+        row_inv_sd[0] = 0.0_f32;
+        row_inv_sd[eff_m / 2] = 0.0_f32;
+
+        let train_idx: Vec<usize> = vec![
+            25, 2, 18, 0, 14, 7, 26, 5, 11, 20, 3, 16, 9, 23, 1, 13, 6, 22, 8, 17, 4,
+        ];
+        let test_idx: Vec<usize> = vec![10, 12, 15, 19, 21, 24];
+        let n_train = train_idx.len();
+        let y_train: Vec<f64> = (0..n_train)
+            .map(|i| ((i as f64) * 0.37).sin() + 0.45 * ((i as f64) * 0.19).cos())
+            .collect();
+        let y_mean = y_train.iter().sum::<f64>() / (n_train as f64);
+        let y_center: Vec<f32> = y_train.iter().map(|&v| (v - y_mean) as f32).collect();
+        let lambda_use = 9.5_f32;
+        let code4_lut = packed_byte_lut().code4;
+        let stage_accum = Mutex::new(PcgStageTimingAccum::default());
+
+        let mut ss_block = 0.0_f64;
+        let mut cap_block = false;
+        let block_op = RrblupDualPcgOperator {
+            source: RrblupPcgSource::Resident {
+                packed_flat: &packed,
+                bytes_per_snp,
+            },
+            n_samples,
+            n_train,
+            m: eff_m,
+            row_flip: &row_flip,
+            row_mean: &row_mean,
+            row_inv_sd: &row_inv_sd,
+            sample_idx: &train_idx,
+            full_sample_fast: false,
+            packed_row_indices: Some(&packed_row_indices),
+            block_rows,
+            code4_lut: &code4_lut,
+            pool: None,
+            lambda_use,
+            stage_timing: false,
+            stage_accum: &stage_accum,
+            block_buf: Vec::new(),
+            tmp_buf: vec![0.0_f32; block_rows],
+            q_buf: vec![0.0_f32; n_train],
+            sum_ss_global: &mut ss_block,
+            sum_ss_captured: &mut cap_block,
+        };
+        let block_sol = pcg_solve(
+            &y_center,
+            None,
+            200,
+            1e-6_f64,
+            1e-20_f64,
+            block_op,
+            IdentityPreconditioner,
+            |_, _, _| Ok(()),
+        )
+        .expect("block dual pcg");
+        assert!(block_sol.converged);
+        let a_mu_b = (block_sol.x.iter().map(|&v| v as f64).sum::<f64>() / (n_train as f64)) as f32;
+        let alpha_c_b: Vec<f32> = block_sol.x.iter().map(|&v| v - a_mu_b).collect();
+        let mut rec_src_b = RrblupPcgSource::Resident {
+            packed_flat: &packed,
+            bytes_per_snp,
+        };
+        let (beta_b, alpha_b, pred_te_b, _) = rrblup_dual_recover_beta_and_test(
+            &mut rec_src_b,
+            n_samples,
+            &row_flip,
+            &row_mean,
+            &row_inv_sd,
+            &train_idx,
+            false,
+            &test_idx,
+            false,
+            Some(&packed_row_indices),
+            block_rows,
+            &alpha_c_b,
+            y_mean,
+            false,
+            &code4_lut,
+            None,
+        )
+        .expect("block recover");
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("janusx_dual_fused_{stamp}"));
+        std::fs::create_dir_all(&dir).expect("create temp BED dir");
+        let prefix = dir.join("tiny");
+        let mut bed_bytes = Vec::with_capacity(3 + packed.len());
+        bed_bytes.extend_from_slice(&[0x6c, 0x1b, 0x01]);
+        bed_bytes.extend_from_slice(&packed);
+        std::fs::write(prefix.with_extension("bed"), &bed_bytes).expect("write BED");
+        let fam_text: String = (0..n_samples)
+            .map(|i| format!("F{i} I{i} 0 0 1 -9\n"))
+            .collect();
+        std::fs::write(prefix.with_extension("fam"), fam_text).expect("write FAM");
+        let prefix_str = prefix.to_string_lossy().into_owned();
+
+        for use_windowed in [false, true] {
+            let src = if use_windowed {
+                RrblupPcgSource::Windowed {
+                    matrix: WindowedBedMatrix::open(&prefix_str, 1).expect("open windowed"),
+                    bytes_per_snp,
+                }
+            } else {
+                RrblupPcgSource::Resident {
+                    packed_flat: &packed,
+                    bytes_per_snp,
+                }
+            };
+            let mut ss_f = 0.0_f64;
+            let mut cap_f = false;
+            let fused_op = RrblupDualFusedPcgOperator::new(
+                src,
+                bytes_per_snp,
+                n_train,
+                eff_m,
+                &row_flip,
+                &row_mean,
+                &row_inv_sd,
+                &train_idx,
+                Some(&packed_row_indices),
+                block_rows,
+                None,
+                lambda_use,
+                false,
+                &stage_accum,
+                &mut ss_f,
+                &mut cap_f,
+            );
+            let fused_sol = pcg_solve(
+                &y_center,
+                None,
+                200,
+                1e-6_f64,
+                1e-20_f64,
+                fused_op,
+                IdentityPreconditioner,
+                |_, _, _| Ok(()),
+            )
+            .expect("fused dual pcg");
+            assert!(fused_sol.converged);
+            assert!(cap_f);
+            assert!(
+                (ss_f - ss_block).abs() < 1e-4,
+                "sum_ss mismatch (windowed={use_windowed}): fused={ss_f}, block={ss_block}"
+            );
+            assert!(max_abs_diff(&fused_sol.x, &block_sol.x) < 1e-5);
+
+            let a_mu_f =
+                (fused_sol.x.iter().map(|&v| v as f64).sum::<f64>() / (n_train as f64)) as f32;
+            let alpha_c_f: Vec<f32> = fused_sol.x.iter().map(|&v| v - a_mu_f).collect();
+            let mut rec_src_f = if use_windowed {
+                RrblupPcgSource::Windowed {
+                    matrix: WindowedBedMatrix::open(&prefix_str, 1).expect("open windowed rec"),
+                    bytes_per_snp,
+                }
+            } else {
+                RrblupPcgSource::Resident {
+                    packed_flat: &packed,
+                    bytes_per_snp,
+                }
+            };
+            let (beta_f, alpha_f, pred_te_f, ss_rec_f) = rrblup_dual_recover_beta_and_test_fused(
+                &mut rec_src_f,
+                bytes_per_snp,
+                &row_flip,
+                &row_mean,
+                &row_inv_sd,
+                &train_idx,
+                &test_idx,
+                Some(&packed_row_indices),
+                block_rows,
+                &alpha_c_f,
+                y_mean,
+                true,
+                None,
+            )
+            .expect("fused recover");
+            assert!((ss_rec_f - ss_block).abs() < 1e-4);
+            assert!((alpha_f - alpha_b).abs() < 1e-4);
+            assert!(max_abs_diff(&beta_f, &beta_b) < 1e-5);
+            let max_te_diff = pred_te_f
+                .iter()
+                .zip(pred_te_b.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+            assert!(max_te_diff < 1e-4, "fused test diff={max_te_diff}");
+        }
+
+        let mut bad_rows = packed_row_indices.clone();
+        bad_rows[eff_m - 1] = m_total + 5;
+        let mut ss_err = 0.0_f64;
+        let mut cap_err = false;
+        let mut err_op = RrblupDualFusedPcgOperator::new(
+            RrblupPcgSource::Windowed {
+                matrix: WindowedBedMatrix::open(&prefix_str, 1).expect("open windowed err"),
+                bytes_per_snp,
+            },
+            bytes_per_snp,
+            n_train,
+            eff_m,
+            &row_flip,
+            &row_mean,
+            &row_inv_sd,
+            &train_idx,
+            Some(&bad_rows),
+            block_rows,
+            None,
+            lambda_use,
+            false,
+            &stage_accum,
+            &mut ss_err,
+            &mut cap_err,
+        );
+        let mut out_err = vec![0.0_f32; n_train];
+        let err_msg = err_op
+            .apply(&y_center, &mut out_err)
+            .expect_err("expected out-of-bounds error");
+        assert!(
+            err_msg.contains("out of bounds"),
+            "unexpected fused error: {err_msg}"
+        );
+        drop(err_op);
+        std::fs::remove_dir_all(dir).expect("remove temp BED dir");
+    }
+
+    #[test]
+    fn rrblup_dual_fused_2bit_handles_duplicate_and_overlapping_indices() {
+        let n_samples = 19usize;
+        let eff_m = 64usize;
+        let block_rows = 24usize;
+        let bytes_per_snp = n_samples.div_ceil(4);
+        let mut packed = vec![0u8; eff_m * bytes_per_snp];
+        for m in 0..eff_m {
+            for b in 0..bytes_per_snp {
+                let mut byte = 0u8;
+                for k in 0..4 {
+                    let s = b * 4 + k;
+                    let code = if s < n_samples {
+                        match (m * 31 + s * 7 + (m ^ s)) % 5 {
+                            0 => 0b00,
+                            1 | 2 => 0b10,
+                            3 => 0b11,
+                            _ => 0b01,
+                        }
+                    } else {
+                        0b10
+                    };
+                    byte |= code << (2 * k);
+                }
+                packed[m * bytes_per_snp + b] = byte;
+            }
+        }
+        let maf: Vec<f32> = (0..eff_m)
+            .map(|m| 0.12 + 0.32 * (((m * 17) % 100) as f32 / 100.0))
+            .collect();
+        let row_flip: Vec<bool> = (0..eff_m).map(|m| (m % 2) == 1).collect();
+        let (row_mean, row_inv_sd, _m_eff) = rrblup_parallel_row_standardization(
+            &maf,
+            1e-12_f32,
+            None,
+            RrblupScaleMode::Standardized,
+        );
+
+        // Duplicate train indices, duplicate test indices, and explicit train/test overlap.
+        let train_idx: Vec<usize> = vec![0, 2, 2, 5, 7, 9, 9, 11, 13, 14, 16, 18, 5, 1, 3];
+        let test_idx: Vec<usize> = vec![2, 4, 4, 9, 12, 15, 17, 17, 0];
+        let n_train = train_idx.len();
+        let y_train: Vec<f64> = (0..n_train)
+            .map(|i| ((i as f64) * 0.41).sin() - 0.3 * ((i as f64) * 0.23).cos())
+            .collect();
+        let y_mean = y_train.iter().sum::<f64>() / (n_train as f64);
+        let y_center: Vec<f32> = y_train.iter().map(|&v| (v - y_mean) as f32).collect();
+        let lambda_use = 6.0_f32;
+        let code4_lut = packed_byte_lut().code4;
+        let stage_accum = Mutex::new(PcgStageTimingAccum::default());
+
+        let mut ss_block = 0.0_f64;
+        let mut cap_block = false;
+        let block_op = RrblupDualPcgOperator {
+            source: RrblupPcgSource::Resident {
+                packed_flat: &packed,
+                bytes_per_snp,
+            },
+            n_samples,
+            n_train,
+            m: eff_m,
+            row_flip: &row_flip,
+            row_mean: &row_mean,
+            row_inv_sd: &row_inv_sd,
+            sample_idx: &train_idx,
+            full_sample_fast: false,
+            packed_row_indices: None,
+            block_rows,
+            code4_lut: &code4_lut,
+            pool: None,
+            lambda_use,
+            stage_timing: false,
+            stage_accum: &stage_accum,
+            block_buf: Vec::new(),
+            tmp_buf: vec![0.0_f32; block_rows],
+            q_buf: vec![0.0_f32; n_train],
+            sum_ss_global: &mut ss_block,
+            sum_ss_captured: &mut cap_block,
+        };
+        let block_sol = pcg_solve(
+            &y_center,
+            None,
+            200,
+            1e-6_f64,
+            1e-20_f64,
+            block_op,
+            IdentityPreconditioner,
+            |_, _, _| Ok(()),
+        )
+        .expect("block dual dup/overlap");
+        let a_mu_b = (block_sol.x.iter().map(|&v| v as f64).sum::<f64>() / (n_train as f64)) as f32;
+        let alpha_c_b: Vec<f32> = block_sol.x.iter().map(|&v| v - a_mu_b).collect();
+        let mut rec_src_b = RrblupPcgSource::Resident {
+            packed_flat: &packed,
+            bytes_per_snp,
+        };
+        let (beta_b, alpha_b, pred_te_b, _) = rrblup_dual_recover_beta_and_test(
+            &mut rec_src_b,
+            n_samples,
+            &row_flip,
+            &row_mean,
+            &row_inv_sd,
+            &train_idx,
+            false,
+            &test_idx,
+            false,
+            None,
+            block_rows,
+            &alpha_c_b,
+            y_mean,
+            false,
+            &code4_lut,
+            None,
+        )
+        .expect("block recover dup/overlap");
+
+        let mut ss_fused = 0.0_f64;
+        let mut cap_fused = false;
+        let fused_op = RrblupDualFusedPcgOperator::new(
+            RrblupPcgSource::Resident {
+                packed_flat: &packed,
+                bytes_per_snp,
+            },
+            bytes_per_snp,
+            n_train,
+            eff_m,
+            &row_flip,
+            &row_mean,
+            &row_inv_sd,
+            &train_idx,
+            None,
+            block_rows,
+            None,
+            lambda_use,
+            false,
+            &stage_accum,
+            &mut ss_fused,
+            &mut cap_fused,
+        );
+        let fused_sol = pcg_solve(
+            &y_center,
+            None,
+            200,
+            1e-6_f64,
+            1e-20_f64,
+            fused_op,
+            IdentityPreconditioner,
+            |_, _, _| Ok(()),
+        )
+        .expect("fused dual dup/overlap");
+        assert!(fused_sol.converged);
+        assert!(cap_fused);
+        assert!((ss_fused - ss_block).abs() < 1e-4);
+        assert!(max_abs_diff(&fused_sol.x, &block_sol.x) < 1e-5);
+
+        let a_mu_f = (fused_sol.x.iter().map(|&v| v as f64).sum::<f64>() / (n_train as f64)) as f32;
+        let alpha_c_f: Vec<f32> = fused_sol.x.iter().map(|&v| v - a_mu_f).collect();
+        let mut rec_src_f = RrblupPcgSource::Resident {
+            packed_flat: &packed,
+            bytes_per_snp,
+        };
+        let (beta_f, alpha_f, pred_te_f, ss_rec_f) = rrblup_dual_recover_beta_and_test_fused(
+            &mut rec_src_f,
+            bytes_per_snp,
+            &row_flip,
+            &row_mean,
+            &row_inv_sd,
+            &train_idx,
+            &test_idx,
+            None,
+            block_rows,
+            &alpha_c_f,
+            y_mean,
+            true,
+            None,
+        )
+        .expect("fused recover dup/overlap");
+        assert!((ss_rec_f - ss_block).abs() < 1e-4);
+        assert!((alpha_f - alpha_b).abs() < 1e-4);
+        assert!(max_abs_diff(&beta_f, &beta_b) < 1e-5);
+        let max_te_diff = pred_te_f
+            .iter()
+            .zip(pred_te_b.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(max_te_diff < 1e-4, "dup/overlap test diff={max_te_diff}");
+        // Duplicate test indices must receive identical predictions.
+        assert_eq!(pred_te_f[1], pred_te_f[2]);
+        assert_eq!(pred_te_f[6], pred_te_f[7]);
     }
 }

@@ -9740,8 +9740,11 @@ def GSapi(
                     model_state["pve"] = float(pve)
 
                 if _GS_DEBUG_STAGE:
+                    pcg_space_dbg = (
+                        str(os.getenv("JX_RRBLUP_PCG_SPACE", "dual")).strip().lower() or "dual"
+                    )
                     print(
-                        f"[GS-DEBUG] GSapi model_fit_done method={method}(pcg) "
+                        f"[GS-DEBUG] GSapi model_fit_done method={method}(pcg-{pcg_space_dbg}) "
                         f"elapsed={time.time() - t_fit:.3f}s iters={int(pcg_iters)} "
                         f"converged={int(bool(pcg_converged))} rel_res={float(pcg_rel_res):.6g}",
                         flush=True,

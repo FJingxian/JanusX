@@ -50,7 +50,7 @@ use crate::decode::decode_prepared_additive_block_packed_f32;
 use crate::eigh::symmetric_eigh_f64_row_major;
 use crate::gload::WindowedBedMatrix;
 use crate::packed::bed_packed_row_flip_mask;
-use crate::pcg::{pcg_solve, DiagonalPreconditioner, PcgOperator};
+use crate::pcg::{pcg_solve, DiagonalPreconditioner, IdentityPreconditioner, PcgOperator};
 use crate::pipeline::run_double_buffer;
 use crate::stats_common::{
     check_ctrlc, env_truthy, format_bytes, get_cached_pool, map_err_string_to_py,
@@ -1012,6 +1012,554 @@ impl PcgOperator<f32> for RrblupPcgOperator<'_> {
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RrblupPcgSpace {
+    Dual,
+    Primal,
+}
+
+impl RrblupPcgSpace {
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "" | "dual" | "sample" => Ok(Self::Dual),
+            "primal" | "marker" | "snp" => Ok(Self::Primal),
+            other => Err(format!(
+                "Unsupported JX_RRBLUP_PCG_SPACE '{other}'; expected 'dual' or 'primal'."
+            )),
+        }
+    }
+}
+
+#[inline]
+fn row_centered_sum_squares_f32_to_f64(
+    block: &[f32],
+    rows: usize,
+    cols: usize,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> f64 {
+    if rows == 0 || cols == 0 {
+        return 0.0_f64;
+    }
+    let cols_f64 = cols as f64;
+    let row_ss = |row: &[f32]| -> f64 {
+        let mean = row_major_row_sum_f64(row) / cols_f64;
+        let ss_raw = row_major_row_sumsq_f64(row);
+        (ss_raw - cols_f64 * mean * mean).max(0.0_f64)
+    };
+    if let Some(tp) = pool.filter(|_| rows.saturating_mul(cols) >= 1_048_576) {
+        tp.install(|| block.par_chunks_exact(cols).map(row_ss).sum::<f64>())
+    } else {
+        block.chunks_exact(cols).map(row_ss).sum::<f64>()
+    }
+}
+
+struct RrblupDualPcgOperator<'a> {
+    source: RrblupPcgSource<'a>,
+    n_samples: usize,
+    n_train: usize,
+    m: usize,
+    row_flip: &'a [bool],
+    row_mean: &'a [f32],
+    row_inv_sd: &'a [f32],
+    sample_idx: &'a [usize],
+    full_sample_fast: bool,
+    packed_row_indices: Option<&'a [usize]>,
+    block_rows: usize,
+    code4_lut: &'a [[u8; 4]; 256],
+    pool: Option<&'a Arc<rayon::ThreadPool>>,
+    lambda_use: f32,
+    stage_timing: bool,
+    stage_accum: &'a Mutex<PcgStageTimingAccum>,
+    block_buf: Vec<f32>,
+    tmp_buf: Vec<f32>,
+    q_buf: Vec<f32>,
+    sum_ss_global: &'a mut f64,
+    sum_ss_captured: &'a mut bool,
+}
+
+impl PcgOperator<f32> for RrblupDualPcgOperator<'_> {
+    fn apply(&mut self, input: &[f32], output: &mut [f32]) -> Result<(), String> {
+        if input.len() != self.n_train || output.len() != self.n_train {
+            return Err(format!(
+                "RrblupDualPcgOperator length mismatch: input={}, output={}, n_train={}",
+                input.len(),
+                output.len(),
+                self.n_train
+            ));
+        }
+        let n = self.n_train;
+        if n == 0 {
+            return Ok(());
+        }
+        let mean_p = (input.iter().map(|&v| v as f64).sum::<f64>() / (n as f64)) as f32;
+        for i in 0..n {
+            self.q_buf[i] = input[i] - mean_p;
+        }
+        output.fill(0.0_f32);
+
+        let capture_ss = !*self.sum_ss_captured;
+        let mut ss_acc = 0.0_f64;
+        let mut decode_acc = 0.0_f64;
+        let mut xmul_acc = 0.0_f64;
+        let mut xtmul_acc = 0.0_f64;
+        let row_step = self.block_rows.max(1).min(self.m.max(1));
+        let use_double_buffer =
+            matches!(self.source, RrblupPcgSource::Windowed { .. }) && self.m > row_step;
+
+        if use_double_buffer {
+            let source = &mut self.source;
+            let n_samples = self.n_samples;
+            let m = self.m;
+            let row_flip = self.row_flip;
+            let row_mean = self.row_mean;
+            let row_inv_sd = self.row_inv_sd;
+            let sample_idx = self.sample_idx;
+            let full_sample_fast = self.full_sample_fast;
+            let packed_row_indices = self.packed_row_indices;
+            let code4_lut = self.code4_lut;
+            let pool = self.pool;
+            let stage_timing = self.stage_timing;
+            let q_buf = self.q_buf.as_slice();
+            let tmp_buf = self.tmp_buf.as_mut_slice();
+            let pool_cloned = pool.cloned();
+            let mut next_row = 0usize;
+            let producer_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+            let producer_err_bg = Arc::clone(&producer_err);
+            run_double_buffer(
+                2usize,
+                || DecodedBlockBuffer {
+                    row_start: 0,
+                    row_end: 0,
+                    decode_secs: 0.0,
+                    block: vec![0.0_f32; row_step * n],
+                },
+                |buf| {
+                    if next_row >= m {
+                        return false;
+                    }
+                    let st = next_row;
+                    let ed = (st + row_step).min(m);
+                    let cur_rows = ed - st;
+                    buf.row_start = st;
+                    buf.row_end = ed;
+                    let t_decode = if stage_timing {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
+                    let blk_slice = &mut buf.block[..cur_rows * n];
+                    if let Err(err) = decode_standardized_block_f32(
+                        source,
+                        n_samples,
+                        row_flip,
+                        row_mean,
+                        row_inv_sd,
+                        sample_idx,
+                        full_sample_fast,
+                        packed_row_indices,
+                        st,
+                        blk_slice,
+                        code4_lut,
+                        pool_cloned.as_ref(),
+                    ) {
+                        if let Ok(mut slot) = producer_err_bg.lock() {
+                            *slot = Some(err);
+                        }
+                        buf.row_end = buf.row_start;
+                        next_row = m;
+                        return false;
+                    }
+                    buf.decode_secs = t_decode.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+                    next_row = ed;
+                    next_row < m
+                },
+                |buf| {
+                    if let Ok(slot) = producer_err.lock() {
+                        if let Some(err) = slot.as_ref() {
+                            return Err(err.clone());
+                        }
+                    }
+                    let cur_rows = buf.row_end.saturating_sub(buf.row_start);
+                    if cur_rows == 0 {
+                        return Ok(());
+                    }
+                    let blk_slice = &buf.block[..cur_rows * n];
+                    decode_acc += buf.decode_secs;
+                    if capture_ss {
+                        ss_acc += row_centered_sum_squares_f32_to_f64(blk_slice, cur_rows, n, pool);
+                    }
+                    let tmp_slice = &mut tmp_buf[..cur_rows];
+                    let t1 = if stage_timing {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
+                    row_major_block_mul_vec_f32(blk_slice, cur_rows, n, q_buf, tmp_slice, pool);
+                    if let Some(ts) = t1 {
+                        xmul_acc += ts.elapsed().as_secs_f64();
+                    }
+                    let t2 = if stage_timing {
+                        Some(Instant::now())
+                    } else {
+                        None
+                    };
+                    row_major_block_t_mul_vec_accum_f32(
+                        blk_slice, cur_rows, n, tmp_slice, output, pool,
+                    );
+                    if let Some(ts) = t2 {
+                        xtmul_acc += ts.elapsed().as_secs_f64();
+                    }
+                    Ok::<(), String>(())
+                },
+            )?;
+            let final_err = producer_err.lock().ok().and_then(|slot| slot.clone());
+            if let Some(err) = final_err {
+                return Err(err);
+            }
+        } else {
+            let need = row_step.saturating_mul(n);
+            if self.block_buf.len() < need {
+                self.block_buf.resize(need, 0.0_f32);
+            }
+            for row_start in (0..self.m).step_by(row_step) {
+                let cur_rows = (self.m - row_start).min(row_step);
+                let blk_slice = &mut self.block_buf[..cur_rows * n];
+                let t0 = if self.stage_timing {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                decode_standardized_block_f32(
+                    &mut self.source,
+                    self.n_samples,
+                    self.row_flip,
+                    self.row_mean,
+                    self.row_inv_sd,
+                    self.sample_idx,
+                    self.full_sample_fast,
+                    self.packed_row_indices,
+                    row_start,
+                    blk_slice,
+                    self.code4_lut,
+                    self.pool,
+                )?;
+                if let Some(ts) = t0 {
+                    decode_acc += ts.elapsed().as_secs_f64();
+                }
+                if capture_ss {
+                    ss_acc +=
+                        row_centered_sum_squares_f32_to_f64(blk_slice, cur_rows, n, self.pool);
+                }
+                let tmp_slice = &mut self.tmp_buf[..cur_rows];
+                let t1 = if self.stage_timing {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                row_major_block_mul_vec_f32(
+                    blk_slice,
+                    cur_rows,
+                    n,
+                    &self.q_buf,
+                    tmp_slice,
+                    self.pool,
+                );
+                if let Some(ts) = t1 {
+                    xmul_acc += ts.elapsed().as_secs_f64();
+                }
+                let t2 = if self.stage_timing {
+                    Some(Instant::now())
+                } else {
+                    None
+                };
+                row_major_block_t_mul_vec_accum_f32(
+                    blk_slice, cur_rows, n, tmp_slice, output, self.pool,
+                );
+                if let Some(ts) = t2 {
+                    xtmul_acc += ts.elapsed().as_secs_f64();
+                }
+            }
+        }
+        if capture_ss {
+            *self.sum_ss_global = ss_acc;
+            *self.sum_ss_captured = true;
+        }
+        let mean_u = (output.iter().map(|&v| v as f64).sum::<f64>() / (n as f64)) as f32;
+        for i in 0..n {
+            output[i] = (output[i] - mean_u) + self.lambda_use * input[i];
+        }
+        if self.stage_timing {
+            if let Ok(mut acc) = self.stage_accum.lock() {
+                acc.decode_secs += decode_acc;
+                acc.xmul_secs += xmul_acc;
+                acc.xtmul_secs += xtmul_acc;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rrblup_dual_recover_beta_and_test(
+    source: &mut RrblupPcgSource<'_>,
+    n_samples: usize,
+    row_flip: &[bool],
+    row_mean: &[f32],
+    row_inv_sd: &[f32],
+    train_idx: &[usize],
+    full_train_fast: bool,
+    test_idx: &[usize],
+    full_test_fast: bool,
+    packed_row_indices: Option<&[usize]>,
+    block_rows: usize,
+    alpha_c: &[f32],
+    y_mean: f64,
+    need_sum_ss: bool,
+    code4_lut: &[[u8; 4]; 256],
+    pool: Option<&Arc<rayon::ThreadPool>>,
+) -> Result<(Vec<f32>, f32, Vec<f64>, f64), String> {
+    let m = row_mean.len();
+    let n_train = train_idx.len();
+    let n_test = test_idx.len();
+    let row_step = block_rows.max(1).min(m.max(1));
+    let inv_n_train = if n_train > 0 {
+        1.0_f64 / (n_train as f64)
+    } else {
+        0.0_f64
+    };
+    let mut beta = vec![0.0_f32; m];
+    let mut pred_test_f32 = vec![0.0_f32; n_test];
+    let mut block_train = vec![0.0_f32; row_step.saturating_mul(n_train)];
+    let mut block_test = if n_test > 0 {
+        vec![0.0_f32; row_step.saturating_mul(n_test)]
+    } else {
+        Vec::new()
+    };
+    let mut dot_mean_beta = 0.0_f64;
+    let mut sum_ss_global = 0.0_f64;
+
+    for row_start in (0..m).step_by(row_step) {
+        let cur_rows = (m - row_start).min(row_step);
+        let row_end = row_start + cur_rows;
+        let blk_train = &mut block_train[..cur_rows * n_train];
+        decode_standardized_block_f32(
+            source,
+            n_samples,
+            row_flip,
+            row_mean,
+            row_inv_sd,
+            train_idx,
+            full_train_fast,
+            packed_row_indices,
+            row_start,
+            blk_train,
+            code4_lut,
+            pool,
+        )?;
+        if need_sum_ss {
+            sum_ss_global +=
+                row_centered_sum_squares_f32_to_f64(blk_train, cur_rows, n_train, pool);
+        }
+        let beta_blk = &mut beta[row_start..row_end];
+        row_major_block_mul_vec_f32(blk_train, cur_rows, n_train, alpha_c, beta_blk, pool);
+        let blk_dot: f64 = if let Some(tp) = pool.filter(|_| cur_rows * n_train >= 1_048_576) {
+            tp.install(|| {
+                beta_blk
+                    .par_iter()
+                    .enumerate()
+                    .map(|(r, &bj)| {
+                        let row = &blk_train[r * n_train..(r + 1) * n_train];
+                        let row_mu = row_major_row_sum_f64(row) * inv_n_train;
+                        row_mu * (bj as f64)
+                    })
+                    .sum::<f64>()
+            })
+        } else {
+            beta_blk
+                .iter()
+                .enumerate()
+                .map(|(r, &bj)| {
+                    let row = &blk_train[r * n_train..(r + 1) * n_train];
+                    let row_mu = row_major_row_sum_f64(row) * inv_n_train;
+                    row_mu * (bj as f64)
+                })
+                .sum::<f64>()
+        };
+        dot_mean_beta += blk_dot;
+
+        if n_test > 0 {
+            let blk_test = &mut block_test[..cur_rows * n_test];
+            decode_standardized_block_f32(
+                source,
+                n_samples,
+                row_flip,
+                row_mean,
+                row_inv_sd,
+                test_idx,
+                full_test_fast,
+                packed_row_indices,
+                row_start,
+                blk_test,
+                code4_lut,
+                pool,
+            )?;
+            row_major_block_t_mul_vec_accum_f32(
+                blk_test,
+                cur_rows,
+                n_test,
+                beta_blk,
+                &mut pred_test_f32,
+                pool,
+            );
+        }
+    }
+    let alpha_use = (y_mean - dot_mean_beta) as f32;
+    let pred_test_ret: Vec<f64> = pred_test_f32
+        .iter()
+        .map(|&v| (v as f64) + (alpha_use as f64))
+        .collect();
+    Ok((beta, alpha_use, pred_test_ret, sum_ss_global))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rrblup_dual_finalize_train_predictions(
+    resident_packed: Option<&[u8]>,
+    bytes_per_snp: usize,
+    prefix: &str,
+    n_samples: usize,
+    row_flip: &[bool],
+    row_mean: &[f32],
+    row_inv_sd: &[f32],
+    train_idx: &[usize],
+    full_train_fast: bool,
+    train_pred_pick: Option<&[usize]>,
+    packed_row_indices: Option<&[usize]>,
+    row_step: usize,
+    y_vec_f64: &[f64],
+    alpha_c: &[f32],
+    lambda_use: f32,
+    beta: &[f32],
+    alpha_use: f32,
+    converged: bool,
+    compute_trainvar: bool,
+    code4_lut: &[[u8; 4]; 256],
+    pool_ref: Option<&Arc<rayon::ThreadPool>>,
+) -> Result<(Vec<f64>, f64), String> {
+    let need_train_pred_all = train_pred_pick.is_none();
+    let need_train_pred_subset = train_pred_pick.map(|idx| !idx.is_empty()).unwrap_or(false);
+    let need_train_pred_any = need_train_pred_all || need_train_pred_subset;
+    let need_train_full = compute_trainvar || need_train_pred_all;
+
+    if converged {
+        let lam_f64 = lambda_use as f64;
+        let pred_train_f64: Vec<f64> = y_vec_f64
+            .iter()
+            .zip(alpha_c.iter())
+            .map(|(&yi, &ai)| yi - lam_f64 * (ai as f64))
+            .collect();
+        let pred_train_ret: Vec<f64> = if let Some(local_idx) = train_pred_pick {
+            local_idx.iter().map(|&i| pred_train_f64[i]).collect()
+        } else {
+            pred_train_f64.clone()
+        };
+        let pve_trainvar = if compute_trainvar {
+            let resid: Vec<f64> = y_vec_f64
+                .iter()
+                .zip(pred_train_f64.iter())
+                .map(|(&y, &p)| y - p)
+                .collect();
+            let var_g = sample_var_f64(&pred_train_f64, pool_ref);
+            let var_e = sample_var_f64(&resid, pool_ref);
+            let denom = var_g + var_e;
+            if denom.is_finite() && denom > 0.0 {
+                var_g / denom
+            } else {
+                f64::NAN
+            }
+        } else {
+            f64::NAN
+        };
+        return Ok((pred_train_ret, pve_trainvar));
+    }
+
+    if need_train_full {
+        let mut pred_train_source =
+            build_rrblup_source(resident_packed, bytes_per_snp, prefix, n_samples, row_step)?;
+        let mut pred_train_full = pcg_x_mul_samples(
+            &mut pred_train_source,
+            n_samples,
+            row_flip,
+            row_mean,
+            row_inv_sd,
+            train_idx,
+            full_train_fast,
+            packed_row_indices,
+            row_step,
+            beta,
+            code4_lut,
+            pool_ref,
+            None,
+        )?;
+        for v in &mut pred_train_full {
+            *v += alpha_use;
+        }
+        let pred_train_f64: Vec<f64> = pred_train_full.iter().map(|v| *v as f64).collect();
+        let pred_train_ret: Vec<f64> = if let Some(local_idx) = train_pred_pick {
+            local_idx.iter().map(|&i| pred_train_f64[i]).collect()
+        } else {
+            pred_train_f64.clone()
+        };
+        let pve_trainvar = if compute_trainvar {
+            let resid: Vec<f64> = y_vec_f64
+                .iter()
+                .zip(pred_train_f64.iter())
+                .map(|(&y, &p)| y - p)
+                .collect();
+            let var_g = sample_var_f64(&pred_train_f64, pool_ref);
+            let var_e = sample_var_f64(&resid, pool_ref);
+            let denom = var_g + var_e;
+            if denom.is_finite() && denom > 0.0 {
+                var_g / denom
+            } else {
+                f64::NAN
+            }
+        } else {
+            f64::NAN
+        };
+        return Ok((pred_train_ret, pve_trainvar));
+    }
+
+    if need_train_pred_any {
+        if let Some(local_idx) = train_pred_pick {
+            let train_pred_abs: Vec<usize> = local_idx.iter().map(|&i| train_idx[i]).collect();
+            let train_pred_fast = is_identity_indices(&train_pred_abs, n_samples);
+            let mut pred_train_sub_source =
+                build_rrblup_source(resident_packed, bytes_per_snp, prefix, n_samples, row_step)?;
+            let mut pred_train_sub = pcg_x_mul_samples(
+                &mut pred_train_sub_source,
+                n_samples,
+                row_flip,
+                row_mean,
+                row_inv_sd,
+                &train_pred_abs,
+                train_pred_fast,
+                packed_row_indices,
+                row_step,
+                beta,
+                code4_lut,
+                pool_ref,
+                None,
+            )?;
+            for v in &mut pred_train_sub {
+                *v += alpha_use;
+            }
+            let pred_train_ret = pred_train_sub.iter().map(|v| *v as f64).collect();
+            return Ok((pred_train_ret, f64::NAN));
+        }
+    }
+    Ok((Vec::new(), f64::NAN))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4307,6 +4855,8 @@ fn rrblup_pcg_bed_impl<'py>(
         .and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|&v| v > 0)
         .unwrap_or(100usize);
+    let pcg_space_raw = std::env::var("JX_RRBLUP_PCG_SPACE").unwrap_or_else(|_| "dual".to_string());
+    let pcg_space = RrblupPcgSpace::parse(&pcg_space_raw).map_err(PyRuntimeError::new_err)?;
 
     let (row_mean, row_inv_sd, m_effective) = rrblup_subset_or_validate_stats(
         row_mean_external_full,
@@ -4344,6 +4894,231 @@ fn rrblup_pcg_bed_impl<'py>(
                 };
                 let _pcg_blas_guard = OpenBlasThreadGuard::enter(blas_threads_effective);
                 let stage_accum = Arc::new(Mutex::new(PcgStageTimingAccum::default()));
+                if pcg_space == RrblupPcgSpace::Dual {
+                    let mut last_notified = 0usize;
+                    let pcg_t0 = Instant::now();
+                    let resident_packed = resident_packed_flat.as_ref().map(|cow| cow.as_ref());
+                    let mut sum_ss_global = 0.0_f64;
+                    let mut sum_ss_captured = false;
+                    let dual_op = RrblupDualPcgOperator {
+                        source: build_rrblup_source(
+                            resident_packed,
+                            bytes_per_snp,
+                            prefix.as_str(),
+                            n_samples,
+                            row_step,
+                        )?,
+                        n_samples,
+                        n_train,
+                        m,
+                        row_flip: row_flip_keep.as_ref(),
+                        row_mean: &row_mean,
+                        row_inv_sd: &row_inv_sd,
+                        sample_idx: &train_idx,
+                        full_sample_fast: full_train_fast,
+                        packed_row_indices: packed_row_indices.as_deref(),
+                        block_rows: row_step,
+                        code4_lut: &code4_lut,
+                        pool: pool_ref,
+                        lambda_use,
+                        stage_timing,
+                        stage_accum: stage_accum.as_ref(),
+                        block_buf: Vec::new(),
+                        tmp_buf: vec![0.0_f32; row_step],
+                        q_buf: vec![0.0_f32; n_train],
+                        sum_ss_global: &mut sum_ss_global,
+                        sum_ss_captured: &mut sum_ss_captured,
+                    };
+                    let pcg_res = pcg_solve(
+                        &y_center_f32,
+                        None,
+                        max_iter,
+                        tol_use,
+                        1e-20_f64,
+                        dual_op,
+                        IdentityPreconditioner,
+                        |iters_now, iters_max, rel_res_now| {
+                            let cb_t0 = Instant::now();
+                            if ((iters_now == 0usize) && (last_notified == 0usize))
+                                || (iters_now >= last_notified.saturating_add(notify_step))
+                                || (iters_now == iters_max)
+                            {
+                                last_notified = iters_now;
+                                if let Some(cb) = progress_callback.as_ref() {
+                                    Python::attach(|py2| -> PyResult<()> {
+                                        py2.check_signals()?;
+                                        match cb.call1(py2, (iters_now, iters_max, rel_res_now)) {
+                                            Ok(_) => {}
+                                            Err(err) => {
+                                                if err.is_instance_of::<PyTypeError>(py2) {
+                                                    cb.call1(py2, (iters_now, iters_max))?;
+                                                } else {
+                                                    return Err(err);
+                                                }
+                                            }
+                                        }
+                                        Ok(())
+                                    })
+                                    .map_err(|e| e.to_string())?;
+                                }
+                            }
+                            if (iters_now & 7) == 0 {
+                                check_ctrlc()?;
+                            }
+                            let cb_elapsed = cb_t0.elapsed().as_secs_f64();
+                            if stage_timing {
+                                if let Ok(mut acc) = stage_accum.lock() {
+                                    acc.callback_secs += cb_elapsed;
+                                }
+                                if (iters_now % stage_log_every) == 0 || iters_now == iters_max {
+                                    if let Ok(acc) = stage_accum.lock() {
+                                        let elapsed = pcg_t0.elapsed().as_secs_f64().max(1e-12_f64);
+                                        let decode_s = acc.decode_secs.max(0.0);
+                                        let xmul_s = acc.xmul_secs.max(0.0);
+                                        let xtmul_s = acc.xtmul_secs.max(0.0);
+                                        let cb_s = acc.callback_secs.max(0.0);
+                                        let known = decode_s + xmul_s + xtmul_s + cb_s;
+                                        let update_s = (elapsed - known).max(0.0_f64);
+                                        let pct = |x: f64| -> f64 { (x * 100.0) / elapsed };
+                                        eprintln!(
+                                            "rrBLUP-PCG(dual) stage timing iter={}/{} decode={:.3}s ({:.1}%) xmul={:.3}s ({:.1}%) xtmul={:.3}s ({:.1}%) update={:.3}s ({:.1}%) callback={:.3}s ({:.1}%) total={:.3}s",
+                                            iters_now,
+                                            iters_max,
+                                            decode_s,
+                                            pct(decode_s),
+                                            xmul_s,
+                                            pct(xmul_s),
+                                            xtmul_s,
+                                            pct(xtmul_s),
+                                            update_s,
+                                            pct(update_s),
+                                            cb_s,
+                                            pct(cb_s),
+                                            elapsed
+                                        );
+                                    }
+                                }
+                            }
+                            Ok(())
+                        },
+                    )?;
+                    let converged = pcg_res.converged;
+                    let iters_done = pcg_res.iters;
+                    let rel_res = pcg_res.rel_res;
+                    let alpha_raw = pcg_res.x;
+                    let alpha_mean =
+                        (alpha_raw.iter().map(|&v| v as f64).sum::<f64>() / (n_train as f64))
+                            as f32;
+                    let alpha_c: Vec<f32> = alpha_raw.iter().map(|&v| v - alpha_mean).collect();
+                    if stage_timing {
+                        if let Ok(acc) = stage_accum.lock() {
+                            let elapsed = pcg_t0.elapsed().as_secs_f64().max(1e-12_f64);
+                            let decode_s = acc.decode_secs.max(0.0);
+                            let xmul_s = acc.xmul_secs.max(0.0);
+                            let xtmul_s = acc.xtmul_secs.max(0.0);
+                            let cb_s = acc.callback_secs.max(0.0);
+                            let known = decode_s + xmul_s + xtmul_s + cb_s;
+                            let update_s = (elapsed - known).max(0.0_f64);
+                            let pct = |x: f64| -> f64 { (x * 100.0) / elapsed };
+                            eprintln!(
+                                "rrBLUP-PCG(dual) stage timing final iter={}/{} decode={:.3}s ({:.1}%) xmul={:.3}s ({:.1}%) xtmul={:.3}s ({:.1}%) update={:.3}s ({:.1}%) callback={:.3}s ({:.1}%) total={:.3}s",
+                                iters_done,
+                                max_iter,
+                                decode_s,
+                                pct(decode_s),
+                                xmul_s,
+                                pct(xmul_s),
+                                xtmul_s,
+                                pct(xtmul_s),
+                                update_s,
+                                pct(update_s),
+                                cb_s,
+                                pct(cb_s),
+                                elapsed
+                            );
+                        }
+                    }
+                    let mut recover_source = build_rrblup_source(
+                        resident_packed,
+                        bytes_per_snp,
+                        prefix.as_str(),
+                        n_samples,
+                        row_step,
+                    )?;
+                    let (beta, alpha_use, pred_test_ret, sum_ss_rec) =
+                        rrblup_dual_recover_beta_and_test(
+                            &mut recover_source,
+                            n_samples,
+                            row_flip_keep.as_ref(),
+                            &row_mean,
+                            &row_inv_sd,
+                            &train_idx,
+                            full_train_fast,
+                            &test_idx,
+                            full_test_fast,
+                            packed_row_indices.as_deref(),
+                            row_step,
+                            &alpha_c,
+                            y_mean,
+                            !sum_ss_captured,
+                            &code4_lut,
+                            pool_ref,
+                        )?;
+                    if !sum_ss_captured {
+                        sum_ss_global = sum_ss_rec;
+                    }
+                    let (pred_train_ret, pve_trainvar) = rrblup_dual_finalize_train_predictions(
+                        resident_packed,
+                        bytes_per_snp,
+                        prefix.as_str(),
+                        n_samples,
+                        row_flip_keep.as_ref(),
+                        &row_mean,
+                        &row_inv_sd,
+                        &train_idx,
+                        full_train_fast,
+                        train_pred_pick.as_deref(),
+                        packed_row_indices.as_deref(),
+                        row_step,
+                        &y_vec_f64,
+                        &alpha_c,
+                        lambda_use,
+                        &beta,
+                        alpha_use,
+                        converged,
+                        compute_trainvar,
+                        &code4_lut,
+                        pool_ref,
+                    )?;
+                    let mean_k_trace = if n_train > 0 && m_effective > 0 {
+                        sum_ss_global / ((m_effective as f64) * (n_train as f64))
+                    } else {
+                        f64::NAN
+                    };
+                    let pve_lambda_vc =
+                        if mean_k_trace.is_finite() && mean_k_trace > 0.0 && m_effective > 0 {
+                            let lambda_k = (lambda_use as f64) / (m_effective as f64);
+                            let denom_vc = mean_k_trace + lambda_k;
+                            if denom_vc.is_finite() && denom_vc > 0.0 {
+                                mean_k_trace / denom_vc
+                            } else {
+                                f64::NAN
+                            }
+                        } else {
+                            f64::NAN
+                        };
+                    return Ok((
+                        pred_train_ret,
+                        pred_test_ret,
+                        pve_trainvar,
+                        converged,
+                        iters_done,
+                        rel_res,
+                        pve_lambda_vc,
+                        mean_k_trace,
+                        beta,
+                    ));
+                }
                 let prep_t0 = Instant::now();
                 let resident_packed = resident_packed_flat.as_ref().map(|cow| cow.as_ref());
                 let mut prep_source = build_rrblup_source(
@@ -5915,6 +6690,613 @@ mod tests {
             )
             .is_err());
         }
+
+        std::fs::remove_dir_all(dir).expect("remove temp BED dir");
+    }
+
+    #[test]
+    fn rrblup_dual_pcg_matches_primal_beta_and_predictions() {
+        let n_samples = 40usize;
+        let n_train = 32usize;
+        let eff_m = 128usize;
+        let bytes_per_snp = n_samples.div_ceil(4);
+        let mut packed = vec![0u8; eff_m * bytes_per_snp];
+        for m in 0..eff_m {
+            for b in 0..bytes_per_snp {
+                let mut byte = 0u8;
+                for k in 0..4 {
+                    let s = b * 4 + k;
+                    let code = match (m * 19 + s * 11 + (m ^ s)) % 5 {
+                        0 => 0b00,
+                        1 | 2 => 0b10,
+                        3 => 0b11,
+                        _ => 0b01,
+                    };
+                    byte |= code << (2 * k);
+                }
+                packed[m * bytes_per_snp + b] = byte;
+            }
+        }
+        let maf: Vec<f32> = (0..eff_m)
+            .map(|m| 0.1 + 0.35 * (((m * 17) % 100) as f32 / 100.0))
+            .collect();
+        let row_flip = vec![false; eff_m];
+        let (row_mean, row_inv_sd, _m_eff) = rrblup_parallel_row_standardization(
+            &maf,
+            1e-12_f32,
+            None,
+            RrblupScaleMode::Standardized,
+        );
+        let train_idx: Vec<usize> = (0..n_train).collect();
+        let test_idx: Vec<usize> = (n_train..n_samples).collect();
+        let y_train: Vec<f64> = (0..n_train)
+            .map(|i| ((i as f64) * 0.31).sin() + 0.4 * ((i as f64) * 0.17).cos())
+            .collect();
+        let y_mean = y_train.iter().sum::<f64>() / (n_train as f64);
+        let y_center: Vec<f32> = y_train.iter().map(|&v| (v - y_mean) as f32).collect();
+        let lambda_use = 15.0_f32;
+        let code4_lut = packed_byte_lut().code4;
+        let stage_accum = Mutex::new(PcgStageTimingAccum::default());
+
+        let mut prep_src = RrblupPcgSource::Resident {
+            packed_flat: &packed,
+            bytes_per_snp,
+        };
+        let (b, diag_inv, train_row_mean, sum_ss_primal, _, _, _) = rrblup_prepare_rhs_diag(
+            &mut prep_src,
+            n_samples,
+            &row_flip,
+            &row_mean,
+            &row_inv_sd,
+            &train_idx,
+            false,
+            None,
+            32,
+            &y_center,
+            lambda_use,
+            &code4_lut,
+            None,
+        )
+        .expect("primal prepare");
+        let primal_op = RrblupPcgOperator {
+            source: RrblupPcgSource::Resident {
+                packed_flat: &packed,
+                bytes_per_snp,
+            },
+            n_samples,
+            n_train,
+            row_flip: &row_flip,
+            row_mean: &row_mean,
+            row_inv_sd: &row_inv_sd,
+            train_row_mean: &train_row_mean,
+            sample_idx: &train_idx,
+            full_sample_fast: false,
+            packed_row_indices: None,
+            block_rows: 32,
+            code4_lut: &code4_lut,
+            pool: None,
+            lambda_use,
+            stage_timing: false,
+            stage_accum: &stage_accum,
+        };
+        let primal_res = pcg_solve(
+            &b,
+            None,
+            200,
+            1e-6_f64,
+            1e-20_f64,
+            primal_op,
+            DiagonalPreconditioner::new(&diag_inv),
+            |_, _, _| Ok(()),
+        )
+        .expect("primal pcg");
+        assert!(primal_res.converged);
+        let primal_alpha = (y_mean as f32)
+            - train_row_mean
+                .iter()
+                .zip(primal_res.x.iter())
+                .map(|(mu, bj)| *mu * *bj)
+                .sum::<f32>();
+        let mut pred_src = RrblupPcgSource::Resident {
+            packed_flat: &packed,
+            bytes_per_snp,
+        };
+        let primal_pred_train: Vec<f64> = pcg_x_mul_samples(
+            &mut pred_src,
+            n_samples,
+            &row_flip,
+            &row_mean,
+            &row_inv_sd,
+            &train_idx,
+            false,
+            None,
+            32,
+            &primal_res.x,
+            &code4_lut,
+            None,
+            None,
+        )
+        .expect("primal pred train")
+        .into_iter()
+        .map(|v| (v + primal_alpha) as f64)
+        .collect();
+        let primal_pred_test: Vec<f64> = pcg_x_mul_samples(
+            &mut pred_src,
+            n_samples,
+            &row_flip,
+            &row_mean,
+            &row_inv_sd,
+            &test_idx,
+            false,
+            None,
+            32,
+            &primal_res.x,
+            &code4_lut,
+            None,
+            None,
+        )
+        .expect("primal pred test")
+        .into_iter()
+        .map(|v| (v + primal_alpha) as f64)
+        .collect();
+
+        let mut sum_ss_dual = 0.0_f64;
+        let mut sum_ss_captured = false;
+        let dual_op = RrblupDualPcgOperator {
+            source: RrblupPcgSource::Resident {
+                packed_flat: &packed,
+                bytes_per_snp,
+            },
+            n_samples,
+            n_train,
+            m: eff_m,
+            row_flip: &row_flip,
+            row_mean: &row_mean,
+            row_inv_sd: &row_inv_sd,
+            sample_idx: &train_idx,
+            full_sample_fast: false,
+            packed_row_indices: None,
+            block_rows: 32,
+            code4_lut: &code4_lut,
+            pool: None,
+            lambda_use,
+            stage_timing: false,
+            stage_accum: &stage_accum,
+            block_buf: vec![0.0_f32; 32 * n_train],
+            tmp_buf: vec![0.0_f32; 32],
+            q_buf: vec![0.0_f32; n_train],
+            sum_ss_global: &mut sum_ss_dual,
+            sum_ss_captured: &mut sum_ss_captured,
+        };
+        let dual_res = pcg_solve(
+            &y_center,
+            None,
+            200,
+            1e-6_f64,
+            1e-20_f64,
+            dual_op,
+            IdentityPreconditioner,
+            |_, _, _| Ok(()),
+        )
+        .expect("dual pcg");
+        assert!(dual_res.converged);
+        assert!(sum_ss_captured);
+        assert!((sum_ss_dual - sum_ss_primal).abs() < 1e-2);
+
+        let a_mean = (dual_res.x.iter().map(|&v| v as f64).sum::<f64>() / (n_train as f64)) as f32;
+        let alpha_c: Vec<f32> = dual_res.x.iter().map(|&v| v - a_mean).collect();
+        let dual_pred_train: Vec<f64> = y_train
+            .iter()
+            .zip(alpha_c.iter())
+            .map(|(&yi, &ai)| yi - (lambda_use as f64) * (ai as f64))
+            .collect();
+        let mut rec_src = RrblupPcgSource::Resident {
+            packed_flat: &packed,
+            bytes_per_snp,
+        };
+        let (dual_beta, _dual_alpha, dual_pred_test, _) = rrblup_dual_recover_beta_and_test(
+            &mut rec_src,
+            n_samples,
+            &row_flip,
+            &row_mean,
+            &row_inv_sd,
+            &train_idx,
+            false,
+            &test_idx,
+            false,
+            None,
+            32,
+            &alpha_c,
+            y_mean,
+            false,
+            &code4_lut,
+            None,
+        )
+        .expect("dual recover");
+
+        assert!(max_abs_diff(&dual_beta, &primal_res.x) < 1e-4);
+        let max_tr_diff = dual_pred_train
+            .iter()
+            .zip(primal_pred_train.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        let max_te_diff = dual_pred_test
+            .iter()
+            .zip(primal_pred_test.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(max_tr_diff < 1e-4, "train diff={max_tr_diff}");
+        assert!(max_te_diff < 1e-4, "test diff={max_te_diff}");
+    }
+
+    #[test]
+    fn rrblup_dual_pcg_unconverged_max_iter_one_matches_beta_predictions() {
+        let n_samples = 32usize;
+        let n_train = 26usize;
+        let eff_m = 96usize;
+        let bytes_per_snp = n_samples.div_ceil(4);
+        let mut packed = vec![0u8; eff_m * bytes_per_snp];
+        for m in 0..eff_m {
+            for b in 0..bytes_per_snp {
+                let mut byte = 0u8;
+                for k in 0..4 {
+                    let s = b * 4 + k;
+                    let code = match (m * 29 + s * 13 + (m ^ s)) % 5 {
+                        0 => 0b00,
+                        1 | 2 => 0b10,
+                        3 => 0b11,
+                        _ => 0b01,
+                    };
+                    byte |= code << (2 * k);
+                }
+                packed[m * bytes_per_snp + b] = byte;
+            }
+        }
+        let maf: Vec<f32> = (0..eff_m)
+            .map(|m| 0.12 + 0.32 * (((m * 11) % 100) as f32 / 100.0))
+            .collect();
+        let row_flip = vec![false; eff_m];
+        let (row_mean, row_inv_sd, _m_eff) = rrblup_parallel_row_standardization(
+            &maf,
+            1e-12_f32,
+            None,
+            RrblupScaleMode::Standardized,
+        );
+        let train_idx: Vec<usize> = (0..n_train).collect();
+        let y_train: Vec<f64> = (0..n_train)
+            .map(|i| ((i as f64) * 0.43).sin() + 0.5 * ((i as f64) * 0.19).cos())
+            .collect();
+        let y_mean = y_train.iter().sum::<f64>() / (n_train as f64);
+        let y_center: Vec<f32> = y_train.iter().map(|&v| (v - y_mean) as f32).collect();
+        let lambda_use = 5.0_f32;
+        let code4_lut = packed_byte_lut().code4;
+        let stage_accum = Mutex::new(PcgStageTimingAccum::default());
+
+        let mut sum_ss = 0.0_f64;
+        let mut sum_ss_captured = false;
+        let dual_op = RrblupDualPcgOperator {
+            source: RrblupPcgSource::Resident {
+                packed_flat: &packed,
+                bytes_per_snp,
+            },
+            n_samples,
+            n_train,
+            m: eff_m,
+            row_flip: &row_flip,
+            row_mean: &row_mean,
+            row_inv_sd: &row_inv_sd,
+            sample_idx: &train_idx,
+            full_sample_fast: false,
+            packed_row_indices: None,
+            block_rows: 32,
+            code4_lut: &code4_lut,
+            pool: None,
+            lambda_use,
+            stage_timing: false,
+            stage_accum: &stage_accum,
+            block_buf: Vec::new(),
+            tmp_buf: vec![0.0_f32; 32],
+            q_buf: vec![0.0_f32; n_train],
+            sum_ss_global: &mut sum_ss,
+            sum_ss_captured: &mut sum_ss_captured,
+        };
+        let pcg_res = pcg_solve(
+            &y_center,
+            None,
+            1,
+            1e-12_f64,
+            1e-20_f64,
+            dual_op,
+            IdentityPreconditioner,
+            |_, _, _| Ok(()),
+        )
+        .expect("max_iter=1 dual pcg");
+        assert!(!pcg_res.converged);
+
+        let a_mean = (pcg_res.x.iter().map(|&v| v as f64).sum::<f64>() / (n_train as f64)) as f32;
+        let alpha_c: Vec<f32> = pcg_res.x.iter().map(|&v| v - a_mean).collect();
+        let mut rec_src = RrblupPcgSource::Resident {
+            packed_flat: &packed,
+            bytes_per_snp,
+        };
+        let (beta, alpha_use, _, _) = rrblup_dual_recover_beta_and_test(
+            &mut rec_src,
+            n_samples,
+            &row_flip,
+            &row_mean,
+            &row_inv_sd,
+            &train_idx,
+            false,
+            &[],
+            false,
+            None,
+            32,
+            &alpha_c,
+            y_mean,
+            false,
+            &code4_lut,
+            None,
+        )
+        .expect("recover beta");
+
+        let (pred_train_fixed, pve_fixed) = rrblup_dual_finalize_train_predictions(
+            Some(&packed),
+            bytes_per_snp,
+            "",
+            n_samples,
+            &row_flip,
+            &row_mean,
+            &row_inv_sd,
+            &train_idx,
+            false,
+            None,
+            None,
+            32,
+            &y_train,
+            &alpha_c,
+            lambda_use,
+            &beta,
+            alpha_use,
+            pcg_res.converged,
+            true,
+            &code4_lut,
+            None,
+        )
+        .expect("finalize unconverged train predictions");
+        let resid_check: Vec<f64> = y_train
+            .iter()
+            .zip(pred_train_fixed.iter())
+            .map(|(&y, &p)| y - p)
+            .collect();
+        let var_g_check = sample_var_f64(&pred_train_fixed, None);
+        let var_e_check = sample_var_f64(&resid_check, None);
+        let expected_pve = var_g_check / (var_g_check + var_e_check);
+        assert!(pve_fixed.is_finite());
+        assert!(
+            (pve_fixed - expected_pve).abs() < 1e-12,
+            "unconverged pve mismatch: got {pve_fixed}, expected {expected_pve}"
+        );
+
+        let mut check_src = RrblupPcgSource::Resident {
+            packed_flat: &packed,
+            bytes_per_snp,
+        };
+        let pred_from_beta: Vec<f64> = pcg_x_mul_samples(
+            &mut check_src,
+            n_samples,
+            &row_flip,
+            &row_mean,
+            &row_inv_sd,
+            &train_idx,
+            false,
+            None,
+            32,
+            &beta,
+            &code4_lut,
+            None,
+            None,
+        )
+        .expect("direct train pred from beta")
+        .into_iter()
+        .map(|v| (v + alpha_use) as f64)
+        .collect();
+        let max_beta_diff = pred_train_fixed
+            .iter()
+            .zip(pred_from_beta.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_beta_diff < 1e-5,
+            "unconverged train predictions diverged from W*beta: {max_beta_diff}"
+        );
+    }
+
+    #[test]
+    fn rrblup_dual_pcg_windowed_double_buffer_and_error_propagation() {
+        let n_samples = 24usize;
+        let eff_m = 96usize;
+        let block_rows = 32usize;
+        let bytes_per_snp = n_samples.div_ceil(4);
+        let mut packed = vec![0u8; eff_m * bytes_per_snp];
+        for m in 0..eff_m {
+            for b in 0..bytes_per_snp {
+                let mut byte = 0u8;
+                for k in 0..4 {
+                    let s = b * 4 + k;
+                    let code = match (m * 17 + s * 9 + (m ^ s)) % 5 {
+                        0 => 0b00,
+                        1 | 2 => 0b10,
+                        3 => 0b11,
+                        _ => 0b01,
+                    };
+                    byte |= code << (2 * k);
+                }
+                packed[m * bytes_per_snp + b] = byte;
+            }
+        }
+        let maf: Vec<f32> = (0..eff_m)
+            .map(|m| 0.1 + 0.35 * (((m * 13) % 100) as f32 / 100.0))
+            .collect();
+        let row_flip = vec![false; eff_m];
+        let (row_mean, row_inv_sd, _m_eff) = rrblup_parallel_row_standardization(
+            &maf,
+            1e-12_f32,
+            None,
+            RrblupScaleMode::Standardized,
+        );
+        let train_idx: Vec<usize> = (0..n_samples).collect();
+        let y_train: Vec<f64> = (0..n_samples)
+            .map(|i| ((i as f64) * 0.33).sin() - 0.25 * ((i as f64) * 0.21).cos())
+            .collect();
+        let y_mean = y_train.iter().sum::<f64>() / (n_samples as f64);
+        let y_center: Vec<f32> = y_train.iter().map(|&v| (v - y_mean) as f32).collect();
+        let lambda_use = 12.0_f32;
+        let code4_lut = packed_byte_lut().code4;
+        let stage_accum = Mutex::new(PcgStageTimingAccum::default());
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("janusx_dual_db_{stamp}"));
+        std::fs::create_dir_all(&dir).expect("create temp BED dir");
+        let prefix = dir.join("tiny");
+        let mut bed_bytes = Vec::with_capacity(3 + packed.len());
+        bed_bytes.extend_from_slice(&[0x6c, 0x1b, 0x01]);
+        bed_bytes.extend_from_slice(&packed);
+        std::fs::write(prefix.with_extension("bed"), &bed_bytes).expect("write BED");
+        let fam_text: String = (0..n_samples)
+            .map(|i| format!("F{i} I{i} 0 0 1 -9\n"))
+            .collect();
+        std::fs::write(prefix.with_extension("fam"), fam_text).expect("write FAM");
+        let prefix_str = prefix.to_string_lossy().into_owned();
+
+        let mut sum_ss_res = 0.0_f64;
+        let mut cap_res = false;
+        let res_op = RrblupDualPcgOperator {
+            source: RrblupPcgSource::Resident {
+                packed_flat: &packed,
+                bytes_per_snp,
+            },
+            n_samples,
+            n_train: n_samples,
+            m: eff_m,
+            row_flip: &row_flip,
+            row_mean: &row_mean,
+            row_inv_sd: &row_inv_sd,
+            sample_idx: &train_idx,
+            full_sample_fast: true,
+            packed_row_indices: None,
+            block_rows,
+            code4_lut: &code4_lut,
+            pool: None,
+            lambda_use,
+            stage_timing: false,
+            stage_accum: &stage_accum,
+            block_buf: Vec::new(),
+            tmp_buf: vec![0.0_f32; block_rows],
+            q_buf: vec![0.0_f32; n_samples],
+            sum_ss_global: &mut sum_ss_res,
+            sum_ss_captured: &mut cap_res,
+        };
+        let res_sol = pcg_solve(
+            &y_center,
+            None,
+            200,
+            1e-6_f64,
+            1e-20_f64,
+            res_op,
+            IdentityPreconditioner,
+            |_, _, _| Ok(()),
+        )
+        .expect("resident dual pcg");
+
+        let win_mat = WindowedBedMatrix::open(&prefix_str, 1).expect("open windowed BED");
+        let mut sum_ss_win = 0.0_f64;
+        let mut cap_win = false;
+        let win_op = RrblupDualPcgOperator {
+            source: RrblupPcgSource::Windowed {
+                matrix: win_mat,
+                bytes_per_snp,
+            },
+            n_samples,
+            n_train: n_samples,
+            m: eff_m,
+            row_flip: &row_flip,
+            row_mean: &row_mean,
+            row_inv_sd: &row_inv_sd,
+            sample_idx: &train_idx,
+            full_sample_fast: true,
+            packed_row_indices: None,
+            block_rows,
+            code4_lut: &code4_lut,
+            pool: None,
+            lambda_use,
+            stage_timing: false,
+            stage_accum: &stage_accum,
+            block_buf: Vec::new(),
+            tmp_buf: vec![0.0_f32; block_rows],
+            q_buf: vec![0.0_f32; n_samples],
+            sum_ss_global: &mut sum_ss_win,
+            sum_ss_captured: &mut cap_win,
+        };
+        let win_sol = pcg_solve(
+            &y_center,
+            None,
+            200,
+            1e-6_f64,
+            1e-20_f64,
+            win_op,
+            IdentityPreconditioner,
+            |_, _, _| Ok(()),
+        )
+        .expect("windowed double-buffer dual pcg");
+        assert!(win_sol.converged);
+        assert!(cap_win);
+        assert!((sum_ss_win - sum_ss_res).abs() < 1e-6);
+        assert!(max_abs_diff(&win_sol.x, &res_sol.x) < 1e-6);
+
+        // Verify decode error inside the double-buffer producer propagates cleanly.
+        let win_mat_err = WindowedBedMatrix::open(&prefix_str, 1).expect("open windowed BED err");
+        let mut bad_rows: Vec<usize> = (0..eff_m).collect();
+        bad_rows[eff_m - 1] = eff_m + 10;
+        let mut sum_ss_err = 0.0_f64;
+        let mut cap_err = false;
+        let mut err_op = RrblupDualPcgOperator {
+            source: RrblupPcgSource::Windowed {
+                matrix: win_mat_err,
+                bytes_per_snp,
+            },
+            n_samples,
+            n_train: n_samples,
+            m: eff_m,
+            row_flip: &row_flip,
+            row_mean: &row_mean,
+            row_inv_sd: &row_inv_sd,
+            sample_idx: &train_idx,
+            full_sample_fast: true,
+            packed_row_indices: Some(&bad_rows),
+            block_rows,
+            code4_lut: &code4_lut,
+            pool: None,
+            lambda_use,
+            stage_timing: false,
+            stage_accum: &stage_accum,
+            block_buf: Vec::new(),
+            tmp_buf: vec![0.0_f32; block_rows],
+            q_buf: vec![0.0_f32; n_samples],
+            sum_ss_global: &mut sum_ss_err,
+            sum_ss_captured: &mut cap_err,
+        };
+        let mut out_err = vec![0.0_f32; n_samples];
+        let err_msg = err_op
+            .apply(&y_center, &mut out_err)
+            .expect_err("expected out-of-bounds decode error");
+        assert!(
+            err_msg.contains("out of bounds"),
+            "unexpected double-buffer error message: {err_msg}"
+        );
+        drop(err_op);
 
         std::fs::remove_dir_all(dir).expect("remove temp BED dir");
     }

@@ -20,7 +20,7 @@ use ancestry::{paint_chromosome_ancestry_cancellable, ChromosomeAncestryBinsSpar
 use ibd::{build_sparse_ibd_kinship_csr, detect_chromosome_ibd_cancellable};
 use mott::{
     paint_chromosome_mott_cancellable, select_even_marker_indices, MottCoreConfig,
-    MottPosteriorMatrix,
+    MottPosteriorMatrix, MottSegmentDiagnostic,
 };
 use phasing::{phase_unphased_diploids_one_pass, DisjointPhaseBlock, SampleHaplotypeLayout};
 use sparse_io::{
@@ -28,6 +28,8 @@ use sparse_io::{
     HaploidSparsePayload,
 };
 use std::collections::{HashMap, HashSet};
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -193,6 +195,7 @@ where
     let mut all_ancestry_segments: Vec<AncestrySegment> = Vec::new();
     let mut all_chrom_bins: Vec<ChromosomeAncestryBinsSparse> = Vec::new();
     let mut all_mott_posteriors: Vec<MottPosteriorMatrix> = Vec::new();
+    let mut all_mott_diagnostics: Vec<MottSegmentDiagnostic> = Vec::new();
 
     let mut emit_progress = |stage: &str,
                              chrom: &str,
@@ -544,6 +547,7 @@ where
                         })?;
                         all_ancestry_segments.extend(mott_out.segments);
                         all_chrom_bins.push(mott_out.bins);
+                        all_mott_diagnostics.extend(mott_out.diagnostics);
                         if let Some(post) = mott_out.posterior {
                             all_mott_posteriors.push(post);
                         }
@@ -669,6 +673,21 @@ where
         None
     };
 
+    let mott_diagnostics_path = if mode == HaploidIbdMode::MultiParentAncestry
+        && config.ancestry_model == AncestryModel::Mott
+        && config.mott_write_diagnostics
+    {
+        let diagnostics_path = mott_diagnostics_tsv_output_path(&config.output);
+        write_mott_diagnostics_tsv_atomic(
+            &diagnostics_path,
+            &all_mott_diagnostics,
+            cancelled,
+        )?;
+        Some(diagnostics_path.to_string_lossy().into_owned())
+    } else {
+        None
+    };
+
     emit_progress(
         "complete",
         "",
@@ -693,6 +712,7 @@ where
         output_path: output_path.to_string_lossy().into_owned(),
         tsv_path,
         posterior_path,
+        mott_diagnostics_path,
         aligned_exact_markers,
         aligned_swapped_markers,
         aligned_incompatible_markers,
@@ -704,6 +724,7 @@ where
 
 static SPOOL_COUNTER: AtomicU64 = AtomicU64::new(0);
 static MOTT_POSTERIOR_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+static MOTT_DIAGNOSTICS_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Disk-backed per-chromosome reference spool that keeps peak RAM strictly
 /// bounded to a single chromosome even when target and reference files have
@@ -912,6 +933,106 @@ fn posterior_tsv_output_path(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
     let stem = s.strip_suffix(".jhibd").unwrap_or(&s);
     PathBuf::from(format!("{stem}.posterior.tsv"))
+}
+
+fn mott_diagnostics_tsv_output_path(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    let stem = s.strip_suffix(".jhibd").unwrap_or(&s);
+    PathBuf::from(format!("{stem}.mott_diagnostics.tsv.gz"))
+}
+
+fn write_mott_diagnostics_tsv_atomic(
+    path: &Path,
+    diagnostics: &[MottSegmentDiagnostic],
+    cancelled: Option<&AtomicBool>,
+) -> Result<(), String> {
+    if is_cancelled(cancelled) {
+        return Err("Interrupted".to_owned());
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| format!("create directory {}: {err}", parent.display()))?;
+        }
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("mott_diagnostics.tsv.gz");
+    let tmp_id = MOTT_DIAGNOSTICS_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = path.with_file_name(format!(
+        ".{file_name}.tmp.{}.{}",
+        std::process::id(),
+        tmp_id
+    ));
+    let write_res = (|| -> Result<(), String> {
+        let file = File::create(&tmp_path)
+            .map_err(|err| format!("create temp diagnostics {}: {err}", tmp_path.display()))?;
+        let mut encoder = GzEncoder::new(
+            BufWriter::with_capacity(1 << 20, file),
+            Compression::fast(),
+        );
+        encoder
+            .write_all(
+                b"target\tchrom\tstart_bp\tend_bp\tcalled_parent\tconfidence\tsecond_parent\tsecond_posterior\tposterior_margin\tambiguous_parents\n",
+            )
+            .map_err(|err| format!("write diagnostics header {}: {err}", path.display()))?;
+        for (idx, row) in diagnostics.iter().enumerate() {
+            if (idx & 4095) == 0 && is_cancelled(cancelled) {
+                return Err("Interrupted".to_owned());
+            }
+            for value in [
+                row.confidence,
+                row.second_posterior,
+                row.posterior_margin,
+            ] {
+                if !value.is_finite() {
+                    return Err(format!(
+                        "non-finite diagnostic value at row {idx} for target {}",
+                        row.target_sample
+                    ));
+                }
+            }
+            writeln!(
+                encoder,
+                "{}\t{}\t{}\t{}\t{}\t{:.8}\t{}\t{:.8}\t{:.8}\t{}",
+                row.target_sample,
+                row.chrom_idx,
+                row.start_bp,
+                row.end_bp,
+                row.called_parent,
+                row.confidence,
+                row.second_parent,
+                row.second_posterior,
+                row.posterior_margin,
+                row.ambiguous_parents
+            )
+            .map_err(|err| format!("write diagnostics {}: {err}", path.display()))?;
+        }
+        let mut writer = encoder
+            .finish()
+            .map_err(|err| format!("finish diagnostics gzip {}: {err}", path.display()))?;
+        writer
+            .flush()
+            .map_err(|err| format!("flush diagnostics {}: {err}", path.display()))?;
+        Ok(())
+    })();
+    if is_cancelled(cancelled) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err("Interrupted".to_owned());
+    }
+    if let Err(err) = write_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    std::fs::rename(&tmp_path, path).map_err(|err| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!(
+            "rename temp diagnostics {} -> {}: {err}",
+            tmp_path.display(),
+            path.display()
+        )
+    })
 }
 
 fn write_mott_posterior_tsv_atomic(

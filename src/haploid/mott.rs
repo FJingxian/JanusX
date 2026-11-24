@@ -12,6 +12,7 @@ use super::ancestry::{
 use super::phasing::SampleHaplotypeLayout;
 use super::types::{AncestrySegment, BitHaplotypeMatrix, HaploidIbdConfig};
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,6 +31,12 @@ pub(crate) struct MottCoreConfig {
 
 impl MottCoreConfig {
     pub(crate) fn from_ibd_config(config: &HaploidIbdConfig) -> Result<Self, String> {
+        if !config.mott_ambiguity_delta.is_finite() || config.mott_ambiguity_delta < 0.0 {
+            return Err(format!(
+                "mott_ambiguity_delta must be finite and >= 0, got {}",
+                config.mott_ambiguity_delta
+            ));
+        }
         let cfg = Self {
             generations: config.mott_generations,
             parent_match_prob: config.mott_parent_match_prob,
@@ -83,7 +90,22 @@ pub(crate) struct MottChromosomeOutput {
     pub segments: Vec<AncestrySegment>,
     pub bins: ChromosomeAncestryBinsSparse,
     pub posterior: Option<MottPosteriorMatrix>,
+    pub diagnostics: Vec<MottSegmentDiagnostic>,
     pub selected_markers: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MottSegmentDiagnostic {
+    pub target_sample: u32,
+    pub chrom_idx: u16,
+    pub start_bp: u64,
+    pub end_bp: u64,
+    pub called_parent: u32,
+    pub confidence: f32,
+    pub second_parent: u32,
+    pub second_posterior: f32,
+    pub posterior_margin: f32,
+    pub ambiguous_parents: u16,
 }
 
 #[inline]
@@ -416,6 +438,7 @@ pub(crate) fn select_even_marker_indices(informative: &[bool], cap: usize) -> Ve
         .collect()
 }
 
+#[cfg(test)]
 fn compress_calls_to_segments(
     target_sample: u32,
     chrom_idx: u16,
@@ -425,8 +448,112 @@ fn compress_calls_to_segments(
     positions_bp: &[u64],
     cm_positions: &[f64],
 ) -> Vec<AncestrySegment> {
+    compress_calls_to_segments_with_diagnostics(
+        target_sample,
+        chrom_idx,
+        calls,
+        posterior,
+        n_states,
+        positions_bp,
+        cm_positions,
+        None,
+    )
+    .map(|(segments, _)| segments)
+    .unwrap_or_default()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_segment_diagnostic(
+    target_sample: u32,
+    chrom_idx: u16,
+    start_bp: u64,
+    end_bp: u64,
+    called_parent: usize,
+    posterior: &[f64],
+    n_states: usize,
+    n_markers: usize,
+    ambiguity_delta: f64,
+) -> Result<MottSegmentDiagnostic, String> {
+    if n_states == 0 || n_markers == 0 {
+        return Err("diagnostic requires positive states and markers".to_owned());
+    }
+    if called_parent >= n_states {
+        return Err(format!(
+            "called parent {called_parent} is outside {n_states} founder states"
+        ));
+    }
+    if posterior.len() != n_states.saturating_mul(n_markers) {
+        return Err(format!(
+            "diagnostic posterior length {} does not match {n_markers} markers * {n_states} states",
+            posterior.len()
+        ));
+    }
+    if !ambiguity_delta.is_finite() || ambiguity_delta < 0.0 {
+        return Err(format!(
+            "mott ambiguity delta must be finite and >= 0, got {ambiguity_delta}"
+        ));
+    }
+    let mut means = vec![0.0f64; n_states];
+    for row in posterior.chunks_exact(n_states) {
+        for (state, &value) in row.iter().enumerate() {
+            if !value.is_finite() {
+                return Err(format!(
+                    "non-finite posterior value at diagnostic state {state}"
+                ));
+            }
+            means[state] += value;
+        }
+    }
+    for value in &mut means {
+        *value /= n_markers as f64;
+    }
+    let confidence = means[called_parent];
+    let mut second_parent = called_parent;
+    let mut second_posterior = f64::NEG_INFINITY;
+    for (state, &value) in means.iter().enumerate() {
+        if state != called_parent && value > second_posterior {
+            second_parent = state;
+            second_posterior = value;
+        }
+    }
+    if n_states == 1 {
+        second_posterior = 0.0;
+    }
+    let threshold = confidence - ambiguity_delta;
+    let ambiguous_parents = means
+        .iter()
+        .filter(|&&value| value >= threshold)
+        .count()
+        .max(1)
+        .min(u16::MAX as usize) as u16;
+    Ok(MottSegmentDiagnostic {
+        target_sample,
+        chrom_idx,
+        start_bp,
+        end_bp,
+        called_parent: called_parent as u32,
+        confidence: confidence as f32,
+        second_parent: second_parent as u32,
+        second_posterior: second_posterior as f32,
+        posterior_margin: (confidence - second_posterior) as f32,
+        ambiguous_parents,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compress_calls_to_segments_with_diagnostics(
+    target_sample: u32,
+    chrom_idx: u16,
+    calls: &[Option<usize>],
+    posterior: &[f64],
+    n_states: usize,
+    positions_bp: &[u64],
+    cm_positions: &[f64],
+    ambiguity_delta: Option<f64>,
+) -> Result<(Vec<AncestrySegment>, Vec<MottSegmentDiagnostic>), String> {
     let n_markers = calls.len();
     let mut segments = Vec::new();
+    let mut diagnostics = Vec::new();
     let mut i = 0usize;
     while i < n_markers {
         let Some(parent) = calls[i] else {
@@ -445,14 +572,13 @@ fn compress_calls_to_segments(
         let followed_by_called = i < n_markers && calls[i].is_some();
         let (end_bp, end_cm) = if followed_by_called {
             (
-                positions_bp[i].saturating_sub(1).max(positions_bp[run_start]),
+                positions_bp[i]
+                    .saturating_sub(1)
+                    .max(positions_bp[run_start]),
                 cm_positions[i] as f32,
             )
         } else {
-            (
-                positions_bp[run_end],
-                cm_positions[run_end] as f32,
-            )
+            (positions_bp[run_end], cm_positions[run_end] as f32)
         };
         segments.push(AncestrySegment {
             target_sample,
@@ -468,8 +594,24 @@ fn compress_calls_to_segments(
             ambiguous_parents: 1,
             n_markers: run_len as u32,
         });
+        if let Some(delta) = ambiguity_delta {
+            let start_off = run_start * n_states;
+            let end_off = (run_end + 1) * n_states;
+            let diag = build_segment_diagnostic(
+                target_sample,
+                chrom_idx,
+                positions_bp[run_start],
+                end_bp,
+                parent,
+                &posterior[start_off..end_off],
+                n_states,
+                run_len,
+                delta,
+            )?;
+            diagnostics.push(diag);
+        }
     }
-    segments
+    Ok((segments, diagnostics))
 }
 
 /// Run author-compatible Mott HMM ancestry painting on a single chromosome.
@@ -496,6 +638,7 @@ pub(crate) fn paint_chromosome_mott_cancellable(
             segments: Vec::new(),
             bins: empty_bins,
             posterior: None,
+            diagnostics: Vec::new(),
             selected_markers: 0,
         });
     }
@@ -573,6 +716,7 @@ pub(crate) fn paint_chromosome_mott_cancellable(
             segments: Vec::new(),
             bins: empty_bins,
             posterior: None,
+            diagnostics: Vec::new(),
             selected_markers: 0,
         });
     }
@@ -616,14 +760,21 @@ pub(crate) fn paint_chromosome_mott_cancellable(
     const TARGET_CHUNK: usize = 256;
     let mut all_segments: Vec<AncestrySegment> = Vec::new();
     let mut exported_posterior: Option<MottPosteriorMatrix> = None;
+    let mut all_diagnostics: Vec<MottSegmentDiagnostic> = Vec::new();
 
     for chunk_start in (0..n_targets).step_by(TARGET_CHUNK) {
         if is_cancelled(cancelled) {
             return Err("Interrupted".to_owned());
         }
         let chunk_end = (chunk_start + TARGET_CHUNK).min(n_targets);
-        let chunk_res: Result<Vec<(Vec<AncestrySegment>, Option<Vec<f64>>)>, String> = (chunk_start
-            ..chunk_end)
+        let chunk_res: Result<
+            Vec<(
+                Vec<AncestrySegment>,
+                Vec<MottSegmentDiagnostic>,
+                Option<Vec<f64>>,
+            )>,
+            String,
+        > = (chunk_start..chunk_end)
             .into_par_iter()
             .map(|s| {
                 if is_cancelled(cancelled) {
@@ -635,31 +786,34 @@ pub(crate) fn paint_chromosome_mott_cancellable(
                     tcalls.push(joint_matrix.allele(m, h));
                 }
                 let post = posterior_one_sample_precomputed(
-                    n_sel,
-                    n_founders,
-                    &emit0,
-                    &emit1,
-                    &uniform,
-                    &tcalls,
-                    &sel_cm,
-                    &core_cfg,
+                    n_sel, n_founders, &emit0, &emit1, &uniform, &tcalls, &sel_cm, &core_cfg,
                     cancelled,
                 )?;
                 let calls = hard_calls(&post, n_sel, n_founders, core_cfg.unknown_fold)?;
-                let segs = compress_calls_to_segments(
-                    s as u32, chrom_idx, &calls, &post, n_founders, &sel_bp, &sel_cm,
-                );
+                let (segs, diagnostics) = compress_calls_to_segments_with_diagnostics(
+                    s as u32,
+                    chrom_idx,
+                    &calls,
+                    &post,
+                    n_founders,
+                    &sel_bp,
+                    &sel_cm,
+                    config
+                        .mott_write_diagnostics
+                        .then_some(config.mott_ambiguity_delta),
+                )?;
                 let keep_post = if config.mott_write_posterior {
                     Some(post)
                 } else {
                     None
                 };
-                Ok((segs, keep_post))
+                Ok((segs, diagnostics, keep_post))
             })
             .collect();
 
-        for (segs, post_opt) in chunk_res? {
+        for (segs, diagnostics, post_opt) in chunk_res? {
             all_segments.extend(segs);
+            all_diagnostics.extend(diagnostics);
             if let Some(values) = post_opt {
                 exported_posterior = Some(MottPosteriorMatrix {
                     n_states: n_founders,
@@ -684,6 +838,7 @@ pub(crate) fn paint_chromosome_mott_cancellable(
         segments: all_segments,
         bins,
         posterior: exported_posterior,
+        diagnostics: all_diagnostics,
         selected_markers: n_sel,
     })
 }
@@ -740,10 +895,14 @@ mod tests {
         assert!(uniform.iter().all(|&value| value == 0.042));
 
         let present = founder_emission(&missing_target, Some(0), 0.97);
-        assert!(present.iter().all(|&value| (value - 0.97 / 24.0).abs() < 1e-15));
+        assert!(present
+            .iter()
+            .all(|&value| (value - 0.97 / 24.0).abs() < 1e-15));
 
         let absent = founder_emission(&missing_target, Some(1), 0.97);
-        assert!(absent.iter().all(|&value| (value - 0.03 / 24.0).abs() < 1e-15));
+        assert!(absent
+            .iter()
+            .all(|&value| (value - 0.03 / 24.0).abs() < 1e-15));
     }
 
     #[test]
@@ -933,5 +1092,29 @@ mod tests {
         )
         .expect_err("pre-cancelled posterior compute must stop");
         assert!(err.contains("Interrupted"));
+    }
+
+    #[test]
+    fn mott_segment_diagnostic_uses_mean_posterior_contract() {
+        let posterior = vec![0.60, 0.39, 0.01, 0.60, 0.39, 0.01];
+        let diag = build_segment_diagnostic(7, 3, 100, 300, 0, &posterior, 3, 2, 0.02).unwrap();
+        assert_eq!(diag.target_sample, 7);
+        assert_eq!(diag.chrom_idx, 3);
+        assert_eq!(diag.start_bp, 100);
+        assert_eq!(diag.end_bp, 300);
+        assert_eq!(diag.called_parent, 0);
+        assert!((diag.confidence - 0.60).abs() < 1e-6);
+        assert_eq!(diag.second_parent, 1);
+        assert!((diag.second_posterior - 0.39).abs() < 1e-6);
+        assert!((diag.posterior_margin - 0.21).abs() < 1e-6);
+        assert_eq!(diag.ambiguous_parents, 1);
+    }
+
+    #[test]
+    fn mott_segment_diagnostic_counts_near_tie() {
+        let posterior = vec![0.50, 0.49, 0.01];
+        let diag = build_segment_diagnostic(0, 0, 100, 100, 0, &posterior, 3, 1, 0.02).unwrap();
+        assert_eq!(diag.second_parent, 1);
+        assert_eq!(diag.ambiguous_parents, 2);
     }
 }

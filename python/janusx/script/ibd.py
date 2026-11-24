@@ -282,6 +282,8 @@ def _validate_parameters(args: argparse.Namespace) -> None:
             raise ValueError("--mott-unknown-fold must be a finite positive number")
         if args.mott_max_markers_per_chrom < 0:
             raise ValueError("--mott-max-markers-per-chrom must be a nonnegative integer")
+        if not math.isfinite(args.mott_ambiguity_delta) or args.mott_ambiguity_delta < 0.0:
+            raise ValueError("--mott-ambiguity-delta must be finite and nonnegative")
 
 
 def build_parser(argv: Sequence[str] | None = None) -> CliArgumentParser:
@@ -534,6 +536,25 @@ def build_parser(argv: Sequence[str] | None = None) -> CliArgumentParser:
         default=False,
         help=help_text(
             "Write <out>.posterior.tsv for single-sample Mott HMM runs (default: %(default)s).",
+            advanced=True,
+        ),
+    )
+    mott_group.add_argument(
+        "--mott-write-diagnostics",
+        action="store_true",
+        default=False,
+        help=help_text(
+            "Write <out>.mott_diagnostics.tsv.gz with segment-level posterior runner-up diagnostics "
+            "(default: %(default)s).",
+            advanced=True,
+        ),
+    )
+    mott_group.add_argument(
+        "--mott-ambiguity-delta",
+        type=float,
+        default=0.02,
+        help=help_text(
+            "Posterior-mean delta used for Mott ambiguous-parent diagnostics (default: %(default)s).",
             advanced=True,
         ),
     )
@@ -1020,6 +1041,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "mott_unknown_fold": float(args.mott_unknown_fold),
                 "mott_max_markers_per_chrom": int(args.mott_max_markers_per_chrom),
                 "mott_write_posterior": bool(args.mott_write_posterior),
+                "mott_write_diagnostics": bool(args.mott_write_diagnostics),
+                "mott_ambiguity_delta": float(args.mott_ambiguity_delta),
             }
         )
 
@@ -1114,6 +1137,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         generated_outputs.append(Path(str(summary["tsv_path"])))
     if summary.get("posterior_path"):
         generated_outputs.append(Path(str(summary["posterior_path"])))
+    if summary.get("mott_diagnostics_path"):
+        generated_outputs.append(Path(str(summary["mott_diagnostics_path"])))
 
     report_logger.info("")
     _report_block(report_logger, "Outputs Generated")
@@ -1149,6 +1174,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 report_logger,
                 "Mott posterior TSV",
                 "Yes" if bool(args.mott_write_posterior) else "No",
+            )
+            _report_kv(
+                report_logger,
+                "Mott diagnostics",
+                "Yes" if bool(args.mott_write_diagnostics) else "No",
+            )
+            _report_kv(
+                report_logger,
+                "Mott ambiguity delta",
+                float(args.mott_ambiguity_delta),
             )
         else:
             _report_kv(report_logger, "Ancestry step cM", float(args.ancestry_step_cm))

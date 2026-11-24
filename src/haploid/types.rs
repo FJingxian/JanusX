@@ -86,6 +86,9 @@ fn default_mott_unknown_fold() -> f64 {
 fn default_mott_max_markers_per_chrom() -> usize {
     0
 }
+fn default_mott_ambiguity_delta() -> f64 {
+    0.02
+}
 fn default_cm_per_mb() -> f64 {
     1.0
 }
@@ -121,6 +124,8 @@ pub struct HaploidIbdConfig {
     pub mott_unknown_fold: f64,
     pub mott_max_markers_per_chrom: usize,
     pub mott_write_posterior: bool,
+    pub mott_write_diagnostics: bool,
+    pub mott_ambiguity_delta: f64,
     pub cm_per_mb: f64,
     pub write_tsv: bool,
 }
@@ -151,6 +156,8 @@ impl Default for HaploidIbdConfig {
             mott_unknown_fold: default_mott_unknown_fold(),
             mott_max_markers_per_chrom: default_mott_max_markers_per_chrom(),
             mott_write_posterior: false,
+            mott_write_diagnostics: false,
+            mott_ambiguity_delta: default_mott_ambiguity_delta(),
             cm_per_mb: default_cm_per_mb(),
             write_tsv: false,
         }
@@ -173,6 +180,8 @@ pub struct HaploidIbdSummary {
     pub tsv_path: Option<String>,
     #[serde(default)]
     pub posterior_path: Option<String>,
+    #[serde(default)]
+    pub mott_diagnostics_path: Option<String>,
     #[serde(default)]
     pub aligned_exact_markers: u64,
     #[serde(default)]

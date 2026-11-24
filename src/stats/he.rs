@@ -743,13 +743,18 @@ fn build_row_standardization_stats_from_source(
         let cur_rows = ed - st;
         let chunk = match source {
             HeGrmSource::Resident { packed_flat, .. } => {
+                let (packed_chunk, row_idx_chunk) = if let Some(idx) = row_source_indices {
+                    (*packed_flat, Some(&idx[st..ed]))
+                } else {
+                    (&packed_flat[st * bytes_per_snp..ed * bytes_per_snp], None)
+                };
                 build_row_standardization_stats_with_options(
-                    packed_flat,
+                    packed_chunk,
                     bytes_per_snp,
                     &row_flip[st..ed],
                     &row_maf[st..ed],
                     sample_idx,
-                    row_source_indices.map(|idx| &idx[st..ed]),
+                    row_idx_chunk,
                     std_eps32,
                     use_train_maf,
                     compute_sample_diag,
@@ -1547,21 +1552,28 @@ fn apply_grm_to_mat_f32_with_workspace_from_source(
         let blk_slice = &mut workspace.block[..cur_rows * n_out];
         let t_decode = Instant::now();
         match source {
-            HeGrmSource::Resident { packed_flat, .. } => decode_standardized_packed_block_rows_f32(
-                packed_flat,
-                bytes_per_snp,
-                n_samples,
-                &row_flip[st..ed],
-                &row_mean[st..ed],
-                &row_inv_sd[st..ed],
-                sample_idx,
-                full_sample_fast,
-                row_source_indices.map(|idx| &idx[st..ed]),
-                0,
-                blk_slice,
-                code4_lut,
-                pool,
-            )?,
+            HeGrmSource::Resident { packed_flat, .. } => {
+                let (packed_chunk, row_idx_chunk) = if let Some(idx) = row_source_indices {
+                    (*packed_flat, Some(&idx[st..ed]))
+                } else {
+                    (&packed_flat[st * bytes_per_snp..ed * bytes_per_snp], None)
+                };
+                decode_standardized_packed_block_rows_f32(
+                    packed_chunk,
+                    bytes_per_snp,
+                    n_samples,
+                    &row_flip[st..ed],
+                    &row_mean[st..ed],
+                    &row_inv_sd[st..ed],
+                    sample_idx,
+                    full_sample_fast,
+                    row_idx_chunk,
+                    0,
+                    blk_slice,
+                    code4_lut,
+                    pool,
+                )?
+            }
             HeGrmSource::Windowed { matrix, .. } => {
                 let source_rows = if let Some(idx) = row_source_indices {
                     &idx[st..ed]
@@ -1607,6 +1619,409 @@ fn apply_grm_to_mat_f32_with_workspace_from_source(
     }
     let inv_m = 1.0_f32 / m_scale.max(1.0_f32);
     out.iter_mut().for_each(|v| *v *= inv_m);
+    if let Some(t) = timing {
+        t.decode_secs += decode_acc;
+        t.xmul_secs += xmul_acc;
+        t.xtmul_secs += xtmul_acc;
+    }
+    Ok(())
+}
+
+#[inline]
+fn he_fused_2bit_enabled() -> bool {
+    !matches!(
+        std::env::var("JX_GS_HE_FUSED_2BIT")
+            .unwrap_or_else(|_| "1".to_string())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "off" | "no"
+    )
+}
+
+#[inline]
+fn he_row_2bit_value_lut(flip: bool, mean_g: f32, inv_sd: f32) -> [f32; 4] {
+    if flip {
+        [
+            (2.0_f32 - mean_g) * inv_sd,
+            0.0_f32,
+            (1.0_f32 - mean_g) * inv_sd,
+            (0.0_f32 - mean_g) * inv_sd,
+        ]
+    } else {
+        [
+            (0.0_f32 - mean_g) * inv_sd,
+            0.0_f32,
+            (1.0_f32 - mean_g) * inv_sd,
+            (2.0_f32 - mean_g) * inv_sd,
+        ]
+    }
+}
+
+#[inline(always)]
+fn he_add_slice_f32(dst: &mut [f32], src: &[f32]) {
+    debug_assert_eq!(dst.len(), src.len());
+    for (d, &s) in dst.iter_mut().zip(src.iter()) {
+        *d += s;
+    }
+}
+
+/// Two-phase 2-bit fused GRM matmul `out = (1 / m_scale) * W^T (W R)` with
+/// majority-allele skipping (`0x00` for unflipped rows, `0xFF` for flipped
+/// rows). Eliminates `f32` decoded block allocation and per-thread `out`
+/// duplication by parallelizing Phase 1 over SNPs and Phase 2 over disjoint
+/// sample-byte slices.
+#[allow(clippy::too_many_arguments)]
+fn apply_grm_to_mat_f32_fused_2bit_from_source(
+    source: &mut HeGrmSource<'_>,
+    row_flip: &[bool],
+    row_mean: &[f32],
+    row_inv_sd: &[f32],
+    sample_idx: &[usize],
+    row_source_indices: Option<&[usize]>,
+    block_rows: usize,
+    rhs: &[f32],
+    n_rhs: usize,
+    m_scale: f32,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    timing: Option<&mut HeApplyTiming>,
+    mut trace_sum_squares: Option<&mut f64>,
+    out: &mut [f32],
+) -> Result<(), String> {
+    let m = row_flip.len();
+    let n_out = sample_idx.len();
+    if row_mean.len() != m || row_inv_sd.len() != m {
+        return Err(
+            "apply_grm_to_mat_f32_fused_2bit_from_source row stats length mismatch".to_string(),
+        );
+    }
+    if let Some(row_idx) = row_source_indices {
+        if row_idx.len() != m {
+            return Err(
+                "apply_grm_to_mat_f32_fused_2bit_from_source row source index length mismatch"
+                    .to_string(),
+            );
+        }
+        if row_idx.iter().any(|&idx| idx >= source.total_rows()) {
+            return Err(
+                "apply_grm_to_mat_f32_fused_2bit_from_source row source index out of bounds"
+                    .to_string(),
+            );
+        }
+    } else if source.total_rows() < m {
+        return Err(
+            "apply_grm_to_mat_f32_fused_2bit_from_source source row count mismatch".to_string(),
+        );
+    } else if matches!(source, HeGrmSource::Resident { .. }) && source.total_rows() != m {
+        return Err(
+            "apply_grm_to_mat_f32_fused_2bit_from_source resident packed row count mismatch"
+                .to_string(),
+        );
+    }
+    if rhs.len() != n_out.saturating_mul(n_rhs) {
+        return Err(format!(
+            "apply_grm_to_mat_f32_fused_2bit RHS length mismatch: got {}, expected {}",
+            rhs.len(),
+            n_out.saturating_mul(n_rhs)
+        ));
+    }
+    if out.len() != n_out.saturating_mul(n_rhs) {
+        return Err(format!(
+            "apply_grm_to_mat_f32_fused_2bit out length mismatch: got {}, expected {}",
+            out.len(),
+            n_out.saturating_mul(n_rhs)
+        ));
+    }
+    out.fill(0.0_f32);
+    if n_rhs == 0 || m == 0 || n_out == 0 {
+        return Ok(());
+    }
+
+    let bps = source.bytes_per_snp();
+    let padded_n = bps.saturating_mul(4);
+    let mut rhs_full = vec![0.0_f32; padded_n.saturating_mul(n_rhs)];
+    let mut col_sum_r = vec![0.0_f64; n_rhs];
+    for (i, &sid) in sample_idx.iter().enumerate() {
+        let src_row = &rhs[i * n_rhs..(i + 1) * n_rhs];
+        let dst_row = &mut rhs_full[sid * n_rhs..(sid + 1) * n_rhs];
+        for col in 0..n_rhs {
+            let v = src_row[col];
+            dst_row[col] += v;
+            col_sum_r[col] += v as f64;
+        }
+    }
+
+    let want_ss = trace_sum_squares.is_some();
+    let (sample_mult, byte_mult_sum): (Vec<u32>, Vec<u64>) = if want_ss {
+        let mut mult = vec![0u32; padded_n];
+        for &sid in sample_idx {
+            mult[sid] = mult[sid].saturating_add(1);
+        }
+        let bsum: Vec<u64> = (0..bps)
+            .map(|b| {
+                (mult[b * 4] as u64)
+                    + (mult[b * 4 + 1] as u64)
+                    + (mult[b * 4 + 2] as u64)
+                    + (mult[b * 4 + 3] as u64)
+            })
+            .collect();
+        (mult, bsum)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    let row_step = block_rows.clamp(1, 512).min(m.max(1));
+    let n_threads = pool
+        .map(|tp| tp.current_num_threads().max(1))
+        .unwrap_or(1usize);
+    let mut tmp = vec![0.0_f32; row_step.saturating_mul(n_rhs)];
+    let mut out_full = vec![0.0_f32; padded_n.saturating_mul(n_rhs)];
+    let mut global_shift = vec![0.0_f64; n_rhs];
+    let mut ss_total = 0.0_f64;
+    let mut decode_acc = 0.0_f64;
+    let mut xmul_acc = 0.0_f64;
+    let mut xtmul_acc = 0.0_f64;
+    let mut rel_indices = Vec::<usize>::with_capacity(row_step);
+    let mut source_rows_tmp = Vec::<usize>::with_capacity(row_step);
+
+    for st in (0..m).step_by(row_step) {
+        let ed = (st + row_step).min(m);
+        let cur_rows = ed - st;
+        let t_io = Instant::now();
+        let (packed_slice, rel_map, base_offset): (&[u8], Option<&[usize]>, usize) = match source {
+            HeGrmSource::Resident { packed_flat, .. } => {
+                if let Some(indices) = row_source_indices {
+                    (*packed_flat, Some(&indices[st..ed]), 0usize)
+                } else {
+                    (*packed_flat, None, st)
+                }
+            }
+            HeGrmSource::Windowed { matrix, .. } => {
+                if let Some(indices) = row_source_indices {
+                    rel_indices.clear();
+                    let slice = matrix.prepare_source_rows(&indices[st..ed], &mut rel_indices)?;
+                    (slice, Some(rel_indices.as_slice()), 0usize)
+                } else {
+                    source_rows_tmp.clear();
+                    source_rows_tmp.extend(st..ed);
+                    rel_indices.clear();
+                    let src_rows = source_rows_tmp.as_slice();
+                    let slice = matrix.prepare_source_rows(src_rows, &mut rel_indices)?;
+                    (slice, Some(rel_indices.as_slice()), 0usize)
+                }
+            }
+        };
+        decode_acc += t_io.elapsed().as_secs_f64();
+
+        // Phase 1: parallel over SNPs in this block -> compute tmp (cur_rows x n_rhs).
+        let t_p1 = Instant::now();
+        let tmp_slice = &mut tmp[..cur_rows * n_rhs];
+        let phase1_row = |local_r: usize,
+                          tmp_row: &mut [f32],
+                          acc_buf: &mut [f32],
+                          shift_acc: &mut [f64],
+                          ss_acc: &mut f64| {
+            let global_r = st + local_r;
+            let inv_sd = row_inv_sd[global_r];
+            if inv_sd == 0.0_f32 {
+                tmp_row.fill(0.0_f32);
+                return;
+            }
+            let flip = row_flip[global_r];
+            let v_lut = he_row_2bit_value_lut(flip, row_mean[global_r], inv_sd);
+            let (maj_code, skip_byte) = if flip {
+                (3usize, 0xFF_u8)
+            } else {
+                (0usize, 0x00_u8)
+            };
+            let v_maj = v_lut[maj_code];
+            let src_r = rel_map
+                .map(|mp| mp[local_r])
+                .unwrap_or(base_offset + local_r);
+            let row = &packed_slice[src_r * bps..(src_r + 1) * bps];
+            acc_buf.fill(0.0_f32);
+            let mut cnt = [0u64; 4];
+
+            for (b, &byte_u8) in row.iter().enumerate() {
+                if byte_u8 == skip_byte {
+                    if want_ss {
+                        cnt[maj_code] += byte_mult_sum[b];
+                    }
+                    continue;
+                }
+                let byte = byte_u8 as usize;
+                let base_s = b * 4;
+                for k in 0..4 {
+                    let c = (byte >> (2 * k)) & 3;
+                    if want_ss {
+                        cnt[c] += sample_mult[base_s + k] as u64;
+                    }
+                    if c != maj_code {
+                        let r_row = &rhs_full[(base_s + k) * n_rhs..(base_s + k + 1) * n_rhs];
+                        let dst_c = &mut acc_buf[c * n_rhs..(c + 1) * n_rhs];
+                        he_add_slice_f32(dst_c, r_row);
+                    }
+                }
+            }
+
+            let d0 = (v_lut[0] - v_maj) as f64;
+            let d1 = (v_lut[1] - v_maj) as f64;
+            let d2 = (v_lut[2] - v_maj) as f64;
+            let d3 = (v_lut[3] - v_maj) as f64;
+            let v_maj_f64 = v_maj as f64;
+            for col in 0..n_rhs {
+                let val = v_maj_f64 * col_sum_r[col]
+                    + d0 * (acc_buf[col] as f64)
+                    + d1 * (acc_buf[n_rhs + col] as f64)
+                    + d2 * (acc_buf[2 * n_rhs + col] as f64)
+                    + d3 * (acc_buf[3 * n_rhs + col] as f64);
+                let val_f32 = val as f32;
+                tmp_row[col] = val_f32;
+                shift_acc[col] += v_maj_f64 * (val_f32 as f64);
+            }
+            if want_ss {
+                let v0 = v_lut[0] as f64;
+                let v2 = v_lut[2] as f64;
+                let v3 = v_lut[3] as f64;
+                *ss_acc += (cnt[0] as f64) * v0 * v0
+                    + (cnt[2] as f64) * v2 * v2
+                    + (cnt[3] as f64) * v3 * v3;
+            }
+        };
+
+        if let Some(tp) = pool.filter(|_| n_threads > 1 && cur_rows > 1) {
+            let (blk_shift, blk_ss) = tp.install(|| {
+                tmp_slice
+                    .par_chunks_mut(n_rhs)
+                    .enumerate()
+                    .fold(
+                        || (vec![0.0_f32; 4 * n_rhs], vec![0.0_f64; n_rhs], 0.0_f64),
+                        |(mut acc_buf, mut sh_acc, mut ss_acc), (local_r, tmp_row)| {
+                            phase1_row(local_r, tmp_row, &mut acc_buf, &mut sh_acc, &mut ss_acc);
+                            (acc_buf, sh_acc, ss_acc)
+                        },
+                    )
+                    .map(|(_, sh, ss)| (sh, ss))
+                    .reduce(
+                        || (vec![0.0_f64; n_rhs], 0.0_f64),
+                        |(mut sh_a, ss_a), (sh_b, ss_b)| {
+                            for (a, b) in sh_a.iter_mut().zip(sh_b.iter()) {
+                                *a += *b;
+                            }
+                            (sh_a, ss_a + ss_b)
+                        },
+                    )
+            });
+            for (g, b) in global_shift.iter_mut().zip(blk_shift.iter()) {
+                *g += *b;
+            }
+            ss_total += blk_ss;
+        } else {
+            let mut acc_buf = vec![0.0_f32; 4 * n_rhs];
+            for (local_r, tmp_row) in tmp_slice.chunks_mut(n_rhs).enumerate() {
+                phase1_row(
+                    local_r,
+                    tmp_row,
+                    &mut acc_buf,
+                    &mut global_shift,
+                    &mut ss_total,
+                );
+            }
+        }
+        xmul_acc += t_p1.elapsed().as_secs_f64();
+
+        // Phase 2: parallel over disjoint sample-byte ranges -> accumulate directly into out_full.
+        let t_p2 = Instant::now();
+        let p2_threads = n_threads.min(bps.max(1));
+        let base_b = bps / p2_threads;
+        let rem_b = bps % p2_threads;
+        let mut out_parts: Vec<(usize, usize, &mut [f32])> = Vec::with_capacity(p2_threads);
+        let mut tail = out_full.as_mut_slice();
+        let mut b_off = 0usize;
+        for tid in 0..p2_threads {
+            let b_len = base_b + usize::from(tid < rem_b);
+            let elem_len = b_len * 4 * n_rhs;
+            let (head, rest) = tail.split_at_mut(elem_len);
+            out_parts.push((b_off, b_off + b_len, head));
+            b_off += b_len;
+            tail = rest;
+        }
+
+        let phase2_part = |b_lo: usize, b_hi: usize, out_slice: &mut [f32]| {
+            let mut dt_buf = vec![0.0_f32; 4 * n_rhs];
+            for local_r in 0..cur_rows {
+                let global_r = st + local_r;
+                let inv_sd = row_inv_sd[global_r];
+                if inv_sd == 0.0_f32 {
+                    continue;
+                }
+                let flip = row_flip[global_r];
+                let v_lut = he_row_2bit_value_lut(flip, row_mean[global_r], inv_sd);
+                let (maj_code, skip_byte) = if flip {
+                    (3usize, 0xFF_u8)
+                } else {
+                    (0usize, 0x00_u8)
+                };
+                let v_maj = v_lut[maj_code];
+                let tmp_row = &tmp_slice[local_r * n_rhs..(local_r + 1) * n_rhs];
+                for c in 0..4 {
+                    if c == maj_code {
+                        continue;
+                    }
+                    let dc = v_lut[c] - v_maj;
+                    let dst_dt = &mut dt_buf[c * n_rhs..(c + 1) * n_rhs];
+                    for col in 0..n_rhs {
+                        dst_dt[col] = dc * tmp_row[col];
+                    }
+                }
+                let src_r = rel_map
+                    .map(|mp| mp[local_r])
+                    .unwrap_or(base_offset + local_r);
+                let row_slice = &packed_slice[src_r * bps + b_lo..src_r * bps + b_hi];
+                for (local_b, &byte_u8) in row_slice.iter().enumerate() {
+                    if byte_u8 == skip_byte {
+                        continue;
+                    }
+                    let byte = byte_u8 as usize;
+                    let base_s = local_b * 4;
+                    for k in 0..4 {
+                        let c = (byte >> (2 * k)) & 3;
+                        if c != maj_code {
+                            let src_dt = &dt_buf[c * n_rhs..(c + 1) * n_rhs];
+                            let dst_o =
+                                &mut out_slice[(base_s + k) * n_rhs..(base_s + k + 1) * n_rhs];
+                            he_add_slice_f32(dst_o, src_dt);
+                        }
+                    }
+                }
+            }
+        };
+
+        if let Some(tp) = pool.filter(|_| p2_threads > 1) {
+            tp.install(|| {
+                out_parts
+                    .into_par_iter()
+                    .for_each(|(b_lo, b_hi, out_slice)| phase2_part(b_lo, b_hi, out_slice));
+            });
+        } else {
+            for (b_lo, b_hi, out_slice) in out_parts {
+                phase2_part(b_lo, b_hi, out_slice);
+            }
+        }
+        xtmul_acc += t_p2.elapsed().as_secs_f64();
+    }
+
+    let inv_m = 1.0_f32 / m_scale.max(1.0_f32);
+    for (i, &sid) in sample_idx.iter().enumerate() {
+        let src = &out_full[sid * n_rhs..(sid + 1) * n_rhs];
+        let dst = &mut out[i * n_rhs..(i + 1) * n_rhs];
+        for col in 0..n_rhs {
+            dst[col] = ((src[col] as f64 + global_shift[col]) as f32) * inv_m;
+        }
+    }
+    if let Some(trace_sum) = trace_sum_squares.as_mut() {
+        **trace_sum += ss_total;
+    }
     if let Some(t) = timing {
         t.decode_secs += decode_acc;
         t.xmul_secs += xmul_acc;
@@ -1946,6 +2361,61 @@ fn he_variance_components_with_source(
     row_inv_sd_override: Option<&[f32]>,
     grm_scale_override: Option<f64>,
 ) -> Result<HePcgResult, String> {
+    he_variance_components_with_source_mode(
+        source,
+        n_samples,
+        row_flip,
+        row_maf,
+        sample_idx,
+        row_source_indices,
+        y,
+        x_cov,
+        p_cov,
+        trace_samples,
+        trace_probe_batch,
+        block_rows,
+        std_eps,
+        use_train_maf,
+        max_iter,
+        tol,
+        seed,
+        exact_trace_debug,
+        exact_trace_max_n,
+        pool,
+        row_mean_override,
+        row_inv_sd_override,
+        grm_scale_override,
+        he_fused_2bit_enabled(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn he_variance_components_with_source_mode(
+    source: &mut HeGrmSource<'_>,
+    n_samples: usize,
+    row_flip: &[bool],
+    row_maf: &[f32],
+    sample_idx: &[usize],
+    row_source_indices: Option<&[usize]>,
+    y: &[f64],
+    x_cov: Option<&[f64]>,
+    p_cov: usize,
+    trace_samples: usize,
+    trace_probe_batch: usize,
+    block_rows: usize,
+    std_eps: f64,
+    use_train_maf: bool,
+    max_iter: usize,
+    tol: f64,
+    seed: u64,
+    exact_trace_debug: bool,
+    exact_trace_max_n: usize,
+    pool: Option<&Arc<rayon::ThreadPool>>,
+    row_mean_override: Option<&[f32]>,
+    row_inv_sd_override: Option<&[f32]>,
+    grm_scale_override: Option<f64>,
+    use_fused_2bit: bool,
+) -> Result<HePcgResult, String> {
     let stage_timing = env_truthy("JX_GS_HE_STAGE_TIMING");
     let stage_log_every = std::env::var("JX_GS_HE_STAGE_LOG_EVERY")
         .ok()
@@ -2097,43 +2567,72 @@ fn he_variance_components_with_source(
     let mut grm_ws = GrmApplyWorkspace::new();
     let mut ky_apply_t = HeApplyTiming::default();
     let mut k_diag_sum_squares = 0.0_f64;
-
-    let k_y = apply_grm_to_vec_f32_with_workspace_from_source(
-        source,
-        n_samples,
-        row_flip,
-        &row_stats.row_mean,
-        &row_stats.row_inv_sd,
-        sample_idx,
-        full_sample_fast,
-        row_source_indices,
-        block_rows,
-        &y_f32,
-        m_scale,
-        code4_lut,
-        pool,
-        &mut grm_ws,
-        if stage_timing {
-            Some(&mut ky_apply_t)
-        } else {
-            None
-        },
-        Some(&mut k_diag_sum_squares),
-    )?;
-    let mean_k_diag = if m_scale.is_finite() && m_scale > 0.0_f32 && n > 0 {
-        k_diag_sum_squares / (m_scale as f64 * n as f64)
-    } else {
-        f64::NAN
-    };
-    let y_ky = dot_f32_f64(&y_f32, &k_y);
     let y_y = dot_f32_f64(&y_f32, &y_f32);
+    let exact_trace_used = exact_trace_debug && n <= exact_trace_max_n.max(1);
+    let fuse_y_with_probes = use_fused_2bit && !exact_trace_used;
+
+    let mut y_ky = 0.0_f64;
+    if !fuse_y_with_probes {
+        let k_y = if use_fused_2bit {
+            let mut k_y_out = vec![0.0_f32; n];
+            apply_grm_to_mat_f32_fused_2bit_from_source(
+                source,
+                row_flip,
+                &row_stats.row_mean,
+                &row_stats.row_inv_sd,
+                sample_idx,
+                row_source_indices,
+                block_rows,
+                &y_f32,
+                1,
+                m_scale,
+                pool,
+                if stage_timing {
+                    Some(&mut ky_apply_t)
+                } else {
+                    None
+                },
+                Some(&mut k_diag_sum_squares),
+                &mut k_y_out,
+            )?;
+            k_y_out
+        } else {
+            apply_grm_to_vec_f32_with_workspace_from_source(
+                source,
+                n_samples,
+                row_flip,
+                &row_stats.row_mean,
+                &row_stats.row_inv_sd,
+                sample_idx,
+                full_sample_fast,
+                row_source_indices,
+                block_rows,
+                &y_f32,
+                m_scale,
+                code4_lut,
+                pool,
+                &mut grm_ws,
+                if stage_timing {
+                    Some(&mut ky_apply_t)
+                } else {
+                    None
+                },
+                Some(&mut k_diag_sum_squares),
+            )?
+        };
+        y_ky = dot_f32_f64(&y_f32, &k_y);
+    }
 
     let batch_cols = trace_probe_batch.max(1);
-    let mut probe_batch = vec![0.0_f32; n.saturating_mul(batch_cols)];
-    let mut kv_batch = vec![0.0_f32; n.saturating_mul(batch_cols)];
+    let max_buf_cols = if fuse_y_with_probes {
+        batch_cols.saturating_add(1)
+    } else {
+        batch_cols
+    };
+    let mut probe_batch = vec![0.0_f32; n.saturating_mul(max_buf_cols)];
+    let mut kv_batch = vec![0.0_f32; n.saturating_mul(max_buf_cols)];
     let mut tr_k_acc = 0.0_f64;
     let mut tr_k2_acc = 0.0_f64;
-    let exact_trace_used = exact_trace_debug && n <= exact_trace_max_n.max(1);
     let total_trace_batches = if exact_trace_used {
         n.div_ceil(batch_cols)
     } else {
@@ -2154,30 +2653,53 @@ fn he_variance_components_with_source(
             }
             projector.project_mat_f32_in_place(&mut probe_batch, batch_cols, &mut proj_ws)?;
             kv_batch.fill(0.0_f32);
-            apply_grm_to_mat_f32_with_workspace_from_source(
-                source,
-                n_samples,
-                row_flip,
-                &row_stats.row_mean,
-                &row_stats.row_inv_sd,
-                sample_idx,
-                full_sample_fast,
-                row_source_indices,
-                block_rows,
-                &probe_batch,
-                batch_cols,
-                m_scale,
-                code4_lut,
-                pool,
-                &mut grm_ws,
-                if stage_timing {
-                    Some(&mut trace_apply_t)
-                } else {
-                    None
-                },
-                None,
-                &mut kv_batch,
-            )?;
+            if use_fused_2bit {
+                apply_grm_to_mat_f32_fused_2bit_from_source(
+                    source,
+                    row_flip,
+                    &row_stats.row_mean,
+                    &row_stats.row_inv_sd,
+                    sample_idx,
+                    row_source_indices,
+                    block_rows,
+                    &probe_batch,
+                    batch_cols,
+                    m_scale,
+                    pool,
+                    if stage_timing {
+                        Some(&mut trace_apply_t)
+                    } else {
+                        None
+                    },
+                    None,
+                    &mut kv_batch,
+                )?;
+            } else {
+                apply_grm_to_mat_f32_with_workspace_from_source(
+                    source,
+                    n_samples,
+                    row_flip,
+                    &row_stats.row_mean,
+                    &row_stats.row_inv_sd,
+                    sample_idx,
+                    full_sample_fast,
+                    row_source_indices,
+                    block_rows,
+                    &probe_batch,
+                    batch_cols,
+                    m_scale,
+                    code4_lut,
+                    pool,
+                    &mut grm_ws,
+                    if stage_timing {
+                        Some(&mut trace_apply_t)
+                    } else {
+                        None
+                    },
+                    None,
+                    &mut kv_batch,
+                )?;
+            }
             projector.project_mat_f32_in_place(&mut kv_batch, batch_cols, &mut proj_ws)?;
 
             for t in 0..cur {
@@ -2217,51 +2739,100 @@ fn he_variance_components_with_source(
         let mut b_start = 0usize;
         while b_start < trace_samples {
             let cur = (trace_samples - b_start).min(batch_cols);
-            probe_batch.fill(0.0_f32);
+            let include_y = fuse_y_with_probes && b_start == 0;
+            let y_offset = usize::from(include_y);
+            let cols_use = if use_fused_2bit {
+                cur + y_offset
+            } else {
+                batch_cols
+            };
+            let probe_slice = &mut probe_batch[..n * cols_use];
+            let kv_slice = &mut kv_batch[..n * cols_use];
+            probe_slice.fill(0.0_f32);
+            if include_y {
+                for i in 0..n {
+                    probe_slice[i * cols_use] = y_f32[i];
+                }
+            }
             for t in 0..cur {
                 let probe_idx = b_start + t;
                 let mut state =
                     splitmix64(seed ^ ((probe_idx as u64).wrapping_mul(0x517CC1B727220A95)));
                 for i in 0..n {
                     state = splitmix64(state);
-                    probe_batch[i * batch_cols + t] =
+                    probe_slice[i * cols_use + (t + y_offset)] =
                         if (state & 1) == 0 { 1.0_f32 } else { -1.0_f32 };
                 }
             }
-            projector.project_mat_f32_in_place(&mut probe_batch, batch_cols, &mut proj_ws)?;
-            kv_batch.fill(0.0_f32);
-            apply_grm_to_mat_f32_with_workspace_from_source(
-                source,
-                n_samples,
-                row_flip,
-                &row_stats.row_mean,
-                &row_stats.row_inv_sd,
-                sample_idx,
-                full_sample_fast,
-                row_source_indices,
-                block_rows,
-                &probe_batch,
-                batch_cols,
-                m_scale,
-                code4_lut,
-                pool,
-                &mut grm_ws,
-                if stage_timing {
-                    Some(&mut trace_apply_t)
-                } else {
-                    None
-                },
-                None,
-                &mut kv_batch,
-            )?;
-            projector.project_mat_f32_in_place(&mut kv_batch, batch_cols, &mut proj_ws)?;
+            projector.project_mat_f32_in_place(probe_slice, cols_use, &mut proj_ws)?;
+            kv_slice.fill(0.0_f32);
+            if use_fused_2bit {
+                apply_grm_to_mat_f32_fused_2bit_from_source(
+                    source,
+                    row_flip,
+                    &row_stats.row_mean,
+                    &row_stats.row_inv_sd,
+                    sample_idx,
+                    row_source_indices,
+                    block_rows,
+                    probe_slice,
+                    cols_use,
+                    m_scale,
+                    pool,
+                    if stage_timing {
+                        Some(&mut trace_apply_t)
+                    } else {
+                        None
+                    },
+                    if include_y {
+                        Some(&mut k_diag_sum_squares)
+                    } else {
+                        None
+                    },
+                    kv_slice,
+                )?;
+            } else {
+                apply_grm_to_mat_f32_with_workspace_from_source(
+                    source,
+                    n_samples,
+                    row_flip,
+                    &row_stats.row_mean,
+                    &row_stats.row_inv_sd,
+                    sample_idx,
+                    full_sample_fast,
+                    row_source_indices,
+                    block_rows,
+                    probe_slice,
+                    cols_use,
+                    m_scale,
+                    code4_lut,
+                    pool,
+                    &mut grm_ws,
+                    if stage_timing {
+                        Some(&mut trace_apply_t)
+                    } else {
+                        None
+                    },
+                    None,
+                    kv_slice,
+                )?;
+            }
+            if include_y {
+                let mut y_ky_acc = 0.0_f64;
+                for i in 0..n {
+                    y_ky_acc += (y_f32[i] as f64) * (kv_slice[i * cols_use] as f64);
+                }
+                y_ky = y_ky_acc;
+            }
+            projector.project_mat_f32_in_place(kv_slice, cols_use, &mut proj_ws)?;
 
             for t in 0..cur {
+                let col = t + y_offset;
                 let mut trk_one = 0.0_f64;
                 let mut trk2_one = 0.0_f64;
                 for i in 0..n {
-                    let z = probe_batch[i * batch_cols + t] as f64;
-                    let v = kv_batch[i * batch_cols + t] as f64;
+                    let z = probe_slice[i * cols_use + col] as f64;
+                    let v = kv_slice[i * cols_use + col] as f64;
                     trk_one += z * v;
                     trk2_one += v * v;
                 }
@@ -2362,6 +2933,11 @@ fn he_variance_components_with_source(
     // exactly one after genotype filtering, missing-value imputation, or
     // non-HWE genotype frequencies. Convert its variance contribution to
     // phenotype scale before reporting PVE.
+    let mean_k_diag = if m_scale.is_finite() && m_scale > 0.0_f32 && n > 0 {
+        k_diag_sum_squares / (m_scale as f64 * n as f64)
+    } else {
+        f64::NAN
+    };
     let h2 = {
         let var_g_pheno = sigma_g2 * mean_k_diag;
         let denom = var_g_pheno + sigma_e2;
@@ -3039,4 +3615,295 @@ pub fn he_pcg_bed<'py>(
         he_res.lambda,
         he_res.tr_k2_solve,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_synthetic_packed_bed(n_samples: usize, m_total: usize) -> (Vec<u8>, usize) {
+        let bps = n_samples.div_ceil(4);
+        let mut packed = vec![0u8; m_total * bps];
+        for m in 0..m_total {
+            let flip_bias = (m % 3) == 0;
+            for b in 0..bps {
+                let mut byte = 0u8;
+                for k in 0..4 {
+                    let s = b * 4 + k;
+                    let code = if s < n_samples {
+                        let h = (m * 29 + s * 13 + (m ^ s)) % 10;
+                        if flip_bias {
+                            match h {
+                                0..=5 => 0b11,
+                                6 | 7 => 0b10,
+                                8 => 0b00,
+                                _ => 0b01,
+                            }
+                        } else {
+                            match h {
+                                0..=5 => 0b00,
+                                6 | 7 => 0b10,
+                                8 => 0b11,
+                                _ => 0b01,
+                            }
+                        }
+                    } else {
+                        0b11
+                    };
+                    byte |= code << (2 * k);
+                }
+                packed[m * bps + b] = byte;
+            }
+        }
+        (packed, bps)
+    }
+
+    #[test]
+    fn he_fused_2bit_apply_grm_matches_block_path() {
+        let n_samples = 27usize;
+        let m_total = 96usize;
+        let (packed, bps) = make_synthetic_packed_bed(n_samples, m_total);
+        let row_source_indices: Vec<usize> = (0..m_total).filter(|&i| i % 5 != 0).collect();
+        let m = row_source_indices.len();
+        let row_flip: Vec<bool> = (0..m).map(|i| (i % 3) == 0).collect();
+        let row_mean: Vec<f32> = (0..m)
+            .map(|i| 0.25 + 0.6 * (((i * 17) % 100) as f32 / 100.0))
+            .collect();
+        let mut row_inv_sd: Vec<f32> = (0..m)
+            .map(|i| 1.2 + 0.5 * (((i * 11) % 100) as f32 / 100.0))
+            .collect();
+        row_inv_sd[0] = 0.0_f32;
+        row_inv_sd[m / 2] = 0.0_f32;
+
+        // Shuffled subset with duplicate sample indices.
+        let sample_idx: Vec<usize> = vec![
+            25, 2, 2, 18, 0, 14, 7, 26, 5, 11, 20, 3, 16, 9, 23, 1, 13, 6, 22, 11, 8, 17, 4,
+        ];
+        let n_out = sample_idx.len();
+        let m_scale = (m - 2) as f32;
+        let code4_lut = &packed_byte_lut().code4;
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("janusx_he_fused_{stamp}"));
+        std::fs::create_dir_all(&dir).expect("create temp BED dir");
+        let prefix = dir.join("tiny");
+        let mut bed_bytes = Vec::with_capacity(3 + packed.len());
+        bed_bytes.extend_from_slice(&[0x6c, 0x1b, 0x01]);
+        bed_bytes.extend_from_slice(&packed);
+        std::fs::write(prefix.with_extension("bed"), &bed_bytes).expect("write BED");
+        let fam_text: String = (0..n_samples)
+            .map(|i| format!("F{i} I{i} 0 0 1 -9\n"))
+            .collect();
+        std::fs::write(prefix.with_extension("fam"), fam_text).expect("write FAM");
+        let prefix_str = prefix.to_string_lossy().into_owned();
+
+        for n_rhs in [1usize, 33usize] {
+            let rhs: Vec<f32> = (0..n_out * n_rhs)
+                .map(|idx| ((idx as f32) * 0.23).sin() - 0.3 * ((idx as f32) * 0.11).cos())
+                .collect();
+            let mut out_block = vec![0.0_f32; n_out * n_rhs];
+            let mut ss_block = 0.0_f64;
+            let mut ws = GrmApplyWorkspace::new();
+            let mut src_block = HeGrmSource::Resident {
+                packed_flat: &packed,
+                bytes_per_snp: bps,
+            };
+            apply_grm_to_mat_f32_with_workspace_from_source(
+                &mut src_block,
+                n_samples,
+                &row_flip,
+                &row_mean,
+                &row_inv_sd,
+                &sample_idx,
+                false,
+                Some(&row_source_indices),
+                24,
+                &rhs,
+                n_rhs,
+                m_scale,
+                code4_lut,
+                None,
+                &mut ws,
+                None,
+                Some(&mut ss_block),
+                &mut out_block,
+            )
+            .expect("block apply_grm");
+
+            let par_pool = Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(2)
+                    .build()
+                    .expect("build test rayon pool"),
+            );
+            for use_windowed in [false, true] {
+                let pool_arg = if use_windowed { Some(&par_pool) } else { None };
+                let mut src_fused = if use_windowed {
+                    HeGrmSource::Windowed {
+                        matrix: WindowedBedMatrix::open(&prefix_str, 1).expect("open windowed"),
+                        bytes_per_snp: bps,
+                    }
+                } else {
+                    HeGrmSource::Resident {
+                        packed_flat: &packed,
+                        bytes_per_snp: bps,
+                    }
+                };
+                let mut out_fused = vec![0.0_f32; n_out * n_rhs];
+                let mut ss_fused = 0.0_f64;
+                apply_grm_to_mat_f32_fused_2bit_from_source(
+                    &mut src_fused,
+                    &row_flip,
+                    &row_mean,
+                    &row_inv_sd,
+                    &sample_idx,
+                    Some(&row_source_indices),
+                    24,
+                    &rhs,
+                    n_rhs,
+                    m_scale,
+                    pool_arg,
+                    None,
+                    Some(&mut ss_fused),
+                    &mut out_fused,
+                )
+                .expect("fused apply_grm");
+                assert!(
+                    (ss_fused - ss_block).abs() < 1e-3,
+                    "ss mismatch (n_rhs={n_rhs}, windowed={use_windowed}): fused={ss_fused}, block={ss_block}"
+                );
+                let max_diff = out_fused
+                    .iter()
+                    .zip(out_block.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0_f32, f32::max);
+                assert!(
+                    max_diff < 1e-4,
+                    "out mismatch (n_rhs={n_rhs}, windowed={use_windowed}): max_diff={max_diff}"
+                );
+            }
+        }
+
+        // Verify out-of-bounds row index error propagates cleanly on Windowed fused path.
+        let mut bad_rows = row_source_indices.clone();
+        bad_rows[m - 1] = m_total + 4;
+        let mut src_err = HeGrmSource::Windowed {
+            matrix: WindowedBedMatrix::open(&prefix_str, 1).expect("open windowed err"),
+            bytes_per_snp: bps,
+        };
+        let rhs_one = vec![1.0_f32; n_out];
+        let mut out_err = vec![0.0_f32; n_out];
+        let err_msg = apply_grm_to_mat_f32_fused_2bit_from_source(
+            &mut src_err,
+            &row_flip,
+            &row_mean,
+            &row_inv_sd,
+            &sample_idx,
+            Some(&bad_rows),
+            24,
+            &rhs_one,
+            1,
+            m_scale,
+            None,
+            None,
+            None,
+            &mut out_err,
+        )
+        .expect_err("expected out-of-bounds error");
+        assert!(
+            err_msg.contains("out of bounds"),
+            "unexpected he fused error: {err_msg}"
+        );
+        drop(src_err);
+        std::fs::remove_dir_all(dir).expect("remove temp BED dir");
+    }
+
+    #[test]
+    fn he_variance_components_fused_single_pass_matches_block_two_pass() {
+        let n_samples = 36usize;
+        let m = 128usize;
+        let (packed, bps) = make_synthetic_packed_bed(n_samples, m);
+        let row_flip: Vec<bool> = (0..m).map(|i| (i % 3) == 0).collect();
+        let row_maf: Vec<f32> = (0..m)
+            .map(|i| 0.1 + 0.3 * (((i * 19) % 100) as f32 / 100.0))
+            .collect();
+        let sample_idx: Vec<usize> = (0..n_samples).collect();
+        let y: Vec<f64> = (0..n_samples)
+            .map(|i| ((i as f64) * 0.37).sin() + 0.4 * ((i as f64) * 0.17).cos())
+            .collect();
+        let x_cov: Vec<f64> = (0..n_samples).map(|i| ((i as f64) * 0.29).cos()).collect();
+
+        let mut src_fused = HeGrmSource::Resident {
+            packed_flat: &packed,
+            bytes_per_snp: bps,
+        };
+        let res_fused = he_variance_components_with_source_mode(
+            &mut src_fused,
+            n_samples,
+            &row_flip,
+            &row_maf,
+            &sample_idx,
+            None,
+            &y,
+            Some(&x_cov),
+            1,
+            16,
+            32,
+            32,
+            1e-12,
+            false,
+            32,
+            1e-6,
+            20260512,
+            false,
+            256,
+            None,
+            None,
+            None,
+            None,
+            true,
+        )
+        .expect("fused HE");
+        let mut src_block = HeGrmSource::Resident {
+            packed_flat: &packed,
+            bytes_per_snp: bps,
+        };
+        let res_block = he_variance_components_with_source_mode(
+            &mut src_block,
+            n_samples,
+            &row_flip,
+            &row_maf,
+            &sample_idx,
+            None,
+            &y,
+            Some(&x_cov),
+            1,
+            16,
+            32,
+            32,
+            1e-12,
+            false,
+            32,
+            1e-6,
+            20260512,
+            false,
+            256,
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect("block HE");
+        assert!((res_fused.y_y - res_block.y_y).abs() < 1e-10);
+        assert!((res_fused.y_ky - res_block.y_ky).abs() < 1e-4);
+        assert!((res_fused.tr_k - res_block.tr_k).abs() < 1e-3);
+        assert!((res_fused.tr_k2 - res_block.tr_k2).abs() < 1e-3);
+        assert!((res_fused.sigma_g2 - res_block.sigma_g2).abs() < 1e-4);
+        assert!((res_fused.sigma_e2 - res_block.sigma_e2).abs() < 1e-4);
+        assert!((res_fused.h2 - res_block.h2).abs() < 1e-4);
+    }
 }

@@ -9050,6 +9050,7 @@ fn bim_line_simple_snp_alleles(line: &str) -> Option<bool> {
 }
 
 fn read_bim_simple_snp_allele_mask(prefix: &str) -> Result<Vec<u8>, String> {
+    let prefix = normalize_plink_prefix_local(prefix);
     let path = PathBuf::from(format!("{prefix}.bim"));
     let file = File::open(&path).map_err(|error| error.to_string())?;
     let mut reader = BufReader::with_capacity(1 << 20, file);

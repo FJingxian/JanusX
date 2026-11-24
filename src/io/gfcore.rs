@@ -504,7 +504,7 @@ impl BimChunkReader {
 // ---------------------------
 // PLINK helpers
 // ---------------------------
-fn normalize_genotype_prefix(path_or_prefix: &str) -> String {
+pub(crate) fn normalize_genotype_prefix(path_or_prefix: &str) -> String {
     let mut prefix = path_or_prefix.trim().to_string();
     let lower = prefix.to_ascii_lowercase();
     for suffix in [

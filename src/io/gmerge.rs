@@ -12,7 +12,9 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 use rayon::ThreadPoolBuilder;
 
-use crate::gfcore::{open_text_maybe_gz, process_snp_row, read_bim, HmpSnpIter, SiteInfo};
+use crate::gfcore::{
+    normalize_genotype_prefix, open_text_maybe_gz, process_snp_row, read_bim, HmpSnpIter, SiteInfo,
+};
 use crate::gfreader::build_sample_selection;
 use crate::gwriter::{HmpWriter, PlinkBfileWriter, SampleRecord, VcfWriter};
 
@@ -522,6 +524,8 @@ struct BedSnpIterRaw {
 
 impl BedSnpIterRaw {
     fn new(prefix: &str) -> Result<Self, String> {
+        let prefix = normalize_genotype_prefix(prefix);
+        let prefix = prefix.as_str();
         let sample_metadata = read_fam_records(prefix)?;
         let samples = sample_metadata
             .iter()
@@ -635,6 +639,7 @@ impl BedSnpIterRaw {
 }
 
 fn read_fam_records(prefix: &str) -> Result<Vec<FamSample>, String> {
+    let prefix = normalize_genotype_prefix(prefix);
     let fam_path = format!("{prefix}.fam");
     let file = File::open(&fam_path).map_err(|e| format!("{fam_path}: {e}"))?;
     let mut samples = Vec::new();
@@ -1105,17 +1110,19 @@ impl InputIter {
         } else if is_hmp_path(path_or_prefix) {
             Ok(InputIter::Hmp(HmpSnpIterRaw::new(path_or_prefix)?))
         } else {
-            // Treat input as a PLINK prefix, not a filename stem extension.
-            // This preserves prefixes containing dots, e.g. "geno/DH.10k".
-            let bed = format!("{path_or_prefix}.bed");
-            let bim = format!("{path_or_prefix}.bim");
-            let fam = format!("{path_or_prefix}.fam");
+            // Treat input as a PLINK prefix (or canonical .bed/.bim/.fam path).
+            // Normalizing only known PLINK suffixes preserves prefixes containing dots,
+            // e.g. "geno/DH.10k".
+            let prefix = normalize_genotype_prefix(path_or_prefix);
+            let bed = format!("{prefix}.bed");
+            let bim = format!("{prefix}.bim");
+            let fam = format!("{prefix}.fam");
             if !(Path::new(&bed).exists() && Path::new(&bim).exists() && Path::new(&fam).exists()) {
                 return Err(format!(
                     "PLINK prefix not found or missing .bed/.bim/.fam: {path_or_prefix}"
                 ));
             }
-            Ok(InputIter::Bed(BedSnpIterRaw::new(path_or_prefix)?))
+            Ok(InputIter::Bed(BedSnpIterRaw::new(&prefix)?))
         }
     }
 

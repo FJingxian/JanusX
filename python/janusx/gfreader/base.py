@@ -4,6 +4,7 @@ try:
     v = version("janusx")
 except PackageNotFoundError:
     v = "0.0.0"
+from janusx._plink import normalize_plink_prefix
 from .gfreader import load_genotype_chunks, inspect_genotype_file
 import numpy as np
 import pandas as pd
@@ -176,7 +177,7 @@ def breader(
         pbar.close(success=False)
         raise
     pbar.close(success=True)
-    bim = pd.read_csv(f'{prefix}.bim',sep=r'\s+',header=None)
+    bim = pd.read_csv(f'{normalize_plink_prefix(str(prefix))}.bim',sep=r'\s+',header=None)
     genotype = pd.DataFrame(genotype,index=idv,).T
     genotype = pd.concat([bim[[0,3,4,5]],genotype],axis=1)
     genotype.columns = ['#CHROM','POS','A0','A1']+idv

@@ -67,6 +67,7 @@ from janusx.janusx import (
     count_hmp_snps,
 )
 from ._common.outprefix import apply_output_prefix_compat
+from janusx._plink import normalize_plink_prefix
 from janusx.gfreader.gfreader import _is_pgen_prefix, _resolve_input
 
 try:
@@ -242,7 +243,7 @@ def _iter_snp_named_chunks(
 def _rewrite_plink_bim_snp_names(prefix: str, snp_name_template: str | None) -> None:
     if snp_name_template is None:
         return
-    bim_path = f"{str(prefix)}.bim"
+    bim_path = f"{normalize_plink_prefix(str(prefix))}.bim"
     tmp_path = f"{bim_path}.jxsnprename.tmp"
     with open(bim_path, "r", encoding="utf-8", errors="replace") as fr, open(
         tmp_path, "w", encoding="utf-8"
@@ -495,7 +496,7 @@ def _select_keep_samples_from_fam(prefix: str, keep_file: str) -> list[str]:
         return out
 
     out: list[str] = []
-    fam_path = f"{str(prefix)}.fam"
+    fam_path = f"{normalize_plink_prefix(str(prefix))}.fam"
     with open(fam_path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
             s = line.strip()
@@ -733,11 +734,7 @@ def _resolve_prune_mask_mmap_window_mb() -> int | None:
 def _inspect_plink_prefix_light(prefix: str) -> tuple[list[str], int]:
     p = str(prefix)
     is_pgen = _is_pgen_prefix(p)
-    low = p.lower()
-    for suffix in (".pvar.zst", ".bed", ".bim", ".fam", ".pgen", ".pvar", ".psam"):
-        if low.endswith(suffix):
-            p = p[: -len(suffix)]
-            break
+    p = normalize_plink_prefix(p)
     if is_pgen:
         sample_ids, n_sites = inspect_genotype_file(f"{p}.pgen")
         return [str(sid) for sid in sample_ids], int(n_sites)
@@ -904,7 +901,7 @@ def _refine_plink_source_keep_mask(
         bp_max=bp_max,
         ranges=ranges,
     )
-    bim_path = f"{str(prefix)}.bim"
+    bim_path = f"{normalize_plink_prefix(str(prefix))}.bim"
     resolved_rows = 0
     with open(bim_path, "r", encoding="utf-8", errors="replace") as f:
         for row_idx, line in enumerate(f):
@@ -983,7 +980,7 @@ def _scan_plink_selected_snp_indices_from_bim(
         ranges=ranges,
     )
     out_idx: list[int] = []
-    bim_path = f"{str(prefix)}.bim"
+    bim_path = f"{normalize_plink_prefix(str(prefix))}.bim"
     with open(bim_path, "r", encoding="utf-8", errors="replace") as f:
         for row_idx, line in enumerate(f):
             tok = _split_tokens(line.strip())
@@ -1057,7 +1054,7 @@ def _refine_plink_selected_snp_indices(
     )
     out_idx: list[int] = []
     row_ptr = 0
-    bim_path = f"{str(prefix)}.bim"
+    bim_path = f"{normalize_plink_prefix(str(prefix))}.bim"
     with open(bim_path, "r", encoding="utf-8", errors="replace") as f:
         for row_idx, line in enumerate(f):
             if row_ptr >= n_selected:
@@ -1329,8 +1326,7 @@ def _stack_chunks(
 
 
 def _read_plink_bim_sites(prefix: str) -> list[SiteInfo]:
-    p = str(prefix)
-    bim_path = p if p.lower().endswith(".bim") else f"{p}.bim"
+    bim_path = f"{normalize_plink_prefix(str(prefix))}.bim"
     if not Path(bim_path).is_file():
         raise ValueError(f"Cannot find BIM file for PLINK prefix: {prefix}")
     out: list[SiteInfo] = []
@@ -1473,8 +1469,8 @@ def _write_plink_subset_from_packed(
     source_row_idx: np.ndarray | None = None,
     max_output_sites: int | None = None,
 ) -> None:
-    src = str(src_prefix)
-    out = str(out_prefix)
+    src = normalize_plink_prefix(str(src_prefix))
+    out = normalize_plink_prefix(str(out_prefix))
     src_bed = f"{src}.bed"
     src_bim = f"{src}.bim"
     src_fam = f"{src}.fam"
@@ -1712,8 +1708,8 @@ def _copy_prune_fam_with_source_pedigree(
     sample_ids: list[str] | None,
 ) -> None:
     """Restore source pedigree metadata after the packed QC writer normalizes FAM rows."""
-    source_fam = f"{str(src_prefix)}.fam"
-    filtered_fam = f"{str(filtered_prefix)}.fam"
+    source_fam = f"{normalize_plink_prefix(str(src_prefix))}.fam"
+    filtered_fam = f"{normalize_plink_prefix(str(filtered_prefix))}.fam"
     if sample_ids is None:
         shutil.copyfile(source_fam, filtered_fam)
         return

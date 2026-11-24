@@ -25,6 +25,7 @@ from typing import Any, Optional
 
 import numpy as np
 
+from janusx._plink import normalize_plink_prefix
 from janusx.adamixture.external_cli import (
     ExternalAdmixtureError,
     resolve_executable,
@@ -191,8 +192,9 @@ def _resolve_input(args: argparse.Namespace, logger: logging.Logger) -> tuple[st
 
 
 def _read_fam_ids(prefix: str) -> list[str]:
+    base = normalize_plink_prefix(str(prefix))
     result: list[str] = []
-    with open(f"{prefix}.fam", "r", encoding="utf-8", errors="replace") as handle:
+    with open(f"{base}.fam", "r", encoding="utf-8", errors="replace") as handle:
         for line in handle:
             fields = line.strip().split()
             if fields:
@@ -201,7 +203,8 @@ def _read_fam_ids(prefix: str) -> list[str]:
 
 
 def _read_psam_ids(prefix: str) -> list[str]:
-    path = Path(f"{prefix}.psam")
+    base = normalize_plink_prefix(str(prefix))
+    path = Path(f"{base}.psam")
     if not path.is_file():
         return []
     result: list[str] = []
@@ -215,7 +218,8 @@ def _read_psam_ids(prefix: str) -> list[str]:
 
 
 def _count_pvar_sites(prefix: str) -> int:
-    candidates = [Path(f"{prefix}.pvar"), Path(f"{prefix}.pvar.zst"), Path(f"{prefix}.pvar.gz")]
+    base = normalize_plink_prefix(str(prefix))
+    candidates = [Path(f"{base}.pvar"), Path(f"{base}.pvar.zst"), Path(f"{base}.pvar.gz")]
     path = next((p for p in candidates if p.is_file()), None)
     if path is None:
         return 0
@@ -259,7 +263,8 @@ def _read_vcf_metadata(path: str) -> tuple[list[str], int]:
 
 
 def _count_bim_sites(prefix: str) -> int:
-    with open(f"{prefix}.bim", "r", encoding="utf-8", errors="replace") as handle:
+    base = normalize_plink_prefix(str(prefix))
+    with open(f"{base}.bim", "r", encoding="utf-8", errors="replace") as handle:
         return sum(1 for line in handle if line.strip())
 
 

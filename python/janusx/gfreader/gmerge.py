@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 
+from janusx._plink import normalize_plink_prefix
 from ..janusx import merge_genotypes
 
 
@@ -29,7 +30,10 @@ def _ensure_outdir(out: str) -> None:
 def _normalize_inputs(inputs: Iterable[PathLike]) -> List[str]:
     if inputs is None:
         raise ValueError("inputs cannot be None")
-    xs = [os.fspath(x) for x in inputs]
+    xs = [
+        os.fspath(x) if _is_vcf(os.fspath(x)) else normalize_plink_prefix(os.fspath(x))
+        for x in inputs
+    ]
     if len(xs) == 0:
         raise ValueError("inputs must be a non-empty list")
     return xs
@@ -47,9 +51,10 @@ def _check_inputs_exist(inputs: List[str]) -> None:
             if not os.path.exists(x):
                 missing.append(x)
         else:
-            bed = x + ".bed"
-            bim = x + ".bim"
-            fam = x + ".fam"
+            base = normalize_plink_prefix(x)
+            bed = base + ".bed"
+            bim = base + ".bim"
+            fam = base + ".fam"
             if not (os.path.exists(bed) and os.path.exists(bim) and os.path.exists(fam)):
                 missing.append(f"{x} (need {bed},{bim},{fam})")
     if missing:

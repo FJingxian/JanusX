@@ -33,6 +33,8 @@ from typing import Callable, Iterator, Sequence
 import numpy as np
 import pandas as pd
 
+from janusx._plink import normalize_plink_prefix
+
 from ._common.cli_args import add_common_out_arg, add_common_prefix_arg, add_common_thread_arg
 from ._common.config_render import emit_cli_configuration
 from ._common.genoio import (
@@ -371,7 +373,7 @@ def _resolve_output(format_name: str, outdir: str, prefix: str) -> tuple[str, st
 
 
 def _read_fam_sample_names(prefix: str) -> list[str]:
-    fam = f"{prefix}.fam"
+    fam = f"{normalize_plink_prefix(str(prefix))}.fam"
     out: list[str] = []
     with open(fam, "r", encoding="utf-8") as fr:
         for lineno, raw in enumerate(fr, start=1):

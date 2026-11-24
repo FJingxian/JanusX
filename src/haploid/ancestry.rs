@@ -2,12 +2,13 @@
 //! whole-chromosome PBWT candidate narrowing + genetic-step Viterbi decoding,
 //! plus Union-of-Breakpoints sparse ancestry dosage matrix for `src/hgwas`.
 
-use super::pbwt::scan_chromosome_seeds;
+use super::pbwt::scan_chromosome_seeds_cancellable;
 use super::phasing::SampleHaplotypeLayout;
 use super::types::{AncestrySegment, BitHaplotypeMatrix, HaploidIbdConfig};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Exact population-level union-of-breakpoints sparse ancestry dosage matrix
 /// for one chromosome, stored in bin-major (CSC-like) layout so `src/hgwas`
@@ -36,6 +37,13 @@ pub struct ChromosomeAncestryBinsSparse {
 ///
 /// `joint_matrix` lays out reference haplotypes in columns `0..ref_layout.total_haps`
 /// and target haplotypes in columns `ref_layout.total_haps..joint_matrix.n_haps`.
+#[inline]
+fn is_cancelled(cancelled: Option<&AtomicBool>) -> bool {
+    cancelled
+        .map(|flag| flag.load(Ordering::Relaxed))
+        .unwrap_or(false)
+}
+
 pub fn paint_chromosome_ancestry(
     joint_matrix: &BitHaplotypeMatrix,
     ref_layout: &SampleHaplotypeLayout,
@@ -45,11 +53,40 @@ pub fn paint_chromosome_ancestry(
     cm_positions: &[f64],
     config: &HaploidIbdConfig,
 ) -> (Vec<AncestrySegment>, ChromosomeAncestryBinsSparse) {
+    paint_chromosome_ancestry_cancellable(
+        joint_matrix,
+        ref_layout,
+        target_layout,
+        chrom_idx,
+        positions_bp,
+        cm_positions,
+        config,
+        None,
+    )
+    .unwrap_or_default()
+}
+
+/// Cancellable variant of `paint_chromosome_ancestry` that checks `cancelled`
+/// during PBWT seed scanning, fallback donor scoring, and per-haplotype Viterbi decoding.
+#[allow(clippy::too_many_arguments)]
+pub fn paint_chromosome_ancestry_cancellable(
+    joint_matrix: &BitHaplotypeMatrix,
+    ref_layout: &SampleHaplotypeLayout,
+    target_layout: &SampleHaplotypeLayout,
+    chrom_idx: u16,
+    positions_bp: &[u64],
+    cm_positions: &[f64],
+    config: &HaploidIbdConfig,
+    cancelled: Option<&AtomicBool>,
+) -> Result<(Vec<AncestrySegment>, ChromosomeAncestryBinsSparse), String> {
+    if is_cancelled(cancelled) {
+        return Err("Interrupted".to_string());
+    }
     let n_markers = joint_matrix.n_markers;
     let n_ref_haps = ref_layout.total_haps;
     let n_target_haps = target_layout.total_haps;
     if n_markers == 0 || n_ref_haps == 0 || n_target_haps == 0 {
-        return (Vec::new(), ChromosomeAncestryBinsSparse::default());
+        return Ok((Vec::new(), ChromosomeAncestryBinsSparse::default()));
     }
 
     // Step 1: Partition the chromosome into genetic steps (~0.05 cM) so even
@@ -63,13 +100,14 @@ pub fn paint_chromosome_ancestry(
     let per_target_candidates: Vec<Vec<usize>> = if n_ref_haps <= config.ancestry_top_donors {
         vec![(0..n_ref_haps).collect(); n_target_haps]
     } else {
-        let seeds = scan_chromosome_seeds(
+        let seeds = scan_chromosome_seeds_cancellable(
             joint_matrix,
             cm_positions,
             (config.min_seed_cm * 0.5).max(0.2),
             config.min_markers.min(10).max(4),
             Some(n_ref_haps),
-        );
+            cancelled,
+        )?;
         let mut counts: Vec<HashMap<usize, u64>> = vec![HashMap::new(); n_target_haps];
         for seed in seeds {
             let (ref_h, tgt_h) = if (seed.hap_a as usize) < n_ref_haps {
@@ -83,7 +121,10 @@ pub fn paint_chromosome_ancestry(
         counts
             .into_par_iter()
             .enumerate()
-            .map(|(tgt_local_h, map)| {
+            .map(|(tgt_local_h, map)| -> Result<Vec<usize>, String> {
+                if is_cancelled(cancelled) {
+                    return Err("Interrupted".to_string());
+                }
                 let mut ranked: Vec<(usize, u64)> = map.into_iter().collect();
                 ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
                 let mut cands: Vec<usize> = ranked
@@ -141,9 +182,9 @@ pub fn paint_chromosome_ancestry(
                             .map(|(h, _, _, _)| h),
                     );
                 }
-                cands
+                Ok(cands)
             })
-            .collect()
+            .collect::<Result<Vec<Vec<usize>>, String>>()?
     };
 
     // Step 3: Parallel step-level Viterbi mosaic decoding per target haplotype.
@@ -153,15 +194,18 @@ pub fn paint_chromosome_ancestry(
     let match_reward: f32 = 0.7;
     let switch_penalty = config.ancestry_switch_penalty.max(0.5);
 
-    let segments: Vec<AncestrySegment> = (0..n_target_haps)
+    let per_hap_segments: Result<Vec<Vec<AncestrySegment>>, String> = (0..n_target_haps)
         .into_par_iter()
-        .flat_map(|tgt_local_h| {
+        .map(|tgt_local_h| {
+            if is_cancelled(cancelled) {
+                return Err("Interrupted".to_string());
+            }
             let tgt_col = n_ref_haps + tgt_local_h;
             let (target_sample, target_hap) = target_layout.hap_to_sample[tgt_local_h];
             let candidates = &per_target_candidates[tgt_local_h];
             let k = candidates.len();
             if k == 0 || n_steps == 0 {
-                return Vec::new();
+                return Ok(Vec::new());
             }
 
             // Evidence-aware Viterbi DP with `k + 1` states:
@@ -185,6 +229,9 @@ pub fn paint_chromosome_ancestry(
             let mut prev_had_obs = false;
 
             for (step_idx, &(m_start, m_end)) in step_ranges.iter().enumerate() {
+                if (step_idx & 255) == 0 && is_cancelled(cancelled) {
+                    return Err("Interrupted".to_string());
+                }
                 let row_off = step_idx * k;
                 let bp_off = step_idx * n_states;
 
@@ -417,9 +464,14 @@ pub fn paint_chromosome_ancestry(
                 });
                 seg_start_step = seg_end_step;
             }
-            out
+            Ok(out)
         })
         .collect();
+    let segments: Vec<AncestrySegment> = per_hap_segments?.into_iter().flatten().collect();
+
+    if is_cancelled(cancelled) {
+        return Err("Interrupted".to_string());
+    }
 
     // Step 4: Build exact Union-of-Breakpoints sparse ancestry dosage matrix.
     let sparse_bins = build_union_breakpoint_sparse_matrix(
@@ -428,7 +480,7 @@ pub fn paint_chromosome_ancestry(
         ref_layout.n_samples,
         &segments,
     );
-    (segments, sparse_bins)
+    Ok((segments, sparse_bins))
 }
 
 fn build_genetic_step_ranges(cm_positions: &[f64], step_cm: f64) -> Vec<(usize, usize)> {

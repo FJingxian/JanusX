@@ -1,12 +1,13 @@
 //! Error-tolerant hap-IBD pairwise IBD1/IBD2 detection (Mode 1: no `--ref`)
 //! and genome-wide sparse IBD kinship CSR matrix builder for `src/hgwas`.
 
-use super::pbwt::{scan_chromosome_seeds, PbwtSeed};
+use super::pbwt::{scan_chromosome_seeds_cancellable, PbwtSeed};
 use super::phasing::SampleHaplotypeLayout;
 use super::types::{BitHaplotypeMatrix, HaploidIbdConfig, IbdSegment};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Minimum fraction of markers in a candidate IBD segment that must be jointly
 /// observed (non-missing in both haplotypes) to accept the segment.
@@ -29,6 +30,13 @@ pub struct SparseIbdKinshipCsr {
     pub kinship: Vec<f32>,
 }
 
+#[inline]
+fn is_cancelled(cancelled: Option<&AtomicBool>) -> bool {
+    cancelled
+        .map(|flag| flag.load(Ordering::Relaxed))
+        .unwrap_or(false)
+}
+
 /// Detect error-tolerant pairwise IBD1/IBD2 segments on a single chromosome.
 pub fn detect_chromosome_ibd(
     matrix: &BitHaplotypeMatrix,
@@ -38,44 +46,93 @@ pub fn detect_chromosome_ibd(
     cm_positions: &[f64],
     config: &HaploidIbdConfig,
 ) -> Vec<IbdSegment> {
+    detect_chromosome_ibd_cancellable(
+        matrix,
+        layout,
+        chrom_idx,
+        positions_bp,
+        cm_positions,
+        config,
+        None,
+    )
+    .unwrap_or_default()
+}
+
+/// Cancellable variant of `detect_chromosome_ibd` that checks `cancelled` during
+/// PBWT seed scanning and pair-level seed extension.
+pub fn detect_chromosome_ibd_cancellable(
+    matrix: &BitHaplotypeMatrix,
+    layout: &SampleHaplotypeLayout,
+    chrom_idx: u16,
+    positions_bp: &[u64],
+    cm_positions: &[f64],
+    config: &HaploidIbdConfig,
+    cancelled: Option<&AtomicBool>,
+) -> Result<Vec<IbdSegment>, String> {
+    if is_cancelled(cancelled) {
+        return Err("Interrupted".to_string());
+    }
     let n_markers = matrix.n_markers;
     if n_markers < config.min_markers.max(2) || matrix.n_haps < 2 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     // Step 1: Whole-chromosome PBWT seed discovery.
-    let raw_seeds = scan_chromosome_seeds(
+    let raw_seeds = scan_chromosome_seeds_cancellable(
         matrix,
         cm_positions,
         config.min_seed_cm,
         config.min_markers.min(15).max(5),
         None,
-    );
+        cancelled,
+    )?;
     if raw_seeds.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
-    // Group seeds by haplotype pair `(hap_a, hap_b)` skipping intra-sample pairs.
-    let mut grouped: HashMap<(u32, u32), Vec<PbwtSeed>> = HashMap::new();
-    for seed in raw_seeds {
-        let (s1, _) = layout.hap_to_sample[seed.hap_a as usize];
-        let (s2, _) = layout.hap_to_sample[seed.hap_b as usize];
-        if s1 == s2 {
-            continue;
+    // Filter intra-sample seeds and sort in parallel by `(hap_a, hap_b, start, end)`
+    // to eliminate the single-threaded HashMap grouping bottleneck.
+    let mut filtered_seeds: Vec<PbwtSeed> = raw_seeds
+        .into_par_iter()
+        .filter(|seed| {
+            layout.hap_to_sample[seed.hap_a as usize].0
+                != layout.hap_to_sample[seed.hap_b as usize].0
+        })
+        .collect();
+    if filtered_seeds.is_empty() {
+        return Ok(Vec::new());
+    }
+    if is_cancelled(cancelled) {
+        return Err("Interrupted".to_string());
+    }
+    filtered_seeds.par_sort_unstable_by_key(|s| (s.hap_a, s.hap_b, s.start_marker, s.end_marker));
+
+    // Build contiguous slice ranges per `(hap_a, hap_b)` pair.
+    let mut pair_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut r_start = 0usize;
+    while r_start < filtered_seeds.len() {
+        let key = (filtered_seeds[r_start].hap_a, filtered_seeds[r_start].hap_b);
+        let mut r_end = r_start + 1;
+        while r_end < filtered_seeds.len()
+            && (filtered_seeds[r_end].hap_a, filtered_seeds[r_end].hap_b) == key
+        {
+            r_end += 1;
         }
-        grouped
-            .entry((seed.hap_a, seed.hap_b))
-            .or_default()
-            .push(seed);
+        pair_ranges.push((r_start, r_end));
+        r_start = r_end;
     }
-
-    let pairs: Vec<((u32, u32), Vec<PbwtSeed>)> = grouped.into_iter().collect();
 
     // Step 2: Parallel error-tolerant left/right extension & gap bridging per pair.
-    let hap_segments: Vec<IbdSegment> = pairs
+    let per_pair_segments: Result<Vec<Vec<IbdSegment>>, String> = pair_ranges
         .into_par_iter()
-        .flat_map(|((hap_a, hap_b), mut seeds)| {
-            seeds.sort_by_key(|s| (s.start_marker, s.end_marker));
+        .enumerate()
+        .map(|(pair_idx, (r_start, r_end))| {
+            if (pair_idx & 63) == 0 && is_cancelled(cancelled) {
+                return Err("Interrupted".to_string());
+            }
+            let seeds = &filtered_seeds[r_start..r_end];
+            let hap_a = seeds[0].hap_a;
+            let hap_b = seeds[0].hap_b;
             let (s1, h1) = layout.hap_to_sample[hap_a as usize];
             let (s2, h2) = layout.hap_to_sample[hap_b as usize];
             let (sample1, hap1, sample2, hap2) = if s1 < s2 {
@@ -170,13 +227,18 @@ pub fn detect_chromosome_ibd(
                     mismatch_rate,
                 });
             }
-            out
+            Ok(out)
         })
         .collect();
+    let hap_segments: Vec<IbdSegment> = per_pair_segments?.into_iter().flatten().collect();
+
+    if is_cancelled(cancelled) {
+        return Err("Interrupted".to_string());
+    }
 
     // Step 3: Split overlapping diploid haplotype tracks into exact mutually
     // exclusive IBD1 and IBD2 intervals so no region is double-counted.
-    resolve_diploid_ibd2_intervals(hap_segments, layout)
+    Ok(resolve_diploid_ibd2_intervals(hap_segments, layout))
 }
 
 /// Extend a PBWT seed `[start, end)` left and right across single genotyping
@@ -292,119 +354,117 @@ fn resolve_diploid_ibd2_intervals(
         }
     }
 
-    for ((chrom_idx, sample1, sample2), group) in diploid_groups {
-        if group.len() == 1 {
-            out.push(group.into_iter().next().unwrap());
-            continue;
-        }
-        // Collect unique sorted breakpoints `(bp, cm)`.
-        let mut pts: Vec<(u64, f32)> = Vec::with_capacity(group.len() * 2);
-        for seg in &group {
-            pts.push((seg.start_bp, seg.start_cm));
-            pts.push((seg.end_bp, seg.end_cm));
-        }
-        pts.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
-        pts.dedup_by_key(|p| p.0);
-
-        let mut resolved: Vec<IbdSegment> = Vec::new();
-        for w in pts.windows(2) {
-            let (bp_l, cm_l) = w[0];
-            let (bp_r, cm_r) = w[1];
-            if bp_r <= bp_l {
-                continue;
+    let diploid_resolved: Vec<IbdSegment> = diploid_groups
+        .into_par_iter()
+        .flat_map(|((chrom_idx, sample1, sample2), group)| {
+            if group.len() == 1 {
+                return group;
             }
-            let mut cov_mask = 0u8; // bit (hap1 * 2 + hap2)
-            let mut first_hap = (0u8, 0u8);
-            let mut has_any = false;
-            let mut track_markers = [0u32; 4];
-            let mut track_mis = [0.0f32; 4];
+            let mut pts: Vec<(u64, f32)> = Vec::with_capacity(group.len() * 2);
             for seg in &group {
-                if seg.start_bp <= bp_l && seg.end_bp >= bp_r {
-                    let idx = ((seg.hap1 & 1) * 2 + (seg.hap2 & 1)) as usize;
-                    cov_mask |= 1u8 << idx;
-                    if !has_any {
-                        first_hap = (seg.hap1, seg.hap2);
-                        has_any = true;
-                    }
-                    let full_bp = seg.end_bp.saturating_sub(seg.start_bp).max(1) as f64;
-                    let frac = (bp_r - bp_l) as f64 / full_bp;
-                    let m_est = ((seg.n_markers as f64) * frac).round() as u32;
-                    track_markers[idx] = track_markers[idx].max(m_est);
-                    track_mis[idx] = track_mis[idx].max(seg.mismatch_rate);
-                }
+                pts.push((seg.start_bp, seg.start_cm));
+                pts.push((seg.end_bp, seg.end_cm));
             }
-            if !has_any {
-                continue;
-            }
-            // Complementary diploid pairs:
-            //   parallel: (0,0)&(1,1) = bits 0b1001 -> hap=(0,0), track2=Some((1,1))
-            //   crossed : (0,1)&(1,0) = bits 0b0110 -> hap=(0,1), track2=Some((1,0))
-            let (ibd_type, hap1, hap2, track2, markers_sum, mis_rate) = if (cov_mask & 0b1001)
-                == 0b1001
-            {
-                (
-                    2u8,
-                    0u8,
-                    0u8,
-                    Some((1u8, 1u8)),
-                    track_markers[0].min(track_markers[3]),
-                    track_mis[0].max(track_mis[3]),
-                )
-            } else if (cov_mask & 0b0110) == 0b0110 {
-                (
-                    2u8,
-                    0u8,
-                    1u8,
-                    Some((1u8, 0u8)),
-                    track_markers[1].min(track_markers[2]),
-                    track_mis[1].max(track_mis[2]),
-                )
-            } else {
-                let idx = ((first_hap.0 & 1) * 2 + (first_hap.1 & 1)) as usize;
-                (
-                    1u8,
-                    first_hap.0,
-                    first_hap.1,
-                    None,
-                    track_markers[idx],
-                    track_mis[idx],
-                )
-            };
+            pts.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.total_cmp(&b.1)));
+            pts.dedup_by_key(|p| p.0);
 
-            if let Some(prev) = resolved.last_mut() {
-                if prev.end_bp == bp_l
-                    && prev.ibd_type == ibd_type
-                    && prev.hap1 == hap1
-                    && prev.hap2 == hap2
-                    && prev.track2 == track2
-                {
-                    prev.end_bp = bp_r;
-                    prev.end_cm = cm_r;
-                    prev.n_markers = prev.n_markers.saturating_add(markers_sum);
-                    prev.mismatch_rate = prev.mismatch_rate.max(mis_rate);
+            let mut resolved: Vec<IbdSegment> = Vec::new();
+            for w in pts.windows(2) {
+                let (bp_l, cm_l) = w[0];
+                let (bp_r, cm_r) = w[1];
+                if bp_r <= bp_l {
                     continue;
                 }
-            }
-            resolved.push(IbdSegment {
-                sample1,
-                hap1,
-                sample2,
-                hap2,
-                track2,
-                chrom_idx,
-                start_bp: bp_l,
-                end_bp: bp_r,
-                start_cm: cm_l,
-                end_cm: cm_r,
-                ibd_type,
-                n_markers: markers_sum,
-                mismatch_rate: mis_rate,
-            });
-        }
-        out.extend(resolved);
-    }
+                let mut cov_mask = 0u8;
+                let mut first_hap = (0u8, 0u8);
+                let mut has_any = false;
+                let mut track_markers = [0u32; 4];
+                let mut track_mis = [0.0f32; 4];
+                for seg in &group {
+                    if seg.start_bp <= bp_l && seg.end_bp >= bp_r {
+                        let idx = ((seg.hap1 & 1) * 2 + (seg.hap2 & 1)) as usize;
+                        cov_mask |= 1u8 << idx;
+                        if !has_any {
+                            first_hap = (seg.hap1, seg.hap2);
+                            has_any = true;
+                        }
+                        let full_bp = seg.end_bp.saturating_sub(seg.start_bp).max(1) as f64;
+                        let frac = (bp_r - bp_l) as f64 / full_bp;
+                        let m_est = ((seg.n_markers as f64) * frac).round() as u32;
+                        track_markers[idx] = track_markers[idx].max(m_est);
+                        track_mis[idx] = track_mis[idx].max(seg.mismatch_rate);
+                    }
+                }
+                if !has_any {
+                    continue;
+                }
+                let (ibd_type, hap1, hap2, track2, markers_sum, mis_rate) =
+                    if (cov_mask & 0b1001) == 0b1001 {
+                        (
+                            2u8,
+                            0u8,
+                            0u8,
+                            Some((1u8, 1u8)),
+                            track_markers[0].min(track_markers[3]),
+                            track_mis[0].max(track_mis[3]),
+                        )
+                    } else if (cov_mask & 0b0110) == 0b0110 {
+                        (
+                            2u8,
+                            0u8,
+                            1u8,
+                            Some((1u8, 0u8)),
+                            track_markers[1].min(track_markers[2]),
+                            track_mis[1].max(track_mis[2]),
+                        )
+                    } else {
+                        let idx = ((first_hap.0 & 1) * 2 + (first_hap.1 & 1)) as usize;
+                        (
+                            1u8,
+                            first_hap.0,
+                            first_hap.1,
+                            None,
+                            track_markers[idx],
+                            track_mis[idx],
+                        )
+                    };
 
-    out.sort_by_key(|s| (s.chrom_idx, s.sample1, s.sample2, s.start_bp, s.hap1, s.hap2));
+                if let Some(prev) = resolved.last_mut() {
+                    if prev.end_bp == bp_l
+                        && prev.ibd_type == ibd_type
+                        && prev.hap1 == hap1
+                        && prev.hap2 == hap2
+                        && prev.track2 == track2
+                    {
+                        prev.end_bp = bp_r;
+                        prev.end_cm = cm_r;
+                        prev.n_markers = prev.n_markers.saturating_add(markers_sum);
+                        prev.mismatch_rate = prev.mismatch_rate.max(mis_rate);
+                        continue;
+                    }
+                }
+                resolved.push(IbdSegment {
+                    sample1,
+                    hap1,
+                    sample2,
+                    hap2,
+                    track2,
+                    chrom_idx,
+                    start_bp: bp_l,
+                    end_bp: bp_r,
+                    start_cm: cm_l,
+                    end_cm: cm_r,
+                    ibd_type,
+                    n_markers: markers_sum,
+                    mismatch_rate: mis_rate,
+                });
+            }
+            resolved
+        })
+        .collect();
+    out.extend(diploid_resolved);
+
+    out.par_sort_unstable_by_key(|s| (s.chrom_idx, s.sample1, s.sample2, s.start_bp, s.hap1, s.hap2));
     out
 }
 
@@ -449,56 +509,62 @@ pub fn build_sparse_ibd_kinship_csr(
             .push(seg);
     }
 
-    // Sweep-line partition each `(chrom, s1, s2)` into mutually exclusive IBD1 & IBD2 cM.
-    let mut pair_cm: HashMap<(u32, u32), (f64, f64)> = HashMap::new();
-    for ((_, s1, s2), group) in by_chrom_pair {
-        let mut coords: Vec<f64> = Vec::with_capacity(group.len() * 2);
-        for seg in &group {
-            coords.push(seg.start_cm as f64);
-            coords.push(seg.end_cm as f64);
-        }
-        coords.sort_by(|a, b| a.total_cmp(b));
-        coords.dedup_by(|a, b| (*a - *b).abs() <= 1e-9);
-
-        let mut ibd1_cm = 0.0f64;
-        let mut ibd2_cm = 0.0f64;
-        for w in coords.windows(2) {
-            let l = w[0];
-            let r = w[1];
-            let len = r - l;
-            if len <= 1e-9 {
-                continue;
-            }
-            let mid = 0.5 * (l + r);
-            let mut explicit_ibd2 = false;
-            let mut cov_mask = 0u8;
-            let mut any_cov = false;
+    // Sweep-line partition each `(chrom, s1, s2)` in parallel into mutually exclusive IBD1 & IBD2 cM.
+    let chrom_pair_totals: Vec<(u32, u32, f64, f64)> = by_chrom_pair
+        .into_par_iter()
+        .map(|((_, s1, s2), group)| {
+            let mut coords: Vec<f64> = Vec::with_capacity(group.len() * 2);
             for seg in &group {
-                if (seg.start_cm as f64) <= mid && (seg.end_cm as f64) >= mid {
-                    any_cov = true;
-                    if seg.ibd_type >= 2 {
-                        explicit_ibd2 = true;
-                    } else {
-                        let (h1, h2) = if seg.sample1 == s1 {
-                            (seg.hap1 & 1, seg.hap2 & 1)
+                coords.push(seg.start_cm as f64);
+                coords.push(seg.end_cm as f64);
+            }
+            coords.sort_by(|a, b| a.total_cmp(b));
+            coords.dedup_by(|a, b| (*a - *b).abs() <= 1e-9);
+
+            let mut ibd1_cm = 0.0f64;
+            let mut ibd2_cm = 0.0f64;
+            for w in coords.windows(2) {
+                let l = w[0];
+                let r = w[1];
+                let len = r - l;
+                if len <= 1e-9 {
+                    continue;
+                }
+                let mid = 0.5 * (l + r);
+                let mut explicit_ibd2 = false;
+                let mut cov_mask = 0u8;
+                let mut any_cov = false;
+                for seg in &group {
+                    if (seg.start_cm as f64) <= mid && (seg.end_cm as f64) >= mid {
+                        any_cov = true;
+                        if seg.ibd_type >= 2 {
+                            explicit_ibd2 = true;
                         } else {
-                            (seg.hap2 & 1, seg.hap1 & 1)
-                        };
-                        cov_mask |= 1u8 << (h1 * 2 + h2);
+                            let (h1, h2) = if seg.sample1 == s1 {
+                                (seg.hap1 & 1, seg.hap2 & 1)
+                            } else {
+                                (seg.hap2 & 1, seg.hap1 & 1)
+                            };
+                            cov_mask |= 1u8 << (h1 * 2 + h2);
+                        }
                     }
                 }
+                if !any_cov {
+                    continue;
+                }
+                let complementary_ibd2 =
+                    (cov_mask & 0b1001) == 0b1001 || (cov_mask & 0b0110) == 0b0110;
+                if explicit_ibd2 || complementary_ibd2 {
+                    ibd2_cm += len;
+                } else {
+                    ibd1_cm += len;
+                }
             }
-            if !any_cov {
-                continue;
-            }
-            let complementary_ibd2 =
-                (cov_mask & 0b1001) == 0b1001 || (cov_mask & 0b0110) == 0b0110;
-            if explicit_ibd2 || complementary_ibd2 {
-                ibd2_cm += len;
-            } else {
-                ibd1_cm += len;
-            }
-        }
+            (s1, s2, ibd1_cm, ibd2_cm)
+        })
+        .collect();
+    let mut pair_cm: HashMap<(u32, u32), (f64, f64)> = HashMap::with_capacity(chrom_pair_totals.len());
+    for (s1, s2, ibd1_cm, ibd2_cm) in chrom_pair_totals {
         let entry = pair_cm.entry((s1, s2)).or_insert((0.0, 0.0));
         entry.0 += ibd1_cm;
         entry.1 += ibd2_cm;
@@ -716,5 +782,70 @@ mod tests {
             segs_strict.is_empty(),
             "segment with 0.01 mismatch rate must be rejected when max_mismatch_rate=0.005, got {segs_strict:?}"
         );
+    }
+
+    #[test]
+    fn parallel_ibd_and_csr_match_single_threaded_on_4096_markers() {
+        let n_markers = 4096usize;
+        let layout = SampleHaplotypeLayout::from_inbred_flags(vec![true, true, true]);
+        let mut matrix = BitHaplotypeMatrix::new(layout.total_haps, n_markers);
+        let pos: Vec<u64> = (0..n_markers).map(|m| (m as u64 + 1) * 10_000).collect();
+        let cm: Vec<f64> = (0..n_markers).map(|m| m as f64 * 1.0).collect(); // 0..4095 cM
+        for m in 0..n_markers {
+            let a0 = ((m * 7 + 3) % 2) as u8;
+            let a1 = a0; // full-length match [0, 4096)
+            let a2 = if (2030..2048).contains(&m) {
+                a0
+            } else {
+                1 - a0
+            };
+            matrix.set_allele(m, 0, Some(a0));
+            matrix.set_allele(m, 1, Some(a1));
+            matrix.set_allele(m, 2, Some(a2));
+        }
+
+        let cfg = HaploidIbdConfig {
+            min_seed_cm: 15.0,
+            min_output_cm: 15.0,
+            max_gap_cm: 0.5,
+            max_mismatch_rate: 0.01,
+            min_markers: 15,
+            ..HaploidIbdConfig::default()
+        };
+
+        let run_with_threads = |threads: usize| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let segs = pool.install(|| detect_chromosome_ibd(&matrix, &layout, 0, &pos, &cm, &cfg));
+            let csr = pool.install(|| build_sparse_ibd_kinship_csr(3, 4095.0, &segs));
+            (segs, csr)
+        };
+
+        let (segs1, csr1) = run_with_threads(1);
+        let (segs2, csr2) = run_with_threads(2);
+        assert_eq!(segs1, segs2, "2-thread IBD segments diverged from 1-thread");
+        assert_eq!(csr1.row_ptr, csr2.row_ptr);
+        assert_eq!(csr1.col_idx, csr2.col_idx);
+        assert_eq!(csr1.ibd1_frac, csr2.ibd1_frac);
+        assert_eq!(csr1.ibd2_frac, csr2.ibd2_frac);
+        assert_eq!(csr1.kinship, csr2.kinship);
+
+        let pair01: Vec<_> = segs2
+            .iter()
+            .filter(|s| s.sample1 == 0 && s.sample2 == 1)
+            .collect();
+        assert_eq!(pair01.len(), 1);
+        assert!((pair01[0].start_cm - 0.0).abs() < 1e-3);
+        assert!((pair01[0].end_cm - 4095.0).abs() < 1e-3);
+
+        let pair02: Vec<_> = segs2
+            .iter()
+            .filter(|s| s.sample1 == 0 && s.sample2 == 2)
+            .collect();
+        assert_eq!(pair02.len(), 1);
+        assert!((pair02[0].start_cm - 2030.0).abs() < 1e-3);
+        assert!((pair02[0].end_cm - 2047.0).abs() < 1e-3);
     }
 }

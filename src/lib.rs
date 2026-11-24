@@ -335,15 +335,147 @@ fn imp_run(
 }
 
 #[pyfunction]
-fn haploid_ibd_run(py: Python<'_>, options_json: String) -> PyResult<String> {
+#[pyo3(signature = (options_json, progress_callback=None))]
+fn haploid_ibd_run(
+    py: Python<'_>,
+    options_json: String,
+    progress_callback: Option<Py<PyAny>>,
+) -> PyResult<String> {
+    use pyo3::exceptions::PyKeyboardInterrupt;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, RecvTimeoutError},
+        Arc,
+    };
+    use std::time::Duration;
+
+    enum WorkerMsg {
+        Progress(haploid::types::HaploidIbdProgress),
+        Finished(Result<haploid::types::HaploidIbdSummary, String>),
+    }
+
     let config = serde_json::from_str::<haploid::types::HaploidIbdConfig>(&options_json)
         .map_err(|error| PyRuntimeError::new_err(format!("invalid haploid ibd options: {error}")))?;
-    let summary = py
-        .detach(move || haploid::run_haploid_ibd(config))
-        .map_err(PyRuntimeError::new_err)?;
-    serde_json::to_string(&summary).map_err(|error| {
-        PyRuntimeError::new_err(format!("serialize haploid ibd summary: {error}"))
-    })
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let (tx, mut rx) = mpsc::channel::<WorkerMsg>();
+
+    // Run Rust computation on a worker thread so the Python main thread stays free
+    // to call `py.check_signals()` every 25 ms (CPython only executes signal handlers
+    // on the main thread of the main interpreter).
+    let worker_cancelled = Arc::clone(&cancelled);
+    let worker = std::thread::spawn(move || {
+        let run_res = haploid::run_haploid_ibd_with_progress_and_cancel(
+            config,
+            |event| {
+                if worker_cancelled.load(Ordering::Relaxed) {
+                    return Err("Interrupted".to_owned());
+                }
+                let _ = tx.send(WorkerMsg::Progress(event.clone()));
+                Ok(())
+            },
+            Some(worker_cancelled.as_ref()),
+        );
+        let _ = tx.send(WorkerMsg::Finished(run_res));
+    });
+
+    let dispatch_progress = |py: Python<'_>, event: &haploid::types::HaploidIbdProgress| -> PyResult<()> {
+        if let Some(cb) = progress_callback.as_ref() {
+            cb.call1(
+                py,
+                (
+                    event.stage.as_str(),
+                    event.chrom.as_str(),
+                    event.chrom_index,
+                    event.chrom_markers,
+                    event.raw_target_markers_done,
+                    event.markers_done,
+                    event.segments_found,
+                ),
+            )?;
+        }
+        Ok(())
+    };
+
+    let finish_with_error = |py: Python<'_>, err: PyErr, worker: std::thread::JoinHandle<()>| -> PyResult<String> {
+        cancelled.store(true, Ordering::Relaxed);
+        py.detach(|| {
+            let _ = worker.join();
+        });
+        Err(err)
+    };
+
+    loop {
+        let rx_ref = &mut rx;
+        let msg = py.detach(move || rx_ref.recv_timeout(Duration::from_millis(25)));
+
+        // Always check Python signals on the main thread every <= 25 ms so SIGINT
+        // immediately flips `cancelled` even during long compute stages.
+        if let Err(sig_err) = py.check_signals() {
+            return finish_with_error(py, sig_err, worker);
+        }
+
+        match msg {
+            Ok(WorkerMsg::Progress(event)) => {
+                if let Err(cb_err) = dispatch_progress(py, &event) {
+                    return finish_with_error(py, cb_err, worker);
+                }
+                // Drain any additional queued messages without blocking.
+                loop {
+                    match rx.try_recv() {
+                        Ok(WorkerMsg::Progress(next_ev)) => {
+                            if let Err(sig_err) = py.check_signals() {
+                                return finish_with_error(py, sig_err, worker);
+                            }
+                            if let Err(cb_err) = dispatch_progress(py, &next_ev) {
+                                return finish_with_error(py, cb_err, worker);
+                            }
+                        }
+                        Ok(WorkerMsg::Finished(run_res)) => {
+                            py.detach(|| {
+                                let _ = worker.join();
+                            });
+                            if let Err(sig_err) = py.check_signals() {
+                                return Err(sig_err);
+                            }
+                            if cancelled.load(Ordering::Relaxed) {
+                                return Err(PyKeyboardInterrupt::new_err("interrupted by user"));
+                            }
+                            let summary = run_res.map_err(PyRuntimeError::new_err)?;
+                            return serde_json::to_string(&summary).map_err(|error| {
+                                PyRuntimeError::new_err(format!(
+                                    "serialize haploid ibd summary: {error}"
+                                ))
+                            });
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+            Ok(WorkerMsg::Finished(run_res)) => {
+                py.detach(|| {
+                    let _ = worker.join();
+                });
+                if let Err(sig_err) = py.check_signals() {
+                    return Err(sig_err);
+                }
+                if cancelled.load(Ordering::Relaxed) {
+                    return Err(PyKeyboardInterrupt::new_err("interrupted by user"));
+                }
+                let summary = run_res.map_err(PyRuntimeError::new_err)?;
+                return serde_json::to_string(&summary).map_err(|error| {
+                    PyRuntimeError::new_err(format!("serialize haploid ibd summary: {error}"))
+                });
+            }
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => {
+                return finish_with_error(
+                    py,
+                    PyRuntimeError::new_err("haploid ibd worker thread terminated unexpectedly"),
+                    worker,
+                );
+            }
+        }
+    }
 }
 
 #[pyfunction]

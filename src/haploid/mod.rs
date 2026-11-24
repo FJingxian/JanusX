@@ -14,29 +14,63 @@ pub mod types;
 
 use crate::imp::types::{PhaseSetId, VariantRow};
 use crate::imp_reader::ImpReader;
-use ancestry::{paint_chromosome_ancestry, ChromosomeAncestryBinsSparse};
-use ibd::{build_sparse_ibd_kinship_csr, detect_chromosome_ibd};
+use ancestry::{paint_chromosome_ancestry_cancellable, ChromosomeAncestryBinsSparse};
+use ibd::{build_sparse_ibd_kinship_csr, detect_chromosome_ibd_cancellable};
 use phasing::{phase_unphased_diploids_one_pass, DisjointPhaseBlock, SampleHaplotypeLayout};
 use sparse_io::{
-    write_segments_tsv_gz, write_sparse_archive, HaploidSparseArchive, HaploidSparsePayload,
+    write_segments_tsv_gz_cancellable, write_sparse_archive, HaploidSparseArchive,
+    HaploidSparsePayload,
 };
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
+use rayon::prelude::*;
 use types::{
     AncestrySegment, BitHaplotypeMatrix, GeneticMap, HaploidIbdConfig, HaploidIbdMode,
-    HaploidIbdSummary, IbdSegment, PloidyMode,
+    HaploidIbdProgress, HaploidIbdSummary, IbdSegment, PloidyMode,
 };
 
-/// Main entry point for `--only-ibd`: streams one chromosome at a time,
-/// filters to biallelic markers, auto-classifies inbred/DH vs diploid samples,
-/// runs 1-pass PBWT phasing on unphased diploids (and across disjoint VCF PS
-/// phase blocks), and dispatches to either all-vs-all pairwise IBD (no `--ref`)
-/// or multi-parent ancestry painting (with `--ref`).
+#[inline]
+fn is_cancelled(cancelled: Option<&AtomicBool>) -> bool {
+    cancelled
+        .map(|flag| flag.load(Ordering::Relaxed))
+        .unwrap_or(false)
+}
+
+/// Main entry point for `jx ibd` without a progress callback.
 pub fn run_haploid_ibd(config: HaploidIbdConfig) -> Result<HaploidIbdSummary, String> {
+    run_haploid_ibd_with_progress(config, |_| Ok(()))
+}
+
+/// Main entry point for `jx ibd` with stage-level progress callbacks.
+pub fn run_haploid_ibd_with_progress<F>(
+    config: HaploidIbdConfig,
+    on_progress: F,
+) -> Result<HaploidIbdSummary, String>
+where
+    F: FnMut(&HaploidIbdProgress) -> Result<(), String>,
+{
+    run_haploid_ibd_with_progress_and_cancel(config, on_progress, None)
+}
+
+/// Main entry point for `jx ibd` with stage-level progress callbacks and
+/// cooperative cancellation (`AtomicBool`) checked inside long-running loops:
+/// streams one chromosome at a time, filters to biallelic markers,
+/// auto-classifies inbred/DH vs diploid samples, runs 1-pass PBWT phasing on
+/// unphased diploids (and across disjoint VCF PS phase blocks), and dispatches
+/// to either all-vs-all pairwise IBD (no `--ref`) or multi-parent ancestry
+/// painting (with `--ref`).
+pub fn run_haploid_ibd_with_progress_and_cancel<F>(
+    config: HaploidIbdConfig,
+    mut on_progress: F,
+    cancelled: Option<&AtomicBool>,
+) -> Result<HaploidIbdSummary, String>
+where
+    F: FnMut(&HaploidIbdProgress) -> Result<(), String>,
+{
     let started = Instant::now();
     if config.target.as_os_str().is_empty() {
         return Err("--only-ibd requires a target genotype input".to_owned());
@@ -96,9 +130,31 @@ pub fn run_haploid_ibd(config: HaploidIbdConfig) -> Result<HaploidIbdSummary, St
         .map(|r| r.sample_ids().to_vec())
         .unwrap_or_default();
 
-    let mut target_pending: Option<VariantRow> = target_reader.next_row()?;
+    // Binary PLINK (BED/PGEN) encodings only represent biallelic calls, so they
+    // can safely use `next_biallelic_reference_row()` (O(1) shape validation).
+    // Text formats (VCF/HapMap) must use `next_row()` so out-of-range alleles
+    // such as `0|2` on a biallelic site still fail validation.
+    let target_fast_binary_read = is_binary_plink_input(&config.target);
+    let mut target_pending: Option<VariantRow> = pool.install(|| {
+        if target_fast_binary_read {
+            target_reader.next_biallelic_reference_row()
+        } else {
+            target_reader.next_row()
+        }
+    })?;
+    let ref_fast_binary_read = config
+        .reference
+        .as_deref()
+        .map(is_binary_plink_input)
+        .unwrap_or(false);
     let mut ref_pending: Option<VariantRow> = match ref_reader_opt.as_mut() {
-        Some(r) => r.next_biallelic_reference_row()?,
+        Some(r) => pool.install(|| {
+            if ref_fast_binary_read {
+                r.next_biallelic_reference_row()
+            } else {
+                r.next_row()
+            }
+        })?,
         None => None,
     };
     // Bounded-memory disk-backed reference chromosome spool: zero I/O when
@@ -107,6 +163,7 @@ pub fn run_haploid_ibd(config: HaploidIbdConfig) -> Result<HaploidIbdSummary, St
     let mut ref_chrom_spool = RefChromSpool::new();
 
     let mut chrom_names: Vec<String> = Vec::new();
+    let mut raw_target_markers_scanned: u64 = 0;
     let mut markers_processed: u64 = 0;
     let mut total_genome_cm: f64 = 0.0;
     let mut last_inbred_count: usize = 0;
@@ -116,104 +173,231 @@ pub fn run_haploid_ibd(config: HaploidIbdConfig) -> Result<HaploidIbdSummary, St
     let mut all_ancestry_segments: Vec<AncestrySegment> = Vec::new();
     let mut all_chrom_bins: Vec<ChromosomeAncestryBinsSparse> = Vec::new();
 
+    let mut emit_progress = |stage: &str,
+                             chrom: &str,
+                             chrom_index: u64,
+                             chrom_markers: u64,
+                             raw_target_markers_done: u64,
+                             markers_done: u64,
+                             segments_found: u64| {
+        if is_cancelled(cancelled) {
+            return Err("Interrupted".to_owned());
+        }
+        on_progress(&HaploidIbdProgress {
+            stage: stage.to_owned(),
+            chrom: chrom.to_owned(),
+            chrom_index,
+            chrom_markers,
+            raw_target_markers_done,
+            markers_done,
+            segments_found,
+        })
+    };
+
+    emit_progress("prepare", "", 0, 0, 0, 0, 0)?;
+
     while let Some(first_row) = target_pending.take() {
+        if is_cancelled(cancelled) {
+            return Err("Interrupted".to_owned());
+        }
         let chrom = first_row.meta.chrom.clone();
+        let next_chrom_index = chrom_names.len() as u64 + 1;
+        let cur_segs = match mode {
+            HaploidIbdMode::PairwiseIbd => all_ibd_segments.len() as u64,
+            HaploidIbdMode::MultiParentAncestry => all_ancestry_segments.len() as u64,
+        };
+        emit_progress(
+            "load",
+            &chrom,
+            next_chrom_index,
+            0,
+            raw_target_markers_scanned,
+            markers_processed,
+            cur_segs,
+        )?;
+
         let mut target_rows = Vec::new();
+        let mut chrom_raw_target_rows: u64 = 1;
         if first_row.meta.alt_alleles.len() == 1 {
             target_rows.push(first_row);
         }
-        while let Some(next_row) = target_reader.next_row()? {
-            if next_row.meta.chrom == chrom {
-                if next_row.meta.alt_alleles.len() == 1 {
-                    target_rows.push(next_row);
-                }
+        pool.install(|| -> Result<(), String> {
+            while let Some(next_row) = if target_fast_binary_read {
+                target_reader.next_biallelic_reference_row()?
             } else {
-                target_pending = Some(next_row);
-                break;
+                target_reader.next_row()?
+            } {
+                if (chrom_raw_target_rows & 4095) == 0 && is_cancelled(cancelled) {
+                    return Err("Interrupted".to_owned());
+                }
+                if next_row.meta.chrom == chrom {
+                    chrom_raw_target_rows += 1;
+                    if next_row.meta.alt_alleles.len() == 1 {
+                        target_rows.push(next_row);
+                    }
+                } else {
+                    target_pending = Some(next_row);
+                    break;
+                }
             }
-        }
+            Ok(())
+        })?;
         if target_rows.is_empty() {
+            raw_target_markers_scanned += chrom_raw_target_rows;
             continue;
         }
 
         match mode {
             HaploidIbdMode::PairwiseIbd => {
                 let chrom_idx = chrom_names.len() as u16;
+                let chrom_index = chrom_idx as u64 + 1;
+                let chrom_markers = target_rows.len() as u64;
                 chrom_names.push(chrom.clone());
 
-                let (is_inbred, unphased_hets, disjoint_ps_blocks) = classify_and_collect_hets(
-                    &target_rows,
-                    target_sample_ids.len(),
-                    config.ploidy_mode,
-                    config.inbred_het_threshold,
-                );
+                emit_progress(
+                    "encode",
+                    &chrom,
+                    chrom_index,
+                    chrom_markers,
+                    raw_target_markers_scanned,
+                    markers_processed,
+                    all_ibd_segments.len() as u64,
+                )?;
+                let (is_inbred, unphased_hets, disjoint_ps_blocks) = pool.install(|| {
+                    classify_and_collect_hets(
+                        &target_rows,
+                        target_sample_ids.len(),
+                        config.ploidy_mode,
+                        config.inbred_het_threshold,
+                    )
+                });
                 last_inbred_count = is_inbred.iter().filter(|&&b| b).count();
                 last_diploid_count = target_sample_ids.len().saturating_sub(last_inbred_count);
                 let layout = SampleHaplotypeLayout::from_inbred_flags(is_inbred);
-                let (mut matrix, positions_bp, cm_positions) =
-                    encode_rows_to_matrix(&target_rows, &layout, &map);
+                let (mut matrix, positions_bp, cm_positions) = pool.install(|| {
+                    encode_rows_to_matrix(&target_rows, &layout, &map)
+                });
                 drop(target_rows);
 
-                markers_processed += matrix.n_markers as u64;
                 if cm_positions.len() >= 2 {
                     total_genome_cm +=
                         (cm_positions[cm_positions.len() - 1] - cm_positions[0]).max(0.0);
                 }
 
-                phase_unphased_diploids_one_pass(
-                    &mut matrix,
-                    &layout,
-                    &unphased_hets,
-                    &disjoint_ps_blocks,
-                );
+                if unphased_hets.iter().any(|v| !v.is_empty())
+                    || disjoint_ps_blocks
+                        .iter()
+                        .any(|b| b.iter().any(|x| !x.all_phased_markers.is_empty()))
+                {
+                    emit_progress(
+                        "phase",
+                        &chrom,
+                        chrom_index,
+                        chrom_markers,
+                        raw_target_markers_scanned,
+                        markers_processed,
+                        all_ibd_segments.len() as u64,
+                    )?;
+                    phase_unphased_diploids_one_pass(
+                        &mut matrix,
+                        &layout,
+                        &unphased_hets,
+                        &disjoint_ps_blocks,
+                    );
+                }
+
+                emit_progress(
+                    "ibd",
+                    &chrom,
+                    chrom_index,
+                    chrom_markers,
+                    raw_target_markers_scanned,
+                    markers_processed,
+                    all_ibd_segments.len() as u64,
+                )?;
                 let segs = pool.install(|| {
-                    detect_chromosome_ibd(
+                    detect_chromosome_ibd_cancellable(
                         &matrix,
                         &layout,
                         chrom_idx,
                         &positions_bp,
                         &cm_positions,
                         &config,
+                        cancelled,
                     )
-                });
+                })?;
                 all_ibd_segments.extend(segs);
+                raw_target_markers_scanned += chrom_raw_target_rows;
+                markers_processed += matrix.n_markers as u64;
+                emit_progress(
+                    "chrom_done",
+                    &chrom,
+                    chrom_index,
+                    chrom_markers,
+                    raw_target_markers_scanned,
+                    markers_processed,
+                    all_ibd_segments.len() as u64,
+                )?;
             }
             HaploidIbdMode::MultiParentAncestry => {
                 let ref_reader = ref_reader_opt
                     .as_mut()
                     .expect("reference reader present in ancestry mode");
-                let ref_rows = take_reference_chromosome_rows(
-                    &chrom,
-                    ref_reader,
-                    &mut ref_pending,
-                    &mut ref_chrom_spool,
-                )?;
+                let ref_rows = pool.install(|| {
+                    take_reference_chromosome_rows(
+                        &chrom,
+                        ref_reader,
+                        &mut ref_pending,
+                        &mut ref_chrom_spool,
+                        ref_fast_binary_read,
+                        cancelled,
+                    )
+                })?;
                 if ref_rows.is_empty() {
+                    raw_target_markers_scanned += chrom_raw_target_rows;
                     continue;
                 }
 
-                let (aligned_ref, aligned_tgt) = align_chromosome_rows(&ref_rows, &target_rows);
-                drop(ref_rows);
-                drop(target_rows);
-                if aligned_tgt.is_empty() {
+                let aligned_pairs = pool.install(|| align_chromosome_row_indices(&ref_rows, &target_rows));
+                if aligned_pairs.is_empty() {
+                    drop(ref_rows);
+                    drop(target_rows);
+                    raw_target_markers_scanned += chrom_raw_target_rows;
                     continue;
                 }
 
                 let chrom_idx = chrom_names.len() as u16;
+                let chrom_index = chrom_idx as u64 + 1;
+                let chrom_markers = aligned_pairs.len() as u64;
                 chrom_names.push(chrom.clone());
 
-                let (ref_inbred, ref_unphased_hets, ref_ps_blocks) = classify_and_collect_hets(
-                    &aligned_ref,
-                    reference_sample_ids.len(),
-                    config.ploidy_mode,
-                    config.inbred_het_threshold,
-                );
-                let (tgt_inbred, tgt_unphased_hets, tgt_ps_blocks) = classify_and_collect_hets(
-                    &aligned_tgt,
-                    target_sample_ids.len(),
-                    config.ploidy_mode,
-                    config.inbred_het_threshold,
-                );
+                emit_progress(
+                    "encode",
+                    &chrom,
+                    chrom_index,
+                    chrom_markers,
+                    raw_target_markers_scanned,
+                    markers_processed,
+                    all_ancestry_segments.len() as u64,
+                )?;
+                let (ref_inbred, ref_unphased_hets, ref_ps_blocks) = pool.install(|| {
+                    classify_and_collect_hets_with(
+                        aligned_pairs.len(),
+                        reference_sample_ids.len(),
+                        config.ploidy_mode,
+                        config.inbred_het_threshold,
+                        |m| &ref_rows[aligned_pairs[m].0],
+                    )
+                });
+                let (tgt_inbred, tgt_unphased_hets, tgt_ps_blocks) = pool.install(|| {
+                    classify_and_collect_hets_with(
+                        aligned_pairs.len(),
+                        target_sample_ids.len(),
+                        config.ploidy_mode,
+                        config.inbred_het_threshold,
+                        |m| &target_rows[aligned_pairs[m].1],
+                    )
+                });
                 last_inbred_count = tgt_inbred.iter().filter(|&&b| b).count();
                 last_diploid_count = target_sample_ids.len().saturating_sub(last_inbred_count);
 
@@ -228,31 +412,57 @@ pub fn run_haploid_ibd(config: HaploidIbdConfig) -> Result<HaploidIbdSummary, St
                 let mut joint_ps_blocks = ref_ps_blocks;
                 joint_ps_blocks.extend(tgt_ps_blocks);
 
-                let (mut joint_matrix, positions_bp, cm_positions) = encode_joint_rows_to_matrix(
-                    &aligned_ref,
-                    &aligned_tgt,
-                    &ref_layout,
-                    &tgt_layout,
-                    &map,
-                );
-                drop(aligned_ref);
-                drop(aligned_tgt);
+                let (mut joint_matrix, positions_bp, cm_positions) = pool.install(|| {
+                    encode_joint_rows_to_matrix_indexed(
+                        &ref_rows,
+                        &target_rows,
+                        &aligned_pairs,
+                        &ref_layout,
+                        &tgt_layout,
+                        &map,
+                    )
+                });
+                drop(ref_rows);
+                drop(target_rows);
 
-                markers_processed += joint_matrix.n_markers as u64;
                 if cm_positions.len() >= 2 {
                     total_genome_cm +=
                         (cm_positions[cm_positions.len() - 1] - cm_positions[0]).max(0.0);
                 }
 
-                phase_unphased_diploids_one_pass(
-                    &mut joint_matrix,
-                    &joint_layout,
-                    &joint_unphased_hets,
-                    &joint_ps_blocks,
-                );
+                if joint_unphased_hets.iter().any(|v| !v.is_empty())
+                    || joint_ps_blocks
+                        .iter()
+                        .any(|b| b.iter().any(|x| !x.all_phased_markers.is_empty()))
+                {
+                    emit_progress(
+                        "phase",
+                        &chrom,
+                        chrom_index,
+                        chrom_markers,
+                        raw_target_markers_scanned,
+                        markers_processed,
+                        all_ancestry_segments.len() as u64,
+                    )?;
+                    phase_unphased_diploids_one_pass(
+                        &mut joint_matrix,
+                        &joint_layout,
+                        &joint_unphased_hets,
+                        &joint_ps_blocks,
+                    );
+                }
 
+                emit_progress(
+                    "ancestry",
+                    &chrom,
+                    chrom_index,
+                    chrom_markers,
+                    raw_target_markers_scanned,
+                    markers_processed,
+                    all_ancestry_segments.len() as u64,
+                )?;
                 let (segs, bins) = pool.install(|| {
-                    paint_chromosome_ancestry(
+                    paint_chromosome_ancestry_cancellable(
                         &joint_matrix,
                         &ref_layout,
                         &tgt_layout,
@@ -260,10 +470,22 @@ pub fn run_haploid_ibd(config: HaploidIbdConfig) -> Result<HaploidIbdSummary, St
                         &positions_bp,
                         &cm_positions,
                         &config,
+                        cancelled,
                     )
-                });
+                })?;
                 all_ancestry_segments.extend(segs);
                 all_chrom_bins.push(bins);
+                raw_target_markers_scanned += chrom_raw_target_rows;
+                markers_processed += joint_matrix.n_markers as u64;
+                emit_progress(
+                    "chrom_done",
+                    &chrom,
+                    chrom_index,
+                    chrom_markers,
+                    raw_target_markers_scanned,
+                    markers_processed,
+                    all_ancestry_segments.len() as u64,
+                )?;
             }
         }
     }
@@ -276,11 +498,22 @@ pub fn run_haploid_ibd(config: HaploidIbdConfig) -> Result<HaploidIbdSummary, St
 
     let (segments_written, sparse_bins_written, sparse_nnz, payload) = match mode {
         HaploidIbdMode::PairwiseIbd => {
-            let kinship_csr = build_sparse_ibd_kinship_csr(
-                target_sample_ids.len(),
-                total_genome_cm,
-                &all_ibd_segments,
-            );
+            emit_progress(
+                "kinship",
+                "",
+                chrom_names.len() as u64,
+                0,
+                raw_target_markers_scanned,
+                markers_processed,
+                all_ibd_segments.len() as u64,
+            )?;
+            let kinship_csr = pool.install(|| {
+                build_sparse_ibd_kinship_csr(
+                    target_sample_ids.len(),
+                    total_genome_cm,
+                    &all_ibd_segments,
+                )
+            });
             let segs_n = all_ibd_segments.len() as u64;
             let nnz = kinship_csr.col_idx.len() as u64;
             (
@@ -321,7 +554,19 @@ pub fn run_haploid_ibd(config: HaploidIbdConfig) -> Result<HaploidIbdSummary, St
         payload,
     };
 
+    emit_progress(
+        "write",
+        "",
+        chrom_names.len() as u64,
+        0,
+        raw_target_markers_scanned,
+        markers_processed,
+        segments_written,
+    )?;
     let output_path = normalize_jhibd_output_path(&config.output);
+    if is_cancelled(cancelled) {
+        return Err("Interrupted".to_owned());
+    }
     write_sparse_archive(&output_path, &archive)?;
 
     let tsv_path = if config.write_tsv {
@@ -331,11 +576,21 @@ pub fn run_haploid_ibd(config: HaploidIbdConfig) -> Result<HaploidIbdSummary, St
             .and_then(|s| s.to_str())
             .unwrap_or("haploid_ibd");
         p.set_file_name(format!("{file_name}.tsv.gz"));
-        write_segments_tsv_gz(&p, &archive)?;
+        write_segments_tsv_gz_cancellable(&p, &archive, cancelled)?;
         Some(p.to_string_lossy().into_owned())
     } else {
         None
     };
+
+    emit_progress(
+        "complete",
+        "",
+        chrom_names.len() as u64,
+        0,
+        raw_target_markers_scanned,
+        markers_processed,
+        segments_written,
+    )?;
 
     Ok(HaploidIbdSummary {
         mode,
@@ -449,18 +704,35 @@ fn take_reference_chromosome_rows(
     ref_reader: &mut ImpReader,
     ref_pending: &mut Option<VariantRow>,
     spool: &mut RefChromSpool,
+    fast_binary_read: bool,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<Vec<VariantRow>, String> {
+    if is_cancelled(cancelled) {
+        return Err("Interrupted".to_owned());
+    }
     if let Some(rows) = spool.take(target_chrom)? {
         return Ok(rows);
     }
     while let Some(first_row) = ref_pending.take() {
+        if is_cancelled(cancelled) {
+            return Err("Interrupted".to_owned());
+        }
         let cur_chrom = first_row.meta.chrom.clone();
         if cur_chrom == target_chrom {
             let mut rows = Vec::new();
+            let mut seen = 1u64;
             if first_row.meta.alt_alleles.len() == 1 {
                 rows.push(first_row);
             }
-            while let Some(next_row) = ref_reader.next_biallelic_reference_row()? {
+            while let Some(next_row) = if fast_binary_read {
+                ref_reader.next_biallelic_reference_row()?
+            } else {
+                ref_reader.next_row()?
+            } {
+                seen += 1;
+                if (seen & 4095) == 0 && is_cancelled(cancelled) {
+                    return Err("Interrupted".to_owned());
+                }
                 if next_row.meta.chrom == cur_chrom {
                     if next_row.meta.alt_alleles.len() == 1 {
                         rows.push(next_row);
@@ -474,13 +746,22 @@ fn take_reference_chromosome_rows(
         }
         let (path, mut encoder) = spool.create_writer(&cur_chrom)?;
         let mut count = 0u64;
+        let mut seen = 1u64;
         if first_row.meta.alt_alleles.len() == 1 {
             bincode::serialize_into(&mut encoder, &Some(&first_row))
                 .map_err(|err| format!("write reference spool {}: {err}", path.display()))?;
             count += 1;
         }
         drop(first_row);
-        while let Some(next_row) = ref_reader.next_biallelic_reference_row()? {
+        while let Some(next_row) = if fast_binary_read {
+            ref_reader.next_biallelic_reference_row()?
+        } else {
+            ref_reader.next_row()?
+        } {
+            seen += 1;
+            if (seen & 4095) == 0 && is_cancelled(cancelled) {
+                return Err("Interrupted".to_owned());
+            }
             if next_row.meta.chrom == cur_chrom {
                 if next_row.meta.alt_alleles.len() == 1 {
                     bincode::serialize_into(&mut encoder, &Some(&next_row)).map_err(|err| {
@@ -506,6 +787,24 @@ fn take_reference_chromosome_rows(
     Ok(Vec::new())
 }
 
+fn is_binary_plink_input(path: &std::path::Path) -> bool {
+    let path_str = path.to_string_lossy();
+    let lower = path_str.to_ascii_lowercase();
+    if lower.ends_with(".vcf")
+        || lower.ends_with(".vcf.gz")
+        || lower.ends_with(".hmp")
+        || lower.ends_with(".hmp.gz")
+        || lower.ends_with(".hmp.txt")
+        || lower.ends_with(".hmp.txt.gz")
+    {
+        return false;
+    }
+    crate::pgen::path_uses_pgen(&path_str)
+        || lower.ends_with(".bed")
+        || lower.ends_with(".bim")
+        || lower.ends_with(".fam")
+}
+
 fn normalize_jhibd_output_path(path: &std::path::Path) -> PathBuf {
     let s = path.to_string_lossy();
     if s.ends_with(".jhibd") {
@@ -529,6 +828,83 @@ fn classify_and_collect_hets(
     ploidy_mode: PloidyMode,
     inbred_het_threshold: f64,
 ) -> (Vec<bool>, Vec<Vec<u32>>, Vec<Vec<DisjointPhaseBlock>>) {
+    classify_and_collect_hets_with(
+        rows.len(),
+        n_samples,
+        ploidy_mode,
+        inbred_het_threshold,
+        |m| &rows[m],
+    )
+}
+
+fn classify_and_collect_hets_with<'a, F>(
+    n_markers: usize,
+    n_samples: usize,
+    ploidy_mode: PloidyMode,
+    inbred_het_threshold: f64,
+    row_at: F,
+) -> (Vec<bool>, Vec<Vec<u32>>, Vec<Vec<DisjointPhaseBlock>>)
+where
+    F: Fn(usize) -> &'a VariantRow + Sync,
+{
+    const CHUNK_MARKERS: usize = 2048;
+    let n_chunks = n_markers.div_ceil(CHUNK_MARKERS).max(1);
+    let chunk_results: Vec<(
+        Vec<u64>,
+        Vec<u64>,
+        Vec<Vec<u32>>,
+        Vec<Vec<(u32, PhaseSetId, bool)>>,
+    )> = (0..n_chunks)
+        .into_par_iter()
+        .map(|chunk_idx| {
+            let m_start = chunk_idx * CHUNK_MARKERS;
+            let m_end = (m_start + CHUNK_MARKERS).min(n_markers);
+            let mut local_called = vec![0u64; n_samples];
+            let mut local_het = vec![0u64; n_samples];
+            let mut local_unphased = vec![Vec::<u32>::new(); n_samples];
+            let mut local_ps_events = vec![Vec::<(u32, PhaseSetId, bool)>::new(); n_samples];
+
+            for marker in m_start..m_end {
+                let row = row_at(marker);
+                let has_ps = row.calls.has_phase_set_track();
+                let marker_u32 = marker as u32;
+                for s in 0..n_samples {
+                    if let Some(call) = row.calls.get(s) {
+                        let is_complete_biallelic = matches!(
+                            call.alleles,
+                            [Some(a0), Some(a1)] if a0 <= 1 && a1 <= 1
+                        );
+                        let is_complete_het = matches!(
+                            call.alleles,
+                            [Some(a0), Some(a1)] if a0 <= 1 && a1 <= 1 && a0 != a1
+                        );
+                        if is_complete_biallelic {
+                            local_called[s] += 1;
+                            if is_complete_het {
+                                local_het[s] += 1;
+                                if !call.phased {
+                                    local_unphased[s].push(marker_u32);
+                                }
+                            }
+                        }
+                        if has_ps && call.phased {
+                            let is_partial_phased = matches!(
+                                call.alleles,
+                                [Some(a), None] | [None, Some(a)] if a <= 1
+                            );
+                            if is_complete_het || is_partial_phased {
+                                if let Some(ps_id) = row.calls.phase_set(s) {
+                                    local_ps_events[s].push((marker_u32, ps_id, is_complete_het));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            (local_called, local_het, local_unphased, local_ps_events)
+        })
+        .collect();
+
     let mut called = vec![0u64; n_samples];
     let mut het = vec![0u64; n_samples];
     let mut unphased_hets = vec![Vec::new(); n_samples];
@@ -537,53 +913,30 @@ fn classify_and_collect_hets(
     let mut first_ps: Vec<Option<PhaseSetId>> = vec![None; n_samples];
     let mut ps_block_map: Vec<HashMap<PhaseSetId, usize>> = vec![HashMap::new(); n_samples];
 
-    for (marker, row) in rows.iter().enumerate() {
-        let marker_u32 = marker as u32;
+    for (local_called, local_het, local_unphased, local_ps_events) in chunk_results {
         for s in 0..n_samples {
-            if let Some(call) = row.calls.get(s) {
-                let is_complete_biallelic = matches!(
-                    call.alleles,
-                    [Some(a0), Some(a1)] if a0 <= 1 && a1 <= 1
-                );
-                let is_complete_het = matches!(
-                    call.alleles,
-                    [Some(a0), Some(a1)] if a0 <= 1 && a1 <= 1 && a0 != a1
-                );
-                let is_partial_phased = call.phased
-                    && matches!(
-                        call.alleles,
-                        [Some(a), None] | [None, Some(a)] if a <= 1
-                    );
-                if is_complete_biallelic {
-                    called[s] += 1;
-                    if is_complete_het {
-                        het[s] += 1;
-                        if !call.phased {
-                            unphased_hets[s].push(marker_u32);
-                        }
+            called[s] += local_called[s];
+            het[s] += local_het[s];
+            if !local_unphased[s].is_empty() {
+                unphased_hets[s].extend_from_slice(&local_unphased[s]);
+            }
+            for &(marker_u32, ps_id, is_complete_het) in &local_ps_events[s] {
+                match first_ps[s] {
+                    None => {
+                        first_ps[s] = Some(ps_id);
                     }
-                }
-                if call.phased && (is_complete_het || is_partial_phased) {
-                    if let Some(ps_id) = row.calls.phase_set(s) {
-                        match first_ps[s] {
-                            None => {
-                                first_ps[s] = Some(ps_id);
-                            }
-                            Some(first) if first == ps_id => {}
-                            Some(_) => {
-                                let block_idx =
-                                    *ps_block_map[s].entry(ps_id).or_insert_with(|| {
-                                        let idx = raw_ps_blocks[s].len();
-                                        raw_ps_blocks[s].push((None, Vec::new()));
-                                        idx
-                                    });
-                                let entry = &mut raw_ps_blocks[s][block_idx];
-                                if is_complete_het && entry.0.is_none() {
-                                    entry.0 = Some(marker_u32);
-                                }
-                                entry.1.push(marker_u32);
-                            }
+                    Some(first) if first == ps_id => {}
+                    Some(_) => {
+                        let block_idx = *ps_block_map[s].entry(ps_id).or_insert_with(|| {
+                            let idx = raw_ps_blocks[s].len();
+                            raw_ps_blocks[s].push((None, Vec::new()));
+                            idx
+                        });
+                        let entry = &mut raw_ps_blocks[s][block_idx];
+                        if is_complete_het && entry.0.is_none() {
+                            entry.0 = Some(marker_u32);
                         }
+                        entry.1.push(marker_u32);
                     }
                 }
             }
@@ -644,128 +997,195 @@ fn biallelic_code(allele: Option<u16>) -> Option<u8> {
     }
 }
 
+#[inline]
+fn set_bit_in_row(allele_row: &mut [u64], missing_row: &mut [u64], hap: usize, val: Option<u8>) {
+    let word = hap >> 6;
+    let mask = 1u64 << (hap & 63);
+    match val {
+        Some(0) => {}
+        Some(_) => allele_row[word] |= mask,
+        None => missing_row[word] |= mask,
+    }
+}
+
 fn encode_rows_to_matrix(
     rows: &[VariantRow],
     layout: &SampleHaplotypeLayout,
     map: &GeneticMap,
 ) -> (BitHaplotypeMatrix, Vec<u64>, Vec<f64>) {
-    let mut matrix = BitHaplotypeMatrix::with_capacity(layout.total_haps, rows.len());
-    let mut positions_bp = Vec::with_capacity(rows.len());
-    let mut cm_positions = Vec::with_capacity(rows.len());
-    let mut buf = vec![None; layout.total_haps];
-
-    for row in rows {
-        positions_bp.push(row.meta.pos);
-        cm_positions.push(map.interpolate_cm(&row.meta.chrom, row.meta.pos));
-        for s in 0..layout.n_samples {
-            let off = layout.hap_offset[s];
-            let call = row.calls.get(s);
-            if layout.is_inbred[s] {
-                buf[off] = call.and_then(|c| match c.alleles {
-                    [Some(a0), Some(a1)] if a0 == a1 && a0 <= 1 => Some(a0 as u8),
-                    _ => None,
-                });
-            } else {
-                match call {
-                    Some(c) => {
-                        buf[off] = biallelic_code(c.alleles[0]);
-                        buf[off + 1] = biallelic_code(c.alleles[1]);
-                    }
-                    None => {
-                        buf[off] = None;
-                        buf[off + 1] = None;
+    let n_markers = rows.len();
+    let mut matrix = BitHaplotypeMatrix::new(layout.total_haps, n_markers);
+    let positions_bp: Vec<u64> = rows.par_iter().map(|row| row.meta.pos).collect();
+    let cm_positions: Vec<f64> = rows
+        .par_iter()
+        .map(|row| map.interpolate_cm(&row.meta.chrom, row.meta.pos))
+        .collect();
+    let stride = matrix.words_per_marker;
+    if stride > 0 {
+        matrix
+            .allele_bits
+            .par_chunks_mut(stride)
+            .zip(matrix.missing_bits.par_chunks_mut(stride))
+            .zip(rows.par_iter())
+            .for_each(|((allele_row, missing_row), row)| {
+                for s in 0..layout.n_samples {
+                    let off = layout.hap_offset[s];
+                    let call = row.calls.get(s);
+                    if layout.is_inbred[s] {
+                        let val = call.and_then(|c| match c.alleles {
+                            [Some(a0), Some(a1)] if a0 == a1 && a0 <= 1 => Some(a0 as u8),
+                            _ => None,
+                        });
+                        set_bit_in_row(allele_row, missing_row, off, val);
+                    } else {
+                        match call {
+                            Some(c) => {
+                                set_bit_in_row(
+                                    allele_row,
+                                    missing_row,
+                                    off,
+                                    biallelic_code(c.alleles[0]),
+                                );
+                                set_bit_in_row(
+                                    allele_row,
+                                    missing_row,
+                                    off + 1,
+                                    biallelic_code(c.alleles[1]),
+                                );
+                            }
+                            None => {
+                                set_bit_in_row(allele_row, missing_row, off, None);
+                                set_bit_in_row(allele_row, missing_row, off + 1, None);
+                            }
+                        }
                     }
                 }
-            }
-        }
-        matrix.push_marker_row(&buf);
+            });
     }
     (matrix, positions_bp, cm_positions)
 }
 
-fn encode_joint_rows_to_matrix(
+fn encode_joint_rows_to_matrix_indexed(
     ref_rows: &[VariantRow],
     tgt_rows: &[VariantRow],
+    aligned_pairs: &[(usize, usize)],
     ref_layout: &SampleHaplotypeLayout,
     tgt_layout: &SampleHaplotypeLayout,
     map: &GeneticMap,
 ) -> (BitHaplotypeMatrix, Vec<u64>, Vec<f64>) {
     let total_haps = ref_layout.total_haps + tgt_layout.total_haps;
-    let mut matrix = BitHaplotypeMatrix::with_capacity(total_haps, tgt_rows.len());
-    let mut positions_bp = Vec::with_capacity(tgt_rows.len());
-    let mut cm_positions = Vec::with_capacity(tgt_rows.len());
-    let mut buf = vec![None; total_haps];
-
-    for (rrow, trow) in ref_rows.iter().zip(tgt_rows.iter()) {
-        positions_bp.push(trow.meta.pos);
-        cm_positions.push(map.interpolate_cm(&trow.meta.chrom, trow.meta.pos));
-        for s in 0..ref_layout.n_samples {
-            let off = ref_layout.hap_offset[s];
-            let call = rrow.calls.get(s);
-            if ref_layout.is_inbred[s] {
-                buf[off] = call.and_then(|c| match c.alleles {
-                    [Some(a0), Some(a1)] if a0 == a1 && a0 <= 1 => Some(a0 as u8),
-                    _ => None,
-                });
-            } else {
-                match call {
-                    Some(c) => {
-                        buf[off] = biallelic_code(c.alleles[0]);
-                        buf[off + 1] = biallelic_code(c.alleles[1]);
-                    }
-                    None => {
-                        buf[off] = None;
-                        buf[off + 1] = None;
+    let n_markers = aligned_pairs.len();
+    let mut matrix = BitHaplotypeMatrix::new(total_haps, n_markers);
+    let positions_bp: Vec<u64> = aligned_pairs
+        .par_iter()
+        .map(|&(_, tidx)| tgt_rows[tidx].meta.pos)
+        .collect();
+    let cm_positions: Vec<f64> = aligned_pairs
+        .par_iter()
+        .map(|&(_, tidx)| {
+            let row = &tgt_rows[tidx];
+            map.interpolate_cm(&row.meta.chrom, row.meta.pos)
+        })
+        .collect();
+    let stride = matrix.words_per_marker;
+    let base = ref_layout.total_haps;
+    if stride > 0 {
+        matrix
+            .allele_bits
+            .par_chunks_mut(stride)
+            .zip(matrix.missing_bits.par_chunks_mut(stride))
+            .zip(aligned_pairs.par_iter())
+            .for_each(|((allele_row, missing_row), &(ridx, tidx))| {
+                let rrow = &ref_rows[ridx];
+                let trow = &tgt_rows[tidx];
+                for s in 0..ref_layout.n_samples {
+                    let off = ref_layout.hap_offset[s];
+                    let call = rrow.calls.get(s);
+                    if ref_layout.is_inbred[s] {
+                        let val = call.and_then(|c| match c.alleles {
+                            [Some(a0), Some(a1)] if a0 == a1 && a0 <= 1 => Some(a0 as u8),
+                            _ => None,
+                        });
+                        set_bit_in_row(allele_row, missing_row, off, val);
+                    } else {
+                        match call {
+                            Some(c) => {
+                                set_bit_in_row(
+                                    allele_row,
+                                    missing_row,
+                                    off,
+                                    biallelic_code(c.alleles[0]),
+                                );
+                                set_bit_in_row(
+                                    allele_row,
+                                    missing_row,
+                                    off + 1,
+                                    biallelic_code(c.alleles[1]),
+                                );
+                            }
+                            None => {
+                                set_bit_in_row(allele_row, missing_row, off, None);
+                                set_bit_in_row(allele_row, missing_row, off + 1, None);
+                            }
+                        }
                     }
                 }
-            }
-        }
-        let base = ref_layout.total_haps;
-        for s in 0..tgt_layout.n_samples {
-            let off = base + tgt_layout.hap_offset[s];
-            let call = trow.calls.get(s);
-            if tgt_layout.is_inbred[s] {
-                buf[off] = call.and_then(|c| match c.alleles {
-                    [Some(a0), Some(a1)] if a0 == a1 && a0 <= 1 => Some(a0 as u8),
-                    _ => None,
-                });
-            } else {
-                match call {
-                    Some(c) => {
-                        buf[off] = biallelic_code(c.alleles[0]);
-                        buf[off + 1] = biallelic_code(c.alleles[1]);
-                    }
-                    None => {
-                        buf[off] = None;
-                        buf[off + 1] = None;
+                for s in 0..tgt_layout.n_samples {
+                    let off = base + tgt_layout.hap_offset[s];
+                    let call = trow.calls.get(s);
+                    if tgt_layout.is_inbred[s] {
+                        let val = call.and_then(|c| match c.alleles {
+                            [Some(a0), Some(a1)] if a0 == a1 && a0 <= 1 => Some(a0 as u8),
+                            _ => None,
+                        });
+                        set_bit_in_row(allele_row, missing_row, off, val);
+                    } else {
+                        match call {
+                            Some(c) => {
+                                set_bit_in_row(
+                                    allele_row,
+                                    missing_row,
+                                    off,
+                                    biallelic_code(c.alleles[0]),
+                                );
+                                set_bit_in_row(
+                                    allele_row,
+                                    missing_row,
+                                    off + 1,
+                                    biallelic_code(c.alleles[1]),
+                                );
+                            }
+                            None => {
+                                set_bit_in_row(allele_row, missing_row, off, None);
+                                set_bit_in_row(allele_row, missing_row, off + 1, None);
+                            }
+                        }
                     }
                 }
-            }
-        }
-        matrix.push_marker_row(&buf);
+            });
     }
     (matrix, positions_bp, cm_positions)
 }
 
-fn align_chromosome_rows(
+fn align_chromosome_row_indices(
     ref_rows: &[VariantRow],
     tgt_rows: &[VariantRow],
-) -> (Vec<VariantRow>, Vec<VariantRow>) {
+) -> Vec<(usize, usize)> {
     let mut ref_index: HashMap<(u64, &str, &str), usize> = HashMap::with_capacity(ref_rows.len());
     for (idx, row) in ref_rows.iter().enumerate() {
         let alt0 = row.meta.alt_alleles.first().map(String::as_str).unwrap_or("");
         ref_index.insert((row.meta.pos, row.meta.ref_allele.as_str(), alt0), idx);
     }
-    let mut aligned_ref = Vec::new();
-    let mut aligned_tgt = Vec::new();
-    for trow in tgt_rows {
-        let alt0 = trow.meta.alt_alleles.first().map(String::as_str).unwrap_or("");
-        if let Some(&ridx) = ref_index.get(&(trow.meta.pos, trow.meta.ref_allele.as_str(), alt0)) {
-            aligned_ref.push(ref_rows[ridx].clone());
-            aligned_tgt.push(trow.clone());
-        }
-    }
-    (aligned_ref, aligned_tgt)
+    tgt_rows
+        .par_iter()
+        .enumerate()
+        .filter_map(|(tidx, trow)| {
+            let alt0 = trow.meta.alt_alleles.first().map(String::as_str).unwrap_or("");
+            ref_index
+                .get(&(trow.meta.pos, trow.meta.ref_allele.as_str(), alt0))
+                .map(|&ridx| (ridx, tidx))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -877,5 +1297,89 @@ mod tests {
             res.is_err(),
             "truncated reference spool must fail instead of returning partial rows"
         );
+    }
+
+    #[test]
+    fn vcf_out_of_range_allele_on_biallelic_site_returns_error() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir();
+        let vcf_path = dir.join(format!("janusx_haploid_bad_gt_{}_{unique}.vcf", std::process::id()));
+        let out_path = dir.join(format!("janusx_haploid_bad_gt_{}_{unique}", std::process::id()));
+        std::fs::write(
+            &vcf_path,
+            concat!(
+                "##fileformat=VCFv4.2\n",
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\ts2\n",
+                "1\t100\tv1\tA\tG\t.\tPASS\t.\tGT\t0|2\t0|0\n"
+            ),
+        )
+        .unwrap();
+
+        for ploidy_mode in [PloidyMode::Inbred, PloidyMode::Diploid] {
+            let cfg = super::HaploidIbdConfig {
+                target: vcf_path.clone(),
+                output: out_path.clone(),
+                ploidy_mode,
+                ..super::HaploidIbdConfig::default()
+            };
+            let res = super::run_haploid_ibd(cfg);
+            assert!(
+                res.is_err(),
+                "biallelic VCF site with GT=0|2 must error in {ploidy_mode:?} mode"
+            );
+        }
+        let _ = std::fs::remove_file(&vcf_path);
+        let _ = std::fs::remove_file(format!("{}.jhibd", out_path.display()));
+    }
+
+    #[test]
+    fn ref_vcf_out_of_range_allele_on_biallelic_site_returns_error() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir();
+        let tgt_path = dir.join(format!("janusx_haploid_tgt_ok_{}_{unique}.vcf", std::process::id()));
+        let ref_path = dir.join(format!("janusx_haploid_ref_bad_{}_{unique}.vcf", std::process::id()));
+        let out_path = dir.join(format!("janusx_haploid_ref_bad_{}_{unique}", std::process::id()));
+        std::fs::write(
+            &tgt_path,
+            concat!(
+                "##fileformat=VCFv4.2\n",
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tt1\n",
+                "1\t100\tv1\tA\tG\t.\tPASS\t.\tGT\t0|0\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &ref_path,
+            concat!(
+                "##fileformat=VCFv4.2\n",
+                "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tr1\tr2\n",
+                "1\t100\tv1\tA\tG\t.\tPASS\t.\tGT\t0|2\t0|0\n"
+            ),
+        )
+        .unwrap();
+
+        for ploidy_mode in [PloidyMode::Inbred, PloidyMode::Diploid] {
+            let cfg = super::HaploidIbdConfig {
+                target: tgt_path.clone(),
+                reference: Some(ref_path.clone()),
+                output: out_path.clone(),
+                ploidy_mode,
+                ..super::HaploidIbdConfig::default()
+            };
+            let res = super::run_haploid_ibd(cfg);
+            assert!(
+                res.is_err(),
+                "biallelic reference VCF site with GT=0|2 must error in {ploidy_mode:?} mode"
+            );
+        }
+        let _ = std::fs::remove_file(&tgt_path);
+        let _ = std::fs::remove_file(&ref_path);
+        let _ = std::fs::remove_file(format!("{}.jhibd", out_path.display()));
     }
 }

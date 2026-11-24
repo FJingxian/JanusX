@@ -9,9 +9,21 @@ use flate2::Compression;
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const JHIBD_MAGIC: &[u8; 8] = b"JHIBD01\0";
+static TMP_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn sibling_temp_path(target: &Path) -> PathBuf {
+    let id = TMP_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let file_name = target
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("haploid_out");
+    let tmp_name = format!(".{file_name}.tmp.{}.{id}", std::process::id());
+    target.with_file_name(tmp_name)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum HaploidSparsePayload {
@@ -37,8 +49,10 @@ pub struct HaploidSparseArchive {
     pub payload: HaploidSparsePayload,
 }
 
-/// Write a `HaploidSparseArchive` to `path` using zstd-compressed bincode with
-/// a fixed 8-byte `JHIBD01\0` magic header.
+/// Write a `HaploidSparseArchive` atomically to `path` via a same-directory
+/// temporary file using zstd-compressed bincode with a fixed 8-byte `JHIBD01\0`
+/// magic header, so an abrupt signal (`os._exit`) never leaves a truncated archive
+/// at `path`.
 pub fn write_sparse_archive(path: &Path, archive: &HaploidSparseArchive) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -47,22 +61,38 @@ pub fn write_sparse_archive(path: &Path, archive: &HaploidSparseArchive) -> Resu
             })?;
         }
     }
-    let file = File::create(path)
-        .map_err(|err| format!("create sparse IBD output {}: {err}", path.display()))?;
-    let mut writer = BufWriter::new(file);
-    writer
-        .write_all(JHIBD_MAGIC)
-        .map_err(|err| format!("write magic header to {}: {err}", path.display()))?;
-    let mut encoder = zstd::stream::Encoder::new(writer, 3)
-        .map_err(|err| format!("init zstd encoder for {}: {err}", path.display()))?;
-    bincode::serialize_into(&mut encoder, archive)
-        .map_err(|err| format!("serialize sparse IBD archive {}: {err}", path.display()))?;
-    let mut inner = encoder
-        .finish()
-        .map_err(|err| format!("finish zstd stream {}: {err}", path.display()))?;
-    inner
-        .flush()
-        .map_err(|err| format!("flush sparse IBD output {}: {err}", path.display()))?;
+    let tmp_path = sibling_temp_path(path);
+    let write_res = (|| -> Result<(), String> {
+        let file = File::create(&tmp_path)
+            .map_err(|err| format!("create sparse IBD temp output {}: {err}", tmp_path.display()))?;
+        let mut writer = BufWriter::new(file);
+        writer
+            .write_all(JHIBD_MAGIC)
+            .map_err(|err| format!("write magic header to {}: {err}", tmp_path.display()))?;
+        let mut encoder = zstd::stream::Encoder::new(writer, 3)
+            .map_err(|err| format!("init zstd encoder for {}: {err}", tmp_path.display()))?;
+        bincode::serialize_into(&mut encoder, archive)
+            .map_err(|err| format!("serialize sparse IBD archive {}: {err}", tmp_path.display()))?;
+        let mut inner = encoder
+            .finish()
+            .map_err(|err| format!("finish zstd stream {}: {err}", tmp_path.display()))?;
+        inner
+            .flush()
+            .map_err(|err| format!("flush sparse IBD output {}: {err}", tmp_path.display()))?;
+        Ok(())
+    })();
+    if let Err(err) = write_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    std::fs::rename(&tmp_path, path).map_err(|err| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!(
+            "finalize sparse IBD archive {} -> {}: {err}",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -92,69 +122,119 @@ pub fn read_sparse_archive(path: &Path) -> Result<HaploidSparseArchive, String> 
 /// Export segments in human-readable gzipped TSV alongside the binary archive
 /// when `write_tsv = true`.
 pub fn write_segments_tsv_gz(path: &Path, archive: &HaploidSparseArchive) -> Result<(), String> {
-    let file = File::create(path)
-        .map_err(|err| format!("create TSV output {}: {err}", path.display()))?;
-    let mut gz = GzEncoder::new(BufWriter::new(file), Compression::fast());
-    match &archive.payload {
-        HaploidSparsePayload::PairwiseIbd { segments, .. } => {
-            writeln!(
-                gz,
-                "sample1\thap1\tsample2\thap2\tibd2_hap1\tibd2_hap2\tchrom\tstart_bp\tend_bp\tstart_cm\tend_cm\tibd_type\tn_markers\tmismatch_rate"
-            )
-            .map_err(|err| format!("write IBD TSV header: {err}"))?;
-            for seg in segments {
-                let s1 = &archive.target_sample_ids[seg.sample1 as usize];
-                let s2 = &archive.target_sample_ids[seg.sample2 as usize];
-                let chrom = &archive.chrom_names[seg.chrom_idx as usize];
-                let (t2_h1, t2_h2) = match seg.track2 {
-                    Some((a, b)) => (a.to_string(), b.to_string()),
-                    None => (".".to_owned(), ".".to_owned()),
-                };
-                writeln!(
-                    gz,
-                    "{s1}\t{}\t{s2}\t{}\t{t2_h1}\t{t2_h2}\t{chrom}\t{}\t{}\t{:.4}\t{:.4}\t{}\t{}\t{:.6}",
-                    seg.hap1,
-                    seg.hap2,
-                    seg.start_bp,
-                    seg.end_bp,
-                    seg.start_cm,
-                    seg.end_cm,
-                    seg.ibd_type,
-                    seg.n_markers,
-                    seg.mismatch_rate,
-                )
-                .map_err(|err| format!("write IBD TSV row: {err}"))?;
-            }
-        }
-        HaploidSparsePayload::MultiParentAncestry { segments, .. } => {
-            writeln!(
-                gz,
-                "target\thap\tchrom\tstart_bp\tend_bp\tstart_cm\tend_cm\tparent\tparent_hap\tconfidence\tambiguous_parents\tn_markers"
-            )
-            .map_err(|err| format!("write ancestry TSV header: {err}"))?;
-            for seg in segments {
-                let target = &archive.target_sample_ids[seg.target_sample as usize];
-                let parent = &archive.reference_sample_ids[seg.parent_sample as usize];
-                let chrom = &archive.chrom_names[seg.chrom_idx as usize];
-                writeln!(
-                    gz,
-                    "{target}\t{}\t{chrom}\t{}\t{}\t{:.4}\t{:.4}\t{parent}\t{}\t{:.4}\t{}\t{}",
-                    seg.hap,
-                    seg.start_bp,
-                    seg.end_bp,
-                    seg.start_cm,
-                    seg.end_cm,
-                    seg.parent_hap,
-                    seg.confidence,
-                    seg.ambiguous_parents,
-                    seg.n_markers,
-                )
-                .map_err(|err| format!("write ancestry TSV row: {err}"))?;
-            }
+    write_segments_tsv_gz_cancellable(path, archive, None)
+}
+
+#[inline]
+fn is_cancelled(cancelled: Option<&std::sync::atomic::AtomicBool>) -> bool {
+    cancelled
+        .map(|flag| flag.load(Ordering::Relaxed))
+        .unwrap_or(false)
+}
+
+/// Cancellable atomic gzipped TSV export checking `cancelled` every 4,096 rows
+/// and renaming from a same-directory temp file only upon full completion.
+pub fn write_segments_tsv_gz_cancellable(
+    path: &Path,
+    archive: &HaploidSparseArchive,
+    cancelled: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|err| {
+                format!("create TSV output directory {}: {err}", parent.display())
+            })?;
         }
     }
-    gz.finish()
-        .map_err(|err| format!("finish gzip TSV stream {}: {err}", path.display()))?;
+    let tmp_path = sibling_temp_path(path);
+    let write_res = (|| -> Result<(), String> {
+        let file = File::create(&tmp_path)
+            .map_err(|err| format!("create TSV temp output {}: {err}", tmp_path.display()))?;
+        let mut gz = GzEncoder::new(BufWriter::new(file), Compression::fast());
+        match &archive.payload {
+            HaploidSparsePayload::PairwiseIbd { segments, .. } => {
+                writeln!(
+                    gz,
+                    "sample1\thap1\tsample2\thap2\tibd2_hap1\tibd2_hap2\tchrom\tstart_bp\tend_bp\tstart_cm\tend_cm\tibd_type\tn_markers\tmismatch_rate"
+                )
+                .map_err(|err| format!("write IBD TSV header: {err}"))?;
+                for (idx, seg) in segments.iter().enumerate() {
+                    if (idx & 4095) == 0 && is_cancelled(cancelled) {
+                        return Err("Interrupted".to_owned());
+                    }
+                    let s1 = &archive.target_sample_ids[seg.sample1 as usize];
+                    let s2 = &archive.target_sample_ids[seg.sample2 as usize];
+                    let chrom = &archive.chrom_names[seg.chrom_idx as usize];
+                    let (t2_h1, t2_h2) = match seg.track2 {
+                        Some((a, b)) => (a.to_string(), b.to_string()),
+                        None => (".".to_owned(), ".".to_owned()),
+                    };
+                    writeln!(
+                        gz,
+                        "{s1}\t{}\t{s2}\t{}\t{t2_h1}\t{t2_h2}\t{chrom}\t{}\t{}\t{:.4}\t{:.4}\t{}\t{}\t{:.6}",
+                        seg.hap1,
+                        seg.hap2,
+                        seg.start_bp,
+                        seg.end_bp,
+                        seg.start_cm,
+                        seg.end_cm,
+                        seg.ibd_type,
+                        seg.n_markers,
+                        seg.mismatch_rate,
+                    )
+                    .map_err(|err| format!("write IBD TSV row: {err}"))?;
+                }
+            }
+            HaploidSparsePayload::MultiParentAncestry { segments, .. } => {
+                writeln!(
+                    gz,
+                    "target\thap\tchrom\tstart_bp\tend_bp\tstart_cm\tend_cm\tparent\tparent_hap\tconfidence\tambiguous_parents\tn_markers"
+                )
+                .map_err(|err| format!("write ancestry TSV header: {err}"))?;
+                for (idx, seg) in segments.iter().enumerate() {
+                    if (idx & 4095) == 0 && is_cancelled(cancelled) {
+                        return Err("Interrupted".to_owned());
+                    }
+                    let target = &archive.target_sample_ids[seg.target_sample as usize];
+                    let parent = &archive.reference_sample_ids[seg.parent_sample as usize];
+                    let chrom = &archive.chrom_names[seg.chrom_idx as usize];
+                    writeln!(
+                        gz,
+                        "{target}\t{}\t{chrom}\t{}\t{}\t{:.4}\t{:.4}\t{parent}\t{}\t{:.4}\t{}\t{}",
+                        seg.hap,
+                        seg.start_bp,
+                        seg.end_bp,
+                        seg.start_cm,
+                        seg.end_cm,
+                        seg.parent_hap,
+                        seg.confidence,
+                        seg.ambiguous_parents,
+                        seg.n_markers,
+                    )
+                    .map_err(|err| format!("write ancestry TSV row: {err}"))?;
+                }
+            }
+        }
+        let mut inner = gz
+            .finish()
+            .map_err(|err| format!("finish gzip TSV stream {}: {err}", tmp_path.display()))?;
+        inner
+            .flush()
+            .map_err(|err| format!("flush gzip TSV stream {}: {err}", tmp_path.display()))?;
+        Ok(())
+    })();
+    if let Err(err) = write_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    std::fs::rename(&tmp_path, path).map_err(|err| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!(
+            "finalize TSV output {} -> {}: {err}",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
     Ok(())
 }
 

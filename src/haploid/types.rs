@@ -129,6 +129,19 @@ pub struct HaploidIbdSummary {
     pub elapsed_s: f64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct HaploidIbdProgress {
+    pub stage: String,
+    pub chrom: String,
+    pub chrom_index: u64,
+    pub chrom_markers: u64,
+    /// Cumulative raw target rows scanned (matches .pvar/.bim denominator).
+    pub raw_target_markers_done: u64,
+    /// Cumulative biallelic/aligned markers actually analyzed.
+    pub markers_done: u64,
+    pub segments_found: u64,
+}
+
 /// Pairwise IBD segment emitted when `--ref` is not provided.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IbdSegment {

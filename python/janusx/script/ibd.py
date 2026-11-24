@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import logging
 import math
+import os
 import shlex
 import socket
 import sys
@@ -15,7 +17,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 from janusx import janusx as jxrs
-from janusx._plink import pvar_path_for_prefix
+from janusx._plink import open_text_auto, pvar_path_for_prefix
 from ._common.cli_core import (
     CliArgumentParser,
     cli_help_formatter,
@@ -24,6 +26,10 @@ from ._common.cli_core import (
 from ._common.config_render import emit_cli_configuration
 from ._common.log import get_log_path, setup_logging
 from ._common.progress import (
+    CliStatus,
+    _emit_to_file_handlers,
+    build_rich_progress,
+    format_elapsed,
     log_success,
     rich_progress_available,
     stdout_is_tty,
@@ -33,6 +39,7 @@ from ._common.threads import detect_effective_threads
 
 _REPORT_RULE = "=" * 72
 _TERMINAL_SECTION_WIDTH = 60
+_IBD_PROGRESS_BAR_WIDTH = 12
 
 
 def _janusx_version() -> str:
@@ -58,7 +65,7 @@ def _report_block(logger: logging.Logger, title: str) -> None:
 
 
 def _report_kv(logger: logging.Logger, key: str, value: object) -> None:
-    logger.info(f"  {str(key):<24} : {value}")
+    logger.info(f"  {str(key):<20} : {value}")
 
 
 def _logger_handlers(
@@ -456,6 +463,338 @@ def build_parser(argv: Sequence[str] | None = None) -> CliArgumentParser:
     return parser
 
 
+def _process_rss_bytes() -> int:
+    current_rss = 0
+    statm = Path("/proc/self/statm")
+    if statm.is_file():
+        try:
+            resident_pages = int(statm.read_text().split()[1])
+            current_rss = resident_pages * int(os.sysconf("SC_PAGE_SIZE"))
+        except (OSError, ValueError, IndexError):
+            current_rss = 0
+    try:
+        import resource
+
+        maximum_rss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        if sys.platform.startswith("linux"):
+            maximum_rss *= 1024
+    except (ImportError, OSError, ValueError):
+        maximum_rss = 0
+    return max(current_rss, maximum_rss)
+
+
+def _open_text_input(path: Path):
+    lower = str(path).lower()
+    if lower.endswith(".gz"):
+        return gzip.open(path, mode="rt", encoding="utf-8", errors="replace")
+    if lower.endswith(".zst"):
+        return open_text_auto(str(path))
+    return path.open(mode="rt", encoding="utf-8", errors="replace")
+
+
+def _inspect_reference_dimensions(
+    reference: Path | None,
+) -> tuple[int | None, int | None]:
+    """Fast `(ref_samples, ref_max_chrom_markers)` inspection for BED/PGEN/VCF/HMP reference."""
+    if reference is None:
+        return None, None
+    lower = str(reference).lower()
+    try:
+        if lower.endswith(".bed"):
+            samples, _, _, max_chrom = _inspect_target_dimensions("bfile", reference)
+            return samples, max_chrom
+        if lower.endswith(".pgen"):
+            samples, _, _, max_chrom = _inspect_target_dimensions("pfile", reference)
+            return samples, max_chrom
+        if lower.endswith((".vcf", ".vcf.gz")):
+            with _open_text_input(reference) as fh:
+                for raw in fh:
+                    if raw.startswith("#CHROM"):
+                        fields = raw.rstrip("\r\n").split("\t")
+                        return (max(0, len(fields) - 9) or None), None
+                    if not raw.startswith("#"):
+                        break
+            return None, None
+        if lower.endswith((".hmp", ".hmp.gz", ".hmp.txt", ".hmp.txt.gz")):
+            with _open_text_input(reference) as fh:
+                for raw in fh:
+                    line = raw.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    fields = line.split("\t") if "\t" in line else line.split()
+                    return (max(0, len(fields) - 11) or None), None
+            return None, None
+    except Exception:
+        return None, None
+    return None, None
+
+
+def _inspect_target_dimensions(
+    target_kind: str, target: Path
+) -> tuple[int | None, int | None, int | None, int | None]:
+    """Fast `(samples, markers, chromosomes, max_chrom_markers)` inspection for BED/PGEN."""
+    try:
+        if target_kind == "bfile":
+            prefix = _strip_input_suffix(target, (".bed", ".bim", ".fam"))
+            fam = Path(f"{prefix}.fam")
+            bim = Path(f"{prefix}.bim")
+            samples = None
+            markers = None
+            chrom_counts: dict[str, int] = {}
+            if fam.is_file():
+                with fam.open("rb") as fh:
+                    samples = sum(1 for line in fh if line.strip()) or None
+            if bim.is_file():
+                with bim.open("rt", encoding="utf-8", errors="replace") as fh:
+                    total = 0
+                    for raw in fh:
+                        line = raw.strip()
+                        if not line:
+                            continue
+                        total += 1
+                        chrom = line.split(None, 1)[0]
+                        chrom_counts[chrom] = chrom_counts.get(chrom, 0) + 1
+                    markers = total or None
+            chroms = len(chrom_counts) or None
+            max_chrom = max(chrom_counts.values()) if chrom_counts else None
+            return samples, markers, chroms, max_chrom
+        if target_kind == "pfile":
+            prefix = _strip_input_suffix(target, (".pgen", ".pvar.zst", ".pvar", ".psam"))
+            psam = Path(f"{prefix}.psam")
+            pvar = Path(pvar_path_for_prefix(str(prefix)))
+            samples = None
+            markers = None
+            chrom_counts = {}
+            if psam.is_file():
+                with open_text_auto(str(psam)) as fh:
+                    samples = sum(1 for line in fh if line.strip() and not line.startswith("#")) or None
+            if pvar.is_file():
+                with open_text_auto(str(pvar)) as fh:
+                    total = 0
+                    for raw in fh:
+                        line = raw.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        total += 1
+                        chrom = line.split(None, 1)[0]
+                        chrom_counts[chrom] = chrom_counts.get(chrom, 0) + 1
+                    markers = total or None
+            chroms = len(chrom_counts) or None
+            max_chrom = max(chrom_counts.values()) if chrom_counts else None
+            return samples, markers, chroms, max_chrom
+    except Exception:
+        return None, None, None, None
+    return None, None, None, None
+
+
+def _estimate_peak_rss_bytes(
+    *,
+    samples: int,
+    max_chrom_markers: int,
+    ploidy: str,
+    threads: int,
+    ref_samples: int | None = None,
+    ref_max_chrom_markers: int | None = None,
+    target_is_vcf: bool = False,
+    ref_is_vcf: bool = False,
+) -> int:
+    """Estimate peak RSS (bytes) for streaming whole-chromosome IBD / ancestry."""
+    n_samples = max(int(samples), 1)
+    m_max = max(int(max_chrom_markers), 1)
+    n_threads = max(int(threads), 1)
+    n_ref = max(int(ref_samples), 0) if ref_samples else 0
+    m_ref_max = (
+        max(int(ref_max_chrom_markers), 1)
+        if ref_max_chrom_markers is not None
+        else m_max
+    )
+
+    # Peak occurs while encoding the largest chromosome:
+    # VariantRow vec(s) + classify chunk scratch (het/PS events) + BitHaplotypeMatrix.
+    row_bytes_per_marker = ((n_samples + 1) // 2) + 192
+    if target_is_vcf:
+        # VCF rows may carry optional per-sample PS tracks (`Option<PhaseSetId>` ~ 8 B/sample).
+        row_bytes_per_marker += n_samples * 8
+    target_rows_bytes = m_max * row_bytes_per_marker
+
+    ref_rows_bytes = 0
+    if n_ref > 0:
+        ref_row_bytes_per_marker = ((n_ref + 1) // 2) + 192
+        if ref_is_vcf:
+            ref_row_bytes_per_marker += n_ref * 8
+        ref_rows_bytes = m_ref_max * ref_row_bytes_per_marker
+
+    is_inbred = str(ploidy).lower() == "inbred"
+    haps_per_sample = 1 if is_inbred else 2
+    total_haps = (n_samples + n_ref) * haps_per_sample
+    words_per_marker = (total_haps + 63) // 64
+    matrix_bytes = m_max * (2 * words_per_marker * 8 + 16)
+
+    # Parallel classify_and_collect_hets_with chunk scratch + unphased het / PS event buffers.
+    n_chunks = max((m_max + 2047) // 2048, 1)
+    classify_base_bytes = n_chunks * (n_samples + n_ref) * 64
+    het_event_bytes = (
+        0
+        if is_inbred
+        else int(m_max * (n_samples + n_ref) * 0.05 * 4)
+    )
+    ps_event_bytes = (
+        int(m_max * (n_samples + n_ref) * 0.05 * 12)
+        if (target_is_vcf or ref_is_vcf) and not is_inbred
+        else 0
+    )
+    classify_scratch_bytes = classify_base_bytes + het_event_bytes + ps_event_bytes
+
+    pbwt_scratch_bytes = n_threads * total_haps * 32 + m_max * 32
+
+    # Calibrate dynamic peak for allocator/reader overhead (similar to imp.py).
+    dynamic_peak = max(
+        target_rows_bytes + ref_rows_bytes + matrix_bytes + classify_scratch_bytes,
+        matrix_bytes + pbwt_scratch_bytes,
+    )
+    calibrated_dynamic = int(dynamic_peak * 1.35)
+    return max(_process_rss_bytes(), 0) + calibrated_dynamic
+
+
+def _emit_memory_preflight(
+    logger: logging.Logger,
+    *,
+    chromosomes: int,
+    estimated_peak_rss_bytes: int,
+) -> None:
+    logger.info(f"chromosomes                   {chromosomes:,}")
+    logger.info(
+        "estimated peak RSS            "
+        f"{estimated_peak_rss_bytes / (1024.0**3):.1f} GiB"
+    )
+
+
+class _IbdProgressReporter:
+    """Rich progress on TTY and state-change-only progress records elsewhere (aligned with imp.py)."""
+
+    _STAGE_LABELS = {
+        "prepare": "Preparing",
+        "load": "Loading",
+        "encode": "Encoding",
+        "phase": "Phasing",
+        "ibd": "IBD scan",
+        "ancestry": "Ancestry",
+        "chrom_done": "Finished chrom",
+        "kinship": "Kinship CSR",
+        "write": "Writing",
+        "complete": "Finished",
+    }
+
+    def __init__(
+        self,
+        logger: logging.Logger,
+        *,
+        total: int | None = None,
+        task_label: str = "IBD",
+    ) -> None:
+        self.logger = logger
+        self._total = None if total is None or total <= 0 else int(total)
+        self._task_label = str(task_label).strip() or "IBD"
+        self._started = time.monotonic()
+        self._progress = None
+        self._task_id = None
+        self._last_signature = None
+        if stdout_is_tty() and rich_progress_available():
+            self._progress = build_rich_progress(
+                description_template="[green]{task.description:<16}",
+                show_spinner=True,
+                show_bar=True,
+                show_percentage=self._total is not None,
+                show_elapsed=True,
+                show_remaining=self._total is not None,
+                field_templates=[],
+                bar_width=_IBD_PROGRESS_BAR_WIDTH,
+                transient=True,
+            )
+
+    def elapsed_seconds(self) -> float:
+        return max(0.0, time.monotonic() - self._started)
+
+    def _ensure_started(self) -> None:
+        if self._progress is None or self._task_id is not None:
+            return
+        self._progress.start()
+        self._task_id = self._progress.add_task(self._task_label, total=self._total)
+
+    def __call__(
+        self,
+        stage: str,
+        chrom: str,
+        chrom_index: int,
+        chrom_markers: int,
+        raw_markers_done: int,
+        analyzed_markers_done: int,
+        segments_found: int,
+    ) -> None:
+        stage = str(stage)
+        chrom = str(chrom)
+        chrom_index = int(max(0, chrom_index))
+        chrom_markers = int(max(0, chrom_markers))
+        raw_markers_done = int(max(0, raw_markers_done))
+        analyzed_markers_done = int(max(0, analyzed_markers_done))
+        segments_found = int(max(0, segments_found))
+        stage_label = self._STAGE_LABELS.get(stage, stage)
+        desc = f"{stage_label} {chrom}".strip() if chrom else stage_label
+
+        self._ensure_started()
+        if self._progress is not None and self._task_id is not None:
+            update_kwargs: dict[str, object] = {"description": desc[:16]}
+            if self._total is not None:
+                update_kwargs["completed"] = (
+                    self._total
+                    if stage == "complete"
+                    else min(self._total, raw_markers_done)
+                )
+            self._progress.update(self._task_id, **update_kwargs)
+
+        signature = (
+            stage,
+            chrom,
+            chrom_index,
+            chrom_markers,
+            raw_markers_done,
+            analyzed_markers_done,
+            segments_found,
+        )
+        if signature == self._last_signature:
+            return
+        self._last_signature = signature
+
+        parts = [f"stage={stage_label}"]
+        if chrom:
+            parts.append(f"chromosome={chrom}")
+        if chrom_markers and stage != "complete":
+            parts.append(f"chrom_markers={chrom_markers:,}")
+        if self._total is not None:
+            done_val = min(self._total, raw_markers_done)
+            pct = 100.0 * float(done_val) / float(self._total)
+            parts.append(f"scanned={done_val:,}/{self._total:,} ({pct:.1f}%)")
+        elif raw_markers_done:
+            parts.append(f"scanned={raw_markers_done:,}")
+        if analyzed_markers_done:
+            parts.append(f"analyzed={analyzed_markers_done:,}")
+        if segments_found:
+            parts.append(f"segments={segments_found:,}")
+        parts.append(f"elapsed={format_elapsed(self.elapsed_seconds())}")
+        message = "  Progress             : " + " | ".join(parts)
+        if self._progress is not None:
+            _emit_to_file_handlers(self.logger, logging.INFO, message)
+        else:
+            self.logger.info(message)
+
+    def close(self) -> None:
+        if self._progress is not None:
+            if self._task_id is not None:
+                self._progress.stop()
+            self._progress = None
+            self._task_id = None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     wall_started = time.monotonic()
     parser = build_parser(argv)
@@ -487,6 +826,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         report_logger = logger
         terminal_logger = logger
 
+    target_display = str(target)
+    progress_target_label = (
+        target_display
+        if len(target_display) <= 56
+        else os.path.basename(target_display.rstrip("/\\"))
+    )
     input_format = {
         "bfile": "PLINK BED",
         "pfile": "PLINK 2 PGEN",
@@ -497,14 +842,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         "Multi-parent ancestry" if resolved_mode == "ancestry" else "Pairwise IBD"
     )
     general_config_rows = [
-        ("Genotype file", str(target)),
+        ("Genotype file", target_display),
         ("Input format", input_format),
         ("Reference", "None" if reference is None else str(reference)),
+        ("Genetic map", "None" if args.map is None else str(Path(args.map).expanduser())),
         ("Mode", mode_label),
         ("Ploidy", str(args.ploidy)),
         ("Min IBD length", f"{float(args.min_output_cm):g} cM"),
         ("Write TSV", "Yes" if bool(args.write_tsv) else "No"),
         ("Threads", int(args.threads)),
+    ]
+    config_rows = [
+        *general_config_rows,
+        ("Output", f"{output_prefix}.jhibd"),
+        ("Version", _janusx_version()),
     ]
     host = socket.gethostname()
     if terminal_rich:
@@ -517,20 +868,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             footer_rows=[("Output prefix", str(output_prefix))],
             line_max_chars=_TERMINAL_SECTION_WIDTH,
         )
-    _report_banner(report_logger, "JanusX - Whole-Chromosome PBWT IBD Analysis")
+    _report_banner(report_logger, "JanusX - IBD Pipeline Analysis")
     _report_block(report_logger, "System Context")
     _report_kv(report_logger, "Host", host)
     _report_kv(report_logger, "Version", _janusx_version())
     _report_kv(report_logger, "Threads", int(args.threads))
     report_logger.info("")
     _report_block(report_logger, "Configuration")
-    for key, value in general_config_rows:
+    for key, value in config_rows:
         _report_kv(report_logger, key, value)
-    _report_kv(report_logger, "Output archive", f"{output_prefix}.jhibd")
     report_logger.info("")
     _report_block(report_logger, "Command")
     report_logger.info(f"  {_invocation_command()}")
     report_logger.info("")
+    _report_block(report_logger, "Stage Progress")
 
     options = {
         "target": str(target),
@@ -551,17 +902,121 @@ def main(argv: Sequence[str] | None = None) -> int:
         "cm_per_mb": float(args.cm_per_mb),
         "write_tsv": bool(args.write_tsv),
     }
+
+    inspected_samples: int | None = None
+    progress_total: int | None = None
+    inspected_chroms: int | None = None
+    max_chrom_markers: int | None = None
+    estimated_peak_rss_bytes: int = 0
+    count_task = None
+    if terminal_rich:
+        count_task = CliStatus(
+            f"Loading genotype from {progress_target_label}...",
+            enabled=True,
+            use_process=True,
+        )
+        count_task.__enter__()
     try:
-        summary = json.loads(jxrs.haploid_ibd_run(json.dumps(options)))
+        (
+            inspected_samples,
+            progress_total,
+            inspected_chroms,
+            max_chrom_markers,
+        ) = _inspect_target_dimensions(target_kind, target)
+        if progress_total is not None:
+            report_logger.info(
+                f"  Progress denominator : {progress_total:,} target markers"
+            )
+        if (
+            inspected_samples is not None
+            and max_chrom_markers is not None
+            and inspected_chroms is not None
+        ):
+            ref_samples, ref_max_chrom_markers = _inspect_reference_dimensions(reference)
+            ref_lower = "" if reference is None else str(reference).lower()
+            ref_is_vcf = ref_lower.endswith((".vcf", ".vcf.gz"))
+            # Only emit peak-RSS preflight when BOTH reference sample count and
+            # reference max-chromosome marker count (if -ref is set) are known,
+            # avoiding silent underestimates on unindexed VCF/HapMap references.
+            if reference is None or (
+                ref_samples is not None and ref_max_chrom_markers is not None
+            ):
+                estimated_peak_rss_bytes = _estimate_peak_rss_bytes(
+                    samples=inspected_samples,
+                    max_chrom_markers=max_chrom_markers,
+                    ploidy=str(args.ploidy),
+                    threads=int(args.threads),
+                    ref_samples=ref_samples,
+                    ref_max_chrom_markers=ref_max_chrom_markers,
+                    target_is_vcf=(target_kind == "vcf"),
+                    ref_is_vcf=ref_is_vcf,
+                )
+        if count_task is not None:
+            if inspected_samples is not None and progress_total is not None:
+                count_task.complete(
+                    f"Loading genotype from {progress_target_label} "
+                    f"(n={inspected_samples:,}, nSNP={progress_total:,})"
+                )
+            else:
+                count_task.complete(f"Loading genotype from {progress_target_label}")
+    finally:
+        if count_task is not None:
+            count_task.close(show_done=False)
+    if estimated_peak_rss_bytes and inspected_chroms is not None:
+        _emit_memory_preflight(
+            report_logger,
+            chromosomes=inspected_chroms,
+            estimated_peak_rss_bytes=estimated_peak_rss_bytes,
+        )
+        if terminal_logger is not report_logger:
+            _emit_memory_preflight(
+                terminal_logger,
+                chromosomes=inspected_chroms,
+                estimated_peak_rss_bytes=estimated_peak_rss_bytes,
+            )
+
+    reporter = _IbdProgressReporter(
+        report_logger if terminal_rich else logger,
+        total=progress_total,
+        task_label=mode_label,
+    )
+    try:
+        summary = json.loads(jxrs.haploid_ibd_run(json.dumps(options), reporter))
     except Exception as exc:
+        reporter.close()
         logger.error(str(exc))
         return 1
+    processing_elapsed = reporter.elapsed_seconds()
+    reporter.close()
 
-    elapsed = max(time.monotonic() - wall_started, 0.0)
+    generated_outputs = [Path(str(summary["output_path"]))]
+    if summary.get("tsv_path"):
+        generated_outputs.append(Path(str(summary["tsv_path"])))
+
+    report_logger.info("")
+    _report_block(report_logger, "Outputs Generated")
+    for path in generated_outputs:
+        _report_kv(report_logger, "Output", path)
+    _report_kv(report_logger, "Log", log_path)
+    report_logger.info("")
+    _report_block(report_logger, "Advanced Parameters")
+    _report_kv(report_logger, "Min seed cM", float(args.min_seed_cm))
+    _report_kv(report_logger, "Min output cM", float(args.min_output_cm))
+    _report_kv(report_logger, "Max gap cM", float(args.max_gap_cm))
+    _report_kv(report_logger, "Max mismatch rate", float(args.max_mismatch_rate))
+    _report_kv(report_logger, "Min markers", int(args.min_markers))
+    _report_kv(report_logger, "Inbred het threshold", float(args.inbred_het_threshold))
+    _report_kv(report_logger, "cM per Mb", float(args.cm_per_mb))
+    if resolved_mode == "ancestry":
+        _report_kv(report_logger, "Ancestry step cM", float(args.ancestry_step_cm))
+        _report_kv(report_logger, "Switch penalty", float(args.ancestry_switch_penalty))
+        _report_kv(report_logger, "Top donors", int(args.ancestry_top_donors))
+    report_logger.info("")
     _report_block(report_logger, "Execution Summary")
+    _report_kv(report_logger, "Status", "done")
     _report_kv(report_logger, "Mode", str(summary["mode"]))
     _report_kv(report_logger, "Chromosomes", f"{int(summary['chromosomes']):,}")
-    _report_kv(report_logger, "Markers", f"{int(summary['markers_processed']):,}")
+    _report_kv(report_logger, "Markers analyzed", f"{int(summary['markers_processed']):,}")
     _report_kv(
         report_logger,
         "Target samples",
@@ -580,19 +1035,37 @@ def main(argv: Sequence[str] | None = None) -> int:
             report_logger, "Sparse bins", f"{int(summary['sparse_bins_written']):,}"
         )
     _report_kv(report_logger, "Sparse nnz", f"{int(summary['sparse_nnz']):,}")
-    _report_kv(report_logger, "Sparse archive", str(summary["output_path"]))
-    if summary.get("tsv_path"):
-        _report_kv(report_logger, "TSV export", str(summary["tsv_path"]))
-    _report_kv(report_logger, "Log", log_path)
-    _report_kv(report_logger, "Wall time", f"{elapsed:.2f} s")
+    elapsed_seconds = max(time.monotonic() - wall_started, 0.0)
+    _report_kv(report_logger, "Total wall time", f"{elapsed_seconds:.2f}s")
+    report_logger.info(f"IBD run status: done; log: {log_path}")
 
-    completion_msg = (
-        f"Finished {mode_label}: {int(summary['segments_written']):,} segments "
-        f"across {int(summary['chromosomes']):,} chromosomes "
-        f"({int(summary['markers_processed']):,} markers) -> {summary['output_path']} "
-        f"[{elapsed:.2f}s]"
-    )
-    log_success(terminal_logger, completion_msg)
+    if terminal_rich:
+        log_success(
+            terminal_logger,
+            f"{mode_label} ...Finished "
+            f"({int(summary['segments_written']):,} segments, "
+            f"{int(summary['markers_processed']):,} markers) "
+            f"[{format_elapsed(processing_elapsed)}]",
+            force_color=True,
+        )
+        saved_lines = "\n".join(f"  {path}" for path in generated_outputs)
+        terminal_logger.info(f"Saved IBD outputs:\n{saved_lines}")
+        lt = time.localtime()
+        endinfo = (
+            f"\nFinished IBD calculation. Total wall time: {elapsed_seconds:.2f} seconds\n"
+            f"{lt.tm_year}-{lt.tm_mon:02d}-{lt.tm_mday:02d} "
+            f"{lt.tm_hour:02d}:{lt.tm_min:02d}:{lt.tm_sec:02d}"
+        )
+        _emit_to_file_handlers(report_logger, logging.INFO, endinfo)
+        log_success(terminal_logger, endinfo)
+    else:
+        log_success(
+            report_logger,
+            f"Finished {mode_label}: {int(summary['segments_written']):,} segments "
+            f"across {int(summary['chromosomes']):,} chromosomes "
+            f"({int(summary['markers_processed']):,} markers, "
+            f"{int(summary['target_samples']):,} samples).",
+        )
     return 0
 
 

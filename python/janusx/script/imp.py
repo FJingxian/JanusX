@@ -1588,6 +1588,9 @@ def main() -> int:
             else parse_cli_ranges(args.bimrange, allow_chrom_only=True)
         )
         diagnostic_site = _diagnostic_site(args.trace_site)
+        from ._common.outprefix import validate_output_prefix_arg
+
+        args.out = validate_output_prefix_arg(str(args.out), auto_prefix="imp")
     except ValueError as exc:
         parser.error(str(exc))
 

@@ -37,6 +37,34 @@ def looks_like_output_directory_hint(path_value: str) -> bool:
         return False
 
 
+def _is_directory_only_output_path(path_value: str) -> bool:
+    raw = str(path_value).strip()
+    if raw == "":
+        return True
+    if raw.endswith(("/", "\\")):
+        return True
+    norm = os.path.normpath(raw)
+    tail = os.path.basename(norm)
+    return tail in {"", ".", ".."}
+
+
+def validate_output_prefix_arg(
+    out_value: str,
+    *,
+    auto_prefix: str = "output",
+) -> str:
+    """Validate and expand a ``-o/--out`` argument under unified output-prefix semantics."""
+    raw = str(out_value).strip()
+    if _is_directory_only_output_path(raw):
+        example_dir = raw.rstrip("/\\") or "."
+        example_stem = str(auto_prefix).strip() or "output"
+        raise ValueError(
+            f"-o/--out expects an output file prefix (e.g. '{example_dir}/{example_stem}'), "
+            f"not a directory path: {out_value!r}"
+        )
+    return os.path.normpath(str(safe_expanduser(raw)))
+
+
 def resolve_output_prefix(
     out_value: Optional[str],
     legacy_prefix: Optional[str],
@@ -55,10 +83,7 @@ def resolve_output_prefix(
         else:
             raw_prefix = legacy_prefix_text
     elif out_was_explicit and out_text != "":
-        if looks_like_output_directory_hint(out_text):
-            raw_prefix = os.path.join(out_text, auto_prefix_text)
-        else:
-            raw_prefix = out_text
+        raw_prefix = validate_output_prefix_arg(out_text, auto_prefix=auto_prefix_text)
     else:
         raw_prefix = auto_prefix_text
 

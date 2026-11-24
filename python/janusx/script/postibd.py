@@ -120,17 +120,14 @@ def _resolve_input_jhibd(raw: str) -> Path:
 
 
 def _resolve_output_prefix(out_arg: Optional[str], input_path: Path) -> Path:
+    from ._common.outprefix import validate_output_prefix_arg
+
     stem = input_path.name
     if stem.endswith(".jhibd"):
         stem = stem[: -len(".jhibd")]
     if not out_arg or str(out_arg).strip() == "":
         return Path.cwd() / f"{stem}.postibd"
-    out_path = Path(str(out_arg).strip()).expanduser()
-    if out_path.exists() and out_path.is_dir():
-        return out_path / stem
-    if str(out_arg).endswith(("/", os.sep)):
-        out_path.mkdir(parents=True, exist_ok=True)
-        return out_path / stem
+    out_path = Path(validate_output_prefix_arg(str(out_arg), auto_prefix=f"{stem}.postibd"))
     out_path.parent.mkdir(parents=True, exist_ok=True)
     return out_path
 
@@ -1284,7 +1281,7 @@ def build_parser() -> CliArgumentParser:
         "--out",
         dest="out",
         default=None,
-        help="Output prefix or directory (default: <input_stem>.postibd in current directory).",
+        help="Output prefix (default: <input_stem>.postibd in current directory).",
     )
     io_group.add_argument(
         "-fmt",
@@ -1420,7 +1417,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         parser.error("--generations must be a positive finite number.")
 
     input_path = _resolve_input_jhibd(args.input)
-    out_prefix = _resolve_output_prefix(args.out, input_path)
+    try:
+        out_prefix = _resolve_output_prefix(args.out, input_path)
+    except ValueError as exc:
+        parser.error(str(exc))
     out_prefix.parent.mkdir(parents=True, exist_ok=True)
 
     # Default to all three plots if no switch was explicitly passed.

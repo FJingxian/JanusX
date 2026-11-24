@@ -723,10 +723,24 @@ def build_parser() -> CliArgumentParser:
     return parser
 
 
+def _validate_gmerge_args(args: argparse.Namespace) -> None:
+    if args.thread is not None and int(args.thread) < 0:
+        raise ValueError("-t/--thread must be >= 0 (0 = auto).")
+    if not (0.0 <= float(args.maf) <= 0.5):
+        raise ValueError("--maf must be within [0, 0.5].")
+    if not (0.0 <= float(args.geno) <= 1.0):
+        raise ValueError("--geno must be within [0, 1.0].")
+
+
 def main(log: bool = True) -> None:
     t_start = time.time()
     use_spinner = stdout_is_tty()
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        _validate_gmerge_args(args)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     vcf_inputs = [str(x) for x in (args.vcf or [])]
     hmp_inputs = [str(x) for x in (args.hmp or [])]

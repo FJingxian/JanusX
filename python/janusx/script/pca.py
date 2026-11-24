@@ -91,6 +91,7 @@ from ._common.progress import (
 )
 from ._common.outprefix import apply_output_prefix_compat
 from ._common.genocache import configure_genotype_cache_from_out
+from ._common.grmio import resolve_grm_id_path
 from ._common.genoio import (
     determine_genotype_source as _determine_genotype_source,
     genotype_load_status_done,
@@ -1114,6 +1115,15 @@ def eigendecompose_grm_file(
     return eigvec, eigval, backend, int(n)
 
 
+def _normalize_pca_prefix(path_or_prefix: str) -> str:
+    raw = str(path_or_prefix).strip()
+    low = raw.lower()
+    for suffix in (".eigenvec", ".eigenval"):
+        if low.endswith(suffix):
+            return raw[: -len(suffix)]
+    return raw
+
+
 # ======================================================================
 # Main CLI
 # ======================================================================
@@ -1308,10 +1318,10 @@ def main(log: bool = True):
         gfile = args.grm
         auto_prefix = strip_default_prefix_suffix(os.path.basename(gfile))
     elif args.qcov:
-        gfile = args.qcov
+        gfile = _normalize_pca_prefix(args.qcov)
         auto_prefix = strip_default_prefix_suffix(os.path.basename(gfile))
     else:
-        raise ValueError("No valid input found; one of --vcf/--hmp/--bfile/--grm/--cov must be provided.")
+        raise ValueError("No valid input found; one of --vcf/--hmp/--bfile/--pfile/--grm/--cov must be provided.")
 
     out_dir, outprefix, out_stem = apply_output_prefix_compat(args, auto_prefix)
     genotype_input_mode = bool(args.vcf or args.hmp or args.file or args.bfile or args.pfile)
@@ -1461,7 +1471,8 @@ def main(log: bool = True):
             )
             checks.append(False)
         if grm_input is not None:
-            checks.append(ensure_file_exists(logger, f"{grm_input}.id", "GRM ID file"))
+            resolved_grm_id = resolve_grm_id_path(grm_input) or f"{grm_input}.id"
+            checks.append(ensure_file_exists(logger, resolved_grm_id, "GRM ID file"))
     elif args.qcov:
         checks.append(ensure_file_exists(logger, f"{gfile}.eigenvec", "Eigenvec file"))
         checks.append(ensure_file_exists(logger, f"{gfile}.eigenval", "Eigenval file"))
@@ -1760,7 +1771,7 @@ def main(log: bool = True):
         grm = None
         with CliStatus(f"Loading GRM from {grm_src}...", enabled=use_spinner) as task:
             try:
-                id_path = f"{grm_file}.id"
+                id_path = resolve_grm_id_path(grm_file) or f"{grm_file}.id"
                 samples = _read_id_file(id_path, logger, "GRM", show_status=False)
                 if samples is None:
                     raise ValueError(f"GRM ID file not found: {id_path}")

@@ -23,6 +23,7 @@ from ._common.cli_args import (
     parse_trait_selector_specs,
 )
 from ._common.cli_core import CliArgumentParser, cli_help_formatter, minimal_help_epilog
+from ._common.outprefix import validate_output_prefix_arg
 
 
 def build_parser() -> CliArgumentParser:
@@ -180,6 +181,7 @@ def build_parser() -> CliArgumentParser:
 
 def validate_args(args: argparse.Namespace) -> None:
     _resolve_source_args(args)
+    args.out = validate_output_prefix_arg(str(args.out), auto_prefix="ct")
     if args.hmp and not args.cross:
         raise ValueError("-hmp requires --cross/--parents because HMP records do not encode phase")
     if args.model == "fvlmm" and not args.grm:

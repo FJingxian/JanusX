@@ -462,7 +462,9 @@ def _write_family_map(outprefix: str, sample_ids: np.ndarray, layout: FamilyLayo
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    from ._common.cli_core import CliArgumentParser
+
+    parser = CliArgumentParser(
         prog="jx sim",
         description="Quick genotype + phenotype simulator for benchmark workflows.",
     )

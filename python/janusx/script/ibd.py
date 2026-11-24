@@ -822,6 +822,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         target_kind, target = _selected_target(args)
         reference = _resolve_reference_arg(args.reference)
         resolved_mode = _resolve_mode(args.mode, reference)
+        from ._common.outprefix import validate_output_prefix_arg
+
+        args.out = validate_output_prefix_arg(str(args.out), auto_prefix="ibd")
     except ValueError as exc:
         parser.error(str(exc))
 

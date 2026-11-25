@@ -143,8 +143,29 @@ fn dgemm_aat(n: usize, k: usize, a: &[f64], c: &mut [f64]) {
 }
 
 #[inline]
+fn dgemm_ata(n: usize, a: &[f64], c: &mut [f64]) {
+    dgemm_rm(true, false, n, n, n, 1.0, a, n, a, n, 0.0, c, n);
+}
+
+#[inline]
 fn dgemm_nt_sub(m: usize, n: usize, k: usize, a: &[f64], b: &[f64], c: &mut [f64]) {
     dgemm_rm(false, true, m, n, k, -1.0, a, k, b, k, 1.0, c, n);
+}
+
+#[inline]
+fn dgemm_panel(
+    m: usize,
+    n: usize,
+    k: usize,
+    s: f64,
+    a: (&[f64], usize),
+    b: (&[f64], usize),
+    c: (&mut [f64], usize),
+) {
+    let (ap, la) = a;
+    let (bp, lb) = b;
+    let (cp, lc) = c;
+    dgemm_rm(false, false, m, n, k, s, ap, la, bp, lb, 0.0, cp, lc);
 }
 
 /// Validate that `k_mat` is an `n x n` finite, symmetric matrix with non-negative
@@ -159,28 +180,33 @@ fn validate_symmetric_kernel(k_mat: &[f64], n: usize, label: &str) -> Result<(),
             k_mat.len()
         ));
     }
-    if k_mat.iter().any(|v| !v.is_finite()) {
+    if k_mat
+        .par_chunks(8192)
+        .any(|c| c.iter().any(|v| !v.is_finite()))
+    {
         return Err(format!("{label}: kernel contains non-finite values"));
     }
-    for i in 0..n {
-        let dii = k_mat[i * n + i];
-        if dii < 0.0 {
-            return Err(format!(
-                "{label}: kernel has negative diagonal {dii} at index {i}"
-            ));
-        }
-        for j in (i + 1)..n {
-            let a_ij = k_mat[i * n + j];
-            let a_ji = k_mat[j * n + i];
-            let diff = (a_ij - a_ji).abs();
-            if diff > 1e-6 * a_ij.abs().max(a_ji.abs()) {
+    (0..n)
+        .into_par_iter()
+        .try_for_each(|i| -> Result<(), String> {
+            let dii = k_mat[i * n + i];
+            if dii < 0.0 {
                 return Err(format!(
-                    "{label}: kernel is not symmetric at ({i}, {j}) (diff={diff})"
+                    "{label}: kernel has negative diagonal {dii} at index {i}"
                 ));
             }
-        }
-    }
-    Ok(())
+            for j in (i + 1)..n {
+                let a_ij = k_mat[i * n + j];
+                let a_ji = k_mat[j * n + i];
+                let diff = (a_ij - a_ji).abs();
+                if diff > 1e-6 * a_ij.abs().max(a_ji.abs()) {
+                    return Err(format!(
+                        "{label}: kernel is not symmetric at ({i}, {j}) (diff={diff})"
+                    ));
+                }
+            }
+            Ok(())
+        })
 }
 
 /// Blocked right-looking Cholesky factorization `A = L * L^T` in row-major order.
@@ -261,29 +287,46 @@ fn blocked_cholesky_lower_inplace(a: &mut [f64], n: usize) -> Option<()> {
     Some(())
 }
 
-/// Invert a lower-triangular matrix `L` and compute `V^{-1} = L^{-T} * L^{-1}`
-/// using BLAS `dgemm`.
+/// Invert a lower-triangular matrix `L` via blocked BLAS3 `dgemm` and compute
+/// `V^{-1} = L^{-T} * L^{-1}`.
 fn cholesky_invert_spd(l: &[f64], n: usize) -> Option<Vec<f64>> {
     if l.len() != n.checked_mul(n)? {
         return None;
     }
-    let mut linv_cols = vec![0.0_f64; n * n];
-    linv_cols
-        .par_chunks_mut(n)
-        .enumerate()
-        .for_each(|(col, dst_col)| {
-            dst_col[col] = 1.0 / l[col * n + col];
-            for row in (col + 1)..n {
+    let mut x = vec![0.0_f64; n * n];
+    let mut l11_inv = vec![0.0_f64; CHOL_BLOCK * CHOL_BLOCK];
+    let mut tmp = vec![0.0_f64; CHOL_BLOCK * n];
+    for i0 in (0..n).step_by(CHOL_BLOCK) {
+        let ib = (n - i0).min(CHOL_BLOCK);
+        for col in 0..ib {
+            l11_inv[col * ib + col] = 1.0 / l[(i0 + col) * n + (i0 + col)];
+            for row in (col + 1)..ib {
                 let mut sum = 0.0_f64;
-                let row_off = row * n;
+                let row_off = (i0 + row) * n + i0;
                 for k in col..row {
-                    sum += l[row_off + k] * dst_col[k];
+                    sum += l[row_off + k] * l11_inv[k * ib + col];
                 }
-                dst_col[row] = -sum / l[row_off + row];
+                l11_inv[row * ib + col] = -sum / l[row_off + row];
             }
-        });
+            for row in 0..col {
+                l11_inv[row * ib + col] = 0.0;
+            }
+        }
+        for r in 0..ib {
+            let dst_off = (i0 + r) * n + i0;
+            x[dst_off..dst_off + ib].copy_from_slice(&l11_inv[r * ib..(r + 1) * ib]);
+        }
+        if i0 > 0 {
+            let l10 = &l[i0 * n..];
+            let (xt, xb) = x.split_at_mut(i0 * n);
+            let t = &mut tmp;
+            let d = &l11_inv;
+            dgemm_panel(ib, i0, i0, 1.0, (l10, n), (xt, n), (t, i0));
+            dgemm_panel(ib, i0, ib, -1.0, (d, ib), (t, i0), (xb, n));
+        }
+    }
     let mut v_inv = vec![0.0_f64; n * n];
-    dgemm_aat(n, n, &linv_cols, &mut v_inv);
+    dgemm_ata(n, &x, &mut v_inv);
     for i in 0..n {
         for j in (i + 1)..n {
             let avg = 0.5 * (v_inv[i * n + j] + v_inv[j * n + i]);
@@ -628,14 +671,24 @@ pub fn mkblup_fit_reml(
             break;
         }
 
-        let mut p_f_vecs: Vec<Vec<f64>> = Vec::with_capacity(m_comp);
-        for fk in &f_vecs {
-            p_f_vecs.push(sym_matvec(&state.p_mat, n, fk));
+        // Batch P * [f_0, ..., f_R] into a single BLAS3 dgemm so P is read once.
+        let mut f_mat = vec![0.0_f64; n * m_comp];
+        for k in 0..m_comp {
+            let fk = &f_vecs[k];
+            for i in 0..n {
+                f_mat[i * m_comp + k] = fk[i];
+            }
         }
+        let mut pf_mat = vec![0.0_f64; n * m_comp];
+        dgemm_nn(n, m_comp, n, &state.p_mat, &f_mat, &mut pf_mat);
         let mut ai = vec![0.0_f64; m_comp * m_comp];
         for k in 0..m_comp {
             for l in 0..=k {
-                let val = 0.5 * dot_f64(&f_vecs[k], &p_f_vecs[l]);
+                let mut acc = 0.0_f64;
+                for i in 0..n {
+                    acc += f_mat[i * m_comp + k] * pf_mat[i * m_comp + l];
+                }
+                let val = 0.5 * acc;
                 ai[k * m_comp + l] = val;
                 ai[l * m_comp + k] = val;
             }

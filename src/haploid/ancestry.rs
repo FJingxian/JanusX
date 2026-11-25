@@ -191,6 +191,78 @@ impl HaplotypeMajorBits {
         (comp, mis)
     }
 
+    /// Count exact mismatches and measure their genetic-coordinate dispersion
+    /// directly at mismatch marker indices (completely invariant to `ancestry_step_cm`).
+    /// Returns `(total_mismatches, mis_clusters, mis_span_cm)`, opening a new cluster
+    /// only when consecutive mismatch markers are separated by `>= cluster_gap_cm`.
+    #[inline]
+    fn mismatch_dispersion(
+        &self,
+        hap_a: usize,
+        hap_b: usize,
+        start_marker: usize,
+        end_marker: usize,
+        cm_positions: &[f64],
+        cluster_gap_cm: f64,
+    ) -> (u32, u32, f64) {
+        if start_marker >= end_marker || self.words_per_hap == 0 {
+            return (0, 0, 0.0);
+        }
+        let base_a = hap_a * self.words_per_hap;
+        let base_b = hap_b * self.words_per_hap;
+        let w_start = start_marker >> 6;
+        let w_end = (end_marker - 1) >> 6;
+        let start_mask = !0u64 << (start_marker & 63);
+        let end_rem = end_marker & 63;
+        let end_mask = if end_rem == 0 {
+            !0u64
+        } else {
+            (1u64 << end_rem) - 1
+        };
+
+        let all_a = &self.allele_words[base_a..base_a + self.words_per_hap];
+        let all_b = &self.allele_words[base_b..base_b + self.words_per_hap];
+        let miss_a = &self.missing_words[base_a..base_a + self.words_per_hap];
+        let miss_b = &self.missing_words[base_b..base_b + self.words_per_hap];
+
+        let mut total_mis = 0u32;
+        let mut mis_clusters = 0u32;
+        let mut first_mis_cm: Option<f64> = None;
+        let mut last_mis_cm = 0.0f64;
+        let mut scan_word = |w: usize, mask: u64| {
+            let valid = !(miss_a[w] | miss_b[w]) & mask;
+            let mut mis_bits = (all_a[w] ^ all_b[w]) & valid;
+            while mis_bits != 0 {
+                let bit = mis_bits.trailing_zeros() as usize;
+                mis_bits &= mis_bits - 1;
+                let m = (w << 6) + bit;
+                let m_cm = cm_positions[m];
+                total_mis = total_mis.saturating_add(1);
+                if first_mis_cm.is_none() || (m_cm - last_mis_cm) >= cluster_gap_cm {
+                    mis_clusters = mis_clusters.saturating_add(1);
+                }
+                if first_mis_cm.is_none() {
+                    first_mis_cm = Some(m_cm);
+                }
+                last_mis_cm = m_cm;
+            }
+        };
+
+        if w_start == w_end {
+            scan_word(w_start, start_mask & end_mask);
+        } else {
+            scan_word(w_start, start_mask);
+            for w in (w_start + 1)..w_end {
+                scan_word(w, !0u64);
+            }
+            scan_word(w_end, end_mask);
+        }
+        let mis_span_cm = first_mis_cm
+            .map(|lo| (last_mis_cm - lo).max(0.0))
+            .unwrap_or(0.0);
+        (total_mis, mis_clusters, mis_span_cm)
+    }
+
     #[inline]
     #[allow(clippy::too_many_arguments)]
     fn count_mismatches_weighted(
@@ -361,12 +433,19 @@ impl RefAlleleWeightPlanes {
         let mut freq_active_plane = vec![0u64; words_per_hap];
         let mut w0_planes = std::array::from_fn(|_| vec![0u64; words_per_hap]);
         let mut w1_planes = std::array::from_fn(|_| vec![0u64; words_per_hap]);
+        let mut any_freq_active = false;
         for (w_idx, (active, w0, w1)) in per_word.into_iter().enumerate() {
+            if active != 0 {
+                any_freq_active = true;
+            }
             freq_active_plane[w_idx] = active;
             for b in 0..6 {
                 w0_planes[b][w_idx] = w0[b];
                 w1_planes[b][w_idx] = w1[b];
             }
+        }
+        if !any_freq_active {
+            return None;
         }
         Some(Self {
             freq_active_plane,
@@ -374,6 +453,27 @@ impl RefAlleleWeightPlanes {
             w1_planes,
         })
     }
+}
+
+/// One-sided Binomial log-likelihood-ratio deviance `2 * [m*ln(p_hat/p0) + (n-m)*ln((1-p_hat)/(1-p0))]`
+/// testing whether observed mismatch rate `m/n` significantly exceeds the baseline error rate `p0`.
+#[inline]
+fn one_sided_binomial_deviance(m: f64, n: f64, p0: f64) -> f64 {
+    if n <= 0.0 || m <= 0.0 {
+        return 0.0;
+    }
+    let p_hat = (m / n).clamp(0.0, 1.0);
+    if p_hat <= p0 {
+        return 0.0;
+    }
+    let p0 = p0.clamp(1e-6, 1.0 - 1e-6);
+    let term1 = m * (p_hat / p0).ln();
+    let term2 = if m < n {
+        (n - m) * ((1.0 - p_hat) / (1.0 - p0)).ln()
+    } else {
+        0.0
+    };
+    (2.0 * (term1 + term2)).max(0.0)
 }
 
 pub fn paint_chromosome_ancestry(
@@ -1000,9 +1100,32 @@ pub fn paint_chromosome_ancestry_cancellable(
             }
 
             // Collapse consecutive CALLED steps with the same `(parent_sample, parent_hap)`
-            // track into contiguous segments so intra-parent haplotype switches split
-            // cleanly and every segment's `parent_hap` & `n_markers` match its exact track.
-            let mut out = Vec::new();
+            // track into proto-segments so intra-parent haplotype switches split cleanly,
+            // then apply out-of-panel mosaic/excess-mismatch rejection and sample-calibrated
+            // IBD-fit confidence for multi-parent frequency-model panels.
+            struct ProtoSeg {
+                start_step: usize,
+                end_step: usize,
+                parent_sample: u32,
+                parent_hap: u8,
+                seg_comp: u32,
+                seg_mis: u32,
+                mis_clusters: u32,
+                mis_span_cm: f64,
+                start_cm: f64,
+                end_cm: f64,
+                len_cm: f64,
+                best_seg_score: f64,
+                second_best_score: f64,
+                raw_conf: f64,
+                ambiguous: u16,
+                div_uncalled_left: bool,
+                div_uncalled_right: bool,
+                interior_mosaic_ibs: bool,
+                rejected: bool,
+            }
+
+            let mut proto_segs: Vec<ProtoSeg> = Vec::new();
             let mut seg_start_step = 0usize;
             while seg_start_step < n_steps {
                 let Some(c_idx) = called_path[seg_start_step] else {
@@ -1044,6 +1167,7 @@ pub fn paint_chromosome_ancestry_cancellable(
                 }
 
                 let best_seg_score = cand_totals[c_idx];
+                let mut second_best_score = f64::NEG_INFINITY;
                 let mut ambiguous = 0u16;
                 let mut exp_sum = 0.0f64;
                 for ci in 0..k {
@@ -1051,6 +1175,9 @@ pub fn paint_chromosome_ancestry_cancellable(
                         continue;
                     }
                     let score = cand_totals[ci];
+                    if ci != c_idx && score > second_best_score {
+                        second_best_score = score;
+                    }
                     if (best_seg_score - score) <= 0.5 {
                         ambiguous = ambiguous.saturating_add(1);
                     }
@@ -1062,21 +1189,347 @@ pub fn paint_chromosome_ancestry_cancellable(
                 // or negative raw LLR cannot report inflated `confidence = 1.0`.
                 let uncalled_delta = (0.0 - best_seg_score).clamp(-40.0, 40.0);
                 exp_sum += uncalled_delta.exp();
-                let confidence = if exp_sum > 0.0 {
-                    (1.0 / exp_sum).clamp(0.0, 1.0) as f32
+                let raw_conf = if exp_sum > 0.0 {
+                    (1.0 / exp_sum).clamp(0.0, 1.0)
                 } else {
                     1.0
                 };
 
                 let m_start = step_ranges[seg_start_step].0;
                 let m_end = step_ranges[seg_end_step - 1].1;
+                let (seg_mis, mis_clusters, mis_span_cm) = hap_major.mismatch_dispersion(
+                    tgt_col,
+                    ref_col,
+                    m_start,
+                    m_end,
+                    cm_positions,
+                    0.5,
+                );
+                let start_cm = cm_positions[m_start];
+                let end_cm = cm_positions[m_end - 1];
+                let len_cm = (end_cm - start_cm).max(0.0);
+
+                proto_segs.push(ProtoSeg {
+                    start_step: seg_start_step,
+                    end_step: seg_end_step,
+                    parent_sample,
+                    parent_hap,
+                    seg_comp: seg_comparable,
+                    seg_mis,
+                    mis_clusters,
+                    mis_span_cm,
+                    start_cm,
+                    end_cm,
+                    len_cm,
+                    best_seg_score,
+                    second_best_score,
+                    raw_conf,
+                    ambiguous: ambiguous.max(1),
+                    div_uncalled_left: false,
+                    div_uncalled_right: false,
+                    interior_mosaic_ibs: false,
+                    rejected: false,
+                });
+                seg_start_step = seg_end_step;
+            }
+
+            // Out-of-panel mosaic/excess-mismatch rejection & sample-baseline confidence
+            // ranking adjustment (active only when the multi-parent frequency model is active).
+            let mut baseline_err = 0.003f64;
+            if ref_weights.is_some() && !proto_segs.is_empty() {
+                // Mark which proto-segments border a *divergence* Uncalled gap (where the
+                // target had observed markers yet no panel founder beat Uncalled).
+                for i in 0..proto_segs.len() {
+                    let left_gap_start = if i == 0 { 0 } else { proto_segs[i - 1].end_step };
+                    let left_gap_end = proto_segs[i].start_step;
+                    if left_gap_start < left_gap_end {
+                        proto_segs[i].div_uncalled_left = (left_gap_start..left_gap_end)
+                            .any(|s| step_max_comps[s] > 0);
+                    }
+                    let right_gap_start = proto_segs[i].end_step;
+                    let right_gap_end = if i + 1 < proto_segs.len() {
+                        proto_segs[i + 1].start_step
+                    } else {
+                        n_steps
+                    };
+                    if right_gap_start < right_gap_end {
+                        proto_segs[i].div_uncalled_right = (right_gap_start..right_gap_end)
+                            .any(|s| step_max_comps[s] > 0);
+                    }
+                }
+
+                // Estimate this target haplotype's own clean baseline mismatch rate from
+                // the lower quartile (25th percentile, marker-weighted) of substantial
+                // segments (`seg_comp >= 50`). Uniformly noisy samples automatically get
+                // a higher `baseline_err` so they are not falsely rejected.
+                let mut substantial: Vec<(f64, u32)> = proto_segs
+                    .iter()
+                    .filter(|s| s.seg_comp >= 50)
+                    .map(|s| (s.seg_mis as f64 / s.seg_comp as f64, s.seg_comp))
+                    .collect();
+                if !substantial.is_empty() {
+                    substantial.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    let total_sub_comp: u64 =
+                        substantial.iter().map(|&(_, c)| c as u64).sum();
+                    let q25_target = total_sub_comp / 4;
+                    let mut acc = 0u64;
+                    let mut q25_rate = substantial[0].0;
+                    for &(rate, comp) in &substantial {
+                        acc += comp as u64;
+                        if acc >= q25_target {
+                            q25_rate = rate;
+                            break;
+                        }
+                    }
+                    baseline_err = q25_rate.clamp(0.003, 0.05);
+                }
+
+                // Rule B1: Reject contiguous rapid-switching mosaic runs whose full
+                // genetic span (including any short embedded divergence Uncalled gaps
+                // `<= 6.0 cM`) exhibits anomalously high switch density and excess
+                // mismatch over `baseline_err`. Only *internal* short divergence gaps
+                // count toward `has_internal_div_uncalled` (never outer gaps outside the
+                // run), and individual segments with strong unambiguous single-founder
+                // support (`seg_mis <= 2`, `best > 0`, `raw_conf >= 0.99`, meaning the
+                // chosen founder beats every competitor and Uncalled by >= 4.6 LLR)
+                // are protected from run-level and bridge-level hard deletion.
+                // Independent in-panel single-segment protection requires <= 2 mismatches,
+                // strong positive LLR vs Uncalled (`>= switch_penalty`), and a decisive
+                // margin over every competing founder (`>= switch_penalty` above
+                // `max(second_best, 0)` and `>= 2 * switch_penalty` above `second_best`),
+                // keeping `raw_conf` strictly separate from in-panel protection.
+                const MOSAIC_SEG_MAX_CM: f64 = 6.0;
+                const MOSAIC_GAP_MAX_CM: f64 = 6.0;
+                let sw_f64 = switch_penalty as f64;
+                let is_strong_single_seg = |seg: &ProtoSeg| -> bool {
+                    seg.seg_mis <= 2
+                        && seg.best_seg_score >= sw_f64
+                        && (seg.best_seg_score - seg.second_best_score.max(0.0)) >= sw_f64
+                        && (seg.best_seg_score - seg.second_best_score) >= 2.0 * sw_f64
+                };
+                let mut idx = 0usize;
+                while idx < proto_segs.len() {
+                    if proto_segs[idx].len_cm > MOSAIC_SEG_MAX_CM {
+                        idx += 1;
+                        continue;
+                    }
+                    let mut end = idx + 1;
+                    while end < proto_segs.len() && proto_segs[end].len_cm <= MOSAIC_SEG_MAX_CM {
+                        let direct_adj =
+                            proto_segs[end - 1].end_step == proto_segs[end].start_step;
+                        let gap_cm = (proto_segs[end].start_cm - proto_segs[end - 1].end_cm).max(0.0);
+                        let short_div_gap =
+                            proto_segs[end - 1].div_uncalled_right && gap_cm <= MOSAIC_GAP_MAX_CM;
+                        if !direct_adj && !short_div_gap {
+                            break;
+                        }
+                        end += 1;
+                    }
+                    let run_len = end - idx;
+                    if run_len >= 3 {
+                        let mut run_comp = 0u32;
+                        let mut run_mis = 0u32;
+                        let mut run_mis_clusters = 0u32;
+                        let mut weak_segs = 0usize;
+                        for seg in &proto_segs[idx..end] {
+                            run_comp = run_comp.saturating_add(seg.seg_comp);
+                            run_mis = run_mis.saturating_add(seg.seg_mis);
+                            run_mis_clusters = run_mis_clusters.saturating_add(seg.mis_clusters);
+                            if !is_strong_single_seg(seg) {
+                                weak_segs += 1;
+                            }
+                        }
+                        let has_internal_div_uncalled = (idx..end - 1)
+                            .any(|j| proto_segs[j].div_uncalled_right);
+                        let span_cm =
+                            (proto_segs[end - 1].end_cm - proto_segs[idx].start_cm).max(0.0);
+                        let avg_span_cm = span_cm / run_len as f64;
+                        let run_mis_rate = run_mis as f64 / run_comp.max(1) as f64;
+                        let density_qualifies = (run_len >= 4
+                            && weak_segs >= 3
+                            && avg_span_cm < 2.5)
+                            || (has_internal_div_uncalled
+                                && weak_segs >= 2
+                                && avg_span_cm < 3.0);
+                        if density_qualifies
+                            && run_mis >= 3
+                            && run_mis_clusters >= 3
+                            && run_mis_rate > (baseline_err * 2.0).max(0.006)
+                            && one_sided_binomial_deviance(
+                                run_mis as f64,
+                                run_comp as f64,
+                                baseline_err,
+                            ) >= 8.0
+                        {
+                            let first_weak = (idx..end)
+                                .find(|&j| !is_strong_single_seg(&proto_segs[j]));
+                            let last_weak = (idx..end)
+                                .rfind(|&j| !is_strong_single_seg(&proto_segs[j]));
+                            for j in idx..end {
+                                let seg = &mut proto_segs[j];
+                                if !is_strong_single_seg(seg) {
+                                    seg.rejected = true;
+                                } else if first_weak
+                                    .zip(last_weak)
+                                    .map(|(lo, hi)| j > lo && j < hi && seg.len_cm <= 3.0)
+                                    .unwrap_or(false)
+                                {
+                                    // Preserve strong single-founder calls inside a rejected
+                                    // mosaic run and downweight confidence instead of hard-deleting.
+                                    seg.interior_mosaic_ibs = true;
+                                }
+                            }
+                        }
+                    }
+                    idx = end;
+                }
+
+                // Rule B3: Reject standalone segments with *genetically dispersed* excess
+                // mismatch (`>= 3` marker-coordinate mismatch clusters separated by
+                // `>= 0.5 cM`, spanning `>= 1.0 cM` and `>= 35%` of segment genetic length).
+                // Fully invariant to `ancestry_step_cm` and preserves contiguous noise blocks.
+                for seg in &mut proto_segs {
+                    if seg.rejected || seg.seg_comp < 60 || seg.seg_mis < 5 {
+                        continue;
+                    }
+                    let mis_rate = seg.seg_mis as f64 / seg.seg_comp as f64;
+                    let span_frac = if seg.len_cm > 1e-6 {
+                        seg.mis_span_cm / seg.len_cm
+                    } else {
+                        0.0
+                    };
+                    if mis_rate >= (baseline_err * 3.0).max(0.015)
+                        && seg.mis_clusters >= 3
+                        && seg.mis_span_cm >= 1.0
+                        && span_frac >= 0.35
+                        && one_sided_binomial_deviance(
+                            seg.seg_mis as f64,
+                            seg.seg_comp as f64,
+                            baseline_err,
+                        ) >= 16.0
+                    {
+                        seg.rejected = true;
+                    }
+                }
+
+                // Rule B2: Single non-cascading pass rejecting short-to-medium stitched
+                // bridges bordering *original* DP divergence Uncalled gaps (or directly
+                // adjacent B1/B3 rejections — never feeding B2's own rejections forward
+                // and never propagating across pure-missing gaps). Protects unambiguous
+                // strong single-founder segments on single-sided edges.
+                let pre_b2_rejected: Vec<bool> = proto_segs.iter().map(|s| s.rejected).collect();
+                for i in 0..proto_segs.len() {
+                    if proto_segs[i].rejected {
+                        continue;
+                    }
+                    let left_adj_b13 = i > 0
+                        && pre_b2_rejected[i - 1]
+                        && proto_segs[i - 1].end_step == proto_segs[i].start_step;
+                    let right_adj_b13 = i + 1 < proto_segs.len()
+                        && pre_b2_rejected[i + 1]
+                        && proto_segs[i].end_step == proto_segs[i + 1].start_step;
+                    let left_div = proto_segs[i].div_uncalled_left || left_adj_b13;
+                    let right_div = proto_segs[i].div_uncalled_right || right_adj_b13;
+                    if !left_div && !right_div {
+                        continue;
+                    }
+                    proto_segs[i].div_uncalled_left = left_div;
+                    proto_segs[i].div_uncalled_right = right_div;
+                    let seg = &proto_segs[i];
+                    if seg.len_cm > 8.0
+                        || seg.seg_mis < 2
+                        || seg.mis_clusters < 2
+                        || is_strong_single_seg(seg)
+                    {
+                        continue;
+                    }
+                    let mis_rate = seg.seg_mis as f64 / seg.seg_comp.max(1) as f64;
+                    let dev = one_sided_binomial_deviance(
+                        seg.seg_mis as f64,
+                        seg.seg_comp as f64,
+                        baseline_err,
+                    );
+                    let sandwiched_reject = left_div
+                        && right_div
+                        && mis_rate > (baseline_err * 1.5).max(0.006)
+                        && dev >= 4.0;
+                    let edge_reject =
+                        mis_rate > (baseline_err * 2.0).max(0.008) && dev >= 6.0;
+                    if sandwiched_reject || edge_reject {
+                        proto_segs[i].rejected = true;
+                    }
+                }
+
+                // Clear rejected segments from `called_path` so surviving neighbors stop
+                // cleanly at their own last marker rather than bleeding into Uncalled gaps.
+                for seg in &proto_segs {
+                    if seg.rejected {
+                        for slot in &mut called_path[seg.start_step..seg.end_step] {
+                            *slot = None;
+                        }
+                    }
+                }
+            }
+
+            let mut out = Vec::with_capacity(proto_segs.len());
+            for seg in &proto_segs {
+                if seg.rejected {
+                    continue;
+                }
+                // Composite segment confidence / ranking score: combines competitor +
+                // Uncalled posterior (`raw_conf`) with an LD-damped excess-mismatch
+                // penalty (capped at 10 effective SNPs/cM and weighted by genetically
+                // separated mismatch clusters so dense LD bursts do not over-penalize
+                // true in-panel segments).
+                let confidence = if ref_weights.is_some() {
+                    let n_eff_cap = (seg.len_cm.max(0.5) * 10.0).max(20.0);
+                    let (m_eff, n_eff) = if (seg.seg_comp as f64) > n_eff_cap {
+                        let scale = n_eff_cap / seg.seg_comp as f64;
+                        (seg.seg_mis as f64 * scale, n_eff_cap)
+                    } else {
+                        (seg.seg_mis as f64, seg.seg_comp as f64)
+                    };
+                    let dev = one_sided_binomial_deviance(m_eff, n_eff, baseline_err);
+                    let ibd_fit_factor = if dev <= 0.0 {
+                        1.0
+                    } else {
+                        let spread = (seg.mis_clusters as f64 / 4.0).clamp(0.15, 1.0);
+                        let eff_ll_penalty = 0.5 * dev * spread;
+                        let prior_log_odds =
+                            if seg.div_uncalled_left || seg.div_uncalled_right || seg.len_cm < 3.0 {
+                                2.0
+                            } else {
+                                4.5
+                            };
+                        1.0 / (1.0 + (eff_ll_penalty - prior_log_odds).clamp(-40.0, 40.0).exp())
+                    };
+                    let structural_discount = if seg.interior_mosaic_ibs {
+                        0.75
+                    } else if seg.div_uncalled_left
+                        && seg.div_uncalled_right
+                        && seg.len_cm < 3.0
+                    {
+                        0.80
+                    } else if (seg.div_uncalled_left || seg.div_uncalled_right) && seg.len_cm < 3.0
+                    {
+                        0.85
+                    } else {
+                        1.0
+                    };
+                    (seg.raw_conf * ibd_fit_factor * structural_discount).clamp(0.0, 1.0) as f32
+                } else {
+                    seg.raw_conf as f32
+                };
+
+                let m_start = step_ranges[seg.start_step].0;
+                let m_end = step_ranges[seg.end_step - 1].1;
                 let start_bp = positions_bp[m_start];
                 let start_cm = cm_positions[m_start] as f32;
                 // Share the exact recombination boundary with the next segment ONLY
                 // when immediately followed by another called segment; otherwise stop
                 // at this segment's own last marker so uncalled gaps remain uncalled.
                 let followed_by_called =
-                    seg_end_step < n_steps && called_path[seg_end_step].is_some();
+                    seg.end_step < n_steps && called_path[seg.end_step].is_some();
                 let (end_bp, end_cm) = if followed_by_called && m_end < n_markers {
                     (
                         positions_bp[m_end].saturating_sub(1).max(start_bp),
@@ -1094,13 +1547,12 @@ pub fn paint_chromosome_ancestry_cancellable(
                     end_bp,
                     start_cm,
                     end_cm,
-                    parent_sample,
-                    parent_hap,
+                    parent_sample: seg.parent_sample,
+                    parent_hap: seg.parent_hap,
                     confidence,
-                    ambiguous_parents: ambiguous.max(1),
-                    n_markers: seg_comparable,
+                    ambiguous_parents: seg.ambiguous,
+                    n_markers: seg.seg_comp,
                 });
-                seg_start_step = seg_end_step;
             }
             Ok(out)
         })
@@ -2581,5 +3033,484 @@ mod tests {
             "3-marker segment with raw LLR ~2.1 must reflect Uncalled competition (confidence={})",
             segs[0].confidence
         );
+    }
+
+    /// Deterministic 64-bit SplitMix hash producing uncorrelated alleles per `(m, p)`.
+    fn splitmix_allele_bits(m: usize, p: usize) -> u64 {
+        let mut z = ((m as u64) << 16) ^ (p as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    /// Deterministic pairwise-distinct synthetic founder allele generator (~25% MAF).
+    fn distinct_founder_allele(m: usize, p: usize) -> u8 {
+        ((splitmix_allele_bits(m, p) & 3) == 0) as u8
+    }
+
+    /// Deterministic pairwise-distinct synthetic founder allele generator (~50% MAF).
+    fn balanced_founder_allele(m: usize, p: usize) -> u8 {
+        (splitmix_allele_bits(m, p) & 1) as u8
+    }
+
+    #[test]
+    fn out_of_panel_mosaic_stitching_run_is_rejected_to_uncalled() {
+        // 12 independent balanced ~50%-MAF founders over 600 markers (0.045 cM/marker).
+        // [0..300) cleanly matches visible founder P0 (13.5 cM, 0 mismatches -> baseline=0.003).
+        // [300..600) has 6 short 2.25 cM blocks (50 markers each, P1..P6; avg span < 2.5 cM):
+        // 5 weak blocks carry 3 mismatches each (6% error, raw LLR ~+16.4 > switch_penalty),
+        // while interior block P4 has 0 mismatches and strong unambiguous single-founder LLR.
+        // Rule B1 must hard-reject all 5 weak mosaic blocks to Uncalled while preserving
+        // strong 0-mismatch P4 with a mosaic-interior confidence discount of 0.75.
+        let n_parents = 12usize;
+        let n_markers = 600usize;
+        let ref_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true; n_parents]);
+        let tgt_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true]);
+        let mut joint =
+            BitHaplotypeMatrix::new(ref_layout.total_haps + tgt_layout.total_haps, n_markers);
+        let pos: Vec<u64> = (0..n_markers).map(|m| (m as u64 + 1) * 10_000).collect();
+        let cm: Vec<f64> = (0..n_markers).map(|m| m as f64 * 0.045).collect();
+
+        for m in 0..n_markers {
+            for p in 0..n_parents {
+                joint.set_allele(m, p, Some(balanced_founder_allele(m, p)));
+            }
+            if m >= 300 {
+                let blk = (m - 300) / 50; // 0..6 -> P1..P6
+                let off = (m - 300) % 50;
+                let src_a = joint.allele(m, 1 + blk).unwrap();
+                let flip = blk != 3 && (off == 10 || off == 25 || off == 40);
+                joint.set_allele(m, n_parents, Some(if flip { 1 - src_a } else { src_a }));
+            } else {
+                joint.set_allele(m, n_parents, joint.allele(m, 0));
+            }
+        }
+
+        let cfg = HaploidIbdConfig::default();
+        let (segs, bins) =
+            paint_chromosome_ancestry(&joint, &ref_layout, &tgt_layout, 0, &pos, &cm, &cfg);
+        assert_eq!(
+            segs.len(),
+            2,
+            "5 weak mosaic blocks must be rejected while preserving strong 0-mismatch P4, got {segs:?}"
+        );
+        assert_eq!(segs[0].parent_sample, 0);
+        assert!(segs[0].end_bp >= pos[295] && segs[0].end_bp <= pos[305]);
+        assert_eq!(segs[0].ambiguous_parents, 1);
+        assert!(segs[0].confidence > 0.99);
+        assert_eq!(segs[1].parent_sample, 4);
+        assert!(
+            (segs[1].confidence - 0.75).abs() < 1e-3,
+            "interior short strong segment in rejected mosaic must get 0.75 discount, got {}",
+            segs[1].confidence
+        );
+        assert_eq!(bins.bin_starts_bp.len(), 2);
+    }
+
+    #[test]
+    fn out_of_panel_excess_mismatch_segment_confidence_is_calibrated_below_clean_segment() {
+        // 12 pairwise-distinct founders over 600 markers (0.06 cM/marker = 36 cM).
+        // [0..400) cleanly matches P0 (0 mismatches -> baseline_err=0.003, ambiguous=1).
+        // [400..600) matches P1 with 4 well-separated mismatches (2.0%, 4 clusters > 0.5 cM,
+        // below B3's hard-rejection count floor of 5). Both segments are emitted, P0 stays
+        // > 0.995, and P1's composite confidence drops well below 0.90.
+        let n_parents = 12usize;
+        let n_markers = 600usize;
+        let ref_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true; n_parents]);
+        let tgt_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true]);
+        let mut joint =
+            BitHaplotypeMatrix::new(ref_layout.total_haps + tgt_layout.total_haps, n_markers);
+        let pos: Vec<u64> = (0..n_markers).map(|m| (m as u64 + 1) * 10_000).collect();
+        let cm: Vec<f64> = (0..n_markers).map(|m| m as f64 * 0.06).collect();
+
+        for m in 0..n_markers {
+            for p in 0..n_parents {
+                joint.set_allele(m, p, Some(distinct_founder_allele(m, p)));
+            }
+            let tgt = if m < 400 {
+                joint.allele(m, 0).unwrap()
+            } else {
+                let p1_a = joint.allele(m, 1).unwrap();
+                let flip = m == 425 || m == 475 || m == 525 || m == 575;
+                if flip { 1 - p1_a } else { p1_a }
+            };
+            joint.set_allele(m, n_parents, Some(tgt));
+        }
+
+        let cfg = HaploidIbdConfig::default();
+        let (segs, _) =
+            paint_chromosome_ancestry(&joint, &ref_layout, &tgt_layout, 0, &pos, &cm, &cfg);
+        assert_eq!(segs.len(), 2, "expected [P0, P1], got {segs:?}");
+        assert_eq!(segs[0].parent_sample, 0);
+        assert_eq!(segs[0].ambiguous_parents, 1);
+        assert_eq!(segs[1].parent_sample, 1);
+        assert!(segs[0].confidence > 0.995);
+        assert!(
+            segs[1].confidence < 0.90,
+            "2% excess-mismatch segment must have composite confidence < 0.90, got {}",
+            segs[1].confidence
+        );
+    }
+
+    #[test]
+    fn uniformly_noisy_in_panel_sample_is_not_falsely_rejected() {
+        // 12 pairwise-distinct founders over 600 markers: true P0 on [0..300) and true P1
+        // on [300..600), both carrying uniform ~2.7% genotyping error (8 mismatches each).
+        // Sample-baseline calibration adapts `baseline_err` to ~2.7%, preserving both
+        // true in-panel segments without false out-of-panel rejection.
+        let n_parents = 12usize;
+        let n_markers = 600usize;
+        let ref_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true; n_parents]);
+        let tgt_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true]);
+        let mut joint =
+            BitHaplotypeMatrix::new(ref_layout.total_haps + tgt_layout.total_haps, n_markers);
+        let pos: Vec<u64> = (0..n_markers).map(|m| (m as u64 + 1) * 10_000).collect();
+        let cm: Vec<f64> = (0..n_markers).map(|m| m as f64 * 0.06).collect();
+
+        for m in 0..n_markers {
+            for p in 0..n_parents {
+                joint.set_allele(m, p, Some(distinct_founder_allele(m, p)));
+            }
+            let base = if m < 300 {
+                joint.allele(m, 0).unwrap()
+            } else {
+                joint.allele(m, 1).unwrap()
+            };
+            let off = m % 300;
+            let flip = off == 20
+                || off == 55
+                || off == 90
+                || off == 125
+                || off == 160
+                || off == 195
+                || off == 230
+                || off == 265;
+            joint.set_allele(m, n_parents, Some(if flip { 1 - base } else { base }));
+        }
+
+        let cfg = HaploidIbdConfig::default();
+        let (segs, bins) =
+            paint_chromosome_ancestry(&joint, &ref_layout, &tgt_layout, 0, &pos, &cm, &cfg);
+        assert_eq!(
+            segs.len(),
+            2,
+            "uniformly noisy in-panel sample must keep both P0 and P1, got {segs:?}"
+        );
+        assert_eq!(segs[0].parent_sample, 0);
+        assert_eq!(segs[1].parent_sample, 1);
+        assert_eq!(bins.bin_starts_bp.len(), 2);
+    }
+
+    #[test]
+    fn true_short_recombination_series_without_uncalled_gaps_is_preserved() {
+        // Regression for P1 (B1 & B2 non-cascading): 12 uncorrelated ~50%-MAF founders
+        // so each 40-marker / 2.2 cM true block with 2 errors scores ~+14 > switch_penalty=12
+        // and is emitted by Viterbi. P0 (200 markers) is followed by 4 true short
+        // recombination segments P1..P4 and a 22 cM outer divergence Uncalled gap.
+        // Neither B1 nor B2 may wipe or cascade through P1..P4.
+        let n_parents = 12usize;
+        let n_markers = 760usize;
+        let ref_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true; n_parents]);
+        let tgt_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true]);
+        let mut joint =
+            BitHaplotypeMatrix::new(ref_layout.total_haps + tgt_layout.total_haps, n_markers);
+        let pos: Vec<u64> = (0..n_markers).map(|m| (m as u64 + 1) * 10_000).collect();
+        let cm: Vec<f64> = (0..n_markers).map(|m| m as f64 * 0.055).collect();
+
+        for m in 0..n_markers {
+            for p in 0..n_parents {
+                joint.set_allele(m, p, Some(balanced_founder_allele(m, p)));
+            }
+            let tgt = if m < 200 {
+                joint.allele(m, 0).unwrap()
+            } else if m < 360 {
+                let blk = (m - 200) / 40; // 0..4 -> P1, P2, P3, P4 (2.2 cM each)
+                let off = (m - 200) % 40;
+                let src_a = joint.allele(m, 1 + blk).unwrap();
+                let flip = off == 12 || off == 28;
+                if flip { 1 - src_a } else { src_a }
+            } else {
+                // Outer 22 cM divergence Uncalled gap beyond P4
+                for p in 0..n_parents {
+                    joint.set_allele(m, p, Some(0));
+                }
+                1u8
+            };
+            joint.set_allele(m, n_parents, Some(tgt));
+        }
+
+        let cfg = HaploidIbdConfig::default();
+        let (segs, _) =
+            paint_chromosome_ancestry(&joint, &ref_layout, &tgt_layout, 0, &pos, &cm, &cfg);
+        assert_eq!(
+            segs.len(),
+            5,
+            "true P0-P1-P2-P3-P4 short recombination series before 22 cM gap must be preserved, got {segs:?}"
+        );
+        assert_eq!(segs[0].parent_sample, 0);
+        assert_eq!(segs[1].parent_sample, 1);
+        assert_eq!(segs[2].parent_sample, 2);
+        assert_eq!(segs[3].parent_sample, 3);
+        assert_eq!(segs[4].parent_sample, 4);
+    }
+
+    #[test]
+    fn sandwiched_strong_single_cluster_true_segment_is_preserved_by_b2() {
+        // Regression for P1 (B2 sandwiched_reject): 12 uncorrelated ~50%-MAF founders.
+        // Clean P0 flanks establish baseline_err=0.003; a 90-SNP (3.6 cM) true P1 segment
+        // sandwiched between two divergence Uncalled gaps has only 2 errors spaced 0.12 cM
+        // apart (1 cluster, strong raw LLR ~+48, raw_conf=1.0). B2 must preserve P1.
+        let n_parents = 12usize;
+        let n_markers = 810usize;
+        let ref_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true; n_parents]);
+        let tgt_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true]);
+        let mut joint =
+            BitHaplotypeMatrix::new(ref_layout.total_haps + tgt_layout.total_haps, n_markers);
+        let pos: Vec<u64> = (0..n_markers).map(|m| (m as u64 + 1) * 10_000).collect();
+        let cm: Vec<f64> = (0..n_markers).map(|m| m as f64 * 0.04).collect();
+
+        for m in 0..n_markers {
+            for p in 0..n_parents {
+                joint.set_allele(m, p, Some(balanced_founder_allele(m, p)));
+            }
+            let tgt = if m < 300 || m >= 510 {
+                joint.allele(m, 0).unwrap()
+            } else if (360..450).contains(&m) {
+                // True 90-SNP (3.6 cM) P1 with 2 errors spaced 3 markers (0.12 cM) apart
+                let base = joint.allele(m, 1).unwrap();
+                if m == 400 || m == 403 { 1 - base } else { base }
+            } else {
+                // Divergence Uncalled gaps on both sides of P1
+                for p in 0..n_parents {
+                    joint.set_allele(m, p, Some(0));
+                }
+                1u8
+            };
+            joint.set_allele(m, n_parents, Some(tgt));
+        }
+
+        let cfg = HaploidIbdConfig::default();
+        let (segs, _) =
+            paint_chromosome_ancestry(&joint, &ref_layout, &tgt_layout, 0, &pos, &cm, &cfg);
+        assert_eq!(
+            segs.len(),
+            3,
+            "sandwiched strong single-cluster true P1 segment must be preserved by B2, got {segs:?}"
+        );
+        assert_eq!(segs[0].parent_sample, 0);
+        assert_eq!(segs[1].parent_sample, 1);
+        assert_eq!(segs[2].parent_sample, 0);
+    }
+
+    #[test]
+    fn b3_mismatch_clustering_is_invariant_to_large_ancestry_step_cm() {
+        // Regression for P1 (B3 step-size invariance): 12 distinct founders (0.01 cM/marker).
+        // [0..400) is clean P0 (4 cM); [400..1400) is true P1 (10 cM, 1,000 SNPs) with 35
+        // errors spaced 0.12 cM (< 0.5 cM) apart across 4.08 cM (1 single contiguous cluster).
+        // Even with `--ancestry-step-cm 1.0`, marker-coordinate clustering must count 1
+        // cluster and preserve P1.
+        let n_parents = 12usize;
+        let n_markers = 1_400usize;
+        let ref_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true; n_parents]);
+        let tgt_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true]);
+        let mut joint =
+            BitHaplotypeMatrix::new(ref_layout.total_haps + tgt_layout.total_haps, n_markers);
+        let pos: Vec<u64> = (0..n_markers).map(|m| (m as u64 + 1) * 1_000).collect();
+        let cm: Vec<f64> = (0..n_markers).map(|m| m as f64 * 0.01).collect();
+
+        for m in 0..n_markers {
+            for p in 0..n_parents {
+                let x = m
+                    .wrapping_mul(2_654_435_761usize)
+                    .wrapping_add(p.wrapping_mul(2_246_822_519usize) ^ 0x9e37_79b9usize);
+                let a = (((x ^ (x >> 13)) & 1) == 1) as u8;
+                joint.set_allele(m, p, Some(a));
+            }
+            let tgt = if m < 400 {
+                joint.allele(m, 0).unwrap()
+            } else {
+                let base = joint.allele(m, 1).unwrap();
+                // 35 errors spaced 12 markers (0.12 cM) apart across [650..1059) = 4.08 cM
+                let is_err = m >= 650 && m <= 1058 && (m - 650) % 12 == 0;
+                if is_err { 1 - base } else { base }
+            };
+            joint.set_allele(m, n_parents, Some(tgt));
+        }
+
+        let cfg = HaploidIbdConfig {
+            ancestry_step_cm: 1.0,
+            ..HaploidIbdConfig::default()
+        };
+        let (segs, _) =
+            paint_chromosome_ancestry(&joint, &ref_layout, &tgt_layout, 0, &pos, &cm, &cfg);
+        assert_eq!(
+            segs.len(),
+            2,
+            "contiguous 0.12 cM-spaced error block must remain 1 cluster under step_cm=1.0, got {segs:?}"
+        );
+        assert_eq!(segs[0].parent_sample, 0);
+        assert_eq!(segs[1].parent_sample, 1);
+    }
+
+    #[test]
+    fn uncalled_flanked_true_segment_below_sample_baseline_is_preserved() {
+        // Regression for P1 (B2): 12 distinct founders (balanced ~50% MAF so 60-marker P1
+        // scores ~+34 > 2*switch_penalty=24 and is emitted by Viterbi). P0 flanks carry
+        // 2.67% error (baseline_err ≈ 2.67%), while the 2.1 cM true P1 segment sandwiched
+        // between two divergence Uncalled gaps has only 1/60 = 1.67% mismatch (< baseline).
+        // B2 must preserve P1.
+        let n_parents = 12usize;
+        let n_markers = 780usize;
+        let ref_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true; n_parents]);
+        let tgt_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true]);
+        let mut joint =
+            BitHaplotypeMatrix::new(ref_layout.total_haps + tgt_layout.total_haps, n_markers);
+        let pos: Vec<u64> = (0..n_markers).map(|m| (m as u64 + 1) * 10_000).collect();
+        let cm: Vec<f64> = (0..n_markers).map(|m| m as f64 * 0.035).collect();
+
+        for m in 0..n_markers {
+            for p in 0..n_parents {
+                let x = m
+                    .wrapping_mul(2_654_435_761usize)
+                    .wrapping_add(p.wrapping_mul(2_246_822_519usize) ^ 0x9e37_79b9usize);
+                let a = (((x ^ (x >> 13)) & 1) == 1) as u8;
+                joint.set_allele(m, p, Some(a));
+            }
+            let tgt = if m < 300 || m >= 480 {
+                let base = joint.allele(m, 0).unwrap();
+                let local = if m < 300 { m } else { m - 480 };
+                let flip = (local % 37) == 10 && local < 296; // 8/300 = 2.67%
+                if flip { 1 - base } else { base }
+            } else if (360..420).contains(&m) {
+                // True 2.1 cM P1 segment (60 markers) with 1/60 = 1.67% mismatch (< 2.67% baseline)
+                let base = joint.allele(m, 1).unwrap();
+                if m == 390 { 1 - base } else { base }
+            } else {
+                // Divergence Uncalled gap: all refs 0, target 1
+                for p in 0..n_parents {
+                    joint.set_allele(m, p, Some(0));
+                }
+                1u8
+            };
+            joint.set_allele(m, n_parents, Some(tgt));
+        }
+
+        let cfg = HaploidIbdConfig::default();
+        let (segs, _) =
+            paint_chromosome_ancestry(&joint, &ref_layout, &tgt_layout, 0, &pos, &cm, &cfg);
+        assert_eq!(
+            segs.len(),
+            3,
+            "Uncalled-flanked 2.1 cM true P1 segment cleaner than baseline must be preserved, got {segs:?}"
+        );
+        assert_eq!(segs[0].parent_sample, 0);
+        assert_eq!(segs[1].parent_sample, 1);
+        assert_eq!(segs[2].parent_sample, 0);
+    }
+
+    #[test]
+    fn b2_does_not_propagate_rejection_across_pure_missing_gap() {
+        // Regression for P1 (B2): true P5 segment (3.15 cM, 70 markers, 2 errors) separated
+        // by a 22.5 cM all-missing target gap from a B1-rejected 6-block out-of-panel mosaic.
+        // B2 must NEVER propagate rejection across the pure-missing gap to delete P5, and
+        // the entire far-side mosaic must be rejected to Uncalled.
+        let n_parents = 12usize;
+        let n_markers = 1_120usize;
+        let ref_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true; n_parents]);
+        let tgt_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true]);
+        let mut joint =
+            BitHaplotypeMatrix::new(ref_layout.total_haps + tgt_layout.total_haps, n_markers);
+        let pos: Vec<u64> = (0..n_markers).map(|m| (m as u64 + 1) * 10_000).collect();
+        let cm: Vec<f64> = (0..n_markers).map(|m| m as f64 * 0.045).collect();
+
+        for m in 0..n_markers {
+            for p in 0..n_parents {
+                joint.set_allele(m, p, Some(balanced_founder_allele(m, p)));
+            }
+            if m < 250 {
+                // Clean P0 establishing baseline_err = 0.003
+                joint.set_allele(m, n_parents, joint.allele(m, 0));
+            } else if m < 320 {
+                // True P5 (70 markers, 3.15 cM, 2 mismatches -> 2.86%)
+                let base = joint.allele(m, 5).unwrap();
+                let flip = m == 270 || m == 300;
+                joint.set_allele(m, n_parents, Some(if flip { 1 - base } else { base }));
+            } else if m < 820 {
+                // 500 markers = 22.5 cM pure all-missing target gap
+                joint.set_allele(m, n_parents, None);
+            } else {
+                // 6-block B1-rejected out-of-panel mosaic on [820..1120) (50 markers/2.25 cM each)
+                let blk = (m - 820) / 50;
+                let off = (m - 820) % 50;
+                let src_a = joint.allele(m, 1 + blk).unwrap();
+                let flip = off == 10 || off == 25 || off == 40;
+                joint.set_allele(m, n_parents, Some(if flip { 1 - src_a } else { src_a }));
+            }
+        }
+
+        let cfg = HaploidIbdConfig::default();
+        let (segs, _) =
+            paint_chromosome_ancestry(&joint, &ref_layout, &tgt_layout, 0, &pos, &cm, &cfg);
+        assert!(
+            segs.iter().any(|s| s.parent_sample == 0 && s.n_markers >= 240),
+            "clean P0 must be preserved, got {segs:?}"
+        );
+        assert!(
+            segs.iter().any(|s| s.parent_sample == 5 && s.n_markers >= 60),
+            "B2 must not propagate across a 22.5 cM all-missing gap to delete true P5, got {segs:?}"
+        );
+        assert!(
+            segs.iter().all(|s| s.end_bp < pos[820]),
+            "far-side 6-block mosaic on [820..1120) must be completely rejected, got {segs:?}"
+        );
+    }
+
+    #[test]
+    fn high_density_contiguous_local_error_cluster_is_not_rejected_by_b3() {
+        // Regression for P1 (B3): 12 distinct founders at high density (0.008 cM/marker).
+        // [0..400) is clean P0 (3.2 cM, 0 mismatches -> baseline=0.003); [400..800) is true
+        // P1 (3.2 cM, 400 SNPs) with 10 genotyping errors forming a single contiguous 1.15 cM
+        // local noise block (consecutive errors spaced 0.128 cM < 0.5 cM -> exactly 1 cluster).
+        // B3 must count consecutive-mismatch gaps and preserve P1.
+        let n_parents = 12usize;
+        let n_markers = 800usize;
+        let ref_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true; n_parents]);
+        let tgt_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true]);
+        let mut joint =
+            BitHaplotypeMatrix::new(ref_layout.total_haps + tgt_layout.total_haps, n_markers);
+        let pos: Vec<u64> = (0..n_markers).map(|m| (m as u64 + 1) * 1_000).collect();
+        let cm: Vec<f64> = (0..n_markers).map(|m| m as f64 * 0.008).collect();
+
+        for m in 0..n_markers {
+            for p in 0..n_parents {
+                // Balanced ~50% MAF so the 10-error local block stays in P1 under Viterbi.
+                let x = m
+                    .wrapping_mul(2_654_435_761usize)
+                    .wrapping_add(p.wrapping_mul(2_246_822_519usize) ^ 0x9e37_79b9usize);
+                let a = (((x ^ (x >> 13)) & 1) == 1) as u8;
+                joint.set_allele(m, p, Some(a));
+            }
+            let tgt = if m < 400 {
+                joint.allele(m, 0).unwrap()
+            } else {
+                let base = joint.allele(m, 1).unwrap();
+                // 10 errors spaced 16 markers (0.128 cM < 0.5 cM) apart across [520..665):
+                // total span = 144 * 0.008 = 1.152 cM (> 1.0 cM, > 35% of 3.2 cM), yet 1 cluster.
+                let is_burst_err = m >= 520 && m <= 664 && (m - 520) % 16 == 0;
+                if is_burst_err { 1 - base } else { base }
+            };
+            joint.set_allele(m, n_parents, Some(tgt));
+        }
+
+        let cfg = HaploidIbdConfig::default();
+        let (segs, _) =
+            paint_chromosome_ancestry(&joint, &ref_layout, &tgt_layout, 0, &pos, &cm, &cfg);
+        assert_eq!(
+            segs.len(),
+            2,
+            "true 400-SNP P1 segment with a single contiguous 1.15 cM 10-error block must be preserved, got {segs:?}"
+        );
+        assert_eq!(segs[0].parent_sample, 0);
+        assert_eq!(segs[1].parent_sample, 1);
     }
 }

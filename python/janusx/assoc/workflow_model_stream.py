@@ -1054,6 +1054,7 @@ def run_chunked_gwas_ibd(
     saved_paths: Optional[list[str]] = None,
     use_spinner: bool = False,
     plot: bool = False,
+    ibd_handle: Optional[object] = None,
 ) -> None:
     """Run streaming hGWAS over a `.jhibd` multi-parent ancestry archive.
 
@@ -1069,7 +1070,9 @@ def run_chunked_gwas_ibd(
             requested.append(key)
     if not requested:
         return
-    if not hasattr(jxrs, "hgwas_scan_jhibd_to_tsv_f64"):
+    if ibd_handle is None and hasattr(jxrs, "HgwasArchive"):
+        ibd_handle = jxrs.HgwasArchive.open(str(ibd_path))
+    if ibd_handle is None and not hasattr(jxrs, "hgwas_scan_jhibd_to_tsv_f64"):
         raise RuntimeError(
             "Rust extension missing hgwas_scan_jhibd_to_tsv_f64; rebuild/reinstall JanusX."
         )
@@ -1192,23 +1195,41 @@ def run_chunked_gwas_ibd(
                     progress_last = d
 
             try:
-                count_raw, null_pve_raw = jxrs.hgwas_scan_jhibd_to_tsv_f64(
-                    jhibd_path=str(ibd_path),
-                    out_tsv=str(tmp_tsv),
-                    s=s_vec,
-                    x_rot=x_rot,
-                    y_rot=y_rot,
-                    u_t=u_t,
-                    sample_indices=sample_indices,
-                    exact_lmm=bool(exact_lmm),
-                    lambda_g_null=lambda_g_null,
-                    low=-5.0,
-                    high=5.0,
-                    max_iter=30,
-                    tol=1e-2,
-                    threads=max(1, int(threads)),
-                    progress_callback=_on_progress,
-                )
+                if ibd_handle is not None:
+                    count_raw, null_pve_raw = ibd_handle.scan_to_tsv(
+                        out_tsv=str(tmp_tsv),
+                        s=s_vec,
+                        x_rot=x_rot,
+                        y_rot=y_rot,
+                        u_t=u_t,
+                        sample_indices=sample_indices,
+                        exact_lmm=bool(exact_lmm),
+                        lambda_g_null=lambda_g_null,
+                        low=-5.0,
+                        high=5.0,
+                        max_iter=30,
+                        tol=1e-2,
+                        threads=max(1, int(threads)),
+                        progress_callback=_on_progress,
+                    )
+                else:
+                    count_raw, null_pve_raw = jxrs.hgwas_scan_jhibd_to_tsv_f64(
+                        jhibd_path=str(ibd_path),
+                        out_tsv=str(tmp_tsv),
+                        s=s_vec,
+                        x_rot=x_rot,
+                        y_rot=y_rot,
+                        u_t=u_t,
+                        sample_indices=sample_indices,
+                        exact_lmm=bool(exact_lmm),
+                        lambda_g_null=lambda_g_null,
+                        low=-5.0,
+                        high=5.0,
+                        max_iter=30,
+                        tol=1e-2,
+                        threads=max(1, int(threads)),
+                        progress_callback=_on_progress,
+                    )
                 count = int(count_raw)
                 pve_now = (
                     float(null_pve_raw)

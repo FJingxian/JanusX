@@ -1,4 +1,4 @@
-//! Rust-native compressed sparse binary archive (`JHIBD01`) designed for
+//! Rust-native sparse binary archives (`JHIBD01` and compact `JHIBD02`) designed for
 //! direct zero-loss loading by `src/hgwas`, plus optional `.tsv.gz` export.
 
 use super::ancestry::ChromosomeAncestryBinsSparse;
@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub const JHIBD_MAGIC: &[u8; 8] = b"JHIBD01\0";
+pub const JHIBD_MAGIC_V2: &[u8; 8] = b"JHIBD02\0";
 static TMP_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Raw chunk size (1 MiB) per independent zstd frame when multi-threaded
@@ -46,7 +47,7 @@ pub enum HaploidSparsePayload {
 }
 
 /// Top-level Rust-native sparse archive written by `--only-ibd` and consumed by
-/// `src/hgwas`.
+/// `src/hgwas` and `src/haploid/post`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HaploidSparseArchive {
     pub version: u32,
@@ -55,6 +56,133 @@ pub struct HaploidSparseArchive {
     pub reference_sample_ids: Vec<String>,
     pub chrom_names: Vec<String>,
     pub payload: HaploidSparsePayload,
+}
+
+/// Compact uncompressed header written at the start of `JHIBD02\0` archives so
+/// metadata inspection (`hgwas_inspect_jhibd`, CLI validation) completes in <1 ms
+/// without decompressing the zstd payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SparseArchiveHeaderV2 {
+    pub version: u32,
+    pub mode: HaploidIbdMode,
+    pub target_sample_ids: Vec<String>,
+    pub reference_sample_ids: Vec<String>,
+    pub chrom_names: Vec<String>,
+    /// True iff target sample `s` is inbred/DH (dosage weight 1.0); false for diploid (0.5/hap).
+    pub target_is_inbred: Vec<bool>,
+    /// Total number of non-empty Union-of-Breakpoints bins across chromosomes.
+    pub n_bins: u64,
+}
+
+/// Compact zstd-compressed payload for `JHIBD02\0` archives. Multi-parent
+/// ancestry stores only lossless `segments` (typically 100x smaller than
+/// expanded `chrom_bins`), which both `postibd` and `hgwas` consume directly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum HaploidSparsePayloadV2 {
+    PairwiseIbd {
+        segments: Vec<IbdSegment>,
+        kinship_csr: SparseIbdKinshipCsr,
+    },
+    MultiParentAncestry {
+        segments: Vec<AncestrySegment>,
+    },
+}
+
+/// Lightweight metadata returned by `inspect_sparse_archive_meta` without
+/// materializing large `chrom_bins` matrices.
+#[derive(Debug, Clone)]
+pub struct SparseArchiveMeta {
+    pub version: u32,
+    pub mode: HaploidIbdMode,
+    pub target_sample_ids: Vec<String>,
+    pub reference_sample_ids: Vec<String>,
+    pub chrom_names: Vec<String>,
+    pub n_bins: usize,
+}
+
+/// Low-memory representation of a MultiParentAncestry `.jhibd` archive (works
+/// transparently for both legacy `JHIBD01\0` and compact `JHIBD02\0` files).
+#[derive(Debug, Clone)]
+pub struct AncestrySegmentsArchive {
+    pub version: u32,
+    pub mode: HaploidIbdMode,
+    pub target_sample_ids: Vec<String>,
+    pub reference_sample_ids: Vec<String>,
+    pub chrom_names: Vec<String>,
+    pub target_is_inbred: Vec<bool>,
+    pub segments: Vec<AncestrySegment>,
+    /// Only populated for synthetic `JHIBD01` archives that have empty `segments`
+    /// and non-empty `chrom_bins`.
+    pub fallback_chrom_bins: Vec<ChromosomeAncestryBinsSparse>,
+}
+
+/// Prefix of `HaploidSparseArchive` up to `chrom_names`, matching bincode's
+/// sequential field layout in `JHIBD01\0` so we can read header + `segments`
+/// and stop immediately before the multi-GB `chrom_bins` vector.
+#[derive(Debug, Deserialize)]
+struct LegacyArchivePrefix {
+    version: u32,
+    mode: HaploidIbdMode,
+    target_sample_ids: Vec<String>,
+    reference_sample_ids: Vec<String>,
+    chrom_names: Vec<String>,
+}
+
+/// Infer per-sample inbred flags from `segments` when reading legacy `JHIBD01`
+/// archives that did not record `target_is_inbred` explicitly.
+pub fn infer_target_is_inbred_from_segments(
+    n_samples: usize,
+    segments: &[AncestrySegment],
+) -> Vec<bool> {
+    let mut is_inbred = vec![true; n_samples];
+    for seg in segments {
+        let s = seg.target_sample as usize;
+        if s < n_samples && seg.hap > 0 {
+            is_inbred[s] = false;
+        }
+    }
+    is_inbred
+}
+
+/// Count the exact number of non-empty Union-of-Breakpoints bins represented by
+/// `segments` across `n_chroms` chromosomes (matching
+/// `build_union_breakpoint_sparse_matrix`).
+pub fn count_union_breakpoint_bins(n_chroms: usize, segments: &[AncestrySegment]) -> usize {
+    if n_chroms == 0 || segments.is_empty() {
+        return 0;
+    }
+    let mut events_by_chrom: Vec<Vec<(u64, i32)>> = vec![Vec::new(); n_chroms];
+    for seg in segments {
+        let c = seg.chrom_idx as usize;
+        if c < n_chroms && seg.end_bp >= seg.start_bp {
+            events_by_chrom[c].push((seg.start_bp, 1));
+            events_by_chrom[c].push((seg.end_bp.saturating_add(1), -1));
+        }
+    }
+    events_by_chrom
+        .into_par_iter()
+        .map(|mut evs| {
+            if evs.is_empty() {
+                return 0usize;
+            }
+            evs.sort_unstable_by_key(|&(bp, _)| bp);
+            let mut active: i64 = 0;
+            let mut n_bins = 0usize;
+            let mut i = 0usize;
+            let len = evs.len();
+            while i < len {
+                let bp = evs[i].0;
+                while i < len && evs[i].0 == bp {
+                    active += evs[i].1 as i64;
+                    i += 1;
+                }
+                if i < len && active > 0 {
+                    n_bins += 1;
+                }
+            }
+            n_bins
+        })
+        .sum()
 }
 
 /// Bounded-memory chunked parallel zstd writer that emits standard RFC 8878
@@ -146,9 +274,10 @@ impl<W: Write> Write for ParallelZstdFrameWriter<W> {
 }
 
 /// Write a `HaploidSparseArchive` atomically to `path` via a same-directory
-/// temporary file using zstd-compressed bincode with a fixed 8-byte `JHIBD01\0`
-/// magic header, so an abrupt signal (`os._exit`) never leaves a truncated archive
-/// at `path`.
+/// temporary file. Multi-parent ancestry archives with segments are stored in
+/// the compact `JHIBD02\0` format (uncompressed header + zstd segments, no
+/// redundant expanded `chrom_bins`), while synthetic bin-only archives fall
+/// back to `JHIBD01\0`.
 pub fn write_sparse_archive(path: &Path, archive: &HaploidSparseArchive) -> Result<(), String> {
     write_sparse_archive_with_threads(path, archive, 1)
 }
@@ -161,17 +290,56 @@ pub fn write_sparse_archive_with_threads(
     archive: &HaploidSparseArchive,
     threads: usize,
 ) -> Result<(), String> {
+    match &archive.payload {
+        HaploidSparsePayload::MultiParentAncestry {
+            segments,
+            chrom_bins,
+        } if segments.is_empty() && !chrom_bins.is_empty() => {
+            write_sparse_archive_v1_with_threads(path, archive, threads)
+        }
+        HaploidSparsePayload::MultiParentAncestry {
+            segments,
+            chrom_bins,
+        } => {
+            let target_is_inbred =
+                infer_target_is_inbred_from_segments(archive.target_sample_ids.len(), segments);
+            let n_bins: u64 = if !chrom_bins.is_empty() {
+                chrom_bins
+                    .iter()
+                    .map(|cb| cb.bin_starts_bp.len() as u64)
+                    .sum()
+            } else {
+                count_union_breakpoint_bins(archive.chrom_names.len(), segments) as u64
+            };
+            write_sparse_archive_v2_with_threads(path, archive, &target_is_inbred, n_bins, threads)
+        }
+        HaploidSparsePayload::PairwiseIbd { .. } => {
+            write_sparse_archive_v2_with_threads(path, archive, &[], 0, threads)
+        }
+    }
+}
+
+/// Write legacy `JHIBD01\0` format verbatim (retained for synthetic bin-only
+/// test fixtures and backward-compatibility round-trip tests).
+pub fn write_sparse_archive_v1_with_threads(
+    path: &Path,
+    archive: &HaploidSparseArchive,
+    threads: usize,
+) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(|err| {
-                format!("create output directory {}: {err}", parent.display())
-            })?;
+            std::fs::create_dir_all(parent)
+                .map_err(|err| format!("create output directory {}: {err}", parent.display()))?;
         }
     }
     let tmp_path = sibling_temp_path(path);
     let write_res = (|| -> Result<(), String> {
-        let file = File::create(&tmp_path)
-            .map_err(|err| format!("create sparse IBD temp output {}: {err}", tmp_path.display()))?;
+        let file = File::create(&tmp_path).map_err(|err| {
+            format!(
+                "create sparse IBD temp output {}: {err}",
+                tmp_path.display()
+            )
+        })?;
         let mut writer = BufWriter::with_capacity(1 << 20, file);
         writer
             .write_all(JHIBD_MAGIC)
@@ -181,9 +349,9 @@ pub fn write_sparse_archive_with_threads(
             bincode::serialize_into(&mut encoder, archive).map_err(|err| {
                 format!("serialize sparse IBD archive {}: {err}", tmp_path.display())
             })?;
-            encoder
-                .finish()
-                .map_err(|err| format!("finish parallel zstd stream {}: {err}", tmp_path.display()))?;
+            encoder.finish().map_err(|err| {
+                format!("finish parallel zstd stream {}: {err}", tmp_path.display())
+            })?;
         } else {
             let mut encoder = zstd::stream::Encoder::new(writer, 3)
                 .map_err(|err| format!("init zstd encoder for {}: {err}", tmp_path.display()))?;
@@ -214,7 +382,270 @@ pub fn write_sparse_archive_with_threads(
     Ok(())
 }
 
-/// Load a `HaploidSparseArchive` from `path` (primary entry point for `src/hgwas`).
+/// Write compact `JHIBD02\0` format: uncompressed `SparseArchiveHeaderV2`
+/// followed by zstd-compressed `HaploidSparsePayloadV2` (segments only for
+/// MultiParentAncestry, omitting redundant expanded `chrom_bins`).
+pub fn write_sparse_archive_v2_with_threads(
+    path: &Path,
+    archive: &HaploidSparseArchive,
+    target_is_inbred: &[bool],
+    n_bins: u64,
+    threads: usize,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| format!("create output directory {}: {err}", parent.display()))?;
+        }
+    }
+    let header = SparseArchiveHeaderV2 {
+        version: 2,
+        mode: archive.mode,
+        target_sample_ids: archive.target_sample_ids.clone(),
+        reference_sample_ids: archive.reference_sample_ids.clone(),
+        chrom_names: archive.chrom_names.clone(),
+        target_is_inbred: if target_is_inbred.len() == archive.target_sample_ids.len() {
+            target_is_inbred.to_vec()
+        } else {
+            vec![true; archive.target_sample_ids.len()]
+        },
+        n_bins,
+    };
+    let tmp_path = sibling_temp_path(path);
+    let write_res = (|| -> Result<(), String> {
+        let file = File::create(&tmp_path).map_err(|err| {
+            format!(
+                "create sparse IBD temp output {}: {err}",
+                tmp_path.display()
+            )
+        })?;
+        let mut writer = BufWriter::with_capacity(1 << 20, file);
+        writer
+            .write_all(JHIBD_MAGIC_V2)
+            .map_err(|err| format!("write magic header to {}: {err}", tmp_path.display()))?;
+        bincode::serialize_into(&mut writer, &header)
+            .map_err(|err| format!("serialize JHIBD02 header {}: {err}", tmp_path.display()))?;
+        let serialize_payload = |enc: &mut dyn Write| -> Result<(), String> {
+            match &archive.payload {
+                HaploidSparsePayload::PairwiseIbd {
+                    segments,
+                    kinship_csr,
+                } => {
+                    // Tag 0u32 matches HaploidSparsePayloadV2::PairwiseIbd.
+                    bincode::serialize_into(&mut *enc, &0u32)
+                        .and_then(|()| bincode::serialize_into(&mut *enc, segments))
+                        .and_then(|()| bincode::serialize_into(&mut *enc, kinship_csr))
+                        .map_err(|err| {
+                            format!(
+                                "serialize JHIBD02 PairwiseIbd {}: {err}",
+                                tmp_path.display()
+                            )
+                        })
+                }
+                HaploidSparsePayload::MultiParentAncestry { segments, .. } => {
+                    // Tag 1u32 matches HaploidSparsePayloadV2::MultiParentAncestry.
+                    bincode::serialize_into(&mut *enc, &1u32)
+                        .and_then(|()| bincode::serialize_into(&mut *enc, segments))
+                        .map_err(|err| {
+                            format!(
+                                "serialize JHIBD02 MultiParentAncestry {}: {err}",
+                                tmp_path.display()
+                            )
+                        })
+                }
+            }
+        };
+        if threads > 1 {
+            let mut encoder = ParallelZstdFrameWriter::new(writer, 3, threads);
+            serialize_payload(&mut encoder)?;
+            encoder.finish().map_err(|err| {
+                format!("finish parallel zstd stream {}: {err}", tmp_path.display())
+            })?;
+        } else {
+            let mut encoder = zstd::stream::Encoder::new(writer, 3)
+                .map_err(|err| format!("init zstd encoder for {}: {err}", tmp_path.display()))?;
+            serialize_payload(&mut encoder)?;
+            let mut inner = encoder
+                .finish()
+                .map_err(|err| format!("finish zstd stream {}: {err}", tmp_path.display()))?;
+            inner
+                .flush()
+                .map_err(|err| format!("flush sparse IBD output {}: {err}", tmp_path.display()))?;
+        }
+        Ok(())
+    })();
+    if let Err(err) = write_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    std::fs::rename(&tmp_path, path).map_err(|err| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!(
+            "finalize sparse IBD archive {} -> {}: {err}",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// Fast metadata inspection for `.jhibd` archives:
+/// - `JHIBD02\0`: reads only the uncompressed header (<1 ms, zero zstd work).
+/// - `JHIBD01\0`: reads header + `segments` only and stops before `chrom_bins`.
+pub fn inspect_sparse_archive_meta(path: &Path) -> Result<SparseArchiveMeta, String> {
+    let file = File::open(path)
+        .map_err(|err| format!("open sparse IBD archive {}: {err}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut magic = [0u8; 8];
+    reader
+        .read_exact(&mut magic)
+        .map_err(|err| format!("read magic header from {}: {err}", path.display()))?;
+    if &magic == JHIBD_MAGIC_V2 {
+        let hdr: SparseArchiveHeaderV2 = bincode::deserialize_from(&mut reader)
+            .map_err(|err| format!("deserialize JHIBD02 header {}: {err}", path.display()))?;
+        return Ok(SparseArchiveMeta {
+            version: hdr.version,
+            mode: hdr.mode,
+            target_sample_ids: hdr.target_sample_ids,
+            reference_sample_ids: hdr.reference_sample_ids,
+            chrom_names: hdr.chrom_names,
+            n_bins: hdr.n_bins as usize,
+        });
+    }
+    if &magic != JHIBD_MAGIC {
+        return Err(format!(
+            "invalid JHIBD magic header in {}: expected {:?} or {:?}, got {:?}",
+            path.display(),
+            JHIBD_MAGIC,
+            JHIBD_MAGIC_V2,
+            magic
+        ));
+    }
+    let anc = read_ancestry_segments_archive(path)?;
+    let n_bins = if !anc.segments.is_empty() {
+        count_union_breakpoint_bins(anc.chrom_names.len(), &anc.segments)
+    } else {
+        anc.fallback_chrom_bins
+            .iter()
+            .map(|cb| cb.bin_starts_bp.len())
+            .sum()
+    };
+    Ok(SparseArchiveMeta {
+        version: anc.version,
+        mode: anc.mode,
+        target_sample_ids: anc.target_sample_ids,
+        reference_sample_ids: anc.reference_sample_ids,
+        chrom_names: anc.chrom_names,
+        n_bins,
+    })
+}
+
+/// Low-memory reader for `MultiParentAncestry` `.jhibd` archives (used by both
+/// `src/stats/hgwas.rs` and `src/haploid/post.rs`).
+///
+/// - On `JHIBD02\0`: reads compact header + zstd `segments` directly.
+/// - On `JHIBD01\0`: reads header + `segments` from the zstd stream and stops
+///   immediately before the multi-GB `chrom_bins` vector whenever `segments` is
+///   non-empty (falling back to `chrom_bins` only for synthetic bin-only files).
+pub fn read_ancestry_segments_archive(path: &Path) -> Result<AncestrySegmentsArchive, String> {
+    let file = File::open(path)
+        .map_err(|err| format!("open sparse IBD archive {}: {err}", path.display()))?;
+    let mut reader = BufReader::with_capacity(256 * 1024, file);
+    let mut magic = [0u8; 8];
+    reader
+        .read_exact(&mut magic)
+        .map_err(|err| format!("read magic header from {}: {err}", path.display()))?;
+
+    if &magic == JHIBD_MAGIC_V2 {
+        let hdr: SparseArchiveHeaderV2 = bincode::deserialize_from(&mut reader)
+            .map_err(|err| format!("deserialize JHIBD02 header {}: {err}", path.display()))?;
+        if hdr.mode != HaploidIbdMode::MultiParentAncestry {
+            return Err(format!(
+                "input .jhibd archive is in {:?} mode; expected MultiParentAncestry",
+                hdr.mode
+            ));
+        }
+        let mut decoder = zstd::stream::Decoder::new(reader)
+            .map_err(|err| format!("init zstd decoder for {}: {err}", path.display()))?;
+        let payload: HaploidSparsePayloadV2 = bincode::deserialize_from(&mut decoder)
+            .map_err(|err| format!("deserialize JHIBD02 payload {}: {err}", path.display()))?;
+        let segments = match payload {
+            HaploidSparsePayloadV2::MultiParentAncestry { segments } => segments,
+            HaploidSparsePayloadV2::PairwiseIbd { .. } => {
+                return Err(
+                    "input .jhibd archive payload is PairwiseIbd; expected MultiParentAncestry"
+                        .to_owned(),
+                );
+            }
+        };
+        let target_is_inbred = if hdr.target_is_inbred.len() == hdr.target_sample_ids.len() {
+            hdr.target_is_inbred
+        } else {
+            infer_target_is_inbred_from_segments(hdr.target_sample_ids.len(), &segments)
+        };
+        return Ok(AncestrySegmentsArchive {
+            version: hdr.version,
+            mode: hdr.mode,
+            target_sample_ids: hdr.target_sample_ids,
+            reference_sample_ids: hdr.reference_sample_ids,
+            chrom_names: hdr.chrom_names,
+            target_is_inbred,
+            segments,
+            fallback_chrom_bins: Vec::new(),
+        });
+    }
+
+    if &magic != JHIBD_MAGIC {
+        return Err(format!(
+            "invalid JHIBD magic header in {}: expected {:?} or {:?}, got {:?}",
+            path.display(),
+            JHIBD_MAGIC,
+            JHIBD_MAGIC_V2,
+            magic
+        ));
+    }
+
+    let mut decoder = zstd::stream::Decoder::new(reader)
+        .map_err(|err| format!("init zstd decoder for {}: {err}", path.display()))?;
+    let prefix: LegacyArchivePrefix = bincode::deserialize_from(&mut decoder)
+        .map_err(|err| format!("deserialize JHIBD01 header {}: {err}", path.display()))?;
+    if prefix.mode != HaploidIbdMode::MultiParentAncestry {
+        return Err(format!(
+            "input .jhibd archive is in {:?} mode; expected MultiParentAncestry",
+            prefix.mode
+        ));
+    }
+    let variant_tag: u32 = bincode::deserialize_from(&mut decoder)
+        .map_err(|err| format!("deserialize JHIBD01 payload tag {}: {err}", path.display()))?;
+    if variant_tag != 1 {
+        return Err(
+            "input .jhibd archive payload is PairwiseIbd; expected MultiParentAncestry".to_owned(),
+        );
+    }
+    let segments: Vec<AncestrySegment> = bincode::deserialize_from(&mut decoder)
+        .map_err(|err| format!("deserialize JHIBD01 segments {}: {err}", path.display()))?;
+    let fallback_chrom_bins = if segments.is_empty() {
+        bincode::deserialize_from(&mut decoder)
+            .map_err(|err| format!("deserialize JHIBD01 chrom_bins {}: {err}", path.display()))?
+    } else {
+        // Stop immediately before the multi-GB `chrom_bins` tail!
+        Vec::new()
+    };
+    let target_is_inbred =
+        infer_target_is_inbred_from_segments(prefix.target_sample_ids.len(), &segments);
+    Ok(AncestrySegmentsArchive {
+        version: prefix.version,
+        mode: prefix.mode,
+        target_sample_ids: prefix.target_sample_ids,
+        reference_sample_ids: prefix.reference_sample_ids,
+        chrom_names: prefix.chrom_names,
+        target_is_inbred,
+        segments,
+        fallback_chrom_bins,
+    })
+}
+
+/// Load a `HaploidSparseArchive` from `path` (supports both `JHIBD01\0` and `JHIBD02\0`).
 pub fn read_sparse_archive(path: &Path) -> Result<HaploidSparseArchive, String> {
     let file = File::open(path)
         .map_err(|err| format!("open sparse IBD archive {}: {err}", path.display()))?;
@@ -223,11 +654,43 @@ pub fn read_sparse_archive(path: &Path) -> Result<HaploidSparseArchive, String> 
     reader
         .read_exact(&mut magic)
         .map_err(|err| format!("read magic header from {}: {err}", path.display()))?;
+    if &magic == JHIBD_MAGIC_V2 {
+        let hdr: SparseArchiveHeaderV2 = bincode::deserialize_from(&mut reader)
+            .map_err(|err| format!("deserialize JHIBD02 header {}: {err}", path.display()))?;
+        let decoder = zstd::stream::Decoder::new(reader)
+            .map_err(|err| format!("init zstd decoder for {}: {err}", path.display()))?;
+        let payload_v2: HaploidSparsePayloadV2 = bincode::deserialize_from(decoder)
+            .map_err(|err| format!("deserialize JHIBD02 payload {}: {err}", path.display()))?;
+        let payload = match payload_v2 {
+            HaploidSparsePayloadV2::PairwiseIbd {
+                segments,
+                kinship_csr,
+            } => HaploidSparsePayload::PairwiseIbd {
+                segments,
+                kinship_csr,
+            },
+            HaploidSparsePayloadV2::MultiParentAncestry { segments } => {
+                HaploidSparsePayload::MultiParentAncestry {
+                    segments,
+                    chrom_bins: Vec::new(),
+                }
+            }
+        };
+        return Ok(HaploidSparseArchive {
+            version: hdr.version,
+            mode: hdr.mode,
+            target_sample_ids: hdr.target_sample_ids,
+            reference_sample_ids: hdr.reference_sample_ids,
+            chrom_names: hdr.chrom_names,
+            payload,
+        });
+    }
     if &magic != JHIBD_MAGIC {
         return Err(format!(
-            "invalid JHIBD magic header in {}: expected {:?}, got {:?}",
+            "invalid JHIBD magic header in {}: expected {:?} or {:?}, got {:?}",
             path.display(),
             JHIBD_MAGIC,
+            JHIBD_MAGIC_V2,
             magic
         ));
     }
@@ -473,8 +936,7 @@ pub fn write_segments_tsv_gz_parallel(
                 writer
                     .write_all(&hdr_gz)
                     .map_err(|err| format!("write IBD TSV header: {err}"))?;
-                let chunks: Vec<&[IbdSegment]> =
-                    segments.chunks(TSV_PARALLEL_CHUNK_ROWS).collect();
+                let chunks: Vec<&[IbdSegment]> = segments.chunks(TSV_PARALLEL_CHUNK_ROWS).collect();
                 for wave in chunks.chunks(wave_chunks) {
                     if is_cancelled(cancelled) {
                         return Err("Interrupted".to_owned());

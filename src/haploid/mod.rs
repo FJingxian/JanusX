@@ -3,7 +3,7 @@
 //!
 //! Deliberately isolated from `src/imp` so imputation memory/runtime
 //! optimizations remain untouched. Produces compact Rust-native sparse binary
-//! archives (`JHIBD01`) designed for downstream `src/hgwas` computation.
+//! archives (`JHIBD01` and compact `JHIBD02`) designed for downstream `src/hgwas` computation.
 
 pub mod ancestry;
 pub mod ibd;
@@ -16,26 +16,26 @@ pub mod types;
 
 use crate::imp::types::{PhaseSetId, VariantRow};
 use crate::imp_reader::ImpReader;
-use ancestry::{paint_chromosome_ancestry_cancellable, ChromosomeAncestryBinsSparse};
+use ancestry::paint_chromosome_ancestry_cancellable;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use ibd::{build_sparse_ibd_kinship_csr, detect_chromosome_ibd_cancellable};
 use mott::{
     paint_chromosome_mott_cancellable, select_even_marker_indices, MottCoreConfig,
     MottPosteriorMatrix, MottSegmentDiagnostic,
 };
 use phasing::{phase_unphased_diploids_one_pass, DisjointPhaseBlock, SampleHaplotypeLayout};
+use rayon::prelude::*;
 use sparse_io::{
-    write_segments_tsv_gz_parallel, write_sparse_archive_with_threads, HaploidSparseArchive,
-    HaploidSparsePayload,
+    write_segments_tsv_gz_parallel, write_sparse_archive_v2_with_threads,
+    write_sparse_archive_with_threads, HaploidSparseArchive, HaploidSparsePayload,
 };
 use std::collections::{HashMap, HashSet};
-use flate2::write::GzEncoder;
-use flate2::Compression;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
-use rayon::prelude::*;
 use types::{
     AncestryModel, AncestrySegment, BitHaplotypeMatrix, GeneticMap, HaploidIbdConfig,
     HaploidIbdMode, HaploidIbdProgress, HaploidIbdSummary, IbdSegment, PloidyMode,
@@ -190,10 +190,12 @@ where
     let mut total_genome_cm: f64 = 0.0;
     let mut last_inbred_count: usize = 0;
     let mut last_diploid_count: usize = 0;
+    let mut target_is_inbred_any = vec![true; target_sample_ids.len()];
 
     let mut all_ibd_segments: Vec<IbdSegment> = Vec::new();
     let mut all_ancestry_segments: Vec<AncestrySegment> = Vec::new();
-    let mut all_chrom_bins: Vec<ChromosomeAncestryBinsSparse> = Vec::new();
+    let mut total_sparse_bins: u64 = 0;
+    let mut total_sparse_nnz: u64 = 0;
     let mut all_mott_posteriors: Vec<MottPosteriorMatrix> = Vec::new();
     let mut all_mott_diagnostics: Vec<MottSegmentDiagnostic> = Vec::new();
 
@@ -298,9 +300,8 @@ where
                 last_inbred_count = is_inbred.iter().filter(|&&b| b).count();
                 last_diploid_count = target_sample_ids.len().saturating_sub(last_inbred_count);
                 let layout = SampleHaplotypeLayout::from_inbred_flags(is_inbred);
-                let (mut matrix, positions_bp, cm_positions) = pool.install(|| {
-                    encode_rows_to_matrix(&target_rows, &layout, &map)
-                });
+                let (mut matrix, positions_bp, cm_positions) =
+                    pool.install(|| encode_rows_to_matrix(&target_rows, &layout, &map));
                 drop(target_rows);
 
                 if cm_positions.len() >= 2 {
@@ -451,6 +452,11 @@ where
                         |m| &target_rows[aligned_pairs[m].target_idx],
                     )
                 });
+                for (dst, &flag) in target_is_inbred_any.iter_mut().zip(tgt_inbred.iter()) {
+                    if !flag {
+                        *dst = false;
+                    }
+                }
                 last_inbred_count = tgt_inbred.iter().filter(|&&b| b).count();
                 last_diploid_count = target_sample_ids.len().saturating_sub(last_inbred_count);
 
@@ -529,7 +535,9 @@ where
                             )
                         })?;
                         all_ancestry_segments.extend(segs);
-                        all_chrom_bins.push(bins);
+                        total_sparse_bins += bins.bin_starts_bp.len() as u64;
+                        total_sparse_nnz += bins.dosage.len() as u64;
+                        drop(bins);
                         joint_matrix.n_markers as u64
                     }
                     AncestryModel::Mott => {
@@ -546,7 +554,9 @@ where
                             )
                         })?;
                         all_ancestry_segments.extend(mott_out.segments);
-                        all_chrom_bins.push(mott_out.bins);
+                        total_sparse_bins += mott_out.bins.bin_starts_bp.len() as u64;
+                        total_sparse_nnz += mott_out.bins.dosage.len() as u64;
+                        drop(mott_out.bins);
                         all_mott_diagnostics.extend(mott_out.diagnostics);
                         if let Some(post) = mott_out.posterior {
                             all_mott_posteriors.push(post);
@@ -608,25 +618,20 @@ where
         }
         HaploidIbdMode::MultiParentAncestry => {
             let segs_n = all_ancestry_segments.len() as u64;
-            let bins_n: u64 = all_chrom_bins
-                .iter()
-                .map(|b| b.bin_starts_bp.len() as u64)
-                .sum();
-            let nnz: u64 = all_chrom_bins.iter().map(|b| b.dosage.len() as u64).sum();
             (
                 segs_n,
-                bins_n,
-                nnz,
+                total_sparse_bins,
+                total_sparse_nnz,
                 HaploidSparsePayload::MultiParentAncestry {
                     segments: all_ancestry_segments,
-                    chrom_bins: all_chrom_bins,
+                    chrom_bins: Vec::new(),
                 },
             )
         }
     };
 
     let archive = HaploidSparseArchive {
-        version: 1,
+        version: 2,
         mode,
         target_sample_ids: target_sample_ids.clone(),
         reference_sample_ids: reference_sample_ids.clone(),
@@ -647,7 +652,18 @@ where
     if is_cancelled(cancelled) {
         return Err("Interrupted".to_owned());
     }
-    pool.install(|| write_sparse_archive_with_threads(&output_path, &archive, threads))?;
+    pool.install(|| match mode {
+        HaploidIbdMode::MultiParentAncestry => write_sparse_archive_v2_with_threads(
+            &output_path,
+            &archive,
+            &target_is_inbred_any,
+            sparse_bins_written,
+            threads,
+        ),
+        HaploidIbdMode::PairwiseIbd => {
+            write_sparse_archive_with_threads(&output_path, &archive, threads)
+        }
+    })?;
 
     let tsv_path = if config.write_tsv {
         let mut p = output_path.clone();
@@ -678,11 +694,7 @@ where
         && config.mott_write_diagnostics
     {
         let diagnostics_path = mott_diagnostics_tsv_output_path(&config.output);
-        write_mott_diagnostics_tsv_atomic(
-            &diagnostics_path,
-            &all_mott_diagnostics,
-            cancelled,
-        )?;
+        write_mott_diagnostics_tsv_atomic(&diagnostics_path, &all_mott_diagnostics, cancelled)?;
         Some(diagnostics_path.to_string_lossy().into_owned())
     } else {
         None
@@ -968,10 +980,8 @@ fn write_mott_diagnostics_tsv_atomic(
     let write_res = (|| -> Result<(), String> {
         let file = File::create(&tmp_path)
             .map_err(|err| format!("create temp diagnostics {}: {err}", tmp_path.display()))?;
-        let mut encoder = GzEncoder::new(
-            BufWriter::with_capacity(1 << 20, file),
-            Compression::fast(),
-        );
+        let mut encoder =
+            GzEncoder::new(BufWriter::with_capacity(1 << 20, file), Compression::fast());
         encoder
             .write_all(
                 b"target\tchrom\tstart_bp\tend_bp\tcalled_parent\tconfidence\tsecond_parent\tsecond_posterior\tposterior_margin\tambiguous_parents\n",
@@ -981,11 +991,7 @@ fn write_mott_diagnostics_tsv_atomic(
             if (idx & 4095) == 0 && is_cancelled(cancelled) {
                 return Err("Interrupted".to_owned());
             }
-            for value in [
-                row.confidence,
-                row.second_posterior,
-                row.posterior_margin,
-            ] {
+            for value in [row.confidence, row.second_posterior, row.posterior_margin] {
                 if !value.is_finite() {
                     return Err(format!(
                         "non-finite diagnostic value at row {idx} for target {}",
@@ -1072,10 +1078,7 @@ fn write_mott_posterior_tsv_atomic(
         .and_then(|s| s.to_str())
         .unwrap_or("posterior.tsv");
     let tmp_id = MOTT_POSTERIOR_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp_path = path.with_file_name(format!(
-        ".{file_name}.tmp.{}.{tmp_id}",
-        std::process::id()
-    ));
+    let tmp_path = path.with_file_name(format!(".{file_name}.tmp.{}.{tmp_id}", std::process::id()));
     let write_res = (|| -> Result<(), String> {
         let file = File::create(&tmp_path)
             .map_err(|err| format!("create temp posterior {}: {err}", tmp_path.display()))?;
@@ -1468,13 +1471,13 @@ fn encode_joint_rows_to_matrix_indexed(
                     let call = trow.calls.get(s);
                     if tgt_layout.is_inbred[s] {
                         let val = call.and_then(|c| match c.alleles {
-                            [Some(a0), Some(a1)] if a0 == a1 && a0 <= 1 => Some(
-                                if pair.swap_alleles {
+                            [Some(a0), Some(a1)] if a0 == a1 && a0 <= 1 => {
+                                Some(if pair.swap_alleles {
                                     1 - a0 as u8
                                 } else {
                                     a0 as u8
-                                },
-                            ),
+                                })
+                            }
                             _ => None,
                         });
                         set_bit_in_row(allele_row, missing_row, off, val);
@@ -1485,19 +1488,13 @@ fn encode_joint_rows_to_matrix_indexed(
                                     allele_row,
                                     missing_row,
                                     off,
-                                    flipped_biallelic_code(
-                                        c.alleles[0],
-                                        pair.swap_alleles,
-                                    ),
+                                    flipped_biallelic_code(c.alleles[0], pair.swap_alleles),
                                 );
                                 set_bit_in_row(
                                     allele_row,
                                     missing_row,
                                     off + 1,
-                                    flipped_biallelic_code(
-                                        c.alleles[1],
-                                        pair.swap_alleles,
-                                    ),
+                                    flipped_biallelic_code(c.alleles[1], pair.swap_alleles),
                                 );
                             }
                             None => {
@@ -1590,8 +1587,12 @@ fn align_chromosome_row_indices(
             None
         }
     };
-    let ref_sorted = ref_rows.par_windows(2).all(|w| w[0].meta.pos <= w[1].meta.pos);
-    let tgt_sorted = tgt_rows.par_windows(2).all(|w| w[0].meta.pos <= w[1].meta.pos);
+    let ref_sorted = ref_rows
+        .par_windows(2)
+        .all(|w| w[0].meta.pos <= w[1].meta.pos);
+    let tgt_sorted = tgt_rows
+        .par_windows(2)
+        .all(|w| w[0].meta.pos <= w[1].meta.pos);
     if ref_sorted && tgt_sorted {
         let mut aligned = Vec::with_capacity(ref_rows.len().min(tgt_rows.len()));
         let mut stats = AlignChromStats::default();
@@ -1638,7 +1639,12 @@ fn align_chromosome_row_indices(
                         HashMap::with_capacity(r_end - ri);
                     for ridx in ri..r_end {
                         let rrow = &ref_rows[ridx];
-                        let r_alt0 = rrow.meta.alt_alleles.first().map(String::as_str).unwrap_or("");
+                        let r_alt0 = rrow
+                            .meta
+                            .alt_alleles
+                            .first()
+                            .map(String::as_str)
+                            .unwrap_or("");
                         local_ref.insert((rrow.meta.ref_allele.as_str(), r_alt0), ridx);
                     }
                     for tidx in ti..t_end {
@@ -1649,8 +1655,7 @@ fn align_chromosome_row_indices(
                             .first()
                             .map(String::as_str)
                             .unwrap_or("");
-                        if let Some(&ridx) =
-                            local_ref.get(&(trow.meta.ref_allele.as_str(), t_alt0))
+                        if let Some(&ridx) = local_ref.get(&(trow.meta.ref_allele.as_str(), t_alt0))
                         {
                             stats.exact += 1;
                             aligned.push(AlignedVariantPair {
@@ -1717,7 +1722,12 @@ fn align_chromosome_row_indices(
     let mut ref_index: HashMap<(u64, &str, &str), usize> = HashMap::with_capacity(ref_rows.len());
     let mut ref_positions: HashSet<u64> = HashSet::with_capacity(ref_rows.len());
     for (idx, row) in ref_rows.iter().enumerate() {
-        let alt0 = row.meta.alt_alleles.first().map(String::as_str).unwrap_or("");
+        let alt0 = row
+            .meta
+            .alt_alleles
+            .first()
+            .map(String::as_str)
+            .unwrap_or("");
         ref_index.insert((row.meta.pos, row.meta.ref_allele.as_str(), alt0), idx);
         ref_positions.insert(row.meta.pos);
     }
@@ -1729,7 +1739,12 @@ fn align_chromosome_row_indices(
         .par_iter()
         .enumerate()
         .filter_map(|(tidx, trow)| {
-            let alt0 = trow.meta.alt_alleles.first().map(String::as_str).unwrap_or("");
+            let alt0 = trow
+                .meta
+                .alt_alleles
+                .first()
+                .map(String::as_str)
+                .unwrap_or("");
             if let Some(&ridx) =
                 ref_index.get(&(trow.meta.pos, trow.meta.ref_allele.as_str(), alt0))
             {
@@ -1740,11 +1755,9 @@ fn align_chromosome_row_indices(
                 }));
             }
             if allow_swapped_alleles {
-                if let Some(&ridx) = ref_index.get(&(
-                    trow.meta.pos,
-                    alt0,
-                    trow.meta.ref_allele.as_str(),
-                )) {
+                if let Some(&ridx) =
+                    ref_index.get(&(trow.meta.pos, alt0, trow.meta.ref_allele.as_str()))
+                {
                     return Some(UnsortedMatch::Aligned(AlignedVariantPair {
                         ref_idx: ridx,
                         target_idx: tidx,
@@ -1783,9 +1796,8 @@ fn align_chromosome_row_indices(
 mod tests {
     use super::{
         align_chromosome_row_indices, classify_and_collect_hets,
-        encode_joint_rows_to_matrix_indexed, DisjointPhaseBlock, GeneticMap, PloidyMode,
-        RefChromSpool, SampleHaplotypeLayout, MottPosteriorMatrix,
-        write_mott_posterior_tsv_atomic,
+        encode_joint_rows_to_matrix_indexed, write_mott_posterior_tsv_atomic, DisjointPhaseBlock,
+        GeneticMap, MottPosteriorMatrix, PloidyMode, RefChromSpool, SampleHaplotypeLayout,
     };
     use crate::imp::types::{DiploidCall, DiploidCalls, PhaseSetId, VariantMeta, VariantRow};
     use std::io::Write;
@@ -1977,8 +1989,14 @@ mod tests {
             .unwrap()
             .as_nanos();
         let dir = std::env::temp_dir();
-        let vcf_path = dir.join(format!("janusx_haploid_bad_gt_{}_{unique}.vcf", std::process::id()));
-        let out_path = dir.join(format!("janusx_haploid_bad_gt_{}_{unique}", std::process::id()));
+        let vcf_path = dir.join(format!(
+            "janusx_haploid_bad_gt_{}_{unique}.vcf",
+            std::process::id()
+        ));
+        let out_path = dir.join(format!(
+            "janusx_haploid_bad_gt_{}_{unique}",
+            std::process::id()
+        ));
         std::fs::write(
             &vcf_path,
             concat!(
@@ -2013,9 +2031,18 @@ mod tests {
             .unwrap()
             .as_nanos();
         let dir = std::env::temp_dir();
-        let tgt_path = dir.join(format!("janusx_haploid_tgt_ok_{}_{unique}.vcf", std::process::id()));
-        let ref_path = dir.join(format!("janusx_haploid_ref_bad_{}_{unique}.vcf", std::process::id()));
-        let out_path = dir.join(format!("janusx_haploid_ref_bad_{}_{unique}", std::process::id()));
+        let tgt_path = dir.join(format!(
+            "janusx_haploid_tgt_ok_{}_{unique}.vcf",
+            std::process::id()
+        ));
+        let ref_path = dir.join(format!(
+            "janusx_haploid_ref_bad_{}_{unique}.vcf",
+            std::process::id()
+        ));
+        let out_path = dir.join(format!(
+            "janusx_haploid_ref_bad_{}_{unique}",
+            std::process::id()
+        ));
         std::fs::write(
             &tgt_path,
             concat!(

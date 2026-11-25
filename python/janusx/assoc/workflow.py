@@ -5342,8 +5342,18 @@ def _prepare_ibd_stream_context(
     logger: logging.Logger,
     use_spinner: bool = False,
     inverse_normal: bool = False,
+    ibd_handle: Optional[object] = None,
 ) -> tuple[pd.DataFrame, np.ndarray, int, np.ndarray, np.ndarray, Optional[np.ndarray], int]:
-    ibd_ids, n_bins, _info = _inspect_ibd_source(ibd_path)
+    if ibd_handle is not None:
+        info = dict(ibd_handle.inspect())
+        ibd_ids = np.asarray(info.get("sample_ids", []), dtype=str).reshape(-1)
+        n_bins = int(info.get("n_bins", 0))
+        if ibd_ids.shape[0] == 0 or n_bins == 0:
+            raise ValueError(".jhibd archive contains no target samples or ancestry bins.")
+        if len(set(ibd_ids.tolist())) != int(ibd_ids.shape[0]):
+            raise ValueError(".jhibd archive contains duplicate target sample IDs.")
+    else:
+        ibd_ids, n_bins, _info = _inspect_ibd_source(ibd_path)
     pheno = _load_phenotype_with_status(
         phenofile,
         pheno_cols,
@@ -5429,7 +5439,7 @@ def _prepare_ibd_stream_context(
             f"(n={int(grm.shape[0])}) [{format_elapsed(time.monotonic() - grm_t0)}]",
         )
     else:
-        if not hasattr(jxrs, "hgwas_grm_from_jhibd_f64"):
+        if ibd_handle is None and not hasattr(jxrs, "hgwas_grm_from_jhibd_f64"):
             raise RuntimeError(
                 "Rust extension missing hgwas_grm_from_jhibd_f64; rebuild/reinstall JanusX."
             )
@@ -5441,12 +5451,19 @@ def _prepare_ibd_stream_context(
             use_process=True,
         ) as task:
             try:
-                grm_raw, eff_bins = jxrs.hgwas_grm_from_jhibd_f64(
-                    str(ibd_path),
-                    sample_indices=np.ascontiguousarray(sample_indices, dtype=np.int64),
-                    method=int(method_int),
-                    threads=max(1, int(threads)),
-                )
+                if ibd_handle is not None:
+                    grm_raw, eff_bins = ibd_handle.build_grm(
+                        sample_indices=np.ascontiguousarray(sample_indices, dtype=np.int64),
+                        method=int(method_int),
+                        threads=max(1, int(threads)),
+                    )
+                else:
+                    grm_raw, eff_bins = jxrs.hgwas_grm_from_jhibd_f64(
+                        str(ibd_path),
+                        sample_indices=np.ascontiguousarray(sample_indices, dtype=np.int64),
+                        method=int(method_int),
+                        threads=max(1, int(threads)),
+                    )
                 grm = np.ascontiguousarray(np.asarray(grm_raw, dtype=np.float64))
                 eff_m = int(eff_bins)
             except Exception:
@@ -9050,6 +9067,7 @@ def _run_gwas_pipeline_impl(
     file_fast_dense_mode = False
     preinspect_ids: Optional[np.ndarray] = None
     preinspect_n_snps: Optional[int] = None
+    preinspect_ibd_handle: Optional[object] = None
     preinspect_elapsed_secs: Optional[float] = None
     preinspect_src_for_merge: Optional[str] = None
     preinspect_warnings: list[str] = []
@@ -9070,7 +9088,17 @@ def _run_gwas_pipeline_impl(
         if ibd_mode:
             preinspect_t0 = time.monotonic()
             try:
-                preinspect_ids, preinspect_n_snps, _ibd_info = _inspect_ibd_source(gfile)
+                if hasattr(jxrs, "HgwasArchive"):
+                    preinspect_ibd_handle = jxrs.HgwasArchive.open(str(gfile))
+                    _ibd_info = dict(preinspect_ibd_handle.inspect())
+                    preinspect_ids = np.asarray(
+                        _ibd_info.get("sample_ids", []), dtype=str
+                    ).reshape(-1)
+                    preinspect_n_snps = int(_ibd_info.get("n_bins", 0))
+                else:
+                    preinspect_ids, preinspect_n_snps, _ibd_info = _inspect_ibd_source(
+                        gfile
+                    )
             except Exception as ex:
                 _abort_cli_input_error(logger, ex)
             preinspect_elapsed_secs = max(time.monotonic() - preinspect_t0, 0.0)
@@ -9176,7 +9204,17 @@ def _run_gwas_pipeline_impl(
     elif ibd_mode:
         preinspect_t0 = time.monotonic()
         try:
-            preinspect_ids, preinspect_n_snps, _ibd_info = _inspect_ibd_source(gfile)
+            if hasattr(jxrs, "HgwasArchive"):
+                preinspect_ibd_handle = jxrs.HgwasArchive.open(str(gfile))
+                _ibd_info = dict(preinspect_ibd_handle.inspect())
+                preinspect_ids = np.asarray(
+                    _ibd_info.get("sample_ids", []), dtype=str
+                ).reshape(-1)
+                preinspect_n_snps = int(_ibd_info.get("n_bins", 0))
+            else:
+                preinspect_ids, preinspect_n_snps, _ibd_info = _inspect_ibd_source(
+                    gfile
+                )
         except Exception as ex:
             _abort_cli_input_error(logger, ex)
         preinspect_elapsed_secs = max(time.monotonic() - preinspect_t0, 0.0)
@@ -9951,6 +9989,9 @@ def _run_gwas_pipeline_impl(
                     _section(terminal_logger, "hGWAS task")
                 if (not bool(preconfig_successes_flushed)) and len(preconfig_terminal_successes) > 0:
                     _flush_preconfig_successes()
+                ibd_handle = preinspect_ibd_handle
+                if ibd_handle is None and hasattr(jxrs, "HgwasArchive"):
+                    ibd_handle = jxrs.HgwasArchive.open(str(genofile_stream))
                 pheno, ids, n_bins, grm, qmatrix, cov_all, eff_m = _prepare_ibd_stream_context(
                     ibd_path=str(genofile_stream),
                     phenofile=str(args.pheno),
@@ -9962,6 +10003,7 @@ def _run_gwas_pipeline_impl(
                     logger=logger,
                     use_spinner=bool(use_spinner),
                     inverse_normal=bool(getattr(args, "intrans", False)),
+                    ibd_handle=ibd_handle,
                 )
                 _flush_pending_gwas_overlap_line(
                     logger,
@@ -10003,6 +10045,7 @@ def _run_gwas_pipeline_impl(
                     saved_paths=saved_result_paths,
                     use_spinner=bool(use_spinner),
                     plot=bool(args.plot),
+                    ibd_handle=ibd_handle,
                 )
                 ibd_rows = gwas_summary_rows[ibd_summary_start:]
                 emitted_ibd_rows: set[int] = set()

@@ -125,8 +125,6 @@ mod sim;
 #[path = "io/vcfout.rs"]
 mod vcfout;
 
-
-
 // math
 #[path = "math/active_path.rs"]
 mod active_path;
@@ -190,8 +188,8 @@ use fst::fst_bed_window_to_tsv;
 use fvlmm::{
     fvlmm_assoc_bed_to_tsv_f32, fvlmm_assoc_chunk_f32, fvlmm_assoc_chunk_from_snp_f32,
     fvlmm_assoc_chunk_from_snp_to_tsv_f32, fvlmm_assoc_chunk_from_snp_with_cache_f32,
-    fvlmm_assoc_chunk_with_cache_f32, fvlmm_assoc_kfile_to_tsv_f32,
-    fvlmm_assoc_packed_f32_to_tsv, fvlmm_assoc_prepare_cache_f32, FvLmmAssocCache,
+    fvlmm_assoc_chunk_with_cache_f32, fvlmm_assoc_kfile_to_tsv_f32, fvlmm_assoc_packed_f32_to_tsv,
+    fvlmm_assoc_prepare_cache_f32, FvLmmAssocCache,
 };
 
 use garfield::{
@@ -234,7 +232,9 @@ use gwas_unified::{
 use gwriter::{HmpStreamWriter, PgenStreamWriter, PlinkStreamWriter, VcfStreamWriter};
 use he::he_pcg_bed;
 use heritability::{prepare_sparse_onehot_blup_cache, SparseOneHotBlupCache};
-use hgwas::{hgwas_grm_from_jhibd_f64, hgwas_inspect_jhibd, hgwas_scan_jhibd_to_tsv_f64};
+use hgwas::{
+    hgwas_grm_from_jhibd_f64, hgwas_inspect_jhibd, hgwas_scan_jhibd_to_tsv_f64, HgwasArchive,
+};
 use kmer::{
     kfile_inspect_py, kfile_read_rows_f32_py, kformat_run_py, kmer_count_run_py,
     kmer_resolve_inputs_py, kmerge_run_py, kstats_run_py,
@@ -364,8 +364,9 @@ fn haploid_ibd_run(
         Finished(Result<haploid::types::HaploidIbdSummary, String>),
     }
 
-    let config = serde_json::from_str::<haploid::types::HaploidIbdConfig>(&options_json)
-        .map_err(|error| PyRuntimeError::new_err(format!("invalid haploid ibd options: {error}")))?;
+    let config = serde_json::from_str::<haploid::types::HaploidIbdConfig>(&options_json).map_err(
+        |error| PyRuntimeError::new_err(format!("invalid haploid ibd options: {error}")),
+    )?;
     let cancelled = Arc::new(AtomicBool::new(false));
     let (tx, mut rx) = mpsc::channel::<WorkerMsg>();
 
@@ -388,31 +389,33 @@ fn haploid_ibd_run(
         let _ = tx.send(WorkerMsg::Finished(run_res));
     });
 
-    let dispatch_progress = |py: Python<'_>, event: &haploid::types::HaploidIbdProgress| -> PyResult<()> {
-        if let Some(cb) = progress_callback.as_ref() {
-            cb.call1(
-                py,
-                (
-                    event.stage.as_str(),
-                    event.chrom.as_str(),
-                    event.chrom_index,
-                    event.chrom_markers,
-                    event.raw_target_markers_done,
-                    event.markers_done,
-                    event.segments_found,
-                ),
-            )?;
-        }
-        Ok(())
-    };
+    let dispatch_progress =
+        |py: Python<'_>, event: &haploid::types::HaploidIbdProgress| -> PyResult<()> {
+            if let Some(cb) = progress_callback.as_ref() {
+                cb.call1(
+                    py,
+                    (
+                        event.stage.as_str(),
+                        event.chrom.as_str(),
+                        event.chrom_index,
+                        event.chrom_markers,
+                        event.raw_target_markers_done,
+                        event.markers_done,
+                        event.segments_found,
+                    ),
+                )?;
+            }
+            Ok(())
+        };
 
-    let finish_with_error = |py: Python<'_>, err: PyErr, worker: std::thread::JoinHandle<()>| -> PyResult<String> {
-        cancelled.store(true, Ordering::Relaxed);
-        py.detach(|| {
-            let _ = worker.join();
-        });
-        Err(err)
-    };
+    let finish_with_error =
+        |py: Python<'_>, err: PyErr, worker: std::thread::JoinHandle<()>| -> PyResult<String> {
+            cancelled.store(true, Ordering::Relaxed);
+            py.detach(|| {
+                let _ = worker.join();
+            });
+            Err(err)
+        };
 
     loop {
         let rx_ref = &mut rx;
@@ -603,6 +606,7 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<PyMax6PreparedGenotypeTags>()?;
     m.add_class::<PyMax6PreparedGenotypeUniverse>()?;
     m.add_class::<Bin01StreamWriter>()?;
+    m.add_class::<HgwasArchive>()?;
     m.add_function(wrap_pyfunction!(imp_run, m)?)?;
     m.add_function(wrap_pyfunction!(haploid_ibd_run, m)?)?;
     m.add_function(wrap_pyfunction!(haploid_ibd_post_extract, m)?)?;

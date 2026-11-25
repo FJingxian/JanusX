@@ -12,8 +12,10 @@
 //!    multi-chromosome population mosaic matrices using cumulative per-parent
 //!    overlap weights.
 
-use super::ancestry::ChromosomeAncestryBinsSparse;
-use super::sparse_io::{read_sparse_archive, HaploidSparseArchive, HaploidSparsePayload};
+use super::sparse_io::{
+    infer_target_is_inbred_from_segments, read_ancestry_segments_archive, AncestrySegmentsArchive,
+    HaploidSparseArchive, HaploidSparsePayload,
+};
 use super::types::{AncestrySegment, HaploidIbdMode};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -179,8 +181,9 @@ pub struct PostIbdResult {
     pub pop_mosaics: Vec<PopMosaicChrom>,
 }
 
-/// Load a `.jhibd` archive from disk and extract all requested post-processing
-/// summaries.
+/// Load a `.jhibd` archive from disk (`JHIBD01` or `JHIBD02`) and extract all
+/// requested post-processing summaries directly from `segments` without
+/// materializing multi-GB expanded `chrom_bins`.
 pub fn extract_post_ibd(config: &PostIbdConfig) -> Result<PostIbdResult, String> {
     if config.input.as_os_str().is_empty() {
         return Err("postibd requires a .jhibd input file".to_owned());
@@ -188,8 +191,17 @@ pub fn extract_post_ibd(config: &PostIbdConfig) -> Result<PostIbdResult, String>
     if config.window_bp == 0 {
         return Err("window_bp must be > 0".to_owned());
     }
-    let archive = read_sparse_archive(&config.input)?;
-    extract_post_ibd_from_archive(&archive, config)
+    let archive = read_ancestry_segments_archive(&config.input).map_err(|err| {
+        if err.contains("PairwiseIbd") {
+            "input .jhibd archive is in pairwise_ibd mode (no --ref); recombination, \
+             segregation distortion, and mosaic plots require a multi-parent ancestry \
+             archive produced by `jx ibd -ref ...`"
+                .to_owned()
+        } else {
+            err
+        }
+    })?;
+    extract_post_ibd_from_segments(&archive, config)
 }
 
 /// Core aggregation operating directly on an in-memory `HaploidSparseArchive`.
@@ -197,11 +209,8 @@ pub fn extract_post_ibd_from_archive(
     archive: &HaploidSparseArchive,
     config: &PostIbdConfig,
 ) -> Result<PostIbdResult, String> {
-    let (segments, chrom_bins) = match &archive.payload {
-        HaploidSparsePayload::MultiParentAncestry {
-            segments,
-            chrom_bins,
-        } => (segments.as_slice(), chrom_bins.as_slice()),
+    let segments = match &archive.payload {
+        HaploidSparsePayload::MultiParentAncestry { segments, .. } => segments.clone(),
         HaploidSparsePayload::PairwiseIbd { .. } => {
             return Err(
                 "input .jhibd archive is in pairwise_ibd mode (no --ref); recombination, \
@@ -211,7 +220,28 @@ pub fn extract_post_ibd_from_archive(
             );
         }
     };
+    let target_is_inbred =
+        infer_target_is_inbred_from_segments(archive.target_sample_ids.len(), &segments);
+    let compact = AncestrySegmentsArchive {
+        version: archive.version,
+        mode: archive.mode,
+        target_sample_ids: archive.target_sample_ids.clone(),
+        reference_sample_ids: archive.reference_sample_ids.clone(),
+        chrom_names: archive.chrom_names.clone(),
+        target_is_inbred,
+        segments,
+        fallback_chrom_bins: Vec::new(),
+    };
+    extract_post_ibd_from_segments(&compact, config)
+}
 
+/// Core aggregation operating directly on `AncestrySegmentsArchive` (segments +
+/// per-sample ploidy flags, zero `chrom_bins` required).
+pub fn extract_post_ibd_from_segments(
+    archive: &AncestrySegmentsArchive,
+    config: &PostIbdConfig,
+) -> Result<PostIbdResult, String> {
+    let segments = archive.segments.as_slice();
     let n_chroms = archive.chrom_names.len();
     let n_samples = archive.target_sample_ids.len();
     let n_parents = archive.reference_sample_ids.len();
@@ -223,15 +253,15 @@ pub fn extract_post_ibd_from_archive(
 
     // Determine chromosome physical lengths and per-sample haplotype count.
     let mut chrom_lengths_bp = vec![0u64; n_chroms];
-    for bins in chrom_bins {
-        let c = bins.chrom_idx as usize;
-        if c < n_chroms {
-            if let Some(&last_end) = bins.bin_ends_bp.last() {
-                chrom_lengths_bp[c] = chrom_lengths_bp[c].max(last_end);
+    let mut sample_n_haps: Vec<u8> = (0..n_samples)
+        .map(|s| {
+            if archive.target_is_inbred.get(s).copied().unwrap_or(true) {
+                1u8
+            } else {
+                2u8
             }
-        }
-    }
-    let mut sample_n_haps = vec![1u8; n_samples];
+        })
+        .collect();
     for seg in segments {
         let c = seg.chrom_idx as usize;
         if c < n_chroms {
@@ -244,23 +274,12 @@ pub fn extract_post_ibd_from_archive(
     }
     let total_haplotype_tracks: usize = sample_n_haps.iter().map(|&h| h as usize).sum();
 
-    // Map chrom_idx -> ChromosomeAncestryBinsSparse reference for O(1) lookup.
-    let mut bins_by_chrom: Vec<Option<&ChromosomeAncestryBinsSparse>> = vec![None; n_chroms];
-    for b in chrom_bins {
-        let c = b.chrom_idx as usize;
-        if c < n_chroms {
-            bins_by_chrom[c] = Some(b);
-        }
-    }
-
     // Partition segments by chromosome once so per-chromosome computations run in parallel.
     let mut segs_by_chrom: Vec<Vec<&AncestrySegment>> = vec![Vec::new(); n_chroms];
-    if config.want_recomb || config.want_mosaic {
-        for seg in segments {
-            let c = seg.chrom_idx as usize;
-            if c < n_chroms {
-                segs_by_chrom[c].push(seg);
-            }
+    for seg in segments {
+        let c = seg.chrom_idx as usize;
+        if c < n_chroms {
+            segs_by_chrom[c].push(seg);
         }
     }
 
@@ -274,7 +293,6 @@ pub fn extract_post_ibd_from_archive(
     let (recomb_windows, sample_breakpoints) = if config.want_recomb || config.want_mosaic {
         compute_recomb_and_breakpoints(
             &segs_by_chrom,
-            &bins_by_chrom,
             &chrom_lengths_bp,
             n_samples,
             total_haplotype_tracks,
@@ -293,9 +311,10 @@ pub fn extract_post_ibd_from_archive(
 
     // 2. Parent / group contribution & windowed segregation distortion.
     let (parent_contrib_chroms, segregation_windows) = if config.want_segregation {
-        compute_segregation_from_bins(
-            &bins_by_chrom,
+        compute_segregation_from_segments(
+            &segs_by_chrom,
             &chrom_lengths_bp,
+            &sample_n_haps,
             n_samples,
             n_groups,
             &parent_to_group,
@@ -310,7 +329,6 @@ pub fn extract_post_ibd_from_archive(
         compute_mosaic_data(
             archive,
             &segs_by_chrom,
-            &bins_by_chrom,
             &chrom_lengths_bp,
             &sample_n_haps,
             &sample_breakpoints,
@@ -402,48 +420,44 @@ fn resolve_parent_groups(
     Ok((group_names, parent_to_group, true))
 }
 
-fn interpolate_bin_cm(bins: &ChromosomeAncestryBinsSparse, bp: u64) -> f64 {
-    let n = bins.bin_starts_bp.len();
+fn build_bp_cm_anchors(chrom_segs: &[&AncestrySegment]) -> Vec<(u64, f64)> {
+    let mut anchors: Vec<(u64, f64)> = Vec::with_capacity(chrom_segs.len() * 2);
+    for seg in chrom_segs {
+        anchors.push((seg.start_bp, seg.start_cm as f64));
+        anchors.push((seg.end_bp, seg.end_cm as f64));
+    }
+    anchors.sort_unstable_by_key(|&(bp, _)| bp);
+    anchors.dedup_by_key(|(bp, _)| *bp);
+    anchors
+}
+
+fn interpolate_bp_cm(anchors: &[(u64, f64)], bp: u64) -> f64 {
+    let n = anchors.len();
     if n == 0 {
         return 0.0;
     }
-    if bp <= bins.bin_starts_bp[0] {
-        return bins.bin_starts_cm[0] as f64;
+    if bp <= anchors[0].0 {
+        return anchors[0].1;
     }
-    if bp >= bins.bin_ends_bp[n - 1] {
-        return bins.bin_ends_cm[n - 1] as f64;
+    if bp >= anchors[n - 1].0 {
+        return anchors[n - 1].1;
     }
-    let idx = bins
-        .bin_starts_bp
-        .partition_point(|&s| s <= bp)
-        .saturating_sub(1);
-    let s_bp = bins.bin_starts_bp[idx];
-    let e_bp = bins.bin_ends_bp[idx];
-    let s_cm = bins.bin_starts_cm[idx] as f64;
-    let e_cm = bins.bin_ends_cm[idx] as f64;
-    if bp <= e_bp {
-        if e_bp <= s_bp {
-            return s_cm;
-        }
-        let frac = (bp - s_bp) as f64 / (e_bp - s_bp) as f64;
-        return s_cm + frac * (e_cm - s_cm);
+    let idx = anchors.partition_point(|&(p, _)| p <= bp).saturating_sub(1);
+    let (bp0, cm0) = anchors[idx];
+    if bp == bp0 || idx + 1 >= n {
+        return cm0;
     }
-    // Between bin `idx` and `idx + 1` (uncalled gap): linearly interpolate.
-    if idx + 1 < n {
-        let next_s_bp = bins.bin_starts_bp[idx + 1];
-        let next_s_cm = bins.bin_starts_cm[idx + 1] as f64;
-        if next_s_bp > e_bp {
-            let frac = (bp - e_bp) as f64 / (next_s_bp - e_bp) as f64;
-            return e_cm + frac * (next_s_cm - e_cm);
-        }
+    let (bp1, cm1) = anchors[idx + 1];
+    if bp1 <= bp0 {
+        return cm0;
     }
-    e_cm
+    let frac = (bp - bp0) as f64 / (bp1 - bp0) as f64;
+    cm0 + frac * (cm1 - cm0)
 }
 
 #[allow(clippy::too_many_arguments)]
 fn compute_recomb_and_breakpoints(
     segs_by_chrom: &[Vec<&AncestrySegment>],
-    bins_by_chrom: &[Option<&ChromosomeAncestryBinsSparse>],
     chrom_lengths_bp: &[u64],
     n_samples: usize,
     total_haplotype_tracks: usize,
@@ -571,8 +585,7 @@ fn compute_recomb_and_breakpoints(
                             if track_win_bp[w] == 0 && track_win_breaks[w] == 0 {
                                 touched_wins.push(w);
                             }
-                            track_win_bp[w] =
-                                track_win_bp[w].saturating_add(ov1 - ov0 + 1);
+                            track_win_bp[w] = track_win_bp[w].saturating_add(ov1 - ov0 + 1);
                         }
                     }
                 }
@@ -617,7 +630,7 @@ fn compute_recomb_and_breakpoints(
                 return (Vec::new(), local_sample_bp);
             }
 
-            let bins_opt = bins_by_chrom[c];
+            let cm_anchors = build_bp_cm_anchors(chrom_segs);
             let mut rows = Vec::with_capacity(n_win);
             let mut cum_cm = 0.0f64;
             for w in 0..n_win {
@@ -640,10 +653,8 @@ fn compute_recomb_and_breakpoints(
                     (0.0, None)
                 };
                 cum_cm += eff_cm;
-                let (in_s_cm, in_e_cm) = match bins_opt {
-                    Some(bins) => (interpolate_bin_cm(bins, wb0), interpolate_bin_cm(bins, wb1)),
-                    None => (0.0, 0.0),
-                };
+                let in_s_cm = interpolate_bp_cm(&cm_anchors, wb0);
+                let in_e_cm = interpolate_bp_cm(&cm_anchors, wb1);
                 rows.push(RecombWindowRow {
                     chrom_idx: c as u16,
                     start_bp: wb0,
@@ -675,15 +686,16 @@ fn compute_recomb_and_breakpoints(
     (all_rows, total_sample_bp)
 }
 
-fn compute_segregation_from_bins(
-    bins_by_chrom: &[Option<&ChromosomeAncestryBinsSparse>],
+fn compute_segregation_from_segments(
+    segs_by_chrom: &[Vec<&AncestrySegment>],
     chrom_lengths_bp: &[u64],
+    sample_n_haps: &[u8],
     n_samples: usize,
     n_parents: usize,
     parent_to_group: &[usize],
     window_bp: u64,
 ) -> (Vec<ParentContributionChrom>, Vec<SegregationWindowRow>) {
-    let per_chrom: Vec<(ParentContributionChrom, Vec<SegregationWindowRow>)> = (0..bins_by_chrom
+    let per_chrom: Vec<(ParentContributionChrom, Vec<SegregationWindowRow>)> = (0..segs_by_chrom
         .len())
         .into_par_iter()
         .map(|c| {
@@ -692,21 +704,9 @@ fn compute_segregation_from_bins(
             let mut called_bp = 0.0f64;
             let max_bp = chrom_lengths_bp[c];
             let total_bp = (n_samples as f64) * (max_bp.saturating_add(1) as f64);
+            let chrom_segs = &segs_by_chrom[c];
 
-            let Some(bins) = bins_by_chrom[c] else {
-                return (
-                    ParentContributionChrom {
-                        chrom_idx: c as u16,
-                        parent_bp,
-                        parent_cm,
-                        called_bp,
-                        total_bp,
-                    },
-                    Vec::new(),
-                );
-            };
-            let n_bins = bins.bin_starts_bp.len();
-            if n_bins == 0 || max_bp == 0 {
+            if chrom_segs.is_empty() || max_bp == 0 {
                 return (
                     ParentContributionChrom {
                         chrom_idx: c as u16,
@@ -721,40 +721,35 @@ fn compute_segregation_from_bins(
 
             let n_win = max_bp.div_ceil(window_bp) as usize;
             let mut win_parent_bp = vec![0.0f64; n_win * n_parents];
-            let mut bin_parent_dosage = vec![0.0f64; n_parents];
 
-            for b in 0..n_bins {
-                let bs = bins.bin_starts_bp[b];
-                let be = bins.bin_ends_bp[b];
+            for seg in chrom_segs {
+                let bs = seg.start_bp;
+                let be = seg.end_bp;
                 if be < bs {
                     continue;
                 }
+                let s = seg.target_sample as usize;
+                if s >= n_samples {
+                    continue;
+                }
+                let raw_p = seg.parent_sample as usize;
+                if raw_p >= parent_to_group.len() {
+                    continue;
+                }
+                let p = parent_to_group[raw_p];
+                if p >= n_parents {
+                    continue;
+                }
+                let weight = if sample_n_haps[s] <= 1 {
+                    1.0f64
+                } else {
+                    0.5f64
+                };
                 let blen_bp = (be - bs + 1) as f64;
-                let blen_cm = (bins.bin_ends_cm[b] - bins.bin_starts_cm[b]).max(0.0) as f64;
-                bin_parent_dosage.fill(0.0);
-
-                let ptr_start = bins.bin_ptr[b] as usize;
-                let ptr_end = bins.bin_ptr[b + 1] as usize;
-                let mut bin_called = 0.0f64;
-                for idx in ptr_start..ptr_end {
-                    let raw_p = bins.parent_idx[idx] as usize;
-                    let d = bins.dosage[idx] as f64;
-                    if raw_p < parent_to_group.len() {
-                        let p = parent_to_group[raw_p];
-                        if p < n_parents {
-                            bin_parent_dosage[p] += d;
-                            bin_called += d;
-                        }
-                    }
-                }
-                called_bp += bin_called * blen_bp;
-                for p in 0..n_parents {
-                    let dp = bin_parent_dosage[p];
-                    if dp > 0.0 {
-                        parent_bp[p] += dp * blen_bp;
-                        parent_cm[p] += dp * blen_cm;
-                    }
-                }
+                let blen_cm = (seg.end_cm - seg.start_cm).max(0.0) as f64;
+                called_bp += weight * blen_bp;
+                parent_bp[p] += weight * blen_bp;
+                parent_cm[p] += weight * blen_cm;
 
                 let w_start = (bs.saturating_sub(1) / window_bp) as usize;
                 let w_end = ((be.saturating_sub(1) / window_bp) as usize).min(n_win - 1);
@@ -765,13 +760,7 @@ fn compute_segregation_from_bins(
                     let ov1 = be.min(wb1);
                     if ov1 >= ov0 {
                         let ov_bp = (ov1 - ov0 + 1) as f64;
-                        let w_off = w * n_parents;
-                        for p in 0..n_parents {
-                            let dp = bin_parent_dosage[p];
-                            if dp > 0.0 {
-                                win_parent_bp[w_off + p] += dp * ov_bp;
-                            }
-                        }
+                        win_parent_bp[w * n_parents + p] += weight * ov_bp;
                     }
                 }
             }
@@ -804,7 +793,11 @@ fn compute_segregation_from_bins(
                 let mut chi2 = 0.0f64;
                 let mut max_p = 0u32;
                 let mut max_prop = 0.0f64;
-                let expected = if k_f64 > 0.0 { eff_samples / k_f64 } else { 0.0 };
+                let expected = if k_f64 > 0.0 {
+                    eff_samples / k_f64
+                } else {
+                    0.0
+                };
                 if sum_called_bp > 0.0 && expected > 0.0 {
                     for p in 0..n_parents {
                         let prop = win_parent_bp[w_off + p] / sum_called_bp;
@@ -874,16 +867,19 @@ fn select_evenly_spaced(indices: &[usize], limit: usize) -> Vec<usize> {
 
 #[allow(clippy::too_many_arguments)]
 fn compute_mosaic_data(
-    archive: &HaploidSparseArchive,
+    archive: &AncestrySegmentsArchive,
     segs_by_chrom: &[Vec<&AncestrySegment>],
-    bins_by_chrom: &[Option<&ChromosomeAncestryBinsSparse>],
     chrom_lengths_bp: &[u64],
     sample_n_haps: &[u8],
     sample_breakpoints: &[u64],
     n_groups: usize,
     parent_to_group: &[usize],
     config: &PostIbdConfig,
-) -> (Vec<MosaicSampleInfo>, Vec<MosaicSegmentCompact>, Vec<PopMosaicChrom>) {
+) -> (
+    Vec<MosaicSampleInfo>,
+    Vec<MosaicSegmentCompact>,
+    Vec<PopMosaicChrom>,
+) {
     let n_samples = archive.target_sample_ids.len();
     let n_parents = n_groups;
 
@@ -916,7 +912,8 @@ fn compute_mosaic_data(
         select_evenly_spaced(&ranked, config.max_mosaic_samples.max(1))
     };
 
-    let mut sample_to_local: HashMap<u32, u32> = HashMap::with_capacity(selected_sample_indices.len());
+    let mut sample_to_local: HashMap<u32, u32> =
+        HashMap::with_capacity(selected_sample_indices.len());
     let mut mosaic_samples = Vec::with_capacity(selected_sample_indices.len());
     for (local_idx, &s_idx) in selected_sample_indices.iter().enumerate() {
         sample_to_local.insert(s_idx as u32, local_idx as u32);
@@ -976,11 +973,7 @@ fn compute_mosaic_data(
         .filter(|&c| {
             let keep_name = target_chrom_set.is_empty()
                 || target_chrom_set.contains(&normalize_chrom_token(&archive.chrom_names[c]));
-            keep_name
-                && chrom_lengths_bp[c] > 0
-                && bins_by_chrom[c]
-                    .map(|b| !b.bin_starts_bp.is_empty())
-                    .unwrap_or(false)
+            keep_name && chrom_lengths_bp[c] > 0 && !segs_by_chrom[c].is_empty()
         })
         .collect();
     let total_active_bp: f64 = active_chroms
@@ -994,20 +987,49 @@ fn compute_mosaic_data(
         .into_par_iter()
         .filter_map(|c| {
             let max_bp = chrom_lengths_bp[c];
-            let bins = bins_by_chrom[c]?;
-            let n_sparse_bins = bins.bin_starts_bp.len();
-            if max_bp == 0 || n_sparse_bins == 0 || n_pop_samples == 0 {
+            let chrom_segs = &segs_by_chrom[c];
+            if max_bp == 0 || chrom_segs.is_empty() || n_pop_samples == 0 {
                 return None;
             }
-            let n_bins_out = ((total_bin_budget * (max_bp as f64 / total_active_bp)).round()
-                as usize)
-                .max(1);
+            let n_bins_out =
+                ((total_bin_budget * (max_bp as f64 / total_active_bp)).round() as usize).max(1);
             let step_bp = (max_bp as f64 / n_bins_out as f64).max(1.0);
             let mut parent_matrix = vec![-1i16; n_pop_samples * n_bins_out];
 
+            // Filter & sort segments for selected population samples by `start_bp`
+            // so each output heatmap bin sweeps only active overlapping segments.
+            let mut pop_segs: Vec<(u64, u64, usize, usize, f32)> = Vec::new();
+            for seg in chrom_segs {
+                if seg.end_bp < seg.start_bp {
+                    continue;
+                }
+                let s_global = seg.target_sample as usize;
+                if s_global >= n_samples {
+                    continue;
+                }
+                let Some(s_local) = global_to_pop[s_global] else {
+                    continue;
+                };
+                let raw_p = seg.parent_sample as usize;
+                if raw_p >= parent_to_group.len() {
+                    continue;
+                }
+                let p = parent_to_group[raw_p];
+                if p >= n_parents {
+                    continue;
+                }
+                let w = if sample_n_haps[s_global] <= 1 {
+                    1.0f32
+                } else {
+                    0.5f32
+                };
+                pop_segs.push((seg.start_bp, seg.end_bp, s_local, p, w));
+            }
+            pop_segs.sort_unstable_by_key(|&(s_bp, _, _, _, _)| s_bp);
+
             // Accumulate total `dosage * overlap_bp` per `(sample, parent_or_group)` across ALL
-            // sparse bins overlapping each output heatmap bin so a parent or ancestry group
-            // split into multiple sparse sub-bins reflects its true summed coverage.
+            // segments overlapping each output heatmap bin so a parent or ancestry group
+            // split into multiple sub-segments reflects its true summed coverage.
             let use_dense = n_pop_samples.saturating_mul(n_parents) <= 2_000_000;
             let mut dense_acc = if use_dense {
                 vec![0.0f32; n_pop_samples * n_parents]
@@ -1015,7 +1037,8 @@ fn compute_mosaic_data(
                 Vec::new()
             };
             let mut sparse_acc: HashMap<(usize, usize), f32> = HashMap::new();
-            let mut b_cursor = 0usize;
+            let mut active: Vec<(u64, u64, usize, usize, f32)> = Vec::new();
+            let mut seg_cursor = 0usize;
 
             for ob in 0..n_bins_out {
                 let ob_s = (ob as f64 * step_bp).floor() as u64 + 1;
@@ -1027,11 +1050,16 @@ fn compute_mosaic_data(
                 if ob_e < ob_s {
                     continue;
                 }
-                while b_cursor < n_sparse_bins && bins.bin_ends_bp[b_cursor] < ob_s {
-                    b_cursor += 1;
+                active.retain(|&(_, e_bp, _, _, _)| e_bp >= ob_s);
+                while seg_cursor < pop_segs.len() && pop_segs[seg_cursor].0 <= ob_e {
+                    let item = pop_segs[seg_cursor];
+                    seg_cursor += 1;
+                    if item.1 >= ob_s {
+                        active.push(item);
+                    }
                 }
-                if b_cursor >= n_sparse_bins {
-                    break;
+                if active.is_empty() {
+                    continue;
                 }
 
                 if use_dense {
@@ -1040,44 +1068,17 @@ fn compute_mosaic_data(
                     sparse_acc.clear();
                 }
 
-                let mut b = b_cursor;
-                while b < n_sparse_bins {
-                    let bs = bins.bin_starts_bp[b];
-                    if bs > ob_e {
-                        break;
-                    }
-                    let be = bins.bin_ends_bp[b];
-                    if be >= ob_s {
-                        let ov0 = bs.max(ob_s);
-                        let ov1 = be.min(ob_e);
-                        let ov_len = (ov1 - ov0 + 1) as f32;
-                        let ptr_start = bins.bin_ptr[b] as usize;
-                        let ptr_end = bins.bin_ptr[b + 1] as usize;
-                        for idx in ptr_start..ptr_end {
-                            let s_global = bins.sample_idx[idx] as usize;
-                            if s_global >= n_samples {
-                                continue;
-                            }
-                            let Some(s_local) = global_to_pop[s_global] else {
-                                continue;
-                            };
-                            let raw_p = bins.parent_idx[idx] as usize;
-                            if raw_p >= parent_to_group.len() {
-                                continue;
-                            }
-                            let p = parent_to_group[raw_p];
-                            if p >= n_parents {
-                                continue;
-                            }
-                            let w = bins.dosage[idx] * ov_len;
-                            if use_dense {
-                                dense_acc[s_local * n_parents + p] += w;
-                            } else {
-                                *sparse_acc.entry((s_local, p)).or_insert(0.0) += w;
-                            }
+                for &(bs, be, s_local, p, dosage_w) in &active {
+                    let ov0 = bs.max(ob_s);
+                    let ov1 = be.min(ob_e);
+                    if ov1 >= ov0 {
+                        let w = dosage_w * ((ov1 - ov0 + 1) as f32);
+                        if use_dense {
+                            dense_acc[s_local * n_parents + p] += w;
+                        } else {
+                            *sparse_acc.entry((s_local, p)).or_insert(0.0) += w;
                         }
                     }
-                    b += 1;
                 }
 
                 if use_dense {
@@ -1123,10 +1124,7 @@ fn compute_mosaic_data(
 
 fn normalize_chrom_token(s: &str) -> String {
     let trimmed = s.trim().to_ascii_lowercase();
-    trimmed
-        .strip_prefix("chr")
-        .unwrap_or(&trimmed)
-        .to_owned()
+    trimmed.strip_prefix("chr").unwrap_or(&trimmed).to_owned()
 }
 
 #[cfg(test)]
@@ -1387,7 +1385,10 @@ mod tests {
         let res = extract_post_ibd_from_archive(&archive, &cfg).unwrap();
         let w1 = &res.recomb_windows[1];
         assert_eq!(w1.breakpoints, 0);
-        assert!(!w1.callable, "2 bp called in 1 Mb window must not be callable");
+        assert!(
+            !w1.callable,
+            "2 bp called in 1 Mb window must not be callable"
+        );
         assert!(
             w1.effective_cm_per_mb.is_none(),
             "low-coverage window must not produce a 50M cM/Mb hotspot"

@@ -13,15 +13,21 @@
 //!   `lambda_g = sigma_g^2 / sigma_e^2` from the null model (`H_0: sigma_b^2 = 0`),
 //!   precomputes the exact original-space projection `M_0 = U P_0 U^T` and `v_0 = U P_0 y_rot`
 //!   once, and maintains `(r_b = Z_b^T v_0, A_b = Z_b^T M_0 Z_b, B_b = M_0 Z_b)` via
-//!   incremental rank-1 sparse-diff updates across adjacent Union-of-Breakpoints bins.
+//!   fused rank-1/rank-2 sweep-line delta updates across adjacent Union-of-Breakpoints bins.
 //! - **LMM** (`exact_lmm = true`): re-estimates all three variance components
-//!   `(sigma_g^2, sigma_b^2, sigma_e^2)` per bin via profile REML over `(lambda_g, tau)`,
-//!   maintaining rotated `Z_rot = U^T Z` incrementally across adjacent bins with a
-//!   precomputed `BackgroundState` grid and tight-bracket Brent refinement.
+//!   `(sigma_g^2, sigma_b^2, sigma_e^2)` per bin via profile REML over `(lambda_g, tau)`.
+//!   When `G * n^2 * 8 <= 256 MiB`, all `G` precomputed background grid points use the same
+//!   O(k * n) original-space incremental update as FVLMM (100% mathematically identical to
+//!   recomputing `Z_rot^T W_g Z_rot` per bin), with zero-allocation Brent refinement over
+//!   incrementally maintained `Z_rot = U^T Z`. Larger sample sizes fall back automatically
+//!   to the low-memory `Z_rot`-only grid path.
 
+use std::collections::HashMap;
+use std::fmt::Write as FmtWrite;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::sync::Arc;
 
 use numpy::{PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -35,7 +41,9 @@ use crate::blas::{
 use crate::brent::brent_minimize_with_init;
 use crate::eigh::symmetric_eigh_f64_row_major;
 use crate::haploid::ancestry::ChromosomeAncestryBinsSparse;
-use crate::haploid::sparse_io::{read_sparse_archive, HaploidSparseArchive, HaploidSparsePayload};
+use crate::haploid::sparse_io::{
+    inspect_sparse_archive_meta, read_ancestry_segments_archive, AncestrySegmentsArchive,
+};
 use crate::haploid::types::HaploidIbdMode;
 use crate::linalg::{
     chi2_sf_df1, cholesky_gram_inplace, cholesky_logdet, cholesky_solve_into,
@@ -52,6 +60,8 @@ const DEFAULT_BIN_BATCH_COLS: usize = 512;
 const CHUNK_BINS: usize = 1024;
 /// Maximum `p x p` size handled by the zero-allocation inline Jacobi eigensolver.
 const INLINE_JACOBI_MAX_P: usize = 64;
+/// Memory budget for LMM multi-grid original-space `M_g` matrices (256 MiB).
+const LMM_MULTI_GRID_MAX_BYTES: usize = 256 * 1024 * 1024;
 
 /// Output statistics for a single bin.
 #[derive(Clone, Copy, Debug)]
@@ -63,6 +73,43 @@ pub(crate) struct HgwasBinResult {
     pub(crate) h2_bin: f64,
     pub(crate) lrt: f64,
     pub(crate) plrt: f64,
+}
+
+/// Compact sweep-line representation of one chromosome's Union-of-Breakpoints bins.
+///
+/// Memory footprint is O(n_segments + n_chunks * n_samples) instead of O(n_bins * n_samples)
+/// (~28 MB vs ~7.8 GB on CUBIC 476k bins), and each bin step processes only the O(k)
+/// active sample transitions instead of O(n) two-pointer bin diffs.
+#[derive(Clone, Debug)]
+struct CompactChromEvents {
+    chrom_idx: u16,
+    bin_starts_bp: Vec<u64>,
+    /// Length `n_bins + 1`: delta entries for bin `b` lie in `delta_ptr[b]..delta_ptr[b+1]`.
+    /// Always empty for chunk-start bins (`b % CHUNK_BINS == 0`), which initialize from
+    /// `chunk_init_*`. Entries within each bin are sorted by `(sample, parent)`.
+    delta_ptr: Vec<u64>,
+    delta_sample: Vec<u32>,
+    delta_parent: Vec<u32>,
+    delta_old: Vec<f32>,
+    delta_new: Vec<f32>,
+    /// Length `n_chunks + 1`: initial active `(sample, parent, dosage)` entries
+    /// for chunk `c` (bin `c * CHUNK_BINS`), sorted by `(sample, parent)`.
+    chunk_init_ptr: Vec<u64>,
+    chunk_init_sample: Vec<u32>,
+    chunk_init_parent: Vec<u32>,
+    chunk_init_dosage: Vec<f32>,
+}
+
+/// Compact in-memory hGWAS archive reusable across traits and models (`-fvlmm`/`-lmm`)
+/// without re-reading or re-decompressing `.jhibd` from disk.
+#[derive(Clone, Debug)]
+pub(crate) struct CompactHgwasArchive {
+    pub(crate) version: u32,
+    pub(crate) target_sample_ids: Vec<String>,
+    pub(crate) reference_sample_ids: Vec<String>,
+    pub(crate) chrom_names: Vec<String>,
+    chrom_events: Vec<CompactChromEvents>,
+    pub(crate) total_bins: usize,
 }
 
 /// Null-model REML quantities evaluated at a given `lambda_g = sigma_g^2 / sigma_e^2`.
@@ -99,17 +146,6 @@ pub(crate) fn variance_component_lrt_pvalue(lrt: f64) -> f64 {
     } else {
         1.0
     }
-}
-
-fn load_multparent_archive(path: &str) -> Result<HaploidSparseArchive, String> {
-    let archive = read_sparse_archive(Path::new(path))?;
-    if archive.mode != HaploidIbdMode::MultiParentAncestry {
-        return Err(format!(
-            "hGWAS requires a MultiParentAncestry .jhibd archive, got {:?}",
-            archive.mode
-        ));
-    }
-    Ok(archive)
 }
 
 fn build_sample_remap(
@@ -224,6 +260,334 @@ fn validate_incremental_sparse_bins(
     Ok(())
 }
 
+/// Build `CompactChromEvents` for one chromosome directly from its `AncestrySegment`s
+/// via a sweep-line over segment start/end breakpoints, matching
+/// `build_union_breakpoint_sparse_matrix` identically (including diploid 0.5/1.0
+/// coalescence and skipping all-uncalled empty gaps).
+fn build_compact_events_from_segments(
+    chrom_idx: u16,
+    n_target_samples: usize,
+    n_parents: usize,
+    target_is_inbred: &[bool],
+    chrom_segs: &[&crate::haploid::types::AncestrySegment],
+) -> CompactChromEvents {
+    let mut out = CompactChromEvents {
+        chrom_idx,
+        bin_starts_bp: Vec::new(),
+        delta_ptr: vec![0u64],
+        delta_sample: Vec::new(),
+        delta_parent: Vec::new(),
+        delta_old: Vec::new(),
+        delta_new: Vec::new(),
+        chunk_init_ptr: vec![0u64],
+        chunk_init_sample: Vec::new(),
+        chunk_init_parent: Vec::new(),
+        chunk_init_dosage: Vec::new(),
+    };
+    if chrom_segs.is_empty() || n_target_samples == 0 || n_parents == 0 {
+        return out;
+    }
+
+    // Raw endpoint events: `(bp, sample, parent, signed_weight)`.
+    let mut events: Vec<(u64, u32, u32, f32)> = Vec::with_capacity(chrom_segs.len() * 2);
+    for seg in chrom_segs {
+        if seg.end_bp < seg.start_bp {
+            continue;
+        }
+        let s = seg.target_sample as usize;
+        let p = seg.parent_sample as usize;
+        if s >= n_target_samples || p >= n_parents {
+            continue;
+        }
+        let w = if target_is_inbred.get(s).copied().unwrap_or(true) {
+            1.0f32
+        } else {
+            0.5f32
+        };
+        events.push((seg.start_bp, seg.target_sample, seg.parent_sample, w));
+        events.push((
+            seg.end_bp.saturating_add(1),
+            seg.target_sample,
+            seg.parent_sample,
+            -w,
+        ));
+    }
+    if events.len() < 2 {
+        return out;
+    }
+    events.sort_unstable_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.cmp(&b.1))
+            .then_with(|| a.2.cmp(&b.2))
+    });
+
+    let mut active_map: HashMap<(u32, u32), f32> = HashMap::with_capacity(n_target_samples * 2);
+    // Tracks net transitions across any skipped empty (all-uncalled) gaps so the next
+    // emitted bin receives the exact diff relative to the previous emitted bin.
+    let mut pending_from_prev_emitted: HashMap<(u32, u32), (f32, f32)> = HashMap::new();
+    let mut snap_buf: Vec<(u32, u32, f32)> = Vec::with_capacity(n_target_samples * 2);
+    let mut delta_buf: Vec<(u32, u32, f32, f32)> = Vec::with_capacity(64);
+    let mut has_emitted_any = false;
+
+    let mut idx = 0usize;
+    let total_ev = events.len();
+    while idx < total_ev {
+        let bp = events[idx].0;
+        let mut group_end = idx + 1;
+        while group_end < total_ev && events[group_end].0 == bp {
+            group_end += 1;
+        }
+
+        // Coalesce consecutive events with identical `(sample, parent)` at `bp`.
+        delta_buf.clear();
+        let mut j = idx;
+        while j < group_end {
+            let s = events[j].1;
+            let p = events[j].2;
+            let mut net = events[j].3;
+            j += 1;
+            while j < group_end && events[j].1 == s && events[j].2 == p {
+                net += events[j].3;
+                j += 1;
+            }
+            if net.abs() <= 1e-6 {
+                continue;
+            }
+            let d_old = active_map.get(&(s, p)).copied().unwrap_or(0.0);
+            let mut d_new = d_old + net;
+            if d_new <= 1e-6 {
+                d_new = 0.0;
+                active_map.remove(&(s, p));
+            } else {
+                active_map.insert((s, p), d_new);
+            }
+            if (d_new - d_old).abs() > 1e-6 {
+                delta_buf.push((s, p, d_old, d_new));
+            }
+        }
+
+        let has_next_bp = group_end < total_ev;
+        if has_next_bp && !active_map.is_empty() {
+            let b = out.bin_starts_bp.len();
+            out.bin_starts_bp.push(bp);
+            if b % CHUNK_BINS == 0 {
+                snap_buf.clear();
+                for (&(s, p), &d) in &active_map {
+                    snap_buf.push((s, p, d));
+                }
+                snap_buf.sort_unstable_by_key(|&(s, p, _)| (s, p));
+                for &(s, p, d) in &snap_buf {
+                    out.chunk_init_sample.push(s);
+                    out.chunk_init_parent.push(p);
+                    out.chunk_init_dosage.push(d);
+                }
+                out.chunk_init_ptr.push(out.chunk_init_sample.len() as u64);
+                out.delta_ptr.push(out.delta_sample.len() as u64);
+                pending_from_prev_emitted.clear();
+            } else if pending_from_prev_emitted.is_empty() {
+                for &(s, p, d_old, d_new) in &delta_buf {
+                    out.delta_sample.push(s);
+                    out.delta_parent.push(p);
+                    out.delta_old.push(d_old);
+                    out.delta_new.push(d_new);
+                }
+                out.delta_ptr.push(out.delta_sample.len() as u64);
+            } else {
+                for &(s, p, d_old, d_new) in &delta_buf {
+                    pending_from_prev_emitted
+                        .entry((s, p))
+                        .and_modify(|entry| entry.1 = d_new)
+                        .or_insert((d_old, d_new));
+                }
+                let mut merged: Vec<(u32, u32, f32, f32)> = pending_from_prev_emitted
+                    .drain()
+                    .filter_map(|((s, p), (d_old, d_new))| {
+                        if (d_new - d_old).abs() > 1e-6 {
+                            Some((s, p, d_old, d_new))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                merged.sort_unstable_by_key(|&(s, p, _, _)| (s, p));
+                for (s, p, d_old, d_new) in merged {
+                    out.delta_sample.push(s);
+                    out.delta_parent.push(p);
+                    out.delta_old.push(d_old);
+                    out.delta_new.push(d_new);
+                }
+                out.delta_ptr.push(out.delta_sample.len() as u64);
+            }
+            has_emitted_any = true;
+        } else if has_emitted_any {
+            // Skipped empty gap bin: record transitions relative to last emitted bin.
+            for &(s, p, d_old, d_new) in &delta_buf {
+                pending_from_prev_emitted
+                    .entry((s, p))
+                    .and_modify(|entry| entry.1 = d_new)
+                    .or_insert((d_old, d_new));
+            }
+        }
+
+        idx = group_end;
+    }
+
+    out
+}
+
+/// Fallback converter from pre-expanded `ChromosomeAncestryBinsSparse` (only used
+/// for synthetic bin-only `JHIBD01` test fixtures where `segments` is empty).
+fn build_compact_events_from_sparse_bins(cb: &ChromosomeAncestryBinsSparse) -> CompactChromEvents {
+    let n_bins = cb.bin_starts_bp.len();
+    let mut out = CompactChromEvents {
+        chrom_idx: cb.chrom_idx,
+        bin_starts_bp: cb.bin_starts_bp.clone(),
+        delta_ptr: Vec::with_capacity(n_bins + 1),
+        delta_sample: Vec::new(),
+        delta_parent: Vec::new(),
+        delta_old: Vec::new(),
+        delta_new: Vec::new(),
+        chunk_init_ptr: vec![0u64],
+        chunk_init_sample: Vec::new(),
+        chunk_init_parent: Vec::new(),
+        chunk_init_dosage: Vec::new(),
+    };
+    out.delta_ptr.push(0u64);
+
+    let mut prev_start = 0usize;
+    let mut prev_end = 0usize;
+    for b in 0..n_bins {
+        let cur_start = cb.bin_ptr[b] as usize;
+        let cur_end = cb.bin_ptr[b + 1] as usize;
+        if b % CHUNK_BINS == 0 {
+            for pos in cur_start..cur_end {
+                let d = cb.dosage[pos];
+                if d != 0.0 && d.is_finite() {
+                    out.chunk_init_sample.push(cb.sample_idx[pos]);
+                    out.chunk_init_parent.push(cb.parent_idx[pos]);
+                    out.chunk_init_dosage.push(d);
+                }
+            }
+            out.chunk_init_ptr.push(out.chunk_init_sample.len() as u64);
+            out.delta_ptr.push(out.delta_sample.len() as u64);
+        } else {
+            let mut i = prev_start;
+            let mut j = cur_start;
+            while i < prev_end && j < cur_end {
+                let ki = (cb.sample_idx[i], cb.parent_idx[i]);
+                let kj = (cb.sample_idx[j], cb.parent_idx[j]);
+                if ki == kj {
+                    let d_old = cb.dosage[i];
+                    let d_new = cb.dosage[j];
+                    if (d_new - d_old).abs() > 1e-6 {
+                        out.delta_sample.push(ki.0);
+                        out.delta_parent.push(ki.1);
+                        out.delta_old.push(d_old);
+                        out.delta_new.push(d_new);
+                    }
+                    i += 1;
+                    j += 1;
+                } else if ki < kj {
+                    let d_old = cb.dosage[i];
+                    if d_old != 0.0 {
+                        out.delta_sample.push(ki.0);
+                        out.delta_parent.push(ki.1);
+                        out.delta_old.push(d_old);
+                        out.delta_new.push(0.0);
+                    }
+                    i += 1;
+                } else {
+                    let d_new = cb.dosage[j];
+                    if d_new != 0.0 {
+                        out.delta_sample.push(kj.0);
+                        out.delta_parent.push(kj.1);
+                        out.delta_old.push(0.0);
+                        out.delta_new.push(d_new);
+                    }
+                    j += 1;
+                }
+            }
+            while i < prev_end {
+                let d_old = cb.dosage[i];
+                if d_old != 0.0 {
+                    out.delta_sample.push(cb.sample_idx[i]);
+                    out.delta_parent.push(cb.parent_idx[i]);
+                    out.delta_old.push(d_old);
+                    out.delta_new.push(0.0);
+                }
+                i += 1;
+            }
+            while j < cur_end {
+                let d_new = cb.dosage[j];
+                if d_new != 0.0 {
+                    out.delta_sample.push(cb.sample_idx[j]);
+                    out.delta_parent.push(cb.parent_idx[j]);
+                    out.delta_old.push(0.0);
+                    out.delta_new.push(d_new);
+                }
+                j += 1;
+            }
+            out.delta_ptr.push(out.delta_sample.len() as u64);
+        }
+        prev_start = cur_start;
+        prev_end = cur_end;
+    }
+    out
+}
+
+impl CompactHgwasArchive {
+    pub(crate) fn from_segments_archive(anc: AncestrySegmentsArchive) -> Result<Self, String> {
+        let n_chroms = anc.chrom_names.len();
+        let n_samples = anc.target_sample_ids.len();
+        let n_parents = anc.reference_sample_ids.len().max(1);
+
+        let chrom_events: Vec<CompactChromEvents> = if !anc.segments.is_empty() {
+            let mut segs_by_chrom: Vec<Vec<&crate::haploid::types::AncestrySegment>> =
+                vec![Vec::new(); n_chroms];
+            for seg in &anc.segments {
+                let c = seg.chrom_idx as usize;
+                if c < n_chroms {
+                    segs_by_chrom[c].push(seg);
+                }
+            }
+            segs_by_chrom
+                .into_par_iter()
+                .enumerate()
+                .map(|(c, chrom_segs)| {
+                    build_compact_events_from_segments(
+                        c as u16,
+                        n_samples,
+                        n_parents,
+                        &anc.target_is_inbred,
+                        &chrom_segs,
+                    )
+                })
+                .collect()
+        } else {
+            validate_incremental_sparse_bins(&anc.fallback_chrom_bins, n_samples, n_parents)?;
+            anc.fallback_chrom_bins
+                .par_iter()
+                .map(build_compact_events_from_sparse_bins)
+                .collect()
+        };
+
+        let total_bins: usize = chrom_events.iter().map(|ce| ce.bin_starts_bp.len()).sum();
+        Ok(Self {
+            version: anc.version,
+            target_sample_ids: anc.target_sample_ids,
+            reference_sample_ids: anc.reference_sample_ids,
+            chrom_names: anc.chrom_names,
+            chrom_events,
+            total_bins,
+        })
+    }
+
+    pub(crate) fn open(path: &str) -> Result<Self, String> {
+        let anc = read_ancestry_segments_archive(Path::new(path))?;
+        Self::from_segments_archive(anc)
+    }
+}
+
 /// Evaluate background REML state at a fixed `lambda_g = sigma_g^2 / sigma_e^2 >= 0`.
 fn evaluate_background_state(
     s: &[f64],
@@ -279,8 +643,6 @@ fn evaluate_background_state(
     let sigma_e2_0 = (rss0 / df).max(MIN_RSS_FLOOR);
 
     let mut p0_y = vec![0.0_f64; n];
-    // Precompute V_x^T = L_x^{-1} X_rot^T W in (q x n) row-major so that
-    // (X_rot^T W Z_rot)^T (X_rot^T W X_rot)^{-1} (X_rot^T W Z_rot) = (V_x^T Z_rot)^T (V_x^T Z_rot).
     let mut vx_t = vec![0.0_f64; q * n];
     let mut tmp = vec![0.0_f64; q];
     for i in 0..n {
@@ -315,6 +677,96 @@ fn evaluate_background_state(
         reml_ll0,
         sigma_e2_0,
     })
+}
+
+/// Zero-allocation in-place background evaluator reused across all Brent steps in LMM.
+fn evaluate_background_state_into(
+    s: &[f64],
+    x_rot: &[f64],
+    y_rot: &[f64],
+    n: usize,
+    q: usize,
+    lambda_g: f64,
+    out: &mut BackgroundState,
+    xwx: &mut [f64],
+    xwy: &mut [f64],
+    beta: &mut [f64],
+    tmp: &mut [f64],
+) -> bool {
+    let Some(df_u) = n.checked_sub(q) else {
+        return false;
+    };
+    let df = df_u as f64;
+    if df <= 0.0 || !lambda_g.is_finite() || lambda_g < 0.0 {
+        return false;
+    }
+
+    out.lambda_g = lambda_g;
+    let mut logdet_d = 0.0_f64;
+    for i in 0..n {
+        let d = (lambda_g * s[i] + 1.0).max(MIN_DIAG_FLOOR);
+        out.w[i] = 1.0 / d;
+        logdet_d += d.ln();
+    }
+    out.logdet_d = logdet_d;
+
+    xwx.fill(0.0);
+    xwy.fill(0.0);
+    let mut ywy = 0.0_f64;
+    for i in 0..n {
+        let wi = out.w[i];
+        let yi = y_rot[i];
+        ywy += wi * yi * yi;
+        let xi = &x_rot[i * q..(i + 1) * q];
+        for a in 0..q {
+            let wxa = wi * xi[a];
+            xwy[a] += wxa * yi;
+            let row = a * q;
+            for b in 0..=a {
+                xwx[row + b] += wxa * xi[b];
+            }
+        }
+    }
+    for a in 0..q {
+        for b in (a + 1)..q {
+            xwx[a * q + b] = xwx[b * q + a];
+        }
+    }
+
+    if cholesky_gram_inplace(xwx, q).is_none() {
+        return false;
+    }
+    let logdet_xwx = cholesky_logdet(xwx, q);
+    out.logdet_xwx = logdet_xwx;
+    cholesky_solve_into(xwx, q, xwy, beta);
+
+    let quad_x: f64 = xwy.iter().zip(beta.iter()).map(|(a, b)| a * b).sum();
+    let rss0 = (ywy - quad_x).max(MIN_RSS_FLOOR);
+    let sigma_e2_0 = (rss0 / df).max(MIN_RSS_FLOOR);
+    out.rss0 = rss0;
+    out.sigma_e2_0 = sigma_e2_0;
+
+    for i in 0..n {
+        let wi = out.w[i];
+        let xi = &x_rot[i * q..(i + 1) * q];
+        let mut xb = 0.0_f64;
+        for a in 0..q {
+            xb += xi[a] * beta[a];
+            let mut sum = wi * xi[a];
+            let l_row = a * q;
+            for k in 0..a {
+                sum -= xwx[l_row + k] * tmp[k];
+            }
+            let val = sum / xwx[l_row + a];
+            tmp[a] = val;
+            out.vx_t[a * n + i] = val;
+        }
+        out.p0_y[i] = wi * (y_rot[i] - xb);
+    }
+
+    let const_term = df * ((2.0 * std::f64::consts::PI).ln() + 1.0);
+    out.reml_ll0 = -0.5 * (const_term + df * sigma_e2_0.ln() + logdet_d + logdet_xwx);
+    true
 }
 
 /// Optimize the null model (`tau = 0`) over `lambda_g` in `[10^low, 10^high]`
@@ -385,7 +837,6 @@ fn fit_null_reml_background(
 /// (`p <= INLINE_JACOBI_MAX_P`). Overwrites `a` with diagonal eigenvalues and writes
 /// eigenvectors as columns in row-major `v` (`v[row * p + col]`).
 fn jacobi_sym_eigh_inplace(a: &mut [f64], v: &mut [f64], p: usize) {
-    // Initialize V = I.
     for val in v.iter_mut() {
         *val = 0.0;
     }
@@ -469,24 +920,61 @@ fn jacobi_sym_eigh_inplace(a: &mut [f64], v: &mut [f64], p: usize) {
     }
 }
 
-/// Scratch workspace reused across bins inside each Rayon worker thread to avoid
-/// per-bin heap allocations.
+/// Scratch workspace reused across bins inside each Rayon worker thread (zero
+/// per-bin heap allocations in both FVLMM and LMM).
 struct TauSolverScratch {
     a_work: Vec<f64>,
     v_work: Vec<f64>,
     mu: Vec<f64>,
     u2: Vec<f64>,
     r_sub: Vec<f64>,
+    v_qp: Vec<f64>,
+    wz_col: Vec<f64>,
 }
 
 impl TauSolverScratch {
-    fn with_capacity(p_max: usize) -> Self {
+    fn with_capacity(p_max: usize, n: usize, q: usize) -> Self {
         Self {
             a_work: vec![0.0_f64; p_max * p_max],
             v_work: vec![0.0_f64; p_max * p_max],
             mu: Vec::with_capacity(p_max),
             u2: Vec::with_capacity(p_max),
             r_sub: Vec::with_capacity(p_max),
+            v_qp: vec![0.0_f64; q * p_max],
+            wz_col: vec![0.0_f64; n],
+        }
+    }
+}
+
+/// Reusable scratch buffers for zero-allocation LMM Brent refinement.
+struct LmmBrentScratch {
+    bg: BackgroundState,
+    xwx: Vec<f64>,
+    xwy: Vec<f64>,
+    beta: Vec<f64>,
+    tmp: Vec<f64>,
+    tau: TauSolverScratch,
+}
+
+impl LmmBrentScratch {
+    fn new(p_max: usize, n: usize, q: usize) -> Self {
+        Self {
+            bg: BackgroundState {
+                lambda_g: 0.0,
+                w: vec![0.0_f64; n],
+                logdet_d: 0.0,
+                vx_t: vec![0.0_f64; q * n],
+                logdet_xwx: 0.0,
+                p0_y: vec![0.0_f64; n],
+                rss0: 0.0,
+                reml_ll0: 0.0,
+                sigma_e2_0: 0.0,
+            },
+            xwx: vec![0.0_f64; q * q],
+            xwy: vec![0.0_f64; q],
+            beta: vec![0.0_f64; q],
+            tmp: vec![0.0_f64; q],
+            tau: TauSolverScratch::with_capacity(p_max, n, q),
         }
     }
 }
@@ -494,10 +982,6 @@ impl TauSolverScratch {
 /// Exact 1D REML optimization over `tau = sigma_b^2 / sigma_e^2 >= 0` given the
 /// `p x p` symmetric PSD matrix `A = Z^T P_0 Z` (stored in `scratch.a_work[..p*p]`)
 /// and vector `r = Z^T P_0 y` (stored in `scratch.r_sub[..p]`).
-///
-/// Uses zero-allocation Jacobi eigendecomposition (for `p <= 64`), an exact
-/// analytical certificate for `tau = 0`, and safeguarded analytical Newton-Raphson
-/// on `d(ll)/d(ln tau) = 0` (converging in ~4-6 iterations to `< 1e-10`).
 fn solve_tau_from_a_r(
     bg: &BackgroundState,
     df: f64,
@@ -567,9 +1051,6 @@ fn solve_tau_from_a_r(
     let rss_perp = (bg.rss0 - rss_proj_max).max(0.0);
 
     // Exact mathematical certificate for boundary optimum tau = 0:
-    // For every tau >= 0, RSS(tau) >= rss_perp, so
-    //   d(ll)/d(tau) = 0.5 * sum_j [mu_j / (1 + tau*mu_j)] * [(df / RSS(tau)) * (u_j^2 / (mu_j * (1 + tau*mu_j))) - 1].
-    // If max_j ((df / rss_perp) * (u_j^2 / mu_j)) <= 1.0, then d(ll)/d(tau) <= 0 for ALL tau >= 0!
     if rss_perp > MIN_RSS_FLOOR {
         let mut max_ratio = 0.0_f64;
         for (&mj, &uj2) in scratch.mu.iter().zip(&scratch.u2) {
@@ -588,21 +1069,20 @@ fn solve_tau_from_a_r(
     let mu_sl = &scratch.mu;
     let u2_sl = &scratch.u2;
 
-    // Evaluate (ll, sigma_e2, d_ll / d(ln tau), d2_ll / d(ln tau)^2) in O(p).
     let eval_reml_derivs = |tau: f64| -> (f64, f64, f64, f64) {
         let mut logdet_m = 0.0_f64;
         let mut rss_var = 0.0_f64;
-        let mut s1 = 0.0_f64; // sum_j t_j
-        let mut s2 = 0.0_f64; // sum_j t_j * (1 - t_j)
-        let mut r1 = 0.0_f64; // sum_j (u_j^2 * tau) / (1 + tau*mu_j)^2
-        let mut r2 = 0.0_f64; // d(r1)/d(ln tau)
+        let mut s1 = 0.0_f64;
+        let mut s2 = 0.0_f64;
+        let mut r1 = 0.0_f64;
+        let mut r2 = 0.0_f64;
         for (&mj, &uj2) in mu_sl.iter().zip(u2_sl.iter()) {
             let tm = tau * mj;
             let inv_d = 1.0 / (1.0 + tm);
             logdet_m += (1.0 + tm).ln();
             let qj = uj2 * inv_d;
             rss_var += qj / mj;
-            let tj = tm * inv_d; // tau*mu / (1 + tau*mu)
+            let tj = tm * inv_d;
             s1 += tj;
             s2 += tj * inv_d;
             let r1j = tau * uj2 * inv_d * inv_d;
@@ -612,15 +1092,12 @@ fn solve_tau_from_a_r(
         let rss = (rss_perp + rss_var).max(MIN_RSS_FLOOR);
         let sigma_e2 = (rss / df).max(MIN_RSS_FLOOR);
         let ll = -0.5 * (const_term + df * sigma_e2.ln() + base_logdet + logdet_m);
-        // d(rss)/d(ln tau) = -r1; d2(rss)/d(ln tau)^2 = -r2.
-        // g = d(ll)/d(ln tau) = 0.5 * (df * r1 / rss - s1).
         let inv_rss = 1.0 / rss;
         let g = 0.5 * (df * r1 * inv_rss - s1);
         let h = 0.5 * (df * (r2 * inv_rss + (r1 * inv_rss) * (r1 * inv_rss)) - s2);
         (ll, sigma_e2, g, h)
     };
 
-    // Fast coarse scan over 9 log-spaced probes to locate global basin(s).
     const PROBES: [f64; 9] = [-14.0, -10.0, -6.0, -3.0, -1.0, 1.0, 3.0, 7.0, 13.0];
     let mut best_ll = bg.reml_ll0;
     let mut best_tau = 0.0_f64;
@@ -642,7 +1119,6 @@ fn solve_tau_from_a_r(
 
     let score_slope = (df / bg.rss0) * u2_sl.iter().sum::<f64>() - mu_sl.iter().sum::<f64>();
     if best_idx.is_none() && score_slope <= 0.0 {
-        // Also check whether any probe had positive slope (interior peak between probes).
         let mut any_pos = false;
         for (k, &g) in probe_g.iter().enumerate() {
             if g > 0.0 {
@@ -656,7 +1132,6 @@ fn solve_tau_from_a_r(
         }
     }
 
-    // Establish a tight bracket around the best probe (or positive-slope region).
     let (mut lo, mut hi, mut x) = if let Some(k) = best_idx {
         let lo_k = if k == 0 { TAU_LOG_LOW } else { PROBES[k - 1] };
         let hi_k = if k + 1 >= PROBES.len() {
@@ -666,11 +1141,9 @@ fn solve_tau_from_a_r(
         };
         (lo_k, hi_k, PROBES[k])
     } else {
-        // Positive score slope at tau=0 but all probes <= ll0 -> optimum is at very small tau.
         (TAU_LOG_LOW, PROBES[0], 0.5 * (TAU_LOG_LOW + PROBES[0]))
     };
 
-    // Safeguarded Newton-Raphson on g(lt) = 0 within [lo, hi].
     for _iter in 0..16 {
         let tau = x.exp();
         let (ll, se2, g, h) = eval_reml_derivs(tau);
@@ -713,17 +1186,17 @@ fn solve_tau_from_a_r(
     (best_ll, best_tau, best_se2)
 }
 
-/// Given rotated active columns `z_rot_cols` (slice of `p` contiguous `n`-vectors)
-/// and a fixed `BackgroundState`, form `A = Z^T P_0 Z` and `r = Z^T P_0 y` and
-/// solve the exact 1D REML optimum over `tau >= 0`.
-fn optimize_tau_for_background_cols(
+/// Zero-allocation version of `optimize_tau_for_background_cols` operating on
+/// active parent indices into contiguous `(p_total x n)` `z_rot`.
+fn optimize_tau_for_background_zrot(
     bg: &BackgroundState,
-    z_rot_cols: &[&[f64]],
+    z_rot: &[f64],
+    active_parents: &[usize],
     n: usize,
     q: usize,
     scratch: &mut TauSolverScratch,
 ) -> (f64, f64, f64) {
-    let p = z_rot_cols.len();
+    let p = active_parents.len();
     if p == 0 {
         return (bg.reml_ll0, 0.0, bg.sigma_e2_0);
     }
@@ -733,17 +1206,14 @@ fn optimize_tau_for_background_cols(
 
     scratch.r_sub.clear();
     scratch.r_sub.resize(p, 0.0);
-    // Compute V = V_x^T Z_rot (q x p) where vx_t is (q x n).
-    let mut v_qp = vec![0.0_f64; q * p];
-    let mut wz_col = vec![0.0_f64; n];
 
-    for c in 0..p {
-        let zc = z_rot_cols[c];
+    for (c, &pc) in active_parents.iter().enumerate() {
+        let zc = &z_rot[pc * n..(pc + 1) * n];
         let mut rc = 0.0_f64;
         for i in 0..n {
             let zci = zc[i];
             rc += zci * p0_y[i];
-            wz_col[i] = w[i] * zci;
+            scratch.wz_col[i] = w[i] * zci;
         }
         scratch.r_sub[c] = rc;
 
@@ -753,19 +1223,19 @@ fn optimize_tau_for_background_cols(
             for i in 0..n {
                 dot += vxa[i] * zc[i];
             }
-            v_qp[a * p + c] = dot;
+            scratch.v_qp[a * p + c] = dot;
         }
 
         let row = c * p;
-        for d in 0..=c {
-            let zd = z_rot_cols[d];
+        for (d, &pd) in active_parents.iter().enumerate().take(c + 1) {
+            let zd = &z_rot[pd * n..(pd + 1) * n];
             let mut zwz_cd = 0.0_f64;
             for i in 0..n {
-                zwz_cd += wz_col[i] * zd[i];
+                zwz_cd += scratch.wz_col[i] * zd[i];
             }
             let mut sub = 0.0_f64;
             for a in 0..q {
-                sub += v_qp[a * p + c] * v_qp[a * p + d];
+                sub += scratch.v_qp[a * p + c] * scratch.v_qp[a * p + d];
             }
             let val = zwz_cd - sub;
             scratch.a_work[row + d] = val;
@@ -777,15 +1247,14 @@ fn optimize_tau_for_background_cols(
 }
 
 /// Build the exact original-space projection matrix `M_0 = U P_0 U^T` (`n x n`, row-major)
-/// and vector `v_0 = U P_0 y_rot` (`n`) once before scanning all bins in FVLMM mode.
-fn build_fvlmm_original_space_projection(
+/// and vector `v_0 = U P_0 y_rot` (`n`) for a fixed `BackgroundState`.
+fn build_original_space_projection(
     u_mat: &[f64],
     bg: &BackgroundState,
     n: usize,
     q: usize,
     threads: usize,
 ) -> (Vec<f64>, Vec<f64>) {
-    // 1. uw[i, j] = U[i, j] * w[j]  ->  M_0 = uw * U^T = U W U^T.
     let mut uw = vec![0.0_f64; n * n];
     for i in 0..n {
         let u_row = &u_mat[i * n..(i + 1) * n];
@@ -817,8 +1286,6 @@ fn build_fvlmm_original_space_projection(
         }
     }
 
-    // 2. Subtract (U V_x)(U V_x)^T where bg.vx_t is V_x^T (q x n, row-major).
-    //    Compute u_vx (n x q, row-major) = U (n x n) * (V_x^T)^T (n x q).
     if q > 0 {
         let mut u_vx = vec![0.0_f64; n * q];
         {
@@ -860,7 +1327,6 @@ fn build_fvlmm_original_space_projection(
         }
     }
 
-    // Enforce exact symmetry on M_0.
     for i in 0..n {
         for j in (i + 1)..n {
             let avg = 0.5 * (m0[i * n + j] + m0[j * n + i]);
@@ -869,7 +1335,6 @@ fn build_fvlmm_original_space_projection(
         }
     }
 
-    // 3. v_0 = U * p0_y.
     let mut v0 = vec![0.0_f64; n];
     for i in 0..n {
         let u_row = &u_mat[i * n..(i + 1) * n];
@@ -881,92 +1346,6 @@ fn build_fvlmm_original_space_projection(
     }
 
     (m0, v0)
-}
-
-/// Sparse entry delta between two adjacent bins: `(sample_new, parent_raw, old_val, new_val)`.
-#[inline]
-fn diff_sorted_bin_slices(
-    cb: &ChromosomeAncestryBinsSparse,
-    prev_start: usize,
-    prev_end: usize,
-    cur_start: usize,
-    cur_end: usize,
-    sample_remap: &[i32],
-    p_total: usize,
-    out_deltas: &mut Vec<(usize, usize, f64, f64)>,
-) {
-    out_deltas.clear();
-    let mut i = prev_start;
-    let mut j = cur_start;
-
-    while i < prev_end && j < cur_end {
-        let key_i = (cb.sample_idx[i], cb.parent_idx[i]);
-        let key_j = (cb.sample_idx[j], cb.parent_idx[j]);
-        if key_i == key_j {
-            let d_old = cb.dosage[i] as f64;
-            let d_new = cb.dosage[j] as f64;
-            if (d_new - d_old).abs() > 1e-12 {
-                let s_raw = key_i.0 as usize;
-                let p_raw = key_i.1 as usize;
-                if s_raw < sample_remap.len() && p_raw < p_total {
-                    let s_new = sample_remap[s_raw];
-                    if s_new >= 0 && d_old.is_finite() && d_new.is_finite() {
-                        out_deltas.push((s_new as usize, p_raw, d_old, d_new));
-                    }
-                }
-            }
-            i += 1;
-            j += 1;
-        } else if key_i < key_j {
-            let s_raw = key_i.0 as usize;
-            let p_raw = key_i.1 as usize;
-            let d_old = cb.dosage[i] as f64;
-            if s_raw < sample_remap.len() && p_raw < p_total && d_old != 0.0 && d_old.is_finite() {
-                let s_new = sample_remap[s_raw];
-                if s_new >= 0 {
-                    out_deltas.push((s_new as usize, p_raw, d_old, 0.0));
-                }
-            }
-            i += 1;
-        } else {
-            let s_raw = key_j.0 as usize;
-            let p_raw = key_j.1 as usize;
-            let d_new = cb.dosage[j] as f64;
-            if s_raw < sample_remap.len() && p_raw < p_total && d_new != 0.0 && d_new.is_finite() {
-                let s_new = sample_remap[s_raw];
-                if s_new >= 0 {
-                    out_deltas.push((s_new as usize, p_raw, 0.0, d_new));
-                }
-            }
-            j += 1;
-        }
-    }
-
-    while i < prev_end {
-        let s_raw = cb.sample_idx[i] as usize;
-        let p_raw = cb.parent_idx[i] as usize;
-        let d_old = cb.dosage[i] as f64;
-        if s_raw < sample_remap.len() && p_raw < p_total && d_old != 0.0 && d_old.is_finite() {
-            let s_new = sample_remap[s_raw];
-            if s_new >= 0 {
-                out_deltas.push((s_new as usize, p_raw, d_old, 0.0));
-            }
-        }
-        i += 1;
-    }
-
-    while j < cur_end {
-        let s_raw = cb.sample_idx[j] as usize;
-        let p_raw = cb.parent_idx[j] as usize;
-        let d_new = cb.dosage[j] as f64;
-        if s_raw < sample_remap.len() && p_raw < p_total && d_new != 0.0 && d_new.is_finite() {
-            let s_new = sample_remap[s_raw];
-            if s_new >= 0 {
-                out_deltas.push((s_new as usize, p_raw, 0.0, d_new));
-            }
-        }
-        j += 1;
-    }
 }
 
 #[inline]
@@ -1002,11 +1381,283 @@ fn build_result_from_opt(
     }
 }
 
-/// Process a chunk of bins `[b_start, b_end)` in **FVLMM** mode using exact incremental
-/// rank-1 updates of `(r, A, B)` in original sample space (`M_0 = U P_0 U^T`).
+#[inline]
+fn format_bin_result_row(buf: &mut String, chrom_name: &str, start_bp: u64, res: &HgwasBinResult) {
+    let _ = writeln!(
+        buf,
+        "{}\t{}\t{}\t{:.6e}\t{:.6e}\t{:.6e}\t{:.6}\t{:.6}\t{:.6e}",
+        chrom_name,
+        start_bp,
+        res.n_parents,
+        res.sigma_g2,
+        res.sigma_b2,
+        res.sigma_e2,
+        res.h2_bin,
+        res.lrt,
+        res.plrt
+    );
+}
+
+/// Mutable incremental projection state `(r = Z^T v, A = Z^T M Z, B = M Z)` for
+/// one fixed background `M = U P U^T`, `v = U P y_rot`.
+struct IncrementalProjState {
+    r_full: Vec<f64>,
+    a_full: Vec<f64>,
+    b_full: Vec<f64>,
+}
+
+impl IncrementalProjState {
+    fn new(p_total: usize, n: usize) -> Self {
+        Self {
+            r_full: vec![0.0_f64; p_total],
+            a_full: vec![0.0_f64; p_total * p_total],
+            b_full: vec![0.0_f64; p_total * n],
+        }
+    }
+
+    fn init_from_entries(
+        &mut self,
+        entries: &[(usize, usize, f64)],
+        p_nnz: &[u32],
+        p_total: usize,
+        n: usize,
+        m0: &[f64],
+        v0: &[f64],
+    ) {
+        self.r_full.fill(0.0);
+        self.a_full.fill(0.0);
+        self.b_full.fill(0.0);
+        for &(si, p_raw, d) in entries {
+            self.r_full[p_raw] += d * v0[si];
+            let m0_row = &m0[si * n..(si + 1) * n];
+            let bp = &mut self.b_full[p_raw * n..(p_raw + 1) * n];
+            for j in 0..n {
+                bp[j] += d * m0_row[j];
+            }
+        }
+        for &(si, p_raw, d) in entries {
+            let row = p_raw * p_total;
+            for p2 in 0..p_total {
+                if p_nnz[p2] > 0 {
+                    self.a_full[row + p2] += d * self.b_full[p2 * n + si];
+                }
+            }
+        }
+        for p1 in 0..p_total {
+            for p2 in (p1 + 1)..p_total {
+                let avg = 0.5 * (self.a_full[p1 * p_total + p2] + self.a_full[p2 * p_total + p1]);
+                self.a_full[p1 * p_total + p2] = avg;
+                self.a_full[p2 * p_total + p1] = avg;
+            }
+        }
+    }
+
+    #[inline]
+    fn apply_single_delta(
+        &mut self,
+        s_new: usize,
+        p_raw: usize,
+        delta: f64,
+        p_total: usize,
+        n: usize,
+        m0: &[f64],
+        v0: &[f64],
+    ) {
+        self.r_full[p_raw] += delta * v0[s_new];
+        let m0_row = &m0[s_new * n..(s_new + 1) * n];
+        for p2 in 0..p_total {
+            let d_bq = delta * self.b_full[p2 * n + s_new];
+            self.a_full[p_raw * p_total + p2] += d_bq;
+            self.a_full[p2 * p_total + p_raw] += d_bq;
+        }
+        self.a_full[p_raw * p_total + p_raw] += delta * delta * m0_row[s_new];
+        let bp = &mut self.b_full[p_raw * n..(p_raw + 1) * n];
+        for j in 0..n {
+            bp[j] += delta * m0_row[j];
+        }
+    }
+
+    /// Fused rank-2 update for a paired parent switch on the same sample:
+    /// `p_dec` changes by `-delta` and `p_inc` changes by `+delta`.
+    /// Reads `m0_row` once instead of twice, halving memory bandwidth.
+    #[inline]
+    fn apply_paired_switch(
+        &mut self,
+        s_new: usize,
+        p_dec: usize,
+        p_inc: usize,
+        delta: f64,
+        p_total: usize,
+        n: usize,
+        m0: &[f64],
+        v0: &[f64],
+    ) {
+        let dv = delta * v0[s_new];
+        self.r_full[p_dec] -= dv;
+        self.r_full[p_inc] += dv;
+        let m0_row = &m0[s_new * n..(s_new + 1) * n];
+        for q in 0..p_total {
+            let d_bq = delta * self.b_full[q * n + s_new];
+            self.a_full[p_dec * p_total + q] -= d_bq;
+            self.a_full[q * p_total + p_dec] -= d_bq;
+            self.a_full[p_inc * p_total + q] += d_bq;
+            self.a_full[q * p_total + p_inc] += d_bq;
+        }
+        let dm_diag = delta * delta * m0_row[s_new];
+        self.a_full[p_dec * p_total + p_dec] += dm_diag;
+        self.a_full[p_inc * p_total + p_inc] += dm_diag;
+        self.a_full[p_dec * p_total + p_inc] -= dm_diag;
+        self.a_full[p_inc * p_total + p_dec] -= dm_diag;
+
+        if p_dec < p_inc {
+            let (left, right) = self.b_full.split_at_mut(p_inc * n);
+            let b_dec = &mut left[p_dec * n..(p_dec + 1) * n];
+            let b_inc = &mut right[..n];
+            for j in 0..n {
+                let dm = delta * m0_row[j];
+                b_dec[j] -= dm;
+                b_inc[j] += dm;
+            }
+        } else {
+            let (left, right) = self.b_full.split_at_mut(p_dec * n);
+            let b_inc = &mut left[p_inc * n..(p_inc + 1) * n];
+            let b_dec = &mut right[..n];
+            for j in 0..n {
+                let dm = delta * m0_row[j];
+                b_dec[j] -= dm;
+                b_inc[j] += dm;
+            }
+        }
+    }
+
+    #[inline]
+    fn extract_active_into(
+        &self,
+        active_parents: &[usize],
+        p_total: usize,
+        scratch: &mut TauSolverScratch,
+    ) {
+        let p_active = active_parents.len();
+        scratch.r_sub.clear();
+        for (i_loc, &pi) in active_parents.iter().enumerate() {
+            scratch.r_sub.push(self.r_full[pi]);
+            let dst_row = i_loc * p_active;
+            let src_row = pi * p_total;
+            for (j_loc, &pj) in active_parents.iter().enumerate() {
+                scratch.a_work[dst_row + j_loc] = self.a_full[src_row + pj];
+            }
+        }
+    }
+}
+
+/// Apply remapped delta list to parent summary stats `(p_sum, p_sq_sum, p_nnz)`.
+#[inline]
+fn update_parent_stats(
+    p_raw: usize,
+    d_old: f64,
+    d_new: f64,
+    p_sum: &mut [f64],
+    p_sq_sum: &mut [f64],
+    p_nnz: &mut [u32],
+) {
+    let delta = d_new - d_old;
+    p_sum[p_raw] += delta;
+    p_sq_sum[p_raw] += d_new * d_new - d_old * d_old;
+    if d_old == 0.0 && d_new != 0.0 {
+        p_nnz[p_raw] = p_nnz[p_raw].saturating_add(1);
+    } else if d_old != 0.0 && d_new == 0.0 {
+        p_nnz[p_raw] = p_nnz[p_raw].saturating_sub(1);
+    }
+}
+
+/// Apply a sorted slice of remapped deltas `(s_new, p_raw, d_old, d_new)` to `z_rot`
+/// (`p_total x n`), fusing paired opposite switches on the same sample.
+#[inline]
+fn apply_deltas_to_zrot(
+    deltas: &[(usize, usize, f64, f64)],
+    z_rot: &mut [f64],
+    u_mat: &[f64],
+    n: usize,
+) {
+    let mut k = 0usize;
+    while k < deltas.len() {
+        let (s0, p0, o0, n0) = deltas[k];
+        let d0 = n0 - o0;
+        if k + 1 < deltas.len() {
+            let (s1, p1, o1, n1) = deltas[k + 1];
+            let d1 = n1 - o1;
+            if s0 == s1 && p0 != p1 && (d0 + d1).abs() <= 1e-12 {
+                let (p_dec, p_inc, delta) = if d0 < 0.0 { (p0, p1, d1) } else { (p1, p0, d0) };
+                let u_row = &u_mat[s0 * n..(s0 + 1) * n];
+                if p_dec < p_inc {
+                    let (left, right) = z_rot.split_at_mut(p_inc * n);
+                    let z_dec = &mut left[p_dec * n..(p_dec + 1) * n];
+                    let z_inc = &mut right[..n];
+                    for j in 0..n {
+                        let du = delta * u_row[j];
+                        z_dec[j] -= du;
+                        z_inc[j] += du;
+                    }
+                } else {
+                    let (left, right) = z_rot.split_at_mut(p_dec * n);
+                    let z_inc = &mut left[p_inc * n..(p_inc + 1) * n];
+                    let z_dec = &mut right[..n];
+                    for j in 0..n {
+                        let du = delta * u_row[j];
+                        z_dec[j] -= du;
+                        z_inc[j] += du;
+                    }
+                }
+                k += 2;
+                continue;
+            }
+        }
+        let u_row = &u_mat[s0 * n..(s0 + 1) * n];
+        let zp = &mut z_rot[p0 * n..(p0 + 1) * n];
+        for j in 0..n {
+            zp[j] += d0 * u_row[j];
+        }
+        k += 1;
+    }
+}
+
+/// Apply a sorted slice of remapped deltas `(s_new, p_raw, d_old, d_new)` to one
+/// `IncrementalProjState`, fusing paired opposite switches on the same sample.
+#[inline]
+fn apply_deltas_to_proj_state(
+    deltas: &[(usize, usize, f64, f64)],
+    state: &mut IncrementalProjState,
+    p_total: usize,
+    n: usize,
+    m0: &[f64],
+    v0: &[f64],
+) {
+    let mut k = 0usize;
+    while k < deltas.len() {
+        let (s0, p0, o0, n0) = deltas[k];
+        let d0 = n0 - o0;
+        if k + 1 < deltas.len() {
+            let (s1, p1, o1, n1) = deltas[k + 1];
+            let d1 = n1 - o1;
+            if s0 == s1 && p0 != p1 && (d0 + d1).abs() <= 1e-12 {
+                let (p_dec, p_inc, delta) = if d0 < 0.0 { (p0, p1, d1) } else { (p1, p0, d0) };
+                state.apply_paired_switch(s0, p_dec, p_inc, delta, p_total, n, m0, v0);
+                k += 2;
+                continue;
+            }
+        }
+        state.apply_single_delta(s0, p0, d0, p_total, n, m0, v0);
+        k += 1;
+    }
+}
+
+/// Process a chunk of bins `[b_start, b_end)` in **FVLMM** mode using sweep-line
+/// checkpoints + fused paired-switch rank-1/rank-2 updates, returning formatted TSV.
 #[allow(clippy::too_many_arguments)]
-fn scan_chunk_fvlmm(
-    cb: &ChromosomeAncestryBinsSparse,
+fn scan_chunk_fvlmm_events(
+    ce: &CompactChromEvents,
+    chrom_name: &str,
+    chunk_idx: usize,
     b_start: usize,
     b_end: usize,
     sample_remap: &[i32],
@@ -1017,56 +1668,20 @@ fn scan_chunk_fvlmm(
     null_bg: &BackgroundState,
     m0: &[f64],
     v0: &[f64],
-) -> Vec<HgwasBinResult> {
+) -> String {
     let df = (n - q) as f64;
     let inv_n = 1.0 / (n as f64);
-    let mut out = Vec::with_capacity(b_end - b_start);
+    let mut tsv_buf = String::with_capacity((b_end - b_start) * 96);
 
-    let mut r_full = vec![0.0_f64; p_total];
-    let mut a_full = vec![0.0_f64; p_total * p_total];
-    let mut b_full = vec![0.0_f64; p_total * n];
+    let mut state = IncrementalProjState::new(p_total, n);
     let mut p_sum = vec![0.0_f64; p_total];
     let mut p_sq_sum = vec![0.0_f64; p_total];
     let mut p_nnz = vec![0u32; p_total];
     let mut active_parents = Vec::with_capacity(p_total);
+    let mut init_entries: Vec<(usize, usize, f64)> = Vec::with_capacity(n);
     let mut deltas: Vec<(usize, usize, f64, f64)> = Vec::with_capacity(64);
-    let mut scratch = TauSolverScratch::with_capacity(p_total);
+    let mut scratch = TauSolverScratch::with_capacity(p_total, n, q);
 
-    let apply_delta = |s_new: usize,
-                       p_raw: usize,
-                       d_old: f64,
-                       d_new: f64,
-                       r_f: &mut [f64],
-                       a_f: &mut [f64],
-                       b_f: &mut [f64],
-                       ps: &mut [f64],
-                       psq: &mut [f64],
-                       pnnz: &mut [u32]| {
-        let delta = d_new - d_old;
-        ps[p_raw] += delta;
-        psq[p_raw] += d_new * d_new - d_old * d_old;
-        if d_old == 0.0 && d_new != 0.0 {
-            pnnz[p_raw] = pnnz[p_raw].saturating_add(1);
-        } else if d_old != 0.0 && d_new == 0.0 {
-            pnnz[p_raw] = pnnz[p_raw].saturating_sub(1);
-        }
-
-        r_f[p_raw] += delta * v0[s_new];
-        let m0_row = &m0[s_new * n..(s_new + 1) * n];
-        for p2 in 0..p_total {
-            let d_bq = delta * b_f[p2 * n + s_new];
-            a_f[p_raw * p_total + p2] += d_bq;
-            a_f[p2 * p_total + p_raw] += d_bq;
-        }
-        a_f[p_raw * p_total + p_raw] += delta * delta * m0_row[s_new];
-        let bp = &mut b_f[p_raw * n..(p_raw + 1) * n];
-        for j in 0..n {
-            bp[j] += delta * m0_row[j];
-        }
-    };
-
-    let mut prev_start = 0usize;
-    let mut prev_end = 0usize;
     let mut last_res = HgwasBinResult {
         n_parents: 0,
         sigma_g2: null_bg.lambda_g * null_bg.sigma_e2_0,
@@ -1078,14 +1693,13 @@ fn scan_chunk_fvlmm(
     };
 
     for b in b_start..b_end {
-        let cur_start = cb.bin_ptr[b] as usize;
-        let cur_end = cb.bin_ptr[b + 1] as usize;
-
         if b == b_start {
-            // Initialize from scratch using only nonzero entries of bin `b_start`.
-            for pos in cur_start..cur_end {
-                let s_raw = cb.sample_idx[pos] as usize;
-                let p_raw = cb.parent_idx[pos] as usize;
+            init_entries.clear();
+            let c0 = ce.chunk_init_ptr[chunk_idx] as usize;
+            let c1 = ce.chunk_init_ptr[chunk_idx + 1] as usize;
+            for pos in c0..c1 {
+                let s_raw = ce.chunk_init_sample[pos] as usize;
+                let p_raw = ce.chunk_init_parent[pos] as usize;
                 if s_raw >= sample_remap.len() || p_raw >= p_total {
                     continue;
                 }
@@ -1093,25 +1707,23 @@ fn scan_chunk_fvlmm(
                 if s_new < 0 {
                     continue;
                 }
-                let d = cb.dosage[pos] as f64;
+                let d = ce.chunk_init_dosage[pos] as f64;
                 if d == 0.0 || !d.is_finite() {
                     continue;
                 }
-                let si = s_new as usize;
+                init_entries.push((s_new as usize, p_raw, d));
                 p_sum[p_raw] += d;
                 p_sq_sum[p_raw] += d * d;
                 p_nnz[p_raw] = p_nnz[p_raw].saturating_add(1);
-                r_full[p_raw] += d * v0[si];
-                let m0_row = &m0[si * n..(si + 1) * n];
-                let bp = &mut b_full[p_raw * n..(p_raw + 1) * n];
-                for j in 0..n {
-                    bp[j] += d * m0_row[j];
-                }
             }
-            // Form initial A = Z^T B directly from nonzero entries of bin `b_start`.
-            for pos in cur_start..cur_end {
-                let s_raw = cb.sample_idx[pos] as usize;
-                let p_raw = cb.parent_idx[pos] as usize;
+            state.init_from_entries(&init_entries, &p_nnz, p_total, n, m0, v0);
+        } else {
+            deltas.clear();
+            let d0 = ce.delta_ptr[b] as usize;
+            let d1 = ce.delta_ptr[b + 1] as usize;
+            for pos in d0..d1 {
+                let s_raw = ce.delta_sample[pos] as usize;
+                let p_raw = ce.delta_parent[pos] as usize;
                 if s_raw >= sample_remap.len() || p_raw >= p_total {
                     continue;
                 }
@@ -1119,60 +1731,20 @@ fn scan_chunk_fvlmm(
                 if s_new < 0 {
                     continue;
                 }
-                let d = cb.dosage[pos] as f64;
-                if d == 0.0 || !d.is_finite() {
+                let old_v = ce.delta_old[pos] as f64;
+                let new_v = ce.delta_new[pos] as f64;
+                if (new_v - old_v).abs() <= 1e-12 {
                     continue;
                 }
-                let si = s_new as usize;
-                let row = p_raw * p_total;
-                for p2 in 0..p_total {
-                    if p_nnz[p2] > 0 {
-                        a_full[row + p2] += d * b_full[p2 * n + si];
-                    }
-                }
+                deltas.push((s_new as usize, p_raw, old_v, new_v));
+                update_parent_stats(p_raw, old_v, new_v, &mut p_sum, &mut p_sq_sum, &mut p_nnz);
             }
-            for p1 in 0..p_total {
-                for p2 in (p1 + 1)..p_total {
-                    let avg = 0.5 * (a_full[p1 * p_total + p2] + a_full[p2 * p_total + p1]);
-                    a_full[p1 * p_total + p2] = avg;
-                    a_full[p2 * p_total + p1] = avg;
-                }
-            }
-        } else {
-            diff_sorted_bin_slices(
-                cb,
-                prev_start,
-                prev_end,
-                cur_start,
-                cur_end,
-                sample_remap,
-                p_total,
-                &mut deltas,
-            );
             if deltas.is_empty() {
-                out.push(last_res);
-                prev_start = cur_start;
-                prev_end = cur_end;
+                format_bin_result_row(&mut tsv_buf, chrom_name, ce.bin_starts_bp[b], &last_res);
                 continue;
             }
-            for &(s_new, p_raw, d_old, d_new) in &deltas {
-                apply_delta(
-                    s_new,
-                    p_raw,
-                    d_old,
-                    d_new,
-                    &mut r_full,
-                    &mut a_full,
-                    &mut b_full,
-                    &mut p_sum,
-                    &mut p_sq_sum,
-                    &mut p_nnz,
-                );
-            }
+            apply_deltas_to_proj_state(&deltas, &mut state, p_total, n, m0, v0);
         }
-
-        prev_start = cur_start;
-        prev_end = cur_end;
 
         active_parents.clear();
         let mut centered_trace_sum = 0.0_f64;
@@ -1197,20 +1769,11 @@ fn scan_chunk_fvlmm(
                 lrt: 0.0,
                 plrt: 1.0,
             };
-            out.push(last_res);
+            format_bin_result_row(&mut tsv_buf, chrom_name, ce.bin_starts_bp[b], &last_res);
             continue;
         }
 
-        scratch.r_sub.clear();
-        for (i_loc, &pi) in active_parents.iter().enumerate() {
-            scratch.r_sub.push(r_full[pi]);
-            let dst_row = i_loc * p_active;
-            let src_row = pi * p_total;
-            for (j_loc, &pj) in active_parents.iter().enumerate() {
-                scratch.a_work[dst_row + j_loc] = a_full[src_row + pj];
-            }
-        }
-
+        state.extract_active_into(&active_parents, p_total, &mut scratch);
         let (best_ll, best_tau, best_se2) = solve_tau_from_a_r(null_bg, df, p_active, &mut scratch);
         last_res = build_result_from_opt(
             p_active,
@@ -1222,17 +1785,24 @@ fn scan_chunk_fvlmm(
             c_k,
             c_b,
         );
-        out.push(last_res);
+        format_bin_result_row(&mut tsv_buf, chrom_name, ce.bin_starts_bp[b], &last_res);
     }
 
-    out
+    tsv_buf
 }
 
-/// Process a chunk of bins `[b_start, b_end)` in exact **LMM** mode using incremental
-/// `Z_rot = U^T Z` updates, a precomputed `BackgroundState` grid, and tight-bracket Brent.
+/// Process a chunk of bins `[b_start, b_end)` in exact **LMM** mode.
+///
+/// When `grid_projs` is `Some` (fits in the 256 MiB budget), every precomputed grid
+/// point (`null_bg` + `cached_grid`) uses O(k * n) original-space incremental updates
+/// (identical to FVLMM), and `z_rot` is maintained incrementally solely for zero-allocation
+/// Brent refinement when `best_tau > 0`. When `grid_projs` is `None`, falls back cleanly
+/// to the low-memory `z_rot`-only grid evaluation.
 #[allow(clippy::too_many_arguments)]
-fn scan_chunk_lmm(
-    cb: &ChromosomeAncestryBinsSparse,
+fn scan_chunk_lmm_events(
+    ce: &CompactChromEvents,
+    chrom_name: &str,
+    chunk_idx: usize,
     b_start: usize,
     b_end: usize,
     sample_remap: &[i32],
@@ -1246,26 +1816,33 @@ fn scan_chunk_lmm(
     c_k: f64,
     null_bg: &BackgroundState,
     cached_grid: &[(f64, BackgroundState)],
+    grid_projs: Option<&[(Vec<f64>, Vec<f64>)]>,
     grid_step: f64,
     log10_low: f64,
     log10_high: f64,
     max_iter: usize,
     tol: f64,
-) -> Vec<HgwasBinResult> {
+) -> String {
+    let df = (n - q) as f64;
     let inv_n = 1.0 / (n as f64);
-    let mut out = Vec::with_capacity(b_end - b_start);
+    let mut tsv_buf = String::with_capacity((b_end - b_start) * 96);
 
-    // `z_rot` stored as (p_total x n) row-major so each parent column is contiguous.
     let mut z_rot = vec![0.0_f64; p_total * n];
+    let mut grid_states: Vec<IncrementalProjState> = match grid_projs {
+        Some(projs) => (0..projs.len())
+            .map(|_| IncrementalProjState::new(p_total, n))
+            .collect(),
+        None => Vec::new(),
+    };
     let mut p_sum = vec![0.0_f64; p_total];
     let mut p_sq_sum = vec![0.0_f64; p_total];
     let mut p_nnz = vec![0u32; p_total];
     let mut active_parents = Vec::with_capacity(p_total);
+    let mut init_entries: Vec<(usize, usize, f64)> = Vec::with_capacity(n);
     let mut deltas: Vec<(usize, usize, f64, f64)> = Vec::with_capacity(64);
-    let mut scratch = TauSolverScratch::with_capacity(p_total);
+    let mut scratch = TauSolverScratch::with_capacity(p_total, n, q);
+    let mut brent_scratch = LmmBrentScratch::new(p_total, n, q);
 
-    let mut prev_start = 0usize;
-    let mut prev_end = 0usize;
     let mut last_res = HgwasBinResult {
         n_parents: 0,
         sigma_g2: null_bg.lambda_g * null_bg.sigma_e2_0,
@@ -1277,13 +1854,13 @@ fn scan_chunk_lmm(
     };
 
     for b in b_start..b_end {
-        let cur_start = cb.bin_ptr[b] as usize;
-        let cur_end = cb.bin_ptr[b + 1] as usize;
-
         if b == b_start {
-            for pos in cur_start..cur_end {
-                let s_raw = cb.sample_idx[pos] as usize;
-                let p_raw = cb.parent_idx[pos] as usize;
+            init_entries.clear();
+            let c0 = ce.chunk_init_ptr[chunk_idx] as usize;
+            let c1 = ce.chunk_init_ptr[chunk_idx + 1] as usize;
+            for pos in c0..c1 {
+                let s_raw = ce.chunk_init_sample[pos] as usize;
+                let p_raw = ce.chunk_init_parent[pos] as usize;
                 if s_raw >= sample_remap.len() || p_raw >= p_total {
                     continue;
                 }
@@ -1291,11 +1868,12 @@ fn scan_chunk_lmm(
                 if s_new < 0 {
                     continue;
                 }
-                let d = cb.dosage[pos] as f64;
+                let d = ce.chunk_init_dosage[pos] as f64;
                 if d == 0.0 || !d.is_finite() {
                     continue;
                 }
                 let si = s_new as usize;
+                init_entries.push((si, p_raw, d));
                 p_sum[p_raw] += d;
                 p_sq_sum[p_raw] += d * d;
                 p_nnz[p_raw] = p_nnz[p_raw].saturating_add(1);
@@ -1305,42 +1883,44 @@ fn scan_chunk_lmm(
                     zp[j] += d * u_row[j];
                 }
             }
+            if let Some(projs) = grid_projs {
+                for (st, (m_g, v_g)) in grid_states.iter_mut().zip(projs.iter()) {
+                    st.init_from_entries(&init_entries, &p_nnz, p_total, n, m_g, v_g);
+                }
+            }
         } else {
-            diff_sorted_bin_slices(
-                cb,
-                prev_start,
-                prev_end,
-                cur_start,
-                cur_end,
-                sample_remap,
-                p_total,
-                &mut deltas,
-            );
+            deltas.clear();
+            let d0 = ce.delta_ptr[b] as usize;
+            let d1 = ce.delta_ptr[b + 1] as usize;
+            for pos in d0..d1 {
+                let s_raw = ce.delta_sample[pos] as usize;
+                let p_raw = ce.delta_parent[pos] as usize;
+                if s_raw >= sample_remap.len() || p_raw >= p_total {
+                    continue;
+                }
+                let s_new = sample_remap[s_raw];
+                if s_new < 0 {
+                    continue;
+                }
+                let old_v = ce.delta_old[pos] as f64;
+                let new_v = ce.delta_new[pos] as f64;
+                if (new_v - old_v).abs() <= 1e-12 {
+                    continue;
+                }
+                deltas.push((s_new as usize, p_raw, old_v, new_v));
+                update_parent_stats(p_raw, old_v, new_v, &mut p_sum, &mut p_sq_sum, &mut p_nnz);
+            }
             if deltas.is_empty() {
-                out.push(last_res);
-                prev_start = cur_start;
-                prev_end = cur_end;
+                format_bin_result_row(&mut tsv_buf, chrom_name, ce.bin_starts_bp[b], &last_res);
                 continue;
             }
-            for &(s_new, p_raw, d_old, d_new) in &deltas {
-                let delta = d_new - d_old;
-                p_sum[p_raw] += delta;
-                p_sq_sum[p_raw] += d_new * d_new - d_old * d_old;
-                if d_old == 0.0 && d_new != 0.0 {
-                    p_nnz[p_raw] = p_nnz[p_raw].saturating_add(1);
-                } else if d_old != 0.0 && d_new == 0.0 {
-                    p_nnz[p_raw] = p_nnz[p_raw].saturating_sub(1);
-                }
-                let u_row = &u_mat[s_new * n..(s_new + 1) * n];
-                let zp = &mut z_rot[p_raw * n..(p_raw + 1) * n];
-                for j in 0..n {
-                    zp[j] += delta * u_row[j];
+            apply_deltas_to_zrot(&deltas, &mut z_rot, u_mat, n);
+            if let Some(projs) = grid_projs {
+                for (st, (m_g, v_g)) in grid_states.iter_mut().zip(projs.iter()) {
+                    apply_deltas_to_proj_state(&deltas, st, p_total, n, m_g, v_g);
                 }
             }
         }
-
-        prev_start = cur_start;
-        prev_end = cur_end;
 
         active_parents.clear();
         let mut centered_trace_sum = 0.0_f64;
@@ -1365,18 +1945,18 @@ fn scan_chunk_lmm(
                 lrt: 0.0,
                 plrt: 1.0,
             };
-            out.push(last_res);
+            format_bin_result_row(&mut tsv_buf, chrom_name, ce.bin_starts_bp[b], &last_res);
             continue;
         }
 
-        let col_refs: Vec<&[f64]> = active_parents
-            .iter()
-            .map(|&p| &z_rot[p * n..(p + 1) * n])
-            .collect();
-
-        // Step 1: Evaluate at null_bg (exact FVLMM warm-start).
-        let (mut best_ll, mut best_tau, mut best_se2) =
-            optimize_tau_for_background_cols(null_bg, &col_refs, n, q, &mut scratch);
+        // Step 1 + Step 2: Evaluate null_bg + cached_grid either via O(1) incremental
+        // `(r_g, A_g)` extraction or via `z_rot` fallback.
+        let (mut best_ll, mut best_tau, mut best_se2) = if grid_projs.is_some() {
+            grid_states[0].extract_active_into(&active_parents, p_total, &mut scratch);
+            solve_tau_from_a_r(null_bg, df, p_active, &mut scratch)
+        } else {
+            optimize_tau_for_background_zrot(null_bg, &z_rot, &active_parents, n, q, &mut scratch)
+        };
         let mut best_lg = null_bg.lambda_g;
         let mut best_log10 = if null_bg.lambda_g > 0.0 {
             null_bg.lambda_g.log10().clamp(log10_low, log10_high)
@@ -1384,11 +1964,20 @@ fn scan_chunk_lmm(
             log10_low
         };
 
-        // Step 2: Evaluate cached BackgroundState grid (0.0 + log-spaced grid) with zero
-        // repeated Cholesky/background recomputation.
-        for (lg_log10, bg_cand) in cached_grid {
-            let (ll, tau, se2) =
-                optimize_tau_for_background_cols(bg_cand, &col_refs, n, q, &mut scratch);
+        for (gi, (lg_log10, bg_cand)) in cached_grid.iter().enumerate() {
+            let (ll, tau, se2) = if grid_projs.is_some() {
+                grid_states[gi + 1].extract_active_into(&active_parents, p_total, &mut scratch);
+                solve_tau_from_a_r(bg_cand, df, p_active, &mut scratch)
+            } else {
+                optimize_tau_for_background_zrot(
+                    bg_cand,
+                    &z_rot,
+                    &active_parents,
+                    n,
+                    q,
+                    &mut scratch,
+                )
+            };
             if ll > best_ll {
                 best_ll = ll;
                 best_tau = tau;
@@ -1400,26 +1989,38 @@ fn scan_chunk_lmm(
             }
         }
 
-        // Step 3: Refine lambda_g via tight-bracket Brent ONLY when a positive tau was found.
+        // Step 3: Zero-allocation tight-bracket Brent refinement ONLY when a positive tau was found.
         if best_tau > 0.0 && best_ll > null_bg.reml_ll0 {
             let b_lo = (best_log10 - grid_step).max(log10_low);
             let b_hi = (best_log10 + grid_step).min(log10_high);
-            let mut local_scratch = TauSolverScratch::with_capacity(p_active);
             let (opt_log10, _) = brent_minimize_with_init(
                 |lg_log10| {
                     let lam = 10.0_f64.powf(lg_log10);
-                    evaluate_background_state(s, x_rot, y_rot, n, q, lam)
-                        .map(|bg| {
-                            -optimize_tau_for_background_cols(
-                                &bg,
-                                &col_refs,
-                                n,
-                                q,
-                                &mut local_scratch,
-                            )
-                            .0
-                        })
-                        .unwrap_or(f64::INFINITY)
+                    if evaluate_background_state_into(
+                        s,
+                        x_rot,
+                        y_rot,
+                        n,
+                        q,
+                        lam,
+                        &mut brent_scratch.bg,
+                        &mut brent_scratch.xwx,
+                        &mut brent_scratch.xwy,
+                        &mut brent_scratch.beta,
+                        &mut brent_scratch.tmp,
+                    ) {
+                        -optimize_tau_for_background_zrot(
+                            &brent_scratch.bg,
+                            &z_rot,
+                            &active_parents,
+                            n,
+                            q,
+                            &mut brent_scratch.tau,
+                        )
+                        .0
+                    } else {
+                        f64::INFINITY
+                    }
                 },
                 b_lo,
                 b_hi,
@@ -1428,9 +2029,27 @@ fn scan_chunk_lmm(
                 Some(best_log10),
             );
             let opt_lam = 10.0_f64.powf(opt_log10);
-            if let Some(bg) = evaluate_background_state(s, x_rot, y_rot, n, q, opt_lam) {
-                let (ll, tau, se2) =
-                    optimize_tau_for_background_cols(&bg, &col_refs, n, q, &mut scratch);
+            if evaluate_background_state_into(
+                s,
+                x_rot,
+                y_rot,
+                n,
+                q,
+                opt_lam,
+                &mut brent_scratch.bg,
+                &mut brent_scratch.xwx,
+                &mut brent_scratch.xwy,
+                &mut brent_scratch.beta,
+                &mut brent_scratch.tmp,
+            ) {
+                let (ll, tau, se2) = optimize_tau_for_background_zrot(
+                    &brent_scratch.bg,
+                    &z_rot,
+                    &active_parents,
+                    n,
+                    q,
+                    &mut brent_scratch.tau,
+                );
                 if ll > best_ll {
                     best_ll = ll;
                     best_tau = tau;
@@ -1450,116 +2069,18 @@ fn scan_chunk_lmm(
             c_k,
             c_b,
         );
-        out.push(last_res);
+        format_bin_result_row(&mut tsv_buf, chrom_name, ce.bin_starts_bp[b], &last_res);
     }
 
-    out
+    tsv_buf
 }
 
-/// Extract a single bin's sparse ancestry entries into dense `n x p_active` column-major
-/// columns inside a batch matrix `z_batch` (used by ancestry GRM construction).
-fn populate_bin_into_batch(
-    cb: &ChromosomeAncestryBinsSparse,
-    bin_idx: usize,
-    sample_remap: &[i32],
-    n: usize,
-    z_batch: &mut Vec<f64>,
-    col_offset: usize,
-    parent_to_local: &mut [i32],
-    col_sums: &mut Vec<f64>,
-    col_sq_sums: &mut Vec<f64>,
-) -> (usize, f64) {
-    let start = cb.bin_ptr[bin_idx] as usize;
-    let end = cb.bin_ptr[bin_idx + 1] as usize;
-    if start >= end {
-        return (0, 0.0);
-    }
-
-    let mut active_parents: Vec<usize> = Vec::new();
-    for pos in start..end {
-        let s_raw = cb.sample_idx[pos] as usize;
-        if s_raw >= sample_remap.len() || sample_remap[s_raw] < 0 {
-            continue;
-        }
-        let d = cb.dosage[pos] as f64;
-        if d == 0.0 || !d.is_finite() {
-            continue;
-        }
-        let p_raw = cb.parent_idx[pos] as usize;
-        if p_raw < parent_to_local.len() && parent_to_local[p_raw] < 0 {
-            parent_to_local[p_raw] = active_parents.len() as i32;
-            active_parents.push(p_raw);
-        }
-    }
-
-    let p_active = active_parents.len();
-    if p_active == 0 {
-        return (0, 0.0);
-    }
-
-    let old_len = z_batch.len();
-    z_batch.resize(old_len + p_active * n, 0.0);
-    col_sums.clear();
-    col_sums.resize(p_active, 0.0);
-    col_sq_sums.clear();
-    col_sq_sums.resize(p_active, 0.0);
-
-    for pos in start..end {
-        let s_raw = cb.sample_idx[pos] as usize;
-        if s_raw >= sample_remap.len() {
-            continue;
-        }
-        let s_new = sample_remap[s_raw];
-        if s_new < 0 {
-            continue;
-        }
-        let p_raw = cb.parent_idx[pos] as usize;
-        if p_raw >= parent_to_local.len() {
-            continue;
-        }
-        let local_p = parent_to_local[p_raw];
-        if local_p < 0 {
-            continue;
-        }
-        let d = cb.dosage[pos] as f64;
-        if d == 0.0 || !d.is_finite() {
-            continue;
-        }
-        let c = local_p as usize;
-        let idx = (col_offset + c) * n + (s_new as usize);
-        z_batch[idx] += d;
-    }
-
-    let inv_n = 1.0 / (n as f64);
-    let mut centered_trace_sum = 0.0_f64;
-    for c in 0..p_active {
-        let col = &z_batch[(col_offset + c) * n..(col_offset + c + 1) * n];
-        let mut s1 = 0.0_f64;
-        let mut s2 = 0.0_f64;
-        for &v in col {
-            s1 += v;
-            s2 += v * v;
-        }
-        let mean = s1 * inv_n;
-        let var_sum = (s2 - s1 * mean).max(0.0);
-        centered_trace_sum += var_sum;
-        col_sums[c] = mean;
-        col_sq_sums[c] = var_sum;
-    }
-
-    for &p_raw in &active_parents {
-        parent_to_local[p_raw] = -1;
-    }
-
-    (p_active, centered_trace_sum * inv_n)
-}
-
-/// Core streaming ancestry GRM builder from `HaploidSparseArchive`.
+/// Core streaming ancestry GRM builder from `CompactHgwasArchive`.
 ///
 /// `method == 1`: centered ancestry GRM `K = Z_c Z_c^T / (tr(Z_c Z_c^T) / n)`.
 /// `method == 2`: standardized ancestry GRM `K = Z_s Z_s^T / m_eff`.
-pub(crate) fn build_ancestry_grm_from_archive(
-    archive: &HaploidSparseArchive,
+pub(crate) fn build_ancestry_grm_from_compact(
+    archive: &CompactHgwasArchive,
     sample_indices: Option<&[i64]>,
     method: i32,
     threads: usize,
@@ -1567,22 +2088,12 @@ pub(crate) fn build_ancestry_grm_from_archive(
     if method != 1 && method != 2 {
         return Err(format!("GRM method must be 1 or 2, got {}", method));
     }
-    let chrom_bins = match &archive.payload {
-        HaploidSparsePayload::MultiParentAncestry { chrom_bins, .. } => chrom_bins,
-        _ => {
-            return Err("hGWAS GRM requires MultiParentAncestry payload".to_string());
-        }
-    };
     let (sample_remap, n) = build_sample_remap(archive.target_sample_ids.len(), sample_indices)?;
     if n == 0 {
         return Err("empty sample selection for ancestry GRM".to_string());
     }
 
-    let n_parents = archive.reference_sample_ids.len().max(1);
-    let mut parent_to_local = vec![-1i32; n_parents];
-    let mut col_sums = Vec::with_capacity(n_parents);
-    let mut col_sq_sums = Vec::with_capacity(n_parents);
-
+    let p_total = archive.reference_sample_ids.len().max(1);
     let mut grm = vec![0.0_f64; n * n];
     let mut z_batch: Vec<f64> = Vec::with_capacity(DEFAULT_BIN_BATCH_COLS * n);
     let mut batch_cols = 0usize;
@@ -1618,50 +2129,93 @@ pub(crate) fn build_ancestry_grm_from_archive(
         *cols = 0;
     };
 
-    for cb in chrom_bins {
-        let n_bins = cb.bin_starts_bp.len();
+    // Maintain current bin's dense `(p_total x n)` dosage matrix via O(k) deltas.
+    let mut cur_z = vec![0.0_f64; p_total * n];
+    let mut p_sum = vec![0.0_f64; p_total];
+    let mut p_sq_sum = vec![0.0_f64; p_total];
+    let mut p_nnz = vec![0u32; p_total];
+
+    for ce in &archive.chrom_events {
+        let n_bins = ce.bin_starts_bp.len();
         for b in 0..n_bins {
-            let col_off = batch_cols;
-            let (p_active, _) = populate_bin_into_batch(
-                cb,
-                b,
-                &sample_remap,
-                n,
-                &mut z_batch,
-                col_off,
-                &mut parent_to_local,
-                &mut col_sums,
-                &mut col_sq_sums,
-            );
-            if p_active == 0 {
-                continue;
+            if b % CHUNK_BINS == 0 {
+                cur_z.fill(0.0);
+                p_sum.fill(0.0);
+                p_sq_sum.fill(0.0);
+                p_nnz.fill(0);
+                let chunk_idx = b / CHUNK_BINS;
+                let c0 = ce.chunk_init_ptr[chunk_idx] as usize;
+                let c1 = ce.chunk_init_ptr[chunk_idx + 1] as usize;
+                for pos in c0..c1 {
+                    let s_raw = ce.chunk_init_sample[pos] as usize;
+                    let p_raw = ce.chunk_init_parent[pos] as usize;
+                    if s_raw >= sample_remap.len() || p_raw >= p_total {
+                        continue;
+                    }
+                    let s_new = sample_remap[s_raw];
+                    if s_new < 0 {
+                        continue;
+                    }
+                    let d = ce.chunk_init_dosage[pos] as f64;
+                    if d == 0.0 || !d.is_finite() {
+                        continue;
+                    }
+                    cur_z[p_raw * n + s_new as usize] = d;
+                    p_sum[p_raw] += d;
+                    p_sq_sum[p_raw] += d * d;
+                    p_nnz[p_raw] = p_nnz[p_raw].saturating_add(1);
+                }
+            } else {
+                let d0 = ce.delta_ptr[b] as usize;
+                let d1 = ce.delta_ptr[b + 1] as usize;
+                for pos in d0..d1 {
+                    let s_raw = ce.delta_sample[pos] as usize;
+                    let p_raw = ce.delta_parent[pos] as usize;
+                    if s_raw >= sample_remap.len() || p_raw >= p_total {
+                        continue;
+                    }
+                    let s_new = sample_remap[s_raw];
+                    if s_new < 0 {
+                        continue;
+                    }
+                    let old_v = ce.delta_old[pos] as f64;
+                    let new_v = ce.delta_new[pos] as f64;
+                    cur_z[p_raw * n + s_new as usize] = new_v;
+                    update_parent_stats(p_raw, old_v, new_v, &mut p_sum, &mut p_sq_sum, &mut p_nnz);
+                }
             }
+
             let mut kept_in_bin = 0usize;
-            for c in 0..p_active {
-                let mean = col_sums[c];
-                let var = col_sq_sums[c] * inv_n;
-                let col_slice = &mut z_batch[(col_off + c) * n..(col_off + c + 1) * n];
-                if var <= 1e-12 {
-                    col_slice.fill(0.0);
+            for p in 0..p_total {
+                if p_nnz[p] == 0 {
                     continue;
                 }
+                let mean = p_sum[p] * inv_n;
+                let var = (p_sq_sum[p] - p_sum[p] * mean).max(0.0) * inv_n;
+                if var <= 1e-12 {
+                    continue;
+                }
+                let col_off = z_batch.len();
+                z_batch.resize(col_off + n, 0.0);
+                let src = &cur_z[p * n..(p + 1) * n];
+                let dst = &mut z_batch[col_off..col_off + n];
                 if method == 1 {
-                    for v in col_slice.iter_mut() {
-                        *v -= mean;
+                    for i in 0..n {
+                        dst[i] = src[i] - mean;
                     }
                 } else {
                     let inv_sd = 1.0 / var.sqrt();
-                    for v in col_slice.iter_mut() {
-                        *v = (*v - mean) * inv_sd;
+                    for i in 0..n {
+                        dst[i] = (src[i] - mean) * inv_sd;
                     }
                 }
                 kept_in_bin += 1;
+                batch_cols += 1;
             }
             if kept_in_bin > 0 {
                 eff_bins += 1;
                 eff_cols += kept_in_bin;
             }
-            batch_cols += p_active;
             if batch_cols >= DEFAULT_BIN_BATCH_COLS {
                 flush_batch(&mut z_batch, &mut batch_cols, &mut grm);
             }
@@ -1697,10 +2251,10 @@ pub(crate) fn build_ancestry_grm_from_archive(
     Ok((grm, n, eff_bins))
 }
 
-/// Core streaming hGWAS scan over a `HaploidSparseArchive`, writing results to `out_tsv`.
+/// Core streaming hGWAS scan over a `CompactHgwasArchive`, writing results to `out_tsv`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn scan_hgwas_archive_to_tsv(
-    archive: &HaploidSparseArchive,
+pub(crate) fn scan_hgwas_compact_to_tsv(
+    archive: &CompactHgwasArchive,
     out_tsv: &str,
     s: &[f64],
     x_rot: &[f64],
@@ -1718,12 +2272,6 @@ pub(crate) fn scan_hgwas_archive_to_tsv(
     threads: usize,
     mut on_progress: impl FnMut(usize, usize),
 ) -> Result<(usize, f64), String> {
-    let chrom_bins = match &archive.payload {
-        HaploidSparsePayload::MultiParentAncestry { chrom_bins, .. } => chrom_bins,
-        _ => {
-            return Err("hGWAS requires MultiParentAncestry payload in .jhibd".to_string());
-        }
-    };
     if s.len() != n || y_rot.len() != n || x_rot.len() != n * q || u_t.len() != n * n {
         return Err("dimension mismatch in rotated inputs for hGWAS".to_string());
     }
@@ -1749,8 +2297,7 @@ pub(crate) fn scan_hgwas_archive_to_tsv(
         fit_null_reml_background(s, x_rot, y_rot, n, q, log10_low, log10_high, None)?
     };
 
-    // Transpose U^T -> U (n x n, row-major) once so U[i, :] is contiguous for both
-    // FVLMM M_0 construction and LMM incremental Z_rot updates.
+    // Transpose U^T -> U (n x n, row-major) once so U[i, :] is contiguous.
     let mut u_mat = vec![0.0_f64; n * n];
     for i in 0..n {
         for j in 0..n {
@@ -1759,14 +2306,15 @@ pub(crate) fn scan_hgwas_archive_to_tsv(
     }
 
     let fvlmm_proj = if !exact_lmm {
-        Some(build_fvlmm_original_space_projection(
-            &u_mat, &null_bg, n, q, threads,
-        ))
+        let proj = build_original_space_projection(&u_mat, &null_bg, n, q, threads);
+        // Free `u_mat` immediately in FVLMM mode (not needed during scan).
+        u_mat.clear();
+        u_mat.shrink_to_fit();
+        Some(proj)
     } else {
         None
     };
 
-    // Precompute cached BackgroundState grid for exact LMM once before scanning.
     let n_grid_lmm = 8usize;
     let grid_step = (log10_high - log10_low) / (n_grid_lmm as f64);
     let cached_grid: Vec<(f64, BackgroundState)> = if exact_lmm {
@@ -1786,19 +2334,6 @@ pub(crate) fn scan_hgwas_archive_to_tsv(
         Vec::new()
     };
 
-    let p_total = archive.reference_sample_ids.len().max(1);
-    validate_incremental_sparse_bins(chrom_bins, archive.target_sample_ids.len(), p_total)?;
-
-    let total_bins: usize = chrom_bins.iter().map(|cb| cb.bin_starts_bp.len()).sum();
-    let file = File::create(out_tsv)
-        .map_err(|e| format!("failed to create hGWAS TSV '{}': {}", out_tsv, e))?;
-    let mut writer = BufWriter::with_capacity(512 * 1024, file);
-    writeln!(
-        writer,
-        "chrom\tpos\tn_parents\tsigma_g2\tsigma_b2\tsigma_e2\th2_bin\tlrt\tplrt"
-    )
-    .map_err(|e| format!("failed to write hGWAS TSV header: {}", e))?;
-
     let pool = if threads > 0 {
         Some(
             rayon::ThreadPoolBuilder::new()
@@ -1810,30 +2345,82 @@ pub(crate) fn scan_hgwas_archive_to_tsv(
         None
     };
 
-    // Build flat chunk descriptors `(chrom_vec_idx, b_start, b_end)`.
-    let mut chunks: Vec<(usize, usize, usize)> = Vec::new();
-    for (ci, cb) in chrom_bins.iter().enumerate() {
-        let n_bins = cb.bin_starts_bp.len();
+    // Precompute original-space `(M_g, v_g)` for `null_bg` + `cached_grid` when they
+    // fit comfortably inside the 256 MiB memory budget (gives 5-10x exact LMM speedup).
+    let lmm_grid_projs: Option<Vec<(Vec<f64>, Vec<f64>)>> = if exact_lmm {
+        let n_states = 1 + cached_grid.len();
+        let est_bytes = n_states
+            .saturating_mul(n)
+            .saturating_mul(n)
+            .saturating_mul(std::mem::size_of::<f64>());
+        if est_bytes <= LMM_MULTI_GRID_MAX_BYTES {
+            let build_all = || -> Vec<(Vec<f64>, Vec<f64>)> {
+                let mut refs: Vec<&BackgroundState> = Vec::with_capacity(n_states);
+                refs.push(&null_bg);
+                for (_, bg) in &cached_grid {
+                    refs.push(bg);
+                }
+                refs.par_iter()
+                    .map(|bg| build_original_space_projection(&u_mat, bg, n, q, 1))
+                    .collect()
+            };
+            let projs = if let Some(tp) = pool.as_ref() {
+                tp.install(build_all)
+            } else {
+                build_all()
+            };
+            Some(projs)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let total_bins = archive.total_bins;
+    let file = File::create(out_tsv)
+        .map_err(|e| format!("failed to create hGWAS TSV '{}': {}", out_tsv, e))?;
+    let mut writer = BufWriter::with_capacity(1024 * 1024, file);
+    writeln!(
+        writer,
+        "chrom\tpos\tn_parents\tsigma_g2\tsigma_b2\tsigma_e2\th2_bin\tlrt\tplrt"
+    )
+    .map_err(|e| format!("failed to write hGWAS TSV header: {}", e))?;
+
+    let p_total = archive.reference_sample_ids.len().max(1);
+
+    // Build flat chunk descriptors `(chrom_vec_idx, chunk_idx, b_start, b_end)`.
+    let mut chunks: Vec<(usize, usize, usize, usize)> = Vec::new();
+    for (ci, ce) in archive.chrom_events.iter().enumerate() {
+        let n_bins = ce.bin_starts_bp.len();
         let mut b = 0usize;
+        let mut chunk_idx = 0usize;
         while b < n_bins {
             let b_end = (b + CHUNK_BINS).min(n_bins);
-            chunks.push((ci, b, b_end));
+            chunks.push((ci, chunk_idx, b, b_end));
             b = b_end;
+            chunk_idx += 1;
         }
     }
 
-    // Process waves of parallel chunks so memory stays bounded and progress updates smoothly.
     let wave_size = (threads.max(1) * 4).clamp(4, 64);
     let mut bins_done = 0usize;
 
     for wave in chunks.chunks(wave_size) {
-        let run_wave = || -> Vec<Vec<HgwasBinResult>> {
+        let run_wave = || -> Vec<String> {
             wave.par_iter()
-                .map(|&(ci, b_start, b_end)| {
-                    let cb = &chrom_bins[ci];
+                .map(|&(ci, chunk_idx, b_start, b_end)| {
+                    let ce = &archive.chrom_events[ci];
+                    let chrom_name = archive
+                        .chrom_names
+                        .get(ce.chrom_idx as usize)
+                        .map(|s| s.as_str())
+                        .unwrap_or("chr?");
                     if let Some((ref m0, ref v0)) = fvlmm_proj {
-                        scan_chunk_fvlmm(
-                            cb,
+                        scan_chunk_fvlmm_events(
+                            ce,
+                            chrom_name,
+                            chunk_idx,
                             b_start,
                             b_end,
                             &sample_remap,
@@ -1846,8 +2433,10 @@ pub(crate) fn scan_hgwas_archive_to_tsv(
                             v0,
                         )
                     } else {
-                        scan_chunk_lmm(
-                            cb,
+                        scan_chunk_lmm_events(
+                            ce,
+                            chrom_name,
+                            chunk_idx,
                             b_start,
                             b_end,
                             &sample_remap,
@@ -1861,6 +2450,7 @@ pub(crate) fn scan_hgwas_archive_to_tsv(
                             c_k,
                             &null_bg,
                             &cached_grid,
+                            lmm_grid_projs.as_deref(),
                             grid_step,
                             log10_low,
                             log10_high,
@@ -1872,37 +2462,16 @@ pub(crate) fn scan_hgwas_archive_to_tsv(
                 .collect()
         };
 
-        let wave_results = if let Some(tp) = pool.as_ref() {
+        let wave_texts = if let Some(tp) = pool.as_ref() {
             tp.install(run_wave)
         } else {
             run_wave()
         };
 
-        for (&(ci, b_start, b_end), chunk_res) in wave.iter().zip(&wave_results) {
-            let cb = &chrom_bins[ci];
-            let chrom_name = archive
-                .chrom_names
-                .get(cb.chrom_idx as usize)
-                .map(|s| s.as_str())
-                .unwrap_or("chr?");
-            for (offset, res) in chunk_res.iter().enumerate() {
-                let b = b_start + offset;
-                let start_bp = cb.bin_starts_bp[b];
-                writeln!(
-                    writer,
-                    "{}\t{}\t{}\t{:.6e}\t{:.6e}\t{:.6e}\t{:.6}\t{:.6}\t{:.6e}",
-                    chrom_name,
-                    start_bp,
-                    res.n_parents,
-                    res.sigma_g2,
-                    res.sigma_b2,
-                    res.sigma_e2,
-                    res.h2_bin,
-                    res.lrt,
-                    res.plrt
-                )
-                .map_err(|e| format!("failed to write hGWAS TSV row: {}", e))?;
-            }
+        for (&(_, _, b_start, b_end), chunk_text) in wave.iter().zip(&wave_texts) {
+            writer
+                .write_all(chunk_text.as_bytes())
+                .map_err(|e| format!("failed to write hGWAS TSV chunk: {}", e))?;
             bins_done += b_end - b_start;
         }
         on_progress(bins_done, total_bins);
@@ -1925,27 +2494,194 @@ pub(crate) fn scan_hgwas_archive_to_tsv(
 }
 
 // ============================================================
-// PyO3 bindings
+// PyO3 bindings (reusable handle + backward-compatible functions)
 // ============================================================
+
+/// Reusable compact hGWAS archive handle (`#[pyclass]`) that loads `.jhibd`
+/// (`JHIBD01` or `JHIBD02`) once into a compact sweep-line event index and can
+/// be reused across ancestry GRM construction, multiple traits, and both
+/// `-fvlmm` and `-lmm` without re-decompressing from disk.
+#[pyclass]
+pub struct HgwasArchive {
+    inner: Arc<CompactHgwasArchive>,
+}
+
+#[pymethods]
+impl HgwasArchive {
+    #[staticmethod]
+    pub fn open(py: Python<'_>, jhibd_path: String) -> PyResult<Self> {
+        let compact = py
+            .detach(move || CompactHgwasArchive::open(&jhibd_path))
+            .map_err(PyValueError::new_err)?;
+        Ok(Self {
+            inner: Arc::new(compact),
+        })
+    }
+
+    pub fn inspect(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let dict = PyDict::new(py);
+        dict.set_item("sample_ids", &self.inner.target_sample_ids)?;
+        dict.set_item("parent_ids", &self.inner.reference_sample_ids)?;
+        dict.set_item("chrom_names", &self.inner.chrom_names)?;
+        dict.set_item("n_bins", self.inner.total_bins)?;
+        dict.set_item("version", self.inner.version)?;
+        Ok(dict.into_any().unbind())
+    }
+
+    #[pyo3(signature = (sample_indices=None, method=1, threads=0))]
+    pub fn build_grm<'py>(
+        &self,
+        py: Python<'py>,
+        sample_indices: Option<PyReadonlyArray1<'py, i64>>,
+        method: i32,
+        threads: usize,
+    ) -> PyResult<(Bound<'py, PyArray2<f64>>, usize)> {
+        let sel_vec: Option<Vec<i64>> = sample_indices
+            .map(|arr| {
+                arr.as_slice()
+                    .map(|sl| sl.to_vec())
+                    .map_err(|_| PyValueError::new_err("sample_indices must be contiguous i64"))
+            })
+            .transpose()?;
+        let arc = Arc::clone(&self.inner);
+        let (grm, n, eff_bins) = py
+            .detach(move || {
+                build_ancestry_grm_from_compact(&arc, sel_vec.as_deref(), method, threads)
+            })
+            .map_err(PyRuntimeError::new_err)?;
+        let arr = PyArray2::<f64>::from_vec2(
+            py,
+            &(0..n)
+                .map(|i| grm[i * n..(i + 1) * n].to_vec())
+                .collect::<Vec<_>>(),
+        )
+        .map_err(|e| PyRuntimeError::new_err(format!("failed to create GRM array: {}", e)))?;
+        Ok((arr, eff_bins))
+    }
+
+    #[pyo3(signature = (
+        out_tsv,
+        s,
+        x_rot,
+        y_rot,
+        u_t,
+        sample_indices=None,
+        exact_lmm=false,
+        lambda_g_null=None,
+        low=-5.0,
+        high=5.0,
+        max_iter=30,
+        tol=1e-2,
+        threads=0,
+        progress_callback=None
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_to_tsv(
+        &self,
+        py: Python<'_>,
+        out_tsv: String,
+        s: PyReadonlyArray1<'_, f64>,
+        x_rot: PyReadonlyArray2<'_, f64>,
+        y_rot: PyReadonlyArray1<'_, f64>,
+        u_t: PyReadonlyArray2<'_, f64>,
+        sample_indices: Option<PyReadonlyArray1<'_, i64>>,
+        exact_lmm: bool,
+        lambda_g_null: Option<f64>,
+        low: f64,
+        high: f64,
+        max_iter: usize,
+        tol: f64,
+        threads: usize,
+        progress_callback: Option<Py<PyAny>>,
+    ) -> PyResult<(usize, f64)> {
+        let s_vec = s
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("s must be contiguous f64"))?
+            .to_vec();
+        let y_vec = y_rot
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("y_rot must be contiguous f64"))?
+            .to_vec();
+        let x_shape = x_rot.shape();
+        let n = s_vec.len();
+        if y_vec.len() != n || x_shape[0] != n || x_shape[1] == 0 {
+            return Err(PyValueError::new_err(
+                "dimension mismatch between s, y_rot, and x_rot",
+            ));
+        }
+        let q = x_shape[1];
+        let x_vec = x_rot
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("x_rot must be contiguous f64"))?
+            .to_vec();
+        let u_shape = u_t.shape();
+        if u_shape[0] != n || u_shape[1] != n {
+            return Err(PyValueError::new_err("u_t must have shape (n, n)"));
+        }
+        let u_vec = u_t
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("u_t must be contiguous f64"))?
+            .to_vec();
+        let sel_vec: Option<Vec<i64>> = sample_indices
+            .map(|arr| {
+                arr.as_slice()
+                    .map(|sl| sl.to_vec())
+                    .map_err(|_| PyValueError::new_err("sample_indices must be contiguous i64"))
+            })
+            .transpose()?;
+
+        let arc = Arc::clone(&self.inner);
+        let cb_ref = progress_callback.map(|cb| cb.clone_ref(py));
+        py.detach(move || {
+            scan_hgwas_compact_to_tsv(
+                &arc,
+                &out_tsv,
+                &s_vec,
+                &x_vec,
+                &y_vec,
+                &u_vec,
+                n,
+                q,
+                sel_vec.as_deref(),
+                exact_lmm,
+                lambda_g_null,
+                low,
+                high,
+                max_iter,
+                tol,
+                threads,
+                |done, total| {
+                    if let Some(cb) = cb_ref.as_ref() {
+                        let _ = Python::attach(|py_inner| cb.call1(py_inner, (done, total)));
+                    }
+                },
+            )
+        })
+        .map_err(PyRuntimeError::new_err)
+    }
+}
 
 /// Inspect metadata of a `.jhibd` archive for hGWAS CLI setup.
 #[pyfunction]
 pub fn hgwas_inspect_jhibd(py: Python<'_>, jhibd_path: String) -> PyResult<Py<PyAny>> {
-    let archive = py
-        .detach(move || load_multparent_archive(&jhibd_path))
+    let meta = py
+        .detach(move || {
+            let meta = inspect_sparse_archive_meta(Path::new(&jhibd_path))?;
+            if meta.mode != HaploidIbdMode::MultiParentAncestry {
+                return Err(format!(
+                    "hGWAS requires a MultiParentAncestry .jhibd archive, got {:?}",
+                    meta.mode
+                ));
+            }
+            Ok(meta)
+        })
         .map_err(PyValueError::new_err)?;
-    let n_bins: usize = match &archive.payload {
-        HaploidSparsePayload::MultiParentAncestry { chrom_bins, .. } => {
-            chrom_bins.iter().map(|cb| cb.bin_starts_bp.len()).sum()
-        }
-        _ => 0,
-    };
     let dict = PyDict::new(py);
-    dict.set_item("sample_ids", archive.target_sample_ids)?;
-    dict.set_item("parent_ids", archive.reference_sample_ids)?;
-    dict.set_item("chrom_names", archive.chrom_names)?;
-    dict.set_item("n_bins", n_bins)?;
-    dict.set_item("version", archive.version)?;
+    dict.set_item("sample_ids", meta.target_sample_ids)?;
+    dict.set_item("parent_ids", meta.reference_sample_ids)?;
+    dict.set_item("chrom_names", meta.chrom_names)?;
+    dict.set_item("n_bins", meta.n_bins)?;
+    dict.set_item("version", meta.version)?;
     Ok(dict.into_any().unbind())
 }
 
@@ -1959,11 +2695,17 @@ pub fn hgwas_grm_from_jhibd_f64<'py>(
     method: i32,
     threads: usize,
 ) -> PyResult<(Bound<'py, PyArray2<f64>>, usize)> {
-    let sel_vec: Option<Vec<i64>> = sample_indices.map(|arr| arr.as_slice().unwrap().to_vec());
+    let sel_vec: Option<Vec<i64>> = sample_indices
+        .map(|arr| {
+            arr.as_slice()
+                .map(|sl| sl.to_vec())
+                .map_err(|_| PyValueError::new_err("sample_indices must be contiguous i64"))
+        })
+        .transpose()?;
     let (grm, n, eff_bins) = py
         .detach(move || {
-            let archive = load_multparent_archive(&jhibd_path)?;
-            build_ancestry_grm_from_archive(&archive, sel_vec.as_deref(), method, threads)
+            let compact = CompactHgwasArchive::open(&jhibd_path)?;
+            build_ancestry_grm_from_compact(&compact, sel_vec.as_deref(), method, threads)
         })
         .map_err(PyRuntimeError::new_err)?;
     let arr = PyArray2::<f64>::from_vec2(
@@ -2015,83 +2757,39 @@ pub fn hgwas_scan_jhibd_to_tsv_f64(
     threads: usize,
     progress_callback: Option<Py<PyAny>>,
 ) -> PyResult<(usize, f64)> {
-    let s_vec = s
-        .as_slice()
-        .map_err(|_| PyValueError::new_err("s must be contiguous f64"))?
-        .to_vec();
-    let y_vec = y_rot
-        .as_slice()
-        .map_err(|_| PyValueError::new_err("y_rot must be contiguous f64"))?
-        .to_vec();
-    let x_shape = x_rot.shape();
-    let n = s_vec.len();
-    if y_vec.len() != n || x_shape[0] != n || x_shape[1] == 0 {
-        return Err(PyValueError::new_err(
-            "dimension mismatch between s, y_rot, and x_rot",
-        ));
-    }
-    let q = x_shape[1];
-    let x_vec = x_rot
-        .as_slice()
-        .map_err(|_| PyValueError::new_err("x_rot must be contiguous f64"))?
-        .to_vec();
-    let u_shape = u_t.shape();
-    if u_shape[0] != n || u_shape[1] != n {
-        return Err(PyValueError::new_err("u_t must have shape (n, n)"));
-    }
-    let u_vec = u_t
-        .as_slice()
-        .map_err(|_| PyValueError::new_err("u_t must be contiguous f64"))?
-        .to_vec();
-    let sel_vec: Option<Vec<i64>> = sample_indices
-        .map(|arr| {
-            arr.as_slice()
-                .map(|sl| sl.to_vec())
-                .map_err(|_| PyValueError::new_err("sample_indices must be contiguous i64"))
-        })
-        .transpose()?;
-
-    let cb_ref = progress_callback.map(|cb| cb.clone_ref(py));
-    let result = py
-        .detach(move || {
-            let archive = load_multparent_archive(&jhibd_path)?;
-            scan_hgwas_archive_to_tsv(
-                &archive,
-                &out_tsv,
-                &s_vec,
-                &x_vec,
-                &y_vec,
-                &u_vec,
-                n,
-                q,
-                sel_vec.as_deref(),
-                exact_lmm,
-                lambda_g_null,
-                low,
-                high,
-                max_iter,
-                tol,
-                threads,
-                |done, total| {
-                    if let Some(cb) = cb_ref.as_ref() {
-                        let _ = Python::attach(|py_inner| cb.call1(py_inner, (done, total)));
-                    }
-                },
-            )
-        })
-        .map_err(PyRuntimeError::new_err)?;
-
-    Ok(result)
+    let handle = HgwasArchive::open(py, jhibd_path)?;
+    handle.scan_to_tsv(
+        py,
+        out_tsv,
+        s,
+        x_rot,
+        y_rot,
+        u_t,
+        sample_indices,
+        exact_lmm,
+        lambda_g_null,
+        low,
+        high,
+        max_iter,
+        tol,
+        threads,
+        progress_callback,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::haploid::sparse_io::write_sparse_archive;
+    use crate::haploid::ancestry::build_union_breakpoint_sparse_matrix;
+    use crate::haploid::phasing::SampleHaplotypeLayout;
+    use crate::haploid::sparse_io::{
+        write_sparse_archive, write_sparse_archive_v1_with_threads,
+        write_sparse_archive_v2_with_threads, HaploidSparseArchive, HaploidSparsePayload,
+    };
+    use crate::haploid::types::AncestrySegment;
     use crate::linalg::{cholesky_inplace, cholesky_logdet, cholesky_solve_into};
 
-    /// Brute-force dense n x n REML log-likelihood for `lambda_g * K + tau * Z Z^T + I`
-    /// (matches Wei & Xu 2016 / Xiao et al. 2016 `nph.13814` random-model REML directly).
+    /// Brute-force dense n x n REML log-likelihood for `lambda_g * K + tau * Z Z^T + I`.
     fn dense_reml_ll(
         k: &[f64],
         z: &[f64],
@@ -2156,6 +2854,30 @@ mod tests {
         let se2 = rss / df;
         let const_term = df * ((2.0 * std::f64::consts::PI).ln() + 1.0);
         -0.5 * (const_term + df * se2.ln() + logdet_h + logdet_xhx)
+    }
+
+    fn parse_tsv_rows(text: &str) -> Vec<(u64, usize, f64, f64, f64, f64, f64)> {
+        let mut lines = text.lines();
+        let header = lines.next().expect("header");
+        assert_eq!(
+            header,
+            "chrom\tpos\tn_parents\tsigma_g2\tsigma_b2\tsigma_e2\th2_bin\tlrt\tplrt"
+        );
+        lines
+            .map(|ln| {
+                let c: Vec<&str> = ln.split('\t').collect();
+                assert_eq!(c.len(), 9);
+                (
+                    c[1].parse::<u64>().unwrap(),
+                    c[2].parse::<usize>().unwrap(),
+                    c[3].parse::<f64>().unwrap(),
+                    c[4].parse::<f64>().unwrap(),
+                    c[5].parse::<f64>().unwrap(),
+                    c[7].parse::<f64>().unwrap(),
+                    c[8].parse::<f64>().unwrap(),
+                )
+            })
+            .collect()
     }
 
     #[test]
@@ -2258,7 +2980,7 @@ mod tests {
         }
         let mut x_rot = vec![0.0_f64; n * q];
         let mut y_rot = vec![0.0_f64; n];
-        let mut z_rot_cols = vec![vec![0.0_f64; n]; p];
+        let mut z_rot = vec![0.0_f64; p * n];
         for i in 0..n {
             for j in 0..n {
                 let uij = u_t[i * n + j];
@@ -2267,7 +2989,7 @@ mod tests {
                     x_rot[i * q + a] += uij * x[j * q + a];
                 }
                 for c in 0..p {
-                    z_rot_cols[c][i] += uij * z[j * p + c];
+                    z_rot[c * n + i] += uij * z[j * p + c];
                 }
             }
         }
@@ -2282,10 +3004,10 @@ mod tests {
             dense_ll0
         );
 
-        let col_refs: Vec<&[f64]> = z_rot_cols.iter().map(|v| v.as_slice()).collect();
-        let mut scratch = TauSolverScratch::with_capacity(p);
+        let active: Vec<usize> = (0..p).collect();
+        let mut scratch = TauSolverScratch::with_capacity(p, n, q);
         let (woodbury_ll1, opt_tau, _) =
-            optimize_tau_for_background_cols(&bg, &col_refs, n, q, &mut scratch);
+            optimize_tau_for_background_zrot(&bg, &z_rot, &active, n, q, &mut scratch);
         let dense_ll1 = dense_reml_ll(&k, &z, &x, &y, n, q, p, lambda_g, opt_tau);
         assert!(opt_tau > 0.1, "expected positive tau for causal bin");
         assert!(
@@ -2297,11 +3019,10 @@ mod tests {
     }
 
     #[test]
-    fn incremental_fvlmm_and_lmm_match_dense_reml_across_multi_bin_transitions() {
+    fn sweep_line_fvlmm_and_multigrid_lmm_match_zrot_and_dense_reml() {
         let n = 48usize;
         let q = 2usize;
         let p_total = 6usize;
-        let n_bins = 16usize;
 
         let mut state: u64 = 0x9876_5432_10fe_dcba;
         fn lcg_u64(state: &mut u64) -> u64 {
@@ -2312,7 +3033,6 @@ mod tests {
             ((lcg_u64(state) >> 11) as f64) / ((1u64 << 53) as f64) * 2.0 - 1.0
         }
 
-        // Construct K, X, y.
         let mut g_raw = vec![0.0_f64; n * 20];
         for v in &mut g_raw {
             *v = lcg_f64(&mut state);
@@ -2333,54 +3053,95 @@ mod tests {
             x[i * q + 1] = lcg_f64(&mut state);
         }
 
-        // Build incremental Union-of-Breakpoints bins where 0-4 samples switch per bin.
-        let mut cur_par: Vec<usize> = (0..n).map(|i| i % p_total).collect();
-        let mut bin_starts_bp = Vec::new();
-        let mut bin_ends_bp = Vec::new();
-        let mut bin_starts_cm = Vec::new();
-        let mut bin_ends_cm = Vec::new();
-        let mut bin_ptr = vec![0u64; n_bins + 1];
-        let mut sample_idx = Vec::new();
-        let mut parent_idx = Vec::new();
-        let mut dosage = Vec::new();
-        let mut z_per_bin: Vec<Vec<f64>> = Vec::new();
-
-        for b in 0..n_bins {
-            if b > 0 && b != 5 {
-                // Switch 3 samples on non-identical bins; keep bin 5 identical to bin 4.
-                for _ in 0..3 {
-                    let si = (lcg_u64(&mut state) as usize) % n;
-                    cur_par[si] =
-                        (cur_par[si] + 1 + ((lcg_u64(&mut state) as usize) % (p_total - 1)))
-                            % p_total;
-                }
+        // Mix of inbred (weight 1.0) and diploid (weight 0.5/hap) samples with
+        // recombination switches AND an all-uncalled empty gap in the middle.
+        let is_inbred: Vec<bool> = (0..n).map(|i| i % 4 != 0).collect();
+        let tgt_layout = SampleHaplotypeLayout::from_inbred_flags(is_inbred.clone());
+        let mut segments: Vec<AncestrySegment> = Vec::new();
+        for s_idx in 0..n {
+            let n_haps = if is_inbred[s_idx] { 1u8 } else { 2u8 };
+            for h in 0..n_haps {
+                let bp1 = 50_000 + ((s_idx as u64 * 13 + h as u64 * 7) % 5) * 10_000;
+                let p0 = ((s_idx + h as usize) % p_total) as u32;
+                let p1 = ((s_idx + h as usize + 2) % p_total) as u32;
+                let p2 = ((s_idx + h as usize + 4) % p_total) as u32;
+                segments.push(AncestrySegment {
+                    target_sample: s_idx as u32,
+                    hap: h,
+                    chrom_idx: 0,
+                    start_bp: 1,
+                    end_bp: bp1,
+                    start_cm: 0.0,
+                    end_cm: 0.5,
+                    parent_sample: p0,
+                    parent_hap: 0,
+                    confidence: 0.99,
+                    ambiguous_parents: 1,
+                    n_markers: 20,
+                });
+                segments.push(AncestrySegment {
+                    target_sample: s_idx as u32,
+                    hap: h,
+                    chrom_idx: 0,
+                    start_bp: bp1 + 1,
+                    end_bp: 120_000,
+                    start_cm: 0.5,
+                    end_cm: 1.2,
+                    parent_sample: p1,
+                    parent_hap: 0,
+                    confidence: 0.99,
+                    ambiguous_parents: 1,
+                    n_markers: 20,
+                });
+                // All-uncalled gap [120_001..150_000], then resume [150_001..250_000].
+                segments.push(AncestrySegment {
+                    target_sample: s_idx as u32,
+                    hap: h,
+                    chrom_idx: 0,
+                    start_bp: 150_001,
+                    end_bp: 250_000,
+                    start_cm: 1.5,
+                    end_cm: 2.5,
+                    parent_sample: p2,
+                    parent_hap: 0,
+                    confidence: 0.99,
+                    ambiguous_parents: 1,
+                    n_markers: 20,
+                });
             }
-            bin_starts_bp.push((b as u64) * 10_000 + 1);
-            bin_ends_bp.push(((b + 1) as u64) * 10_000);
-            bin_starts_cm.push(b as f32 * 0.1);
-            bin_ends_cm.push((b + 1) as f32 * 0.1);
-            let mut z_dense = vec![0.0_f64; n * p_total];
-            for i in 0..n {
-                let d = if i % 4 == 0 { 0.5_f32 } else { 1.0_f32 };
-                sample_idx.push(i as u32);
-                parent_idx.push(cur_par[i] as u32);
-                dosage.push(d);
-                z_dense[i * p_total + cur_par[i]] = d as f64;
-            }
-            bin_ptr[b + 1] = sample_idx.len() as u64;
-            z_per_bin.push(z_dense);
         }
 
+        let sparse_bins = build_union_breakpoint_sparse_matrix(0, &tgt_layout, p_total, &segments);
+        let seg_refs: Vec<&AncestrySegment> = segments.iter().collect();
+        let compact_from_segs =
+            build_compact_events_from_segments(0, n, p_total, &is_inbred, &seg_refs);
+        let compact_from_bins = build_compact_events_from_sparse_bins(&sparse_bins);
+        assert_eq!(
+            compact_from_segs.bin_starts_bp, compact_from_bins.bin_starts_bp,
+            "sweep-line bins must match build_union_breakpoint_sparse_matrix exactly"
+        );
+
+        let n_bins = sparse_bins.bin_starts_bp.len();
+        let mut z_per_bin: Vec<Vec<f64>> = vec![vec![0.0_f64; n * p_total]; n_bins];
+        for b in 0..n_bins {
+            let s0 = sparse_bins.bin_ptr[b] as usize;
+            let s1 = sparse_bins.bin_ptr[b + 1] as usize;
+            for pos in s0..s1 {
+                let si = sparse_bins.sample_idx[pos] as usize;
+                let pi = sparse_bins.parent_idx[pos] as usize;
+                z_per_bin[b][si * p_total + pi] = sparse_bins.dosage[pos] as f64;
+            }
+        }
+
+        let causal_bin = n_bins / 2;
         let effects = [2.2, -1.8, 1.0, -1.2, 0.7, -0.9];
         let mut y = vec![0.0_f64; n];
         for i in 0..n {
-            let par_causal = (0..p_total)
-                .find(|&p| z_per_bin[8][i * p_total + p] > 0.0)
-                .unwrap();
-            y[i] = 3.0
-                + 0.4 * x[i * q + 1]
-                + effects[par_causal] * z_per_bin[8][i * p_total + par_causal]
-                + 0.35 * lcg_f64(&mut state);
+            let mut g_eff = 0.0;
+            for p in 0..p_total {
+                g_eff += z_per_bin[causal_bin][i * p_total + p] * effects[p];
+            }
+            y[i] = 3.0 + 0.4 * x[i * q + 1] + g_eff + 0.35 * lcg_f64(&mut state);
         }
 
         let (s, u, _) = symmetric_eigh_f64_row_major(&k, n).unwrap();
@@ -2402,36 +3163,47 @@ mod tests {
             }
         }
 
-        let cb = ChromosomeAncestryBinsSparse {
-            chrom_idx: 0,
-            n_target_samples: n,
-            n_parents: p_total,
-            bin_starts_bp,
-            bin_ends_bp,
-            bin_starts_cm,
-            bin_ends_cm,
-            bin_ptr,
-            sample_idx,
-            parent_idx,
-            dosage,
-        };
         let remap: Vec<i32> = (0..n).map(|i| i as i32).collect();
         let null_bg = fit_null_reml_background(&s, &x_rot, &y_rot, n, q, -5.0, 5.0, None).unwrap();
         let c_k = (s.iter().sum::<f64>() / (n as f64)).max(1e-12);
-        let (m0, v0) = build_fvlmm_original_space_projection(&u, &null_bg, n, q, 1);
+        let (m0, v0) = build_original_space_projection(&u, &null_bg, n, q, 1);
 
-        let fv_res = scan_chunk_fvlmm(
-            &cb, 0, n_bins, &remap, n, q, p_total, c_k, &null_bg, &m0, &v0,
+        let fv_text_segs = scan_chunk_fvlmm_events(
+            &compact_from_segs,
+            "chr1",
+            0,
+            0,
+            n_bins,
+            &remap,
+            n,
+            q,
+            p_total,
+            c_k,
+            &null_bg,
+            &m0,
+            &v0,
         );
-        assert!((fv_res[5].lrt - fv_res[4].lrt).abs() < 1e-12);
+        let fv_text_bins = scan_chunk_fvlmm_events(
+            &compact_from_bins,
+            "chr1",
+            0,
+            0,
+            n_bins,
+            &remap,
+            n,
+            q,
+            p_total,
+            c_k,
+            &null_bg,
+            &m0,
+            &v0,
+        );
+        assert_eq!(fv_text_segs, fv_text_bins);
 
-        // Verify every bin's FVLMM LRT against brute-force dense Cholesky REML.
-        for b in 0..n_bins {
-            let tau_hat = if fv_res[b].sigma_e2 > 0.0 {
-                fv_res[b].sigma_b2 / fv_res[b].sigma_e2
-            } else {
-                0.0
-            };
+        let header = "chrom\tpos\tn_parents\tsigma_g2\tsigma_b2\tsigma_e2\th2_bin\tlrt\tplrt\n";
+        let fv_rows = parse_tsv_rows(&format!("{header}{fv_text_segs}"));
+        for (b, row) in fv_rows.iter().enumerate() {
+            let tau_hat = if row.4 > 0.0 { row.3 / row.4 } else { 0.0 };
             let dense_ll0 = dense_reml_ll(
                 &k,
                 &z_per_bin[b],
@@ -2456,13 +3228,14 @@ mod tests {
             );
             let dense_lrt = (2.0 * (dense_ll1 - dense_ll0)).max(0.0);
             assert!(
-                (fv_res[b].lrt - dense_lrt).abs() < 1e-7,
+                (row.5 - dense_lrt).abs() < 1e-5,
                 "bin {b} FVLMM LRT mismatch: fast={} vs dense={}",
-                fv_res[b].lrt,
+                row.5,
                 dense_lrt
             );
         }
 
+        // Compare multi-grid incremental LMM vs z_rot-only LMM vs dense Cholesky REML.
         let n_grid_lmm = 8usize;
         let grid_step = 10.0_f64 / (n_grid_lmm as f64);
         let mut cached_grid = Vec::with_capacity(n_grid_lmm + 2);
@@ -2476,8 +3249,16 @@ mod tests {
                 cached_grid.push((lg, bg));
             }
         }
-        let lmm_res = scan_chunk_lmm(
-            &cb,
+        let mut grid_projs = Vec::with_capacity(1 + cached_grid.len());
+        grid_projs.push((m0, v0));
+        for (_, bg) in &cached_grid {
+            grid_projs.push(build_original_space_projection(&u, bg, n, q, 1));
+        }
+
+        let lmm_text_mg = scan_chunk_lmm_events(
+            &compact_from_segs,
+            "chr1",
+            0,
             0,
             n_bins,
             &remap,
@@ -2491,66 +3272,53 @@ mod tests {
             c_k,
             &null_bg,
             &cached_grid,
+            Some(&grid_projs),
             grid_step,
             -5.0,
             5.0,
             30,
             1e-2,
         );
-        assert_eq!(lmm_res.len(), n_bins);
-
-        // The chunked LMM path must agree with a cold-start LMM evaluation of each bin,
-        // and both must reproduce the brute-force dense Cholesky likelihood at the
-        // selected (lambda_g, tau).
+        let lmm_text_zr = scan_chunk_lmm_events(
+            &compact_from_segs,
+            "chr1",
+            0,
+            0,
+            n_bins,
+            &remap,
+            &s,
+            &x_rot,
+            &y_rot,
+            &u,
+            n,
+            q,
+            p_total,
+            c_k,
+            &null_bg,
+            &cached_grid,
+            None,
+            grid_step,
+            -5.0,
+            5.0,
+            30,
+            1e-2,
+        );
+        let mg_rows = parse_tsv_rows(&format!("{header}{lmm_text_mg}"));
+        let zr_rows = parse_tsv_rows(&format!("{header}{lmm_text_zr}"));
         for b in 0..n_bins {
-            let fresh = scan_chunk_lmm(
-                &cb,
-                b,
-                b + 1,
-                &remap,
-                &s,
-                &x_rot,
-                &y_rot,
-                &u,
-                n,
-                q,
-                p_total,
-                c_k,
-                &null_bg,
-                &cached_grid,
-                grid_step,
-                -5.0,
-                5.0,
-                30,
-                1e-2,
-            );
-            assert_eq!(fresh.len(), 1);
             assert!(
-                (lmm_res[b].lrt - fresh[0].lrt).abs() < 1e-7,
-                "bin {b} incremental LMM mismatch: fast={} cold={}",
-                lmm_res[b].lrt,
-                fresh[0].lrt
+                (mg_rows[b].5 - zr_rows[b].5).abs() < 1e-5,
+                "bin {b} multi-grid LMM ({}) != z_rot LMM ({})",
+                mg_rows[b].5,
+                zr_rows[b].5
             );
-            assert!(
-                (lmm_res[b].sigma_g2 - fresh[0].sigma_g2).abs() < 1e-7,
-                "bin {b} incremental LMM sigma_g2 mismatch"
-            );
-            assert!(
-                (lmm_res[b].sigma_b2 - fresh[0].sigma_b2).abs() < 1e-7,
-                "bin {b} incremental LMM sigma_b2 mismatch"
-            );
-            assert!(
-                (lmm_res[b].sigma_e2 - fresh[0].sigma_e2).abs() < 1e-7,
-                "bin {b} incremental LMM sigma_e2 mismatch"
-            );
-
-            let lambda_hat = if lmm_res[b].sigma_e2 > 0.0 {
-                lmm_res[b].sigma_g2 / lmm_res[b].sigma_e2
+            let lam_hat = if mg_rows[b].4 > 0.0 {
+                mg_rows[b].2 / mg_rows[b].4
             } else {
                 0.0
             };
-            let tau_hat = if lmm_res[b].sigma_e2 > 0.0 {
-                lmm_res[b].sigma_b2 / lmm_res[b].sigma_e2
+            let tau_hat = if mg_rows[b].4 > 0.0 {
+                mg_rows[b].3 / mg_rows[b].4
             } else {
                 0.0
             };
@@ -2565,42 +3333,24 @@ mod tests {
                 null_bg.lambda_g,
                 0.0,
             );
-            let dense_ll1 = dense_reml_ll(
-                &k,
-                &z_per_bin[b],
-                &x,
-                &y,
-                n,
-                q,
-                p_total,
-                lambda_hat,
-                tau_hat,
-            );
+            let dense_ll1 =
+                dense_reml_ll(&k, &z_per_bin[b], &x, &y, n, q, p_total, lam_hat, tau_hat);
             let dense_lrt = (2.0 * (dense_ll1 - dense_ll0)).max(0.0);
             assert!(
-                (lmm_res[b].lrt - dense_lrt).abs() < 1e-7,
-                "bin {b} LMM LRT mismatch: fast={} vs dense={}",
-                lmm_res[b].lrt,
+                (mg_rows[b].5 - dense_lrt).abs() < 1e-5,
+                "bin {b} multi-grid LMM LRT mismatch: fast={} vs dense={}",
+                mg_rows[b].5,
                 dense_lrt
             );
         }
     }
 
     #[test]
-    fn end_to_end_jhibd_hgwas_detects_causal_bin_for_fvlmm_and_lmm() {
+    fn end_to_end_jhibd_v1_and_v2_hgwas_match_and_detect_causal_bin() {
         let n = 60usize;
         let n_parents = 6usize;
         let n_bins = 20usize;
         let causal_bin = 7usize;
-
-        let mut bin_starts_bp = Vec::with_capacity(n_bins);
-        let mut bin_ends_bp = Vec::with_capacity(n_bins);
-        let mut bin_starts_cm = Vec::with_capacity(n_bins);
-        let mut bin_ends_cm = Vec::with_capacity(n_bins);
-        let mut bin_ptr = vec![0u64; n_bins + 1];
-        let mut sample_idx = Vec::new();
-        let mut parent_idx = Vec::new();
-        let mut dosage = Vec::new();
 
         let mut state: u64 = 0xdead_beef_cafe_babe;
         let mut next_u64 = || -> u64 {
@@ -2608,23 +3358,34 @@ mod tests {
             state
         };
 
+        let mut segments: Vec<AncestrySegment> = Vec::with_capacity(n * n_bins);
         let mut causal_parent = vec![0usize; n];
         for b in 0..n_bins {
-            bin_starts_bp.push((b as u64) * 100_000 + 1);
-            bin_ends_bp.push(((b + 1) as u64) * 100_000);
-            bin_starts_cm.push(b as f32);
-            bin_ends_cm.push((b + 1) as f32);
+            let s_bp = (b as u64) * 100_000 + 1;
+            let e_bp = ((b + 1) as u64) * 100_000;
             for i in 0..n {
                 let p = (next_u64() as usize) % n_parents;
                 if b == causal_bin {
                     causal_parent[i] = p;
                 }
-                sample_idx.push(i as u32);
-                parent_idx.push(p as u32);
-                dosage.push(1.0_f32);
+                segments.push(AncestrySegment {
+                    target_sample: i as u32,
+                    hap: 0,
+                    chrom_idx: 0,
+                    start_bp: s_bp,
+                    end_bp: e_bp,
+                    start_cm: b as f32,
+                    end_cm: (b + 1) as f32,
+                    parent_sample: p as u32,
+                    parent_hap: 0,
+                    confidence: 0.99,
+                    ambiguous_parents: 1,
+                    n_markers: 20,
+                });
             }
-            bin_ptr[b + 1] = sample_idx.len() as u64;
         }
+        let tgt_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true; n]);
+        let bins = build_union_breakpoint_sparse_matrix(0, &tgt_layout, n_parents, &segments);
 
         let archive = HaploidSparseArchive {
             version: 1,
@@ -2633,32 +3394,32 @@ mod tests {
             reference_sample_ids: (0..n_parents).map(|p| format!("P{}", p)).collect(),
             chrom_names: vec!["chr1".to_string()],
             payload: HaploidSparsePayload::MultiParentAncestry {
-                segments: Vec::new(),
-                chrom_bins: vec![ChromosomeAncestryBinsSparse {
-                    chrom_idx: 0,
-                    n_target_samples: n,
-                    n_parents,
-                    bin_starts_bp,
-                    bin_ends_bp,
-                    bin_starts_cm,
-                    bin_ends_cm,
-                    bin_ptr,
-                    sample_idx,
-                    parent_idx,
-                    dosage,
-                }],
+                segments,
+                chrom_bins: vec![bins],
             },
         };
 
         let tmp_dir = std::env::temp_dir();
-        let jhibd_path = tmp_dir.join("test_hgwas_roundtrip.jhibd");
-        let fvlmm_tsv = tmp_dir.join("test_hgwas_fvlmm.tsv");
-        let lmm_tsv = tmp_dir.join("test_hgwas_lmm.tsv");
-        write_sparse_archive(&jhibd_path, &archive).expect("write jhibd");
-        let loaded = load_multparent_archive(jhibd_path.to_str().unwrap()).expect("read jhibd");
+        let v1_path = tmp_dir.join("test_hgwas_v1_roundtrip.jhibd");
+        let v2_path = tmp_dir.join("test_hgwas_v2_roundtrip.jhibd");
+        let fvlmm_v1 = tmp_dir.join("test_hgwas_fvlmm_v1.tsv");
+        let fvlmm_v2 = tmp_dir.join("test_hgwas_fvlmm_v2.tsv");
+        let lmm_v2 = tmp_dir.join("test_hgwas_lmm_v2.tsv");
+
+        write_sparse_archive_v1_with_threads(&v1_path, &archive, 1).expect("write v1");
+        write_sparse_archive_v2_with_threads(&v2_path, &archive, &vec![true; n], n_bins as u64, 1)
+            .expect("write v2");
+
+        let meta_v1 = inspect_sparse_archive_meta(&v1_path).expect("meta v1");
+        let meta_v2 = inspect_sparse_archive_meta(&v2_path).expect("meta v2");
+        assert_eq!(meta_v1.n_bins, n_bins);
+        assert_eq!(meta_v2.n_bins, n_bins);
+
+        let compact_v1 = CompactHgwasArchive::open(v1_path.to_str().unwrap()).expect("open v1");
+        let compact_v2 = CompactHgwasArchive::open(v2_path.to_str().unwrap()).expect("open v2");
 
         let (grm, n_grm, eff_bins) =
-            build_ancestry_grm_from_archive(&loaded, None, 1, 1).expect("build GRM");
+            build_ancestry_grm_from_compact(&compact_v2, None, 1, 1).expect("build GRM");
         assert_eq!(n_grm, n);
         assert_eq!(eff_bins, n_bins);
 
@@ -2685,9 +3446,9 @@ mod tests {
             }
         }
 
-        let (n_fv, _) = scan_hgwas_archive_to_tsv(
-            &loaded,
-            fvlmm_tsv.to_str().unwrap(),
+        let (n1, _) = scan_hgwas_compact_to_tsv(
+            &compact_v1,
+            fvlmm_v1.to_str().unwrap(),
             &s,
             &x_rot,
             &y_rot,
@@ -2704,12 +3465,30 @@ mod tests {
             1,
             |_, _| {},
         )
-        .expect("fvlmm scan");
-        assert_eq!(n_fv, n_bins);
-
-        let (n_lmm, _) = scan_hgwas_archive_to_tsv(
-            &loaded,
-            lmm_tsv.to_str().unwrap(),
+        .expect("fvlmm v1");
+        let (n2, _) = scan_hgwas_compact_to_tsv(
+            &compact_v2,
+            fvlmm_v2.to_str().unwrap(),
+            &s,
+            &x_rot,
+            &y_rot,
+            &u_t,
+            n,
+            1,
+            None,
+            false,
+            None,
+            -5.0,
+            5.0,
+            30,
+            1e-2,
+            1,
+            |_, _| {},
+        )
+        .expect("fvlmm v2");
+        let (n3, _) = scan_hgwas_compact_to_tsv(
+            &compact_v2,
+            lmm_v2.to_str().unwrap(),
             &s,
             &x_rot,
             &y_rot,
@@ -2726,51 +3505,43 @@ mod tests {
             1,
             |_, _| {},
         )
-        .expect("lmm scan");
-        assert_eq!(n_lmm, n_bins);
+        .expect("lmm v2");
+        assert_eq!(n1, n_bins);
+        assert_eq!(n2, n_bins);
+        assert_eq!(n3, n_bins);
 
-        for tsv in [&fvlmm_tsv, &lmm_tsv] {
-            let text = std::fs::read_to_string(tsv).expect("read tsv");
-            let mut lines = text.lines();
-            let header = lines.next().expect("header");
-            assert_eq!(
-                header,
-                "chrom\tpos\tn_parents\tsigma_g2\tsigma_b2\tsigma_e2\th2_bin\tlrt\tplrt"
-            );
-            assert!(!header.contains("pwald"));
-            let pvals: Vec<f64> = lines
-                .enumerate()
-                .map(|(bin, ln)| {
-                    let cols: Vec<&str> = ln.split('\t').collect();
-                    assert_eq!(cols.len(), 9, "unexpected hGWAS row width");
-                    assert_eq!(
-                        cols[1],
-                        (bin as u64 * 100_000 + 1).to_string(),
-                        "pos must be the bin start"
-                    );
-                    cols[8].parse::<f64>().expect("parse plrt")
-                })
-                .collect();
-            assert_eq!(pvals.len(), n_bins);
-            assert!(
-                pvals[causal_bin] < 1e-6,
-                "causal bin p-value too large: {}",
-                pvals[causal_bin]
-            );
-            let min_null = pvals
+        let t1 = std::fs::read_to_string(&fvlmm_v1).unwrap();
+        let t2 = std::fs::read_to_string(&fvlmm_v2).unwrap();
+        let t3 = std::fs::read_to_string(&lmm_v2).unwrap();
+        assert_eq!(
+            t1, t2,
+            "JHIBD01 and JHIBD02 must produce identical hGWAS TSV"
+        );
+
+        for text in [&t2, &t3] {
+            let rows = parse_tsv_rows(text);
+            assert_eq!(rows.len(), n_bins);
+            assert!(rows[causal_bin].6 < 1e-6);
+            let min_null = rows
                 .iter()
                 .enumerate()
                 .filter(|&(idx, _)| idx != causal_bin)
-                .map(|(_, &p)| p)
+                .map(|(_, r)| r.6)
                 .fold(1.0_f64, f64::min);
-            assert!(
-                pvals[causal_bin] < min_null * 1e-4,
-                "causal bin should dominate null bins"
-            );
+            assert!(rows[causal_bin].6 < min_null * 1e-4);
         }
 
-        let _ = std::fs::remove_file(jhibd_path);
-        let _ = std::fs::remove_file(fvlmm_tsv);
-        let _ = std::fs::remove_file(lmm_tsv);
+        // Also verify default `write_sparse_archive` emits JHIBD02 and loads cleanly.
+        let v_def = tmp_dir.join("test_hgwas_default_roundtrip.jhibd");
+        write_sparse_archive(&v_def, &archive).expect("write default");
+        let loaded_def = CompactHgwasArchive::open(v_def.to_str().unwrap()).expect("open default");
+        assert_eq!(loaded_def.total_bins, n_bins);
+
+        let _ = std::fs::remove_file(v1_path);
+        let _ = std::fs::remove_file(v2_path);
+        let _ = std::fs::remove_file(v_def);
+        let _ = std::fs::remove_file(fvlmm_v1);
+        let _ = std::fs::remove_file(fvlmm_v2);
+        let _ = std::fs::remove_file(lmm_v2);
     }
 }

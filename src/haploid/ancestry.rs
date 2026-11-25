@@ -381,19 +381,24 @@ pub fn paint_chromosome_ancestry_cancellable(
             let mut backptr = vec![uncalled_state as u32; n_steps * n_states];
             let mut step_scores = vec![0.0f32; n_steps * k];
             let mut step_comparable = vec![0u32; n_steps * k];
+            let mut step_max_comps = vec![0u32; n_steps];
+            let mut step_scales = vec![1.0f32; n_steps];
+            let mut cand_total_comp = vec![0u64; k];
 
+            // Precompute per-step raw LLR emissions (`step_scores`) and comparable
+            // counts (`step_comparable`). Raw `step_scores` are kept unmodified for
+            // worklist gap resolution and segment confidence/ambiguity reporting.
             for (step_idx, &(m_start, m_end)) in step_ranges.iter().enumerate() {
                 if (step_idx & 255) == 0 && is_cancelled(cancelled) {
                     return Err("Interrupted".to_string());
                 }
                 let row_off = step_idx * k;
-                let bp_off = step_idx * n_states;
-
                 let mut step_max_comp = 0u32;
                 for (c_idx, &ref_col) in candidates.iter().enumerate() {
                     let (comp, mis) =
                         hap_major.count_mismatches(tgt_col, ref_col, m_start, m_end);
                     step_comparable[row_off + c_idx] = comp;
+                    cand_total_comp[c_idx] = cand_total_comp[c_idx].saturating_add(comp as u64);
                     if comp > step_max_comp {
                         step_max_comp = comp;
                     }
@@ -401,16 +406,49 @@ pub fn paint_chromosome_ancestry_cancellable(
                     step_scores[row_off + c_idx] =
                         matched as f32 * match_reward - mis as f32 * mismatch_penalty;
                 }
+                step_max_comps[step_idx] = step_max_comp;
                 if step_eff_markers_cap > 0.0 && (step_max_comp as f32) > step_eff_markers_cap {
                     let step_scale = step_eff_markers_cap / step_max_comp as f32;
+                    step_scales[step_idx] = step_scale;
                     for score in &mut step_scores[row_off..row_off + k] {
                         *score *= step_scale;
                     }
                 }
+            }
+
+            // Local step-level missingness compensation for Viterbi DP only:
+            // At a target-observed marker (`step_max_comp > 0`), an observed match
+            // scores `match_reward = +0.70`, a mismatch scores `-4.50`, and a
+            // missing allele in a non-empty founder scores `FOUNDER_MISSING_CREDIT = +0.55`
+            // (strictly < `match_reward`, so missingness NEVER beats a local match,
+            // and founders missing elsewhere get ZERO bonus where locally observed).
+            // All-missing founders (`cand_total_comp[c] == 0`) always emit `0.0`.
+            const FOUNDER_MISSING_CREDIT: f32 = 0.55;
+
+            for step_idx in 0..n_steps {
+                if (step_idx & 255) == 0 && is_cancelled(cancelled) {
+                    return Err("Interrupted".to_string());
+                }
+                let row_off = step_idx * k;
+                let bp_off = step_idx * n_states;
+                let step_max_comp = step_max_comps[step_idx];
+                let step_scale = step_scales[step_idx];
+                let dp_emit_for = |c_idx: usize| -> f32 {
+                    let raw = step_scores[row_off + c_idx];
+                    if step_max_comp == 0 || cand_total_comp[c_idx] == 0 {
+                        return raw;
+                    }
+                    let missing_in_step = step_max_comp.saturating_sub(step_comparable[row_off + c_idx]);
+                    if missing_in_step == 0 {
+                        raw
+                    } else {
+                        raw + missing_in_step as f32 * FOUNDER_MISSING_CREDIT * step_scale
+                    }
+                };
 
                 if step_idx == 0 {
                     for c_idx in 0..k {
-                        curr_dp[c_idx] = step_scores[row_off + c_idx];
+                        curr_dp[c_idx] = dp_emit_for(c_idx);
                         backptr[bp_off + c_idx] = c_idx as u32;
                     }
                     curr_dp[uncalled_state] = 0.0;
@@ -428,7 +466,7 @@ pub fn paint_chromosome_ancestry_cancellable(
                     let switch_val = best_prev_val - switch_penalty;
                     for s_idx in 0..n_states {
                         let emit = if s_idx < k {
-                            step_scores[row_off + s_idx]
+                            dp_emit_for(s_idx)
                         } else {
                             0.0
                         };
@@ -523,16 +561,12 @@ pub fn paint_chromosome_ancestry_cancellable(
                     let is_long_gap = gap_markers >= LONG_MISSING_GAP_MIN_MARKERS
                         && gap_cm >= LONG_MISSING_GAP_MIN_CM;
 
-                    let mut any_other_obs = false;
                     // Filter qualified alternatives (`alt_comp >= ALT_EVIDENCE_MIN_MARKERS && alt_score > 0`)
-                    // before ranking by score so a sparse low-marker candidate can never shadow a
-                    // qualified candidate with slightly lower score.
+                    // using raw comparable marker counts and raw scores so gap reassignment
+                    // and boundary edges uniformly enforce the raw marker floor.
                     let mut best_qual_idx: Option<usize> = None;
                     let mut best_qual_score = f64::NEG_INFINITY;
                     let mut best_qual_comp: u32 = 0;
-                    let mut best_any_idx: Option<usize> = None;
-                    let mut best_any_score = f64::NEG_INFINITY;
-                    let mut best_any_comp: u32 = 0;
                     for ci in 0..k {
                         if ci == cur_st {
                             continue;
@@ -547,24 +581,14 @@ pub fn paint_chromosome_ancestry_cancellable(
                                 alt_score += step_scores[off] as f64;
                             }
                         }
-                        if alt_comp > 0 {
-                            any_other_obs = true;
-                            if alt_score > best_any_score
-                                || (alt_score == best_any_score && alt_comp > best_any_comp)
-                            {
-                                best_any_score = alt_score;
-                                best_any_comp = alt_comp;
-                                best_any_idx = Some(ci);
-                            }
-                            if alt_comp >= ALT_EVIDENCE_MIN_MARKERS
-                                && alt_score > 0.0
-                                && (alt_score > best_qual_score
-                                    || (alt_score == best_qual_score && alt_comp > best_qual_comp))
-                            {
-                                best_qual_score = alt_score;
-                                best_qual_comp = alt_comp;
-                                best_qual_idx = Some(ci);
-                            }
+                        if alt_comp >= ALT_EVIDENCE_MIN_MARKERS
+                            && alt_score > 0.0
+                            && (alt_score > best_qual_score
+                                || (alt_score == best_qual_score && alt_comp > best_qual_comp))
+                        {
+                            best_qual_score = alt_score;
+                            best_qual_comp = alt_comp;
+                            best_qual_idx = Some(ci);
                         }
                     }
 
@@ -655,34 +679,106 @@ pub fn paint_chromosome_ancestry_cancellable(
                         for slot in &mut called_path[sub_start..sub_end] {
                             *slot = None;
                         }
-                    } else {
-                        let left_supported = sub_start > 0
-                            && called_path[sub_start - 1] == Some(cur_st)
-                            && step_comparable[(sub_start - 1) * k + cur_st] > 0;
-                        let right_supported = sub_end < n_steps
-                            && called_path[sub_end] == Some(cur_st)
-                            && step_comparable[sub_end * k + cur_st] > 0;
-                        let flanked_by_same_parent = left_supported && right_supported;
-                        if any_other_obs && !flanked_by_same_parent {
-                            if let Some(alt_ci) = best_any_idx {
-                                if best_any_score > 0.0 {
-                                    for slot in &mut called_path[sub_start..sub_end] {
-                                        *slot = Some(alt_ci);
-                                    }
-                                } else {
-                                    for slot in &mut called_path[sub_start..sub_end] {
-                                        *slot = None;
-                                    }
-                                }
-                            } else {
-                                for slot in &mut called_path[sub_start..sub_end] {
-                                    *slot = None;
-                                }
-                            }
-                        }
                     }
                 }
                 gap_step = gap_end;
+            }
+
+            // Enforce the raw comparable marker floor (`ALT_EVIDENCE_MIN_MARKERS = 4`)
+            // on any DP-emitted segment that relied on missingness compensation
+            // (`run_comp < run_max_comp`): a candidate with < 4 raw comparable markers
+            // across a run cannot insert a spurious island solely by accumulating
+            // `FOUNDER_MISSING_CREDIT` over a local target error burst.
+            loop {
+                let mut changed = false;
+                let mut run_start = 0usize;
+                while run_start < n_steps {
+                    let Some(c_idx) = called_path[run_start] else {
+                        run_start += 1;
+                        continue;
+                    };
+                    let (parent_sample, parent_hap) =
+                        ref_layout.hap_to_sample[candidates[c_idx]];
+                    let mut run_end = run_start + 1;
+                    while run_end < n_steps {
+                        let Some(next_c) = called_path[run_end] else {
+                            break;
+                        };
+                        let (np, nh) = ref_layout.hap_to_sample[candidates[next_c]];
+                        if np != parent_sample || nh != parent_hap {
+                            break;
+                        }
+                        run_end += 1;
+                    }
+                    let mut run_comp: u32 = 0;
+                    let mut run_max_comp: u32 = 0;
+                    let mut run_raw_score = 0.0f64;
+                    for s_idx in run_start..run_end {
+                        let chosen = called_path[s_idx].unwrap_or(c_idx);
+                        let off = s_idx * k + chosen;
+                        run_comp = run_comp.saturating_add(step_comparable[off]);
+                        run_max_comp = run_max_comp.saturating_add(step_max_comps[s_idx]);
+                        run_raw_score += step_scores[off] as f64;
+                    }
+                    if run_comp < ALT_EVIDENCE_MIN_MARKERS && run_comp < run_max_comp {
+                        let left_c = if run_start > 0 {
+                            called_path[run_start - 1]
+                        } else {
+                            None
+                        };
+                        let right_c = if run_end < n_steps {
+                            called_path[run_end]
+                        } else {
+                            None
+                        };
+                        let raw_for_cand = |cand: usize| -> f64 {
+                            let mut sum = 0.0f64;
+                            for s_idx in run_start..run_end {
+                                sum += step_scores[s_idx * k + cand] as f64;
+                            }
+                            sum
+                        };
+                        let sw = switch_penalty as f64;
+                        let (flank, stands_without_credit) = match (left_c, right_c) {
+                            (Some(lc), Some(rc))
+                                if ref_layout.hap_to_sample[candidates[lc]]
+                                    == ref_layout.hap_to_sample[candidates[rc]] =>
+                            {
+                                let flank_raw = raw_for_cand(lc);
+                                let uncalled_val = -2.0 * sw;
+                                let best_alt = flank_raw.max(uncalled_val);
+                                let fallback = if uncalled_val > flank_raw {
+                                    None
+                                } else {
+                                    Some(lc)
+                                };
+                                (
+                                    fallback,
+                                    run_raw_score > 0.0 && (run_raw_score - 2.0 * sw) > best_alt,
+                                )
+                            }
+                            (Some(lc), Some(rc)) => {
+                                let best_nb_raw = raw_for_cand(lc).max(raw_for_cand(rc));
+                                (None, run_raw_score > 0.0 && (run_raw_score - sw) > best_nb_raw)
+                            }
+                            (Some(nb), None) | (None, Some(nb)) => {
+                                let nb_raw = raw_for_cand(nb);
+                                (None, run_raw_score > 0.0 && (run_raw_score - sw) > nb_raw)
+                            }
+                            (None, None) => (None, run_raw_score > 0.0),
+                        };
+                        if !stands_without_credit {
+                            for slot in &mut called_path[run_start..run_end] {
+                                *slot = flank;
+                            }
+                            changed = true;
+                        }
+                    }
+                    run_start = run_end;
+                }
+                if !changed {
+                    break;
+                }
             }
 
             // Collapse consecutive CALLED steps with the same `(parent_sample, parent_hap)`
@@ -1792,5 +1888,249 @@ mod tests {
         assert_eq!(segs[2].n_markers, p2_len as u32);
         assert_eq!(segs[3].parent_sample, 0);
         assert_eq!(bins.bin_starts_bp.len(), 4);
+    }
+
+    #[test]
+    fn asymmetric_founder_missingness_does_not_let_low_missing_parent_swallow_true_founder() {
+        // 4 founders over 400 markers: P0 is the true founder across the entire
+        // chromosome with 50% missingness (0% mismatch on observed sites), while
+        // P1/P2/P3 have 0% missingness and share 95% IBS with P0 (1 mismatch
+        // every 20 markers). Call-rate-normalized emissions must recover P0
+        // across the whole chromosome rather than letting 0%-missing P1 swallow it.
+        let n_markers = 400usize;
+        let ref_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true; 4]);
+        let tgt_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true]);
+        let mut joint =
+            BitHaplotypeMatrix::new(ref_layout.total_haps + tgt_layout.total_haps, n_markers);
+        let pos: Vec<u64> = (0..n_markers).map(|m| (m as u64 + 1) * 10_000).collect();
+        let cm: Vec<f64> = (0..n_markers).map(|m| m as f64 * 0.05).collect();
+
+        for m in 0..n_markers {
+            let true_a = (m % 2) as u8;
+            // P0: 50% missing, 0% mismatch
+            joint.set_allele(m, 0, if m % 2 == 0 { Some(true_a) } else { None });
+            // P1..P3: 0% missing, 95% IBS with P0 (mismatch every 20 markers at distinct phases)
+            for p in 1..4usize {
+                let mis = (m + p * 7) % 20 == 0;
+                joint.set_allele(m, p, Some(if mis { 1 - true_a } else { true_a }));
+            }
+            joint.set_allele(m, 4, Some(true_a));
+        }
+
+        let cfg = HaploidIbdConfig::default();
+        let (segs, bins) =
+            paint_chromosome_ancestry(&joint, &ref_layout, &tgt_layout, 0, &pos, &cm, &cfg);
+        assert_eq!(
+            segs.len(),
+            1,
+            "50%-missing true founder P0 must not be swallowed by 0%-missing 95%-IBS founders, got {segs:?}"
+        );
+        assert_eq!(segs[0].parent_sample, 0);
+        assert_eq!(segs[0].start_bp, pos[0]);
+        assert_eq!(segs[0].end_bp, pos[n_markers - 1]);
+        assert_eq!(bins.bin_starts_bp.len(), 1);
+    }
+
+    #[test]
+    fn local_matching_decoy_missing_elsewhere_cannot_intrude_into_full_parent() {
+        // P0 matches all 400 markers. Decoy P1 is missing on 360 markers and
+        // observed only on the middle 40 markers where it is identical to P0.
+        // Missingness elsewhere must never give P1 a local score advantage over P0.
+        let n_markers = 400usize;
+        let ref_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true, true]);
+        let tgt_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true]);
+        let mut joint =
+            BitHaplotypeMatrix::new(ref_layout.total_haps + tgt_layout.total_haps, n_markers);
+        let pos: Vec<u64> = (0..n_markers).map(|m| (m as u64 + 1) * 10_000).collect();
+        let cm: Vec<f64> = (0..n_markers).map(|m| m as f64 * 0.05).collect();
+
+        for m in 0..n_markers {
+            let a = (m % 2) as u8;
+            joint.set_allele(m, 0, Some(a));
+            joint.set_allele(m, 1, if (180..220).contains(&m) { Some(a) } else { None });
+            joint.set_allele(m, 2, Some(a));
+        }
+
+        let cfg = HaploidIbdConfig::default();
+        let (segs, bins) =
+            paint_chromosome_ancestry(&joint, &ref_layout, &tgt_layout, 0, &pos, &cm, &cfg);
+        assert_eq!(
+            segs.len(),
+            1,
+            "decoy missing elsewhere must not intrude into full-coverage matching P0, got {segs:?}"
+        );
+        assert_eq!(segs[0].parent_sample, 0);
+        assert_eq!(segs[0].n_markers, n_markers as u32);
+        assert_eq!(bins.bin_starts_bp.len(), 1);
+    }
+
+    #[test]
+    fn two_marker_p0_missing_gap_does_not_insert_spurious_p1_segment() {
+        // P0 matches everywhere except a 2-marker missing gap in the middle where
+        // P1 happens to match both markers. Raw comparable floor (>= 4) must keep
+        // P0 bridged rather than inserting a 2-marker P1 segment.
+        let n_markers = 82usize;
+        let ref_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true, true]);
+        let tgt_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true]);
+        let mut joint =
+            BitHaplotypeMatrix::new(ref_layout.total_haps + tgt_layout.total_haps, n_markers);
+        let pos: Vec<u64> = (0..n_markers).map(|m| (m as u64 + 1) * 10_000).collect();
+        let cm: Vec<f64> = (0..n_markers).map(|m| m as f64 * 0.05).collect();
+
+        for m in 0..n_markers {
+            let p0 = (m % 2) as u8;
+            let p1 = 1 - p0;
+            if (40..42).contains(&m) {
+                joint.set_allele(m, 0, None);
+                joint.set_allele(m, 1, Some(p1));
+                joint.set_allele(m, 2, Some(p1));
+            } else {
+                joint.set_allele(m, 0, Some(p0));
+                joint.set_allele(m, 1, Some(p1));
+                joint.set_allele(m, 2, Some(p0));
+            }
+        }
+
+        let cfg = HaploidIbdConfig::default();
+        let (segs, bins) =
+            paint_chromosome_ancestry(&joint, &ref_layout, &tgt_layout, 0, &pos, &cm, &cfg);
+        assert_eq!(
+            segs.len(),
+            1,
+            "2-marker P0 missing gap must stay bridged as P0, got {segs:?}"
+        );
+        assert_eq!(segs[0].parent_sample, 0);
+        assert_eq!(bins.bin_starts_bp.len(), 1);
+    }
+
+    #[test]
+    fn dp_switch_requiring_missing_credit_below_raw_floor_does_not_insert_spurious_island() {
+        // 400 markers where P0 is the true parent everywhere except 5 consecutive
+        // target genotyping errors on [198..203). P1 mismatches P0 outside the burst,
+        // matches the target on only 1 of the 5 burst markers (m=200), and is missing
+        // on the other 4 burst markers. DP missingness credit (+2.9 vs P0 -22.5) must
+        // not bypass the 4-marker raw comparable floor to insert a 1-marker P1 island.
+        let n_markers = 400usize;
+        let ref_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true, true]);
+        let tgt_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true]);
+        let mut joint =
+            BitHaplotypeMatrix::new(ref_layout.total_haps + tgt_layout.total_haps, n_markers);
+        let pos: Vec<u64> = (0..n_markers).map(|m| (m as u64 + 1) * 10_000).collect();
+        let cm: Vec<f64> = (0..n_markers).map(|m| m as f64 * 0.05).collect();
+
+        for m in 0..n_markers {
+            let p0 = (m % 2) as u8;
+            let p1 = 1 - p0;
+            joint.set_allele(m, 0, Some(p0));
+            if (198..203).contains(&m) {
+                joint.set_allele(m, 1, if m == 200 { Some(p1) } else { None });
+                joint.set_allele(m, 2, Some(p1));
+            } else {
+                joint.set_allele(m, 1, Some(p1));
+                joint.set_allele(m, 2, Some(p0));
+            }
+        }
+
+        let cfg = HaploidIbdConfig::default();
+        let (segs, bins) =
+            paint_chromosome_ancestry(&joint, &ref_layout, &tgt_layout, 0, &pos, &cm, &cfg);
+        assert_eq!(
+            segs.len(),
+            1,
+            "1-marker P1 relying on missingness credit must not insert a spurious island, got {segs:?}"
+        );
+        assert_eq!(segs[0].parent_sample, 0);
+        assert_eq!(segs[0].start_bp, pos[0]);
+        assert_eq!(segs[0].end_bp, pos[n_markers - 1]);
+        assert_eq!(bins.bin_starts_bp.len(), 1);
+    }
+
+    #[test]
+    fn short_true_segment_standing_without_missing_credit_is_preserved() {
+        // 400 markers where P0 matches everywhere except 5 consecutive markers
+        // [198..203) where P0 mismatches all 5 (raw -22.5). True P1 matches 3 of
+        // the 5 markers (raw +2.1) and is missing on 2. Even without missingness
+        // credit, P1 beats P0 by 24.6 > 2 * switch_penalty (24.0), so P1 must be
+        // preserved as [P0, P1(3), P0].
+        let n_markers = 400usize;
+        let ref_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true, true]);
+        let tgt_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true]);
+        let mut joint =
+            BitHaplotypeMatrix::new(ref_layout.total_haps + tgt_layout.total_haps, n_markers);
+        let pos: Vec<u64> = (0..n_markers).map(|m| (m as u64 + 1) * 10_000).collect();
+        // Strictly > default ancestry_step_cm (0.05) so every marker is its own step.
+        let cm: Vec<f64> = (0..n_markers).map(|m| m as f64 * 0.06).collect();
+
+        for m in 0..n_markers {
+            let p0 = (m % 2) as u8;
+            let p1 = 1 - p0;
+            joint.set_allele(m, 0, Some(p0));
+            if (198..203).contains(&m) {
+                let p1_obs = m == 198 || m == 200 || m == 202;
+                joint.set_allele(m, 1, if p1_obs { Some(p1) } else { None });
+                joint.set_allele(m, 2, Some(p1));
+            } else {
+                joint.set_allele(m, 1, Some(p1));
+                joint.set_allele(m, 2, Some(p0));
+            }
+        }
+
+        let cfg = HaploidIbdConfig::default();
+        let (segs, bins) =
+            paint_chromosome_ancestry(&joint, &ref_layout, &tgt_layout, 0, &pos, &cm, &cfg);
+        assert_eq!(
+            segs.len(),
+            3,
+            "3-match/2-miss P1 standing on uncompensated score must be preserved, got {segs:?}"
+        );
+        assert_eq!(segs[0].parent_sample, 0);
+        assert_eq!(segs[1].parent_sample, 1);
+        assert_eq!(segs[1].n_markers, 3);
+        assert_eq!(segs[2].parent_sample, 0);
+        assert_eq!(bins.bin_starts_bp.len(), 3);
+    }
+
+    #[test]
+    fn mismatched_single_marker_alt_loses_to_uncalled_in_same_parent_flank() {
+        // 400 markers where P0 matches everywhere except 10 consecutive markers
+        // [195..205) where P0 mismatches all 10 (raw -45.0). P1 has only 1 observed
+        // marker in the burst (m=200), which ALSO mismatches (raw -4.5), and is
+        // missing on the other 9 (compensated DP score = -4.5 + 9 * 0.55 = +0.45 > 0,
+        // so DP enters P1). Uncompensated: Uncalled (-24.0) beats both P1 (-28.5)
+        // and P0 (-45.0), so the burst must be left Uncalled ([P0, P0]).
+        let n_markers = 400usize;
+        let ref_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true, true]);
+        let tgt_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true]);
+        let mut joint =
+            BitHaplotypeMatrix::new(ref_layout.total_haps + tgt_layout.total_haps, n_markers);
+        let pos: Vec<u64> = (0..n_markers).map(|m| (m as u64 + 1) * 10_000).collect();
+        let cm: Vec<f64> = (0..n_markers).map(|m| m as f64 * 0.06).collect();
+
+        for m in 0..n_markers {
+            let p0 = (m % 2) as u8;
+            let p1 = 1 - p0;
+            joint.set_allele(m, 0, Some(p0));
+            if (195..205).contains(&m) {
+                joint.set_allele(m, 1, if m == 200 { Some(p0) } else { None });
+                joint.set_allele(m, 2, Some(p1));
+            } else {
+                joint.set_allele(m, 1, Some(p1));
+                joint.set_allele(m, 2, Some(p0));
+            }
+        }
+
+        let cfg = HaploidIbdConfig::default();
+        let (segs, bins) =
+            paint_chromosome_ancestry(&joint, &ref_layout, &tgt_layout, 0, &pos, &cm, &cfg);
+        assert_eq!(
+            segs.len(),
+            2,
+            "mismatched 1-marker P1 must lose to Uncalled (-24 vs -28.5), got {segs:?}"
+        );
+        assert_eq!(segs[0].parent_sample, 0);
+        assert_eq!(segs[0].end_bp, pos[194]);
+        assert_eq!(segs[1].parent_sample, 0);
+        assert_eq!(segs[1].start_bp, pos[205]);
+        assert_eq!(bins.bin_starts_bp.len(), 2);
     }
 }

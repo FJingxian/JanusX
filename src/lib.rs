@@ -41,6 +41,8 @@ mod gwas_unified;
 mod he;
 #[path = "stats/heritability.rs"]
 mod heritability;
+#[path = "stats/hgwas.rs"]
+mod hgwas;
 #[path = "stats/ld.rs"]
 mod ld;
 #[path = "stats/lm_trait.rs"]
@@ -232,6 +234,7 @@ use gwas_unified::{
 use gwriter::{HmpStreamWriter, PgenStreamWriter, PlinkStreamWriter, VcfStreamWriter};
 use he::he_pcg_bed;
 use heritability::{prepare_sparse_onehot_blup_cache, SparseOneHotBlupCache};
+use hgwas::{hgwas_grm_from_jhibd_f64, hgwas_inspect_jhibd, hgwas_scan_jhibd_to_tsv_f64};
 use kmer::{
     kfile_inspect_py, kfile_read_rows_f32_py, kformat_run_py, kmer_count_run_py,
     kmer_resolve_inputs_py, kmerge_run_py, kstats_run_py,
@@ -799,6 +802,9 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(lmm_reml_assoc_packed_f32, m)?)?;
     m.add_function(wrap_pyfunction!(lmm_reml_assoc_packed_f32_to_tsv, m)?)?;
     m.add_function(wrap_pyfunction!(fvlmm_assoc_packed_f32_to_tsv, m)?)?;
+    m.add_function(wrap_pyfunction!(hgwas_inspect_jhibd, m)?)?;
+    m.add_function(wrap_pyfunction!(hgwas_grm_from_jhibd_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(hgwas_scan_jhibd_to_tsv_f64, m)?)?;
     m.add_function(wrap_pyfunction!(bayesa, m)?)?;
     m.add_function(wrap_pyfunction!(bayesb, m)?)?;
     m.add_function(wrap_pyfunction!(bayesc, m)?)?;

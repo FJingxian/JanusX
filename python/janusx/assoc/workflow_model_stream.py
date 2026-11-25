@@ -47,6 +47,7 @@ from .workflow import (
     _log_model_line,
     _resolve_stream_scan_chunk_size,
     _rich_success,
+    _replace_file_with_retry,
     _run_fastplot_from_tsv_with_status,
     _run_result_write_with_status,
     _safe_trait_file_label,
@@ -1033,6 +1034,262 @@ def run_chunked_gwas_kfile(
             _rich_success(logger, done_msg, use_spinner=bool(use_spinner))
             _close_assoc_models(models)
             continue
+
+
+def run_chunked_gwas_ibd(
+    *,
+    model_names: list[str],
+    ibd_path: str,
+    ibd_ids: np.ndarray,
+    pheno: pd.DataFrame,
+    ids: np.ndarray,
+    n_bins: int,
+    outprefix: str,
+    grm: Union[np.ndarray, None],
+    qmatrix: np.ndarray,
+    cov_all: Union[np.ndarray, None],
+    threads: int,
+    logger: logging.Logger,
+    summary_rows: Optional[list[dict[str, object]]] = None,
+    saved_paths: Optional[list[str]] = None,
+    use_spinner: bool = False,
+    plot: bool = False,
+) -> None:
+    """Run streaming hGWAS over a `.jhibd` multi-parent ancestry archive.
+
+    Local founder ancestry at each bin is modeled as a random effect and tested
+    via exact REML LRT (`plrt`; no Wald test):
+      - `lmm`   : re-estimates `(sigma_g^2, sigma_b^2, sigma_e^2)` per bin.
+      - `fvlmm` : fixes background `sigma_g^2 / sigma_e^2` from the null model.
+    """
+    requested: list[str] = []
+    for raw in model_names:
+        key = str(raw).strip().lower()
+        if key in {"lmm", "fvlmm"} and key not in requested:
+            requested.append(key)
+    if not requested:
+        return
+    if not hasattr(jxrs, "hgwas_scan_jhibd_to_tsv_f64"):
+        raise RuntimeError(
+            "Rust extension missing hgwas_scan_jhibd_to_tsv_f64; rebuild/reinstall JanusX."
+        )
+    if grm is None:
+        raise ValueError("hGWAS (-ibd) requires a GRM.")
+    if summary_rows is None:
+        summary_rows = []
+    if saved_paths is None:
+        saved_paths = []
+
+    process = psutil.Process()
+    n_cores = detect_effective_threads()
+    source_ids = np.asarray(ibd_ids, dtype=str).reshape(-1)
+    target_ids = np.asarray(ids, dtype=str).reshape(-1)
+    source_pos = {sid: i for i, sid in enumerate(source_ids.tolist())}
+    missing = [sid for sid in target_ids.tolist() if sid not in source_pos]
+    if missing:
+        raise ValueError(f"hGWAS sample alignment failed: {missing[:5]}")
+
+    grm_arr = np.asarray(grm, dtype=np.float64)
+    if grm_arr.ndim != 2 or grm_arr.shape[0] != grm_arr.shape[1]:
+        raise ValueError("hGWAS GRM must be a square matrix.")
+
+    for trait_name in list(pheno.columns):
+        y_full, sameidx = _trait_values_and_mask(pheno, trait_name)
+        keep_idx = np.flatnonzero(sameidx).astype(np.int64, copy=False)
+        if int(keep_idx.shape[0]) == 0:
+            logger.warning(f"{trait_name}: no overlapping samples, skipped.")
+            continue
+
+        _emit_trait_header(
+            logger,
+            trait_name,
+            int(keep_idx.shape[0]),
+            pve=None,
+            use_spinner=bool(use_spinner),
+            width=60,
+        )
+        trait_ids = np.asarray(target_ids[keep_idx], dtype=str)
+        sample_indices = np.ascontiguousarray(
+            np.asarray([source_pos[sid] for sid in trait_ids.tolist()], dtype=np.int64)
+        )
+        y_vec = np.ascontiguousarray(y_full[keep_idx], dtype=np.float64)
+        x_cov = np.asarray(qmatrix[keep_idx], dtype=np.float64)
+        if cov_all is not None:
+            x_cov = np.concatenate(
+                [x_cov, np.asarray(cov_all[keep_idx], dtype=np.float64)],
+                axis=1,
+            )
+        if grm_arr.shape[0] == target_ids.shape[0]:
+            grm_trait = np.ascontiguousarray(
+                grm_arr[np.ix_(keep_idx, keep_idx)],
+                dtype=np.float64,
+            )
+        elif grm_arr.shape[0] == keep_idx.shape[0]:
+            grm_trait = np.ascontiguousarray(grm_arr, dtype=np.float64)
+        else:
+            raise ValueError(
+                "hGWAS GRM sample dimension does not match phenotype IDs."
+            )
+
+        model_init_t0 = time.monotonic()
+        null_lmm = LMM(y=y_vec, X=x_cov, kinship=grm_trait)
+        init_secs = max(time.monotonic() - model_init_t0, 0.0)
+
+        s_vec = np.ascontiguousarray(
+            np.asarray(null_lmm.S, dtype=np.float64).reshape(-1)
+        )
+        x_rot = np.ascontiguousarray(
+            np.asarray(null_lmm.Xcov, dtype=np.float64)
+        )
+        y_rot = np.ascontiguousarray(
+            np.asarray(null_lmm.y, dtype=np.float64).reshape(-1)
+        )
+        u_t = np.ascontiguousarray(
+            np.asarray(null_lmm.Dh, dtype=np.float64)
+        )
+        try:
+            lbd_null = float(getattr(null_lmm, "lbd_null", np.nan))
+            lambda_g_null = (
+                float(1.0 / lbd_null)
+                if (np.isfinite(lbd_null) and lbd_null > 0.0)
+                else None
+            )
+        except Exception:
+            lambda_g_null = None
+
+        safe_trait = _safe_trait_file_label(trait_name)
+        for model_key in requested:
+            cpu_t0 = process.cpu_times()
+            scan_t0 = time.monotonic()
+            peak_rss = int(process.memory_info().rss)
+            exact_lmm = model_key == "lmm"
+            model_label = _gwas_stream_model_label(model_key)
+            out_tsv = f"{outprefix}.{safe_trait}.hgwas.{model_key}.tsv"
+            tmp_tsv = _gwas_result_tmp_path(out_tsv)
+
+            pbar = _ProgressAdapter(
+                total=max(1, int(n_bins)),
+                desc=f"hGWAS-{model_label}",
+                force_animate=True,
+                logger=logger,
+                trait=str(trait_name),
+            )
+            progress_last = 0
+
+            def _on_progress(done: int, total: int) -> None:
+                nonlocal progress_last
+                try:
+                    d = max(0, int(done))
+                    t = max(1, int(total))
+                except Exception:
+                    return
+                if int(pbar.total) != t:
+                    pbar.set_total(t)
+                d = min(d, int(pbar.total))
+                delta = d - progress_last
+                if delta > 0:
+                    pbar.update(delta)
+                    progress_last = d
+
+            try:
+                count_raw, null_pve_raw = jxrs.hgwas_scan_jhibd_to_tsv_f64(
+                    jhibd_path=str(ibd_path),
+                    out_tsv=str(tmp_tsv),
+                    s=s_vec,
+                    x_rot=x_rot,
+                    y_rot=y_rot,
+                    u_t=u_t,
+                    sample_indices=sample_indices,
+                    exact_lmm=bool(exact_lmm),
+                    lambda_g_null=lambda_g_null,
+                    low=-5.0,
+                    high=5.0,
+                    max_iter=30,
+                    tol=1e-2,
+                    threads=max(1, int(threads)),
+                    progress_callback=_on_progress,
+                )
+                count = int(count_raw)
+                pve_now = (
+                    float(null_pve_raw)
+                    if np.isfinite(float(null_pve_raw))
+                    else _stream_model_pve(model_key, null_lmm)
+                )
+            except Exception:
+                _cleanup_gwas_result_tmp(tmp_tsv)
+                pbar.close(show_done=False)
+                _close_assoc_models([(model_key, null_lmm)])
+                raise
+
+            if progress_last < count:
+                pbar.update(int(count - progress_last))
+            pbar.finish()
+            scan_secs = max(time.monotonic() - scan_t0, 0.0)
+            cpu_t1 = process.cpu_times()
+            peak_rss = max(peak_rss, int(process.memory_info().rss))
+            wall_model = max(scan_secs, 1e-12)
+            cpu_used = float(
+                (cpu_t1.user - cpu_t0.user) + (cpu_t1.system - cpu_t0.system)
+            )
+            avg_cpu_pct = 100.0 * cpu_used / wall_model / max(1, int(n_cores))
+            peak_rss_gb = float(peak_rss / 1024**3)
+            pbar.close(show_done=False)
+            _replace_file_with_retry(str(tmp_tsv), str(out_tsv))
+            saved_paths.append(str(out_tsv))
+
+            viz_secs = 0.0
+            if bool(plot):
+                viz_secs = _run_fastplot_from_tsv_with_status(
+                    out_tsv,
+                    y_vec,
+                    xlabel=str(trait_name),
+                    outpdf=f"{os.path.splitext(out_tsv)[0]}.svg",
+                    use_spinner=bool(use_spinner),
+                    emit_done_line=False,
+                )
+
+            summary_rows.append(
+                {
+                    "phenotype": str(trait_name),
+                    "model": f"hGWAS-{model_label}",
+                    "nidv": int(keep_idx.shape[0]),
+                    "eff_snp": int(count),
+                    "pve": pve_now,
+                    "avg_cpu": float(avg_cpu_pct),
+                    "peak_rss_gb": float(peak_rss_gb),
+                    "gwas_time_s": float(init_secs + scan_secs),
+                    "viz_time_s": float(viz_secs),
+                    "result_file": str(out_tsv),
+                }
+            )
+            time_parts: list[str] = []
+            if init_secs > 0.0:
+                time_parts.append(f"Init {format_elapsed(init_secs)}")
+            time_parts.append(f"Scan {format_elapsed(scan_secs)}")
+            if bool(plot):
+                time_parts.append(f"Plot {format_elapsed(viz_secs)}")
+            done_msg = (
+                f"hGWAS-{model_label} ...pve(pheno) {float(pve_now):.3f} "
+                f"[{'/'.join(time_parts)}]"
+                if (pve_now is not None and np.isfinite(float(pve_now)))
+                else f"hGWAS-{model_label} ...Finished [{'/'.join(time_parts)}]"
+            )
+            _log_model_line(
+                logger,
+                f"hGWAS-{model_label}",
+                f"avg CPU ~ {avg_cpu_pct:.1f}% of {n_cores} c, "
+                f"peak RSS ~ {peak_rss_gb:.2f} G",
+                use_spinner=bool(use_spinner),
+            )
+            _log_model_line(
+                logger,
+                f"hGWAS-{model_label}",
+                f"Results saved to {_display_path(str(out_tsv))}",
+                use_spinner=bool(use_spinner),
+            )
+            _rich_success(logger, done_msg, use_spinner=bool(use_spinner))
+
+        _close_assoc_models([("lmm", null_lmm)])
 
 
 def run_chunked_gwas_lmm_lm(

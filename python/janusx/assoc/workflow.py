@@ -5315,6 +5315,183 @@ def _prepare_kfile_stream_context(
     )
 
 
+def _inspect_ibd_source(ibd_path: str) -> tuple[np.ndarray, int, dict[str, object]]:
+    if not hasattr(jxrs, "hgwas_inspect_jhibd"):
+        raise RuntimeError(
+            "Rust extension missing hgwas_inspect_jhibd; rebuild/reinstall JanusX."
+        )
+    info = dict(jxrs.hgwas_inspect_jhibd(str(ibd_path)))
+    ids = np.asarray(info.get("sample_ids", []), dtype=str).reshape(-1)
+    n_bins = int(info.get("n_bins", 0))
+    if ids.shape[0] == 0 or n_bins == 0:
+        raise ValueError(".jhibd archive contains no target samples or ancestry bins.")
+    if len(set(ids.tolist())) != int(ids.shape[0]):
+        raise ValueError(".jhibd archive contains duplicate target sample IDs.")
+    return ids, n_bins, info
+
+
+def _prepare_ibd_stream_context(
+    *,
+    ibd_path: str,
+    phenofile: str,
+    pheno_cols: Union[list[int], None],
+    cov_inputs: Union[str, list[str], None],
+    grm_option: str,
+    qcov: str,
+    threads: int,
+    logger: logging.Logger,
+    use_spinner: bool = False,
+    inverse_normal: bool = False,
+) -> tuple[pd.DataFrame, np.ndarray, int, np.ndarray, np.ndarray, Optional[np.ndarray], int]:
+    ibd_ids, n_bins, _info = _inspect_ibd_source(ibd_path)
+    pheno = _load_phenotype_with_status(
+        phenofile,
+        pheno_cols,
+        logger,
+        id_col=0,
+        use_spinner=use_spinner,
+    )
+    pheno_n_input = int(pheno.shape[0])
+    pheno, ids = _align_kfile_pheno_to_sample_order(pheno, ibd_ids)
+    any_finite = False
+    for col in pheno.columns:
+        values = pd.to_numeric(pheno[col], errors="coerce").to_numpy(dtype=np.float64)
+        any_finite |= bool(np.any(np.isfinite(values)))
+    if not any_finite:
+        raise ValueError("No finite phenotype samples overlap .jhibd target sample IDs.")
+    id_pos = {sid: i for i, sid in enumerate(ibd_ids.tolist())}
+    sample_indices = np.asarray([id_pos[sid] for sid in ids], dtype=np.int64)
+
+    cov_all = None
+    cov_ids = None
+    cov_norm = _normalize_cov_inputs(cov_inputs)
+    if len(cov_norm) > 0:
+        cov_files, cov_sites = _split_cov_sources(cov_norm)
+        if len(cov_sites) > 0:
+            raise ValueError("Site-style --cov tokens (chr:pos) are not supported with -ibd.")
+        cov_all, cov_ids = _load_covariates_for_models(
+            cov_inputs=cov_files,
+            genofile=ibd_path,
+            sample_ids=ids,
+            chunk_size=1024,
+            logger=logger,
+            context="hGWAS",
+            use_spinner=use_spinner,
+            snps_only=False,
+        )
+        if cov_ids is not None and cov_all is not None:
+            cov_pos = {sid: i for i, sid in enumerate(np.asarray(cov_ids, dtype=str))}
+            keep_cov = np.asarray([sid in cov_pos for sid in ids], dtype=np.bool_)
+            if not np.all(keep_cov):
+                ids = np.asarray(ids[keep_cov], dtype=str)
+                pheno = pheno.loc[ids]
+                sample_indices = np.asarray([id_pos[sid] for sid in ids], dtype=np.int64)
+            cov_all = np.asarray(
+                cov_all[[cov_pos[sid] for sid in ids]],
+                dtype=np.float32,
+            )
+
+    _set_pending_gwas_overlap_line(
+        logger,
+        (
+            f"Sample overlap: ibd={int(ibd_ids.shape[0])}, pheno={pheno_n_input}, "
+            f"cov={(int(len(cov_ids)) if cov_ids is not None else 'NA')}, "
+            f"common={int(ids.shape[0])}"
+        ),
+    )
+    if bool(inverse_normal):
+        pheno = inverse_normal_transform(pheno, logger=logger)
+        logger.info(
+            "Phenotype transform: inverse-normal rank transform "
+            "(average ties; finite values only; transformed scale)."
+        )
+
+    qdim = _parse_qcov_dim(qcov)
+    _validate_qcov_dim_for_n(qdim, int(len(ids)))
+    eff_m = int(n_bins)
+    grm_option_text = str(grm_option).strip()
+    if grm_option_text not in {"", "1", "2"}:
+        grm_t0 = time.monotonic()
+        with CliStatus(
+            grm_load_status_open(grm_option_text),
+            enabled=bool(use_spinner),
+        ) as task:
+            try:
+                grm, _grm_ids = _load_kfile_external_grm(grm_option_text, ids=ids)
+            except Exception:
+                task.fail(grm_load_status_fail(grm_option_text))
+                raise
+            task.complete(grm_load_status_done(grm_option_text, int(grm.shape[0])))
+        _log_file_only(
+            logger,
+            logging.INFO,
+            f"Loading GRM from {_basename_only(grm_option_text)} "
+            f"(n={int(grm.shape[0])}) [{format_elapsed(time.monotonic() - grm_t0)}]",
+        )
+    else:
+        if not hasattr(jxrs, "hgwas_grm_from_jhibd_f64"):
+            raise RuntimeError(
+                "Rust extension missing hgwas_grm_from_jhibd_f64; rebuild/reinstall JanusX."
+            )
+        method_int = int(grm_option_text) if grm_option_text in {"1", "2"} else 1
+        grm_t0 = time.monotonic()
+        with CliStatus(
+            f"Calculating ancestry GRM from {_basename_only(ibd_path)}...",
+            enabled=bool(use_spinner),
+            use_process=True,
+        ) as task:
+            try:
+                grm_raw, eff_bins = jxrs.hgwas_grm_from_jhibd_f64(
+                    str(ibd_path),
+                    sample_indices=np.ascontiguousarray(sample_indices, dtype=np.int64),
+                    method=int(method_int),
+                    threads=max(1, int(threads)),
+                )
+                grm = np.ascontiguousarray(np.asarray(grm_raw, dtype=np.float64))
+                eff_m = int(eff_bins)
+            except Exception:
+                task.fail("Calculating ancestry GRM ...Failed")
+                raise
+            task.complete(
+                f"Calculating ancestry GRM from {_basename_only(ibd_path)} "
+                f"(n={int(grm.shape[0])}, bins={eff_m})"
+            )
+        _log_file_only(
+            logger,
+            logging.INFO,
+            f"Calculating ancestry GRM from {_basename_only(ibd_path)} "
+            f"(n={int(grm.shape[0])}, bins={eff_m}) "
+            f"[{format_elapsed(time.monotonic() - grm_t0)}]",
+        )
+
+    qmatrix = np.zeros((len(ids), 0), dtype=np.float32)
+    if qdim > 0:
+        _eval, eigvec, _backend, _elapsed = _gwas_eigh_from_grm(
+            grm,
+            threads=max(1, int(threads)),
+            logger=logger,
+            stage_label="hGWAS-Q",
+            require_rust=True,
+        )
+        qmatrix = np.asarray(eigvec[:, -int(qdim):], dtype=np.float32)
+    else:
+        _emit_warning_line(
+            logger,
+            "PC dimension set to 0; using empty Q matrix.",
+            use_spinner=bool(use_spinner),
+        )
+
+    return (
+        pheno,
+        np.asarray(ids, dtype=str),
+        int(n_bins),
+        grm,
+        qmatrix,
+        (None if cov_all is None else np.asarray(cov_all, dtype=np.float32)),
+        int(eff_m),
+    )
+
+
 def _is_full_identity_index(idx: object, size: int) -> bool:
     try:
         n = int(size)
@@ -7152,6 +7329,11 @@ def run_chunked_gwas_kfile(*args, **kwargs):
     from janusx.assoc.workflow_model_stream import run_chunked_gwas_kfile as _impl
     return _impl(*args, **kwargs)
 
+
+def run_chunked_gwas_ibd(*args, **kwargs):
+    from janusx.assoc.workflow_model_stream import run_chunked_gwas_ibd as _impl
+    return _impl(*args, **kwargs)
+
 def prepare_qk_and_filter(*args, **kwargs):
     from janusx.assoc.workflow_model_farmcpu import prepare_qk_and_filter as _impl
     return _impl(*args, **kwargs)
@@ -7825,6 +8007,15 @@ def parse_args(argv: Optional[list[str]] = None):
             "through the streaming k-file GWAS route; <prefix>.bkmer is not required."
         ),
     )
+    geno_group.add_argument(
+        "-ibd",
+        "--ibd",
+        type=str,
+        help=(
+            "JanusX haploid IBD multi-parent ancestry archive (.jhibd) for streaming "
+            "hGWAS with random founder ancestry effects (-lmm and/or -fvlmm, plrt only)."
+        ),
+    )
 
     phenotype_group = parser.add_argument_group("Phenotype Arguments (Required)")
     add_common_pheno_arg(
@@ -8134,12 +8325,14 @@ def parse_args(argv: Optional[list[str]] = None):
     args, extras = parser.parse_known_args(argv)
     args._out_was_explicit = bool(_option_present(raw_argv, "-o", "--out"))
     args._prefix_was_explicit = bool(_option_present(raw_argv, "-prefix", "--prefix"))
-    has_genotype = bool(args.vcf or args.hmp or args.file or args.bfile or args.pfile or args.kfile)
+    has_genotype = bool(
+        args.vcf or args.hmp or args.file or args.bfile or args.pfile or args.kfile or args.ibd
+    )
     has_pheno = bool(args.pheno)
     if (not has_pheno) and (not has_genotype):
         parser.error(
             "the following arguments are required: -p/--pheno & "
-            "(-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE | -pfile PFILE | -kfile KFILE)"
+            "(-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE | -pfile PFILE | -kfile KFILE | -ibd IBD)"
         )
     if not has_pheno:
         parser.error("the following arguments are required: -p/--pheno")
@@ -8151,7 +8344,7 @@ def parse_args(argv: Optional[list[str]] = None):
     if not has_genotype:
         parser.error(
             "the following arguments are required: "
-            "(-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE | -pfile PFILE | -kfile KFILE)"
+            "(-vcf VCF | -hmp HMP | -file FILE | -bfile BFILE | -pfile PFILE | -kfile KFILE | -ibd IBD)"
         )
     if len(extras) > 0:
         parser.error("unrecognized arguments: " + " ".join(extras))
@@ -8364,6 +8557,7 @@ def _resolve_gwas_output_for_runlog(args) -> tuple[str, str, str]:
         bfile=getattr(args, "bfile", None),
         pfile=getattr(args, "pfile", None),
         kfile=getattr(args, "kfile", None),
+        ibd=getattr(args, "ibd", None),
         prefix=None,
         snps_only=bool(getattr(args, "snps_only", False)),
         delimiter=getattr(args, "delimiter", None),
@@ -8590,6 +8784,7 @@ def _run_gwas_pipeline_impl(
         setattr(args, "prefix", legacy_prefix)
 
     kfile_mode = bool(getattr(args, "kfile", None))
+    ibd_mode = bool(getattr(args, "ibd", None))
     if kfile_mode:
         gfile = _resolve_kfile_prefix(args.kfile)
         prefix = os.path.basename(gfile.rstrip("/\\"))
@@ -8807,6 +9002,26 @@ def _run_gwas_pipeline_impl(
             het_threshold=float(args.het),
             bimranges=scan_bimranges,
         )
+    if ibd_mode:
+        unsupported_ibd_models = [
+            str(model)
+            for model in requested_stream_models
+            if str(model).strip().lower() not in {"lmm", "fvlmm"}
+        ]
+        if len(unsupported_ibd_models) > 0 or bool(args.farmcpu) or bool(args.algwas):
+            unsupported_ibd_models.extend(
+                model
+                for model, enabled in (("farmcpu", args.farmcpu), ("algwas", args.algwas))
+                if bool(enabled) and model not in unsupported_ibd_models
+            )
+            raise ValueError(
+                "-ibd (hGWAS) currently supports only -lmm and/or -fvlmm (plrt only); "
+                f"unsupported model(s): {', '.join(unsupported_ibd_models)}"
+            )
+        if len(requested_stream_models) == 0:
+            raise ValueError(
+                "-ibd (hGWAS) requires -lmm and/or -fvlmm."
+            )
     qcov_requested = str(getattr(args, "qcov", "0")).strip() not in {"", "0"}
     qcov_needs_grm = False
     standard_stream_models_requested = bool(
@@ -8852,7 +9067,29 @@ def _run_gwas_pipeline_impl(
         )
         raise SystemExit(1)
     if args.memory is None:
-        if kfile_mode:
+        if ibd_mode:
+            preinspect_t0 = time.monotonic()
+            try:
+                preinspect_ids, preinspect_n_snps, _ibd_info = _inspect_ibd_source(gfile)
+            except Exception as ex:
+                _abort_cli_input_error(logger, ex)
+            preinspect_elapsed_secs = max(time.monotonic() - preinspect_t0, 0.0)
+            preinspect_src_for_merge = _basename_only(gfile)
+            qcov_needs_grm = _gwas_qcov_prefers_grm_route(
+                args.qcov,
+                int(len(preinspect_ids)),
+            )
+            ibd_status = (
+                f"Loading .jhibd from {preinspect_src_for_merge} "
+                f"(n={len(preinspect_ids)}, bins={int(preinspect_n_snps)})"
+            )
+            _queue_preconfig_success(
+                f"{ibd_status} [{format_elapsed(preinspect_elapsed_secs)}]"
+            )
+            args.memory = float(DEFAULT_BED_MEMORY_GB)
+            args._memory_mb = _bed_memory_gb_to_mb(args.memory)
+            args._memory_auto_reason = "hGWAS streaming .jhibd default"
+        elif kfile_mode:
             preinspect_t0 = time.monotonic()
             try:
                 preinspect_ids, preinspect_n_snps, _kfile_info = _inspect_kfile_source(gfile)
@@ -8936,6 +9173,25 @@ def _run_gwas_pipeline_impl(
                 logger.info(auto_memory_msg)
             else:
                 _log_file_only(logger, logging.INFO, auto_memory_msg)
+    elif ibd_mode:
+        preinspect_t0 = time.monotonic()
+        try:
+            preinspect_ids, preinspect_n_snps, _ibd_info = _inspect_ibd_source(gfile)
+        except Exception as ex:
+            _abort_cli_input_error(logger, ex)
+        preinspect_elapsed_secs = max(time.monotonic() - preinspect_t0, 0.0)
+        preinspect_src_for_merge = _basename_only(gfile)
+        qcov_needs_grm = _gwas_qcov_prefers_grm_route(
+            args.qcov,
+            int(len(preinspect_ids)),
+        )
+        ibd_status = (
+            f"Loading .jhibd from {preinspect_src_for_merge} "
+            f"(n={len(preinspect_ids)}, bins={int(preinspect_n_snps)})"
+        )
+        _queue_preconfig_success(
+            f"{ibd_status} [{format_elapsed(preinspect_elapsed_secs)}]"
+        )
     elif kfile_mode:
         preinspect_t0 = time.monotonic()
         try:
@@ -9161,7 +9417,15 @@ def _run_gwas_pipeline_impl(
         _flush_preconfig_successes()
 
     checks: list[bool] = []
-    if args.kfile:
+    if args.ibd:
+        checks.append(
+            ensure_file_exists(
+                logger,
+                gfile,
+                "Haploid IBD archive (.jhibd)",
+            )
+        )
+    elif args.kfile:
         checks.append(
             ensure_file_exists(
                 logger,
@@ -9676,6 +9940,90 @@ def _run_gwas_pipeline_impl(
                             row
                             for idx, row in enumerate(kfile_rows)
                             if idx not in emitted_kfile_rows
+                        ],
+                    )
+                preloaded_packed = None
+                stream_models = []
+                has_farmcpu = False
+                farmcpu_handled_in_trait_loop = True
+            elif ibd_mode:
+                if terminal_rich:
+                    _section(terminal_logger, "hGWAS task")
+                if (not bool(preconfig_successes_flushed)) and len(preconfig_terminal_successes) > 0:
+                    _flush_preconfig_successes()
+                pheno, ids, n_bins, grm, qmatrix, cov_all, eff_m = _prepare_ibd_stream_context(
+                    ibd_path=str(genofile_stream),
+                    phenofile=str(args.pheno),
+                    pheno_cols=args.ncol,
+                    cov_inputs=args.cov,
+                    grm_option=str(args.grm),
+                    qcov=str(args.qcov),
+                    threads=max(1, int(args.thread)),
+                    logger=logger,
+                    use_spinner=bool(use_spinner),
+                    inverse_normal=bool(getattr(args, "intrans", False)),
+                )
+                _flush_pending_gwas_overlap_line(
+                    logger,
+                    use_spinner=bool(use_spinner),
+                )
+                setattr(
+                    logger,
+                    "_janusx_gwas_task_context_rows",
+                    [
+                        ("Data Loaded", f"{int(len(ids))} Samples | {int(n_bins)} ancestry bins"),
+                        ("IBD Archive", _display_path(str(genofile_stream))),
+                        ("GRM Status", _format_gwas_grm_status(grm, args.grm)),
+                        ("Q Matrix", _format_gwas_q_status(qmatrix)),
+                        ("Covariates", _format_gwas_cov_status(cov_all)),
+                        (
+                            "Output",
+                            "chrom/pos/n_parents/sigma_g2/sigma_b2/sigma_e2/h2_bin/lrt/plrt; "
+                            f"plot {'enabled' if bool(args.plot) else 'disabled'}",
+                        ),
+                    ],
+                )
+                if terminal_rich:
+                    _phase_split(terminal_logger)
+                ibd_summary_start = len(gwas_summary_rows)
+                run_chunked_gwas_ibd(
+                    model_names=list(stream_models),
+                    ibd_path=str(genofile_stream),
+                    ibd_ids=np.asarray(preinspect_ids, dtype=str),
+                    pheno=pheno,
+                    ids=np.asarray(ids, dtype=str),
+                    n_bins=int(n_bins),
+                    outprefix=str(outprefix),
+                    grm=grm,
+                    qmatrix=np.asarray(qmatrix, dtype=np.float32),
+                    cov_all=(None if cov_all is None else np.asarray(cov_all, dtype=np.float32)),
+                    threads=max(1, int(args.thread)),
+                    logger=logger,
+                    summary_rows=gwas_summary_rows,
+                    saved_paths=saved_result_paths,
+                    use_spinner=bool(use_spinner),
+                    plot=bool(args.plot),
+                )
+                ibd_rows = gwas_summary_rows[ibd_summary_start:]
+                emitted_ibd_rows: set[int] = set()
+                for ibd_trait in list(getattr(pheno, "columns", [])):
+                    trait_indices = [
+                        idx
+                        for idx, row in enumerate(ibd_rows)
+                        if idx not in emitted_ibd_rows
+                        and str(row.get("phenotype", "")) == str(ibd_trait)
+                    ]
+                    if len(trait_indices) == 0:
+                        continue
+                    emitted_ibd_rows.update(trait_indices)
+                    _emit_gwas_trait_summary(logger, [ibd_rows[idx] for idx in trait_indices])
+                if len(emitted_ibd_rows) < len(ibd_rows):
+                    _emit_gwas_trait_summary(
+                        logger,
+                        [
+                            row
+                            for idx, row in enumerate(ibd_rows)
+                            if idx not in emitted_ibd_rows
                         ],
                     )
                 preloaded_packed = None

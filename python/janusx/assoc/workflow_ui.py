@@ -694,14 +694,17 @@ def _read_fastplot_tsv(out_tsv: str) -> pd.DataFrame:
     the chromosome column or perform a second p-value conversion.  A fallback
     keeps the historical tolerant handling for a non-numeric p-value token.
     """
-    usecols = ["chrom", "pos", "pwald"]
+    with open(out_tsv, "r", encoding="utf-8", errors="replace") as fh:
+        header_cols = fh.readline().rstrip("\r\n").split("\t")
+    p_col = "pwald" if "pwald" in header_cols else ("plrt" if "plrt" in header_cols else "pwald")
+    usecols = ["chrom", "pos", p_col]
     dtype_map: dict[str, object] = {
         "chrom": "category",
         "pos": "int64",
-        "pwald": "float64",
+        p_col: "float64",
     }
     try:
-        return pd.read_csv(
+        plot_df = pd.read_csv(
             out_tsv,
             sep="\t",
             usecols=usecols,
@@ -716,8 +719,10 @@ def _read_fastplot_tsv(out_tsv: str) -> pd.DataFrame:
             usecols=usecols,
             dtype={"chrom": "category", "pos": "int64"},
         )
-        plot_df["pwald"] = pd.to_numeric(plot_df["pwald"], errors="coerce")
-        return plot_df
+        plot_df[p_col] = pd.to_numeric(plot_df[p_col], errors="coerce")
+    if p_col != "pwald":
+        plot_df = plot_df.rename(columns={p_col: "pwald"})
+    return plot_df
 
 
 def _resolve_population_plot_column(columns, requested: str) -> str:

@@ -142,6 +142,7 @@ def determine_genotype_source(
     bfile: str | None,
     pfile: str | None = None,
     kfile: str | None = None,
+    ibd: str | None = None,
     prefix: str | None = None,
     snps_only: bool = False,
     delimiter: str | None = None,
@@ -150,7 +151,14 @@ def determine_genotype_source(
 ) -> tuple[str, str]:
     if bfile and pfile:
         raise ValueError("Specify only one PLINK source: bfile or pfile.")
-    if kfile:
+    if ibd:
+        gfile = str(ibd)
+        low_ibd = gfile.lower()
+        if low_ibd.endswith(".jhibd"):
+            auto_prefix = os.path.basename(gfile[: -len(".jhibd")])
+        else:
+            auto_prefix = os.path.basename(gfile.rstrip("/\\"))
+    elif kfile:
         gfile = str(kfile)
         low_kfile = gfile.lower()
         if low_kfile.endswith(".meta.json"):
@@ -174,14 +182,14 @@ def determine_genotype_source(
         auto_prefix = os.path.basename(_normalize_plink_prefix(gfile).rstrip("/\\"))
     else:
         raise ValueError(
-            "No genotype input specified. Use -vcf, -hmp, -file, -bfile, -pfile or -kfile."
+            "No genotype input specified. Use -vcf, -hmp, -file, -bfile, -pfile, -kfile or -ibd."
         )
 
     gfile_norm = gfile.replace("\\", "/")
-    # A k-file is already an on-disk, random-access genotype cache.  Passing it
+    # A k-file or .jhibd archive is already an on-disk binary source.  Passing it
     # through the legacy text/PLINK cache builder would either reject the
-    # source or, worse, make a large unintended copy of the bitmatrix.
-    if apply_cache and not kfile:
+    # source or, worse, make a large unintended copy.
+    if apply_cache and not kfile and not ibd:
         force_kind = determine_genotype_source_force_kind(
             vcf=vcf,
             hmp=hmp,
@@ -189,6 +197,7 @@ def determine_genotype_source(
             bfile=bfile,
             pfile=pfile,
             kfile=kfile,
+            ibd=ibd,
         )
         gfile_norm = prepare_cli_input_cache(
             gfile_norm,
@@ -211,7 +220,10 @@ def determine_genotype_source_force_kind(
     bfile: str | None,
     pfile: str | None = None,
     kfile: str | None = None,
+    ibd: str | None = None,
 ) -> str | None:
+    if ibd:
+        return "ibd"
     if kfile:
         return "kfile"
     if vcf:
@@ -235,6 +247,7 @@ def determine_genotype_source_force_kind_from_args(args: Any) -> str | None:
         bfile=getattr(args, "bfile", None),
         pfile=getattr(args, "pfile", None),
         kfile=getattr(args, "kfile", None),
+        ibd=getattr(args, "ibd", None),
     )
 
 
@@ -246,6 +259,7 @@ def determine_genotype_source_from_args(args: Any) -> tuple[str, str]:
         bfile=getattr(args, "bfile", None),
         pfile=getattr(args, "pfile", None),
         kfile=getattr(args, "kfile", None),
+        ibd=getattr(args, "ibd", None),
         prefix=getattr(args, "prefix", None),
         snps_only=bool(getattr(args, "snps_only", False)),
         delimiter=getattr(args, "delimiter", None),

@@ -650,6 +650,23 @@ def _inspect_reference_dimensions(
     return None, None
 
 
+_PREFLIGHT_TEXT_SCAN_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _read_pgen_header_dimensions(pgen_path: Path) -> tuple[int | None, int | None]:
+    """Read `(samples, markers)` from a PLINK 2 `.pgen` header in O(1) time."""
+    with pgen_path.open("rb") as fh:
+        header = fh.read(12)
+    if len(header) < 3 or header[0:2] != b"\x6c\x1b":
+        return None, None
+    mode = header[2]
+    if mode in (0x02, 0x10) and len(header) >= 11:
+        markers = int.from_bytes(header[3:7], "little") or None
+        samples = int.from_bytes(header[7:11], "little") or None
+        return samples, markers
+    return None, None
+
+
 def _inspect_target_dimensions(
     target_kind: str, target: Path
 ) -> tuple[int | None, int | None, int | None, int | None]:
@@ -659,13 +676,21 @@ def _inspect_target_dimensions(
             prefix = _strip_input_suffix(target, (".bed", ".bim", ".fam"))
             fam = Path(f"{prefix}.fam")
             bim = Path(f"{prefix}.bim")
+            bed = Path(f"{prefix}.bed")
             samples = None
             markers = None
             chrom_counts: dict[str, int] = {}
             if fam.is_file():
                 with fam.open("rb") as fh:
                     samples = sum(1 for line in fh if line.strip()) or None
-            if bim.is_file():
+            if samples is not None and bed.is_file():
+                bed_size = bed.stat().st_size
+                bytes_per_variant = (samples + 3) // 4
+                if bed_size >= 3 and bytes_per_variant > 0 and (bed_size - 3) % bytes_per_variant == 0:
+                    markers = ((bed_size - 3) // bytes_per_variant) or None
+            if bim.is_file() and (
+                markers is None or bim.stat().st_size <= _PREFLIGHT_TEXT_SCAN_MAX_BYTES
+            ):
                 with bim.open("rt", encoding="utf-8", errors="replace") as fh:
                     total = 0
                     for raw in fh:
@@ -681,15 +706,35 @@ def _inspect_target_dimensions(
             return samples, markers, chroms, max_chrom
         if target_kind == "pfile":
             prefix = _strip_input_suffix(target, (".pgen", ".pvar.zst", ".pvar", ".psam"))
+            pgen = Path(f"{prefix}.pgen")
             psam = Path(f"{prefix}.psam")
             pvar = Path(pvar_path_for_prefix(str(prefix)))
             samples = None
             markers = None
             chrom_counts = {}
-            if psam.is_file():
+            if pgen.is_file():
+                samples, markers = _read_pgen_header_dimensions(pgen)
+            if samples is None and psam.is_file():
                 with open_text_auto(str(psam)) as fh:
                     samples = sum(1 for line in fh if line.strip() and not line.startswith("#")) or None
-            if pvar.is_file():
+            if markers is None and samples is not None and pgen.is_file():
+                # Mode 0x01 BED-compatible PGEN: derive marker count directly from payload size.
+                with pgen.open("rb") as fh:
+                    magic = fh.read(3)
+                if magic == b"\x6c\x1b\x01":
+                    pgen_size = pgen.stat().st_size
+                    bytes_per_variant = (samples + 3) // 4
+                    if pgen_size >= 3 and bytes_per_variant > 0 and (pgen_size - 3) % bytes_per_variant == 0:
+                        markers = ((pgen_size - 3) // bytes_per_variant) or None
+            # Only scan `.pvar` text in Python when small (<= 4 MiB) or when the binary
+            # header did not yield a marker count; avoids multi-second single-core pre-scans
+            # on multi-million-SNP panels.
+            pvar_is_small_plain = (
+                pvar.is_file()
+                and not str(pvar).lower().endswith(".zst")
+                and pvar.stat().st_size <= _PREFLIGHT_TEXT_SCAN_MAX_BYTES
+            )
+            if pvar.is_file() and (markers is None or pvar_is_small_plain):
                 with open_text_auto(str(pvar)) as fh:
                     total = 0
                     for raw in fh:

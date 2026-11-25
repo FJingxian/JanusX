@@ -190,6 +190,190 @@ impl HaplotypeMajorBits {
         mis += ((all_a[w_end] ^ all_b[w_end]) & ve).count_ones();
         (comp, mis)
     }
+
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn count_mismatches_weighted(
+        &self,
+        hap_a: usize,
+        hap_b: usize,
+        start_marker: usize,
+        end_marker: usize,
+        weights: &RefAlleleWeightPlanes,
+        match_reward: f32,
+        flat_mismatch_delta: f32,
+        freq_mismatch_delta: f32,
+    ) -> (u32, f32, f32) {
+        if start_marker >= end_marker || self.words_per_hap == 0 {
+            return (0, 0.0, 0.0);
+        }
+        let base_a = hap_a * self.words_per_hap;
+        let base_b = hap_b * self.words_per_hap;
+        let w_start = start_marker >> 6;
+        let w_end = (end_marker - 1) >> 6;
+        let start_mask = !0u64 << (start_marker & 63);
+        let end_rem = end_marker & 63;
+        let end_mask = if end_rem == 0 {
+            !0u64
+        } else {
+            (1u64 << end_rem) - 1
+        };
+
+        let all_a = &self.allele_words[base_a..base_a + self.words_per_hap];
+        let all_b = &self.allele_words[base_b..base_b + self.words_per_hap];
+        let miss_a = &self.missing_words[base_a..base_a + self.words_per_hap];
+        let miss_b = &self.missing_words[base_b..base_b + self.words_per_hap];
+
+        let mut comp_freq = 0u32;
+        let mut mis_freq = 0u32;
+        let mut comp_flat = 0u32;
+        let mut mis_flat = 0u32;
+        let mut qsum = 0u64;
+        let mut accum_word = |w: usize, mask: u64| {
+            let valid = !(miss_a[w] | miss_b[w]) & mask;
+            if valid == 0 {
+                return;
+            }
+            let diff = all_a[w] ^ all_b[w];
+            let active = weights.freq_active_plane[w];
+            let valid_freq = valid & active;
+            if valid_freq != 0 {
+                comp_freq += valid_freq.count_ones();
+                mis_freq += (diff & valid_freq).count_ones();
+                let v1 = valid_freq & all_a[w];
+                let v0 = valid_freq & !all_a[w];
+                for b in 0..6 {
+                    let bits = (v0 & weights.w0_planes[b][w]) | (v1 & weights.w1_planes[b][w]);
+                    qsum += (bits.count_ones() as u64) << b;
+                }
+            }
+            let valid_flat = valid & !active;
+            if valid_flat != 0 {
+                comp_flat += valid_flat.count_ones();
+                mis_flat += (diff & valid_flat).count_ones();
+            }
+        };
+
+        if w_start == w_end {
+            accum_word(w_start, start_mask & end_mask);
+        } else {
+            accum_word(w_start, start_mask);
+            for w in (w_start + 1)..w_end {
+                accum_word(w, !0u64);
+            }
+            accum_word(w_end, end_mask);
+        }
+        let comp_total = comp_freq + comp_flat;
+        let info_freq = qsum as f32 * (1.0 / 16.0);
+        let info_flat = comp_flat as f32 * match_reward;
+        let info_total = info_freq + info_flat;
+        let raw_freq = info_freq - mis_freq as f32 * freq_mismatch_delta;
+        let raw_flat = info_flat - mis_flat as f32 * flat_mismatch_delta;
+        (comp_total, info_total, raw_freq + raw_flat)
+    }
+}
+
+const FREQ_MODEL_MIN_REF_HAPS: usize = 6;
+const FREQ_ERR_RATE: f64 = 0.0025;
+
+/// 6-bit fixed-point (`1/16` resolution, `[0.0, 3.9375]`) bitplanes of
+/// `ln((1 - err) / af(allele))` precomputed from the reference panel so
+/// frequency-aware Bayes LLR emissions run at 64 markers per hardware POPCNT.
+/// Sites with fewer than `FREQ_MODEL_MIN_REF_HAPS` observed reference
+/// haplotypes have their `freq_active_plane` bit cleared and fall back to the
+/// exact legacy flat `+0.7 / -4.5` scoring model.
+struct RefAlleleWeightPlanes {
+    freq_active_plane: Vec<u64>,
+    w0_planes: [Vec<u64>; 6],
+    w1_planes: [Vec<u64>; 6],
+}
+
+impl RefAlleleWeightPlanes {
+    fn from_reference_panel(matrix: &BitHaplotypeMatrix, n_ref_haps: usize) -> Option<Self> {
+        if n_ref_haps < FREQ_MODEL_MIN_REF_HAPS || matrix.n_markers == 0 || matrix.words_per_marker == 0 {
+            return None;
+        }
+        let n_markers = matrix.n_markers;
+        let words_per_hap = n_markers.div_ceil(64);
+        let stride = matrix.words_per_marker;
+        let ref_full_words = n_ref_haps / 64;
+        let ref_rem = n_ref_haps & 63;
+        let ref_tail_mask = if ref_rem == 0 {
+            0u64
+        } else {
+            (1u64 << ref_rem) - 1
+        };
+
+        let per_word: Vec<(u64, [u64; 6], [u64; 6])> = (0..words_per_hap)
+            .into_par_iter()
+            .map(|w_idx| {
+                let m_start = w_idx * 64;
+                let m_len = (n_markers - m_start).min(64);
+                let mut freq_active = 0u64;
+                let mut w0 = [0u64; 6];
+                let mut w1 = [0u64; 6];
+                for bit in 0..m_len {
+                    let m = m_start + bit;
+                    let row_off = m * stride;
+                    let mut obs_ref = 0u32;
+                    let mut c1 = 0u32;
+                    for rw in 0..ref_full_words {
+                        let valid = !matrix.missing_bits[row_off + rw];
+                        obs_ref += valid.count_ones();
+                        c1 += (matrix.allele_bits[row_off + rw] & valid).count_ones();
+                    }
+                    if ref_rem != 0 {
+                        let valid = !matrix.missing_bits[row_off + ref_full_words] & ref_tail_mask;
+                        obs_ref += valid.count_ones();
+                        c1 += (matrix.allele_bits[row_off + ref_full_words] & valid).count_ones();
+                    }
+                    if (obs_ref as usize) < FREQ_MODEL_MIN_REF_HAPS {
+                        continue;
+                    }
+                    let bit_mask = 1u64 << bit;
+                    freq_active |= bit_mask;
+                    let p1 = ((c1 as f64 + 0.5) / (obs_ref as f64 + 1.0)).clamp(0.02, 0.98);
+                    let af0 = 1.0 - p1;
+                    let af1 = p1;
+                    let q0 = ((((1.0 - FREQ_ERR_RATE) / af0)
+                        .ln()
+                        .clamp(0.0, 63.0 / 16.0))
+                        * 16.0)
+                        .round() as u32;
+                    let q1 = ((((1.0 - FREQ_ERR_RATE) / af1)
+                        .ln()
+                        .clamp(0.0, 63.0 / 16.0))
+                        * 16.0)
+                        .round() as u32;
+                    for b in 0..6 {
+                        if (q0 >> b) & 1 != 0 {
+                            w0[b] |= bit_mask;
+                        }
+                        if (q1 >> b) & 1 != 0 {
+                            w1[b] |= bit_mask;
+                        }
+                    }
+                }
+                (freq_active, w0, w1)
+            })
+            .collect();
+
+        let mut freq_active_plane = vec![0u64; words_per_hap];
+        let mut w0_planes = std::array::from_fn(|_| vec![0u64; words_per_hap]);
+        let mut w1_planes = std::array::from_fn(|_| vec![0u64; words_per_hap]);
+        for (w_idx, (active, w0, w1)) in per_word.into_iter().enumerate() {
+            freq_active_plane[w_idx] = active;
+            for b in 0..6 {
+                w0_planes[b][w_idx] = w0[b];
+                w1_planes[b][w_idx] = w1[b];
+            }
+        }
+        Some(Self {
+            freq_active_plane,
+            w0_planes,
+            w1_planes,
+        })
+    }
 }
 
 pub fn paint_chromosome_ancestry(
@@ -340,14 +524,19 @@ pub fn paint_chromosome_ancestry_cancellable(
     // so emission mismatch counts run at 64 markers per hardware POPCNT instruction
     // with sequential L1 cache access.
     let hap_major = HaplotypeMajorBits::from_matrix(joint_matrix, cancelled)?;
-    // Log-likelihood ratio scores relative to uncalled random background (p=0.5, err≈0.005):
-    //   match ≈ ln(0.995 / 0.5) ≈ 0.7, mismatch ≈ -ln(0.005 / 0.5) ≈ -4.5.
-    // Unscaled by default (`ancestry_step_max_markers == 0`) so true short segments remain
-    // recoverable. When explicitly enabled (`ancestry_step_max_markers > 0`), all candidates
-    // in a step share a single step-level scale factor `cap / max_c(comp[c])` so candidate
-    // ranking is preserved and low-coverage references cannot outrank full-coverage parents.
+    let ref_weights = RefAlleleWeightPlanes::from_reference_panel(joint_matrix, n_ref_haps);
+    // Log-likelihood ratio scores relative to `Uncalled` background:
+    //   - For multi-parent panels (`n_ref_haps >= 6`), use empirical reference allele
+    //     frequencies `af(t)` with `err = 0.0025`: `match = ln((1 - err) / af(t))`,
+    //     `mismatch = ln(err / af(t)) = match - ln((1 - err) / err)`. This suppresses
+    //     false-positive IBS on common alleles for out-of-panel founders while preserving
+    //     full rare-allele signal.
+    //   - For tiny synthetic panels (`n_ref_haps < 6`), fall back to uniform `p = 0.5`
+    //     (`match = +0.7`, `mismatch = -4.5`).
     let mismatch_penalty: f32 = 4.5;
     let match_reward: f32 = 0.7;
+    let flat_mismatch_delta: f32 = match_reward + mismatch_penalty;
+    let freq_mismatch_delta: f32 = ((1.0 - FREQ_ERR_RATE) / FREQ_ERR_RATE).ln() as f32;
     let switch_penalty = config.ancestry_switch_penalty.max(0.5);
     let step_eff_markers_cap = config.ancestry_step_max_markers as f32;
 
@@ -380,50 +569,73 @@ pub fn paint_chromosome_ancestry_cancellable(
             // never wrap `uncalled_state` to 0.
             let mut backptr = vec![uncalled_state as u32; n_steps * n_states];
             let mut step_scores = vec![0.0f32; n_steps * k];
+            let mut step_infos = vec![0.0f32; n_steps * k];
             let mut step_comparable = vec![0u32; n_steps * k];
             let mut step_max_comps = vec![0u32; n_steps];
-            let mut step_scales = vec![1.0f32; n_steps];
+            let mut step_max_infos = vec![0.0f32; n_steps];
             let mut cand_total_comp = vec![0u64; k];
 
-            // Precompute per-step raw LLR emissions (`step_scores`) and comparable
-            // counts (`step_comparable`). Raw `step_scores` are kept unmodified for
-            // worklist gap resolution and segment confidence/ambiguity reporting.
+            // Precompute per-step raw LLR emissions (`step_scores`), match-information
+            // potentials (`step_infos`), and comparable counts (`step_comparable`).
+            // Raw `step_scores` are kept unmodified for worklist gap resolution and
+            // segment confidence/ambiguity reporting.
             for (step_idx, &(m_start, m_end)) in step_ranges.iter().enumerate() {
                 if (step_idx & 255) == 0 && is_cancelled(cancelled) {
                     return Err("Interrupted".to_string());
                 }
                 let row_off = step_idx * k;
                 let mut step_max_comp = 0u32;
+                let mut step_max_info = 0.0f32;
                 for (c_idx, &ref_col) in candidates.iter().enumerate() {
-                    let (comp, mis) =
-                        hap_major.count_mismatches(tgt_col, ref_col, m_start, m_end);
+                    let (comp, info_sum, raw_score) = if let Some(ref weights) = ref_weights {
+                        hap_major.count_mismatches_weighted(
+                            tgt_col,
+                            ref_col,
+                            m_start,
+                            m_end,
+                            weights,
+                            match_reward,
+                            flat_mismatch_delta,
+                            freq_mismatch_delta,
+                        )
+                    } else {
+                        let (c, m) = hap_major.count_mismatches(tgt_col, ref_col, m_start, m_end);
+                        let info = c as f32 * match_reward;
+                        (c, info, info - m as f32 * flat_mismatch_delta)
+                    };
                     step_comparable[row_off + c_idx] = comp;
+                    step_infos[row_off + c_idx] = info_sum;
+                    step_scores[row_off + c_idx] = raw_score;
                     cand_total_comp[c_idx] = cand_total_comp[c_idx].saturating_add(comp as u64);
                     if comp > step_max_comp {
                         step_max_comp = comp;
                     }
-                    let matched = comp.saturating_sub(mis);
-                    step_scores[row_off + c_idx] =
-                        matched as f32 * match_reward - mis as f32 * mismatch_penalty;
+                    if info_sum > step_max_info {
+                        step_max_info = info_sum;
+                    }
                 }
                 step_max_comps[step_idx] = step_max_comp;
+                step_max_infos[step_idx] = step_max_info;
                 if step_eff_markers_cap > 0.0 && (step_max_comp as f32) > step_eff_markers_cap {
                     let step_scale = step_eff_markers_cap / step_max_comp as f32;
-                    step_scales[step_idx] = step_scale;
+                    step_max_infos[step_idx] *= step_scale;
                     for score in &mut step_scores[row_off..row_off + k] {
                         *score *= step_scale;
+                    }
+                    for info in &mut step_infos[row_off..row_off + k] {
+                        *info *= step_scale;
                     }
                 }
             }
 
             // Local step-level missingness compensation for Viterbi DP only:
-            // At a target-observed marker (`step_max_comp > 0`), an observed match
-            // scores `match_reward = +0.70`, a mismatch scores `-4.50`, and a
-            // missing allele in a non-empty founder scores `FOUNDER_MISSING_CREDIT = +0.55`
-            // (strictly < `match_reward`, so missingness NEVER beats a local match,
-            // and founders missing elsewhere get ZERO bonus where locally observed).
+            // Scales by `FOUNDER_MISSING_CREDIT_RATIO` (< 1.0) times the step's
+            // frequency-weighted missing information `max_info - cand_info`, so
+            // missingness NEVER beats a local match, low-information major-allele
+            // sites receive proportionally tiny credit, and founders missing
+            // elsewhere get ZERO bonus where locally observed.
             // All-missing founders (`cand_total_comp[c] == 0`) always emit `0.0`.
-            const FOUNDER_MISSING_CREDIT: f32 = 0.55;
+            const FOUNDER_MISSING_CREDIT_RATIO: f32 = 0.75;
 
             for step_idx in 0..n_steps {
                 if (step_idx & 255) == 0 && is_cancelled(cancelled) {
@@ -432,17 +644,17 @@ pub fn paint_chromosome_ancestry_cancellable(
                 let row_off = step_idx * k;
                 let bp_off = step_idx * n_states;
                 let step_max_comp = step_max_comps[step_idx];
-                let step_scale = step_scales[step_idx];
+                let step_max_info = step_max_infos[step_idx];
                 let dp_emit_for = |c_idx: usize| -> f32 {
                     let raw = step_scores[row_off + c_idx];
                     if step_max_comp == 0 || cand_total_comp[c_idx] == 0 {
                         return raw;
                     }
-                    let missing_in_step = step_max_comp.saturating_sub(step_comparable[row_off + c_idx]);
-                    if missing_in_step == 0 {
+                    let missing_info = (step_max_info - step_infos[row_off + c_idx]).max(0.0);
+                    if missing_info == 0.0 {
                         raw
                     } else {
-                        raw + missing_in_step as f32 * FOUNDER_MISSING_CREDIT * step_scale
+                        raw + FOUNDER_MISSING_CREDIT_RATIO * missing_info
                     }
                 };
 
@@ -712,15 +924,21 @@ pub fn paint_chromosome_ancestry_cancellable(
                     }
                     let mut run_comp: u32 = 0;
                     let mut run_max_comp: u32 = 0;
+                    let mut run_info = 0.0f64;
+                    let mut run_max_info = 0.0f64;
                     let mut run_raw_score = 0.0f64;
                     for s_idx in run_start..run_end {
                         let chosen = called_path[s_idx].unwrap_or(c_idx);
                         let off = s_idx * k + chosen;
                         run_comp = run_comp.saturating_add(step_comparable[off]);
                         run_max_comp = run_max_comp.saturating_add(step_max_comps[s_idx]);
+                        run_info += step_infos[off] as f64;
+                        run_max_info += step_max_infos[s_idx] as f64;
                         run_raw_score += step_scores[off] as f64;
                     }
-                    if run_comp < ALT_EVIDENCE_MIN_MARKERS && run_comp < run_max_comp {
+                    if run_comp < ALT_EVIDENCE_MIN_MARKERS
+                        && (run_comp < run_max_comp || run_info + 1e-4 < run_max_info)
+                    {
                         let left_c = if run_start > 0 {
                             called_path[run_start - 1]
                         } else {
@@ -839,6 +1057,11 @@ pub fn paint_chromosome_ancestry_cancellable(
                     let delta = (score - best_seg_score).max(-40.0);
                     exp_sum += delta.exp();
                 }
+                // Include the `Uncalled` background hypothesis (score = 0.0) in the
+                // posterior denominator so poorly-fitting out-of-panel segments with low
+                // or negative raw LLR cannot report inflated `confidence = 1.0`.
+                let uncalled_delta = (0.0 - best_seg_score).clamp(-40.0, 40.0);
+                exp_sum += uncalled_delta.exp();
                 let confidence = if exp_sum > 0.0 {
                     (1.0 / exp_sum).clamp(0.0, 1.0) as f32
                 } else {
@@ -2132,5 +2355,231 @@ mod tests {
         assert_eq!(segs[1].parent_sample, 0);
         assert_eq!(segs[1].start_bp, pos[205]);
         assert_eq!(bins.bin_starts_bp.len(), 2);
+    }
+
+    #[test]
+    fn out_of_panel_hidden_founder_is_rejected_to_uncalled_under_frequency_model() {
+        // 12-founder reference panel (>= FREQ_MODEL_MIN_REF_HAPS) with skewed
+        // allele frequencies (2/12 carry minor allele 1, 10/12 carry major allele 0).
+        // Target is an out-of-panel hidden founder sharing exact 542/600 = 90.33% IBS
+        // with P0 (all 0s; 58 mismatches on target minor-allele sites). Under the old
+        // flat +0.7/-4.5 model, P0 scored +118.4 and forced a full-chromosome mis-call;
+        // under the frequency-aware model, P0 scores ~-151.5 and is rejected to Uncalled.
+        let n_parents = 12usize;
+        let n_markers = 600usize;
+        let ref_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true; n_parents]);
+        let tgt_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true]);
+        let mut joint =
+            BitHaplotypeMatrix::new(ref_layout.total_haps + tgt_layout.total_haps, n_markers);
+        let pos: Vec<u64> = (0..n_markers).map(|m| (m as u64 + 1) * 10_000).collect();
+        let cm: Vec<f64> = (0..n_markers).map(|m| m as f64 * 0.05).collect();
+
+        for m in 0..n_markers {
+            // P0 carries major allele 0 everywhere; 2 distinct founders in 1..12
+            // carry minor allele 1 at every site (af1 ≈ 17%, af0 ≈ 83%).
+            let minor_a = 1 + (m % (n_parents - 1));
+            let minor_b = 1 + ((m + 5) % (n_parents - 1));
+            joint.set_allele(m, 0, Some(0));
+            for p in 1..n_parents {
+                let allele = if p == minor_a || p == minor_b { 1u8 } else { 0u8 };
+                joint.set_allele(m, p, Some(allele));
+            }
+            // Hidden founder carries minor allele 1 at 58 sites (542/600 = 90.33% IBS with P0).
+            let tgt = if m % 10 == 0 && m < 580 { 1u8 } else { 0u8 };
+            joint.set_allele(m, n_parents, Some(tgt));
+        }
+
+        let cfg = HaploidIbdConfig::default();
+        let (segs, bins) =
+            paint_chromosome_ancestry(&joint, &ref_layout, &tgt_layout, 0, &pos, &cm, &cfg);
+        assert!(
+            segs.is_empty(),
+            "out-of-panel founder with 90.33% IBS on skewed-MAF sites must be rejected to Uncalled, got {segs:?}"
+        );
+        assert!(bins.dosage.is_empty());
+    }
+
+    #[test]
+    fn adding_all_missing_sixth_founder_preserves_five_founder_ancestry() {
+        // 5 observed founders where P0 matches target with 12% mismatch (24/200):
+        // under the legacy flat +0.7/-4.5 model, P0 scores +15.2 and is called.
+        // Adding a 6th all-missing founder raises n_ref_haps to 6 (>= FREQ_MODEL_MIN_REF_HAPS),
+        // but every site still has obs_ref = 5 < 6 and must fall back to the exact
+        // legacy +0.7/-4.5 model, producing identical segments instead of Uncalled.
+        let n_markers = 200usize;
+        let pos: Vec<u64> = (0..n_markers).map(|m| (m as u64 + 1) * 10_000).collect();
+        let cm: Vec<f64> = (0..n_markers).map(|m| m as f64 * 0.05).collect();
+        let cfg = HaploidIbdConfig::default();
+
+        let run_panel = |add_all_missing_sixth: bool| {
+            let n_parents = if add_all_missing_sixth { 6 } else { 5 };
+            let ref_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true; n_parents]);
+            let tgt_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true]);
+            let mut joint =
+                BitHaplotypeMatrix::new(ref_layout.total_haps + tgt_layout.total_haps, n_markers);
+            for m in 0..n_markers {
+                let p0 = (m % 2) as u8;
+                joint.set_allele(m, 0, Some(p0));
+                for p in 1..5usize {
+                    joint.set_allele(m, p, Some(1 - p0));
+                }
+                if add_all_missing_sixth {
+                    joint.set_allele(m, 5, None);
+                }
+                let is_err = m % 25 == 0 || m % 25 == 8 || m % 25 == 16; // 12% mismatch
+                joint.set_allele(m, n_parents, Some(if is_err { 1 - p0 } else { p0 }));
+            }
+            paint_chromosome_ancestry(&joint, &ref_layout, &tgt_layout, 0, &pos, &cm, &cfg).0
+        };
+
+        let segs_5 = run_panel(false);
+        let segs_6 = run_panel(true);
+        assert_eq!(segs_5.len(), 1, "5-founder panel must call P0, got {segs_5:?}");
+        assert_eq!(segs_5[0].parent_sample, 0);
+        assert_eq!(
+            segs_6.len(),
+            segs_5.len(),
+            "adding an all-missing 6th founder must not alter ancestry output: 5={segs_5:?}, 6={segs_6:?}"
+        );
+        assert_eq!(segs_6[0].parent_sample, segs_5[0].parent_sample);
+        assert_eq!(segs_6[0].start_bp, segs_5[0].start_bp);
+        assert_eq!(segs_6[0].end_bp, segs_5[0].end_bp);
+        assert_eq!(segs_6[0].n_markers, segs_5[0].n_markers);
+        assert!((segs_6[0].confidence - segs_5[0].confidence).abs() < 1e-6);
+    }
+
+    #[test]
+    fn equal_comparable_counts_with_different_site_information_receives_credit() {
+        // 16-founder panel, 50 steps of 8 markers each (400 markers total).
+        // Every founder observes exactly 4 markers per step (`step_max_comp == 4`):
+        //   - P0 observes the 4 common-allele sites (off 4..8) with 0 mismatches.
+        //   - P1 observes the 4 rare-allele sites (off 0..4) with 1 mismatch (25% error).
+        //   - P2..P8 observe off 0..4 (all mismatching target); P9..P15 observe off 4..8
+        //     (each with 1 mismatch per step), keeping `obs_ref = 8 >= 6` at every site.
+        // Even though `comp(P0) == comp(P1) == step_max_comp == 4`, P0 has lower
+        // observed site information (`cand_info < step_max_info`) and must receive
+        // `0.75 * (step_max_info - cand_info)` credit so 0%-error P0 beats 25%-error P1.
+        let n_parents = 16usize;
+        let n_steps = 50usize;
+        let n_markers = n_steps * 8;
+        let ref_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true; n_parents]);
+        let tgt_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true]);
+        let mut joint =
+            BitHaplotypeMatrix::new(ref_layout.total_haps + tgt_layout.total_haps, n_markers);
+        let pos: Vec<u64> = (0..n_markers).map(|m| (m as u64 + 1) * 10_000).collect();
+        // Each 8-marker block shares one genetic coordinate; blocks are spaced 0.06 cM (> 0.05).
+        let cm: Vec<f64> = (0..n_markers).map(|m| (m / 8) as f64 * 0.06).collect();
+
+        for m in 0..n_markers {
+            let off = m % 8;
+            if off < 4 {
+                // Rare-allele half of step: target = 1, P0 missing, P1 has 1 mismatch at off=0,
+                // P2..P8 carry 0 (so obs_ref = 8, minor allele 1 is rare).
+                joint.set_allele(m, 0, None);
+                joint.set_allele(m, 1, Some(if off == 0 { 0 } else { 1 }));
+                for p in 2..9usize {
+                    joint.set_allele(m, p, Some(0));
+                }
+                for p in 9..n_parents {
+                    joint.set_allele(m, p, None);
+                }
+                joint.set_allele(m, n_parents, Some(1));
+            } else {
+                // Common-allele half of step: target = 0, P0 matches all 4, P1..P8 missing,
+                // P9..P15 carry mostly 0 with 1 mismatch each (obs_ref = 8, major allele 0 common).
+                joint.set_allele(m, 0, Some(0));
+                for p in 1..9usize {
+                    joint.set_allele(m, p, None);
+                }
+                for p in 9..n_parents {
+                    let mis = off == 4 + ((p - 9) % 4);
+                    joint.set_allele(m, p, Some(if mis { 1 } else { 0 }));
+                }
+                joint.set_allele(m, n_parents, Some(0));
+            }
+        }
+
+        let cfg = HaploidIbdConfig::default();
+        let (segs, bins) =
+            paint_chromosome_ancestry(&joint, &ref_layout, &tgt_layout, 0, &pos, &cm, &cfg);
+        assert_eq!(
+            segs.len(),
+            1,
+            "0%-error P0 observing common sites must beat 25%-error P1 observing rare sites despite equal comp==4, got {segs:?}"
+        );
+        assert_eq!(segs[0].parent_sample, 0);
+        assert_eq!(segs[0].n_markers, (n_steps * 4) as u32);
+        assert_eq!(bins.bin_starts_bp.len(), 1);
+    }
+
+    #[test]
+    fn multi_parent_asymmetric_missingness_still_recovers_high_missing_true_founder() {
+        // 12-founder panel (>= FREQ_MODEL_MIN_REF_HAPS): P0 is the true founder
+        // with 50% missingness (0% mismatch), while P1..P11 have 0% missingness
+        // and share 95% IBS with P0. Frequency-scaled missingness credit must
+        // recover P0 across the entire chromosome.
+        let n_parents = 12usize;
+        let n_markers = 400usize;
+        let ref_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true; n_parents]);
+        let tgt_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true]);
+        let mut joint =
+            BitHaplotypeMatrix::new(ref_layout.total_haps + tgt_layout.total_haps, n_markers);
+        let pos: Vec<u64> = (0..n_markers).map(|m| (m as u64 + 1) * 10_000).collect();
+        let cm: Vec<f64> = (0..n_markers).map(|m| m as f64 * 0.05).collect();
+
+        for m in 0..n_markers {
+            let true_a = if m % 4 == 0 { 1u8 } else { 0u8 };
+            joint.set_allele(m, 0, if m % 2 == 0 { Some(true_a) } else { None });
+            for p in 1..n_parents {
+                let mis = (m + p * 7) % 20 == 0;
+                joint.set_allele(m, p, Some(if mis { 1 - true_a } else { true_a }));
+            }
+            joint.set_allele(m, n_parents, Some(true_a));
+        }
+
+        let cfg = HaploidIbdConfig::default();
+        let (segs, bins) =
+            paint_chromosome_ancestry(&joint, &ref_layout, &tgt_layout, 0, &pos, &cm, &cfg);
+        assert_eq!(
+            segs.len(),
+            1,
+            "50%-missing true founder P0 must be recovered in 12-founder frequency model, got {segs:?}"
+        );
+        assert_eq!(segs[0].parent_sample, 0);
+        assert_eq!(segs[0].start_bp, pos[0]);
+        assert_eq!(segs[0].end_bp, pos[n_markers - 1]);
+        assert_eq!(bins.bin_starts_bp.len(), 1);
+    }
+
+    #[test]
+    fn low_llr_segment_confidence_reflects_uncalled_competition() {
+        // Single 3-marker segment where P0 matches all 3 markers (raw LLR ≈ 2.1)
+        // and P1 mismatches all 3 (raw LLR ≈ -13.5). Including Uncalled (0.0) in
+        // the softmax denominator must keep confidence < 0.95 rather than 1.0000.
+        let n_markers = 3usize;
+        let ref_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true, true]);
+        let tgt_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true]);
+        let mut joint =
+            BitHaplotypeMatrix::new(ref_layout.total_haps + tgt_layout.total_haps, n_markers);
+        let pos: Vec<u64> = (0..n_markers).map(|m| (m as u64 + 1) * 10_000).collect();
+        let cm: Vec<f64> = (0..n_markers).map(|m| m as f64 * 0.06).collect();
+
+        for m in 0..n_markers {
+            let a = (m % 2) as u8;
+            joint.set_allele(m, 0, Some(a));
+            joint.set_allele(m, 1, Some(1 - a));
+            joint.set_allele(m, 2, Some(a));
+        }
+
+        let cfg = HaploidIbdConfig::default();
+        let (segs, _) =
+            paint_chromosome_ancestry(&joint, &ref_layout, &tgt_layout, 0, &pos, &cm, &cfg);
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].parent_sample, 0);
+        assert!(
+            segs[0].confidence < 0.95,
+            "3-marker segment with raw LLR ~2.1 must reflect Uncalled competition (confidence={})",
+            segs[0].confidence
+        );
     }
 }

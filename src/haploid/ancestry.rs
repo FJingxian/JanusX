@@ -657,8 +657,7 @@ pub fn paint_chromosome_ancestry_cancellable(
 
     // Step 1: Partition the chromosome into genetic steps (~0.05 cM) so even
     // 10M-SNP chromosomes decode in ~2,000-4,000 lightweight Viterbi steps.
-    let step_ranges =
-        build_genetic_step_ranges(cm_positions, positions_bp, config.ancestry_step_cm);
+    let step_ranges = build_genetic_step_ranges(cm_positions, config.ancestry_step_cm);
     let n_steps = step_ranges.len();
 
     // Step 2: If reference panel is larger than `ancestry_top_donors`, run a
@@ -1677,8 +1676,8 @@ pub fn paint_chromosome_ancestry_cancellable(
                         && seg.seg_comp >= 50
                         && seg_mis_rate <= 0.025
                     {
-                        const CLUSTER_MAX_GAP_BP: u64 = 500_000;
-                        const CLUSTER_MAX_GAP_CM: f64 = 0.8;
+                        const CLUSTER_MAX_GAP_BP: u64 = 400_000;
+                        const CLUSTER_MAX_GAP_CM: f64 = 0.6;
                         const CLUSTER_MAX_SPAN_BP: u64 = 750_000;
                         const CLUSTER_MAX_SPAN_CM: f64 = 1.2;
                         let mis_markers = hap_major.collect_mismatch_markers(
@@ -1694,8 +1693,7 @@ pub fn paint_chromosome_ancestry_cancellable(
                             while c_end < mis_markers.len() {
                                 let prev_m = mis_markers[c_end - 1];
                                 let next_m = mis_markers[c_end];
-                                let gap_bp =
-                                    positions_bp[next_m].saturating_sub(positions_bp[prev_m]);
+                                let gap_bp = positions_bp[next_m].saturating_sub(positions_bp[prev_m]);
                                 let gap_cm = (cm_positions[next_m] - cm_positions[prev_m]).max(0.0);
                                 if gap_bp <= CLUSTER_MAX_GAP_BP && gap_cm <= CLUSTER_MAX_GAP_CM {
                                     c_end += 1;
@@ -1717,13 +1715,9 @@ pub fn paint_chromosome_ancestry_cancellable(
                                     if m_lo < last_splice_end {
                                         continue;
                                     }
-                                    let span_bp =
-                                        positions_bp[m_hi].saturating_sub(positions_bp[m_lo]);
-                                    let span_cm =
-                                        (cm_positions[m_hi] - cm_positions[m_lo]).max(0.0);
-                                    if span_bp > CLUSTER_MAX_SPAN_BP
-                                        || span_cm > CLUSTER_MAX_SPAN_CM
-                                    {
+                                    let span_bp = positions_bp[m_hi].saturating_sub(positions_bp[m_lo]);
+                                    let span_cm = (cm_positions[m_hi] - cm_positions[m_lo]).max(0.0);
+                                    if span_bp > CLUSTER_MAX_SPAN_BP || span_cm > CLUSTER_MAX_SPAN_CM {
                                         continue;
                                     }
                                     let (_, _, bg_raw) = hap_major.count_mismatches_weighted(
@@ -1736,8 +1730,8 @@ pub fn paint_chromosome_ancestry_cancellable(
                                         flat_mismatch_delta,
                                         freq_mismatch_delta,
                                     );
-                                    let mut best_alt: Option<(usize, usize, usize, u32, f32, f32)> =
-                                        None;
+                                    let mut best_alt: Option<(usize, u32, f32)> = None;
+                                    let mut zero_mis_parents: Vec<u32> = Vec::new();
                                     for (alt_ci, &alt_ref_col) in candidates.iter().enumerate() {
                                         if alt_ci == seg.c_idx {
                                             continue;
@@ -1751,12 +1745,17 @@ pub fn paint_chromosome_ancestry_cancellable(
                                         if alt_mis != 0 || alt_comp == 0 {
                                             continue;
                                         }
+                                        let (alt_parent, _) = ref_layout.hap_to_sample[alt_ref_col];
+                                        zero_mis_parents.push(alt_parent);
                                         let obs_diag = cluster[lo_i..=hi_i]
                                             .iter()
                                             .filter(|&&dm| hap_major.is_observed(alt_ref_col, dm))
-                                            .count()
-                                            as u32;
+                                            .count() as u32;
                                         if obs_diag < 3 {
+                                            continue;
+                                        }
+                                        let min_comp = if obs_diag == 3 { 5 } else { 4 };
+                                        if alt_comp < min_comp {
                                             continue;
                                         }
                                         let (_, _, alt_raw) = hap_major.count_mismatches_weighted(
@@ -1769,167 +1768,119 @@ pub fn paint_chromosome_ancestry_cancellable(
                                             flat_mismatch_delta,
                                             freq_mismatch_delta,
                                         );
+                                        let min_alt_raw = if obs_diag == 3 { 3.5f32 } else { 3.0f32 };
                                         let ll_gain = alt_raw - bg_raw;
-                                        if ll_gain < 16.0 {
-                                            continue;
-                                        }
-                                        // Evaluate candidate on its physical-midpoint compatible
-                                        // splice window so compact diagnostic clusters inside a
-                                        // longer compatible block are scored and ranked by full
-                                        // zero-mismatch support.
-                                        let prev_alt_mis = hap_major.find_nearest_mismatch_left(
-                                            tgt_col,
-                                            alt_ref_col,
-                                            last_splice_end,
-                                            m_lo,
-                                        );
-                                        let next_alt_mis = hap_major.find_nearest_mismatch_right(
-                                            tgt_col,
-                                            alt_ref_col,
-                                            m_hi,
-                                            m_end,
-                                        );
-                                        let sp_start = prev_alt_mis
-                                            .map(|p| {
-                                                let bp_l = positions_bp[p];
-                                                let bp_r = positions_bp[m_lo];
-                                                let mid_bp = bp_l + (bp_r.saturating_sub(bp_l)) / 2;
-                                                let lo = p + 1;
-                                                lo + positions_bp[lo..=m_lo]
-                                                    .partition_point(|&bp| bp < mid_bp)
-                                            })
-                                            .unwrap_or(m_lo)
-                                            .max(last_splice_end)
-                                            .min(m_lo);
-                                        let sp_end = next_alt_mis
-                                            .map(|n| {
-                                                let bp_l = positions_bp[m_hi];
-                                                let bp_r = positions_bp[n];
-                                                let mid_bp = bp_l + (bp_r.saturating_sub(bp_l)) / 2;
-                                                let lo = m_hi + 1;
-                                                lo + positions_bp[lo..n]
-                                                    .partition_point(|&bp| bp <= mid_bp)
-                                            })
-                                            .unwrap_or(m_hi + 1)
-                                            .max(m_hi + 1)
-                                            .min(m_end);
-                                        if sp_start >= sp_end {
-                                            continue;
-                                        }
-                                        let (sp_comp, _, sp_raw) = hap_major
-                                            .count_mismatches_weighted(
-                                                tgt_col,
-                                                alt_ref_col,
-                                                sp_start,
-                                                sp_end,
-                                                weights,
-                                                match_reward,
-                                                flat_mismatch_delta,
-                                                freq_mismatch_delta,
-                                            );
-                                        let compact_min_comp = if obs_diag == 3 { 5 } else { 4 };
-                                        let compact_min_raw =
-                                            if obs_diag == 3 { 3.5f32 } else { 3.0f32 };
-                                        let compact_ok = alt_comp >= compact_min_comp
-                                            && alt_raw >= compact_min_raw;
-                                        let splice_ok = sp_comp >= 8 && sp_raw >= 3.8f32;
-                                        if !compact_ok && !splice_ok {
-                                            continue;
-                                        }
-                                        if best_alt
-                                            .map(|(_, _, _, bc, bsr, bar)| {
-                                                sp_raw > bsr
-                                                    || (sp_raw == bsr && sp_comp > bc)
-                                                    || (sp_raw == bsr
-                                                        && sp_comp == bc
-                                                        && alt_raw > bar)
-                                            })
-                                            .unwrap_or(true)
-                                        {
-                                            best_alt = Some((
-                                                alt_ci, sp_start, sp_end, sp_comp, sp_raw, alt_raw,
-                                            ));
+                                        if alt_raw >= min_alt_raw && ll_gain >= 16.0 {
+                                            if best_alt
+                                                .map(|(_, bc, br)| {
+                                                    alt_raw > br || (alt_raw == br && alt_comp > bc)
+                                                })
+                                                .unwrap_or(true)
+                                            {
+                                                best_alt = Some((alt_ci, alt_comp, alt_raw));
+                                            }
                                         }
                                     }
-                                    let Some((
-                                        best_ci,
-                                        splice_start,
-                                        splice_end,
-                                        sp_comp,
-                                        sp_best_raw,
-                                        _,
-                                    )) = best_alt
-                                    else {
+                                    let Some((best_ci, _, _)) = best_alt else {
                                         continue;
                                     };
-                                    // Count all observed zero-mismatch parents across the
-                                    // spliced window independently of obs_diag/comp/raw filters
-                                    // so low-information ties remain protected while flanking
-                                    // contradictions resolve local IBS.
-                                    let mut zero_mis_parents: Vec<u32> = Vec::new();
-                                    for (cand_ci, &cand_ref_col) in candidates.iter().enumerate() {
-                                        if cand_ci == seg.c_idx {
-                                            continue;
-                                        }
-                                        let (cc, cm_err) = hap_major.count_mismatches(
-                                            tgt_col,
-                                            cand_ref_col,
-                                            splice_start,
-                                            splice_end,
-                                        );
-                                        if cm_err == 0 && cc > 0 {
-                                            let (p, _) = ref_layout.hap_to_sample[cand_ref_col];
-                                            zero_mis_parents.push(p);
-                                        }
-                                    }
                                     zero_mis_parents.sort_unstable();
                                     zero_mis_parents.dedup();
                                     if zero_mis_parents.len() > 3 {
                                         continue;
                                     }
                                     let alt_ref_col = candidates[best_ci];
-                                    let (alt_parent, alt_hap) =
-                                        ref_layout.hap_to_sample[alt_ref_col];
-                                    let mut sp_ambig = 0u16;
-                                    let mut sp_exp_sum = 0.0f64;
-                                    for &cand_ref_col in candidates {
-                                        let (cc, _, cs) = hap_major.count_mismatches_weighted(
-                                            tgt_col,
-                                            cand_ref_col,
-                                            splice_start,
-                                            splice_end,
-                                            weights,
-                                            match_reward,
-                                            flat_mismatch_delta,
-                                            freq_mismatch_delta,
-                                        );
-                                        if cc == 0 {
-                                            continue;
-                                        }
-                                        if (sp_best_raw as f64 - cs as f64) <= 0.5 {
-                                            sp_ambig = sp_ambig.saturating_add(1);
+                                    let prev_alt_mis = hap_major.find_nearest_mismatch_left(
+                                        tgt_col,
+                                        alt_ref_col,
+                                        last_splice_end,
+                                        m_lo,
+                                    );
+                                    let next_alt_mis = hap_major.find_nearest_mismatch_right(
+                                        tgt_col,
+                                        alt_ref_col,
+                                        m_hi,
+                                        m_end,
+                                    );
+                                    let splice_start = prev_alt_mis
+                                        .map(|p| {
+                                            let bp_l = positions_bp[p];
+                                            let bp_r = positions_bp[m_lo];
+                                            let mid_bp = bp_l + (bp_r.saturating_sub(bp_l)) / 2;
+                                            let lo = p + 1;
+                                            lo + positions_bp[lo..=m_lo]
+                                                .partition_point(|&bp| bp < mid_bp)
+                                        })
+                                        .unwrap_or(m_lo)
+                                        .max(last_splice_end)
+                                        .min(m_lo);
+                                    let splice_end = next_alt_mis
+                                        .map(|n| {
+                                            let bp_l = positions_bp[m_hi];
+                                            let bp_r = positions_bp[n];
+                                            let mid_bp = bp_l + (bp_r.saturating_sub(bp_l)) / 2;
+                                            let lo = m_hi + 1;
+                                            lo + positions_bp[lo..n]
+                                                .partition_point(|&bp| bp <= mid_bp)
+                                        })
+                                        .unwrap_or(m_hi + 1)
+                                        .max(m_hi + 1)
+                                        .min(m_end);
+                                    if splice_start < splice_end {
+                                        let (alt_parent, alt_hap) =
+                                            ref_layout.hap_to_sample[alt_ref_col];
+                                        let (sp_comp, _, sp_best_raw) =
+                                            hap_major.count_mismatches_weighted(
+                                                tgt_col,
+                                                alt_ref_col,
+                                                splice_start,
+                                                splice_end,
+                                                weights,
+                                                match_reward,
+                                                flat_mismatch_delta,
+                                                freq_mismatch_delta,
+                                            );
+                                        let mut sp_ambig = 0u16;
+                                        let mut sp_exp_sum = 0.0f64;
+                                        for &cand_ref_col in candidates {
+                                            let (cc, _, cs) = hap_major.count_mismatches_weighted(
+                                                tgt_col,
+                                                cand_ref_col,
+                                                splice_start,
+                                                splice_end,
+                                                weights,
+                                                match_reward,
+                                                flat_mismatch_delta,
+                                                freq_mismatch_delta,
+                                            );
+                                            if cc == 0 {
+                                                continue;
+                                            }
+                                            if (sp_best_raw as f64 - cs as f64) <= 0.5 {
+                                                sp_ambig = sp_ambig.saturating_add(1);
+                                            }
+                                            sp_exp_sum +=
+                                                ((cs as f64 - sp_best_raw as f64).max(-40.0)).exp();
                                         }
                                         sp_exp_sum +=
-                                            ((cs as f64 - sp_best_raw as f64).max(-40.0)).exp();
+                                            ((0.0 - sp_best_raw as f64).clamp(-40.0, 40.0)).exp();
+                                        let sp_conf = if sp_exp_sum > 0.0 {
+                                            (1.0 / sp_exp_sum).clamp(0.0, 1.0) as f32
+                                        } else {
+                                            1.0
+                                        };
+                                        splices.push((
+                                            splice_start,
+                                            splice_end,
+                                            alt_parent,
+                                            alt_hap,
+                                            sp_conf,
+                                            sp_ambig.max(1),
+                                            sp_comp,
+                                        ));
+                                        last_splice_end = splice_end;
+                                        break;
                                     }
-                                    sp_exp_sum +=
-                                        ((0.0 - sp_best_raw as f64).clamp(-40.0, 40.0)).exp();
-                                    let sp_conf = if sp_exp_sum > 0.0 {
-                                        (1.0 / sp_exp_sum).clamp(0.0, 1.0) as f32
-                                    } else {
-                                        1.0
-                                    };
-                                    splices.push((
-                                        splice_start,
-                                        splice_end,
-                                        alt_parent,
-                                        alt_hap,
-                                        sp_conf,
-                                        sp_ambig.max(1),
-                                        sp_comp,
-                                    ));
-                                    last_splice_end = splice_end;
-                                    break;
                                 }
                             }
                             c_start = c_end;
@@ -1987,8 +1938,7 @@ pub fn paint_chromosome_ancestry_cancellable(
                             }
                         }
                         let sp_s_bp = positions_bp[sp_start];
-                        let sp_has_right =
-                            sp_end < m_end || (followed_by_called && m_end < n_markers);
+                        let sp_has_right = sp_end < m_end || (followed_by_called && m_end < n_markers);
                         let (sp_e_bp, sp_e_cm) = if sp_has_right && sp_end < n_markers {
                             (
                                 positions_bp[sp_end].saturating_sub(1).max(sp_s_bp),
@@ -2065,11 +2015,7 @@ pub fn paint_chromosome_ancestry_cancellable(
     Ok((segments, sparse_bins))
 }
 
-fn build_genetic_step_ranges(
-    cm_positions: &[f64],
-    positions_bp: &[u64],
-    step_cm: f64,
-) -> Vec<(usize, usize)> {
+fn build_genetic_step_ranges(cm_positions: &[f64], step_cm: f64) -> Vec<(usize, usize)> {
     let n = cm_positions.len();
     if n == 0 {
         return Vec::new();
@@ -2079,17 +2025,12 @@ fn build_genetic_step_ranges(
     } else {
         0.05
     };
-    // Cap physical span per step at 5 Mb/cM (250 kb at default 0.05 cM) so
-    // pericentromeric recombination deserts do not merge multi-Mb flanking regions
-    // into one Viterbi step and dilute true 250-500 kb introgressions.
-    let step_bp = (step * 5_000_000.0).round().max(250_000.0) as u64;
     let mut ranges = Vec::new();
     let mut start = 0usize;
     while start < n {
         let limit_cm = cm_positions[start] + step;
-        let limit_bp = positions_bp[start].saturating_add(step_bp);
         let mut end = start + 1;
-        while end < n && cm_positions[end] < limit_cm && positions_bp[end] < limit_bp {
+        while end < n && cm_positions[end] < limit_cm {
             end += 1;
         }
         ranges.push((start, end));
@@ -4416,12 +4357,14 @@ mod tests {
                     let p1 = if diag { 1 - p0 } else { p0 };
                     joint.set_allele(m, 1, Some(p1));
                     joint.set_allele(m, n_parents, Some(p1));
-                    for p in 2..=4usize {
-                        if m == 202 || m == 203 {
-                            let a = if extra_zero_mis_ties { p1 } else { 1 - p1 };
-                            joint.set_allele(m, p, Some(a));
-                        } else {
-                            joint.set_allele(m, p, None);
+                    if (201..=206).contains(&m) {
+                        for p in 2..=4usize {
+                            if m == 202 || m == 203 {
+                                let a = if extra_zero_mis_ties { p1 } else { 1 - p1 };
+                                joint.set_allele(m, p, Some(a));
+                            } else {
+                                joint.set_allele(m, p, None);
+                            }
                         }
                     }
                 } else {
@@ -4449,109 +4392,5 @@ mod tests {
             "3 additional low-information zero-mismatch parents (total 4 > 3) must block splice, got {segs_tied:?}"
         );
         assert_eq!(segs_tied[0].parent_sample, 0);
-    }
-
-    #[test]
-    fn pericentromeric_500kb_introgression_is_not_diluted_by_low_recombination_step() {
-        // Pericentromeric recombination desert (0.01 cM/Mb): 400 markers at 50 kb spacing
-        // (20 Mb, 0.20 cM total). Without a physical step ceiling, 0.05 cM merges 5 Mb
-        // (100 markers) into one Viterbi step, diluting a true 500 kb (10-marker, 8-diag)
-        // P1 introgression (ll_gain ~48 >> 24). With the 250 kb physical step cap, Viterbi
-        // recovers [P0, P1, P0] cleanly.
-        let n_parents = 12usize;
-        let n_markers = 400usize;
-        let ref_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true; n_parents]);
-        let tgt_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true]);
-        let mut joint =
-            BitHaplotypeMatrix::new(ref_layout.total_haps + tgt_layout.total_haps, n_markers);
-        let pos: Vec<u64> = (0..n_markers).map(|m| (m as u64 + 1) * 50_000).collect();
-        let cm: Vec<f64> = (0..n_markers).map(|m| m as f64 * 0.0005).collect();
-
-        for m in 0..n_markers {
-            for p in 0..n_parents {
-                joint.set_allele(m, p, Some(balanced_founder_allele(m, p)));
-            }
-            let p0 = joint.allele(m, 0).unwrap();
-            if (200..210).contains(&m) {
-                let diag = (201..209).contains(&m);
-                let p1 = if diag { 1 - p0 } else { p0 };
-                joint.set_allele(m, 1, Some(p1));
-                joint.set_allele(m, n_parents, Some(p1));
-            } else {
-                joint.set_allele(m, n_parents, Some(p0));
-            }
-        }
-
-        let cfg = HaploidIbdConfig::default();
-        let (segs, _) =
-            paint_chromosome_ancestry(&joint, &ref_layout, &tgt_layout, 0, &pos, &cm, &cfg);
-        assert_eq!(
-            segs.len(),
-            3,
-            "pericentromeric 500 kb introgression must not be diluted by 0.05 cM step, got {segs:?}"
-        );
-        assert_eq!(segs[0].parent_sample, 0);
-        assert_eq!(segs[1].parent_sample, 1);
-        assert_eq!(segs[2].parent_sample, 0);
-    }
-
-    #[test]
-    fn compact_diagnostic_cluster_uses_compatible_splice_window_support_and_ties() {
-        // True P1 introgression on [200..212) (12 markers = 375 kb) has all 3 diagnostic SNPs
-        // clustered at adjacent markers [204..=206] (compact_comp=3 < 5, compact_raw ~2.1 < 3.5).
-        // Five other founders (P2..P6) match on [204..=206] (6 compact ties > 3) but contradict
-        // target at m=201 inside the compatible splice window [200..212). Evaluating support
-        // and zero-mismatch ties on [splice_start, splice_end) must recover [P0, P1, P0].
-        let n_parents = 12usize;
-        let n_markers = 400usize;
-        let ref_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true; n_parents]);
-        let tgt_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true]);
-        let mut joint =
-            BitHaplotypeMatrix::new(ref_layout.total_haps + tgt_layout.total_haps, n_markers);
-        let pos: Vec<u64> = (0..n_markers).map(|m| (m as u64 + 1) * 31_250).collect();
-        let cm: Vec<f64> = (0..n_markers).map(|m| m as f64 * 0.025).collect();
-
-        for m in 0..n_markers {
-            for p in 0..n_parents {
-                joint.set_allele(m, p, Some(balanced_founder_allele(m, p)));
-            }
-            let p0 = joint.allele(m, 0).unwrap();
-            if (200..212).contains(&m) {
-                let diag = (204..=206).contains(&m);
-                let p1 = if diag { 1 - p0 } else { p0 };
-                joint.set_allele(m, 1, Some(p1));
-                joint.set_allele(m, n_parents, Some(p1));
-                if diag {
-                    for p in 2..=6usize {
-                        joint.set_allele(m, p, Some(p1));
-                    }
-                    for p in 7..n_parents {
-                        joint.set_allele(m, p, Some(1 - p1));
-                    }
-                } else if m == 201 {
-                    for p in 2..=6usize {
-                        joint.set_allele(m, p, Some(1 - p1));
-                    }
-                }
-            } else {
-                if m == 199 || m == 212 {
-                    joint.set_allele(m, 1, Some(1 - p0));
-                }
-                joint.set_allele(m, n_parents, Some(p0));
-            }
-        }
-
-        let cfg = HaploidIbdConfig::default();
-        let (segs, _) =
-            paint_chromosome_ancestry(&joint, &ref_layout, &tgt_layout, 0, &pos, &cm, &cfg);
-        assert_eq!(
-            segs.len(),
-            3,
-            "compact 3-diag cluster with strong 12-marker compatible splice support must recover P1, got {segs:?}"
-        );
-        assert_eq!(segs[0].parent_sample, 0);
-        assert_eq!(segs[1].parent_sample, 1);
-        assert_eq!(segs[1].n_markers, 12);
-        assert_eq!(segs[2].parent_sample, 0);
     }
 }

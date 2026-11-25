@@ -150,6 +150,8 @@ mod lasso;
 mod linalg;
 #[path = "math/ld.rs"]
 mod math_ld;
+#[path = "math/mkblup.rs"]
+mod mkblup;
 #[path = "ml/mod.rs"]
 mod ml;
 #[path = "math/pcg.rs"]
@@ -247,6 +249,11 @@ use lmm::{
     lmm_reml_lmm2_chunk_from_snp_f32,
 };
 use mixed_ld::fvlmm_effective_ld_spectral_f64;
+use mkblup::{
+    mkblup_arccosine_kernel_from_grm_f64, mkblup_epistasis_kernel_from_grm_f64,
+    mkblup_fit_reml_f64, mkblup_linear_kernel_from_embeddings_f64, mkblup_predict_f64,
+    mkblup_rbf_kernel_from_grm_f64,
+};
 use packed::{
     bed_decode_rows_f32_from_meta, bed_packed_decode_rows_f32, bed_packed_decode_stats_f64,
     bed_packed_empirical_stats_f64, bed_packed_empirical_stats_subset_f64,
@@ -720,6 +727,15 @@ fn janusx(_py: Python, m: &Bound<PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(gblup_reml_npy_grm, m)?)?;
     m.add_function(wrap_pyfunction!(gblup_effect_from_meta_stream, m)?)?;
     m.add_function(wrap_pyfunction!(gblup_grm_from_meta_to_npy, m)?)?;
+    m.add_function(wrap_pyfunction!(mkblup_fit_reml_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(mkblup_predict_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(mkblup_rbf_kernel_from_grm_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(mkblup_arccosine_kernel_from_grm_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(mkblup_epistasis_kernel_from_grm_f64, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        mkblup_linear_kernel_from_embeddings_f64,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(rust_sgemm_backend, m)?)?;
     m.add_function(wrap_pyfunction!(rust_eigh_lapack_backend, m)?)?;
     m.add_function(wrap_pyfunction!(rust_blas_set_num_threads, m)?)?;

@@ -71,6 +71,9 @@ fn default_ancestry_step_cm() -> f64 {
 fn default_ancestry_step_max_markers() -> usize {
     0
 }
+fn default_ancestry_error_rate() -> f64 {
+    0.0025
+}
 fn default_mott_generations() -> f64 {
     9.0
 }
@@ -118,6 +121,9 @@ pub struct HaploidIbdConfig {
     /// Optional per-step effective marker cap for high-density WGS ancestry
     /// decoding (`0` = disabled / unscaled default).
     pub ancestry_step_max_markers: usize,
+    /// Per-site genotyping/imputation error rate for frequency-aware Viterbi
+    /// ancestry LLR emissions (default: `0.0025`, must lie in `(0, 0.25)`).
+    pub ancestry_error_rate: f64,
     pub mott_generations: f64,
     pub mott_parent_match_prob: f64,
     pub mott_map_scale_cm: f64,
@@ -150,6 +156,7 @@ impl Default for HaploidIbdConfig {
             ancestry_top_donors: default_ancestry_top_donors(),
             ancestry_step_cm: default_ancestry_step_cm(),
             ancestry_step_max_markers: default_ancestry_step_max_markers(),
+            ancestry_error_rate: default_ancestry_error_rate(),
             mott_generations: default_mott_generations(),
             mott_parent_match_prob: default_mott_parent_match_prob(),
             mott_map_scale_cm: default_mott_map_scale_cm(),

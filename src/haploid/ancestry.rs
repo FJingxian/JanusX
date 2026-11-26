@@ -498,7 +498,11 @@ struct RefAlleleWeightPlanes {
 }
 
 impl RefAlleleWeightPlanes {
-    fn from_reference_panel(matrix: &BitHaplotypeMatrix, n_ref_haps: usize) -> Option<Self> {
+    fn from_reference_panel(
+        matrix: &BitHaplotypeMatrix,
+        n_ref_haps: usize,
+        err_rate: f64,
+    ) -> Option<Self> {
         if n_ref_haps < FREQ_MODEL_MIN_REF_HAPS
             || matrix.n_markers == 0
             || matrix.words_per_marker == 0
@@ -547,9 +551,9 @@ impl RefAlleleWeightPlanes {
                     let p1 = ((c1 as f64 + 0.5) / (obs_ref as f64 + 1.0)).clamp(0.02, 0.98);
                     let af0 = 1.0 - p1;
                     let af1 = p1;
-                    let q0 = ((((1.0 - FREQ_ERR_RATE) / af0).ln().clamp(0.0, 63.0 / 16.0)) * 16.0)
+                    let q0 = ((((1.0 - err_rate) / af0).ln().clamp(0.0, 63.0 / 16.0)) * 16.0)
                         .round() as u32;
-                    let q1 = ((((1.0 - FREQ_ERR_RATE) / af1).ln().clamp(0.0, 63.0 / 16.0)) * 16.0)
+                    let q1 = ((((1.0 - err_rate) / af1).ln().clamp(0.0, 63.0 / 16.0)) * 16.0)
                         .round() as u32;
                     for b in 0..6 {
                         if (q0 >> b) & 1 != 0 {
@@ -759,19 +763,29 @@ pub fn paint_chromosome_ancestry_cancellable(
     // so emission mismatch counts run at 64 markers per hardware POPCNT instruction
     // with sequential L1 cache access.
     let hap_major = HaplotypeMajorBits::from_matrix(joint_matrix, cancelled)?;
-    let ref_weights = RefAlleleWeightPlanes::from_reference_panel(joint_matrix, n_ref_haps);
+    let err_rate = if config.ancestry_error_rate.is_finite()
+        && config.ancestry_error_rate > 0.0
+        && config.ancestry_error_rate < 0.25
+    {
+        config.ancestry_error_rate
+    } else {
+        FREQ_ERR_RATE
+    };
+    let ref_weights =
+        RefAlleleWeightPlanes::from_reference_panel(joint_matrix, n_ref_haps, err_rate);
     // Log-likelihood ratio scores relative to `Uncalled` background:
     //   - For multi-parent panels (`n_ref_haps >= 6`), use empirical reference allele
-    //     frequencies `af(t)` with `err = 0.0025`: `match = ln((1 - err) / af(t))`,
-    //     `mismatch = ln(err / af(t)) = match - ln((1 - err) / err)`. This suppresses
-    //     false-positive IBS on common alleles for out-of-panel founders while preserving
-    //     full rare-allele signal.
+    //     frequencies `af(t)` with `err = ancestry_error_rate` (default `0.0025`):
+    //     `match = ln((1 - err) / af(t))`, `mismatch = match - ln((1 - err) / err)`.
+    //     This suppresses false-positive IBS on common alleles for out-of-panel
+    //     founders while preserving full rare-allele signal.
     //   - For tiny synthetic panels (`n_ref_haps < 6`), fall back to uniform `p = 0.5`
     //     (`match = +0.7`, `mismatch = -4.5`).
     let mismatch_penalty: f32 = 4.5;
     let match_reward: f32 = 0.7;
     let flat_mismatch_delta: f32 = match_reward + mismatch_penalty;
-    let freq_mismatch_delta: f32 = ((1.0 - FREQ_ERR_RATE) / FREQ_ERR_RATE).ln() as f32;
+    let default_freq_mismatch_delta: f32 = ((1.0 - FREQ_ERR_RATE) / FREQ_ERR_RATE).ln() as f32;
+    let freq_mismatch_delta: f32 = ((1.0 - err_rate) / err_rate).ln() as f32;
     let switch_penalty = config.ancestry_switch_penalty.max(0.5);
     let step_eff_markers_cap = config.ancestry_step_max_markers as f32;
 
@@ -1769,8 +1783,10 @@ pub fn paint_chromosome_ancestry_cancellable(
                                             freq_mismatch_delta,
                                         );
                                         let min_alt_raw = if obs_diag == 3 { 3.5f32 } else { 3.0f32 };
+                                        let min_ll_gain = 16.0f32
+                                            * (freq_mismatch_delta / default_freq_mismatch_delta);
                                         let ll_gain = alt_raw - bg_raw;
-                                        if alt_raw >= min_alt_raw && ll_gain >= 16.0 {
+                                        if alt_raw >= min_alt_raw && ll_gain >= min_ll_gain {
                                             if best_alt
                                                 .map(|(_, bc, br)| {
                                                     alt_raw > br || (alt_raw == br && alt_comp > bc)
@@ -4392,5 +4408,52 @@ mod tests {
             "3 additional low-information zero-mismatch parents (total 4 > 3) must block splice, got {segs_tied:?}"
         );
         assert_eq!(segs_tied[0].parent_sample, 0);
+    }
+
+    #[test]
+    fn higher_ancestry_error_rate_retains_noisy_in_panel_segment_without_uncalled() {
+        // 12 balanced founders over 300 markers; target matches P0 with 14% uniform
+        // error (42/300). At default ancestry_error_rate=0.0025 (delta=5.99), per-site
+        // expected LLR ~0.69 - 0.14*5.99 = -0.15 < 0 so Viterbi drops P0 to Uncalled.
+        // Raising ancestry_error_rate=0.02 (delta=3.89) makes expected LLR ~+0.13 > 0
+        // (while 0.14 < 3 * 0.05 stays below B3), so P0 is retained across the chromosome.
+        let n_parents = 12usize;
+        let n_markers = 300usize;
+        let ref_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true; n_parents]);
+        let tgt_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true]);
+        let mut joint =
+            BitHaplotypeMatrix::new(ref_layout.total_haps + tgt_layout.total_haps, n_markers);
+        let pos: Vec<u64> = (0..n_markers).map(|m| (m as u64 + 1) * 10_000).collect();
+        let cm: Vec<f64> = (0..n_markers).map(|m| m as f64 * 0.05).collect();
+
+        for m in 0..n_markers {
+            for p in 0..n_parents {
+                joint.set_allele(m, p, Some(balanced_founder_allele(m, p)));
+            }
+            let p0 = joint.allele(m, 0).unwrap();
+            let flip = (m % 50) % 7 == 0 && (m % 50) < 49; // 14% uniform mismatch (42/300)
+            joint.set_allele(m, n_parents, Some(if flip { 1 - p0 } else { p0 }));
+        }
+
+        let strict_cfg = HaploidIbdConfig::default();
+        let (segs_strict, _) =
+            paint_chromosome_ancestry(&joint, &ref_layout, &tgt_layout, 0, &pos, &cm, &strict_cfg);
+        assert!(
+            segs_strict.is_empty(),
+            "14% uniform mismatch must fall to Uncalled under strict 0.0025 error rate, got {segs_strict:?}"
+        );
+
+        let tolerant_cfg = HaploidIbdConfig {
+            ancestry_error_rate: 0.02,
+            ..HaploidIbdConfig::default()
+        };
+        let (segs_tolerant, _) =
+            paint_chromosome_ancestry(&joint, &ref_layout, &tgt_layout, 0, &pos, &cm, &tolerant_cfg);
+        assert_eq!(
+            segs_tolerant.len(),
+            1,
+            "ancestry_error_rate=0.02 must retain 14%-error in-panel P0, got {segs_tolerant:?}"
+        );
+        assert_eq!(segs_tolerant[0].parent_sample, 0);
     }
 }

@@ -384,11 +384,7 @@ where
                 }
 
                 let (mut aligned_pairs, align_stats) = pool.install(|| {
-                    align_chromosome_row_indices(
-                        &ref_rows,
-                        &target_rows,
-                        config.ancestry_model == AncestryModel::Mott,
-                    )
+                    align_chromosome_row_indices(&ref_rows, &target_rows, true)
                 });
                 aligned_exact_markers += align_stats.exact;
                 aligned_swapped_markers += align_stats.swapped;
@@ -2079,5 +2075,79 @@ mod tests {
         let _ = std::fs::remove_file(&tgt_path);
         let _ = std::fs::remove_file(&ref_path);
         let _ = std::fs::remove_file(format!("{}.jhibd", out_path.display()));
+    }
+
+    #[test]
+    fn viterbi_ancestry_flips_and_uses_swapped_ref_alt_markers() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir();
+        let tgt_path = dir.join(format!(
+            "janusx_haploid_vit_swap_tgt_{}_{unique}.vcf",
+            std::process::id()
+        ));
+        let ref_path = dir.join(format!(
+            "janusx_haploid_vit_swap_ref_{}_{unique}.vcf",
+            std::process::id()
+        ));
+        let out_path = dir.join(format!(
+            "janusx_haploid_vit_swap_out_{}_{unique}",
+            std::process::id()
+        ));
+
+        let mut ref_vcf = String::from(
+            "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tr1\tr2\n",
+        );
+        let mut tgt_vcf = String::from(
+            "##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tt1\n",
+        );
+        for m in 0..20usize {
+            let pos = (m + 1) * 10_000;
+            let r1 = m % 2;
+            let r2 = 1 - r1;
+            // Target encodes swapped REF/ALT (G/A vs ref A/G), so target allele matching r1 is 1 - r1.
+            let t1_swapped = 1 - r1;
+            ref_vcf.push_str(&format!(
+                "1\t{pos}\tv{m}\tA\tG\t.\tPASS\t.\tGT\t{r1}|{r1}\t{r2}|{r2}\n"
+            ));
+            tgt_vcf.push_str(&format!(
+                "1\t{pos}\tv{m}\tG\tA\t.\tPASS\t.\tGT\t{t1_swapped}|{t1_swapped}\n"
+            ));
+        }
+        std::fs::write(&ref_path, ref_vcf).unwrap();
+        std::fs::write(&tgt_path, tgt_vcf).unwrap();
+
+        let cfg = super::HaploidIbdConfig {
+            target: tgt_path.clone(),
+            reference: Some(ref_path.clone()),
+            output: out_path.clone(),
+            ploidy_mode: PloidyMode::Inbred,
+            write_tsv: true,
+            ..super::HaploidIbdConfig::default()
+        };
+        let summary = super::run_haploid_ibd(cfg).expect("Viterbi must align swapped REF/ALT sites");
+        assert_eq!(summary.aligned_exact_markers, 0);
+        assert_eq!(summary.aligned_swapped_markers, 20);
+        assert_eq!(summary.aligned_incompatible_markers, 0);
+        assert_eq!(summary.markers_processed, 20);
+        assert_eq!(summary.segments_written, 1);
+
+        let tsv_path = summary.tsv_path.expect("tsv_path present");
+        let gz_file = std::fs::File::open(&tsv_path).unwrap();
+        let mut dec = flate2::read::GzDecoder::new(gz_file);
+        let mut tsv_text = String::new();
+        std::io::Read::read_to_string(&mut dec, &mut tsv_text).unwrap();
+        let data_line = tsv_text.lines().nth(1).expect("segment row present");
+        let cols: Vec<&str> = data_line.split('\t').collect();
+        assert_eq!(cols[0], "t1");
+        assert_eq!(cols[7], "r1");
+        assert_eq!(cols[11], "20");
+
+        let _ = std::fs::remove_file(&tgt_path);
+        let _ = std::fs::remove_file(&ref_path);
+        let _ = std::fs::remove_file(format!("{}.jhibd", out_path.display()));
+        let _ = std::fs::remove_file(&tsv_path);
     }
 }

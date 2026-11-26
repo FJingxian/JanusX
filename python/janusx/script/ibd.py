@@ -262,6 +262,10 @@ def _validate_parameters(args: argparse.Namespace) -> None:
         raise ValueError("--ancestry-step-cm must be a finite positive number")
     if args.ancestry_step_max_markers < 0:
         raise ValueError("--ancestry-step-max-markers must be a nonnegative integer")
+    if not math.isfinite(args.ancestry_error_rate) or not (
+        0.0 < args.ancestry_error_rate < 0.25
+    ):
+        raise ValueError("--ancestry-error-rate must be in (0, 0.25)")
     if (
         not math.isfinite(args.ancestry_switch_penalty)
         or args.ancestry_switch_penalty <= 0.0
@@ -453,6 +457,16 @@ def build_parser(argv: Sequence[str] | None = None) -> CliArgumentParser:
         help=help_text(
             "Optional per-step effective marker cap for high-density WGS ancestry "
             "decoding; 0 disables step scaling (default: %(default)s).",
+            advanced=True,
+        ),
+    )
+    model.add_argument(
+        "--ancestry-error-rate",
+        type=float,
+        default=0.0025,
+        help=help_text(
+            "Per-site genotyping/imputation error rate in (0, 0.25) for frequency-aware "
+            "Viterbi ancestry emissions (default: %(default)s).",
             advanced=True,
         ),
     )
@@ -1074,6 +1088,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "ancestry_top_donors": int(args.ancestry_top_donors),
         "ancestry_step_cm": float(args.ancestry_step_cm),
         "ancestry_step_max_markers": int(args.ancestry_step_max_markers),
+        "ancestry_error_rate": float(args.ancestry_error_rate),
         "cm_per_mb": float(args.cm_per_mb),
         "write_tsv": bool(args.write_tsv),
     }
@@ -1238,6 +1253,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "Step max markers",
                     int(args.ancestry_step_max_markers),
                 )
+            _report_kv(report_logger, "Ancestry error rate", float(args.ancestry_error_rate))
             _report_kv(report_logger, "Switch penalty", float(args.ancestry_switch_penalty))
             _report_kv(report_logger, "Top donors", int(args.ancestry_top_donors))
     report_logger.info("")

@@ -3,6 +3,7 @@ from __future__ import annotations
 import fnmatch
 import os
 import site
+import struct
 import sys
 import tempfile
 import time
@@ -214,8 +215,9 @@ _extend_package_path_for_native_extension()
 
 
 def _runtime_library_dirs() -> list[Path]:
+    pkg_dirs = [Path(__file__).resolve().parent, *_iter_janusx_package_dirs()]
     dirs = [Path(sys.prefix) / "lib", Path(sys.base_prefix) / "lib"]
-    for pkg_dir in _iter_janusx_package_dirs():
+    for pkg_dir in pkg_dirs:
         dirs.extend([pkg_dir, pkg_dir / ".libs", pkg_dir.parent / "janusx.libs"])
     out: list[Path] = []
     seen: set[Path] = set()
@@ -284,8 +286,291 @@ def _windows_trusted_library_dirs() -> list[Path]:
     return out
 
 
-def _validate_linux_library_environment(library_dirs: list[Path] | None = None) -> None:
-    """Reject foreign BLAS/OpenMP runtimes that override the active Python."""
+def _elf_dynamic_info_from_sections(path: Path) -> tuple[set[str], str | None] | None:
+    """Return (DT_NEEDED SONAMEs, DT_SONAME) from ELF section headers, or None."""
+    try:
+        with path.open("rb") as fh:
+            e_ident = fh.read(16)
+            if len(e_ident) < 16 or e_ident[:4] != b"\x7fELF":
+                return None
+            ei_class = e_ident[4]
+            ei_data = e_ident[5]
+            if ei_class not in (1, 2) or ei_data not in (1, 2):
+                return None
+            endian = "<" if ei_data == 1 else ">"
+            if ei_class == 2:
+                hdr = fh.read(48)
+                if len(hdr) < 48:
+                    return None
+                e_shoff = struct.unpack_from(f"{endian}Q", hdr, 24)[0]
+                e_shentsize, e_shnum = struct.unpack_from(f"{endian}HH", hdr, 42)
+                min_shdr = 64
+                dyn_fmt = f"{endian}qQ"
+                dyn_size_step = 16
+            else:
+                hdr = fh.read(36)
+                if len(hdr) < 36:
+                    return None
+                e_shoff = struct.unpack_from(f"{endian}I", hdr, 16)[0]
+                e_shentsize, e_shnum = struct.unpack_from(f"{endian}HH", hdr, 30)
+                min_shdr = 40
+                dyn_fmt = f"{endian}iI"
+                dyn_size_step = 8
+            if e_shoff == 0 or e_shnum == 0 or e_shentsize < min_shdr:
+                return None
+            fh.seek(e_shoff)
+            sh_table = fh.read(e_shnum * e_shentsize)
+            if len(sh_table) < e_shnum * e_shentsize:
+                return None
+
+            dyn_section: tuple[int, int, int] | None = None
+            for idx in range(e_shnum):
+                base = idx * e_shentsize
+                sh_type = struct.unpack_from(f"{endian}I", sh_table, base + 4)[0]
+                if sh_type == 6:  # SHT_DYNAMIC
+                    if ei_class == 2:
+                        sh_offset, sh_size, sh_link = struct.unpack_from(
+                            f"{endian}QQI", sh_table, base + 24
+                        )
+                    else:
+                        sh_offset, sh_size, sh_link = struct.unpack_from(
+                            f"{endian}III", sh_table, base + 16
+                        )
+                    dyn_section = (sh_offset, sh_size, sh_link)
+                    break
+            if dyn_section is None:
+                return None
+            dyn_offset, dyn_size, strtab_idx = dyn_section
+            if strtab_idx >= e_shnum:
+                return None
+            str_base = strtab_idx * e_shentsize
+            if ei_class == 2:
+                str_offset, str_size = struct.unpack_from(f"{endian}QQ", sh_table, str_base + 24)
+            else:
+                str_offset, str_size = struct.unpack_from(f"{endian}II", sh_table, str_base + 16)
+
+            fh.seek(str_offset)
+            dynstr = fh.read(str_size)
+            fh.seek(dyn_offset)
+            dyn_bytes = fh.read(dyn_size)
+
+            needed: set[str] = set()
+            soname: str | None = None
+            for pos in range(0, len(dyn_bytes) - dyn_size_step + 1, dyn_size_step):
+                d_tag, d_val = struct.unpack_from(dyn_fmt, dyn_bytes, pos)
+                if d_tag == 0:  # DT_NULL
+                    break
+                if d_tag in (1, 14) and d_val < len(dynstr):  # DT_NEEDED / DT_SONAME
+                    end = dynstr.find(b"\x00", d_val)
+                    raw_name = dynstr[d_val:] if end == -1 else dynstr[d_val:end]
+                    if raw_name:
+                        decoded = raw_name.decode("utf-8", errors="replace")
+                        if d_tag == 1:
+                            needed.add(decoded)
+                        else:
+                            soname = decoded
+            return needed, soname
+    except (OSError, struct.error, ValueError):
+        return None
+
+
+def _elf_dynamic_info_from_program_headers(path: Path) -> tuple[set[str], str | None] | None:
+    """Read (DT_NEEDED SONAMEs, DT_SONAME) from PT_DYNAMIC when section headers are stripped."""
+    try:
+        with path.open("rb") as fh:
+            e_ident = fh.read(16)
+            if len(e_ident) < 16 or e_ident[:4] != b"\x7fELF":
+                return None
+            ei_class, ei_data = e_ident[4], e_ident[5]
+            if ei_class not in (1, 2) or ei_data not in (1, 2):
+                return None
+            endian = "<" if ei_data == 1 else ">"
+            if ei_class == 2:
+                hdr = fh.read(48)
+                if len(hdr) < 48:
+                    return None
+                phoff = struct.unpack_from(f"{endian}Q", hdr, 16)[0]
+                phentsize, phnum = struct.unpack_from(f"{endian}HH", hdr, 38)
+                ph_fmt, ph_size = f"{endian}IIQQQQQQ", 56
+                dyn_fmt, dyn_step = f"{endian}qQ", 16
+            else:
+                hdr = fh.read(36)
+                if len(hdr) < 36:
+                    return None
+                phoff = struct.unpack_from(f"{endian}I", hdr, 12)[0]
+                phentsize, phnum = struct.unpack_from(f"{endian}HH", hdr, 26)
+                ph_fmt, ph_size = f"{endian}IIIIIIII", 32
+                dyn_fmt, dyn_step = f"{endian}iI", 8
+            if phoff == 0 or phentsize < ph_size or phnum == 0:
+                return None
+
+            fh.seek(phoff)
+            ph_table = fh.read(phnum * phentsize)
+            if len(ph_table) < phnum * phentsize:
+                return None
+
+            loads: list[tuple[int, int, int, int]] = []
+            dynamic: tuple[int, int] | None = None
+            for idx in range(phnum):
+                base = idx * phentsize
+                fields = struct.unpack_from(ph_fmt, ph_table, base)
+                if ei_class == 2:
+                    p_type, _, p_offset, p_vaddr, _, p_filesz, p_memsz, _ = fields
+                else:
+                    p_type, p_offset, p_vaddr, _, p_filesz, p_memsz, _, _ = fields
+                if p_type == 1:  # PT_LOAD
+                    loads.append((p_vaddr, p_memsz, p_offset, p_filesz))
+                elif p_type == 2:  # PT_DYNAMIC
+                    dynamic = (p_offset, p_filesz)
+            if dynamic is None:
+                return None
+
+            dyn_offset, dyn_size = dynamic
+            fh.seek(dyn_offset)
+            dyn_bytes = fh.read(dyn_size)
+
+            needed_offsets: list[int] = []
+            soname_offset: int | None = None
+            str_vaddr: int | None = None
+            str_size: int | None = None
+            for pos in range(0, len(dyn_bytes) - dyn_step + 1, dyn_step):
+                tag, value = struct.unpack_from(dyn_fmt, dyn_bytes, pos)
+                if tag == 0:  # DT_NULL
+                    break
+                if tag == 1:  # DT_NEEDED
+                    needed_offsets.append(value)
+                elif tag == 5:  # DT_STRTAB
+                    str_vaddr = value
+                elif tag == 10:  # DT_STRSZ
+                    str_size = value
+                elif tag == 14:  # DT_SONAME
+                    soname_offset = value
+            if str_vaddr is None or str_size is None:
+                return None
+
+            str_offset: int | None = None
+            for load_vaddr, _load_memsz, load_offset, load_filesz in loads:
+                if load_vaddr <= str_vaddr < load_vaddr + load_filesz:
+                    delta = str_vaddr - load_vaddr
+                    if delta + str_size <= load_filesz:
+                        str_offset = load_offset + delta
+                    break
+            if str_offset is None:
+                return None
+
+            fh.seek(str_offset)
+            dynstr = fh.read(str_size)
+            if len(dynstr) < str_size:
+                return None
+
+            def _read_cstr(offset: int) -> str | None:
+                if offset >= len(dynstr):
+                    return None
+                end = dynstr.find(b"\x00", offset)
+                raw_name = dynstr[offset:] if end == -1 else dynstr[offset:end]
+                return raw_name.decode("utf-8", errors="replace") if raw_name else None
+
+            needed: set[str] = set()
+            for off in needed_offsets:
+                name = _read_cstr(off)
+                if name:
+                    needed.add(name)
+            soname = _read_cstr(soname_offset) if soname_offset is not None else None
+            return needed, soname
+    except (OSError, struct.error, ValueError):
+        return None
+
+
+def _elf_dynamic_info(path: Path) -> tuple[set[str], str | None] | None:
+    info = _elf_dynamic_info_from_sections(path)
+    if info is not None:
+        return info
+    return _elf_dynamic_info_from_program_headers(path)
+
+
+def _elf_needed_sonames(path: Path) -> set[str] | None:
+    info = _elf_dynamic_info(path)
+    return info[0] if info is not None else None
+
+
+def _elf_soname(path: Path) -> str | None:
+    info = _elf_dynamic_info(path)
+    return info[1] if info is not None else None
+
+
+def _find_linux_native_extensions() -> list[Path]:
+    pkg_dirs = [Path(__file__).resolve().parent, *_iter_janusx_package_dirs()]
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for pkg_dir in pkg_dirs:
+        try:
+            if not pkg_dir.is_dir():
+                continue
+            candidates = sorted(pkg_dir.glob("janusx*.so"))
+        except OSError:
+            continue
+        for cand in candidates:
+            try:
+                if not cand.is_file():
+                    continue
+                resolved = cand.resolve()
+            except OSError:
+                continue
+            if resolved not in seen:
+                seen.add(resolved)
+                out.append(resolved)
+    return out
+
+
+def _collect_linux_numerical_needed_sonames(
+    trusted: list[Path],
+    extension_paths: list[Path] | None = None,
+) -> set[str] | None:
+    """Collect numerical runtime SONAMEs actually required by JanusX ELF binaries."""
+    roots = list(extension_paths) if extension_paths is not None else _find_linux_native_extensions()
+    if not roots:
+        return None
+
+    queue: list[Path] = list(roots)
+    visited: set[Path] = set()
+    active_sonames: set[str] = set()
+    parsed_any = False
+    while queue:
+        current = queue.pop(0)
+        try:
+            resolved = current.resolve()
+        except (OSError, RuntimeError):
+            resolved = current
+        if resolved in visited:
+            continue
+        visited.add(resolved)
+        needed = _elf_needed_sonames(resolved)
+        if needed is None:
+            continue
+        parsed_any = True
+        for soname in needed:
+            low = soname.lower()
+            if _matches_numerical_runtime(low, _LINUX_NUMERICAL_RUNTIME_PATTERNS):
+                active_sonames.add(low)
+            for directory in trusted:
+                candidate = directory / soname
+                try:
+                    if candidate.is_file():
+                        cand_resolved = candidate.resolve()
+                        if cand_resolved not in visited:
+                            queue.append(cand_resolved)
+                        break
+                except OSError:
+                    continue
+    return active_sonames if parsed_any else None
+
+
+def _validate_linux_library_environment(
+    library_dirs: list[Path] | None = None,
+    *,
+    extension_paths: list[Path] | None = None,
+) -> None:
+    """Reject foreign BLAS/OpenMP runtimes that would override JanusX's active dependencies."""
     if sys.platform != "linux":
         return
     if str(os.environ.get(_ALLOW_EXTERNAL_RUNTIME_ENV, "")).strip().lower() in (
@@ -301,11 +586,27 @@ def _validate_linux_library_environment(library_dirs: list[Path] | None = None) 
             trusted.append(path)
 
     # Only flag an LD_LIBRARY_PATH entry when it wins the loader's search for
-    # a SONAME that the active environment or wheel also provides.
+    # a SONAME that the active environment or wheel provides AND that JanusX
+    # actually links (transitively via ELF DT_NEEDED). This prevents false
+    # positives on HPC clusters where module-loaded GCC exposes libgomp.so.1
+    # even though JanusX wheels bundle pthreads OpenBLAS with hashed SONAMEs.
     trusted_names: set[str] = set()
     for directory in trusted:
         for candidate in _numerical_runtime_candidates(directory):
             trusted_names.add(candidate.name.lower())
+
+    active_sonames: set[str] | None = None
+    if library_dirs is None or extension_paths is not None:
+        active_sonames = _collect_linux_numerical_needed_sonames(
+            trusted,
+            extension_paths=extension_paths,
+        )
+    checked_names = (
+        trusted_names & active_sonames if active_sonames is not None else trusted_names
+    )
+
+    def _matches_active_name(name: str, active: set[str]) -> bool:
+        return name in active or any(name.startswith(f"{item}.") for item in active)
 
     library_path_dirs: list[Path] = []
     first_library_by_name: dict[str, Path] = {}
@@ -325,7 +626,7 @@ def _validate_linux_library_environment(library_dirs: list[Path] | None = None) 
             first_library_by_name.setdefault(candidate.name.lower(), candidate)
 
     for name, candidate in first_library_by_name.items():
-        if name not in trusted_names or _is_trusted_runtime_library(candidate, trusted):
+        if name not in checked_names or _is_trusted_runtime_library(candidate, trusted):
             continue
         try:
             resolved = candidate.resolve()
@@ -346,7 +647,18 @@ def _validate_linux_library_environment(library_dirs: list[Path] | None = None) 
                 resolved = candidate.resolve()
             except (OSError, RuntimeError):
                 resolved = candidate
-            if not _matches_numerical_runtime(resolved.name, _LINUX_NUMERICAL_RUNTIME_PATTERNS):
+            preload_names = {resolved.name.lower()}
+            preload_soname = _elf_soname(resolved)
+            if preload_soname:
+                preload_names.add(preload_soname.lower())
+            if not any(
+                _matches_numerical_runtime(item, _LINUX_NUMERICAL_RUNTIME_PATTERNS)
+                for item in preload_names
+            ):
+                continue
+            if active_sonames is not None and not any(
+                _matches_active_name(item, active_sonames) for item in preload_names
+            ):
                 continue
             if not _is_trusted_runtime_library(resolved, trusted):
                 raise RuntimeError(
@@ -355,17 +667,29 @@ def _validate_linux_library_environment(library_dirs: list[Path] | None = None) 
                 )
             continue
 
-        if not _matches_numerical_runtime(candidate.name, _LINUX_NUMERICAL_RUNTIME_PATTERNS):
-            continue
-        # A bare LD_PRELOAD name is resolved through the loader cache when it
-        # is absent from LD_LIBRARY_PATH. We cannot prove which copy that
-        # cache selects, so only accept it when the active copy is explicit in
-        # LD_LIBRARY_PATH; otherwise fail closed.
         matches = [
             directory / token
             for directory in library_path_dirs
             if (directory / token).is_file()
         ]
+        preload_names = {candidate.name.lower()}
+        if matches:
+            preload_soname = _elf_soname(matches[0])
+            if preload_soname:
+                preload_names.add(preload_soname.lower())
+        if not any(
+            _matches_numerical_runtime(item, _LINUX_NUMERICAL_RUNTIME_PATTERNS)
+            for item in preload_names
+        ):
+            continue
+        if active_sonames is not None and not any(
+            _matches_active_name(item, active_sonames) for item in preload_names
+        ):
+            continue
+        # A bare LD_PRELOAD name is resolved through the loader cache when it
+        # is absent from LD_LIBRARY_PATH. We cannot prove which copy that
+        # cache selects, so only accept it when the active copy is explicit in
+        # LD_LIBRARY_PATH; otherwise fail closed.
         if not matches or not _is_trusted_runtime_library(matches[0], trusted):
             try:
                 resolved_label = str(matches[0].resolve()) if matches else token

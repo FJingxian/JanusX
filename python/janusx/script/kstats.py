@@ -131,11 +131,11 @@ def build_parser():
         formatter_class=cli_help_formatter(),
         epilog=minimal_help_epilog(
             [
-                "jx kstats -db sample_A sample_B -pair both -o out",
+                "jx kstats -db sample_A sample_B -pair both -o out/kstats",
                 "jx kstats -db sample_A -db sample_B -venn -o out/pairAB",
                 "jx kstats -db './panel/*.jx*' -venn -o out/panel_venn",
-                "jx kstats -db panel.kmc.tsv -pair intersection -sid A B C -o out -t 8 -mem 8",
-                "jx kstats -kbin test.kmer/kmerge -compare WY25=WY2_11.jx,WY2_21.jx WY35P=YY3P_11.jx,YY5P_11.jx -o out",
+                "jx kstats -db panel.kmc.tsv -pair intersection -sid A B C -o out/kstats -t 8 -mem 8",
+                "jx kstats -kbin test.kmer/kmerge -compare WY25=WY2_11.jx,WY2_21.jx WY35P=YY3P_11.jx,YY5P_11.jx -o out/kstats",
             ]
         ),
         description=(

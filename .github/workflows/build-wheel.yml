@@ -696,7 +696,7 @@ jobs:
           mkdir -p test
           TEST_PREFIX="test/mouse_hs1940"
           jx gformat -vcf example/mouse_hs1940.vcf.gz -fmt bfile -o "$TEST_PREFIX"
-          jx grm -bfile "$TEST_PREFIX" -o test
+          jx grm -bfile "$TEST_PREFIX" -o "$TEST_PREFIX"
           "$PY" - <<'PY'
           import os
           import numpy as np

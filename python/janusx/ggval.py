@@ -1335,13 +1335,13 @@ def run_gwas_suite(paths: dict[str, Path], outdir: Path, logdir: Path, *, thread
     pheno_txt = paths["pheno_txt"]
 
     step("GWAS. Validate GWAS and postGWAS on simulated data")
-    run(["jx", "grm", "-bfile", str(sim_prefix), "-o", str(outdir), "-m", "1"])
-    run(["jx", "grm", "-bfile", str(sim_prefix), "-o", str(outdir), "-m", "2"])
+    run(["jx", "grm", "-bfile", str(sim_prefix), "-o", str(sim_prefix), "-m", "1"])
+    run(["jx", "grm", "-bfile", str(sim_prefix), "-o", str(sim_prefix), "-m", "2"])
     run_pca_with_backend_report(
-        ["jx", "pca", "-bfile", str(sim_prefix), "-o", str(outdir)],
+        ["jx", "pca", "-bfile", str(sim_prefix), "-o", str(sim_prefix)],
         log_path=logdir / "jx_pca_gwas.log",
     )
-    run(["jx", "pca", "-bfile", str(sim_prefix), "-rsvd", "-o", str(outdir)])
+    run(["jx", "pca", "-bfile", str(sim_prefix), "-rsvd", "-o", str(sim_prefix)])
     grm_k = find_grm(sim_prefix)
     require_file(sim_prefix.with_suffix(".eigenvec"), "PCA eigenvec output missing")
 
@@ -1369,7 +1369,7 @@ def run_gwas_suite(paths: dict[str, Path], outdir: Path, logdir: Path, *, thread
             "-t",
             str(threads),
             "-o",
-            str(outdir),
+            str(sim_prefix),
         ]
     )
     # `-force-model` only changes SPLMM now: LMM/LMM2 no longer fall back to
@@ -1394,7 +1394,7 @@ def run_gwas_suite(paths: dict[str, Path], outdir: Path, logdir: Path, *, thread
             "-t",
             str(threads),
             "-o",
-            str(outdir),
+            str(sim_prefix),
             "-force-model",
         ]
     )
@@ -1458,7 +1458,7 @@ def run_gs_file_suite(
             "-t",
             str(threads),
             "-o",
-            str(outdir),
+            str(outdir / SIM_TXT_PREFIX_NAME),
         ]
     )
     gs_summary = validate_gs_file_input_debug_outputs(
@@ -1708,7 +1708,7 @@ def run_reml_suite(paths: dict[str, Path], outdir: Path) -> None:
             "-k",
             str(grm_k),
             "-o",
-            str(outdir),
+            str(outdir / f"{SIM_PREFIX_NAME}.pheno"),
         ]
     )
     validate_reml_outputs(outdir, prefix_name=SIM_PREFIX_NAME)

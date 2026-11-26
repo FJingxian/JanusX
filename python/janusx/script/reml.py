@@ -11,7 +11,7 @@ Input table
 
 Examples
 --------
-  jx reml -p pheno.tsv -n Yield -c year,loc -o outdir
+  jx reml -p pheno.tsv -n Yield -c year,loc -o out/reml
   jx reml -p pheno.tsv -n Yield -c PCA1,PCA2 -rc block -k data.cGRM.npy
 """
 
@@ -3077,7 +3077,7 @@ def build_parser(argv: list[str] | None = None) -> argparse.ArgumentParser:
         allow_abbrev=False,
         epilog=minimal_help_epilog(
             [
-                "jx reml -p pheno.tsv -n Yield -c year,loc -o outdir",
+                "jx reml -p pheno.tsv -n Yield -c year,loc -o out/reml",
                 "jx reml -p pheno.tsv -n Yield -c PCA1,PCA2 -rc block -k data.cGRM.npy",
                 "jx reml -p pheno.tsv -n Yield -gxe loc -gxc temperature -spk data.cGRM.spgrm",
                 "jx reml -h -dev",

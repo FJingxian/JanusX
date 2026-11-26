@@ -296,6 +296,7 @@ def test_run_gwas_suite_emits_common_pca_gwas_and_postgwas_commands(
     )
 
     assert [cmd[1] for cmd in pca_commands] == ["pca"]
+    assert pca_commands[0][pca_commands[0].index("-o") + 1] == str(sim_prefix)
     assert [cmd[1] for cmd in commands] == [
         "grm",
         "grm",
@@ -304,6 +305,8 @@ def test_run_gwas_suite_emits_common_pca_gwas_and_postgwas_commands(
         "gwas",
         "postgwas",
     ]
+    for cmd in commands[:-1]:
+        assert cmd[cmd.index("-o") + 1] == str(sim_prefix)
     gwas_commands = [cmd for cmd in commands if cmd[1] == "gwas"]
     assert "-farmcpu" in gwas_commands[0]
     assert "-splmm-exact" in gwas_commands[0]
@@ -359,6 +362,9 @@ def test_run_gs_file_suite_emits_file_input_and_optional_postgs(
     assert str(txt_matrix) in commands[0]
     assert "-BayesC" in commands[0]
     assert "-save-model" in commands[0]
+    assert commands[0][commands[0].index("-o") + 1] == str(
+        tmp_path / ggval.SIM_TXT_PREFIX_NAME
+    )
     if postgs_enabled:
         assert commands[1] == [
             "jx",
@@ -413,6 +419,9 @@ def test_run_gs_bfile_and_reml_suites_emit_common_commands(
     assert commands[1][:3] == ["jx", "reml", "-file"]
     assert commands[1][commands[1].index("-k") + 1] == str(
         Path(f"{sim_prefix}.cGRM.npy")
+    )
+    assert commands[1][commands[1].index("-o") + 1] == str(
+        tmp_path / f"{ggval.SIM_PREFIX_NAME}.pheno"
     )
 
 

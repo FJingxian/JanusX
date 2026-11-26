@@ -661,7 +661,8 @@ pub fn paint_chromosome_ancestry_cancellable(
 
     // Step 1: Partition the chromosome into genetic steps (~0.05 cM) so even
     // 10M-SNP chromosomes decode in ~2,000-4,000 lightweight Viterbi steps.
-    let step_ranges = build_genetic_step_ranges(cm_positions, config.ancestry_step_cm);
+    let step_ranges =
+        build_genetic_step_ranges(cm_positions, positions_bp, config.ancestry_step_cm);
     let n_steps = step_ranges.len();
 
     // Step 2: If reference panel is larger than `ancestry_top_donors`, run a
@@ -2031,7 +2032,11 @@ pub fn paint_chromosome_ancestry_cancellable(
     Ok((segments, sparse_bins))
 }
 
-fn build_genetic_step_ranges(cm_positions: &[f64], step_cm: f64) -> Vec<(usize, usize)> {
+fn build_genetic_step_ranges(
+    cm_positions: &[f64],
+    positions_bp: &[u64],
+    step_cm: f64,
+) -> Vec<(usize, usize)> {
     let n = cm_positions.len();
     if n == 0 {
         return Vec::new();
@@ -2041,12 +2046,23 @@ fn build_genetic_step_ranges(cm_positions: &[f64], step_cm: f64) -> Vec<(usize, 
     } else {
         0.05
     };
+    // Safeguard for zero/near-zero recombination map plateaus on high-density WGS:
+    // prevent tens of thousands of SNPs spanning multi-Mb plateaus from collapsing
+    // into one atomic Viterbi step, while leaving <=24K panels untouched.
+    const GIANT_STEP_MAX_MARKERS: usize = 2_000;
+    const GIANT_STEP_MIN_SPAN_BP: u64 = 1_000_000;
     let mut ranges = Vec::new();
     let mut start = 0usize;
     while start < n {
         let limit_cm = cm_positions[start] + step;
+        let start_bp = positions_bp[start];
         let mut end = start + 1;
         while end < n && cm_positions[end] < limit_cm {
+            if (end - start) >= GIANT_STEP_MAX_MARKERS
+                && positions_bp[end].saturating_sub(start_bp) >= GIANT_STEP_MIN_SPAN_BP
+            {
+                break;
+            }
             end += 1;
         }
         ranges.push((start, end));
@@ -4455,5 +4471,42 @@ mod tests {
             "ancestry_error_rate=0.02 must retain 14%-error in-panel P0, got {segs_tolerant:?}"
         );
         assert_eq!(segs_tolerant[0].parent_sample, 0);
+    }
+
+    #[test]
+    fn zero_recombination_plateau_giant_step_is_split_for_recombination_recovery() {
+        // Flat 0.00 cM genetic-map plateau spanning 2.0 Mb with 4,000 SNPs (2,000 SNPs/Mb):
+        // target matches P0 on [0..2000) and P1 on [2000..4000). Without the giant-step
+        // safeguard (>=2,000 SNPs && >=1 Mb), all 4,000 SNPs collapse into 1 atomic step
+        // where both P0 and P1 score deeply negative and Viterbi emits Uncalled.
+        let n_markers = 4_000usize;
+        let ref_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true, true]);
+        let tgt_layout = SampleHaplotypeLayout::from_inbred_flags(vec![true]);
+        let mut joint =
+            BitHaplotypeMatrix::new(ref_layout.total_haps + tgt_layout.total_haps, n_markers);
+        let pos: Vec<u64> = (0..n_markers).map(|m| (m as u64 + 1) * 500).collect();
+        let cm = vec![50.0f64; n_markers];
+
+        for m in 0..n_markers {
+            let p0 = (m % 2) as u8;
+            let p1 = 1 - p0;
+            joint.set_allele(m, 0, Some(p0));
+            joint.set_allele(m, 1, Some(p1));
+            joint.set_allele(m, 2, Some(if m < 2_000 { p0 } else { p1 }));
+        }
+
+        let cfg = HaploidIbdConfig::default();
+        let (segs, _) =
+            paint_chromosome_ancestry(&joint, &ref_layout, &tgt_layout, 0, &pos, &cm, &cfg);
+        assert_eq!(
+            segs.len(),
+            2,
+            "zero-recombination 2 Mb / 4,000-SNP plateau must split and recover [P0, P1], got {segs:?}"
+        );
+        assert_eq!(segs[0].parent_sample, 0);
+        assert_eq!(segs[0].n_markers, 2_000);
+        assert_eq!(segs[1].parent_sample, 1);
+        assert_eq!(segs[1].n_markers, 2_000);
+        assert_eq!(segs[0].end_bp + 1, segs[1].start_bp);
     }
 }
